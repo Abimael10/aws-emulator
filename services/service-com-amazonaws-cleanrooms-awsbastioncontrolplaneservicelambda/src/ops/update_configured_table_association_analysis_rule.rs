@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConfiguredTableAssociationAnalysisRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConfiguredTableAssociationAnalysisRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConfiguredTableAssociationAnalysisRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,20 +149,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConfiguredTableAssociationAnalysisRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConfiguredTableAssociationAnalysisRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                UpdateConfiguredTableAssociationAnalysisRuleErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("cleanrooms state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        // The membership the association is addressed under is resolved first, the same
+        // way every other membership-scoped operation resolves it.
+        if !store.memberships.contains_key(&input.membership_identifier) {
+            return Err(
+                UpdateConfiguredTableAssociationAnalysisRuleErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: st::membership_not_found_message(
+                            &input.membership_identifier,
+                            st::caller_account_id(),
+                        ),
+                        resource_id: input.membership_identifier,
+                        resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Each member of the policy union carries the policy of exactly one analysis rule
+        // type, so an `analysisRuleType` naming another type is a combination the model
+        // cannot refuse at the boundary but the service can — the same pairing the create
+        // of the same rule keeps, because the policy this update stores is read back by
+        // the same readers.
+        let policy_type =
+            st::configured_table_association_analysis_rule_policy_type(&input.analysis_rule_policy);
+        if input.analysis_rule_type != policy_type {
+            return Err(
+                UpdateConfiguredTableAssociationAnalysisRuleErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "analysisRulePolicy carries a {policy_type} policy, which does not match analysisRuleType {}",
+                            input.analysis_rule_type
+                        )),
+                        reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "analysisRulePolicy".to_string(),
+                            message: format!(
+                                "must carry the policy of analysisRuleType {}",
+                                input.analysis_rule_type
+                            ),
+                        }]),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The triple is what the update addresses, and this operation updates an EXISTING
+        // rule, so a triple that resolves to no stored rule — an association this
+        // membership does not hold, or one holding no rule of this type — is refused the
+        // way the read and the delete of the same triple refuse it, and mints nothing. The
+        // model's `ResourceType` catalog (COLLABORATION | CONFIGURED_TABLE |
+        // CONFIGURED_TABLE_ASSOCIATION | MEMBERSHIP) names no analysis rule, so the missing
+        // resource is reported as the association that would own it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConfiguredTableAssociationAnalysisRule"))
+        // Answer from the store, so the response is the persisted rule rather than a value
+        // computed beside it.
+        let updated_at = st::now();
+        match store.update_configured_table_association_analysis_rule_policy(
+            &input.membership_identifier,
+            &input.configured_table_association_identifier,
+            &input.analysis_rule_type,
+            input.analysis_rule_policy,
+            updated_at,
+        ) {
+            Some(analysis_rule) => Ok(UpdateConfiguredTableAssociationAnalysisRuleOutput {
+                analysis_rule: analysis_rule.clone(),
+            }),
+            None => Err(
+                UpdateConfiguredTableAssociationAnalysisRuleErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: st::no_such_configured_table_association_analysis_rule_message(
+                            &input.configured_table_association_identifier,
+                            &input.analysis_rule_type,
+                        ),
+                        resource_id: input.configured_table_association_identifier,
+                        resource_type: st::RESOURCE_TYPE_CONFIGURED_TABLE_ASSOCIATION.to_string(),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }

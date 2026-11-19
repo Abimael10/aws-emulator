@@ -1408,6 +1408,38 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
             .insert((association_id.to_string(), rule_type), rule);
     }
 
+    /// Replace the policy of the analysis rule `analysis_rule_type` the association
+    /// `association_identifier` names under `membership_id` holds, and move that rule's
+    /// `updateTime` to `at`.
+    ///
+    /// Answers `None` when the triple holds no rule, so a caller refuses the update rather
+    /// than minting one: `UpdateConfiguredTableAssociationAnalysisRule` "updates the
+    /// analysis rule for a configured table association", and
+    /// `CreateConfiguredTableAssociationAnalysisRule` is what mints one. The rule's
+    /// `createTime` and the identifiers it reports are untouched — only its policy
+    /// changed — and so are the association's `analysisRuleTypes` and `updateTime`,
+    /// because the set of types it holds a rule for has not changed. The mirror of
+    /// [`Self::update_configured_table_analysis_rule_policy`] for the association plane.
+    pub fn update_configured_table_association_analysis_rule_policy(
+        &mut self,
+        membership_id: &str,
+        association_identifier: &str,
+        analysis_rule_type: &str,
+        policy: ConfiguredTableAssociationAnalysisRulePolicy,
+        at: ::aws_smithy_types::DateTime,
+    ) -> Option<&ConfiguredTableAssociationAnalysisRule> {
+        let association_id = self
+            .configured_table_association_in(membership_id, association_identifier)?
+            .id
+            .clone();
+        let rule = self
+            .configured_table_association_analysis_rules
+            .get_mut(&(association_id, analysis_rule_type.to_string()))?;
+        rule.policy = policy;
+        rule.update_time = at;
+        Some(rule)
+    }
+
     /// Drop the analysis rule of `analysis_rule_type` the association
     /// `association_identifier` names under `membership_id` holds, and stop reporting that
     /// type on the association.

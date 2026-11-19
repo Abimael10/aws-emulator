@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the Clean Rooms configured-table-association analysis-rule slice
-//! (`CreateConfiguredTableAssociationAnalysisRule` +
+//! (`CreateConfiguredTableAssociationAnalysisRule`,
+//! `UpdateConfiguredTableAssociationAnalysisRule` +
 //! `GetConfiguredTableAssociationAnalysisRule`).
 //!
 //! The rules under test:
@@ -25,7 +26,12 @@
 //! * an association is a sub-resource of ONE membership, so an identifier no create
 //!   minted — the membership or the association — and an association of ANOTHER
 //!   membership are the modelled 404 `ResourceNotFoundException`, as is a pair the store
-//!   holds no rule for.
+//!   holds no rule for;
+//! * an update REPLACES the policy of the rule the request's triple addresses and moves
+//!   only that rule's `updateTime`, keeping its `createTime` and the identifiers it
+//!   reports, so a later read reports the new policy; it keeps the same pairing of
+//!   `analysisRuleType` and policy member the create keeps, and a triple that holds no
+//!   rule is the modelled 404 rather than a rule this operation mints.
 //!
 //! The tables vary what those rules generalise over: every rule type in the model's
 //! catalog, every (declared type, policy type) pair, and for the policies the optional
@@ -133,6 +139,23 @@ impl Emulator {
                 "/memberships/{membership_id}/configuredTableAssociations/{association_id}/analysisRule/{rule_type}"
             ),
             None,
+        )
+        .await
+    }
+
+    pub(crate) async fn update_association_analysis_rule(
+        &self,
+        membership_id: &str,
+        association_id: &str,
+        rule_type: &str,
+        policy: Value,
+    ) -> (u16, Value) {
+        self.call(
+            "PATCH",
+            &format!(
+                "/memberships/{membership_id}/configuredTableAssociations/{association_id}/analysisRule/{rule_type}"
+            ),
+            Some(json!({ "analysisRulePolicy": policy })),
         )
         .await
     }
@@ -713,4 +736,460 @@ async fn a_pair_holding_no_rule_is_reported_as_the_association_that_would_own_it
             "case {label:?}: expected resourceType CONFIGURED_TABLE_ASSOCIATION, got {read}"
         );
     }
+}
+
+/// The `allowedAdditionalAnalyses` entries a policy shape asks for: `count` ARNs of this
+/// membership, the last of them the wildcard the published pattern admits when `wildcard`.
+fn additional_analyses(
+    membership_id: &str,
+    shape: Option<(usize, bool)>,
+) -> Option<Vec<String>> {
+    shape.map(|(count, wildcard)| {
+        (0..count)
+            .map(|index| {
+                let last = index + 1 == count;
+                additional_analysis_arn(
+                    membership_id,
+                    if last && wildcard {
+                        "*".to_string()
+                    } else {
+                        format!("model-association-{index}")
+                    }
+                    .as_str(),
+                )
+            })
+            .collect()
+    })
+}
+
+/// One row of the update table: the policy the rule is created with and the policy the
+/// update replaces it by, for one rule type.
+struct UpdateCase {
+    label: String,
+    rule_type: &'static str,
+    before: PolicyShape,
+    after: PolicyShape,
+}
+
+/// Every rule type crossed with the transitions an update may make between the optional
+/// members a policy carries: absent to present, present to absent, a longer list, a
+/// wildcard entry, and a shorter list beside an emptied one.
+fn update_cases() -> Vec<UpdateCase> {
+    let transitions: [(PolicyShape, PolicyShape); 5] = [
+        (
+            PolicyShape {
+                label: "no optional member",
+                receivers: None,
+                additional: None,
+            },
+            PolicyShape {
+                label: "both members present",
+                receivers: Some(vec![OTHER_RESULT_RECEIVER]),
+                additional: Some((2, false)),
+            },
+        ),
+        (
+            PolicyShape {
+                label: "both members present",
+                receivers: Some(vec![OTHER_RESULT_RECEIVER]),
+                additional: Some((1, false)),
+            },
+            PolicyShape {
+                label: "no optional member",
+                receivers: None,
+                additional: None,
+            },
+        ),
+        (
+            PolicyShape {
+                label: "one result receiver",
+                receivers: Some(vec![OTHER_RESULT_RECEIVER]),
+                additional: None,
+            },
+            PolicyShape {
+                label: "two result receivers",
+                receivers: Some(vec![OTHER_RESULT_RECEIVER, account_id()]),
+                additional: None,
+            },
+        ),
+        (
+            PolicyShape {
+                label: "one additional analysis",
+                receivers: None,
+                additional: Some((1, false)),
+            },
+            PolicyShape {
+                label: "a wildcard additional analysis",
+                receivers: None,
+                additional: Some((1, true)),
+            },
+        ),
+        (
+            PolicyShape {
+                label: "two additional analyses and a receiver",
+                receivers: Some(vec![OTHER_RESULT_RECEIVER]),
+                additional: Some((2, false)),
+            },
+            PolicyShape {
+                label: "one additional analysis and an empty receiver list",
+                receivers: Some(vec![]),
+                additional: Some((1, false)),
+            },
+        ),
+    ];
+    ALL_RULE_TYPES
+        .iter()
+        .flat_map(|rule_type| {
+            transitions.iter().map(move |(before, after)| UpdateCase {
+                label: format!(
+                    "analysisRuleType={rule_type}, {} -> {}",
+                    before.label, after.label
+                ),
+                rule_type,
+                before: PolicyShape {
+                    label: before.label,
+                    receivers: before.receivers.clone(),
+                    additional: before.additional,
+                },
+                after: PolicyShape {
+                    label: after.label,
+                    receivers: after.receivers.clone(),
+                    additional: after.additional,
+                },
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_updated_association_analysis_rule_policy_is_reported_by_a_later_read() {
+    for (row, case) in update_cases().into_iter().enumerate() {
+        let label = &case.label;
+        let emulator = Emulator::new();
+        let stored = association(&emulator, &format!("assocupd{row}")).await;
+
+        let before_policy = association_policy(
+            case.rule_type,
+            case.before.receivers.as_deref(),
+            additional_analyses(&stored.membership_id, case.before.additional).as_deref(),
+        );
+        let (status, created) = emulator
+            .create_association_analysis_rule(
+                &stored.membership_id,
+                &stored.id,
+                case.rule_type,
+                before_policy.clone(),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected CreateConfiguredTableAssociationAnalysisRule 200, got \
+             {status} with {created}"
+        );
+        let created_rule = created["analysisRule"].clone();
+        let (status, association_after_create) = emulator
+            .read_association(&stored.membership_id, &stored.id)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected GetConfiguredTableAssociation 200, got {status} with \
+             {association_after_create}"
+        );
+        let association_before_update = association_after_create["configuredTableAssociation"].clone();
+
+        let after_policy = association_policy(
+            case.rule_type,
+            case.after.receivers.as_deref(),
+            additional_analyses(&stored.membership_id, case.after.additional).as_deref(),
+        );
+        let (status, updated) = emulator
+            .update_association_analysis_rule(
+                &stored.membership_id,
+                &stored.id,
+                case.rule_type,
+                after_policy.clone(),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected UpdateConfiguredTableAssociationAnalysisRule 200, got \
+             {status} with {updated}"
+        );
+        let rule = &updated["analysisRule"];
+
+        assert_eq!(
+            rule["policy"], after_policy,
+            "case {label:?}: expected the policy that was sent {after_policy}, got {}",
+            rule["policy"]
+        );
+        assert_eq!(
+            rule["type"].as_str(),
+            Some(case.rule_type),
+            "case {label:?}: expected type {:?}, got {}",
+            case.rule_type,
+            rule["type"]
+        );
+        for member in [
+            "membershipIdentifier",
+            "configuredTableAssociationId",
+            "configuredTableAssociationArn",
+            "createTime",
+        ] {
+            assert_eq!(
+                rule[member], created_rule[member],
+                "case {label:?}: the update must leave {member} as the create persisted it \
+                 {}, got {}",
+                created_rule[member], rule[member]
+            );
+        }
+        let created_at = created_rule["createTime"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {label:?}: no numeric createTime in {created_rule}"));
+        let updated_at = rule["updateTime"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {label:?}: no numeric updateTime in {rule}"));
+        assert!(
+            updated_at >= created_at,
+            "case {label:?}: the update's updateTime must be at or after the creation \
+             instant {created_at}, got {updated_at}"
+        );
+
+        // The read reports exactly the persisted record, so the old policy is gone.
+        let (status, read) = emulator
+            .get_association_analysis_rule(&stored.membership_id, &stored.id, case.rule_type)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected GetConfiguredTableAssociationAnalysisRule 200, got \
+             {status} with {read}"
+        );
+        assert_eq!(
+            read["analysisRule"], *rule,
+            "case {label:?}: the read must report the updated rule {rule}, got {}",
+            read["analysisRule"]
+        );
+        if after_policy != before_policy {
+            assert_ne!(
+                read["analysisRule"]["policy"], before_policy,
+                "case {label:?}: the read must not report the replaced policy, got {}",
+                read["analysisRule"]["policy"]
+            );
+        }
+
+        // The set of types the association holds a rule for has not changed, so nothing
+        // about the association itself moved.
+        let (status, after) = emulator
+            .read_association(&stored.membership_id, &stored.id)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected GetConfiguredTableAssociation 200, got {status} with {after}"
+        );
+        assert_eq!(
+            after["configuredTableAssociation"], association_before_update,
+            "case {label:?}: a policy update leaves the association as it was {association_before_update}, got {}",
+            after["configuredTableAssociation"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_updated_policy_must_carry_the_policy_of_the_addressed_type() {
+    let mut row = 0;
+    for addressed in ALL_RULE_TYPES {
+        for policy_type in ALL_RULE_TYPES {
+            let label = format!("analysisRuleType={addressed}, policy={policy_type}");
+            let emulator = Emulator::new();
+            let stored = association(&emulator, &format!("updmismatch{row}")).await;
+            row += 1;
+
+            let (status, created) = emulator
+                .create_association_analysis_rule(
+                    &stored.membership_id,
+                    &stored.id,
+                    addressed,
+                    association_policy(addressed, Some(&[OTHER_RESULT_RECEIVER]), None),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {label:?}: expected the create to be accepted, got {status} with {created}"
+            );
+            let stored_rule = created["analysisRule"].clone();
+
+            let (status, response) = emulator
+                .update_association_analysis_rule(
+                    &stored.membership_id,
+                    &stored.id,
+                    addressed,
+                    association_policy(policy_type, Some(&[account_id()]), None),
+                )
+                .await;
+
+            if addressed == policy_type {
+                assert_eq!(
+                    status, 200,
+                    "case {label:?}: a policy of the addressed type must be accepted, got \
+                     {status} with {response}"
+                );
+                continue;
+            }
+
+            assert_eq!(
+                status, 400,
+                "case {label:?}: a policy of another type must be refused with 400, got \
+                 {status} with {response}"
+            );
+            assert_eq!(
+                error_code(&response),
+                "ValidationException",
+                "case {label:?}: expected ValidationException, got {response}"
+            );
+            assert_eq!(
+                response["fieldList"][0]["name"].as_str(),
+                Some("analysisRulePolicy"),
+                "case {label:?}: expected the fieldList to name analysisRulePolicy, got \
+                 {response}"
+            );
+            assert!(
+                response.get("analysisRule").is_none(),
+                "case {label:?}: a refused update must report no analysis rule, got {response}"
+            );
+
+            // The refusal persisted nothing: the stored rule keeps the policy the create
+            // gave it, and the policy's own type still holds no rule.
+            let (status, read) = emulator
+                .get_association_analysis_rule(&stored.membership_id, &stored.id, addressed)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {label:?}: expected GetConfiguredTableAssociationAnalysisRule 200, got \
+                 {status} with {read}"
+            );
+            assert_eq!(
+                read["analysisRule"], stored_rule,
+                "case {label:?}: a refused update must leave the stored rule {stored_rule}, \
+                 got {}",
+                read["analysisRule"]
+            );
+            let (status, read) = emulator
+                .get_association_analysis_rule(&stored.membership_id, &stored.id, policy_type)
+                .await;
+            assert_eq!(
+                status, 404,
+                "case {label:?}: a refused update mints no rule of the policy's type, so \
+                 {policy_type} must be 404, got {status} with {read}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_update_of_a_triple_holding_no_rule_is_not_found() {
+    let emulator = Emulator::new();
+    let mine = association(&emulator, "updnotfound-mine").await;
+    let other = association(&emulator, "updnotfound-other").await;
+
+    // `mine` holds one rule, so every row below addresses a triple that resolves to no
+    // stored rule: an unknown membership, an unknown association, an association of
+    // ANOTHER membership, and a type this association holds no rule for.
+    let (status, created) = emulator
+        .create_association_analysis_rule(
+            &mine.membership_id,
+            &mine.id,
+            "AGGREGATION",
+            association_policy("AGGREGATION", None, None),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup: expected CreateConfiguredTableAssociationAnalysisRule 200, got {status} with \
+         {created}"
+    );
+
+    let cases: [(&str, &str, &str, &str); 4] = [
+        (
+            "an unknown membership",
+            ABSENT_UUID,
+            mine.id.as_str(),
+            "AGGREGATION",
+        ),
+        (
+            "an unknown association",
+            mine.membership_id.as_str(),
+            ABSENT_UUID,
+            "AGGREGATION",
+        ),
+        (
+            "an association of another membership",
+            mine.membership_id.as_str(),
+            other.id.as_str(),
+            "AGGREGATION",
+        ),
+        (
+            "a type the association holds no rule for",
+            mine.membership_id.as_str(),
+            mine.id.as_str(),
+            "LIST",
+        ),
+    ];
+
+    for (label, membership_id, association_id, rule_type) in cases {
+        let (status, response) = emulator
+            .update_association_analysis_rule(
+                membership_id,
+                association_id,
+                rule_type,
+                association_policy(rule_type, Some(&[OTHER_RESULT_RECEIVER]), None),
+            )
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {label:?}: expected 404 from the update, got {status} with {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ResourceNotFoundException",
+            "case {label:?}: expected ResourceNotFoundException from the update, got {response}"
+        );
+
+        // The refused update minted nothing the read can see.
+        let (status, read) = emulator
+            .get_association_analysis_rule(membership_id, association_id, rule_type)
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {label:?}: a refused update persists nothing, so the read must be 404, got \
+             {status} with {read}"
+        );
+    }
+
+    // A triple whose membership and association resolve names the pair that holds no rule.
+    let (status, response) = emulator
+        .update_association_analysis_rule(
+            &mine.membership_id,
+            &mine.id,
+            "CUSTOM",
+            association_policy("CUSTOM", None, None),
+        )
+        .await;
+    assert_eq!(
+        status, 404,
+        "expected 404 for a type the association holds no rule for, got {status} with {response}"
+    );
+    assert_eq!(
+        error_message(&response),
+        format!(
+            "No such analysis rule with configuredTableAssociationId: {} and type {}",
+            mine.id,
+            internal_rule_type_name("CUSTOM")
+        ),
+        "expected the refusal to name the pair, got {:?}",
+        error_message(&response)
+    );
+    assert_eq!(
+        response["resourceType"].as_str(),
+        Some("CONFIGURED_TABLE_ASSOCIATION"),
+        "expected resourceType CONFIGURED_TABLE_ASSOCIATION, got {response}"
+    );
 }
