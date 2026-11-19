@@ -15,16 +15,28 @@
 //! naming no instance of this account is refused by the gateway's authorization step
 //! before any namespace is looked up.
 //!
+//! REMOVAL IS COMPLETE AND SCOPED: the delete takes exactly the addressed record out of
+//! the data lake, so every reader of that data lake stops reporting it — the paginated
+//! `ListDataLakeNamespaces` no longer pages over it while it still reports every sibling,
+//! in name order and with each sibling's own details — the per-instance namespace slot the
+//! removed namespace held is free again, and a later create under the same name starts a
+//! fresh record that carries nothing of the removed one.
+//!
 //! The tables span what the rule generalises over: the `DataLakeNamespaceName` form and
 //! length (both published bounds), how many datasets block the delete, which namespace
-//! holds them (the addressed one, a sibling, a pre-defined one), and which namespace name
-//! the delete addresses.
+//! holds them (the addressed one, a sibling, a pre-defined one), which namespace name
+//! the delete addresses, how many namespaces the data lake holds and which position in
+//! name order the deleted one occupies, the `maxResults` the listing is read back with
+//! (both published bounds), and which of the removed and the re-created namespace carries
+//! a description.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_supplychain_galaxypublicapigateway::state::PREDEFINED_NAMESPACES;
+use service_com_amazonaws_supplychain_galaxypublicapigateway::state::{
+    MAX_NAMESPACES_PER_INSTANCE, PREDEFINED_NAMESPACES,
+};
 use service_com_amazonaws_supplychain_galaxypublicapigateway::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -145,15 +157,11 @@ impl Emulator {
             .to_string()
     }
 
-    /// `CreateDataLakeNamespace` for `name`, asserted to succeed.
+    /// `CreateDataLakeNamespace` for `name`, asserted to succeed — the case that supplies
+    /// no description.
     async fn given_namespace(&self, case: &str, instance_id: &str, name: &str) {
-        let (status, body) = self
-            .send("PUT", &namespace_path(instance_id, name), Some(json!({})))
+        self.given_described_namespace(case, instance_id, name, None)
             .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: CreateDataLakeNamespace expected 200, got {status} with {body}"
-        );
     }
 
     /// `CreateDataLakeDataset` for one triple, asserted to succeed.
@@ -169,6 +177,84 @@ impl Emulator {
             status, 200,
             "case {case:?}: CreateDataLakeDataset expected 200, got {status} with {body}"
         );
+    }
+
+    /// `CreateDataLakeNamespace` for `name` with `description` when the row carries one —
+    /// the member is `@length` 1..500, so a row without one omits it rather than sending
+    /// an empty string.
+    async fn given_described_namespace(
+        &self,
+        case: &str,
+        instance_id: &str,
+        name: &str,
+        description: Option<&str>,
+    ) {
+        let body = match description {
+            Some(text) => json!({ "description": text }),
+            None => json!({}),
+        };
+        let (status, body) = self
+            .send("PUT", &namespace_path(instance_id, name), Some(body))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateDataLakeNamespace for {name:?} expected 200, got {status} with \
+             {body}"
+        );
+    }
+
+    /// `CreateDataLakeNamespace` for `name` as a client sends it, refusal and all.
+    async fn create_namespace(&self, instance_id: &str, name: &str) -> (u16, Value) {
+        self.send("PUT", &namespace_path(instance_id, name), Some(json!({})))
+            .await
+    }
+
+    /// Every namespace `ListDataLakeNamespaces` reports for `instance_id`, in the order the
+    /// pages report them, read `page_size` at a time through the tokens the listing issues:
+    /// what a client that pages to the end sees.
+    async fn listed_namespaces(
+        &self,
+        case: &str,
+        instance_id: &str,
+        page_size: usize,
+    ) -> Vec<Value> {
+        let mut reported = Vec::new();
+        let mut token: Option<String> = None;
+        // A complete walk cannot take more pages than the data lake can hold namespaces,
+        // so a listing still issuing tokens past that bound is a defect rather than a walk
+        // to wait out.
+        for _ in 0..=MAX_NAMESPACES_PER_INSTANCE {
+            let mut path = format!(
+                "/api/datalake/instance/{instance_id}/namespaces?maxResults={page_size}"
+            );
+            if let Some(resume) = &token {
+                path.push_str("&nextToken=");
+                path.push_str(resume);
+            }
+            let (status, body) = self.send("GET", &path, None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: ListDataLakeNamespaces expected 200, got {status} with {body}"
+            );
+            let page = body
+                .get("namespaces")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: the listing carried no `namespaces`: {body}")
+                });
+            assert!(
+                page.len() <= page_size,
+                "case {case:?}: a page of at most {page_size} reported {} namespaces",
+                page.len()
+            );
+            reported.extend(page);
+            match body.get("nextToken").and_then(Value::as_str) {
+                Some(resume) => token = Some(resume.to_string()),
+                None => return reported,
+            }
+        }
+        panic!("case {case:?}: the listing never stopped issuing page tokens");
     }
 
     async fn delete_namespace(&self, instance_id: &str, name: &str) -> (u16, Value) {
@@ -558,4 +644,337 @@ async fn a_delete_naming_an_unknown_instance_is_refused_by_authorization() {
         "case \"unknown instance\": the real instance's namespace must still be readable, got \
          {status} with {body}"
     );
+}
+
+/// The `name` of each namespace a listing reported, in the order it reported them.
+fn reported_names(case: &str, reported: &[Value]) -> Vec<String> {
+    reported
+        .iter()
+        .map(|entry| {
+            entry
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: a reported namespace carries no `name`: {entry}")
+                })
+                .to_string()
+        })
+        .collect()
+}
+
+/// The `namespace` structure a read or a create answered with.
+fn namespace_of(case: &str, body: &Value) -> Value {
+    body.get("namespace")
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: the response carries no `namespace`: {body}"))
+}
+
+/// A description that names the namespace it belongs to, so a sibling reported with
+/// another namespace's details is visible as such. Well inside the modelled
+/// `DataLakeNamespaceDescription` bound (`@length` 1..500).
+fn description_for(name: &str) -> String {
+    format!("the {name} namespace")
+}
+
+/// Owned namespace names from a literal row.
+fn names(row: &[&str]) -> Vec<String> {
+    row.iter().map(|name| (*name).to_string()).collect()
+}
+
+/// RULE: the delete takes exactly the addressed record out of the data lake, so every
+/// reader of that data lake stops reporting it while every sibling is still reported —
+/// the paginated listing pages over the remaining namespaces in name order and each of
+/// them still reads back with its own details.
+#[tokio::test]
+async fn a_delete_removes_the_namespace_from_every_reader_and_leaves_its_siblings() {
+    // Rows differing along how many namespaces the data lake holds, which position in
+    // name order the delete addresses, and the `maxResults` the listing is read back with
+    // — 1 and 20 are the published bounds of `DataLakeNamespaceMaxResults` (`@range` 1..20,
+    // source: the `maxResults` member of `ListDataLakeNamespacesRequest`). The last row
+    // holds more namespaces than the largest page, so the delete is observed through a
+    // RESUMED page too.
+    let mut rows: Vec<(String, Vec<String>, usize, usize)> = vec![
+        (
+            "the only namespace of the instance".to_string(),
+            names(&["n"]),
+            0,
+            1,
+        ),
+        (
+            "the first in name order".to_string(),
+            names(&["alpha", "beta", "gamma"]),
+            0,
+            20,
+        ),
+        (
+            "the middle one, read one namespace per page".to_string(),
+            names(&["a_1", "b_2", "c_3", "d_4"]),
+            1,
+            1,
+        ),
+        (
+            "the last in name order".to_string(),
+            names(&["m", "n_0", "zone_42_raw"]),
+            2,
+            20,
+        ),
+        (
+            // A name at the modelled 50-character maximum beside a 1-character one.
+            "the longest modelled name beside the shortest".to_string(),
+            names(&["z"])
+                .into_iter()
+                .chain([format!("z{}", "_9".repeat(24) + "0")])
+                .collect(),
+            1,
+            20,
+        ),
+    ];
+    // More namespaces than one page of 20 holds, with the delete addressing one that only
+    // a resumed page reports.
+    rows.push((
+        "one reported only by a resumed page".to_string(),
+        (0..23).map(|index| format!("page_{index:02}")).collect(),
+        21,
+        20,
+    ));
+    // Created in DESCENDING name order, so the listing's order cannot be the creation
+    // order it was handed.
+    rows.push((
+        "created out of name order".to_string(),
+        names(&["t_3", "s_2", "r_1", "q_0"]),
+        2,
+        1,
+    ));
+
+    for (case, held, target, page_size) in rows {
+        let emulator = Emulator::new();
+        let instance = emulator.given_instance(&case).await;
+        for name in &held {
+            emulator
+                .given_described_namespace(&case, &instance, name, Some(&description_for(name)))
+                .await;
+        }
+
+        let removed = held[target].clone();
+        let (status, body) = emulator.delete_namespace(&instance, &removed).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: deleting {removed:?} expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            (
+                body.get("instanceId").and_then(Value::as_str),
+                body.get("name").and_then(Value::as_str),
+            ),
+            (Some(instance.as_str()), Some(removed.as_str())),
+            "case {case:?}: the delete must answer the pair it removed, got {body}"
+        );
+
+        // Gone from the reader that addresses it by name.
+        let gone = not_found_sentence(&removed);
+        let (status, body) = emulator.get_namespace(&instance, &removed).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: {removed:?} must no longer be readable, got {status} with {body}"
+        );
+        let message = message_of(&case, &body);
+        assert_eq!(
+            message, gone,
+            "case {case:?}: expected {gone:?} reading the removed namespace, got {message:?}"
+        );
+
+        // And gone from the listing, which still reports every sibling in name order.
+        let mut expected: Vec<String> = held
+            .iter()
+            .filter(|name| **name != removed)
+            .cloned()
+            .collect();
+        expected.sort();
+        let reported = emulator.listed_namespaces(&case, &instance, page_size).await;
+        let actual = reported_names(&case, &reported);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: after removing {removed:?} the listing must report \
+             {expected:?}, got {actual:?}"
+        );
+        assert_eq!(
+            emulator.stored_namespaces(&instance),
+            expected.len(),
+            "case {case:?}: the delete must remove exactly one namespace record"
+        );
+
+        // Each surviving namespace still reads back as ITSELF: the delete moved no
+        // sibling's details.
+        for name in &expected {
+            let (status, body) = emulator.get_namespace(&instance, name).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: sibling {name:?} must survive the delete, got {status} with {body}"
+            );
+            let namespace = namespace_of(&case, &body);
+            let wanted = description_for(name);
+            assert_eq!(
+                (
+                    namespace.get("name").and_then(Value::as_str),
+                    namespace.get("description").and_then(Value::as_str),
+                ),
+                (Some(name.as_str()), Some(wanted.as_str())),
+                "case {case:?}: sibling {name:?} must still report its own details, got \
+                 {namespace}"
+            );
+        }
+    }
+}
+
+/// RULE: the removal releases the per-instance namespace slot the removed namespace held,
+/// so a create the data lake refused at its cap succeeds once a namespace is deleted —
+/// and the cap still holds afterwards.
+#[tokio::test]
+async fn a_delete_frees_the_namespace_slot_the_removed_namespace_held() {
+    let case = "quota slot";
+    let emulator = Emulator::new();
+    let instance = emulator.given_instance(case).await;
+
+    for index in 0..MAX_NAMESPACES_PER_INSTANCE {
+        emulator
+            .given_namespace(case, &instance, &format!("slot_{index}"))
+            .await;
+    }
+    assert_eq!(
+        emulator.stored_namespaces(&instance),
+        MAX_NAMESPACES_PER_INSTANCE,
+        "case {case:?}: the data lake must hold every namespace that was created"
+    );
+
+    // At the cap, one more create is refused — the modelled `ServiceQuotaExceededException`
+    // (HTTP 402, source: the errors of `CreateDataLakeNamespace`).
+    let (status, body) = emulator.create_namespace(&instance, "one_too_many").await;
+    assert_eq!(
+        status, 402,
+        "case {case:?}: a create past the cap expected 402, got {status} with {body}"
+    );
+    assert_eq!(
+        error_code(case, &body),
+        "ServiceQuotaExceededException",
+        "case {case:?}: expected a ServiceQuotaExceededException envelope, got {body}"
+    );
+
+    // Removing one namespace frees exactly one slot. Which one is immaterial, so the row
+    // takes the middle of the cap rather than a fixed index that a smaller cap would put
+    // outside the set.
+    let freed = format!("slot_{}", MAX_NAMESPACES_PER_INSTANCE / 2);
+    let (status, body) = emulator.delete_namespace(&instance, &freed).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: deleting a namespace expected 200, got {status} with {body}"
+    );
+    let (status, body) = emulator.create_namespace(&instance, "one_too_many").await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the freed slot must take a create, got {status} with {body}"
+    );
+
+    // Exactly one: the data lake is back at its cap, so the next create is refused again.
+    let (status, body) = emulator.create_namespace(&instance, "two_too_many").await;
+    assert_eq!(
+        status, 402,
+        "case {case:?}: back at the cap, a further create expected 402, got {status} with {body}"
+    );
+    assert_eq!(
+        emulator.stored_namespaces(&instance),
+        MAX_NAMESPACES_PER_INSTANCE,
+        "case {case:?}: the data lake must sit at its cap"
+    );
+}
+
+/// RULE: the delete removes the record rather than retiring it, so a create under the same
+/// name afterwards starts a FRESH namespace: its details come from the new request alone
+/// and nothing of the removed namespace is reported.
+#[tokio::test]
+async fn a_namespace_re_created_after_a_delete_carries_nothing_of_the_removed_one() {
+    // Rows differing along which of the removed and the re-created namespace carries a
+    // description (`DataLakeNamespaceDescription` is optional and `@length` 1..500, so a
+    // row without one omits the member).
+    let rows: Vec<(&str, &str, Option<&str>, Option<&str>)> = vec![
+        (
+            "a described namespace re-created without one",
+            "orders",
+            Some("the description the delete removed"),
+            None,
+        ),
+        (
+            "an undescribed namespace re-created with one",
+            "lines_2026",
+            None,
+            Some("the description the re-create supplied"),
+        ),
+        (
+            "a described namespace re-created with another",
+            "z",
+            Some("before"),
+            Some("after"),
+        ),
+    ];
+
+    for (case, name, removed, recreated) in rows {
+        let emulator = Emulator::new();
+        let instance = emulator.given_instance(case).await;
+        emulator
+            .given_described_namespace(case, &instance, name, removed)
+            .await;
+
+        let (status, body) = emulator.get_namespace(&instance, name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the created namespace must be readable, got {status} with {body}"
+        );
+        let before = namespace_of(case, &body);
+        assert_eq!(
+            before.get("description").and_then(Value::as_str),
+            removed,
+            "case {case:?}: the created namespace must report the description it was created \
+             with, got {before}"
+        );
+        let arn = before
+            .get("arn")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: the namespace carries no `arn`: {before}"))
+            .to_string();
+
+        let (status, body) = emulator.delete_namespace(&instance, name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the delete expected 200, got {status} with {body}"
+        );
+
+        emulator
+            .given_described_namespace(case, &instance, name, recreated)
+            .await;
+        let (status, body) = emulator.get_namespace(&instance, name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the re-created namespace must be readable, got {status} with {body}"
+        );
+        let after = namespace_of(case, &body);
+        assert_eq!(
+            after.get("description").and_then(Value::as_str),
+            recreated,
+            "case {case:?}: the re-created namespace must report only what its own create \
+             supplied, got {after}"
+        );
+        // The ARN names the instance and the name, both unchanged, so it is the one part
+        // the fresh record repeats.
+        assert_eq!(
+            after.get("arn").and_then(Value::as_str),
+            Some(arn.as_str()),
+            "case {case:?}: the re-created namespace is addressed by the same name, got {after}"
+        );
+        // And the data lake holds exactly one namespace under that name.
+        let reported = emulator.listed_namespaces(case, &instance, 20).await;
+        assert_eq!(
+            reported_names(case, &reported),
+            vec![name.to_string()],
+            "case {case:?}: the data lake must hold exactly one namespace under {name:?}"
+        );
+    }
 }
