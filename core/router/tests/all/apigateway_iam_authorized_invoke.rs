@@ -26,6 +26,11 @@
 //!
 //! Assembling the router costs stack, so it runs on an explicitly sized thread for the same
 //! reason `boot_serve.rs` does.
+//!
+//! The harness below is `pub(crate)` because the sibling suite that drives the OTHER half of
+//! the same rule — WHICH ARNs a grant's `Resource` covers
+//! ([`crate::apigateway_invoke_grant_arn_matching`]) — vends its sessions and stands its api up
+//! through it, so the two suites cannot disagree about either.
 
 use std::sync::Arc;
 
@@ -34,25 +39,28 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// Keep this at or above the size `boot_serve.rs` uses.
-const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+///
+/// `pub(crate)` for the reason the module header gives: the sibling suite that drives the
+/// REMAINING half of this rule reuses this harness rather than keeping a second copy of it.
+pub(crate) const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// The region every call is signed for, and so the region of the api's own invoke host and of
 /// the method ARN a policy names.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The stage the api is deployed to, and the resource path of its one method.
 const STAGE: &str = "prod";
 const RESOURCE_PATH: &str = "orders";
 
 /// The IAM action an invoke of a deployed method asks for.
-const INVOKE_ACTION: &str = "execute-api:Invoke";
+pub(crate) const INVOKE_ACTION: &str = "execute-api:Invoke";
 
 /// The clause every IAM authorization refusal carries, which is what a 403 row asserts.
-const NOT_AUTHORIZED_CLAUSE: &str = "is not authorized to perform: execute-api:Invoke";
+pub(crate) const NOT_AUTHORIZED_CLAUSE: &str = "is not authorized to perform: execute-api:Invoke";
 
 /// The resource field of an STS assumed-role session ARN, which is how a row observes that the
 /// refusal names the FEDERATED SESSION rather than the account.
-const ASSUMED_ROLE: &str = "assumed-role/";
+pub(crate) const ASSUMED_ROLE: &str = "assumed-role/";
 
 /// The sentence an `AWS_IAM` method reached with no credential at all is answered with.
 const MISSING_TOKEN: &str = "Missing Authentication Token";
@@ -64,19 +72,19 @@ const SERVED_BODY: &str = r#"{"served":"orders"}"#;
 const IAM_VERSION: &str = "2010-05-08";
 
 /// One request dispatched through the router, and what came back.
-struct Answer {
-    status: u16,
-    text: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) text: String,
 }
 
 impl Answer {
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_str(&self.text).unwrap_or(Value::Null)
     }
 
     /// The `Message` member an API Gateway authorization refusal carries, or the `message`
     /// member every other gateway response carries, or the whole body.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         let body = self.json();
         for member in ["Message", "message"] {
             if let Some(message) = body.get(member).and_then(Value::as_str) {
@@ -86,13 +94,13 @@ impl Answer {
         self.text.clone()
     }
 
-    fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         format!("{} {}", self.status, self.text)
     }
 }
 
 /// Dispatch one request with the host, path, headers and body given.
-async fn dispatch(
+pub(crate) async fn dispatch(
     router: &MultiServiceRouter,
     host: &str,
     method: &str,
@@ -119,7 +127,7 @@ async fn dispatch(
 /// The credential scope a signed SDK request carries, for `access_key_id`. The signature is
 /// never checked — this router runs with authentication off — but the KEY ID is what the
 /// invoke's authorization resolves its principal from.
-fn credential_scope(access_key_id: &str, signing_name: &str) -> String {
+pub(crate) fn credential_scope(access_key_id: &str, signing_name: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 \
          Credential={access_key_id}/20260101/{REGION}/{signing_name}/aws4_request, \
@@ -209,7 +217,7 @@ fn xml_text(body: &str, element: &str) -> String {
 }
 
 /// One API Gateway REST control-plane call, which must answer `expected_status`.
-async fn control_plane(
+pub(crate) async fn control_plane(
     router: &MultiServiceRouter,
     what: &str,
     method: &str,
@@ -241,7 +249,7 @@ async fn control_plane(
 }
 
 /// A required string member of a response body.
-fn as_str(what: &str, body: &Value, member: &str) -> String {
+pub(crate) fn as_str(what: &str, body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
@@ -269,7 +277,7 @@ fn pool_trust_policy(pool_id: &str) -> String {
 ///
 /// Compact and free of the characters an urlencoded body treats specially, for the reason
 /// [`pool_trust_policy`] gives.
-fn policy_document(effect: &str, action: &str, resource: &str) -> String {
+pub(crate) fn policy_document(effect: &str, action: &str, resource: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"{effect}\",\
          \"Action\":\"{action}\",\"Resource\":\"{resource}\"}}]}}"
@@ -282,7 +290,7 @@ fn policy_document(effect: &str, action: &str, resource: &str) -> String {
 ///
 /// `policy` is the inline identity-based document attached to that role, or `None` for a role
 /// carrying none.
-async fn vended_session(
+pub(crate) async fn vended_session(
     router: &MultiServiceRouter,
     name: &str,
     policy: Option<String>,
