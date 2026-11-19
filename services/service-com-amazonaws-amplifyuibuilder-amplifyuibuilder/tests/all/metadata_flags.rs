@@ -3,7 +3,7 @@
 //! The UI-builder metadata of an app environment: what `PutMetadataFlag` stores and
 //! `GetMetadata` reports.
 //!
-//! Two rules are under test:
+//! Three rules are under test:
 //!
 //! 1. `PutMetadataFlag` stores the value of ONE feature of the app environment it
 //!    addresses, and `GetMetadata` reports what was stored: the value a caller wrote comes
@@ -13,6 +13,10 @@
 //!    exist: a name outside the catalogue the service holds is refused with HTTP 400 (and,
 //!    like every refusal of this service, names no error type), and the refused write
 //!    stores nothing.
+//! 3. One `GetMetadata` answer carries EXACTLY the feature catalogue the service holds,
+//!    whatever part of it has been written: each feature at the value a `PutMetadataFlag`
+//!    last wrote for it, and at the starting value for one nothing has written — so an
+//!    app environment only partly written reports both branches at once.
 
 use std::sync::Arc;
 
@@ -345,6 +349,85 @@ async fn the_metadata_store_is_bounded_by_its_quota() {
             get_metadata(&router, "app0", ENVIRONMENT).await.features()[held],
             json!("false"),
             "case {held:?}: the write must be read back"
+        );
+    }
+}
+
+/// Rule 3: one answer carries exactly the catalogue, mixing both branches — the value a
+/// `PutMetadataFlag` last wrote for a feature, and the starting value for one nothing has
+/// written.
+///
+/// The rows differ in HOW MUCH of the catalogue has been written, from nothing through a
+/// middle subset to the whole of it, so every answer between the two extremes reports the
+/// written-value branch and the default branch side by side. Each row addresses its own app
+/// environment, so no row writes over another.
+#[tokio::test]
+async fn one_answer_mixes_written_values_with_the_starting_value() {
+    // Values a caller may write, cycled over the features a row writes:
+    // `PutMetadataFlagBody$newValue` is a plain `@required` String, not an enum, so a
+    // written value comes back exactly as it was sent.
+    let values = ["true", "false", "TRUE", "", "not-a-boolean"];
+
+    let router = emulator();
+    for written_count in 0..=METADATA_FEATURES.len() {
+        let case = format!("{written_count} of {} features written", METADATA_FEATURES.len());
+        let app_id = format!("app-written-{written_count}");
+
+        // What the answer must report: the whole catalogue at its starting value, with the
+        // features this row writes overwritten.
+        let mut expected: std::collections::BTreeMap<&str, String> = METADATA_FEATURES
+            .iter()
+            .map(|feature| (*feature, METADATA_FEATURE_DEFAULT.to_string()))
+            .collect();
+
+        for (index, feature) in METADATA_FEATURES.iter().take(written_count).enumerate() {
+            let value = values[index % values.len()];
+            let written = put_flag(&router, &app_id, ENVIRONMENT, feature, value).await;
+            assert_eq!(
+                written.status, 200,
+                "case {case:?}: writing {feature:?}={value:?} must answer HTTP 200, got {} with \
+                 {:?}",
+                written.status, written.body
+            );
+            expected.insert(feature, value.to_string());
+        }
+
+        let answer = get_metadata(&router, &app_id, ENVIRONMENT).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: GetMetadata must answer HTTP 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        let features = answer.features();
+
+        // Each feature carries what was written for it, or the starting value when this row
+        // wrote nothing for it.
+        for (name, want) in &expected {
+            assert_eq!(
+                features[*name],
+                json!(want),
+                "case {case:?}: {name:?} must report {want:?}, got {features:?}"
+            );
+        }
+
+        // Exactly the catalogue: nothing omitted, nothing extra, never an empty map.
+        let whole: Value = expected
+            .iter()
+            .map(|(name, want)| ((*name).to_string(), json!(want)))
+            .collect::<serde_json::Map<String, Value>>()
+            .into();
+        assert_eq!(
+            features, whole,
+            "case {case:?}: GetMetadata must report exactly the catalogue, got {features:?}"
+        );
+
+        // Reporting only: reading changes nothing a later caller sees.
+        let again = get_metadata(&router, &app_id, ENVIRONMENT).await;
+        assert_eq!(
+            again.features(),
+            features,
+            "case {case:?}: a second read must report the same map, got {:?}",
+            again.features()
         );
     }
 }

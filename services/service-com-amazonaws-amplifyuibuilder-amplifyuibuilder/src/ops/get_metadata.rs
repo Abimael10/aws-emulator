@@ -2,8 +2,13 @@
 
 //! @op GetMetadata
 //! Reports the UI-builder metadata of an app environment from [`crate::state`]: every
-//! feature in the catalogue the service holds, each with the value a `PutMetadataFlag`
-//! last wrote for it. Reporting only — it writes nothing.
+//! feature in the catalogue the service holds
+//! ([`crate::state::METADATA_FEATURES`]), each with the value a `PutMetadataFlag` last
+//! wrote for it, or [`crate::state::METADATA_FEATURE_DEFAULT`] for a feature nothing has
+//! written. The service models no create-metadata call, so an app environment no flag
+//! has ever been written on is answered with the whole catalogue at that starting value
+//! rather than refused, and the map is never empty nor absent. Reporting only — it
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
