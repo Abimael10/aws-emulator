@@ -29,11 +29,30 @@
 //! they were given in an Amazon SQS queue, through the AWS SDK their runtime supplies, the
 //! way a `$connect` handler stores a connection id.
 //!
+//! Three slices of that rule are about the DISPATCH DECISION reaching a terminal outcome, and
+//! two of them are about what did NOT happen, which only what RAN can show:
+//!
+//! > The authorizer of the route serving the connection request decides it BEFORE that route's
+//! > integration is performed, so a DENY refuses the handshake and leaves the `$connect`
+//! > integration unperformed, while an ALLOW completes it and the integration runs exactly
+//! > once. A frame the api routes NOWHERE — nothing selected and no `$default` route declared —
+//! > reaches no integration at all and is answered by the gateway's own `Forbidden` frame, over
+//! > a connection that keeps serving the routes it does hold. And the api's CURRENT
+//! > `RouteSelectionExpression` is the path a deployed stage selects by, so a frame sent after
+//! > that expression was replaced and the stage redeployed reaches the route the NEW path
+//! > addresses — and one keyed the way the old path named reaches whatever the new path selects,
+//! > which may be nothing.
+//!
+//! Each of those is an outcome a client can act on — a refused upgrade, a frame that reached one
+//! handler, a frame that reached none while the connection stayed open — and never an
+//! unanswered wait.
+//!
 //! The suites that own the steps BEFORE the integration are not restated here: the
 //! handshake's own statuses and the `MOCK` reply rule are
 //! `websocket_transport_data_plane.rs`, and the identity-source precondition over every
 //! spelling it takes is `websocket_connect_authorization.rs`.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,7 +62,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::http_api_backend_dispatch::{
     gateway_may_invoke, given_function, given_ungranted_function, granted, revoked,
 };
-use crate::websocket_transport_data_plane::{exchanged_reply, handshake_at, ClientSocket};
+use crate::websocket_transport_data_plane::{
+    exchanged_reply, handshake_at, ClientSocket, ACTION_SELECTION_EXPRESSION,
+};
 
 /// The Region every control-plane request below is signed for.
 const REGION: &str = "us-east-1";
@@ -287,6 +308,21 @@ struct Api {
 
 /// Create a WEBSOCKET api whose frames select a route by their `action` member.
 async fn given_api(emulator: &MultiServiceRouter, case: &str) -> Api {
+    given_selecting_api(emulator, case, ACTION_SELECTION_EXPRESSION).await
+}
+
+/// [`given_api`] for an api whose `RouteSelectionExpression` is `expression` — the PATH into
+/// each message whose value is the key that message is routed by.
+///
+/// This suite creates its apis through its OWN control-plane caller ([`control`]) rather than
+/// through `websocket_transport_data_plane`'s `create_selecting_api`, because every request of a
+/// case here — the api, the functions its routes front and the grants that admit the gateway —
+/// is signed for [`REGION`], the Region those functions live in.
+async fn given_selecting_api(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    expression: &str,
+) -> Api {
     let created = created(
         emulator,
         case,
@@ -295,7 +331,7 @@ async fn given_api(emulator: &MultiServiceRouter, case: &str) -> Api {
         json!({
             "name": "socket-routes-api",
             "protocolType": "WEBSOCKET",
-            "routeSelectionExpression": "$request.body.action"
+            "routeSelectionExpression": expression
         }),
     )
     .await;
@@ -1590,63 +1626,8 @@ async fn each_frame_is_answered_by_its_selected_routes_integration_and_only_a_fa
     let patience = std::time::Instant::now() + DECISION_WAIT;
     for frame in FRAMES {
         let row = frame.case;
-        let answered = match frame.answered {
-            Answered::By(_) => route_reply(case, row, &mut socket, frame.sent, patience).await,
-            Answered::GatewayFrame(_) => {
-                parsed(case, row, &exchanged_reply(row, &mut socket, frame.sent).await)
-            }
-        };
-        match frame.answered {
-            Answered::By(route_key) => {
-                assert_eq!(
-                    member(&answered, "/fn"),
-                    json!(route_key),
-                    "case {case:?} / {row}: expected the reply of {route_key:?}'s own function, \
-                     got {answered}"
-                );
-                for (what, pointer, expected) in [
-                    (
-                        "the kind of call",
-                        "/event/requestContext/eventType",
-                        json!("MESSAGE"),
-                    ),
-                    (
-                        "the route that served it",
-                        "/event/requestContext/routeKey",
-                        json!(route_key),
-                    ),
-                    ("the frame itself", "/event/body", json!(frame.sent)),
-                ] {
-                    assert_eq!(
-                        member(&answered, pointer),
-                        expected,
-                        "case {case:?} / {row}: expected {what} at {pointer} to be {expected}, \
-                         got {answered}"
-                    );
-                }
-            }
-            Answered::GatewayFrame(sentence) => {
-                assert_eq!(
-                    member(&answered, "/message"),
-                    json!(sentence),
-                    "case {case:?} / {row}: expected the gateway's {sentence:?} frame, got \
-                     {answered}"
-                );
-                assert_eq!(
-                    member(&answered, "/fn"),
-                    Value::Null,
-                    "case {case:?} / {row}: the gateway's frame is no route's reply, got \
-                     {answered}"
-                );
-                assert!(
-                    member(&answered, "/requestId")
-                        .as_str()
-                        .is_some_and(|id| !id.trim().is_empty()),
-                    "case {case:?} / {row}: the gateway's frame must name the call, got \
-                     {answered}"
-                );
-            }
-        }
+        let answered = dispatched(case, row, &mut socket, frame.sent, frame.answered, patience)
+            .await;
 
         // Whichever answered it, the call belongs to the ONE connection the handshake minted.
         let named = named_connection(&answered, frame);
@@ -1662,5 +1643,604 @@ async fn each_frame_is_answered_by_its_selected_routes_integration_and_only_a_fa
                  {answered}"
             ),
         }
+    }
+}
+
+/// The fixed text of the gateway's own frame for a call it routes NOWHERE: what a client reads
+/// when the value the api's expression selected matches no route key of the api and the api
+/// declares no `$default` route either.
+const FORBIDDEN_FRAME: &str = "Forbidden";
+
+/// A handler that BOTH records the event it was given and answers it, so one route's delivery is
+/// readable from the reply its two-way route sends back AND from the record it left behind —
+/// which is what a frame that reached NO integration is asserted against.
+fn recording_echo_handler(name: &str, queue_url: &str) -> String {
+    recording_handler(
+        name,
+        queue_url,
+        &format!(
+            "{{\"statusCode\": 200, \"body\": json.dumps({{\"fn\": {name:?}, \"event\": event}})}}"
+        ),
+    )
+}
+
+/// Every record written to `queue_url` so far, accumulated over repeated looks until one
+/// carrying each of `awaited` at `pointer` has arrived; nothing awaited is ONE look, which is
+/// what a case that must find no record at all reads.
+///
+/// [`drained`] takes each look's messages OFF the queue, so a case that waits for one record and
+/// then asserts another is ABSENT has to keep what it has already seen: this is that
+/// accumulation. The wait is for records the calls already made owe, so it bounds no behaviour
+/// any case asserts on and nothing here reads the clock as a result.
+async fn records_awaiting(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    queue_url: &str,
+    pointer: &str,
+    awaited: &[&str],
+) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + RECORD_WAIT;
+    let mut seen: Vec<Value> = Vec::new();
+    loop {
+        seen.extend(drained(emulator, case, queue_url).await);
+        let missing: Vec<&str> = awaited
+            .iter()
+            .copied()
+            .filter(|wanted| {
+                !seen
+                    .iter()
+                    .any(|record| member(record, pointer) == json!(wanted))
+            })
+            .collect();
+        if missing.is_empty() {
+            // One more look once the awaited records have landed: a record the queue already
+            // held but did not hand back in the look that satisfied the wait is then part of
+            // the set an absence is asserted over, rather than left behind.
+            seen.extend(drained(emulator, case, queue_url).await);
+            return seen;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected a record carrying each of {awaited:?} at {pointer}, still \
+             missing {missing:?} among {seen:?}"
+        );
+        tokio::time::sleep(LOOK_INTERVAL).await;
+    }
+}
+
+/// What one row of [`CONNECT_DECISIONS`] presents at the authorizer's identity source, and what
+/// the connection request owes for it.
+struct ConnectDecision {
+    case: &'static str,
+    /// The value the handshake's `token` query parameter carries, or `None` when the parameter
+    /// is not carried at all. Every row's value is its own, so each invocation a row causes is
+    /// told apart from every other row's by the token its event carries.
+    token: Option<&'static str>,
+    /// The status the handshake is refused with, or `None` when it is completed.
+    refused: Option<u16>,
+    /// Whether the AUTHORIZER's own function is invoked at all.
+    authorizer_runs: bool,
+    /// Whether the `$connect` route's INTEGRATION is performed.
+    integration_runs: bool,
+}
+
+impl ConnectDecision {
+    /// The query string a client dials the stage with for this row.
+    fn query(&self) -> String {
+        match self.token {
+            Some(token) => format!("?token={token}"),
+            None => String::new(),
+        }
+    }
+}
+
+/// The rows span what the decision generalises over: two different tokens the authorizer denies,
+/// the identity source absent — carried empty, and not carried at all — and the token it allows.
+///
+/// The ORDER matters, and the admitted row is deliberately LAST: its `$connect` record is the
+/// evidence every invocation this table causes has landed, since the gateway performs the
+/// connection request before answering each handshake, and each handshake here is answered before
+/// the next is offered. Asserting the absence of a record then needs no wait on the clock.
+const CONNECT_DECISIONS: &[ConnectDecision] = &[
+    ConnectDecision {
+        // The recorded case: a token the authorizer answers an explicit deny for.
+        case: "a token the authorizer denies",
+        token: Some("shut"),
+        refused: Some(FORBIDDEN),
+        authorizer_runs: true,
+        integration_runs: false,
+    },
+    ConnectDecision {
+        case: "another token it denies, which is every value but the one it admits",
+        token: Some("let-me-in"),
+        refused: Some(FORBIDDEN),
+        authorizer_runs: true,
+        integration_runs: false,
+    },
+    ConnectDecision {
+        case: "the identity source carried empty, which is absent",
+        token: Some(""),
+        refused: Some(UNAUTHORIZED),
+        authorizer_runs: false,
+        integration_runs: false,
+    },
+    ConnectDecision {
+        case: "the identity source not carried at all",
+        token: None,
+        refused: Some(UNAUTHORIZED),
+        authorizer_runs: false,
+        integration_runs: false,
+    },
+    ConnectDecision {
+        case: "the token the authorizer allows",
+        token: Some("open"),
+        refused: None,
+        authorizer_runs: true,
+        integration_runs: true,
+    },
+];
+
+/// The `REQUEST` authorizer of the `$connect` route decides the handshake BEFORE the route's
+/// integration is performed: every row reaches a terminal outcome — the upgrade completed, or
+/// refused with a definite status — and the `$connect` integration ran for exactly the row the
+/// authorizer admitted.
+///
+/// Every row is offered against ONE api, so what ran is one set of records: each invocation
+/// carries the token of the row that caused it, and the whole set is compared to the set the rows
+/// own. A record from a row that must cause none — the `$connect` integration of a refused
+/// connection request, the authorizer of a handshake presenting nothing — therefore fails the
+/// case wherever it lands, and the admitted row's own record (the last invocation the table
+/// causes) is what says the set is complete.
+#[tokio::test]
+async fn a_connect_authorizers_decision_is_terminal_and_decides_whether_the_integration_runs() {
+    let case = "one api whose $connect route is guarded by a REQUEST authorizer over a token";
+    let (emulator, engine) = emulator();
+    let queue = given_queue(&emulator, case).await;
+    let authorizer_function = given_function(
+        &emulator,
+        &engine,
+        case,
+        "connect-authorizer",
+        &authorizer_handler(&queue),
+    )
+    .await;
+    let connect = given_function(
+        &emulator,
+        &engine,
+        case,
+        "connect-route",
+        &recording_handler("$connect", &queue, "{\"statusCode\": 200}"),
+    )
+    .await;
+
+    let api = given_api(&emulator, case).await;
+    let authorizer_id = given_authorizer(&emulator, case, &api.api_id, &authorizer_function).await;
+    given_route(
+        &emulator,
+        case,
+        &api.api_id,
+        "$connect",
+        &connect,
+        false,
+        Some(&authorizer_id),
+    )
+    .await;
+    given_stage(&emulator, case, &api.api_id).await;
+
+    // Each row's own handshake, in the table's order, and the status it must be answered with.
+    // One socket per admitted row is kept open until the case ends, as a client's would be.
+    let mut _upgraded: Vec<ClientSocket> = Vec::new();
+    for row in CONNECT_DECISIONS {
+        let label = row.case;
+        // The handshake is offered again while the gateway is still answering its own `500` for
+        // an authorizer whose runtime is starting, which a loaded host produces transiently and
+        // no row expects. The wait is for a DECISION — a condition — and nothing here asserts on
+        // the clock.
+        let deadline = std::time::Instant::now() + DECISION_WAIT;
+        let answered = loop {
+            let answered =
+                handshake_at(label, &api.authority, &format!("/{STAGE}{}", row.query())).await;
+            let transient = matches!(answered, Err(status)
+                if status == INTERNAL_SERVER_ERROR && row.refused != Some(INTERNAL_SERVER_ERROR));
+            if !transient || std::time::Instant::now() >= deadline {
+                break answered;
+            }
+            tokio::time::sleep(LOOK_INTERVAL).await;
+        };
+        match (row.refused, answered) {
+            (None, Ok(socket)) => _upgraded.push(socket),
+            (None, Err(status)) => {
+                panic!("case {case:?} / {label}: the handshake must be completed, got {status}")
+            }
+            (Some(expected), Err(status)) => assert_eq!(
+                status, expected,
+                "case {case:?} / {label}: expected the handshake refused {expected}, got {status}"
+            ),
+            (Some(expected), Ok(_socket)) => panic!(
+                "case {case:?} / {label}: expected the handshake refused {expected}, got 101"
+            ),
+        }
+    }
+
+    // What RAN, as the set of (function, the token the event it was given carried). The wait is
+    // for the LAST invocation the table causes — the admitted row's connection request — after
+    // which no invocation of any row is still in flight, because each handshake was answered
+    // before the next was offered and the connection request is performed before that answer.
+    let records = records_awaiting(&emulator, case, &queue, "/fn", &["$connect"]).await;
+    // The token is kept as the JSON text its member carries, so a row that sends no token and a
+    // row that sends an empty one are two different entries and both are printable.
+    let mut ran: BTreeSet<(String, String)> = BTreeSet::new();
+    for record in &records {
+        ran.insert((
+            member(record, "/fn").as_str().unwrap_or_default().to_string(),
+            member(record, "/event/queryStringParameters/token").to_string(),
+        ));
+    }
+    let mut owed: BTreeSet<(String, String)> = BTreeSet::new();
+    for row in CONNECT_DECISIONS {
+        let token = row
+            .token
+            .map_or(Value::Null, |token| json!(token))
+            .to_string();
+        if row.authorizer_runs {
+            owed.insert(("authorizer".to_string(), token.clone()));
+        }
+        if row.integration_runs {
+            owed.insert(("$connect".to_string(), token));
+        }
+    }
+    assert_eq!(
+        ran, owed,
+        "case {case:?}: expected exactly the invocations the rows owe, got the records {records:?}"
+    );
+}
+
+/// Send one frame and assert the answer it owes: the reply of the ROUTE that must serve it — its
+/// own function's payload, the kind of call, the route key and the frame itself — or the
+/// GATEWAY's own frame, which carries that sentence, names the connection and the call, and is no
+/// route's reply. The answered frame is handed back, for a case that reads more of it.
+///
+/// The ONE statement of what an answered frame must carry, shared by every table in this suite:
+/// the rows differ, what each kind of answer owes does not.
+async fn dispatched(
+    case: &str,
+    row: &str,
+    socket: &mut ClientSocket,
+    sent: &str,
+    answered_by: Answered,
+    patience: std::time::Instant,
+) -> Value {
+    match answered_by {
+        Answered::By(route_key) => {
+            let answered = route_reply(case, row, socket, sent, patience).await;
+            for (what, pointer, expected) in [
+                ("the function that served it", "/fn", json!(route_key)),
+                (
+                    "the kind of call",
+                    "/event/requestContext/eventType",
+                    json!("MESSAGE"),
+                ),
+                (
+                    "the route it was dispatched to",
+                    "/event/requestContext/routeKey",
+                    json!(route_key),
+                ),
+                ("the frame itself", "/event/body", json!(sent)),
+            ] {
+                assert_eq!(
+                    member(&answered, pointer),
+                    expected,
+                    "case {case:?} / {row}: expected {what} at {pointer} to be {expected}, got \
+                     {answered}"
+                );
+            }
+            answered
+        }
+        Answered::GatewayFrame(sentence) => {
+            let answered = parsed(case, row, &exchanged_reply(row, socket, sent).await);
+            assert_eq!(
+                member(&answered, "/message"),
+                json!(sentence),
+                "case {case:?} / {row}: expected the gateway's {sentence:?} frame, got {answered}"
+            );
+            assert_eq!(
+                member(&answered, "/fn"),
+                Value::Null,
+                "case {case:?} / {row}: the gateway's frame is no route's reply, got {answered}"
+            );
+            for (what, pointer) in [
+                ("the connection", "/connectionId"),
+                ("the call", "/requestId"),
+            ] {
+                assert!(
+                    member(&answered, pointer)
+                        .as_str()
+                        .is_some_and(|id| !id.trim().is_empty()),
+                    "case {case:?} / {row}: the gateway's frame must name {what} at {pointer}, \
+                     got {answered}"
+                );
+            }
+            answered
+        }
+    }
+}
+
+/// The two custom routes every api in the two cases below holds, each fronting its own
+/// function. Neither case declares a `$default` route, which is what leaves a frame selecting
+/// anything else routed NOWHERE.
+const CUSTOM_ROUTES: &[&str] = &["alpha", "beta"];
+
+/// The rows span what the drop generalises over: an action each route holds, an action no route
+/// holds, an action that only RESEMBLES one, the selected value under another member, a frame
+/// whose selected member is `null`, one that is no JSON object at all, and the first action once
+/// more — after every drop, over the same connection.
+const UNROUTED_FRAMES: &[Frame] = &[
+    Frame {
+        case: "an action a custom route holds",
+        sent: r#"{"action":"alpha"}"#,
+        answered: Answered::By("alpha"),
+    },
+    Frame {
+        case: "another action, which is the other route's own function",
+        sent: r#"{"action":"beta","text":"hello"}"#,
+        answered: Answered::By("beta"),
+    },
+    Frame {
+        // The recorded case: an action matching no route, with no `$default` declared.
+        case: "an action no route holds, and no $default route serves",
+        sent: r#"{"action":"nowhere"}"#,
+        answered: Answered::GatewayFrame(FORBIDDEN_FRAME),
+    },
+    Frame {
+        case: "an action that only resembles one the api holds",
+        sent: r#"{"action":"alpha-2"}"#,
+        answered: Answered::GatewayFrame(FORBIDDEN_FRAME),
+    },
+    Frame {
+        case: "a route's own key, carried under another member",
+        sent: r#"{"name":"alpha"}"#,
+        answered: Answered::GatewayFrame(FORBIDDEN_FRAME),
+    },
+    Frame {
+        case: "a frame whose selected member is null",
+        sent: r#"{"action":null}"#,
+        answered: Answered::GatewayFrame(FORBIDDEN_FRAME),
+    },
+    Frame {
+        case: "a frame that is no JSON object",
+        sent: "plain text, no JSON",
+        answered: Answered::GatewayFrame(FORBIDDEN_FRAME),
+    },
+    Frame {
+        case: "the first action once more, after every drop",
+        sent: r#"{"action":"alpha","marker":"again"}"#,
+        answered: Answered::By("alpha"),
+    },
+];
+
+/// A frame the api routes NOWHERE — nothing the expression selected matches a route key, and the
+/// api declares no `$default` route — reaches no integration at all, is answered by the
+/// gateway's own frame, and leaves the connection serving the routes the api does hold.
+#[tokio::test]
+async fn a_frame_the_api_routes_nowhere_reaches_no_integration_and_keeps_the_connection_serving() {
+    let case = "an api holding two custom routes and NO $default route";
+    let (emulator, engine) = emulator();
+    let queue = given_queue(&emulator, case).await;
+    let api = given_api(&emulator, case).await;
+    for route_key in CUSTOM_ROUTES {
+        let function = given_function(
+            &emulator,
+            &engine,
+            case,
+            &format!("{route_key}-route"),
+            &recording_echo_handler(route_key, &queue),
+        )
+        .await;
+        given_route(&emulator, case, &api.api_id, route_key, &function, true, None).await;
+    }
+    given_stage(&emulator, case, &api.api_id).await;
+
+    let mut socket: ClientSocket = upgraded(case, &api.authority).await;
+    // One budget for the whole table (see [`route_reply`]), so a loaded host cannot stretch the
+    // case row by row.
+    let patience = std::time::Instant::now() + DECISION_WAIT;
+    for row in UNROUTED_FRAMES {
+        dispatched(
+            case,
+            row.case,
+            &mut socket,
+            row.sent,
+            row.answered,
+            patience,
+        )
+        .await;
+    }
+
+    // And what RAN says the same: a record for each frame a route served, and a record for
+    // NOTHING else — no integration was handed a frame the api routes nowhere.
+    let delivered: Vec<&str> = UNROUTED_FRAMES
+        .iter()
+        .filter(|row| matches!(row.answered, Answered::By(_)))
+        .map(|row| row.sent)
+        .collect();
+    let records = records_awaiting(&emulator, case, &queue, "/event/body", &delivered).await;
+    for record in &records {
+        let body = member(record, "/event/body");
+        let body = body.as_str().unwrap_or_default();
+        assert!(
+            delivered.contains(&body),
+            "case {case:?}: only a frame the api routes somewhere may reach an integration, got \
+             the record {record}"
+        );
+    }
+}
+
+/// One phase of [`a_replaced_route_selection_expression_redirects_later_frames`]: the expression
+/// the api carries, and the frames a connection opened while it does sends.
+struct SelectionPhase {
+    case: &'static str,
+    /// The `RouteSelectionExpression` the api carries — the api is created with the first
+    /// phase's, and each later phase replaces it.
+    expression: &'static str,
+    /// The frames this phase's connection sends, as [`Frame`] rows.
+    frames: &'static [Frame],
+}
+
+/// The phases span what the replacement generalises over: the path's DEPTH (a member of the
+/// message, then a nested one), WHICH member at the same depth is read, a frame keyed the way an
+/// earlier phase's path named, and a frame carrying both paths at once.
+///
+/// Every frame below carries its own `sentIn` marker, so no two phases send the same body: the
+/// closing check — that a record exists for exactly the frames a route served — can then tell a
+/// phase's drop from another phase's delivery.
+const SELECTION_PHASES: &[SelectionPhase] = &[
+    SelectionPhase {
+        case: "the expression the api was created with",
+        expression: ACTION_SELECTION_EXPRESSION,
+        frames: &[
+            Frame {
+                case: "the created path selects a route",
+                sent: r#"{"action":"beta","sentIn":"created"}"#,
+                answered: Answered::By("beta"),
+            },
+            Frame {
+                case: "and the other route under the same path",
+                sent: r#"{"action":"alpha","sentIn":"created"}"#,
+                answered: Answered::By("alpha"),
+            },
+        ],
+    },
+    SelectionPhase {
+        // The recorded case: the expression is replaced, and a frame then selects the newly
+        // addressed route.
+        case: "a nested path, replacing the created one",
+        expression: "$request.body.meta.kind",
+        frames: &[
+            Frame {
+                case: "a frame keyed by the new path reaches that route",
+                sent: r#"{"meta":{"kind":"alpha"},"sentIn":"nested"}"#,
+                answered: Answered::By("alpha"),
+            },
+            Frame {
+                case: "the new path decides, not the member the old one named",
+                sent: r#"{"meta":{"kind":"beta"},"action":"alpha","sentIn":"nested"}"#,
+                answered: Answered::By("beta"),
+            },
+            Frame {
+                case: "a frame keyed the way the old path named is routed nowhere",
+                sent: r#"{"action":"beta","sentIn":"nested"}"#,
+                answered: Answered::GatewayFrame(FORBIDDEN_FRAME),
+            },
+        ],
+    },
+    SelectionPhase {
+        case: "another member at the same depth",
+        expression: "$request.body.meta.route",
+        frames: &[
+            Frame {
+                case: "the member the expression names is the one read",
+                sent: r#"{"meta":{"route":"alpha","kind":"beta"},"sentIn":"sibling"}"#,
+                answered: Answered::By("alpha"),
+            },
+            Frame {
+                case: "the member the previous path named now selects nothing",
+                sent: r#"{"meta":{"kind":"beta"},"sentIn":"sibling"}"#,
+                answered: Answered::GatewayFrame(FORBIDDEN_FRAME),
+            },
+        ],
+    },
+];
+
+/// Replace the api's `RouteSelectionExpression` and release a deployment to its stage: a client
+/// changes which path a frame is routed by through `UpdateApi`, and the expression a deployed
+/// stage selects by is the api's CURRENT one.
+async fn selection_expression_replaced(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    api_id: &str,
+    expression: &str,
+) {
+    let (status, updated) = control(
+        emulator,
+        "PATCH",
+        &format!("/v2/apis/{api_id}"),
+        Some(json!({ "routeSelectionExpression": expression })),
+    )
+    .await;
+    // The status a patch of an api answers here is the one `mutating_success_status.rs` owns.
+    assert_eq!(
+        status, 201,
+        "case {case:?}: UpdateApi must answer 201, got {status} {updated}"
+    );
+    assert_eq!(
+        updated["routeSelectionExpression"].as_str(),
+        Some(expression),
+        "case {case:?}: the api must report the expression it now carries, got {updated}"
+    );
+    created(
+        emulator,
+        case,
+        "CreateDeployment",
+        &format!("/v2/apis/{api_id}/deployments"),
+        json!({ "stageName": STAGE }),
+    )
+    .await;
+}
+
+/// A `RouteSelectionExpression` replaced on a deployed api redirects the frames that follow: each
+/// phase's connection is routed by the path the api carries then, which is readable in WHICH
+/// route's function ran.
+#[tokio::test]
+async fn a_replaced_route_selection_expression_redirects_later_frames() {
+    let case = "an api whose RouteSelectionExpression is replaced, each time redeployed";
+    let (emulator, engine) = emulator();
+    let queue = given_queue(&emulator, case).await;
+    let created_with = SELECTION_PHASES
+        .first()
+        .expect("the phases name the expression the api is created with")
+        .expression;
+    let api = given_selecting_api(&emulator, case, created_with).await;
+    for route_key in CUSTOM_ROUTES {
+        let function = given_function(
+            &emulator,
+            &engine,
+            case,
+            &format!("{route_key}-route"),
+            &recording_echo_handler(route_key, &queue),
+        )
+        .await;
+        given_route(&emulator, case, &api.api_id, route_key, &function, true, None).await;
+    }
+    given_stage(&emulator, case, &api.api_id).await;
+
+    let patience = std::time::Instant::now() + DECISION_WAIT;
+    let mut delivered: Vec<&str> = Vec::new();
+    for (index, phase) in SELECTION_PHASES.iter().enumerate() {
+        if index > 0 {
+            selection_expression_replaced(&emulator, phase.case, &api.api_id, phase.expression)
+                .await;
+        }
+        // Each phase dials its OWN connection: what a frame selects on is the expression the
+        // stage carries when the connection is opened.
+        let mut socket: ClientSocket = upgraded(phase.case, &api.authority).await;
+        for row in phase.frames {
+            let label = &format!("{} / {}", phase.case, row.case);
+            dispatched(case, label, &mut socket, row.sent, row.answered, patience).await;
+            if matches!(row.answered, Answered::By(_)) {
+                delivered.push(row.sent);
+            }
+        }
+    }
+
+    // And no frame any phase's path routed nowhere reached an integration.
+    let records = records_awaiting(&emulator, case, &queue, "/event/body", &delivered).await;
+    for record in &records {
+        let body = member(record, "/event/body");
+        let body = body.as_str().unwrap_or_default();
+        assert!(
+            delivered.contains(&body),
+            "case {case:?}: only a frame a phase's path routes somewhere may reach an \
+             integration, got the record {record}"
+        );
     }
 }
