@@ -261,6 +261,46 @@ pub fn db_proxy_not_found_message(named: &str) -> String {
     format!("DBProxy '{named}' not found.")
 }
 
+/// The name the RDS proxy API gives the state a proxy must be in for an operation that
+/// needs it usable: the `available` status, as the proxy API's own state vocabulary spells
+/// it in a refusal's required-state list.
+pub const DB_PROXY_ACTIVE_STATE_NAME: &str = "ACTIVE";
+
+/// The name the RDS proxy API gives a `DBProxyStatus` where it reports a proxy's state
+/// back to a caller: the status in upper case, with the ready status named
+/// [`DB_PROXY_ACTIVE_STATE_NAME`] — the spelling the required-state list of its
+/// unsupported-state refusal uses for it — and the hyphen of a two-word status written as
+/// the underscore that vocabulary separates words with (`DBProxyStatus`:
+/// `available | modifying | incompatible-network | insufficient-resource-limits |
+/// creating | deleting | suspended | suspending | reactivating`).
+pub fn db_proxy_state_name(status: &str) -> String {
+    if status == DB_PROXY_STATUS_AVAILABLE {
+        return DB_PROXY_ACTIVE_STATE_NAME.to_string();
+    }
+    status.to_ascii_uppercase().replace('-', "_")
+}
+
+/// The message an `InvalidDBProxyStateFault` carries where an operation needs the proxy
+/// usable and the proxy is in another state — "The requested operation can't be performed
+/// while the proxy is in this state".
+///
+/// Amazon RDS words it as a statement about the proxy naming BOTH states: the one it is in
+/// and the one it has to reach for the call to be served, the latter as a list. The fixed
+/// text is `DB Proxy `, ` is in an unsupported state - `, `, needs to be in [ACTIVE]`; the
+/// variable parts are the `DBProxyName` the REQUEST carried and the proxy's current state
+/// ([`db_proxy_state_name`]), so a caller — or an operator reading a log — sees both what
+/// to wait for and what it is waiting on.
+///
+/// It lives here rather than in one handler because every proxy operation that needs the
+/// proxy usable answers the same one sentence, so none of them can drift from the others.
+pub fn db_proxy_unsupported_state_message(named: &str, status: &str) -> String {
+    format!(
+        "DB Proxy {named} is in an unsupported state - {}, needs to be in \
+         [{DB_PROXY_ACTIVE_STATE_NAME}]",
+        db_proxy_state_name(status)
+    )
+}
+
 /// Refuse an `Auth` entry carrying text this store will not hold.
 ///
 /// `UserAuthConfigList`'s published length: "len 0..200" (`smithy_query(query="shape",

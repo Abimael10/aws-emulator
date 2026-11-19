@@ -223,15 +223,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that is already applying a change can, as the modification of a DB instance in
         // the same status is: a further change is accepted while the last one goes into
         // force.
+        //
+        // The refusal reports both states the caller cares about — the one the proxy is in
+        // and the one it has to reach — in the words Amazon RDS puts them in
+        // (`crate::state::db_proxy_unsupported_state_message`).
         let current_status = proxy.status.clone();
         if current_status != crate::state::DB_PROXY_STATUS_AVAILABLE
             && current_status != crate::state::DB_PROXY_STATUS_MODIFYING
         {
             return Err(ModifyDBProxyErrorModeled::InvalidDBProxyStateFault(
                 InvalidDBProxyStateFault {
-                    message: Some(format!(
-                        "DB proxy {} is in state {current_status} and cannot be modified",
-                        input.db_proxy_name
+                    message: Some(crate::state::db_proxy_unsupported_state_message(
+                        &input.db_proxy_name,
+                        &current_status,
                     )),
                 },
             )

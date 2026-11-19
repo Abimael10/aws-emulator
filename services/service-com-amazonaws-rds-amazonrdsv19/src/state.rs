@@ -215,7 +215,8 @@ pub use custom_engine_versions::{
 };
 pub use db_proxies::{
     check_target_group_name, check_user_auth_config, db_proxy_already_exists_message,
-    db_proxy_not_found_message, default_connection_pool_config, merged_connection_pool_config,
+    db_proxy_not_found_message, db_proxy_state_name, db_proxy_unsupported_state_message,
+    default_connection_pool_config, merged_connection_pool_config,
     subnets_span_several_vpcs_message, unreadable_secret_description, user_auth_config_to_info,
     DbProxyRecord, DbProxyTargetGroupRecord,
     DbProxyTargetRecord, ProxyTargetKey, ProxyTargetRow, RegisteredDatabase,
@@ -223,6 +224,7 @@ pub use db_proxies::{
     DEFAULT_CONNECTION_BORROW_TIMEOUT, DEFAULT_DB_PROXY_TARGET_GROUP,
     DEFAULT_IDLE_CLIENT_TIMEOUT, DEFAULT_MAX_CONNECTIONS_PERCENT,
     DEFAULT_MAX_CONNECTIONS_PERCENT_SQLSERVER, DEFAULT_TARGET_GROUP_RENAME_MESSAGE,
+    DB_PROXY_ACTIVE_STATE_NAME,
     DB_PROXY_QUOTA_PER_REGION, DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING,
     DB_PROXY_STATUS_DELETING, DB_PROXY_STATUS_MODIFYING, DB_PROXY_TARGET_QUOTA_PER_PROXY,
     ENGINE_FAMILY_SQLSERVER, MAX_SESSION_PINNING_FILTERS,

@@ -19,9 +19,9 @@
 //! value outside what a member accepts — is refused and leaves the proxy exactly as it was.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING, DB_PROXY_STATUS_DELETING,
-    DB_PROXY_STATUS_MODIFYING, DEFAULT_AUTH_SCHEME_NONE, DEFAULT_IDLE_CLIENT_TIMEOUT,
-    MAX_FREE_FORM_LEN, MAX_USER_AUTH_CONFIGS,
+    db_proxy_unsupported_state_message, DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING,
+    DB_PROXY_STATUS_DELETING, DB_PROXY_STATUS_MODIFYING, DEFAULT_AUTH_SCHEME_NONE,
+    DEFAULT_IDLE_CLIENT_TIMEOUT, MAX_FREE_FORM_LEN, MAX_USER_AUTH_CONFIGS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -530,10 +530,16 @@ async fn a_modification_the_proxy_cannot_take_is_refused_and_changes_nothing() {
         400,
         "InvalidDBProxyStateFault",
     );
-    assert!(
-        creating.contains(DB_PROXY_STATUS_CREATING),
+    let expected = db_proxy_unsupported_state_message(
+        "emu-modproxy-creating",
+        DB_PROXY_STATUS_CREATING,
+    );
+    let message = text(&creating, "Message");
+    assert_eq!(
+        message, expected,
         "case \"a proxy that is still coming up\": expected the refusal to name the state \
-         the proxy is in, got {creating}"
+         the proxy is in and the one it must reach, {expected:?}, got {message:?} in \
+         {creating}"
     );
     wait_for_settle();
 
@@ -561,10 +567,16 @@ async fn a_modification_the_proxy_cannot_take_is_refused_and_changes_nothing() {
         400,
         "InvalidDBProxyStateFault",
     );
-    assert!(
-        deleting.contains(DB_PROXY_STATUS_DELETING),
+    let expected = db_proxy_unsupported_state_message(
+        "emu-modproxy-deleting",
+        DB_PROXY_STATUS_DELETING,
+    );
+    let message = text(&deleting, "Message");
+    assert_eq!(
+        message, expected,
         "case \"a proxy whose delete has been accepted\": expected the refusal to name the \
-         state the proxy is in, got {deleting}"
+         state the proxy is in and the one it must reach, {expected:?}, got {message:?} in \
+         {deleting}"
     );
 
     // A proxy of that name in another region is a proxy this one holds none of: RDS is

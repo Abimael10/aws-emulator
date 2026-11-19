@@ -420,8 +420,9 @@ struct ProxyFacts {
 ///
 /// A proxy whose DELETE has been accepted is on its way out of this service: there is
 /// nothing left for a registration to be made against, which is the state
-/// `InvalidDBProxyStateFault` reports. A proxy that is still coming up, or applying a
-/// modification, is NOT refused — it exists and keeps the registration, and the target it
+/// `InvalidDBProxyStateFault` reports, in the words Amazon RDS reports it with
+/// (`crate::state::db_proxy_unsupported_state_message`). A proxy that is still coming up,
+/// or applying a modification, is NOT refused — it exists and keeps the registration, and the target it
 /// makes reports its own health lifecycle ("`registering` > `unavailable` > `available`",
 /// `TargetHealth$State`) until the proxy is ready to pool its connections.
 fn require_registrable_proxy<'store>(
@@ -455,10 +456,9 @@ fn require_registrable_proxy<'store>(
     if proxy.is_deleting() {
         return Err(RegisterDBProxyTargetsErrorModeled::InvalidDBProxyStateFault(
             InvalidDBProxyStateFault {
-                message: Some(format!(
-                    "DB proxy {db_proxy_name} is in state {} and cannot take a target \
-                     registration",
-                    proxy.status
+                message: Some(crate::state::db_proxy_unsupported_state_message(
+                    db_proxy_name,
+                    &proxy.status,
                 )),
             },
         )

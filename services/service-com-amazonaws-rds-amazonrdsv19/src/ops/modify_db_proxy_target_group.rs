@@ -190,15 +190,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The group is created WITH the proxy and has no provisioning of its own, so it is
         // there to be modified as soon as the proxy record is — a proxy that is still
         // coming up already has its group. Only a proxy on its way out has a target group
-        // this service has nothing left to apply a change to.
+        // this service has nothing left to apply a change to, which is the state
+        // `InvalidDBProxyStateFault` reports, in the words Amazon RDS reports it with
+        // (`crate::state::db_proxy_unsupported_state_message`).
         if proxy.is_deleting() {
             return Err(
                 ModifyDBProxyTargetGroupErrorModeled::InvalidDBProxyStateFault(
                     InvalidDBProxyStateFault {
-                        message: Some(format!(
-                            "DB proxy {} is in state {} and its target group cannot be \
-                             modified",
-                            input.db_proxy_name, proxy.status
+                        message: Some(crate::state::db_proxy_unsupported_state_message(
+                            &input.db_proxy_name,
+                            &proxy.status,
                         )),
                     },
                 )

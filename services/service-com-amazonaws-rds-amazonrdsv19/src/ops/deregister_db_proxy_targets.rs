@@ -207,16 +207,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A proxy whose DELETE has been accepted is on its way out of this service, and
         // takes its target group with it: there is nothing left to deregister a target
-        // from, which is the state `InvalidDBProxyStateFault` reports. A proxy that is
-        // still coming up, or applying a modification, HAS its target group and serves the
-        // deregistration.
+        // from, which is the state `InvalidDBProxyStateFault` reports, in the words Amazon
+        // RDS reports it with (`crate::state::db_proxy_unsupported_state_message`). A proxy
+        // that is still coming up, or applying a modification, HAS its target group and
+        // serves the deregistration.
         if proxy.is_deleting() {
             return Err(
                 DeregisterDBProxyTargetsErrorModeled::InvalidDBProxyStateFault(
                     InvalidDBProxyStateFault {
-                        message: Some(format!(
-                            "DB proxy {} is in state {} and cannot have targets deregistered",
-                            input.db_proxy_name, proxy.status
+                        message: Some(crate::state::db_proxy_unsupported_state_message(
+                            &input.db_proxy_name,
+                            &proxy.status,
                         )),
                     },
                 )

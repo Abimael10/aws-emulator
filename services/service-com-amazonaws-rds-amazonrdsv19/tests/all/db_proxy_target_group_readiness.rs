@@ -14,8 +14,8 @@
 //! itself still owes; the modelled state fault is reserved for a proxy on its way out.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING, DB_PROXY_STATUS_DELETING,
-    DEFAULT_DB_PROXY_TARGET_GROUP, DEFAULT_MAX_CONNECTIONS_PERCENT,
+    db_proxy_unsupported_state_message, DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING,
+    DB_PROXY_STATUS_DELETING, DEFAULT_DB_PROXY_TARGET_GROUP, DEFAULT_MAX_CONNECTIONS_PERCENT,
     DEFAULT_MAX_CONNECTIONS_PERCENT_SQLSERVER,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -293,13 +293,16 @@ async fn a_proxy_on_its_way_out_has_a_target_group_no_modification_acts_on() {
         400,
         "InvalidDBProxyStateFault",
     );
-    for expected in ["emu-ready-leaving", DB_PROXY_STATUS_DELETING] {
-        assert!(
-            refusal.contains(expected),
-            "case \"the target group of a proxy on its way out\": expected the refusal to \
-             name {expected:?}, got {refusal}"
-        );
-    }
+    // The refusal names the proxy the request asked for and the state it is in, in the
+    // words Amazon RDS words that class with.
+    let expected =
+        db_proxy_unsupported_state_message("emu-ready-leaving", DB_PROXY_STATUS_DELETING);
+    let message = text(&refusal, "Message");
+    assert_eq!(
+        message, expected,
+        "case \"the target group of a proxy on its way out\": expected {expected:?}, got \
+         {message:?} in {refusal}"
+    );
     // The group of a proxy on its way out reports the state the proxy is leaving in: it
     // has no provisioning of its own, and it is going with the proxy.
     let reported = read_target_group(
