@@ -32,11 +32,16 @@
 //! ([`observe`]). That port is the group's effective health-check port — `HealthCheckPort`
 //! when it names one, and the port the target receives traffic on otherwise:
 //!
-//! * a registration whose workload declares the ports it LISTENS on
-//!   ([`super::ServedPorts`], what another emulated service's scheduler registered it with)
-//!   fails every check against a port that is not one of them: a workload that is running
-//!   answers nothing on a port it does not serve, which is what a health check pointed at
-//!   the wrong port finds;
+//! * a registration nothing behind it is LISTENING on that port for fails every check
+//!   against it: a workload that is running answers nothing on a port it does not serve,
+//!   which is what a health check pointed at the wrong port finds
+//!   ([`listens_on_health_check_port`]). The ports behind a registration are the ones this
+//!   emulator is told about — the ones the scheduler running the workload declared
+//!   ([`super::ServedPorts`]) and, for a registration naming an INSTANCE of this account, the
+//!   one the registration itself names ("the port on which the target is listening",
+//!   `TargetDescription$Port`, the target group's own port where the registration takes it)
+//!   beside the ones that instance's guest is listening on ([`guest_ports_behind`], the very
+//!   fact a `forward` to such a target is served from);
 //! * a registration the security groups governing it admit no connection to on that port from
 //!   the load balancer doing the checking fails every check too: a check that cannot arrive
 //!   is answered by nothing. Those groups are the ones the scheduler running the workload
@@ -51,7 +56,8 @@
 //! * otherwise, a registration another emulated service's SCHEDULER made for a workload it
 //!   runs stands for that workload, which is running here, so the check passes;
 //! * an `instance` target passes while EC2 — which owns instances — reports that instance
-//!   running, and fails for one it reports stopped or holds no longer;
+//!   running on a port something behind it is listening on, and fails for one it reports
+//!   stopped or holds no longer;
 //! * an `ip` target passes while some network interface of the account holds that address,
 //!   which is what makes the address one something in this VPC answers on, and fails for an
 //!   address no interface holds;
@@ -303,6 +309,17 @@ struct Checked {
     /// ([`super::health_check_firewall`]). `None` for a health check whose port no number
     /// names.
     health_check_port: Option<i32>,
+    /// The port the registration itself names the target as LISTENING on — "the port on
+    /// which the target is listening" (`TargetDescription$Port`), which is the target's own
+    /// port where it carries one and the target group's own port where the registration
+    /// takes it ([`super::TargetGroupRecord::health_check_port_for`] reads the same pair).
+    ///
+    /// Read beside the ports a guest of the account is listening on
+    /// ([`listens_on_health_check_port`]): a check connects to ONE port, so what decides
+    /// whether anything answers it is which ports are listened on behind the registration.
+    /// `None` for a registration neither it nor its group names a port for, which is a
+    /// registration nothing is reached at.
+    traffic_port: Option<i32>,
     /// The `GroupId` of every security group GOVERNING this registration's address, as the
     /// scheduler that runs the workload behind it declares them
     /// ([`super::GuardingGroups`]). Empty for a registration nothing declares them for,
@@ -667,6 +684,9 @@ fn checked_registration(
         // ports the workload behind it serves.
         serves_health_check_port: health_check_port.and_then(|port| target.serves(port)),
         health_check_port,
+        // Where the load balancer routes this registration's traffic, which is the port the
+        // registration names the target as listening on.
+        traffic_port: target.port.or(group.port),
         guarding_group_ids: GuardingGroups::clone(&target.guarded_by),
         source_group_ids,
         source_interface_ids,
@@ -679,8 +699,9 @@ fn checked_registration(
 /// ran and the registration's next one is therefore an interval away.
 ///
 /// The account's EC2 inventory is read ONCE for the whole pass — the VPCs it holds, the
-/// addresses its network interfaces hold and the instances it reports running — so the cost
-/// of a pass does not grow with the number of registrations times the size of the inventory.
+/// addresses its network interfaces hold, the instances it reports running and the ports
+/// those instances' guests are listening on — so the cost of a pass does not grow with the
+/// number of registrations times the size of the inventory.
 fn observe_all<Eng: Send + Sync + 'static>(
     engine: &Eng,
     checked: &[Checked],
@@ -691,6 +712,7 @@ fn observe_all<Eng: Send + Sync + 'static>(
     let inventory = ec2::service_state(engine);
     let held: Option<Inventory> = inventory.as_ref().map(|state| {
         let store = state.lock();
+        let guest_ports = guest_ports_behind(&store, checked);
         let mut interface_groups: HashMap<String, Vec<String>> = HashMap::new();
         let mut interface_addresses: HashMap<String, Vec<String>> = HashMap::new();
         let mut instance_groups: HashMap<String, Vec<String>> = HashMap::new();
@@ -739,6 +761,7 @@ fn observe_all<Eng: Send + Sync + 'static>(
             }
         }
         Inventory {
+            guest_ports,
             interface_networks,
             // The pairs of VPCs an ACTIVE peering joins, which is what makes a check from one
             // of them reach an address the other holds
@@ -810,11 +833,62 @@ fn observe_all<Eng: Send + Sync + 'static>(
         .collect()
 }
 
+/// The ports the GUEST of each instance registration of `checked` is LISTENING on, keyed by
+/// that registration's own target id.
+///
+/// The one reading of what an instance of this account RUNS that a health check takes: a check
+/// is a connection to a port of the workload behind the registration, and what answers on a
+/// port of such an instance is the server its own user data installed and started
+/// (`service_com_amazonaws_ec2_amazonec2::state::guest_services`) — the very fact a `forward`
+/// of a client's request to such a target is served from
+/// ([`crate::service::instance_target`]), so the checks and the data plane report one
+/// instance's ports one way.
+///
+/// Only a registration naming an INSTANCE is read: every other target type names no instance
+/// of this account ([`listens_on_health_check_port`] says what follows for each). A
+/// registration no instance of this account is reported RUNNING behind is ABSENT from the
+/// answer rather than present with no ports: nothing of what it runs is known, and nothing is
+/// failed on silence.
+///
+/// Bounded by the registrations of the pass ([`MAX_CHECKS_PER_PASS`]) rather than by the size
+/// of the inventory, and read under the guard the pass already holds.
+fn guest_ports_behind(
+    store: &ec2::ComAmazonawsEc2Amazonec2State,
+    checked: &[Checked],
+) -> HashMap<String, Vec<i32>> {
+    let mut listening: HashMap<String, Vec<i32>> = HashMap::new();
+    for target in checked {
+        if target.target_type != INSTANCE_TARGET_TYPE || listening.contains_key(&target.id) {
+            continue;
+        }
+        if !store
+            .instances
+            .get(&target.id)
+            .is_some_and(instance_is_running)
+        {
+            continue;
+        }
+        listening.insert(
+            target.id.clone(),
+            store.instance_guest_server_ports(&target.id),
+        );
+    }
+    listening
+}
+
 /// What the account's EC2 inventory holds that a health check reads: the VPCs of the
-/// account, the addresses its network interfaces hold, the instances it reports running, and
-/// the security groups governing what may reach those interfaces.
+/// account, the addresses its network interfaces hold, the instances it reports running, the
+/// ports the guests of those instances are listening on, and the security groups governing
+/// what may reach those interfaces.
 #[derive(Debug, Default)]
 struct Inventory {
+    /// The ports the GUEST behind each checked `instance` registration is listening on, keyed
+    /// by that registration's own target id ([`guest_ports_behind`]).
+    ///
+    /// A registration absent from this is one no running instance of this account is reported
+    /// behind, whose listening ports are therefore not known; one present with an empty list
+    /// is an instance that is up and running no server at all.
+    guest_ports: HashMap<String, Vec<i32>>,
     /// Every `VpcId` the inventory holds.
     vpcs: HashSet<String>,
     /// Every private IPv4 and IPv6 address a network interface of the account holds.
@@ -856,6 +930,13 @@ const INSTANCE_TARGET_TYPE: &str = "instance";
 const IP_TARGET_TYPE: &str = "ip";
 
 impl Inventory {
+    /// The ports the guest behind one registration is LISTENING on, as the account's EC2
+    /// inventory reports them — `None` for a registration no instance of this account is
+    /// reported up behind, whose ports are therefore not known.
+    fn guest_ports(&self, target: &Checked) -> Option<&[i32]> {
+        self.guest_ports.get(&target.id).map(Vec::as_slice)
+    }
+
     /// The security groups GOVERNING traffic to what one registration names, as the account's
     /// inventory reports them — `None` when the inventory reports none, which decides nothing.
     ///
@@ -901,12 +982,12 @@ impl Inventory {
 /// silence, which is how this service reads every other fact it does not own
 /// ([`super::network`]).
 fn observe(target: &Checked, held: Option<&Inventory>) -> Observation {
-    if target.serves_health_check_port == Some(false) {
-        // The check connects to the group's effective health-check port, and the workload
-        // behind this registration does not listen on it: nothing answers there, whatever
-        // else stands behind the registration. This is the one condition a check can
-        // observe about the PORT, and it is read before what stands behind the target,
-        // because a workload that is running answers nothing on a port it does not serve.
+    if !listens_on_health_check_port(target, held) {
+        // The check connects to the group's effective health-check port, and nothing behind
+        // this registration is listening on it: nothing answers there, whatever else stands
+        // behind the registration. This is the one condition a check can observe about the
+        // PORT, and it is read before what stands behind the target, because a workload that
+        // is running answers nothing on a port it does not serve.
         return Some(false);
     }
     if held.is_some_and(|held| health_check_is_blocked(target, held)) {
@@ -942,6 +1023,50 @@ fn observe(target: &Checked, held: Option<&Inventory>) -> Observation {
         // service does not read is one no check here observes anything about.
         _ => None,
     }
+}
+
+/// Whether the port one check CONNECTS to — the group's effective health-check port — is one
+/// something behind the registration is LISTENING on.
+///
+/// A health check is a connection to ONE port of the workload behind the registration, so it
+/// is answered only where something behind it is listening there, however healthy that
+/// workload itself is. The ports behind a registration are the ones this emulator is told
+/// about, and nothing else:
+///
+/// * the ports the SCHEDULER running the workload declared ([`super::ServedPorts`]), which
+///   are the whole answer for a registration carrying them — such a scheduler knows what its
+///   own workload listens on;
+/// * for a registration naming an INSTANCE of this account, the port the registration itself
+///   names — "the port on which the target is listening" (`TargetDescription$Port`), the
+///   target group's own port where the registration takes it, which is the port the load
+///   balancer routes its traffic to — and the ports the GUEST of that instance is listening
+///   on ([`guest_ports_behind`]), the servers its own user data started.
+///
+/// A port none of them names is a port nothing answers on, so every check of it fails and the
+/// registration reaches the `unhealthy` its group's own `UnhealthyThresholdCount` takes.
+/// `true` wherever the question is not decided, because nothing is failed on silence: a check
+/// whose port no number names, a registration naming no instance this account reports
+/// RUNNING — what such a registration stands for is decided by [`observe`] instead — and every
+/// registration naming an ADDRESS whose ports nothing declared, since what listens at an
+/// address is whatever holds it, including a workload another service runs and records its own
+/// server for (`::service_common::served_http_addresses`), which no port of this store is a
+/// statement about.
+fn listens_on_health_check_port(target: &Checked, held: Option<&Inventory>) -> bool {
+    if let Some(declared) = target.serves_health_check_port {
+        return declared;
+    }
+    if target.target_type != INSTANCE_TARGET_TYPE {
+        return true;
+    }
+    let Some(port) = target.health_check_port else {
+        return true;
+    };
+    // Only an instance this account reports running has its ports known at all: what it is
+    // listening on is what Amazon EC2 holds for it ([`guest_ports_behind`]).
+    let Some(guest_ports) = held.and_then(|held| held.guest_ports(target)) else {
+        return true;
+    };
+    target.traffic_port == Some(port) || guest_ports.contains(&port)
 }
 
 /// Whether the account's EC2 inventory says a check of this registration would have to leave
@@ -1557,6 +1682,123 @@ mod tests {
         }
     }
 
+    /// RULE: a check is answered only on a port something behind the registration is LISTENING
+    /// on — for an instance this account reports running, the port its registration names it at
+    /// and the ports its own guest runs a server on — so a check pointed anywhere else fails,
+    /// while a registration whose ports nothing holds is not failed on the port at all.
+    ///
+    /// The rows span the check reaching the port the registration names, a port only the guest
+    /// holds a server on, a port neither holds, an instance running no server at all, an
+    /// instance this account does not report running, and a registration naming an address
+    /// rather than an instance.
+    #[test]
+    fn a_check_is_answered_only_on_a_port_something_behind_the_registration_listens_on() {
+        let instance = "i-0123456789abcdef0".to_string();
+        let address = "10.0.1.7".to_string();
+        let vpc = "vpc-0123456789abcdef0".to_string();
+        // One row: the target type and id, the ports the guest of that instance is listening
+        // on (`None` for an instance this account does not report running), the port the checks
+        // connect to, and what one check observes.
+        struct PortRow {
+            case: &'static str,
+            target_type: &'static str,
+            id: String,
+            guest_ports: Option<Vec<i32>>,
+            health_check_port: i32,
+            expected: Observation,
+        }
+        let rows: [PortRow; 6] = [
+            PortRow {
+                case: "the checks go to the port the registration names the target at",
+                target_type: INSTANCE_TARGET_TYPE,
+                id: instance.clone(),
+                guest_ports: Some(Vec::new()),
+                health_check_port: 443,
+                expected: Some(true),
+            },
+            PortRow {
+                case: "the recorded configuration: a health-check port of its own that nothing \
+                       behind the instance listens on",
+                target_type: INSTANCE_TARGET_TYPE,
+                id: instance.clone(),
+                guest_ports: Some(Vec::new()),
+                health_check_port: 55_555,
+                expected: Some(false),
+            },
+            PortRow {
+                case: "a health-check port of its own the instance's guest runs a server on",
+                target_type: INSTANCE_TARGET_TYPE,
+                id: instance.clone(),
+                guest_ports: Some(vec![80, 8080]),
+                health_check_port: 8080,
+                expected: Some(true),
+            },
+            PortRow {
+                case: "a health-check port neither the registration nor the guest's servers \
+                       name",
+                target_type: INSTANCE_TARGET_TYPE,
+                id: instance.clone(),
+                guest_ports: Some(vec![80, 8080]),
+                health_check_port: 9000,
+                expected: Some(false),
+            },
+            PortRow {
+                case: "an instance this account does not report running, checked beside the \
+                       port its registration names",
+                target_type: INSTANCE_TARGET_TYPE,
+                id: instance.clone(),
+                guest_ports: None,
+                health_check_port: 55_555,
+                expected: Some(true),
+            },
+            PortRow {
+                case: "an address, whose ports nothing declared",
+                target_type: IP_TARGET_TYPE,
+                id: address.clone(),
+                guest_ports: None,
+                health_check_port: 55_555,
+                expected: Some(true),
+            },
+        ];
+        for row in &rows {
+            let held = Inventory {
+                vpcs: HashSet::from([vpc.clone()]),
+                addresses: HashSet::from([address.clone()]),
+                running: HashSet::from([instance.clone()]),
+                guest_ports: row
+                    .guest_ports
+                    .clone()
+                    .map(|ports| HashMap::from([(row.id.clone(), ports)]))
+                    .unwrap_or_default(),
+                ..Inventory::default()
+            };
+            let checked = Checked {
+                target_group_arn: "tg".to_string(),
+                key: (row.id.clone(), Some(443)),
+                target_type: row.target_type.to_string(),
+                vpc_id: Some(vpc.clone()),
+                id: row.id.clone(),
+                // A registration Auto Scaling made for an instance it launched: its scheduler
+                // declares no ports, so what the instance listens on is what Amazon EC2 holds.
+                scheduled: true,
+                serves_health_check_port: None,
+                health_check_port: Some(row.health_check_port),
+                traffic_port: Some(443),
+                guarding_group_ids: Vec::new().into(),
+                source_group_ids: Vec::new(),
+                source_interface_ids: Vec::new(),
+                source_groups_resolved: false,
+            };
+            let observed = observe(&checked, Some(&held));
+            assert_eq!(
+                observed, row.expected,
+                "case {:?}: a check of port {} against the guest ports {:?} must observe {:?}, \
+                 got {observed:?}",
+                row.case, row.health_check_port, row.guest_ports, row.expected
+            );
+        }
+    }
+
     /// RULE: what one check observes is whether the emulator holds something that stands
     /// behind the registration AND answers on the port the check connects to, and nothing
     /// at all where there is no inventory to read.
@@ -1649,6 +1891,9 @@ mod tests {
                 scheduled,
                 serves_health_check_port: serves,
                 health_check_port: Some(443),
+                // The port the registration names the target as listening on, which this
+                // table's checks connect to.
+                traffic_port: Some(443),
                 guarding_group_ids: Vec::new().into(),
                 source_group_ids: Vec::new(),
                 source_interface_ids: Vec::new(),
@@ -1771,6 +2016,7 @@ mod tests {
                     scheduled: true,
                     serves_health_check_port: Some(true),
                     health_check_port: Some(443),
+                    traffic_port: Some(443),
                     guarding_group_ids: declared.into(),
                     source_group_ids: vec![load_balancer_group.clone()],
                     source_interface_ids: vec![load_balancer_interface.clone()],
@@ -1863,6 +2109,7 @@ mod tests {
                     scheduled: false,
                     serves_health_check_port: None,
                     health_check_port: Some(443),
+                    traffic_port: Some(443),
                     guarding_group_ids: Vec::new().into(),
                     source_group_ids: vec![load_balancer_group.clone()],
                     source_interface_ids: vec![load_balancer_interface.clone()],

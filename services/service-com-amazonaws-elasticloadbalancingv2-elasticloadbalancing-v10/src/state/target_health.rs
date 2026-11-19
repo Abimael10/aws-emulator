@@ -33,8 +33,10 @@
 //! no sooner than the threshold times that interval: a registration is never declared
 //! unhealthy faster than the schedule asked for could have decided it. What one check observes
 //! is decided in [`super::host_counts`], against the effective health-check port and the ports
-//! the workload behind the registration serves ([`ServedPorts`]). A registration whose checks
-//! pass, and one no check observed anything about, keep the `healthy` the clock owes them.
+//! something behind the registration is listening on — the ones its scheduler declared
+//! ([`ServedPorts`]), and for an instance of this account the ones Amazon EC2 holds for it. A
+//! registration whose checks pass, and one no check observed anything about, keep the `healthy`
+//! the clock owes them.
 //!
 //! Every span is stored as the instant it comes due, never slept for; a read
 //! materialises what the clock already owes ([`TargetGroupRecord::settle_draining`]) and

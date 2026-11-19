@@ -788,10 +788,12 @@ pub fn reconcile<Eng: Send + Sync + 'static>(
                     port: None,
                     availability_zone: Some(registration.availability_zone.clone()),
                     workload: registration.workload.clone(),
-                    // An instance id names no workload whose listening ports this emulator
-                    // knows, and the security groups governing it are the ones its own
-                    // network interface reports — the same two unknowns a `RegisterTargets`
-                    // caller's instance target carries.
+                    // This service declares neither: what an Amazon EC2 instance is listening
+                    // on is what that service holds for it — the servers its own guest runs,
+                    // beside the port the registration names it at — and the security groups
+                    // governing it are the ones its own network interface reports, so both are
+                    // read off the instance where the check is performed, exactly as they are
+                    // for a `RegisterTargets` caller's instance target.
                     serves_ports: Vec::new().into(),
                     guarded_by: Vec::new().into(),
                 },
