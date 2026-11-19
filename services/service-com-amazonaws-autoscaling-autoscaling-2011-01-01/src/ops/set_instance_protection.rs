@@ -8,8 +8,10 @@
 //!
 //! The instance ids are resolved AGAINST THAT GROUP: the ids this call accepts are
 //! exactly the ids the group reports, so an id of another group, or of no group at
-//! all, is refused and nothing is written. The request is one unit of work, so every
-//! id is checked before the first flag moves.
+//! all, is refused and nothing is written. A name the account holds no group for is
+//! refused ahead of them all — there is no membership to resolve an id against — and
+//! that refusal names the group it was asked about. The request is one unit of work,
+//! so every id is checked before the first flag moves.
 //!
 //! ## Shape of an operation
 //!
@@ -178,12 +180,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
 
-        // A name no group answers to is refused with the wording this service's
-        // group-scoped WRITE paths answer with: the detail field after the dash is
-        // left unfilled, so no part of the request appears in the message.
+        // A name no group answers to is refused for the GROUP, and ahead of every
+        // instance id the request carries: an id is resolved against the membership of
+        // the group the request NAMES, so a name the account holds no group for has no
+        // membership to resolve it against at all. The detail this operation reports
+        // after the fixed text names the group it was asked about, so the caller is told
+        // which name resolved to nothing.
         let Some(group) = state.groups.get_mut(&name) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                crate::state::absent_group_message(&name),
             ));
         };
 

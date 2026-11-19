@@ -10,8 +10,9 @@
 //! belongs to the group writes the setting on exactly those instances and leaves the
 //! rest as they were. Past the operation's own documented per-call bound on instance ids
 //! the call is refused `ValidationError` too — how many ids ONE request carries is a
-//! fact of the request's shape — and a group the account does not hold is refused like
-//! every other group-scoped write of this service.
+//! fact of the request's shape — and a name the account holds no group for is refused
+//! for the GROUP, ahead of every instance id the request carries, in the sentence naming
+//! the group it was asked about.
 //!
 //! The tables below span what that rule generalises over — how many instances the group
 //! holds, how many the request names, where in the request a foreign id sits, whether
@@ -163,6 +164,16 @@ pub(crate) async fn set_protection(
 /// the group name from the request.
 pub(crate) fn not_in_group_message(instance_id: &str, group_name: &str) -> String {
     format!("The instance {instance_id} is not part of Auto Scaling group {group_name}.")
+}
+
+/// The whole message `SetInstanceProtection` refuses a name the account holds no group
+/// for with: the absent-group prefix this service opens every such refusal with, and the
+/// detail form this operation serves — the group named as the resource, unquoted.
+///
+/// `pub(crate)` so the sibling suite over this operation's group resolution asserts the
+/// same sentence rather than a second copy of it.
+pub(crate) fn absent_group_message(name: &str) -> String {
+    format!("AutoScalingGroup name not found - AutoScalingGroup {name} not found")
 }
 
 /// One accepted row: the case, how many instances the group holds, whether every
@@ -492,9 +503,9 @@ async fn a_call_past_the_documented_per_call_maximum_is_refused() {
     );
 }
 
-/// A call naming a group the account does not hold is refused like every other
-/// group-scoped WRITE of this service: the fixed sentence whose detail field is
-/// unfilled, so no part of the request appears in it.
+/// A call naming a group the account does not hold is refused for the GROUP, ahead of
+/// every instance id it carries: the refusal names the group it was asked about rather
+/// than leaving its detail field unfilled.
 #[tokio::test]
 async fn a_call_against_an_absent_group_is_refused() {
     let router = router_with(new_engine());
@@ -510,9 +521,10 @@ async fn a_call_against_an_absent_group_is_refused() {
             code, "ValidationError",
             "case {absent:?}: expected the ValidationError code, got {code:?} {message:?}"
         );
+        let expected = absent_group_message(absent);
         assert_eq!(
-            message, "AutoScalingGroup name not found - null",
-            "case {absent:?}: expected the no-detail absent-group sentence, got {message:?}"
+            message, expected,
+            "case {absent:?}: expected the absent-group sentence {expected:?}, got {message:?}"
         );
     }
 
