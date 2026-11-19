@@ -1321,14 +1321,26 @@ pub fn store_unavailable<E>() -> crate::scaffolded::Scaffolded<E> {
     })
 }
 
-/// How many characters follow the leading letter of a generated CloudFront token: a
-/// distribution id, an invalidation id and a version token (`ETag`) are all a letter
-/// followed by 13 uppercase alphanumerics (`E`+13 for a distribution and for the version
-/// token, `I`+13 for an invalidation), the shape CloudFront's own values take.
+/// How many characters follow the leading letter of a generated CloudFront ENTITY token: a
+/// distribution id and a version token (`ETag`) are both a letter followed by 13 uppercase
+/// alphanumerics (`E`+13), the shape CloudFront's own values take. An invalidation id is
+/// drawn from the same alphabet at its OWN width ([`INVALIDATION_ID_BODY_LEN`]).
 ///
 /// 13 is also what makes the rendering injective on `u64` (36^13 > 2^64), so every
 /// character of a minted token carries mint state rather than padding.
 const ID_BODY_LEN: usize = 13;
+
+/// How many characters of [`TOKEN_ALPHABET`] follow the leading `I` of an invalidation id:
+/// 25, so the whole identifier is 26 characters wide — the width CloudFront's own
+/// invalidation ids are observed to take (`IBM5B2ULLUSKHZAOLO538EHQTE`), and wider than the
+/// `E`+13 entity-token space ([`ID_BODY_LEN`]), which is what keeps an invalidation id out
+/// of the distribution-id space a client may validate against.
+///
+/// `Invalidation$Id` is "The identifier for the invalidation request"
+/// (`smithy_query(query="shape",shape="Invalidation")`); the one example its documentation
+/// carries is as wide as the example it gives for a distribution id, so it is the SERVED
+/// identifiers, not that example, that say how wide each of the two really is.
+pub const INVALIDATION_ID_BODY_LEN: usize = 25;
 
 /// The alphabet CloudFront draws a distribution id, an invalidation id and a version
 /// token from: decimal digits and uppercase ASCII letters.
@@ -1346,6 +1358,10 @@ const OPAQUE_ID_ALPHABET: &[u8; 62] =
 /// identifier this service mints: 27, the width of the observed form
 /// (`dt_3JO1OQa51Jb3BZh7XQh6pbvF3Wa`).
 pub const OPAQUE_ID_BODY_LEN: usize = 27;
+
+/// How many digits of [`TOKEN_ALPHABET`] one draw of the mint renders: 36^12 < 2^64 <
+/// 36^13, so twelve is every base36 digit a single `u64` draw carries.
+const TOKEN_DIGITS_PER_DRAW: usize = 12;
 
 /// How many base62 digits one draw of the mint renders: 62^10 < 2^64 < 62^11, so ten is
 /// every digit a single `u64` draw carries.

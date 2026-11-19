@@ -100,7 +100,7 @@ async fn create_batches(
             .to_string();
         assert!(
             is_invalidation_id(&id),
-            "case {case}: expected an `I`+13 invalidation id for batch {index}, got {id:?}"
+            "case {case}: expected an `I`+25 invalidation id for batch {index}, got {id:?}"
         );
         ids.push(id);
         // Distinct creation instants, so "most recent first" is an order each case can

@@ -842,11 +842,13 @@ pub(crate) fn is_distribution_id(value: &str) -> bool {
     }
 }
 
-/// An invalidation id's shape: `I` followed by 13 uppercase alphanumerics.
+/// An invalidation id's shape: `I` followed by 25 uppercase alphanumerics — the 26-character
+/// token CloudFront identifies an invalidation request by, written out here rather than read
+/// off the crate's own constant so a wrong constant cannot make this test pass.
 pub(crate) fn is_invalidation_id(value: &str) -> bool {
     match value.strip_prefix('I') {
         Some(body) => {
-            body.len() == 13
+            body.len() == 25
                 && body
                     .chars()
                     .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
@@ -1661,7 +1663,7 @@ async fn invalidations_are_stored_under_their_distribution() {
             .to_string();
         assert!(
             is_invalidation_id(&invalidation_id),
-            "case {case}: expected an `I`+13 invalidation id, got {invalidation_id:?}"
+            "case {case}: expected an `I`+25 invalidation id, got {invalidation_id:?}"
         );
         assert!(
             seen.insert(invalidation_id.clone()),

@@ -171,7 +171,7 @@ async fn create_batches(
         let id = answer.root().text_at("Id").unwrap_or_default().to_string();
         assert!(
             is_invalidation_id(&id),
-            "case {case}: expected an `I`+13 invalidation id for batch {index}, got {id:?}"
+            "case {case}: expected an `I`+25 invalidation id for batch {index}, got {id:?}"
         );
         ids.push(id);
         // Distinct creation instants, so "most recent first" is an order each case can
@@ -259,7 +259,7 @@ async fn a_tenant_invalidation_is_persisted_and_read_back() {
             let id = answer.text_at("Id").unwrap_or_default().to_string();
             assert!(
                 is_invalidation_id(&id),
-                "case {case}/{index}: expected an `I`+13 invalidation id, got {id:?}"
+                "case {case}/{index}: expected an `I`+25 invalidation id, got {id:?}"
             );
             // "The location for the invalidation": the URI the tenant's invalidation is
             // addressed by.

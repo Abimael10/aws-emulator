@@ -84,3 +84,42 @@ None of the six carried a stub_path or an owned_by owner.
 4. cloudfront-connection-function-errors#setup#1 (CreateConnectionFunction) - a Location header is emitted that the recording does not have, on cloudfront.amazonaws.com.
 5. cfval-origin-oai-and-oac-both-set#task#4 then #task#5 (CreateDistribution, GetDistribution) - S3OriginConfig has no OriginReadTimeout member.
 6. cloudfront-distribution-tenant-lifecycle#task#4 (ListDistributionTenants) - compare the summary ETag with the ETag the tenant's own Get/Create returned in the same fixture; they differ.
+
+## Resolution
+
+Causes 1 and 2 FIXED (the invalidation-id form; their URIs were already rooted at the
+endpoint the request reached), cause 3 FIXED, causes 4 and 5 FIXED (all three already
+implemented in the current code base and pinned by suites), cause 6 DECLINED as a per-run
+value and pinned by a new suite instead.
+
+- Causes 1 and 2 FIXED: an identifier this service mints takes the width and alphabet
+  CloudFront mints for THAT resource kind, every character of it drawn from mint state. An
+  invalidation id was being drawn at the width of the `E`+13 entity-token space a
+  distribution id and a version token come from, so it collided with that space; it is now
+  the 26-character `I`-prefixed uppercase alphanumeric token CloudFront's recorded
+  invalidation ids take, minted once for both surfaces that create an invalidation
+  (`state::store::mint_invalidation_id`, reached by `allocate_invalidation_id` and
+  `allocate_tenant_invalidation_id`). A width wider than one draw of the mint renders is
+  drawn from as many draws as it needs, through the rendering the opaque namespace-prefixed
+  ids already used. The announced URI's authority is already the endpoint the request
+  reached (`state::announced_url`), covered by `tests/all/announced_location_uri.rs`; the new
+  `tests/all/minted_invalidation_identifier.rs` pins the id's form, its distinctness, its
+  absence from the distribution-id space, the `Location` it is announced in and the read it
+  answers to, on both surfaces.
+  The replay step's residual difference is the minted token itself: an invalidation id is a
+  per-run, server-generated value, and reproducing one recording's token is not a
+  requirement.
+- Cause 3 FIXED (already implemented): `CreateConnectionFunction` roots its `Location` at the
+  endpoint the request reached, like every other create on this surface; its replay key
+  reports fixed.
+- Causes 4 and 5 FIXED (already implemented): `S3OriginConfig$OriginReadTimeout` is resolved
+  into the stored configuration (`state::configuration`), so the create and the readback both
+  report it, and a distribution's `DomainName` is the address its own edge listener answers
+  at (`tests/all/published_address_resolves_to_this_service.rs`).
+- Cause 6 DECLINED: a version token is a per-run, server-generated value. The summary a
+  listing reports already carries the tenant's own current version — the token its create and
+  its read report in their `ETag` header — so a client can take it from the listing and
+  modify the tenant with it; the new `tests/all/tenant_listing_version_token.rs` pins that
+  across the create, an `UpdateDistributionTenant` and an
+  `AssociateDistributionTenantWebACL`, including the list-then-modify path and the refusal of
+  the superseded token.

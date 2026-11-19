@@ -2118,18 +2118,44 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// carries mint state rather than padding; the allocator that prefixes it checks the
     /// candidate against its own store, which is what makes the id it hands out unique.
     pub(super) fn mint_opaque_id_body(&mut self) -> String {
-        let mut body = String::with_capacity(OPAQUE_ID_BODY_LEN);
+        self.mint_body(
+            OPAQUE_ID_BODY_LEN,
+            OPAQUE_ID_ALPHABET,
+            OPAQUE_ID_DIGITS_PER_DRAW,
+        )
+    }
+
+    /// A fresh token body of `len` characters of [`TOKEN_ALPHABET`] — the uppercase
+    /// alphanumeric alphabet CloudFront's own entity tokens are written in — for a width
+    /// that takes more mint state than a single draw renders.
+    ///
+    /// [`Self::mint`] renders ONE draw, so it is the body of a token up to
+    /// [`TOKEN_DIGITS_PER_DRAW`] characters wide; a wider one is drawn from as many draws as
+    /// it needs, so every character carries mint state rather than padding.
+    pub(super) fn mint_token_body(&mut self, len: usize) -> String {
+        self.mint_body(len, TOKEN_ALPHABET, TOKEN_DIGITS_PER_DRAW)
+    }
+
+    /// `len` characters of `alphabet`, rendered from as many draws of the mint as the width
+    /// needs: `digits_per_draw` digits come off each draw, which is how many of them a
+    /// single `u64` carries in that base.
+    ///
+    /// ONE rendering for every width and alphabet this service mints a body in, so no two of
+    /// them draw from the mint by different rules.
+    fn mint_body(&mut self, len: usize, alphabet: &[u8], digits_per_draw: usize) -> String {
+        let base = alphabet.len() as u64;
+        let mut body = String::with_capacity(len);
         let mut rest = 0u64;
         let mut digits_left = 0usize;
-        while body.len() < OPAQUE_ID_BODY_LEN {
+        while body.len() < len {
             if digits_left == 0 {
                 rest = self.mint_u64();
-                digits_left = OPAQUE_ID_DIGITS_PER_DRAW;
+                digits_left = digits_per_draw;
             }
-            let digit = (rest % 62) as usize;
-            rest /= 62;
+            let digit = (rest % base) as usize;
+            rest /= base;
             digits_left -= 1;
-            body.push(char::from(OPAQUE_ID_ALPHABET[digit]));
+            body.push(char::from(alphabet[digit]));
         }
         body
     }
@@ -2179,9 +2205,14 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     }
 
     /// Allocate an invalidation id no invalidation of the named distribution tenant holds.
+    ///
+    /// The same form every invalidation id this service mints takes
+    /// ([`Self::allocate_invalidation_id`]): an invalidation of a tenant is addressed under
+    /// the tenant, but it is the same kind of resource and CloudFront identifies it the same
+    /// way.
     pub fn allocate_tenant_invalidation_id(&mut self, tenant_id: &str) -> String {
         loop {
-            let candidate = format!("I{}", self.mint(ID_BODY_LEN));
+            let candidate = self.mint_invalidation_id();
             let taken = self
                 .distribution_tenants
                 .get(tenant_id)
@@ -2195,7 +2226,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// Allocate an invalidation id no invalidation of the named distribution holds.
     pub fn allocate_invalidation_id(&mut self, distribution_id: &str) -> String {
         loop {
-            let candidate = format!("I{}", self.mint(ID_BODY_LEN));
+            let candidate = self.mint_invalidation_id();
             let taken = self
                 .distributions
                 .get(distribution_id)
@@ -2204,6 +2235,18 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
                 break candidate;
             }
         }
+    }
+
+    /// One candidate invalidation id from the mint: `I` followed by
+    /// [`INVALIDATION_ID_BODY_LEN`] characters of the uppercase alphanumeric token alphabet,
+    /// the form CloudFront's own invalidation ids take.
+    ///
+    /// ONE form for every surface that creates an invalidation, and wider than the `E`+13
+    /// entity-token space, so an invalidation id can never collide with a distribution id or
+    /// a version token; the allocator that calls this is what makes the id unique within the
+    /// resource it is created under.
+    fn mint_invalidation_id(&mut self) -> String {
+        format!("I{}", self.mint_token_body(INVALIDATION_ID_BODY_LEN))
     }
 
     /// Mint the version token a mutation hands back. Every call yields a fresh one, so

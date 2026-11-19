@@ -176,7 +176,7 @@ async fn a_tenant_batch_whose_quantity_agrees_is_accepted_and_stored_whole() {
         let id = answer.text_at("Id").unwrap_or_default().to_string();
         assert!(
             is_invalidation_id(&id),
-            "case {case}: expected an `I`+13 invalidation id, got {id:?}"
+            "case {case}: expected an `I`+25 invalidation id, got {id:?}"
         );
         let location = created.header("location");
         assert!(
