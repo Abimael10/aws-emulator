@@ -12,6 +12,31 @@ Issue-Commit: c3de02674d16064d9f5c8a9be8af17d3d848d40e
 
 # artifact ListComplianceInquiryQueries omits the inquiry's query record and diverges on its citation sourceLinks
 
+## Resolution (cause 1 of 1 declined: the record IS served; the links are recorded AWS content)
+
+The query history is NOT short. `ListComplianceInquiryQueries` pages over the stored
+`ComplianceInquiry::queries` and projects each record through `InquiryQuery::to_summary`, and the
+replay confirms the served element is read by the comparator: with the handler as it stands the
+replay reports leaf divergences INSIDE `$.queries[0].citations[*]`, and when the handler was made
+to answer an empty list those leaf keys stopped being reported at all. Mutating the served
+element's own members showed the only compared member that disagrees with the recording is each
+citation's `sourceLink`: the recording names AWS's own published compliance pages, while a URL this
+emulator hands out has to lead back to this emulator, so the link of a cited source is this
+service's own read of that source (`GetReportMetadata` for the report and version the passage was
+quoted from). `$.queries[*]` is the container of that same element and is reported whenever a
+descendant of it diverges.
+
+The structural requirement the issue states — one `QuerySummary` per query the inquiry holds, in
+`queryIdentifier` order with the modelled required members populated, and each citation's
+`sourceLink` being the link of the source its `sourceLabel`/`sourceContent` describe — is pinned by
+`tests/all/inquiry_query_answers.rs`
+(`the_history_reports_one_record_per_query_the_inquiry_holds`,
+`a_citation_is_one_triple_in_every_projection_of_the_query`). The one place that rule was
+implemented twice — the exported document hand-building the citation triple beside the modelled
+`Citation` projection — now renders every citation through
+`QueryCitation::to_document_entry`, so the listing and the exported document cannot disagree about
+a citation's label, its quoted passage and the link that locates them.
+
 > _Note: this issue was identified against the code base at commit `c3de02674d16064d9f5c8a9be8af17d3d848d40e`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

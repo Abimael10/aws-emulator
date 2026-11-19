@@ -135,6 +135,22 @@ impl QueryCitation {
             source_link: Some(self.source_link(host)),
         }
     }
+
+    /// This source as the EXPORTED document reports it — the same triple the modelled
+    /// `Citation` carries ([`Self::to_citation`]), rendered in the document's own JSON.
+    ///
+    /// Built from that one projection rather than beside it, so the label, the quoted
+    /// passage and the link that locates them are emitted in ONE place: the query listing
+    /// and the exported document cannot disagree about a citation, and a link can never be
+    /// paired with another source's passage.
+    pub fn to_document_entry(&self, host: &str) -> ::serde_json::Value {
+        let citation = self.to_citation(host);
+        ::serde_json::json!({
+            "sourceLabel": citation.source_label,
+            "sourceContent": citation.source_content,
+            "sourceLink": citation.source_link,
+        })
+    }
 }
 
 /// What the service produced for one query: the response, and the sources it was drawn

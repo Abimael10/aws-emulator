@@ -1358,18 +1358,17 @@ impl ComplianceInquiry {
                 if include_citations {
                     // "When true, include citations in the exported document." A citation
                     // cites the source the query's response was drawn from, so the sources
-                    // reported here are the ones the stored answer holds — and a query
+                    // reported here are the ones the stored answer holds — each rendered
+                    // through the ONE citation projection
+                    // ([`QueryCitation::to_document_entry`]), so the triple the document
+                    // reports is the triple the query listing reports — and a query
                     // reporting no answer yet contributes an EMPTY list rather than
                     // references nothing read.
                     entry["citations"] = ::serde_json::json!(answer
                         .map(|answer| answer
                             .citations
                             .iter()
-                            .map(|citation| ::serde_json::json!({
-                                "sourceLabel": citation.source_label,
-                                "sourceContent": citation.source_content,
-                                "sourceLink": citation.source_link(host),
-                            }))
+                            .map(|citation| citation.to_document_entry(host))
                             .collect::<Vec<::serde_json::Value>>())
                         .unwrap_or_default());
                 }

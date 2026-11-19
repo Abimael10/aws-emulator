@@ -21,10 +21,23 @@
 //!   report stays reachable only the way every other caller reaches it, by accepting the
 //!   term governing it.
 //!
+//! Two further rules about the RECORD the query history serves are pinned at the end of
+//! this suite:
+//!
+//! * the history serves ONE `QuerySummary` per query the inquiry holds, in the service's
+//!   own order (ascending `queryIdentifier` from 1), with every member the model requires
+//!   populated — and the whole collection is enumerable whatever page size a caller walks
+//!   it at, so no page under-reports it;
+//! * a citation is ONE consistent triple: its `sourceLink` locates exactly the source its
+//!   `sourceLabel` names and its `sourceContent` quotes, and every projection of that
+//!   citation — the query listing and the exported document — reports the same triple.
+//!
 //! The rows differ along what those rules generalise over: the TERMS the query names (a
 //! series, a report name, prose from a published description, one term, several, none at
 //! all, and terms no catalog document carries) and the FORM of the submission (a text
-//! query, and an uploaded document whose section labels carry the terms).
+//! query, and an uploaded document whose section labels carry the terms), as well as how
+//! many queries one inquiry holds (one, two and three) and the page size the history is
+//! walked at.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -484,5 +497,418 @@ async fn a_citation_links_to_the_source_its_passage_was_read_from() {
              passage came from, got {:?}",
             followed.body
         );
+    }
+}
+
+/// How long a poll loop waits for the transition the CLOCK owes an inquiry before giving
+/// up. Deliberately generous: the span itself is not what any case below is about, and a
+/// loaded host reaches the due instant later than an idle one.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one turn of a poll loop rests before looking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// `QueryStatus`'s values — the closed enum `QuerySummary$status` reports
+/// (`smithy_query(query="shape",shape="QueryStatus")`).
+const QUERY_STATUSES: &[&str] = &["PROCESSING", "COMPLETED", "FAILED"];
+
+/// `QueryStatusMessage`'s values — the closed enum `QuerySummary$statusMessage` reports
+/// (`smithy_query(query="shape",shape="QueryStatusMessage")`).
+const QUERY_STATUS_MESSAGES: &[&str] = &[
+    "Query processing is complete.",
+    "Query processing is in-progress.",
+    "An internal error occurred while processing the query. Try again at a later time.",
+    "Query is pending human review.",
+    "Query contains restricted or unsupported content.",
+];
+
+/// The most queries one submission can name, so a page walk below is bounded: an uploaded
+/// document names at most 30 sections (`InquiryFileContent$fileSections` is
+/// `@length(min: 0, max: 30)`) and a text submission is one query.
+const QUERIES_PER_INQUIRY_CEILING: usize = 30;
+
+/// The queries one inquiry holds once the clock has released their answers.
+///
+/// Polled for the CONDITION — no query left in `PROCESSING` — rather than waited out, so
+/// the suite asserts on the transition and not on how fast the host runs.
+async fn settled_queries(router: &MultiServiceRouter, case: &str, inquiry_id: &str) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let queries = list_queries(router, inquiry_id).await;
+        let settled = !queries.is_empty()
+            && queries
+                .iter()
+                .all(|query| query["status"].as_str() != Some("PROCESSING"));
+        if settled {
+            return queries;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the inquiry's queries must leave PROCESSING once their \
+             processing is due, got {queries:?}"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Every query ONE whole walk of the history reported at `page_size`, in the order the
+/// pages reported them.
+///
+/// Asserts only what makes the walk a walk — every page is served, a page holds at most
+/// `maxResults` records, and the walk terminates — so each case's own rule is asserted
+/// over what this hands back.
+async fn walk_queries(
+    router: &MultiServiceRouter,
+    case: &str,
+    inquiry_id: &str,
+    page_size: i32,
+) -> Vec<Value> {
+    let mut walked: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut page = 0usize;
+    loop {
+        page += 1;
+        assert!(
+            page <= QUERIES_PER_INQUIRY_CEILING + 1,
+            "case {case:?}: a walk at maxResults={page_size} must terminate, got {page} pages"
+        );
+        let mut uri = format!(
+            "/v1/compliance-inquiry/listQueries?complianceInquiryId={inquiry_id}\
+             &maxResults={page_size}"
+        );
+        if let Some(value) = token.as_deref() {
+            uri.push_str(&format!("&nextToken={value}"));
+        }
+        let answer = send(router, "GET", &uri, Bytes::new(), true).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: page {page} at maxResults={page_size} must be served, got {} with \
+             {:?}",
+            answer.status, answer.body
+        );
+        let records = answer.body["queries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            i32::try_from(records.len()).unwrap_or(i32::MAX) <= page_size,
+            "case {case:?}: page {page} must be cut at maxResults={page_size}, got {} records",
+            records.len()
+        );
+        walked.extend(records);
+        match answer.body["nextToken"].as_str() {
+            None => break,
+            Some(next) => token = Some(next.to_string()),
+        }
+    }
+    walked
+}
+
+/// The exported document of one inquiry, citations included, fetched from the URL the
+/// export announced exactly as a client fetches it: the path that URL names, with no
+/// credential at all.
+async fn exported_document(router: &MultiServiceRouter, case: &str, inquiry_id: &str) -> Value {
+    let body = json!({ "complianceInquiryId": inquiry_id, "includeCitations": true });
+    let exported = send(
+        router,
+        "POST",
+        "/v1/compliance-inquiry/export",
+        Bytes::from(body.to_string()),
+        true,
+    )
+    .await;
+    assert_eq!(
+        exported.status, 200,
+        "case {case:?}: the export must succeed, got {} with {:?}",
+        exported.status, exported.body
+    );
+    let url = exported.body["documentPresignedUrl"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the export must announce a document URL, got {:?}",
+                exported.body
+            )
+        })
+        .to_string();
+    let fetched = send(router, "GET", &fetchable(&url), Bytes::new(), false).await;
+    assert_eq!(
+        fetched.status, 200,
+        "case {case:?}: the announced URL must serve the exported document, got {} with {:?}",
+        fetched.status, fetched.body
+    );
+    fetched.body
+}
+
+/// Assert one `createdAt` carries the wire form its target declares — `TimestampAttribute`
+/// is `@timestampFormat date-time`, so an RFC 3339 STRING and never restJson1's default
+/// epoch-seconds number.
+fn assert_date_time(case: &str, position: usize, value: &Value) {
+    assert!(
+        !value.is_number(),
+        "case {case:?}: query {position} must report createdAt as an RFC 3339 string, got \
+         {value:?}"
+    );
+    let text = value.as_str().unwrap_or_else(|| {
+        panic!("case {case:?}: query {position} must report createdAt, got {value:?}")
+    });
+    assert!(
+        text.contains('T') && text.ends_with('Z'),
+        "case {case:?}: query {position} must report createdAt as a UTC date-time, got {text:?}"
+    );
+}
+
+/// One submission, and the query records the inquiry it creates must hold.
+struct Record {
+    label: &'static str,
+    body: Value,
+    /// The text each `QuerySummary` must report, in `queryIdentifier` order: a text
+    /// submission submits the query it carried, and an uploaded document is processed
+    /// section by section ("List of file sections/sheets to process"), one query each.
+    reported: Vec<&'static str>,
+}
+
+/// The submissions the query-history rule is asserted over. The rows differ along the FORM
+/// of the submission, how many queries it submits (one, two, three) and whether the
+/// catalog holds anything bearing on them — none of which changes that every query the
+/// inquiry holds is reported.
+fn records() -> Vec<Record> {
+    vec![
+        Record {
+            label: "a text query the catalog answers",
+            body: text_body("Certification", "Which ISO 27001 certification applies?"),
+            reported: vec!["Which ISO 27001 certification applies?"],
+        },
+        Record {
+            label: "a text query the catalog holds nothing bearing on",
+            body: text_body("Unknown", "zzqqxx wibblewobble nonexistentcomplianceterm"),
+            reported: vec!["zzqqxx wibblewobble nonexistentcomplianceterm"],
+        },
+        Record {
+            label: "an uploaded document naming one section",
+            body: file_body("One section", &["SOC 2 Type 2 controls"]),
+            reported: vec!["SOC 2 Type 2 controls"],
+        },
+        Record {
+            label: "an uploaded document naming two sections",
+            body: file_body("Two sections", &["ISO 27001 scope", "zzqqxx wibblewobble"]),
+            reported: vec!["ISO 27001 scope", "zzqqxx wibblewobble"],
+        },
+        Record {
+            label: "an uploaded document naming three sections",
+            body: file_body(
+                "Three sections",
+                &["PCI DSS cardholder data", "FedRAMP Moderate boundary", "Outposts"],
+            ),
+            reported: vec![
+                "PCI DSS cardholder data",
+                "FedRAMP Moderate boundary",
+                "Outposts",
+            ],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn the_history_reports_one_record_per_query_the_inquiry_holds() {
+    let router = emulator();
+
+    for case in records() {
+        let label = case.label;
+        let id = create(&router, &case.body).await;
+        let queries = settled_queries(&router, label, &id).await;
+
+        assert_eq!(
+            queries.len(),
+            case.reported.len(),
+            "case {label:?}: the history must report one record per query the inquiry holds, \
+             expected {} records, got {queries:?}",
+            case.reported.len()
+        );
+
+        for (position, expected_query) in case.reported.iter().enumerate() {
+            let query = &queries[position];
+            // The service's own order: "Sequential identifier of the query within the
+            // inquiry", 1-based and contiguous, which is also the order the records arrive
+            // in.
+            assert_eq!(
+                query["queryIdentifier"].as_i64(),
+                Some(position as i64 + 1),
+                "case {label:?}: query {position} must report its sequential identifier, got \
+                 {query:?}"
+            );
+            assert_eq!(
+                query["query"].as_str(),
+                Some(*expected_query),
+                "case {label:?}: query {position} must report the query text it was submitted \
+                 as, got {query:?}"
+            );
+            let text = query["query"].as_str().unwrap_or_default();
+            assert!(
+                !text.is_empty() && text.chars().count() <= LONG_STRING_MAX
+                    && !text.contains(['<', '>']),
+                "case {label:?}: query {position} must report a query inside \
+                 LongStringAttribute's bounds, got {text:?}"
+            );
+            let status = query["status"].as_str().unwrap_or_default();
+            assert!(
+                QUERY_STATUSES.contains(&status),
+                "case {label:?}: query {position} must report one of QueryStatus's values \
+                 {QUERY_STATUSES:?}, got {status:?}"
+            );
+            assert_ne!(
+                status, "PROCESSING",
+                "case {label:?}: query {position} must have left PROCESSING once its \
+                 processing was due, got {query:?}"
+            );
+            let message = query["statusMessage"].as_str().unwrap_or_default();
+            assert!(
+                QUERY_STATUS_MESSAGES.contains(&message),
+                "case {label:?}: query {position} must report one of QueryStatusMessage's \
+                 values {QUERY_STATUS_MESSAGES:?}, got {message:?}"
+            );
+            assert_date_time(label, position, &query["createdAt"]);
+        }
+
+        // A read changes nothing a later caller sees, and the collection is the same
+        // whatever page size it is walked at: a page cut at `maxResults` reports the same
+        // records, in the same order, as the unpaged read.
+        let reread = list_queries(&router, &id).await;
+        assert_eq!(
+            reread, queries,
+            "case {label:?}: reading the history twice must report the same records, got \
+             {reread:?} after {queries:?}"
+        );
+        for page_size in [1, 2, 300] {
+            let walked = walk_queries(&router, label, &id, page_size).await;
+            assert_eq!(
+                walked, queries,
+                "case {label:?}: a walk at maxResults={page_size} must enumerate the whole \
+                 history, got {walked:?} where the unpaged read reports {queries:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_citation_is_one_triple_in_every_projection_of_the_query() {
+    let router = emulator();
+    let reports = catalog(&router).await;
+
+    // One submission per FORM, each carrying terms several catalog documents share, so the
+    // answer cites more than one source and the triples can be told apart.
+    for case in [
+        Record {
+            label: "a text query citing several sources",
+            body: text_body(
+                "Audit",
+                "Which independent auditor assessed the SOC 2 and ISO 27001 controls?",
+            ),
+            reported: vec![
+                "Which independent auditor assessed the SOC 2 and ISO 27001 controls?",
+            ],
+        },
+        Record {
+            label: "an uploaded document citing several sources",
+            body: file_body(
+                "Questionnaire",
+                &["SOC 2 Type 2 controls", "ISO 27001 certification scope"],
+            ),
+            reported: vec!["SOC 2 Type 2 controls", "ISO 27001 certification scope"],
+        },
+    ] {
+        let label = case.label;
+        let id = create(&router, &case.body).await;
+        let queries = settled_queries(&router, label, &id).await;
+        assert_eq!(
+            queries.len(),
+            case.reported.len(),
+            "case {label:?}: expected {} records, got {queries:?}",
+            case.reported.len()
+        );
+
+        let mut cited = 0usize;
+        for (position, query) in queries.iter().enumerate() {
+            let citations = query["citations"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for (index, citation) in citations.iter().enumerate() {
+                cited += 1;
+                let source_label = citation["sourceLabel"].as_str().unwrap_or_else(|| {
+                    panic!("case {label:?}: a citation must label its source, got {citation:?}")
+                });
+                let source_content = citation["sourceContent"].as_str().unwrap_or_else(|| {
+                    panic!("case {label:?}: a citation must quote its source, got {citation:?}")
+                });
+                let source_link = citation["sourceLink"].as_str().unwrap_or_else(|| {
+                    panic!("case {label:?}: a citation must link to its source, got {citation:?}")
+                });
+
+                // The triple is ONE source: the label names a report this catalog
+                // publishes, the content is text that same report publishes, and the link
+                // LOCATES that very report — not another one the answer also cited.
+                let report = published(&reports, source_label);
+                let description = report["description"].as_str().unwrap_or_default();
+                let name = report["name"].as_str().unwrap_or_default();
+                assert!(
+                    description.contains(source_content) || name.contains(source_content),
+                    "case {label:?}: query {position} citation {index} must quote text its \
+                     labelled source publishes, got {source_content:?} for {source_label:?}"
+                );
+                let followed =
+                    send(&router, "GET", &fetchable(source_link), Bytes::new(), true).await;
+                assert_eq!(
+                    followed.status, 200,
+                    "case {label:?}: query {position} citation {index} must link to a source \
+                     this emulator serves, got {} with {:?}",
+                    followed.status, followed.body
+                );
+                assert_eq!(
+                    (
+                        followed.body["reportDetails"]["id"].clone(),
+                        followed.body["reportDetails"]["name"].clone(),
+                        followed.body["reportDetails"]["version"].clone(),
+                    ),
+                    (
+                        report["id"].clone(),
+                        report["name"].clone(),
+                        report["version"].clone(),
+                    ),
+                    "case {label:?}: query {position} citation {index} must link to the source \
+                     its label names and its content quotes, got {source_link:?} reading {:?}",
+                    followed.body
+                );
+            }
+        }
+        assert!(
+            cited > 1,
+            "case {label:?}: the submission must be answered out of more than one source for \
+             the triples to be told apart, got {queries:?}"
+        );
+
+        // Every projection of a citation reports the SAME triple: the exported document's
+        // citations are the listing's citations, query by query and in citation order.
+        let document = exported_document(&router, label, &id).await;
+        let exported_queries = document["queries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            exported_queries.len(),
+            queries.len(),
+            "case {label:?}: the export must cover every query the inquiry holds, got {:?}",
+            document["queries"]
+        );
+        for (position, query) in queries.iter().enumerate() {
+            assert_eq!(
+                exported_queries[position]["citations"],
+                query["citations"],
+                "case {label:?}: query {position} must report the same citation triples in the \
+                 exported document as in the listing, got {:?} against {:?}",
+                exported_queries[position]["citations"],
+                query["citations"]
+            );
+        }
     }
 }
