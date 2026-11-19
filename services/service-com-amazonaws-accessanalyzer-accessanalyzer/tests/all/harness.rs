@@ -107,20 +107,47 @@ impl Emulator {
         path: &str,
         body: Option<Value>,
     ) -> Reply {
+        self.send_signed(access_key_id, REGION, method, path, body)
+            .await
+    }
+
+    /// The same call, signed for a named Region.
+    ///
+    /// The SigV4 credential scope is what names the Region a handler scopes the request
+    /// to, so a suite whose rule is per-Region drives it by signing for another one.
+    pub async fn send_in(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Reply {
+        self.send_signed(ACCESS_KEY_ID, region, method, path, body)
+            .await
+    }
+
+    async fn send_signed(
+        &self,
+        access_key_id: &str,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Reply {
         let payload = match body {
             Some(value) => serde_json::to_vec(&value).expect("the request body serializes"),
             None => Vec::new(),
         };
         let request = http::Request::builder()
             .method(method)
-            .uri(format!("https://access-analyzer.{REGION}.amazonaws.com{path}"))
+            .uri(format!("https://access-analyzer.{region}.amazonaws.com{path}"))
             // The SigV4 credential scope is what routes the request to this service
             // and what names the region its ARNs carry. Signatures are not verified
             // unless the process turns authentication on.
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/access-analyzer/aws4_request, SignedHeaders=host, Signature=0000"
+                    "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/access-analyzer/aws4_request, SignedHeaders=host, Signature=0000"
                 ),
             )
             .header("content-type", "application/json")
@@ -394,8 +421,13 @@ pub fn wire_reason(discriminator: &str) -> &'static str {
 /// `arn:aws:access-analyzer:<region>:<account>:analyzer/<name>`, with the account
 /// segment taken from the core's single source of truth.
 pub fn expected_arn(name: &str) -> String {
+    expected_arn_in(REGION, name)
+}
+
+/// [`expected_arn`], for an analyzer created in a named Region.
+pub fn expected_arn_in(region: &str, name: &str) -> String {
     format!(
-        "arn:aws:access-analyzer:{REGION}:{}:analyzer/{name}",
+        "arn:aws:access-analyzer:{region}:{}:analyzer/{name}",
         engine::emulator_account_id()
     )
 }

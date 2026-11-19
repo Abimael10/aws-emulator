@@ -379,7 +379,6 @@ async fn an_analyzers_tag_map_is_always_present() {
         },
     ];
 
-    let emulator = Emulator::new();
     for TagCase {
         case,
         analyzer,
@@ -387,6 +386,8 @@ async fn an_analyzers_tag_map_is_always_present() {
         expected,
     } in &cases
     {
+        // One emulator per row: the account holds a single ACCOUNT analyzer.
+        let emulator = Emulator::new();
         let mut request = json!({"analyzerName": analyzer, "type": "ACCOUNT"});
         if let Some(sent) = sent {
             request["tags"] = sent.clone();

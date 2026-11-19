@@ -276,6 +276,8 @@ async fn every_call_emits_a_structured_audit_record() {
             "validation-refused",
         ),
     ] {
+        // One account per row: the account holds a single analyzer of each type.
+        let emulator = Emulator::new();
         let created = emulator
             .send_as(
                 AUDIT_AKID,

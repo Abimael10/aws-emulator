@@ -571,7 +571,9 @@ async fn a_configuration_that_cannot_be_analyzed_fails_the_preview() {
 async fn an_access_preview_is_scoped_to_the_analyzer_it_was_created_against() {
     let emulator = Emulator::new();
     let first = emulator.analyzer_arn("first_analyzer", "ACCOUNT").await;
-    let second = emulator.analyzer_arn("second_analyzer", "ACCOUNT").await;
+    // A second, DIFFERENT analyzer the account may hold beside the first one: the row it
+    // serves only needs an analyzer that did not mint the preview.
+    let second = emulator.analyzer_arn("second_analyzer", "ORGANIZATION").await;
     let bucket = "arn:aws:s3:::preview-bucket";
     let configurations = json!({bucket: {"s3Bucket": {"bucketPolicy": public_policy(bucket)}}});
 

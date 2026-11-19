@@ -301,9 +301,10 @@ async fn an_update_of_a_rule_that_does_not_exist_is_refused() {
 #[tokio::test]
 async fn an_update_is_scoped_to_its_analyzer() {
     let emulator = Emulator::new();
-    for analyzer in ["first", "second"] {
+    // Two analyzers of two types, because the account holds one analyzer of each type.
+    for (analyzer, analyzer_type) in [("first", "ACCOUNT"), ("second", "ORGANIZATION")] {
         let created = emulator
-            .create_analyzer(json!({"analyzerName": analyzer, "type": "ACCOUNT"}))
+            .create_analyzer(json!({"analyzerName": analyzer, "type": analyzer_type}))
             .await;
         assert_eq!(
             created.status, 200,

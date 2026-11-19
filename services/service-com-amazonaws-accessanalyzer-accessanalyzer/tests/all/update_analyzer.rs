@@ -536,15 +536,17 @@ async fn unused_access_age_is_bounded_by_its_documented_range() {
         }
 
         // CreateAnalyzer accepts the same `AnalyzerConfiguration`, so the same bound
-        // holds there. The name carries the row's own age (with the sign spelled out,
-        // since `AnalyzerName`'s pattern allows no `-` at the front), so two rows can
-        // never collide on one name.
+        // holds there. In an account of its own, because the account's one
+        // unused-access analyzer is the one the updates above run against. The name
+        // carries the row's own age (with the sign spelled out, since `AnalyzerName`'s
+        // pattern allows no `-` at the front), so two rows can never collide on one name.
+        let creating = Emulator::new();
         let created = if *age < 0 {
             format!("created_minus_{}", age.unsigned_abs())
         } else {
             format!("created_{age}")
         };
-        let create_reply = emulator
+        let create_reply = creating
             .create_analyzer(json!({
                 "analyzerName": created,
                 "type": "ACCOUNT_UNUSED_ACCESS",
@@ -557,13 +559,13 @@ async fn unused_access_age_is_bounded_by_its_documented_range() {
                 "case {case:?}: CreateAnalyzer must accept an age inside the range, got {create_reply:?}"
             );
             assert_eq!(
-                stored_configuration(&emulator, case, &created).await.as_ref(),
+                stored_configuration(&creating, case, &created).await.as_ref(),
                 Some(&configuration),
                 "case {case:?}: CreateAnalyzer must store the accepted configuration"
             );
         } else {
             assert_validation_exception(case, &create_reply);
-            let get = emulator.get_analyzer(&created).await;
+            let get = creating.get_analyzer(&created).await;
             assert_eq!(
                 get.status, 404,
                 "case {case:?}: a refused create must store no analyzer, got {get:?}"

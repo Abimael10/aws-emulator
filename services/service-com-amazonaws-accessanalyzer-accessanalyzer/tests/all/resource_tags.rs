@@ -201,8 +201,10 @@ async fn tagging_merges_into_the_tag_set_and_reads_back() {
         },
     ];
 
-    let emulator = Emulator::new();
     for case in cases {
+        // One emulator per row: the account holds a single ACCOUNT analyzer, so each
+        // row's fixture resource is created in an account of its own.
+        let emulator = Emulator::new();
         let TagCase {
             case,
             analyzer,
@@ -311,8 +313,9 @@ async fn untagging_removes_only_the_named_keys() {
         },
     ];
 
-    let emulator = Emulator::new();
     for case in cases {
+        // One emulator per row, for the reason the tagging table above gives.
+        let emulator = Emulator::new();
         let UntagCase {
             case,
             analyzer,
@@ -540,14 +543,15 @@ async fn a_tag_outside_the_restrictions_is_refused() {
         },
     ];
 
-    let emulator = Emulator::new();
     for (row, case) in cases.into_iter().enumerate() {
+        // One fresh resource per row, in an account of its own, so a row only ever sees
+        // its own call.
+        let emulator = Emulator::new();
         let RestrictionCase {
             case,
             tags,
             refusal,
         } = case;
-        // One fresh resource per row, so a row only ever sees its own call.
         let arn = create_analyzer(&emulator, &format!("restrictions_row{row}"), None).await;
 
         let reply = tag_resource(&emulator, &arn, &tag_object(&tags)).await;

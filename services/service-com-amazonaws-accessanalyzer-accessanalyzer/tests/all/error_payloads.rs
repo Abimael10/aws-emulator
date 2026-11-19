@@ -289,11 +289,12 @@ async fn a_deleted_analyzer_is_refused_exactly_like_one_that_never_existed() {
 #[tokio::test]
 async fn an_absent_archive_rule_is_refused_with_a_fixed_message_and_the_rule_in_resource_id() {
     let emulator = Emulator::new();
-    for analyzer in ["stored", "Other.Analyzer-1"] {
+    // Two analyzers of two types, because the account holds one analyzer of each type.
+    for (analyzer, analyzer_type) in [("stored", "ACCOUNT"), ("Other.Analyzer-1", "ORGANIZATION")] {
         let created = emulator
             .create_analyzer(json!({
                 "analyzerName": analyzer,
-                "type": "ACCOUNT",
+                "type": analyzer_type,
                 "archiveRules": [{"ruleName": "kept", "filter": {"isPublic": {"eq": ["true"]}}}],
             }))
             .await;
@@ -526,10 +527,11 @@ async fn a_duplicate_archive_rule_name_conflicts_with_a_fixed_message() {
 /// the SAME fixed conflict payload — the message is one template, not per-caller prose.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn racing_creates_of_one_name_leave_every_loser_the_same_conflict() {
-    let emulator = ::std::sync::Arc::new(Emulator::new());
     // Counts spanning two racers to several; the rule is about EVERY loser, so the
-    // loser count is what varies.
+    // loser count is what varies. One account per row, since the account holds a single
+    // analyzer of the type the racers ask for.
     for racers in [2usize, 3, 5] {
+        let emulator = ::std::sync::Arc::new(Emulator::new());
         let name = format!("race{racers}");
         let body = json!({"analyzerName": name, "type": "ACCOUNT"});
 

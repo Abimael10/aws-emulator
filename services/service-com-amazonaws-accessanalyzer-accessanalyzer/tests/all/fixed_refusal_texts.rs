@@ -79,10 +79,10 @@ pub fn message(reply: &Reply) -> &str {
         .unwrap_or_default()
 }
 
-/// Create an `ACCOUNT` analyzer and answer the ARN it must carry.
-async fn create_analyzer(emulator: &Emulator, name: &str) -> String {
+/// Create an analyzer of `analyzer_type` and answer the ARN it must carry.
+async fn create_analyzer(emulator: &Emulator, name: &str, analyzer_type: &str) -> String {
     let created = emulator
-        .create_analyzer(json!({"analyzerName": name, "type": "ACCOUNT"}))
+        .create_analyzer(json!({"analyzerName": name, "type": analyzer_type}))
         .await;
     assert_eq!(
         created.status, 200,
@@ -142,9 +142,10 @@ impl TaggingCall {
 async fn a_tagging_call_on_an_absent_resource_is_a_not_found_exception() {
     let emulator = Emulator::new();
     // One analyzer that DOES exist, so the table is not answering out of an empty store,
-    // and one that existed and was deleted.
-    let live = create_analyzer(&emulator, "live_target").await;
-    let deleted = create_analyzer(&emulator, "deleted_target").await;
+    // and one that existed and was deleted. Of two types, because the account holds one
+    // analyzer of each.
+    let live = create_analyzer(&emulator, "live_target", "ACCOUNT").await;
+    let deleted = create_analyzer(&emulator, "deleted_target", "ORGANIZATION").await;
     let removed = emulator.delete_analyzer("deleted_target").await;
     assert_eq!(
         removed.status, 200,
@@ -226,7 +227,7 @@ async fn a_tagging_call_on_an_absent_resource_is_a_not_found_exception() {
 #[tokio::test]
 async fn an_analyzer_name_addressed_call_keeps_the_modelled_not_found_code() {
     let emulator = Emulator::new();
-    create_analyzer(&emulator, "gone").await;
+    create_analyzer(&emulator, "gone", "ACCOUNT").await;
     let removed = emulator.delete_analyzer("gone").await;
     assert_eq!(
         removed.status, 200,
@@ -634,8 +635,10 @@ async fn an_unsupported_action_carries_the_fixed_text() {
     }
 
     // The positive control: the same call against a CONFIGURED type succeeds, and what it
-    // stored reads back through `GetAnalyzer`.
+    // stored reads back through `GetAnalyzer`. In an account of its own, because the scan
+    // rows above already hold this account's unused-access analyzer.
     let configured = json!({"unusedAccess": {"unusedAccessAge": 45}});
+    let emulator = Emulator::new();
     let created = emulator
         .create_analyzer(json!({"analyzerName": "configured", "type": "ACCOUNT_UNUSED_ACCESS"}))
         .await;

@@ -189,8 +189,10 @@ async fn a_successful_tag_answers_204_with_no_content() {
         },
     ];
 
-    let emulator = Emulator::new();
     for case in cases {
+        // One emulator per row: the account holds a single ACCOUNT analyzer, so each
+        // row's fixture resource lives in an account of its own.
+        let emulator = Emulator::new();
         let TagCase {
             case,
             analyzer,
@@ -296,8 +298,9 @@ async fn a_successful_untag_answers_204_with_no_content() {
         },
     ];
 
-    let emulator = Emulator::new();
     for case in cases {
+        // One emulator per row, for the reason the tag table above gives.
+        let emulator = Emulator::new();
         let UntagCase {
             case,
             analyzer,

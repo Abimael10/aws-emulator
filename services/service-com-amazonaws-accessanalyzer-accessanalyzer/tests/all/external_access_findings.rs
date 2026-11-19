@@ -938,7 +938,7 @@ async fn an_apply_that_names_no_rule_of_that_analyzer_is_refused_and_archives_no
     let emulator = Emulator::new();
     let fixture = archive_fixture(case, &emulator).await;
     let other = emulator
-        .analyzer(case, "archive-other-analyzer", "ACCOUNT")
+        .analyzer(case, "archive-other-analyzer", "ORGANIZATION")
         .await;
     // A rule that would select every finding, created on the OTHER analyzer: applying it
     // with this analyzer's ARN names no rule of this analyzer.
@@ -2058,7 +2058,7 @@ async fn a_finding_read_names_what_the_caller_has_to_change() {
         .analyzer("refusals", "finding-refusal-analyzer", "ACCOUNT")
         .await;
     let other = emulator
-        .analyzer("refusals", "finding-other-analyzer", "ACCOUNT")
+        .analyzer("refusals", "finding-other-analyzer", "ORGANIZATION")
         .await;
     let unused = emulator
         .analyzer("refusals", "finding-refusal-unused", "ACCOUNT_UNUSED_ACCESS")

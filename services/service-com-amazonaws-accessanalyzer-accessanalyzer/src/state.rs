@@ -195,10 +195,10 @@ pub const ANALYZER_NOT_FOUND_MESSAGE: &str = "Analyzer not found";
 pub const ANALYZER_NAME_CONFLICT_MESSAGE: &str = "Analyzer with the same name already exists";
 
 /// The fixed `message` of the `ServiceQuotaExceededException` (HTTP 402) that answers
-/// a create past this emulator's analyzer ceiling. The ceiling is a property of the
-/// account and Region, not of the request, so the text names neither.
-pub const ANALYZER_QUOTA_EXCEEDED_MESSAGE: &str =
-    "Service quota met for analyzers in this account and Region";
+/// a create past the number of analyzers of one type this account and Region may hold.
+/// The limit is a property of the account and Region, not of the request, so the text
+/// names neither — it is the recorded service's own wording, reproduced verbatim.
+pub const ANALYZER_QUOTA_EXCEEDED_MESSAGE: &str = "Analyzer limit exceeded";
 
 /// The fixed `message` of a `ResourceNotFoundException` for an archive rule the named
 /// analyzer does not hold. AWS publishes no text for this refusal, so the wording is
@@ -243,7 +243,9 @@ pub fn analyzer_name_conflict(analyzer_name: &str) -> ConflictException {
     }
 }
 
-/// The 402 for a create past [`MAX_ANALYZERS`].
+/// The 402 for a create past the limit [`analyzers_allowed_for_type`] reports (or past
+/// the [`MAX_ANALYZERS`] backstop): fixed text, the requested name in the modelled
+/// `resourceId`/`resourceType` members.
 pub fn analyzer_quota_exceeded(analyzer_name: &str) -> ServiceQuotaExceededException {
     ServiceQuotaExceededException {
         message: ANALYZER_QUOTA_EXCEEDED_MESSAGE.to_string(),
@@ -349,14 +351,46 @@ pub fn access_preview_quota_exceeded(analyzer_arn: &str) -> ServiceQuotaExceeded
     }
 }
 
-/// How many analyzers this emulator will hold.
+/// How many analyzers of ONE account-scoped type this account and Region may hold.
 ///
-/// The real service caps analyzers per account per Region with a service quota, and
-/// `CreateAnalyzer` models `ServiceQuotaExceededException` (HTTP 402) for exceeding it.
-/// This number is NOT a fidelity claim about the published quota (which is far smaller
-/// and adjustable): it is the emulator's own ceiling, generous enough that no realistic
-/// workflow meets it, so a caller looping on create cannot grow this process's memory
-/// without bound.
+/// `CreateAnalyzerRequest$type` publishes the limit — "You can create only one analyzer
+/// per account per Region. You can create up to 5 analyzers per organization per Region."
+/// — and what each sentence counts is analyzers of ONE type: an account already holding
+/// an external-access analyzer still accepts an unused-access one, and only a second
+/// analyzer of the SAME type is refused.
+pub const MAX_ANALYZERS_PER_ACCOUNT_TYPE: usize = 1;
+
+/// How many analyzers of ONE organization-scoped type this account and Region may hold,
+/// from the second sentence quoted on [`MAX_ANALYZERS_PER_ACCOUNT_TYPE`].
+pub const MAX_ANALYZERS_PER_ORGANIZATION_TYPE: usize = 5;
+
+/// The prefix the model's organization-scoped `Type` values share (`ORGANIZATION`,
+/// `ORGANIZATION_UNUSED_ACCESS`, `ORGANIZATION_INTERNAL_ACCESS` — the values
+/// [`crate::ops::types::TYPE_VALUES`] lists beside the account-scoped ones).
+const ORGANIZATION_TYPE_PREFIX: &str = "ORGANIZATION";
+
+/// How many analyzers of `analyzer_type` this account and Region may hold at once.
+///
+/// The two limits quoted on [`MAX_ANALYZERS_PER_ACCOUNT_TYPE`], resolved by the scope
+/// the type names: an organization-scoped type counts against the organization's limit,
+/// every other modelled value against the account's. A value this service does not know
+/// falls into the account arm, the stricter of the two.
+pub fn analyzers_allowed_for_type(analyzer_type: &str) -> usize {
+    if analyzer_type.starts_with(ORGANIZATION_TYPE_PREFIX) {
+        MAX_ANALYZERS_PER_ORGANIZATION_TYPE
+    } else {
+        MAX_ANALYZERS_PER_ACCOUNT_TYPE
+    }
+}
+
+/// How many analyzers this emulator will hold, whatever their types and Regions.
+///
+/// A backstop behind [`analyzers_allowed_for_type`], which is what bounds the store in
+/// practice (and far below this): it is NOT a fidelity claim about any published quota,
+/// only the guarantee that a caller looping on create cannot grow this process's memory
+/// without bound should a per-type limit ever be raised. `CreateAnalyzer` models
+/// `ServiceQuotaExceededException` (HTTP 402), so it is reported as a quota rather than
+/// in some unmodelled way.
 pub const MAX_ANALYZERS: usize = 1_000;
 
 /// How many archive rules this emulator will hold under one analyzer. Same reasoning,
@@ -507,6 +541,35 @@ impl ComAmazonawsAccessanalyzerAccessanalyzerState {
         self.analyzers
             .values_mut()
             .find(|analyzer| analyzer.arn == arn)
+    }
+
+    /// How many analyzers of `analyzer_type` this account holds in `region`.
+    ///
+    /// An analyzer is a Regional resource — its ARN pins the Region it was created in —
+    /// so the Region an analyzer belongs to is read back off that ARN, with the same
+    /// [`arn_region`] the external-access walk resolves a resource's Region with, rather
+    /// than from a second copy of it.
+    pub fn analyzers_of_type(&self, region: &str, analyzer_type: &str) -> usize {
+        self.analyzers
+            .values()
+            .filter(|analyzer| {
+                analyzer.r#type == analyzer_type && arn_region(&analyzer.arn) == Some(region)
+            })
+            .count()
+    }
+
+    /// Whether creating one more analyzer of `analyzer_type` in `region` would pass a
+    /// limit, i.e. whether the create has to be refused with the modelled
+    /// `ServiceQuotaExceededException` instead of storing anything.
+    ///
+    /// The limit that decides this is the published per-type one
+    /// ([`analyzers_allowed_for_type`]); [`MAX_ANALYZERS`] is the backstop behind it.
+    /// Deleting an analyzer frees its slot, so the limit is a ceiling and not a one-way
+    /// ratchet.
+    pub fn analyzer_limit_reached(&self, region: &str, analyzer_type: &str) -> bool {
+        self.analyzers_of_type(region, analyzer_type)
+            >= analyzers_allowed_for_type(analyzer_type)
+            || self.analyzers.len() >= MAX_ANALYZERS
     }
 }
 

@@ -23,7 +23,7 @@
 //! one analyzer has been asked for, and how many distinct resources it has scanned. The
 //! recorded `arn:aws:s3:::…`-bucket scan of the end-to-end unit is one row.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_accessanalyzer_accessanalyzer::state::{
@@ -38,6 +38,37 @@ use crate::harness::{
 /// How long a case waits PAST [`RESOURCE_SCAN_SPAN`] before reading the analyzer back, so
 /// a loaded machine cannot read the scan a moment before the clock owes it.
 const SETTLE_MARGIN: Duration = Duration::from_millis(250);
+
+/// How long a case keeps LOOKING for a scan's result before giving up — many times over
+/// [`RESOURCE_SCAN_SPAN`], so a loaded or slow machine has all the room it needs.
+const SCAN_RESULT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Look again until the analyzer named `name` reports `resource_arn` as its most recently
+/// analyzed resource, and answer the read that showed it.
+///
+/// The wait is for the CONDITION the clock owes, not for a span: the loop re-reads until
+/// the analyzer reports the result or [`SCAN_RESULT_DEADLINE`] passes, so the case cannot
+/// depend on how fast the host runs.
+async fn analyzer_reporting_scan(
+    case: &str,
+    emulator: &Emulator,
+    name: &str,
+    resource_arn: &str,
+) -> Reply {
+    let deadline = Instant::now() + SCAN_RESULT_DEADLINE;
+    loop {
+        let reply = emulator.get_analyzer(name).await;
+        if last_analyzed(analyzer_of(&reply)) == Some(resource_arn) {
+            return reply;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the analyzer never reported {resource_arn:?} as its most \
+             recently analyzed resource, last read {reply:?}"
+        );
+        ::tokio::task::yield_now().await;
+    }
+}
 
 /// The `reason` every refusal of this service carries, as the wire spells the model's
 /// `fieldValidationFailed` discriminator.
@@ -103,8 +134,6 @@ fn last_analyzed(analyzer: &Value) -> Option<&str> {
 /// owning account.
 #[tokio::test]
 async fn a_finished_scan_becomes_the_analyzers_most_recently_analyzed_resource() {
-    let emulator = Emulator::new();
-
     // (case, resourceArn, resourceOwnerAccount) — the rows differ along the segment
     // layouts an AWS resource ARN takes, and along whether the owner is named.
     let cases: &[(&str, &str, Option<&str>)] = &[
@@ -150,9 +179,11 @@ async fn a_finished_scan_becomes_the_analyzers_most_recently_analyzed_resource()
         ),
     ];
 
-    // One analyzer per row, so each row's answer is about its own scan alone.
-    let mut started: Vec<(&str, String, &str, Value)> = Vec::new();
+    // One analyzer per row, each in an account of its own — the account holds a single
+    // ACCOUNT analyzer — so each row's answer is about its own scan alone.
+    let mut started: Vec<(&str, Emulator, String, &str, Value)> = Vec::new();
     for (index, (case, resource_arn, owner)) in cases.iter().enumerate() {
+        let emulator = Emulator::new();
         let name = format!("scan_target_{index}");
         let analyzer_arn = create_analyzer(&emulator, &name, "ACCOUNT").await;
         let created = emulator.get_analyzer(&name).await;
@@ -170,17 +201,16 @@ async fn a_finished_scan_becomes_the_analyzers_most_recently_analyzed_resource()
         );
         started.push((
             case,
+            emulator,
             name,
             resource_arn,
             created_at.unwrap_or_else(|| panic!("case {case:?}: the analyzer reports a createdAt")),
         ));
     }
 
-    // The clock owes every one of these scans its result.
-    tokio::time::sleep(RESOURCE_SCAN_SPAN + SETTLE_MARGIN).await;
-
-    for (case, name, resource_arn, created_at) in &started {
-        let reply = emulator.get_analyzer(name).await;
+    // Every one of these scans is read back once the clock owes the analyzer its result.
+    for (case, emulator, name, resource_arn, created_at) in &started {
+        let reply = analyzer_reporting_scan(case, emulator, name, resource_arn).await;
         let analyzer = analyzer_of(&reply);
         assert_eq!(
             last_analyzed(analyzer),

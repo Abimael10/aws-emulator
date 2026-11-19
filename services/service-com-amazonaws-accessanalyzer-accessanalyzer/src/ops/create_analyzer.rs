@@ -214,9 +214,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if state.analyzers.len() >= crate::state::MAX_ANALYZERS {
-            // The emulator's own store ceiling, expressed with the quota error this
-            // operation models (HTTP 402) rather than by growing without bound.
+        let region = crate::state::request_region(ctx.parts());
+        if state.analyzer_limit_reached(&region, &input.r#type) {
+            // The limit this `type` publishes ("You can create only one analyzer per
+            // account per Region. You can create up to 5 analyzers per organization per
+            // Region."), counted over the analyzers of THAT type this account already
+            // holds in THIS Region — so a type at its limit is refused while every other
+            // type, and every other Region, stays creatable. Refused before anything is
+            // stored, with the quota error this operation models (HTTP 402), so the
+            // analyzer store and every listing projected from it are left as they were.
             crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::QuotaExceeded);
             return Err(CreateAnalyzerErrorModeled::ServiceQuotaExceededException(
                 crate::state::analyzer_quota_exceeded(&input.analyzer_name),
@@ -225,7 +231,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::analyzer_arn(&region, &input.analyzer_name);
 
         // Inline `archiveRules` are created with the analyzer, so `ListArchiveRules` and

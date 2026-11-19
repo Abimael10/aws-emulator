@@ -254,7 +254,11 @@ pub fn monitored_resources<Eng: Send + Sync + 'static>(
 /// The Region an ARN names, or `None` when its Region segment is empty — the form the ARN
 /// of a resource in a GLOBAL namespace takes (an IAM role, an Amazon S3 general purpose
 /// bucket).
-fn arn_region(arn: &str) -> Option<&str> {
+///
+/// Also how the Region an ANALYZER belongs to is read back off its own ARN, which
+/// [`analyzer_arn`] is what puts there: see
+/// [`ComAmazonawsAccessanalyzerAccessanalyzerState::analyzers_of_type`].
+pub fn arn_region(arn: &str) -> Option<&str> {
     arn.split(':').nth(3).filter(|region| !region.is_empty())
 }
 

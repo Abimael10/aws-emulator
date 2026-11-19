@@ -14,12 +14,13 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_accessanalyzer_accessanalyzer::state::{
-    MAX_ANALYZERS, MAX_ARCHIVE_RULES_PER_ANALYZER, MAX_PAGE_SIZE,
+    MAX_ARCHIVE_RULES_PER_ANALYZER, MAX_PAGE_SIZE,
 };
 
 // The wire harness is shared by every suite in this target; see `tests/all/harness.rs`.
 use crate::harness::{
-    expected_arn, is_timestamp, listed_names, listed_rule_names, Emulator, Reply,
+    expected_arn, expected_arn_in, is_timestamp, listed_names, listed_rule_names, Emulator, Reply,
+    REGION,
 };
 
 /// Every `Type` the model's `Type` enum accepts, from
@@ -32,6 +33,23 @@ pub(crate) const ANALYZER_TYPES: &[&str] = &[
     "ORGANIZATION_INTERNAL_ACCESS",
     "ORGANIZATION_UNUSED_ACCESS",
 ];
+
+/// How many analyzers of each modelled `Type` one account and Region may hold, from the
+/// `type` member's own documentation (`smithy_query(query="doc",
+/// shape="CreateAnalyzerRequest", member="type")`): "You can create only one analyzer per
+/// account per Region. You can create up to 5 analyzers per organization per Region."
+pub(crate) const TYPE_LIMITS: &[(&str, usize)] = &[
+    ("ACCOUNT", 1),
+    ("ACCOUNT_INTERNAL_ACCESS", 1),
+    ("ACCOUNT_UNUSED_ACCESS", 1),
+    ("ORGANIZATION", 5),
+    ("ORGANIZATION_INTERNAL_ACCESS", 5),
+    ("ORGANIZATION_UNUSED_ACCESS", 5),
+];
+
+/// AWS's fixed `ServiceQuotaExceededException` message for a `CreateAnalyzer` past that
+/// limit, as the recorded refusal words it.
+const ANALYZER_LIMIT_EXCEEDED: &str = "Analyzer limit exceeded";
 
 /// One row of the create/read-back table.
 #[derive(Debug)]
@@ -301,8 +319,9 @@ async fn recreating_a_name_conflicts_unless_the_client_token_repeats() {
         );
     }
 
-    // Same name AND same client token: the same request retried.
-    let request = json!({"analyzerName": "tokened", "type": "ACCOUNT", "clientToken": "token-1"});
+    // Same name AND same client token: the same request retried. An organization-scoped
+    // type, because the account's single ACCOUNT analyzer is already `demo`.
+    let request = json!({"analyzerName": "tokened", "type": "ORGANIZATION", "clientToken": "token-1"});
     let created = emulator.create_analyzer(request.clone()).await;
     assert_eq!(created.status, 200, "the tokened create must succeed: {created:?}");
     for attempt in 1..=2 {
@@ -321,7 +340,7 @@ async fn recreating_a_name_conflicts_unless_the_client_token_repeats() {
 
     // The same token with a DIFFERENT name is a different request, and creates.
     let other = emulator
-        .create_analyzer(json!({"analyzerName": "other", "type": "ACCOUNT", "clientToken": "token-1"}))
+        .create_analyzer(json!({"analyzerName": "other", "type": "ORGANIZATION", "clientToken": "token-1"}))
         .await;
     assert_eq!(
         other.status, 200,
@@ -352,11 +371,11 @@ async fn listing_analyzers_filters_and_pages_over_stored_state() {
     // (name, type) — several analyzers per type, created out of name order so the
     // listing's order cannot come from insertion order.
     let fixtures = [
-        ("gamma", "ACCOUNT"),
-        ("alpha", "ACCOUNT"),
-        ("delta", "ORGANIZATION"),
+        ("gamma", "ORGANIZATION"),
+        ("alpha", "ORGANIZATION"),
+        ("delta", "ACCOUNT"),
         ("beta", "ACCOUNT_UNUSED_ACCESS"),
-        ("epsilon", "ORGANIZATION"),
+        ("epsilon", "ORGANIZATION_UNUSED_ACCESS"),
     ];
     for (name, analyzer_type) in &fixtures {
         let reply = emulator
@@ -378,9 +397,10 @@ async fn listing_analyzers_filters_and_pages_over_stored_state() {
     // Filtering by type reports exactly the analyzers of that type — including the
     // empty answer for a type nothing was created with.
     let filters: Vec<(&str, Vec<&str>)> = vec![
-        ("ACCOUNT", vec!["alpha", "gamma"]),
+        ("ACCOUNT", vec!["delta"]),
         ("ACCOUNT_UNUSED_ACCESS", vec!["beta"]),
-        ("ORGANIZATION", vec!["delta", "epsilon"]),
+        ("ORGANIZATION", vec!["alpha", "gamma"]),
+        ("ORGANIZATION_UNUSED_ACCESS", vec!["epsilon"]),
         ("ORGANIZATION_INTERNAL_ACCESS", vec![]),
     ];
     for (analyzer_type, expected) in &filters {
@@ -728,11 +748,12 @@ async fn inline_archive_rules_are_stored_with_the_analyzer() {
 #[tokio::test]
 async fn deleting_an_analyzer_removes_it_and_its_archive_rules() {
     let emulator = Emulator::new();
+    // Both of an organization-scoped type, which the account may hold several of.
     for name in ["keep", "drop"] {
         let create = emulator
             .create_analyzer(json!({
                 "analyzerName": name,
-                "type": "ACCOUNT",
+                "type": "ORGANIZATION",
                 "archiveRules": [{"ruleName": "rule1", "filter": {"isPublic": {"eq": ["true"]}}}],
             }))
             .await;
@@ -780,7 +801,7 @@ async fn deleting_an_analyzer_removes_it_and_its_archive_rules() {
 
     // The name is free again, and the new analyzer starts with no archive rules.
     let recreated = emulator
-        .create_analyzer(json!({"analyzerName": "drop", "type": "ORGANIZATION"}))
+        .create_analyzer(json!({"analyzerName": "drop", "type": "ACCOUNT"}))
         .await;
     assert_eq!(
         recreated.status, 200,
@@ -797,23 +818,39 @@ async fn deleting_an_analyzer_removes_it_and_its_archive_rules() {
         get.member("analyzer")
             .and_then(|analyzer| analyzer.get("type"))
             .and_then(Value::as_str),
-        Some("ORGANIZATION"),
+        Some("ACCOUNT"),
         "the re-created analyzer must be the one just created, got {get:?}"
     );
 }
 
 /// No single listing hands back the whole store: the page is capped server-side, and
 /// the rest is reached by following `nextToken`.
+///
+/// Driven over `ListArchiveRules`, which reaches the one paging helper every listing of
+/// this service shares: the published one-analyzer-per-type limit keeps the analyzer
+/// store far below a page, so the rules under an analyzer are what can overflow one.
 #[tokio::test]
 async fn a_listing_never_returns_more_than_the_page_cap() {
     let emulator = Emulator::new();
-    // A few more analyzers than fit on one page. Names are zero-padded so their name
+    let created = emulator
+        .create_analyzer(json!({"analyzerName": "paged", "type": "ACCOUNT"}))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the fixture analyzer must be created, got {created:?}"
+    );
+
+    // A few more rules than fit on one page. Names are zero-padded so their name
     // order (the order the listing pages in) is their creation order.
     let overflow = 5_usize;
     let total = MAX_PAGE_SIZE as usize + overflow;
+    let filter = json!({"isPublic": {"eq": ["true"]}});
     for index in 0..total {
         let reply = emulator
-            .create_analyzer(json!({"analyzerName": format!("a{index:04}"), "type": "ACCOUNT"}))
+            .create_archive_rule(
+                "paged",
+                json!({"ruleName": format!("r{index:04}"), "filter": filter}),
+            )
             .await;
         assert_eq!(
             reply.status, 200,
@@ -829,12 +866,12 @@ async fn a_listing_never_returns_more_than_the_page_cap() {
         ("maxResults far above the cap", "?maxResults=100000".to_string()),
     ];
     for (case, query) in &capped {
-        let reply = emulator.list_analyzers(query).await;
+        let reply = emulator.list_archive_rules("paged", query).await;
         assert_eq!(
             reply.status, 200,
             "case {case:?}: the listing must succeed, got {reply:?}"
         );
-        let names = listed_names(&reply);
+        let names = listed_rule_names(&reply);
         assert_eq!(
             names.len(),
             MAX_PAGE_SIZE as usize,
@@ -849,13 +886,13 @@ async fn a_listing_never_returns_more_than_the_page_cap() {
 
         // The rest is reachable, exactly once, from the token the capped page gave.
         let rest = emulator
-            .list_analyzers(&format!("?nextToken={token}"))
+            .list_archive_rules("paged", &format!("?nextToken={token}"))
             .await;
         assert_eq!(
-            listed_names(&rest).len(),
+            listed_rule_names(&rest).len(),
             overflow,
             "case {case:?}: the remainder must hold the other {overflow}, got {:?}",
-            listed_names(&rest)
+            listed_rule_names(&rest)
         );
         assert!(
             rest.member("nextToken").is_none(),
@@ -864,50 +901,219 @@ async fn a_listing_never_returns_more_than_the_page_cap() {
     }
 }
 
-/// The analyzer store is bounded: past the ceiling the create is refused with the
-/// quota error the operation models, not by growing the store.
+/// RULE: `CreateAnalyzer` holds the account to the number of analyzers of the requested
+/// `type` the Region may hold — `CreateAnalyzerRequest$type` publishes "You can create
+/// only one analyzer per account per Region. You can create up to 5 analyzers per
+/// organization per Region." — refusing the create past it with the modelled
+/// `ServiceQuotaExceededException` (HTTP 402) and storing nothing.
+///
+/// The rows are every `Type` the model publishes, so the table spans both scopes and both
+/// limits; the recorded `ACCOUNT` case is one row.
 #[tokio::test]
-async fn the_analyzer_store_is_bounded() {
-    let emulator = Emulator::new();
-    for index in 0..MAX_ANALYZERS {
-        let reply = emulator
-            .create_analyzer(json!({"analyzerName": format!("a{index:04}"), "type": "ACCOUNT"}))
+async fn an_analyzer_type_takes_only_as_many_analyzers_as_its_limit_allows() {
+    for (analyzer_type, allowed) in TYPE_LIMITS {
+        assert!(
+            ANALYZER_TYPES.contains(analyzer_type),
+            "{analyzer_type:?} must be one of the modelled types {ANALYZER_TYPES:?}"
+        );
+        let emulator = Emulator::new();
+
+        // Up to the limit, every create is accepted and reported back by the listing.
+        let mut accepted: Vec<String> = Vec::new();
+        for index in 0..*allowed {
+            let name = format!("within_{index}");
+            let reply = emulator
+                .create_analyzer(json!({"analyzerName": name, "type": analyzer_type}))
+                .await;
+            assert_eq!(
+                reply.status, 200,
+                "case {analyzer_type:?} analyzer {index}: a create inside the limit of \
+                 {allowed} must succeed, got {reply:?}"
+            );
+            accepted.push(name);
+        }
+        accepted.sort();
+
+        // The one past the limit is refused, whatever it is named.
+        for name in ["past_the_limit", "Past.The-Limit_2"] {
+            let refused = emulator
+                .create_analyzer(json!({"analyzerName": name, "type": analyzer_type}))
+                .await;
+            assert_eq!(
+                refused.status, 402,
+                "case {analyzer_type:?} / {name:?}: analyzer {} of a type that takes \
+                 {allowed} must be refused with the modelled 402, got {refused:?}",
+                allowed + 1
+            );
+            assert_eq!(
+                refused.code(),
+                "ServiceQuotaExceededException",
+                "case {analyzer_type:?} / {name:?}: the refusal must be a \
+                 ServiceQuotaExceededException, got {refused:?}"
+            );
+            let message = refused
+                .member("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert_eq!(
+                message, ANALYZER_LIMIT_EXCEEDED,
+                "case {analyzer_type:?} / {name:?}: the refusal carries the fixed text \
+                 {ANALYZER_LIMIT_EXCEEDED:?}, got {message:?}"
+            );
+            // The limit is a property of the account and Region, so the text echoes
+            // nothing of the request.
+            for leaked in [name, *analyzer_type] {
+                assert!(
+                    !message.contains(leaked),
+                    "case {analyzer_type:?} / {name:?}: the text must carry no request \
+                     content, but {message:?} contains {leaked:?}"
+                );
+            }
+
+            // Nothing was stored: the refused name is absent and the listing still
+            // reports exactly the analyzers created inside the limit.
+            let absent = emulator.get_analyzer(name).await;
+            assert_eq!(
+                absent.status, 404,
+                "case {analyzer_type:?} / {name:?}: a refused create stores nothing, got {absent:?}"
+            );
+            let listed = emulator
+                .list_analyzers(&format!("?type={analyzer_type}"))
+                .await;
+            let mut names = listed_names(&listed);
+            names.sort();
+            assert_eq!(
+                names, accepted,
+                "case {analyzer_type:?} / {name:?}: the listing must be untouched by the \
+                 refusal, got {names:?}"
+            );
+        }
+
+        // The limit is a ceiling, not a one-way ratchet: deleting one frees its slot.
+        let deleted = emulator.delete_analyzer(&accepted[0]).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {analyzer_type:?}: the fixture delete must succeed, got {deleted:?}"
+        );
+        let again = emulator
+            .create_analyzer(json!({"analyzerName": "room_again", "type": analyzer_type}))
             .await;
         assert_eq!(
-            reply.status, 200,
-            "case analyzer {index}: a create below the ceiling must succeed, got {reply:?}"
+            again.status, 200,
+            "case {analyzer_type:?}: a create into the freed slot must succeed, got {again:?}"
+        );
+    }
+}
+
+/// RULE (the same one, from the other side): the limit is counted per `type`, so a type
+/// at its limit leaves every OTHER type creatable — an account holding its one
+/// external-access analyzer still takes an unused-access and an internal-access one.
+#[tokio::test]
+async fn a_type_at_its_limit_leaves_every_other_type_creatable() {
+    let emulator = Emulator::new();
+
+    // Fill every type to its own limit, in one account and Region.
+    for (analyzer_type, allowed) in TYPE_LIMITS {
+        for index in 0..*allowed {
+            let name = format!("{}_{index}", analyzer_type.to_lowercase());
+            let reply = emulator
+                .create_analyzer(json!({"analyzerName": name, "type": analyzer_type}))
+                .await;
+            assert_eq!(
+                reply.status, 200,
+                "case {analyzer_type:?} analyzer {index}: a create inside the limit must \
+                 succeed beside every other type, got {reply:?}"
+            );
+        }
+    }
+
+    // Every type is now at its limit, and each refuses on its own count.
+    for (analyzer_type, _) in TYPE_LIMITS {
+        let refused = emulator
+            .create_analyzer(json!({
+                "analyzerName": format!("extra_{}", analyzer_type.to_lowercase()),
+                "type": analyzer_type,
+            }))
+            .await;
+        assert_eq!(
+            (refused.status, refused.code()),
+            (402, "ServiceQuotaExceededException"),
+            "case {analyzer_type:?}: a type at its limit must refuse, got {refused:?}"
         );
     }
 
-    let refused = emulator
-        .create_analyzer(json!({"analyzerName": "oneTooMany", "type": "ACCOUNT"}))
-        .await;
+    // And the store holds exactly what the limits allow, all of it readable.
+    let expected: usize = TYPE_LIMITS.iter().map(|(_, allowed)| *allowed).sum();
+    let mut held = 0;
+    for (analyzer_type, allowed) in TYPE_LIMITS {
+        let listed = emulator
+            .list_analyzers(&format!("?type={analyzer_type}"))
+            .await;
+        let names = listed_names(&listed);
+        assert_eq!(
+            names.len(),
+            *allowed,
+            "case {analyzer_type:?}: the account holds exactly its limit, got {names:?}"
+        );
+        held += names.len();
+    }
     assert_eq!(
-        refused.status, 402,
-        "a create past the ceiling must be refused with the modelled quota error, got {refused:?}"
+        held, expected,
+        "the account holds one analyzer per allowed slot, got {held}"
     );
-    assert_eq!(
-        refused.code(),
-        "ServiceQuotaExceededException",
-        "the refusal must be a ServiceQuotaExceededException, got {refused:?}"
-    );
-    let absent = emulator.get_analyzer("oneTooMany").await;
-    assert_eq!(
-        absent.status, 404,
-        "a refused create must store nothing, got {absent:?}"
-    );
+}
 
-    // Deleting one frees exactly one slot, so the store is a ceiling and not a
-    // one-way ratchet.
-    let deleted = emulator.delete_analyzer("a0000").await;
-    assert_eq!(deleted.status, 200, "the delete must succeed, got {deleted:?}");
-    let accepted = emulator
-        .create_analyzer(json!({"analyzerName": "roomAgain", "type": "ACCOUNT"}))
-        .await;
-    assert_eq!(
-        accepted.status, 200,
-        "a create into the freed slot must succeed, got {accepted:?}"
-    );
+/// RULE (the Region half): the limit is counted per Region, so a Region whose analyzer of
+/// a type is at the limit leaves another Region of the same account free to take its own.
+///
+/// The SigV4 credential scope is what names a request's Region, and the ARN the create
+/// answers with is what reports the Region the analyzer belongs to.
+#[tokio::test]
+async fn the_limit_is_counted_per_region() {
+    // Two Regions, one account: the harness's own and one far from it.
+    let regions = [REGION, "eu-west-1"];
+    let emulator = Emulator::new();
+
+    for region in regions {
+        let name = format!("account_analyzer_{}", region.replace('-', "_"));
+        let created = emulator
+            .send_in(
+                region,
+                "PUT",
+                "/analyzer",
+                Some(json!({"analyzerName": name, "type": "ACCOUNT"})),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {region:?}: each Region takes its own ACCOUNT analyzer, got {created:?}"
+        );
+        assert_eq!(
+            created.member("arn").and_then(Value::as_str),
+            Some(expected_arn_in(region, &name).as_str()),
+            "case {region:?}: the analyzer belongs to the Region the call was signed for, got {created:?}"
+        );
+    }
+
+    // Each Region is now at its own limit, and refuses on its own count.
+    for region in regions {
+        let refused = emulator
+            .send_in(
+                region,
+                "PUT",
+                "/analyzer",
+                Some(json!({
+                    "analyzerName": format!("second_{}", region.replace('-', "_")),
+                    "type": "ACCOUNT",
+                })),
+            )
+            .await;
+        assert_eq!(
+            (refused.status, refused.code()),
+            (402, "ServiceQuotaExceededException"),
+            "case {region:?}: a second ACCOUNT analyzer in one Region is refused, got {refused:?}"
+        );
+    }
 }
 
 /// The per-analyzer archive-rule store is bounded: past the ceiling the create is
