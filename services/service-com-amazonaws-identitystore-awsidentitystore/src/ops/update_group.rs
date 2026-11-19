@@ -428,24 +428,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateGroupErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
+        // Resolved before this service's state is locked, because the answer comes from
+        // another service's records: an identity store exists only as the store of an IAM
+        // Identity Center instance.
+        let store_key =
+            crate::state::addressed_store_key(&*self.engine, &input.identity_store_id)
+                .map_err(UpdateGroupErrorModeled::ResourceNotFoundException)?;
         let mut state = state.lock();
         let group_not_found = || {
             UpdateGroupErrorModeled::ResourceNotFoundException(crate::state::not_found(
                 crate::state::ResourceKind::Group,
-                &input.group_id,
             ))
         };
-        // The identity store the request names is the store the caller has: any
-        // well-formed `IdentityStoreId` of this account resolves, while an identifier
-        // naming no store this emulator serves is refused with the modelled
-        // `ResourceNotFoundException` naming THAT resource. An update stores no new
+        // The store has to be one this account HAS, else the modelled
+        // `ResourceNotFoundException` names THAT resource. An update stores no new
         // resource, so a store this emulator holds no record of holds no such group and
         // the GROUP is what is missing. Both identifiers go through the crate's own key
         // normalisation, so the ARN form and either letter case of each name the same
         // resource the create used.
         let store = state
-            .resolve_recorded_store_mut(&input.identity_store_id)
-            .map_err(UpdateGroupErrorModeled::ResourceNotFoundException)?
+            .resolve_recorded_store_mut(&store_key)
             .ok_or_else(group_not_found)?;
         let group_key = crate::state::resource_key(&input.group_id);
         let stored = store.groups.get(&group_key).ok_or_else(group_not_found)?;

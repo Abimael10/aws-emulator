@@ -8,6 +8,11 @@
 //! it. A request that carries a `Revision` deletes CONDITIONALLY on it being the
 //! user's current revision.
 //!
+//! The operation is `@idempotent`, so a delete of a user id the store no longer holds
+//! removes nothing and answers the same empty success; the modelled
+//! `ResourceNotFoundException` is reserved for an identity store this account does not
+//! have.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -162,22 +167,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteUserErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
+        // The identity store the request names has to be one this account HAS: that is
+        // the only thing a delete reports as not found. Resolved before the state is
+        // locked, because the answer comes from another service's records.
+        let store_key =
+            crate::state::addressed_store_key(&*self.engine, &input.identity_store_id)
+                .map_err(DeleteUserErrorModeled::ResourceNotFoundException)?;
         let mut state = state.lock();
-        let not_found = || {
-            DeleteUserErrorModeled::ResourceNotFoundException(crate::state::not_found(
-                crate::state::ResourceKind::User,
-                &input.user_id,
-            ))
-        };
 
-        // The store is RESOLVED but never REGISTERED: a delete stores nothing, so a
-        // store this emulator holds no record of holds no such user either and the USER
-        // is what is missing. Only an identifier naming no store this emulator serves is
-        // refused for the store's own sake.
-        let store = state
-            .resolve_recorded_store_mut(&input.identity_store_id)
-            .map_err(DeleteUserErrorModeled::ResourceNotFoundException)?
-            .ok_or_else(not_found)?;
+        // The store is RESOLVED but never REGISTERED: a delete stores nothing, so a store
+        // this emulator holds no record of holds no such user either — which this
+        // `@idempotent` delete owes the same empty success it owes for a user that is
+        // already gone (below).
+        let Some(store) = state.resolve_recorded_store_mut(&store_key) else {
+            return Ok(DeleteUserOutput {});
+        };
         // Both the bare id and the resource's ARN name the same user.
         let user_key = crate::state::resource_key(&input.user_id);
         // `Revision` is the caller's EXPECTED current revision: "the user is deleted
@@ -186,24 +190,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // you don't provide this value, the user is deleted regardless of its current
         // revision." The member is a decimal string (`^[0-9]+$`), so it is compared as
         // the number it denotes — `01` and `1` name one revision — and a value too
-        // large to be any revision simply never matches. Only a conditional delete
-        // needs to read the record first; an unconditional one is the removal itself.
+        // large to be any revision simply never matches.
         if let Some(expected) = input.revision.as_deref() {
-            let user = store.users.get(&user_key).ok_or_else(not_found)?;
-            if expected.parse::<u64>().ok() != Some(user.revision) {
-                return Err(DeleteUserErrorModeled::ConflictException(
-                    crate::state::revision_conflict(expected, &user.revision()),
-                )
-                .into());
+            // A precondition on a user that is already gone has nothing to hold
+            // against, so the idempotent success stands.
+            if let Some(user) = store.users.get(&user_key) {
+                if expected.parse::<u64>().ok() != Some(user.revision) {
+                    return Err(DeleteUserErrorModeled::ConflictException(
+                        crate::state::revision_conflict(expected, &user.revision()),
+                    )
+                    .into());
+                }
             }
         }
 
         // Removes the user, the `UserName` uniqueness claim it held and the memberships
-        // naming it as a member (`IdentityStoreData::remove_user`). Its `None` is the
-        // one not-found signal: a user this store does not hold cannot be deleted, and
-        // the operation models `ResourceNotFoundException` for exactly that rather than
-        // a success that removed nothing.
-        store.remove_user(&user_key).ok_or_else(not_found)?;
+        // naming it as a member (`IdentityStoreData::remove_user`). Its `None` means the
+        // user was already gone: `DeleteUser` is `@idempotent`, so a delete of a user id
+        // the store no longer holds removes nothing and answers the same empty success —
+        // the not-found is reserved for an identity store this account does not have.
+        store.remove_user(&user_key);
         Ok(DeleteUserOutput {})
     }
 }

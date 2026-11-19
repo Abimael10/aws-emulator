@@ -5,6 +5,11 @@
 //! Removes the membership the request names from the store and from both of its
 //! indexes, so the next `ListGroupMemberships` for that group no longer reports it.
 //!
+//! The operation is `@idempotent`, so a delete of a membership id the store no longer
+//! holds removes nothing and answers the same empty success; the modelled
+//! `ResourceNotFoundException` is reserved for an identity store this account does not
+//! have.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -156,26 +161,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             )
         })?;
+        // The identity store the request names has to be one this account HAS: that is
+        // the only thing a delete reports as not found. Resolved before the state is
+        // locked, because the answer comes from another service's records.
+        let store_key =
+            crate::state::addressed_store_key(&*self.engine, &input.identity_store_id)
+                .map_err(DeleteGroupMembershipErrorModeled::ResourceNotFoundException)?;
         let mut state = state.lock();
         let membership_key = crate::state::resource_key(&input.membership_id);
         // The store is RESOLVED but never REGISTERED: a delete stores nothing, so a store
-        // this emulator holds no record of holds no such membership either and the
-        // MEMBERSHIP is what is missing (below). Only an identifier naming no store this
-        // emulator serves is refused for the store's own sake.
-        let removed = state
-            .resolve_recorded_store_mut(&input.identity_store_id)
-            .map_err(DeleteGroupMembershipErrorModeled::ResourceNotFoundException)?
+        // this emulator holds no record of holds no such membership either. `None` from
+        // either step means the membership was already gone, which this `@idempotent`
+        // delete answers with the same empty success.
+        state
+            .resolve_recorded_store_mut(&store_key)
             .and_then(|store| store.remove_membership(&membership_key));
-
-        // A membership this store does not hold cannot be deleted: the operation models
-        // `ResourceNotFoundException` for exactly that, so the id is reported as not
-        // found rather than answered with a success that removed nothing.
-        removed.ok_or_else(|| {
-            DeleteGroupMembershipErrorModeled::ResourceNotFoundException(crate::state::not_found(
-                crate::state::ResourceKind::Membership,
-                &input.membership_id,
-            ))
-        })?;
 
         Ok(DeleteGroupMembershipOutput {})
     }

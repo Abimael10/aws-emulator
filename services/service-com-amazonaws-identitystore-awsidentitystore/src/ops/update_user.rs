@@ -192,21 +192,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateUserErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
+        // The store has to be one this account HAS, and the USER it names must exist in
+        // it: an update stores no new resource, so a store this emulator holds no record
+        // of holds no such user and the USER is what is missing. An identifier naming no
+        // identity store of this account is refused for the store's own sake.
+        let store_key =
+            crate::state::addressed_store_key(&*self.engine, &input.identity_store_id)
+                .map_err(UpdateUserErrorModeled::ResourceNotFoundException)?;
         let mut state = state.lock();
-        // The identity store the request names is the store the caller has (any
-        // well-formed `IdentityStoreId` of this account), and the USER it names must
-        // exist in it: an update stores no new resource, so a store this emulator holds
-        // no record of holds no such user and the USER is what is missing. An identifier
-        // naming no store this emulator serves is refused for the store's own sake.
         let user_not_found = || {
             UpdateUserErrorModeled::ResourceNotFoundException(crate::state::not_found(
                 crate::state::ResourceKind::User,
-                &input.user_id,
             ))
         };
         let store = state
-            .resolve_recorded_store_mut(&input.identity_store_id)
-            .map_err(UpdateUserErrorModeled::ResourceNotFoundException)?
+            .resolve_recorded_store_mut(&store_key)
             .ok_or_else(user_not_found)?;
         let user_key = crate::state::resource_key(&input.user_id);
         let stored = store

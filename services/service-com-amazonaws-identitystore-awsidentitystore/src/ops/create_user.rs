@@ -222,23 +222,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateUserErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
+        // The identity store a create is addressed to has to be one this account HAS: an
+        // identity store is not a resource this API creates — it is the store OF an IAM
+        // Identity Center instance — so a well-formed id Identity Center does not report
+        // is refused with the modelled not-found and nothing is created anywhere. Asked
+        // BEFORE this service's state is locked, because the answer comes from another
+        // service's records.
+        let store_key =
+            crate::state::addressed_store_key(&*self.engine, &input.identity_store_id)
+                .map_err(CreateUserErrorModeled::ResourceNotFoundException)?;
         let mut state = state.lock();
-        // `IdentityStoreId` is CALLER-CHOSEN and no modelled operation creates an
-        // identity store, so a well-formed id of this account names the store the client
-        // has and the create is served in it, its record registered on first use. Two
-        // refusals, both modelled: an identifier naming no store this emulator serves
-        // (another account's) is the 404, and one more store than this emulator records
-        // is the 402 — neither creates anything.
+        // The store's RECORD is registered on first use; the only refusal left here is one
+        // more store record than this emulator keeps, the modelled 402.
         let store = state
-            .register_store_mut(&input.identity_store_id)
-            .map_err(|refusal| match refusal {
-                crate::state::StoreWriteRefusal::NotFound(not_found) => {
-                    CreateUserErrorModeled::ResourceNotFoundException(not_found)
-                }
-                crate::state::StoreWriteRefusal::AtCapacity(quota) => {
-                    CreateUserErrorModeled::ServiceQuotaExceededException(quota)
-                }
-            })?;
+            .register_store_mut(&store_key)
+            .map_err(CreateUserErrorModeled::ServiceQuotaExceededException)?;
 
         // The store holds a bounded number of users. The operation models
         // `ServiceQuotaExceededException` for "the request would cause the number of

@@ -195,14 +195,22 @@ async fn deleting_a_group_removes_it_with_its_memberships_and_frees_its_display_
         // The group itself is gone.
         assert_gone(&router, STORE, &group, case).await;
         // So is every membership that pointed at it: the record is no longer in the
-        // store, so even a delete naming its id finds nothing.
+        // store, so a `DescribeGroupMembership` naming its id finds nothing — while the
+        // `@idempotent` delete of that same id removes nothing and succeeds.
         for membership in &victim_memberships {
             refused(
                 &router,
-                "DeleteGroupMembership",
+                "DescribeGroupMembership",
                 json!({ "IdentityStoreId": STORE, "MembershipId": membership }),
                 NOT_FOUND,
                 "ResourceNotFoundException",
+                case,
+            )
+            .await;
+            ok(
+                &router,
+                "DeleteGroupMembership",
+                json!({ "IdentityStoreId": STORE, "MembershipId": membership }),
                 case,
             )
             .await;

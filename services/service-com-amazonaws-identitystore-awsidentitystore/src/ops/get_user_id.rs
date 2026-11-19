@@ -170,16 +170,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetUserIdErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
+        // The store has to be one this account HAS; one with no record yet holds no user,
+        // so the USER is then what is missing, while an identifier naming no identity
+        // store of this account is reported as `IDENTITY_STORE`.
+        let store_key =
+            crate::state::addressed_store_key(&*self.engine, &input.identity_store_id)
+                .map_err(GetUserIdErrorModeled::ResourceNotFoundException)?;
         // A read: the store is RESOLVED and nothing is written, so resolving a user id
         // can never change what a later caller sees.
         let state = state.lock();
-        // The identity store the request names: every well-formed `IdentityStoreId` of
-        // this account names a store this emulator serves — one with no record yet holds
-        // no user, so the USER is then what is missing — while an identifier naming no
-        // store it can serve (another account's) is reported as `IDENTITY_STORE`.
-        let store = state
-            .resolve_store(&input.identity_store_id)
-            .map_err(GetUserIdErrorModeled::ResourceNotFoundException)?;
+        let store = state.resolve_store(&store_key);
         let user = selector.find(&store).ok_or_else(|| selector.not_found())?;
 
         Ok(GetUserIdOutput {

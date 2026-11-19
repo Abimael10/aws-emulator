@@ -118,10 +118,16 @@ async fn a_resource_this_service_does_not_hold_is_a_client_fault_naming_its_clas
             "GROUP",
         ),
         (
-            "a membership id nothing minted, on a delete",
-            "DeleteGroupMembership",
-            json!({ "IdentityStoreId": STORE, "MembershipId": UNMINTED_ID }),
-            "GROUP_MEMBERSHIP",
+            "a user id nothing minted, on an update",
+            "UpdateUser",
+            json!({
+                "IdentityStoreId": STORE,
+                "UserId": UNMINTED_ID,
+                "Operations": [
+                    { "AttributePath": "title", "AttributeValue": "never applied" },
+                ],
+            }),
+            "USER",
         ),
         (
             "a member id no user carries, on a create",

@@ -189,16 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             )
         })?;
+        // The store has to be one this account HAS; one with no record yet holds no
+        // membership, so the MEMBERSHIP is then what is missing. An identifier naming no
+        // identity store of this account is reported as `IDENTITY_STORE`.
+        let store_key =
+            crate::state::addressed_store_key(&*self.engine, &input.identity_store_id)
+                .map_err(GetGroupMembershipIdErrorModeled::ResourceNotFoundException)?;
         // A read: the store is RESOLVED and nothing is written, so resolving a
         // membership id can never change what a later caller sees.
         let state = state.lock();
-        // Any well-formed `IdentityStoreId` of this account names the store the caller
-        // has; one with no record yet holds no membership, so the MEMBERSHIP is then what
-        // is missing. An identifier naming no store this emulator serves (another
-        // account's) is reported as `IDENTITY_STORE`.
-        let store = state
-            .resolve_store(&input.identity_store_id)
-            .map_err(GetGroupMembershipIdErrorModeled::ResourceNotFoundException)?;
+        let store = state.resolve_store(&store_key);
 
         // The membership is named by the pair that identifies it, not by an id: the
         // modelled `MemberId` union declares exactly one variant, `UserId`

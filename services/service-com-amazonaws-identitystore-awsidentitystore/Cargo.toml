@@ -13,6 +13,11 @@ engine = { workspace = true }
 # `sts:GetCallerIdentity` reports for the credential the request was signed with
 # (see `crate::state::caller_principal`).
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# IAM Identity Center's own instance records: an identity store is the store OF an
+# Identity Center instance and is not creatable through this API, so which stores this
+# account has is asked of that service rather than decided here
+# (see `crate::state::identity_center`).
+service-com-amazonaws-ssoadmin-swbexternalservice = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

@@ -23,16 +23,20 @@ use crate::ops::types::{
     ServiceQuotaExceededException, ValidationException,
 };
 
+/// Which identity stores this account HAS, asked of the service that owns IAM Identity
+/// Center instances. A submodule because it reaches ANOTHER service's state, which is a
+/// concern of its own.
+mod identity_center;
+pub use identity_center::*;
+
 /// The identity store this emulator ADVERTISES through IAM Identity Center: the store of
 /// the instance `sso-admin` seeds.
 ///
 /// This API models no operation that creates an identity store — in AWS one comes with an
-/// IAM Identity Center instance — so a store is the deployment the CALLER names, and this
-/// service serves every well-formed `IdentityStoreId` it is addressed to rather than one
-/// privileged value (see
-/// [`ComAmazonawsIdentitystoreAwsidentitystoreState::resolve_store`]). This constant is
-/// not a gate: it is the one store that has a record before anything is written, because
-/// another service points clients at it.
+/// IAM Identity Center instance — so WHICH stores exist is Identity Center's answer, not
+/// this service's ([`addressed_store_key`]). This constant is not a gate: it is the one
+/// store that has a record before anything is written, because another service points
+/// clients at it.
 ///
 /// The VALUE is the identity store of the instance `sso-admin` seeds, which its
 /// `InstanceMetadata$IdentityStoreId` reports to a client
@@ -791,9 +795,9 @@ pub struct ComAmazonawsIdentitystoreAwsidentitystoreState {
     /// [`identity_store_key`] derives from an `IdentityStoreId`.
     ///
     /// An entry is a store something has written to, not the set of stores that exist:
-    /// this API models no operation that creates an identity store, so a store is the
-    /// deployment the CALLER names and an entry appears the first time a write is
-    /// addressed to one ([`ComAmazonawsIdentitystoreAwsidentitystoreState::resolve_store_mut`]).
+    /// WHICH identity stores exist is IAM Identity Center's answer ([`addressed_store_key`]),
+    /// and an entry here appears the first time a resource is CREATED in one
+    /// ([`ComAmazonawsIdentitystoreAwsidentitystoreState::register_store_mut`]).
     /// A store with no entry holds nothing, which is what a read of it reports.
     ///
     /// The map is BOUNDED on both axes: an entry is added only by
@@ -821,21 +825,6 @@ impl Default for ComAmazonawsIdentitystoreAwsidentitystoreState {
         );
         Self { stores }
     }
-}
-
-/// Why a write could not be addressed to the identity store it named.
-///
-/// The two refusals a CREATE can meet at the resolution seam, each the modelled error for
-/// its case: an identifier that names no store this emulator serves, and this emulator
-/// already recording [`MAX_IDENTITY_STORES`] stores. Every operation that registers a
-/// store models both (`ResourceNotFoundException` and `ServiceQuotaExceededException`
-/// 402), so the handler maps this onto its own error channel.
-#[derive(Debug)]
-pub enum StoreWriteRefusal {
-    /// The identifier names no store this emulator serves.
-    NotFound(ResourceNotFoundException),
-    /// One more identity store would not fit inside [`MAX_IDENTITY_STORES`].
-    AtCapacity(ServiceQuotaExceededException),
 }
 
 /// The identity store one request resolved to, as a read sees it.
@@ -867,34 +856,22 @@ impl ::std::ops::Deref for ResolvedStore<'_> {
 }
 
 impl ComAmazonawsIdentitystoreAwsidentitystoreState {
-    /// The store `identifier` names, for a REPORTING operation, or the modelled
-    /// `ResourceNotFoundException` when the identifier can name no store this emulator
-    /// serves.
+    /// The store `store_key` names, for a REPORTING operation.
     ///
-    /// Every operation of this API takes an `IdentityStoreId`, the id is CALLER-CHOSEN,
-    /// and no modelled operation creates an identity store: a client reads the id of the
-    /// store it has out of its own environment (`sso-admin`'s `ListInstances`, its
-    /// configuration), so this emulator serves whatever well-formed id the caller names
-    /// rather than deciding existence from a value of its own. The modelled `@pattern`
-    /// decides well-formedness and the boundary validator has already applied it before a
-    /// handler runs, so what is left to refuse here is an identifier that names a store
-    /// of ANOTHER ACCOUNT ([`identity_store_key`]), which is not a store this emulator
-    /// serves however its id ends.
+    /// `store_key` is the key [`addressed_store_key`] resolved the request's
+    /// `IdentityStoreId` to, so whether the store EXISTS has already been decided, once,
+    /// outside this struct — a read cannot gate differently from a write.
     ///
     /// A store with no record yet resolves to the empty [`ResolvedStore::Unwritten`], so
     /// a read of it reports the nothing it holds — a listing with no entries, the
-    /// not-found of the RESOURCE a describe names — and writes nothing. This is the one place
-    /// resolution happens, so a read cannot gate differently from a write.
-    pub fn resolve_store(
-        &self,
-        identifier: &str,
-    ) -> Result<ResolvedStore<'_>, ResourceNotFoundException> {
-        let key =
-            identity_store_key(identifier).ok_or_else(|| identity_store_not_found(identifier))?;
-        Ok(match self.stores.get(&key) {
+    /// not-found of the RESOURCE a describe names — and writes nothing.
+    pub fn resolve_store(&self, store_key: &str) -> ResolvedStore<'_> {
+        match self.stores.get(store_key) {
             Some(store) => ResolvedStore::Held(store),
-            None => ResolvedStore::Unwritten(Box::new(IdentityStoreData::new(key))),
-        })
+            None => ResolvedStore::Unwritten(Box::new(IdentityStoreData::new(
+                store_key.to_string(),
+            ))),
+        }
     }
 
     /// [`Self::resolve_store`] for a write that CHANGES WHAT IS ALREADY THERE: the
@@ -906,16 +883,11 @@ impl ComAmazonawsIdentitystoreAwsidentitystoreState {
     /// `@idempotent` delete owes for a resource that is already gone). That keeps a
     /// request which stores nothing from leaving a permanent entry behind, so the size of
     /// [`Self::stores`] follows the stores resources were actually CREATED in.
-    ///
-    /// The refusal is the same one every path answers: an identifier naming no store this
-    /// emulator serves.
     pub fn resolve_recorded_store_mut(
         &mut self,
-        identifier: &str,
-    ) -> Result<Option<&mut IdentityStoreData>, ResourceNotFoundException> {
-        let key =
-            identity_store_key(identifier).ok_or_else(|| identity_store_not_found(identifier))?;
-        Ok(self.stores.get_mut(&key))
+        store_key: &str,
+    ) -> Option<&mut IdentityStoreData> {
+        self.stores.get_mut(store_key)
     }
 
     /// [`Self::resolve_store`] for a write that STORES A NEW RESOURCE: the store's
@@ -923,30 +895,28 @@ impl ComAmazonawsIdentitystoreAwsidentitystoreState {
     ///
     /// A create has to persist into the store it names, so the record is materialised
     /// here rather than left to a later call — registering it is how the first
-    /// `CreateUser`/`CreateGroup` addressed to a caller-named store becomes readable.
+    /// `CreateUser`/`CreateGroup` addressed to a store this account has becomes readable.
     /// This is the ONLY path that adds an entry, which is what bounds the map: an entry
     /// appears only where a resource was created, and never past
     /// [`MAX_IDENTITY_STORES`] — reached through the `ServiceQuotaExceededException`
     /// every operation that calls this models.
     ///
-    /// Both paths refuse the same identifiers, so a write cannot be accepted where a read
-    /// is refused.
+    /// `store_key` has already been resolved by [`addressed_store_key`], so a store this
+    /// account does not have never reaches this: a create cannot conjure one.
     pub fn register_store_mut(
         &mut self,
-        identifier: &str,
-    ) -> Result<&mut IdentityStoreData, StoreWriteRefusal> {
-        let key = identity_store_key(identifier)
-            .ok_or_else(|| StoreWriteRefusal::NotFound(identity_store_not_found(identifier)))?;
-        if !self.stores.contains_key(&key) && self.stores.len() >= MAX_IDENTITY_STORES {
-            return Err(StoreWriteRefusal::AtCapacity(quota_exceeded(format!(
+        store_key: &str,
+    ) -> Result<&mut IdentityStoreData, ServiceQuotaExceededException> {
+        if !self.stores.contains_key(store_key) && self.stores.len() >= MAX_IDENTITY_STORES {
+            return Err(quota_exceeded(format!(
                 "this emulator already records {} identity stores",
                 self.stores.len()
-            ))));
+            )));
         }
         Ok(self
             .stores
-            .entry(key.clone())
-            .or_insert_with(|| IdentityStoreData::new(key)))
+            .entry(store_key.to_string())
+            .or_insert_with(|| IdentityStoreData::new(store_key.to_string())))
     }
 
     /// The RECORD this emulator holds for the store `identifier` names, or `None` when it
@@ -965,45 +935,90 @@ pub fn modeled_list<T: Clone>(items: &[T]) -> Option<Vec<T>> {
     (!items.is_empty()).then(|| items.to_vec())
 }
 
-/// The fixed message [`identity_store_not_found`] carries, so a handler and a test
-/// name one text.
-pub const IDENTITY_STORE_NOT_FOUND_MESSAGE: &str = "Identity store not found";
+/// The store key the request's `IdentityStoreId` names, or the modelled
+/// `ResourceNotFoundException` when it names no identity store this account HAS.
+///
+/// Resolution happens ONCE, here, before a handler touches this service's state, so a
+/// read cannot gate differently from a write and a create cannot register a store that
+/// does not exist. Two things make an identifier name no store:
+///
+/// * its FORM puts the store outside this account — the ARN of a store another account
+///   owns ([`identity_store_key`]);
+/// * IAM Identity Center ANSWERS that the account holds no such identity store
+///   ([`identity_store_is_absent`]). An identity store is not caller-creatable through
+///   this API: it is the identity store OF an Identity Center instance, so the stores the
+///   account has are the ones that service reports — and while it has decided nothing, the
+///   store a client names is the one its own environment gave it and is served.
+///
+/// The key is the bare id both the id and ARN forms of one store reduce to, so everything
+/// downstream addresses one store by one key.
+///
+/// LOCK ORDER: this takes the Identity Center state's lock and releases it before
+/// returning, so a handler calls it BEFORE locking this service's own state and the two
+/// locks are never held together.
+pub fn addressed_store_key<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    identifier: &str,
+) -> Result<String, ResourceNotFoundException> {
+    let key = identity_store_key(identifier).ok_or_else(|| identity_store_not_found(identifier))?;
+    if identity_store_is_absent(engine, &key) {
+        return Err(identity_store_not_found(identifier));
+    }
+    Ok(key)
+}
+
+/// The fixed part of the message [`identity_store_not_found`] carries, so a handler and a
+/// test name one text.
+pub const IDENTITY_STORE_NOT_FOUND_MESSAGE_PREFIX: &str =
+    "IdentityStore not present for IdentityStoreId: ";
+
+/// The message a `ResourceNotFoundException` for an identity store carries: the recorded
+/// fixed text followed by the `IdentityStoreId` the request sent, verbatim.
+///
+/// Unlike the per-class constants a RESOURCE not-found states
+/// ([`ResourceKind::not_found_message`]), this class's recorded message names the value
+/// the caller addressed — which is the caller's own input, not a store this emulator
+/// holds — so it is taken from the request rather than from state.
+pub fn identity_store_not_found_message(identifier: &str) -> String {
+    format!("{IDENTITY_STORE_NOT_FOUND_MESSAGE_PREFIX}{identifier}")
+}
 
 /// The `ResourceNotFoundException` for an identifier that names no identity store this
-/// emulator serves.
+/// account has (see [`addressed_store_key`]). `IDENTITY_STORE` is the `ResourceType`
+/// value for this kind (`RESOURCE_TYPE_VALUES`).
 ///
-/// Reached only for an identifier whose FORM puts the store outside this emulator — the
-/// ARN of a store owned by another account ([`identity_store_key`]) — because a
-/// well-formed id of this account's partition names the caller's own store, which is
-/// served (see [`ComAmazonawsIdentitystoreAwsidentitystoreState::resolve_store`]).
-/// `IDENTITY_STORE` is the `ResourceType` value for this kind (`RESOURCE_TYPE_VALUES`).
-///
-/// The MESSAGE is this class's constant, like every other not-found message this service
-/// states: it carries nothing of the request, so it neither varies per call nor
-/// discloses which store identifier was probed. No recording pins the text for this
-/// class, so it follows the form the recorded classes use; `ResourceId` still reports
-/// the store the request named, which is the modelled member for exactly that.
+/// `ResourceId` is left unset: the modelled member is a `ResourceId` (pattern
+/// `^(arn:…)?([0-9a-f]{10}-|)[A-Fa-f0-9]{8}-…$`, from
+/// `smithy_query(query="shape",shape="ResourceId")`), which an `IdentityStoreId` is not —
+/// and a not-found refusal of this service names the resource CLASS rather than echoing
+/// the identifier that was probed.
 pub fn identity_store_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         resource_type: Some("IDENTITY_STORE".to_string()),
-        resource_id: identity_store_key(identifier),
+        resource_id: None,
         reason: None,
-        message: Some(IDENTITY_STORE_NOT_FOUND_MESSAGE.to_string()),
+        message: Some(identity_store_not_found_message(identifier)),
         request_id: Some(new_request_id()),
     }
 }
 
-/// The `ResourceNotFoundException` for a resource this store does not hold.
+/// The `ResourceNotFoundException` for a resource this store does not hold, named by the
+/// operation's own resource id.
 ///
 /// The MESSAGE is the fixed one its resource class carries
 /// ([`ResourceKind::not_found_message`]) rather than a sentence built from the
 /// lookup: the service's message is a constant per class, so it neither varies per
-/// request nor tells the caller which id was probed. `resource_type` and
-/// `resource_id` are the modelled members for naming the resource, and keep doing so.
-pub fn not_found(kind: ResourceKind, resource_id: &str) -> ResourceNotFoundException {
+/// request nor tells the caller which id was probed.
+///
+/// `ResourceId` is left unset for the same reason the message carries no id: a recorded
+/// not-found of this class reports the `ResourceType` and the message and nothing else,
+/// so the probed identifier is not echoed back in a typed member — the way
+/// [`not_found_by_alternate_identifier`] already answers for a resource named by another
+/// identifier.
+pub fn not_found(kind: ResourceKind) -> ResourceNotFoundException {
     ResourceNotFoundException {
         resource_type: Some(kind.resource_type().to_string()),
-        resource_id: Some(resource_id.to_string()),
+        resource_id: None,
         reason: None,
         message: Some(kind.not_found_message().to_string()),
         request_id: Some(new_request_id()),
@@ -1034,8 +1049,8 @@ pub fn member_not_found(member_user_id: &str) -> ResourceNotFoundException {
 /// The membership class's own fixed message, which [`not_found`] already supplies
 /// through [`ResourceKind::not_found_message`]; this stays as the named entry point its
 /// handlers call.
-pub fn membership_not_found(membership_id: &str) -> ResourceNotFoundException {
-    not_found(ResourceKind::Membership, membership_id)
+pub fn membership_not_found() -> ResourceNotFoundException {
+    not_found(ResourceKind::Membership)
 }
 
 /// AWS's fixed `ResourceNotFoundException` message for a membership id the identity

@@ -182,21 +182,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             )
         })?;
+        // The identity store the create is addressed to has to be one this account HAS
+        // (an identity store is the store OF an IAM Identity Center instance, not a
+        // resource this API creates). Asked BEFORE this service's state is locked,
+        // because the answer comes from another service's records.
+        let store_key =
+            crate::state::addressed_store_key(&*self.engine, &input.identity_store_id)
+                .map_err(CreateGroupMembershipErrorModeled::ResourceNotFoundException)?;
         let mut state = state.lock();
-        // A well-formed `IdentityStoreId` of this account names the store the client has;
-        // an identifier naming no store this emulator serves is refused. Both ENDS of the
-        // membership must already exist in that store, so a store with no record yet
-        // holds neither: the GROUP is then what is missing, and no record is registered
-        // for a create that cannot be served.
+        // Both ENDS of the membership must already exist in that store, so a store with
+        // no record yet holds neither: the GROUP is then what is missing, and no record is
+        // registered for a create that cannot be served.
         let group_not_found = || {
             CreateGroupMembershipErrorModeled::ResourceNotFoundException(crate::state::not_found(
                 crate::state::ResourceKind::Group,
-                &input.group_id,
             ))
         };
         let store = state
-            .resolve_recorded_store_mut(&input.identity_store_id)
-            .map_err(CreateGroupMembershipErrorModeled::ResourceNotFoundException)?
+            .resolve_recorded_store_mut(&store_key)
             .ok_or_else(group_not_found)?;
 
         // Both ends of the membership must already exist in this identity store. The

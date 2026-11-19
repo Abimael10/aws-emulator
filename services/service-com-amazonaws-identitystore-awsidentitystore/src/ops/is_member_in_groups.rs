@@ -166,10 +166,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             IsMemberInGroupsErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
+        // The store has to be one this account HAS; an identifier naming no identity
+        // store of this account is reported as `IDENTITY_STORE`.
+        let store_key =
+            crate::state::addressed_store_key(&*self.engine, &input.identity_store_id)
+                .map_err(IsMemberInGroupsErrorModeled::ResourceNotFoundException)?;
         let state = state.lock();
-        let store = state
-            .resolve_store(&input.identity_store_id)
-            .map_err(IsMemberInGroupsErrorModeled::ResourceNotFoundException)?;
+        let store = state.resolve_store(&store_key);
 
         // The modelled `MemberId` union declares exactly one variant, `UserId`, so the
         // member is always a user of this store — and a user the store does not hold is

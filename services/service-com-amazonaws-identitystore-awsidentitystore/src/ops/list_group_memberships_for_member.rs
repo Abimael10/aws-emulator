@@ -172,6 +172,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             )
         })?;
+        // The store has to be one this account HAS; an identifier naming no identity
+        // store of this account is the missing resource, reported as `IDENTITY_STORE`.
+        let store_key =
+            crate::state::addressed_store_key(&*self.engine, &input.identity_store_id)
+                .map_err(ListGroupMembershipsForMemberErrorModeled::ResourceNotFoundException)?;
         // A read: the store is RESOLVED and nothing is written, so listing a
         // member's memberships can never change what a later caller sees.
         let state = state.lock();
@@ -191,12 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::member_not_found(member),
             )
         };
-        // Any well-formed `IdentityStoreId` of this account names the store the caller
-        // has; an identifier naming no store this emulator serves is the missing
-        // resource, reported as `IDENTITY_STORE`.
-        let store = state
-            .resolve_store(&input.identity_store_id)
-            .map_err(ListGroupMembershipsForMemberErrorModeled::ResourceNotFoundException)?;
+        let store = state.resolve_store(&store_key);
         let member_key = crate::state::resource_key(member);
         if !store.users.contains_key(&member_key) {
             return Err(not_found().into());

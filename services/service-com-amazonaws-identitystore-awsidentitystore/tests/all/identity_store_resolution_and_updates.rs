@@ -3,11 +3,13 @@
 //! Four rules about addressing an identity store and changing what it holds, driven
 //! end to end over HTTP through [`crate::harness`]:
 //!
-//! 1. every operation RESOLVES the `IdentityStoreId` it is given as the store the
-//!    CALLER names — any value the modelled pattern admits is served, holding whatever
-//!    has been written to it — and only an identifier naming a store of another account
-//!    is refused, with the modelled `ResourceNotFoundException` having written
-//!    nothing;
+//! 1. every operation RESOLVES the `IdentityStoreId` it is given against the stores this
+//!    account HAS — while IAM Identity Center has decided nothing about the account's
+//!    enablement, as in this suite's router, that is any value the modelled pattern
+//!    admits, holding whatever has been written to it — and an identifier naming a store
+//!    of another account is refused, with the modelled `ResourceNotFoundException`
+//!    having written nothing (the Identity-Center-backed half of the rule is
+//!    `crate::caller_named_identity_stores`);
 //! 2. a user this API creates reports a `UserStatus`, and it is `ENABLED`;
 //! 3. a resource created or updated through the API records the IDENTIFIER of the
 //!    principal whose credential the request was signed with, so a describe reports
@@ -113,11 +115,12 @@ enum Addressed {
     AnotherAccountsStore,
 }
 
-/// Rule 1: every operation resolves the `IdentityStoreId` it is given as the store the
-/// CALLER names — any value the modelled pattern admits names a store this emulator
-/// serves, holding whatever has been written to it — and only an identifier that names a
-/// store of another account is refused, with the modelled
-/// `ResourceNotFoundException` naming `IDENTITY_STORE`.
+/// Rule 1: every operation resolves the `IdentityStoreId` it is given against the stores
+/// this account has — with the account's Identity Center enablement undecided, as here,
+/// any value the modelled pattern admits names a store this emulator serves, holding
+/// whatever has been written to it — and an identifier that names a store of another
+/// account is refused, with the modelled `ResourceNotFoundException` naming
+/// `IDENTITY_STORE`.
 ///
 /// Rows span the forms the modelled pattern admits (`smithy_query(query="shape",
 /// shape="IdentityStoreId")`: `d-` + 10 hex or a UUID, each optionally written as
@@ -297,10 +300,11 @@ async fn every_well_formed_identity_store_id_is_served_and_only_another_accounts
                 // `DisplayName`/`UserName` claim is scoped to one store, so no row
                 // collides with another.
                 ("CreateGroup" | "CreateUser", _) => &[200],
+                // `DeleteGroupMembership` is `@idempotent`: a membership id no store
+                // holds is removed nowhere and answered with the empty success.
+                ("DeleteGroupMembership", _) => &[200],
                 // The seed store holds the resources the other requests name: the
-                // membership create repeats a pair it already holds (409) and the delete
-                // names a membership nothing created (the not-found).
-                ("DeleteGroupMembership", Addressed::SeedStore) => &[NOT_FOUND],
+                // membership create repeats a pair it already holds (409).
                 ("CreateGroupMembership", Addressed::SeedStore) => &[200, 409],
                 (_, Addressed::SeedStore) => &[200],
                 // Any other store is served and holds none of those resources, so each

@@ -3018,6 +3018,39 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
                 && instance_arn == self::instance_arn(SEED_INSTANCE_ID))
     }
 
+    /// The identity stores this ACCOUNT holds — one per instance — or `None` while
+    /// nothing has decided the account's enablement, when the account's identity stores
+    /// are not yet knowable.
+    ///
+    /// An identity store is not a resource any API creates: one comes with an IAM Identity
+    /// Center instance and is reported as that instance's
+    /// `InstanceMetadata$IdentityStoreId`, so the stores the account has are exactly the
+    /// stores of the instances it holds. The identity-store service asks this before it
+    /// serves a request addressed to a store id, which is why the answer lives HERE, beside
+    /// the instances it is derived from, rather than being re-derived from a store id's
+    /// form.
+    ///
+    /// `None` — nothing is decided yet — while the account's enablement is still open
+    /// ([`Self::ambient_instance_enabled`], and no instance stored): a caller that has not
+    /// consulted Identity Center at all addresses the store ITS OWN environment names, and
+    /// this emulator knows of no instance to contradict it. Once a request has settled the
+    /// account's enablement — an ambient instance handed out, an instance created, or an
+    /// instance deleted — the answer is the set of stores those instances have, which may
+    /// be empty.
+    ///
+    /// A READ: it reports what the account holds at this instant and enables nothing.
+    pub fn account_identity_store_ids(&self) -> Option<Vec<String>> {
+        if !self.ambient_instance_enabled && self.instances.is_empty() {
+            return None;
+        }
+        Some(
+            self.instances
+                .values()
+                .map(|instance| instance.identity_store_id.clone())
+                .collect(),
+        )
+    }
+
     /// The instance `instance_arn` names, for a handler that updates it.
     pub fn instance_mut(&mut self, instance_arn: &str) -> Option<&mut Instance> {
         self.instances.get_mut(instance_arn)

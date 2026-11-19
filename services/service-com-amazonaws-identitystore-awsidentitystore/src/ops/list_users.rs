@@ -174,13 +174,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListUsersErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
+        // The store has to be one this account HAS; one with no record yet reports the
+        // nothing it holds.
+        let store_key =
+            crate::state::addressed_store_key(&*self.engine, &input.identity_store_id)
+                .map_err(ListUsersErrorModeled::ResourceNotFoundException)?;
         // `@readonly`: the store is RESOLVED and nothing is written, so listing users
-        // can never change what a later caller sees — a store with no record yet reports
-        // the nothing it holds.
+        // can never change what a later caller sees.
         let state = state.lock();
-        let store = state
-            .resolve_store(&input.identity_store_id)
-            .map_err(ListUsersErrorModeled::ResourceNotFoundException)?;
+        let store = state.resolve_store(&store_key);
 
         // The (deprecated) `Filters` member carries at most one filter — the modelled
         // `Filters` list is `length 0..1` — which restricts the listing to the users

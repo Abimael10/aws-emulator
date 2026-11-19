@@ -115,21 +115,32 @@ async fn deleting_a_user_removes_that_user_and_nothing_else() {
         )
         .await;
 
-        // Deleting it again finds nothing to delete.
-        let body = refused(
+        // Deleting it again removes nothing and answers the same empty success:
+        // `DeleteUser` is `@idempotent`, so a repeat of a delete that already happened
+        // is a no-op, and the user stays absent.
+        let repeated = ok(
             &router,
             "DeleteUser",
             json!({ "IdentityStoreId": STORE, "UserId": users[victim].clone() }),
-            NOT_FOUND,
-            "ResourceNotFoundException",
             case,
         )
         .await;
-        assert_eq!(
-            body["ResourceType"].as_str().unwrap_or_default(),
-            "USER",
-            "case {case:?}: expected the modelled USER ResourceType, got {body}"
+        assert_empty_body(&repeated, case);
+        assert!(
+            !user_exists(&router, STORE, &users[victim]).await,
+            "case {case:?}: expected user {} to stay absent after a repeated delete",
+            users[victim]
         );
+        for (index, user) in users.iter().enumerate() {
+            let present = user_exists(&router, STORE, user).await;
+            assert_eq!(
+                present,
+                index != victim,
+                "case {case:?}: expected the repeated delete to change nothing: user \
+                 {index} (id {user}) present={}, got present={present}",
+                index != victim
+            );
+        }
     }
 }
 
@@ -350,23 +361,37 @@ async fn a_delete_accepts_every_form_of_the_user_id_and_refuses_one_it_does_not_
         );
     }
 
-    // And the rows a delete cannot satisfy: the id names no user of the store the
-    // request names, or the store itself does not exist.
+    // And the rows a delete does not store anything for. An `@idempotent` delete of a
+    // user id the store does not hold is the empty success; only an identity store this
+    // account does not have is the modelled not-found.
     let router = emulator();
     let known = create_user(&router, STORE, "alice", "seed").await;
-    let missing: [(&str, Value, &str); 3] = [
+    let idempotent: [(&str, Value); 2] = [
         (
             "an uncreated id in the live store",
             json!({ "IdentityStoreId": STORE, "UserId": UNCREATED_ID }),
-            "USER",
         ),
         (
-            "a known user, through a store that does not exist",
+            "the same uncreated id again",
+            json!({ "IdentityStoreId": STORE, "UserId": UNCREATED_ID }),
+        ),
+    ];
+    for (case, request) in idempotent {
+        let body = ok(&router, "DeleteUser", request, case).await;
+        assert_empty_body(&body, case);
+        assert!(
+            !user_exists(&router, STORE, UNCREATED_ID).await,
+            "case {case:?}: expected the uncreated id to stay absent after a no-op delete"
+        );
+    }
+    let missing: [(&str, Value, &str); 2] = [
+        (
+            "a known user, through a store this account does not have",
             json!({ "IdentityStoreId": MISSING_STORE, "UserId": known.clone() }),
             "IDENTITY_STORE",
         ),
         (
-            "a store that does not exist",
+            "a store this account does not have",
             json!({ "IdentityStoreId": MISSING_STORE, "UserId": UNCREATED_ID }),
             "IDENTITY_STORE",
         ),
@@ -388,10 +413,10 @@ async fn a_delete_accepts_every_form_of_the_user_id_and_refuses_one_it_does_not_
         );
     }
     // A failed delete is not a write: the user is still in the store that holds it, and
-    // the store that does not exist still does not.
+    // the store this account does not have still does not exist.
     assert!(
         user_exists(&router, STORE, &known).await,
-        "expected the known user {known} to survive three failed deletes"
+        "expected the known user {known} to survive the refused deletes"
     );
     refused(
         &router,

@@ -16,7 +16,9 @@
 //!    violation inside a STRUCT element keeps its own deeper path;
 //! 3. a `ResourceNotFoundException` and a `ConflictException` carry the fixed message of
 //!    the resource class / uniqueness claim, with nothing of the request and no id of a
-//!    resource the caller did not name in it.
+//!    resource the caller did not name in it — and a not-found by resource id echoes no
+//!    identifier in its typed members either, while the identity-store class names the
+//!    `IdentityStoreId` the request sent, as AWS words that one.
 //!
 //! The harness is the lifecycle suite's: every case goes through `MultiServiceRouter`
 //! as a client's `POST /` with `X-Amz-Target: AWSIdentityStore.<Operation>`.
@@ -424,16 +426,6 @@ async fn a_resource_that_is_not_there_is_reported_with_its_classs_fixed_message(
             vec![UNKNOWN_ID.to_string()],
         ),
         (
-            // The identifier names a store of another account, which is no store this
-            // emulator serves, so the refusal names THAT class: there is no store to
-            // look a group up in.
-            "a group id under another account's store",
-            "DescribeGroup",
-            json!({ "IdentityStoreId": MISSING_STORE, "GroupId": OTHER_UNKNOWN_ID }),
-            "Identity store not found",
-            vec![OTHER_UNKNOWN_ID.to_string()],
-        ),
-        (
             "a group named by its ARN",
             "DescribeGroup",
             json!({
@@ -476,7 +468,7 @@ async fn a_resource_that_is_not_there_is_reported_with_its_classs_fixed_message(
             // The membership class's constant is the recorded sentence that names the
             // identity store ("pool") and the request member, not the id probed.
             "a membership id no create minted",
-            "DeleteGroupMembership",
+            "DescribeGroupMembership",
             json!({ "IdentityStoreId": STORE, "MembershipId": UNKNOWN_ID }),
             identitystore::state::MEMBERSHIP_NOT_FOUND_MESSAGE,
             vec![UNKNOWN_ID.to_string()],
@@ -543,13 +535,6 @@ async fn a_resource_that_is_not_there_is_reported_with_its_classs_fixed_message(
             vec![UNKNOWN_ID.to_string(), group.clone()],
         ),
         (
-            "an identity store of another account",
-            "ListUsers",
-            json!({ "IdentityStoreId": MISSING_STORE }),
-            "Identity store not found",
-            vec!["d-9999999999".to_string()],
-        ),
-        (
             // Named through `MemberId` on a listing too: one member end, one constant,
             // whichever operation asks.
             "a member id no user carries, on a membership listing",
@@ -581,6 +566,195 @@ async fn a_resource_that_is_not_there_is_reported_with_its_classs_fixed_message(
             assert!(
                 !message.contains(&id),
                 "case {case:?}: expected the probed id to stay out of the message, got {message:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_not_found_by_resource_id_carries_only_its_class_and_no_probed_identifier() {
+    let router = emulator();
+    let case = "the resources a typed-member case needs";
+    let user = create_user(&router, STORE, "typed-members", case).await;
+    let group = create_group(&router, STORE, "typed-members", case).await;
+
+    // Rows are the reads BY RESOURCE ID, each named in every form the modelled
+    // `ResourceId` admits (the bare UUID, the resource's ARN, the id in upper case —
+    // `smithy_query(query="shape",shape="ResourceId")`), plus a live id read through the
+    // wrong resource class. Whatever the row, the refusal reports the resource CLASS and
+    // its fixed message and echoes no identifier: `ResourceId` and `Reason` are absent.
+    type IdForm = fn(&str, &str) -> String;
+    let forms: [(&str, IdForm); 3] = [
+        ("the bare id", |_kind, id| id.to_string()),
+        ("the resource ARN", |kind, id| {
+            format!("arn:aws:identitystore:::{kind}/{id}")
+        }),
+        ("the id in upper case", |_kind, id| {
+            id.to_ascii_uppercase()
+        }),
+    ];
+    // (operation, the id member, the resource segment of the ARN form, the
+    // `ResourceType` the class reports, its fixed message, the ids to probe)
+    type NotFoundClass = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        [&'static str; 2],
+    );
+    let classes: [NotFoundClass; 3] = [
+        (
+            "DescribeUser",
+            "UserId",
+            "user",
+            "USER",
+            "User not found",
+            [UNKNOWN_ID, OTHER_UNKNOWN_ID],
+        ),
+        (
+            "DescribeGroup",
+            "GroupId",
+            "group",
+            "GROUP",
+            "Group not found",
+            [UNKNOWN_ID, OTHER_UNKNOWN_ID],
+        ),
+        (
+            "DescribeGroupMembership",
+            "MembershipId",
+            "membership",
+            "GROUP_MEMBERSHIP",
+            identitystore::state::MEMBERSHIP_NOT_FOUND_MESSAGE,
+            [UNKNOWN_ID, OTHER_UNKNOWN_ID],
+        ),
+    ];
+
+    for (operation, member, segment, resource_type, message, unknown_ids) in classes {
+        // A live id of ANOTHER class is a row too: the resource that class does not hold
+        // is still reported without the identifier that was probed.
+        let live_of_another_class = if operation == "DescribeUser" {
+            group.clone()
+        } else {
+            user.clone()
+        };
+        let probes: Vec<String> = unknown_ids
+            .iter()
+            .map(|id| (*id).to_string())
+            .chain(std::iter::once(live_of_another_class))
+            .collect();
+        for probe in probes {
+            for (form_case, form) in forms {
+                let case = format!("{operation} by {form_case} ({probe})");
+                let (status, code, body) = call(
+                    &router,
+                    operation,
+                    json!({ "IdentityStoreId": STORE, member: form(segment, &probe) }),
+                )
+                .await;
+                assert_eq!(
+                    (status, code.ends_with("ResourceNotFoundException")),
+                    (NOT_FOUND, true),
+                    "case {case:?}: expected {NOT_FOUND} ResourceNotFoundException, \
+                     got {status} {code} with {body}"
+                );
+                assert_eq!(
+                    body["ResourceType"].as_str().unwrap_or_default(),
+                    resource_type,
+                    "case {case:?}: expected ResourceType {resource_type:?}, got {body}"
+                );
+                assert_eq!(
+                    crate::harness::error_message(&body),
+                    message,
+                    "case {case:?}: expected the class's fixed message {message:?}, \
+                     got {body}"
+                );
+                assert!(
+                    body.get("ResourceId").unwrap_or(&Value::Null).is_null(),
+                    "case {case:?}: expected no ResourceId on a not-found by resource \
+                     id, got {body}"
+                );
+                assert!(
+                    body.get("Reason").unwrap_or(&Value::Null).is_null(),
+                    "case {case:?}: expected no Reason outside the KMS case, got {body}"
+                );
+            }
+        }
+    }
+}
+
+/// An identity store the account does not have is named in its own refusal: the recorded
+/// fixed text followed by the `IdentityStoreId` the request sent, verbatim.
+#[tokio::test]
+async fn an_identity_store_the_account_does_not_have_is_named_in_its_refusal() {
+    let router = emulator();
+
+    // The FIXED text of this class's recorded message, written out here rather than read
+    // from the implementation, so a change in the wording fails this suite. The variable
+    // part is the `IdentityStoreId` of the request each row makes.
+    const RECORDED_PREFIX: &str = "IdentityStore not present for IdentityStoreId: ";
+
+    // Rows differ along the FORM of an identifier that names a store outside this
+    // account — the partition spelling, the owning account, and whether the id is the
+    // `d-` or the UUID form the modelled pattern admits — and along which operation is
+    // addressed to it.
+    let identifiers: Vec<(&str, String)> = vec![
+        ("another account's d- store", MISSING_STORE.to_string()),
+        (
+            "another account's store in UUID form",
+            "arn:aws:identitystore::210987654321:identitystore/11111111-2222-3333-4444-555555555555"
+                .to_string(),
+        ),
+        (
+            "another account's store in another partition",
+            format!("arn:aws-cn:identitystore::555555555555:identitystore/{STORE}"),
+        ),
+    ];
+    let requests: [(&str, &str); 4] = [
+        ("ListUsers", "{}"),
+        ("ListGroups", "{}"),
+        ("DescribeUser", UNKNOWN_ID),
+        ("CreateGroup", "a group never stored"),
+    ];
+
+    for (identifier_case, identifier) in &identifiers {
+        for (operation, argument) in requests {
+            let case = format!("{identifier_case} / {operation}");
+            let mut request = json!({ "IdentityStoreId": identifier });
+            match operation {
+                "DescribeUser" => request["UserId"] = json!(argument),
+                "CreateGroup" => request["DisplayName"] = json!(argument),
+                _ => {}
+            }
+            let (status, code, body) = call(&router, operation, request).await;
+            assert_eq!(
+                (status, code.ends_with("ResourceNotFoundException")),
+                (NOT_FOUND, true),
+                "case {case:?}: expected {NOT_FOUND} ResourceNotFoundException, \
+                 got {status} {code} with {body}"
+            );
+            assert_eq!(
+                body["ResourceType"].as_str().unwrap_or_default(),
+                "IDENTITY_STORE",
+                "case {case:?}: expected the identity store to be the missing resource, \
+                 got {body}"
+            );
+            assert_eq!(
+                crate::harness::error_message(&body),
+                format!("{RECORDED_PREFIX}{identifier}"),
+                "case {case:?}: expected the store class's recorded message to name the \
+                 requested IdentityStoreId, got {body}"
+            );
+            assert_eq!(
+                crate::harness::error_message(&body),
+                identitystore::state::identity_store_not_found_message(identifier),
+                "case {case:?}: expected the handler and the crate's one renderer of that \
+                 message to agree, got {body}"
+            );
+            assert!(
+                body.get("ResourceId").unwrap_or(&Value::Null).is_null(),
+                "case {case:?}: expected no ResourceId: an IdentityStoreId is not a \
+                 modelled ResourceId, got {body}"
             );
         }
     }

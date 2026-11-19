@@ -5,12 +5,21 @@
 //!
 //! The rule under test: this API models no operation that creates an identity store — in
 //! AWS one comes with an IAM Identity Center instance, and a client reads its id out of
-//! its own environment — so every operation serves whatever `IdentityStoreId` the
-//! modelled constraints admit, each store holding exactly what has been written to it,
-//! and the modelled `ResourceNotFoundException` naming `IDENTITY_STORE` is reserved
-//! for an identifier that names a store this emulator cannot serve at all (an ARN
-//! carrying another account). A value the modelled `@length`/`@pattern` refuse is a
-//! `ValidationException`, never a not-found.
+//! its own environment — so WHICH stores exist is Identity Center's answer:
+//!
+//! * while Identity Center has decided nothing about this account's enablement, every
+//!   `IdentityStoreId` the modelled constraints admit names the store the caller's own
+//!   environment gave it and is served, each store holding exactly what has been written
+//!   to it;
+//! * once Identity Center holds an instance, the stores the account has are those
+//!   instances' identity stores, and any other well-formed id is refused with the
+//!   modelled `ResourceNotFoundException` naming `IDENTITY_STORE` — having created
+//!   nothing ([`an_identity_store_the_account_does_not_have_is_refused`]);
+//! * an identifier that names a store this emulator cannot serve at all (an ARN carrying
+//!   another account) is refused either way.
+//!
+//! A value the modelled `@length`/`@pattern` refuse is a `ValidationException`, never a
+//! not-found.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: the FORM
 //! of the identifier (`d-` + 10 hex or a UUID, bare or as the store's ARN, in either
@@ -64,6 +73,54 @@ async fn create_group(
         case,
     )
     .await
+}
+
+/// A router with this service AND IAM Identity Center mounted on ONE engine, so the
+/// identity stores this service serves are the stores that service's own instances have.
+fn emulator_with_identity_center() -> MultiServiceRouter {
+    let engine: std::sync::Arc<engine::InMemoryEngine> =
+        std::sync::Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    // Signatures are not what this suite is about; the request still carries a SigV4
+    // credential scope, which is what routes it to its service.
+    router.set_request_authentication(false);
+    router.register_service(identitystore::EmulatedService::new(engine.clone()));
+    router.register_service(
+        service_com_amazonaws_ssoadmin_swbexternalservice::EmulatedService::new(engine),
+    );
+    router
+}
+
+/// One `awsJson1_1` call to IAM Identity Center, which must answer 200, as its body.
+///
+/// Its own front door: the `sso` signing name in the credential scope is what routes the
+/// request there, and `SWBExternalService` is its `X-Amz-Target` prefix.
+async fn identity_center_call(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("SWBExternalService.{operation}"))
+        .header("host", "sso.us-east-1.amazonaws.com")
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=AKIDIDENTITYCENTER/20260101/us-east-1\
+             /sso/aws4_request, SignedHeaders=host;x-amz-target, Signature=00",
+        )
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(&body).expect("the request body serializes"),
+        ))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = response.into_body();
+    assert_eq!(
+        status,
+        200,
+        "expected Identity Center's {operation} to answer 200, got {status} with {}",
+        String::from_utf8_lossy(&payload)
+    );
+    serde_json::from_slice(&payload).unwrap_or(Value::Null)
 }
 
 /// `ListGroups` in the store `identity_store_id` names, as the whole response body.
@@ -395,10 +452,163 @@ async fn a_store_nothing_has_written_to_is_served_and_holds_nothing() {
     }
 }
 
+/// The rule once Identity Center HAS answered: the stores this account has are the
+/// identity stores of the IAM Identity Center instances it holds, and any other
+/// well-formed `IdentityStoreId` is refused with the modelled
+/// `ResourceNotFoundException` naming `IDENTITY_STORE`, having created nothing.
+///
+/// Both services are mounted on ONE engine, so the store this suite serves is the store
+/// `sso-admin`'s own `ListInstances` reports rather than a value restated here. Rows
+/// differ along the FORM of the refused id (both forms the modelled pattern admits, bare
+/// and as this account's ARN) and along which operation is addressed to it — a create, a
+/// read, a listing, an update and a delete.
+#[tokio::test]
+async fn an_identity_store_the_account_does_not_have_is_refused() {
+    let router = emulator_with_identity_center();
+
+    // The account's own identity store, as a client reads it: Identity Center's
+    // `ListInstances`. Asking it is also what settles the account's enablement, so from
+    // here on the stores the account has are knowable.
+    let instances = identity_center_call(&router, "ListInstances", json!({})).await;
+    let listed = instances["Instances"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        listed.len(),
+        1,
+        "expected Identity Center to report the account's one instance, got {instances}"
+    );
+    let account_store = listed[0]["IdentityStoreId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !account_store.is_empty(),
+        "expected the instance to report its IdentityStoreId, got {instances}"
+    );
+
+    // The store Identity Center reports IS served, in both forms that name it: this is
+    // the store a client has.
+    for (case, identifier) in [
+        ("the account's store", account_store.clone()),
+        (
+            "the account's store by ARN",
+            store_arn("aws", &account_id(), &account_store),
+        ),
+    ] {
+        let created = create_group(&router, &identifier, &format!("group-for-{case}"), case).await;
+        assert_eq!(
+            string(&created, "IdentityStoreId", case),
+            account_store,
+            "case {case:?}: expected the account's store to be echoed, got {created}"
+        );
+    }
+
+    // Every other well-formed id names no identity store this account has.
+    let absent: Vec<(&str, String)> = vec![
+        ("a d- id of no instance", "d-9999999999".to_string()),
+        (
+            "a second d- id of no instance",
+            "d-0123456789".to_string(),
+        ),
+        ("an id in UUID form", UUID_FORM.to_string()),
+        (
+            "an id of no instance, by this account's ARN",
+            store_arn("aws", &account_id(), "d-abcdef0123"),
+        ),
+        (
+            "the seeded value under another account",
+            store_arn("aws", OTHER_ACCOUNT, &account_store),
+        ),
+    ];
+    for (case, identity_store_id) in &absent {
+        for operation in [
+            "CreateGroup",
+            "CreateUser",
+            "DescribeUser",
+            "ListGroups",
+            "UpdateGroup",
+            "DeleteUser",
+        ] {
+            let case = format!("{case} / {operation}");
+            let unminted = "a1b2c3d4-5678-90ab-cdef-999999999999";
+            let request = match operation {
+                "CreateGroup" => json!({
+                    "IdentityStoreId": identity_store_id,
+                    "DisplayName": "never stored",
+                }),
+                "CreateUser" => json!({
+                    "IdentityStoreId": identity_store_id,
+                    "UserName": "never-stored",
+                }),
+                "DescribeUser" => {
+                    json!({ "IdentityStoreId": identity_store_id, "UserId": unminted })
+                }
+                "UpdateGroup" => json!({
+                    "IdentityStoreId": identity_store_id,
+                    "GroupId": unminted,
+                    "Operations": [{ "AttributePath": "description", "AttributeValue": "d" }],
+                }),
+                "DeleteUser" => {
+                    json!({ "IdentityStoreId": identity_store_id, "UserId": unminted })
+                }
+                _ => json!({ "IdentityStoreId": identity_store_id }),
+            };
+            let body = refused(
+                &router,
+                operation,
+                request,
+                NOT_FOUND,
+                "ResourceNotFoundException",
+                &case,
+            )
+            .await;
+            assert_eq!(
+                body["ResourceType"].as_str().unwrap_or_default(),
+                "IDENTITY_STORE",
+                "case {case:?}: expected the identity store to be the missing resource, \
+                 got {body}"
+            );
+            assert_eq!(
+                crate::harness::error_message(&body),
+                identitystore::state::identity_store_not_found_message(identity_store_id),
+                "case {case:?}: expected the refusal to name the requested \
+                 IdentityStoreId, got {body}"
+            );
+        }
+
+        // The refused creates stored nothing: the store is still unknown, and the group
+        // and user they named are nowhere — not in it, and not in the account's store.
+        let case = format!("{case} / nothing stored");
+        let listed = ok(
+            &router,
+            "ListGroups",
+            json!({ "IdentityStoreId": account_store.clone() }),
+            &case,
+        )
+        .await;
+        let names: Vec<&str> = listed["Groups"]
+            .as_array()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter_map(|group| group["DisplayName"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !names.contains(&"never stored"),
+            "case {case:?}: expected the refused create to have stored nothing, \
+             got {names:?}"
+        );
+    }
+}
+
 /// The rule's NEGATIVE side: an identifier that names a store this emulator cannot serve
 /// is the modelled not-found, and one the modelled constraints refuse is a
 /// `ValidationException` — so a not-found is never the answer to a well-formed id of this
-/// account.
+/// account while Identity Center has decided nothing.
 #[tokio::test]
 async fn only_a_store_outside_this_account_is_not_found_and_a_bad_value_is_a_400() {
     let router = emulator();
@@ -564,18 +774,6 @@ async fn a_write_that_stores_nothing_records_no_identity_store() {
     // a store nothing has written to, and what each must answer there.
     let probes: Vec<(&str, Value, u16, &str)> = vec![
         (
-            "DeleteUser",
-            json!({ "UserId": "a1b2c3d4-5678-90ab-cdef-999999999999" }),
-            NOT_FOUND,
-            "USER",
-        ),
-        (
-            "DeleteGroupMembership",
-            json!({ "MembershipId": "a1b2c3d4-5678-90ab-cdef-999999999999" }),
-            NOT_FOUND,
-            "GROUP_MEMBERSHIP",
-        ),
-        (
             "UpdateUser",
             json!({
                 "UserId": "a1b2c3d4-5678-90ab-cdef-999999999999",
@@ -632,21 +830,36 @@ async fn a_write_that_stores_nothing_records_no_identity_store() {
         }
     }
 
-    // `DeleteGroup` is `@idempotent`, so its answer there is the empty success — which
-    // also stores nothing.
-    for round in 0..rounds {
-        let store = format!("d-e00000{round:04x}");
-        let case = format!("DeleteGroup in {store}");
-        ok(
-            &router,
+    // The delete family is `@idempotent`, so its answer in a store that holds nothing is
+    // the empty success — which also stores nothing.
+    let idempotent: [(&str, Value); 3] = [
+        (
             "DeleteGroup",
-            json!({
-                "IdentityStoreId": store,
-                "GroupId": "a1b2c3d4-5678-90ab-cdef-999999999999",
-            }),
-            &case,
-        )
-        .await;
+            json!({ "GroupId": "a1b2c3d4-5678-90ab-cdef-999999999999" }),
+        ),
+        (
+            "DeleteUser",
+            json!({ "UserId": "a1b2c3d4-5678-90ab-cdef-999999999999" }),
+        ),
+        (
+            "DeleteGroupMembership",
+            json!({ "MembershipId": "a1b2c3d4-5678-90ab-cdef-999999999999" }),
+        ),
+    ];
+    for (probe, (operation, body)) in idempotent.iter().enumerate() {
+        for round in 0..rounds {
+            let store = format!("d-e{probe:01x}0000{round:04x}");
+            let case = format!("{operation} in {store}");
+            let mut request = body.clone();
+            request["IdentityStoreId"] = json!(store);
+            let answered = ok(&router, operation, request, &case).await;
+            assert_eq!(
+                answered,
+                json!({}),
+                "case {case:?}: expected the idempotent delete's empty success, \
+                 got {answered}"
+            );
+        }
     }
 
     // None of those writes recorded a store, so the whole bound is still free: a create

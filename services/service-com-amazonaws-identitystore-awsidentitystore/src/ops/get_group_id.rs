@@ -171,6 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request whether or not the named store exists.
         let lookup = GroupLookup::from_identifier(&input.alternate_identifier)?;
 
+        // The store has to be one this account HAS; an identifier naming no identity
+        // store of this account is the missing resource, reported as `IDENTITY_STORE`
+        // rather than as a missing group. Resolved before this service's state is
+        // locked, because the answer comes from another service's records.
+        let store_key =
+            crate::state::addressed_store_key(&*self.engine, &input.identity_store_id)
+                .map_err(GetGroupIdErrorModeled::ResourceNotFoundException)?;
+
         // A read: the store is RESOLVED and nothing is written, so resolving a group id
         // can never change what a later caller sees — a store with no record yet
         // resolves to the empty store and holds no group to report.
@@ -180,13 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::not_found_by_alternate_identifier(crate::state::ResourceKind::Group),
             )
         };
-        // The identity store the request names: every well-formed `IdentityStoreId` of
-        // this account names a store this emulator serves, and an identifier that names
-        // no store it can serve at all (another account's) is the missing resource,
-        // reported as `IDENTITY_STORE` rather than as a missing group.
-        let store = state
-            .resolve_store(&input.identity_store_id)
-            .map_err(GetGroupIdErrorModeled::ResourceNotFoundException)?;
+        let store = state.resolve_store(&store_key);
         let group = lookup.find(&store).ok_or_else(not_found)?;
 
         Ok(GetGroupIdOutput {

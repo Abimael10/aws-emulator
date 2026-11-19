@@ -594,6 +594,109 @@ async fn memberships_paginate_in_creation_order() {
     }
 }
 
+/// Every delete of this family is `@idempotent`
+/// (`smithy_query(query="operation",operation="DeleteUser,DeleteGroup,DeleteGroupMembership")`:
+/// `"idempotent": true`, each with an empty output shape), so a delete of a resource the
+/// store no longer holds removes nothing and answers HTTP 200 with an empty body — and
+/// the resource stays absent, which its reader still reports as not found.
+#[tokio::test]
+async fn an_idempotent_delete_of_a_resource_the_store_no_longer_holds_is_an_empty_success() {
+    let router = emulator();
+    let case = "idempotent deletes";
+    // A well-formed `ResourceId` nothing ever minted, so the answer comes from state and
+    // not from the boundary validator.
+    const UNMINTED: &str = "0123abcd-4567-89ab-cdef-0123456789ab";
+
+    // One live resource of each class, so each row can be deleted and then re-deleted.
+    let user = create_user(&router, STORE, "idempotent-delete", case).await;
+    let group = create_group(&router, STORE, "idempotent-delete", case).await;
+    let membership = string(
+        &ok(
+            &router,
+            "CreateGroupMembership",
+            json!({
+                "IdentityStoreId": STORE,
+                "GroupId": group.clone(),
+                "MemberId": { "UserId": user.clone() },
+            }),
+            case,
+        )
+        .await,
+        "MembershipId",
+        case,
+    );
+
+    // (the delete, its id member, the ARN resource segment, the live id, the reader that
+    // reports the resource, its id member)
+    let classes: [(&str, &str, &str, String, &str); 3] = [
+        (
+            "DeleteGroupMembership",
+            "MembershipId",
+            "membership",
+            membership,
+            "DescribeGroupMembership",
+        ),
+        ("DeleteUser", "UserId", "user", user, "DescribeUser"),
+        ("DeleteGroup", "GroupId", "group", group, "DescribeGroup"),
+    ];
+
+    for (operation, member, segment, live, reader) in classes {
+        // Rows differ along WHICH id is deleted and in which of the forms the modelled
+        // `ResourceId` admits: one nothing ever minted (bare, as the resource's ARN and
+        // in upper case), then the live resource — whose first delete removes it and
+        // whose second and third are the no-op this rule is about.
+        let rows: [(&str, String); 6] = [
+            ("an id nothing minted", UNMINTED.to_string()),
+            (
+                "an id nothing minted, by ARN",
+                format!("arn:aws:identitystore:::{segment}/{UNMINTED}"),
+            ),
+            (
+                "an id nothing minted, in upper case",
+                UNMINTED.to_ascii_uppercase(),
+            ),
+            ("the live resource", live.clone()),
+            ("the same resource again", live.clone()),
+            (
+                "the same resource again, by ARN",
+                format!("arn:aws:identitystore:::{segment}/{live}"),
+            ),
+        ];
+        for (row, identifier) in rows {
+            let row_case = format!("{operation}: {row}");
+            let answered = ok(
+                &router,
+                operation,
+                json!({ "IdentityStoreId": STORE, member: identifier }),
+                &row_case,
+            )
+            .await;
+            assert_eq!(
+                answered,
+                json!({}),
+                "case {row_case:?}: expected the empty success of an idempotent delete, \
+                 got {answered}"
+            );
+        }
+
+        // The repeats changed nothing: the resource is still absent, and its reader
+        // still reports it as not found.
+        let body = refused(
+            &router,
+            reader,
+            json!({ "IdentityStoreId": STORE, member: live.clone() }),
+            NOT_FOUND,
+            "ResourceNotFoundException",
+            &format!("{operation}: the deleted resource stays absent"),
+        )
+        .await;
+        assert!(
+            body.get("ResourceId").unwrap_or(&Value::Null).is_null(),
+            "case {operation:?}: expected no ResourceId on the reader's refusal, got {body}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn deleting_a_membership_removes_it_from_the_group_listing() {
     let router = emulator();
@@ -645,16 +748,26 @@ async fn deleting_a_membership_removes_it_from_the_group_listing() {
             "case {case:?}: expected the surviving memberships in creation order, got {remaining:?}"
         );
 
-        // Deleting it again finds nothing to delete.
-        refused(
+        // Deleting it again removes nothing and answers the same empty success:
+        // `DeleteGroupMembership` is `@idempotent`.
+        let repeated = ok(
             &router,
             "DeleteGroupMembership",
-            json!({ "IdentityStoreId": STORE, "MembershipId": removed_id }),
-            NOT_FOUND,
-            "ResourceNotFoundException",
+            json!({ "IdentityStoreId": STORE, "MembershipId": removed_id.clone() }),
             case,
         )
         .await;
+        assert_eq!(
+            repeated,
+            json!({}),
+            "case {case:?}: expected a repeated DeleteGroupMembership to answer an empty body"
+        );
+        let after_repeat =
+            walk_memberships(&router, STORE, &group, Some(MAX_RESULTS_MIN), case).await;
+        assert_eq!(
+            after_repeat, expected,
+            "case {case:?}: expected the repeated delete to change nothing, got {after_repeat:?}"
+        );
 
         // And the pair is free again: the same user can rejoin the group.
         ok(
@@ -681,7 +794,7 @@ async fn a_membership_needs_both_of_its_ends_and_cannot_be_created_twice() {
     // so the refusal comes from state, not from the boundary validator.
     let missing = "0123abcd-4567-89ab-cdef-0123456789ab";
 
-    let rows: [(&str, Value, u16, &str); 5] = [
+    let rows: [(&str, Value, u16, &str); 4] = [
         (
             "unknown group",
             json!({
@@ -718,23 +831,31 @@ async fn a_membership_needs_both_of_its_ends_and_cannot_be_created_twice() {
             NOT_FOUND,
             "ResourceNotFoundException",
         ),
-        (
-            "unknown membership on a delete",
-            json!({ "IdentityStoreId": STORE, "MembershipId": missing }),
-            NOT_FOUND,
-            "ResourceNotFoundException",
-        ),
     ];
     let operations = [
         "CreateGroupMembership",
         "CreateGroupMembership",
         "CreateGroupMembership",
         "ListGroupMemberships",
-        "DeleteGroupMembership",
     ];
     for ((row_case, request, status, error), operation) in rows.into_iter().zip(operations) {
         refused(&router, operation, request, status, error, row_case).await;
     }
+
+    // A delete is `@idempotent`: a membership id the store does not hold is removed
+    // nowhere and answered with the empty success rather than refused.
+    let deleted = ok(
+        &router,
+        "DeleteGroupMembership",
+        json!({ "IdentityStoreId": STORE, "MembershipId": missing }),
+        "unknown membership on a delete",
+    )
+    .await;
+    assert_eq!(
+        deleted,
+        json!({}),
+        "case \"unknown membership on a delete\": expected the empty success, got {deleted}"
+    );
 
     // The pair is unique: a repeat of a membership that exists conflicts.
     let created = ok(
@@ -1421,12 +1542,12 @@ async fn a_membership_the_store_does_not_hold_is_reported_as_not_found() {
                 "case {row:?}: expected the service's fixed not-found message, got {message:?}"
             );
         } else {
-            // The store-not-found message is this class's constant, which
-            // `crate::state` states once.
+            // The store-not-found message is the recorded fixed text followed by the
+            // `IdentityStoreId` the request sent, which `crate::state` renders once.
             assert_eq!(
                 message,
-                identitystore::state::IDENTITY_STORE_NOT_FOUND_MESSAGE,
-                "case {row:?}: expected the identity store's fixed not-found message, \
+                identitystore::state::identity_store_not_found_message(store),
+                "case {row:?}: expected the identity store's not-found message, \
                  got {message:?}"
             );
         }

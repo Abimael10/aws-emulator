@@ -20,19 +20,22 @@ const TARGET_PREFIX: &str = "AWSIdentityStore";
 /// The identity store this emulator ADVERTISES: the store IAM Identity Center
 /// provisioned for the instance `sso-admin` seeds, which is what `ListInstances` points a
 /// client at (`identitystore::state::SEED_IDENTITY_STORE_ID`). Most suites address this
-/// one, but it is not privileged: this API creates no identity store, so every
-/// well-formed `IdentityStoreId` of this account names the store its caller has and is
-/// served.
+/// one. This API creates no identity store, so WHICH stores exist is Identity Center's
+/// answer: in a router with no Identity Center request behind it — as here — the account's
+/// enablement is undecided and every well-formed `IdentityStoreId` of this account names
+/// the store its caller has and is served (see
+/// [`crate::caller_named_identity_stores`]).
 pub const STORE: &str = identitystore::state::SEED_IDENTITY_STORE_ID;
 
-/// An `IdentityStoreId` the model admits that names NO identity store this emulator
-/// serves, so a call addressed to it is refused rather than served.
+/// An `IdentityStoreId` the model admits that names NO identity store of this account, so
+/// a call addressed to it is refused rather than served, whatever Identity Center has
+/// decided.
 ///
 /// It is an ARN, because the ARN form is what carries the OWNING ACCOUNT: this one names
 /// a store of ANOTHER account (`210987654321`, which is not
 /// `engine::emulator_account_id()`), which is not a store this emulator holds however its
-/// id ends. A bare `d-…` id would NOT do: the modelled pattern is all that decides
-/// well-formedness, and a well-formed id of this account names the caller's own store.
+/// id ends. A bare `d-…` id is refused only once Identity Center has answered which
+/// stores the account has, which these suites' router never asks.
 pub const MISSING_STORE: &str =
     "arn:aws:identitystore::210987654321:identitystore/d-9999999999";
 

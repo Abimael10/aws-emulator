@@ -179,15 +179,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteGroupErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
+        // The identity store the request names has to be one this account HAS: that is
+        // the only thing a delete reports as not found. Resolved before the state is
+        // locked, because the answer comes from another service's records.
+        let store_key =
+            crate::state::addressed_store_key(&*self.engine, &input.identity_store_id)
+                .map_err(DeleteGroupErrorModeled::ResourceNotFoundException)?;
         let mut state = state.lock();
-        // The store is RESOLVED but never REGISTERED: a delete stores nothing. An
-        // identifier naming no store this emulator serves is refused; a store it holds no
-        // record of holds no such group either, which `@idempotent` owes the same empty
-        // success it owes for a group that is already gone (below).
-        let Some(store) = state
-            .resolve_recorded_store_mut(&input.identity_store_id)
-            .map_err(DeleteGroupErrorModeled::ResourceNotFoundException)?
-        else {
+        // The store is RESOLVED but never REGISTERED: a delete stores nothing. A store
+        // this emulator holds no record of holds no such group either, which
+        // `@idempotent` owes the same empty success it owes for a group that is already
+        // gone (below).
+        let Some(store) = state.resolve_recorded_store_mut(&store_key) else {
             return Ok(DeleteGroupOutput {});
         };
         // Both the bare id and the resource's ARN name the same group.
