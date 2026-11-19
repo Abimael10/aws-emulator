@@ -467,7 +467,7 @@ fn detail_block(body: &str, list_tag: &str, name_tag: &str, name: &str) -> Strin
 /// `MaxItems` is the published maximum (`maxItemsType` is range 1..1000), which is
 /// above the fixture's entity count, so the assertions about WHAT is reported are
 /// separate from the assertions about paging.
-async fn report(router: &MultiServiceRouter, case: &str, filter: &[&str]) -> String {
+pub(crate) async fn report(router: &MultiServiceRouter, case: &str, filter: &[&str]) -> String {
     let mut params = vec![param("MaxItems", "1000")];
     for (position, entity_type) in filter.iter().enumerate() {
         params.push(param(

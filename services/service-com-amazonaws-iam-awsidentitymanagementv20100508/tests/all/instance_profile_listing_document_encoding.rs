@@ -20,6 +20,11 @@
 //! for whatever the account holds now, which is why a trust policy REPLACED after the
 //! profiles were bound is asserted too.
 //!
+//! The READER dimension of that same projection — that every reader of an embedded role,
+//! the account-wide configuration report included, reports ONE encoded text — is the sibling
+//! suite `tests/all/instance_profile_embedded_role_document_readers.rs`, which drives the
+//! fixture, the constants and the paginated walk defined here rather than copies of them.
+//!
 //! Every assertion drives a `MultiServiceRouter` holding this service over one shared
 //! `InMemoryEngine`, exactly as the production router does, so what is under test is the HTTP
 //! behaviour of documents that were PERSISTED by the write operations, never a handler called
@@ -59,7 +64,7 @@ struct TrustPolicyCase {
 
 /// The compact trust policy of an instance profile's role: the EC2 service principal, which
 /// is the one such a role carries.
-const CANONICAL_TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
+pub(crate) const CANONICAL_TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
 
 /// [`CANONICAL_TRUST_POLICY`] percent-encoded, written out here character by character rather
 /// than computed, so this suite pins the TRANSFORM and not whatever the service happens to
@@ -67,7 +72,7 @@ const CANONICAL_TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"E
 /// `.`, `_` and `~`) is the `%XX` of its byte — `{` is `%7B`, `"` is `%22`, `:` is `%3A`, `,`
 /// is `%2C`, `[` is `%5B`, `]` is `%5D` — while `2012-10-17` and `ec2.amazonaws.com` carry
 /// only unreserved characters and so stand as they are.
-const CANONICAL_TRUST_POLICY_ENCODED: &str = "%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D";
+pub(crate) const CANONICAL_TRUST_POLICY_ENCODED: &str = "%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D";
 
 /// The path the fixture's profiles live under, so a listing can be filtered to exactly them.
 const FIXTURE_PATH: &str = "/encoding/";
@@ -161,7 +166,7 @@ fn assert_unreserved_runs_are_literal(case: &str, stored: &str, reported: &str) 
 /// The decode is what IAM's own contract tells a caller to do, and it is the half that makes
 /// this more than a shape check: a document carrying a literal `+` or `%` only survives it
 /// when the member really was encoded.
-fn assert_reported_document(case: &str, stored: &str, reported: &str) {
+pub(crate) fn assert_reported_document(case: &str, stored: &str, reported: &str) {
     assert_percent_encoded(case, reported);
     assert_unreserved_runs_are_literal(case, stored, reported);
     let decoded = ::smithy_server_runtime::percent_decode(reported);
@@ -173,7 +178,12 @@ fn assert_reported_document(case: &str, stored: &str, reported: &str) {
 }
 
 /// Create a role whose trust policy is `submitted`, asserting the fixture create succeeded.
-async fn create_role(router: &MultiServiceRouter, case: &str, name: &str, submitted: &str) {
+pub(crate) async fn create_role(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    submitted: &str,
+) {
     let (status, body) = call(
         router,
         "CreateRole",
@@ -188,7 +198,12 @@ async fn create_role(router: &MultiServiceRouter, case: &str, name: &str, submit
 
 /// Create the instance profile `profile` under `path` and bind `role` into it, asserting both
 /// fixture writes succeeded.
-async fn bind_profile(router: &MultiServiceRouter, profile: &str, path: &str, role: &str) {
+pub(crate) async fn bind_profile(
+    router: &MultiServiceRouter,
+    profile: &str,
+    path: &str,
+    role: &str,
+) {
     let (status, body) = call(
         router,
         "CreateInstanceProfile",
@@ -231,7 +246,7 @@ async fn with_fixture_profiles() -> MultiServiceRouter {
 /// Each fixture profile holds exactly one role, so a page carries one document per profile
 /// and the two member lists pair up position by position — which the walk asserts before it
 /// pairs them.
-async fn walk(
+pub(crate) async fn walk(
     router: &MultiServiceRouter,
     listing: &str,
     params: &[(String, String)],
@@ -511,7 +526,7 @@ fn trust_policy_of_statements(statements: usize) -> String {
 /// Every profile a single page of `listing` reports, as the `(InstanceProfileName,
 /// AssumeRolePolicyDocument)` pairs it carries — unlike [`walk`], without requiring one
 /// document per profile, which is what lets a profile holding NO role be asserted.
-async fn page(
+pub(crate) async fn page(
     router: &MultiServiceRouter,
     listing: &str,
     params: &[(String, String)],
