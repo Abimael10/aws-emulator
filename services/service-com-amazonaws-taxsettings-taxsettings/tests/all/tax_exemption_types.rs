@@ -13,9 +13,10 @@
 //!
 //! The tables below therefore span the whole catalog (pinned LITERALLY in
 //! [`PINNED_CATALOG`], and cross-checked against the published
-//! [`TAX_EXEMPTION_TYPE_CATALOG`] so neither can drift from the other, which
-//! covers entries no issue cited) and the forms a request for a member-less input
-//! shape can take, with literal spot checks on documented categories.
+//! [`TAX_EXEMPTION_TYPE_CATALOG`] so neither can drift from the other), the forms
+//! a request for a member-less input shape can take, and — since the same
+//! collection is what `PutTaxExemption` admits a jurisdiction against — the states
+//! one entry names against the states another one names.
 //!
 //! The harness (`emulator`, `emulator_with_engine`, `call`,
 //! `hold_validations_open`) lives in `tax_registration_lifecycle.rs`; nothing
@@ -24,11 +25,12 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::ops::types::TaxExemptionType;
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    tax_exemption_type_catalog, TAX_EXEMPTION_TYPE_CATALOG,
+    tax_exemption_type_catalog, ERROR_CODE_FIELD_VALIDATION_FAILED,
+    EXEMPTION_AUTHORITY_NOT_SUPPORTED, TAX_EXEMPTION_TYPE_CATALOG,
 };
 
 use crate::tax_registration_lifecycle::{
-    call, emulator, emulator_with_engine, hold_validations_open, Answer,
+    call, emulator, emulator_with_engine, field_list, hold_validations_open, Answer,
 };
 
 /// The `taxExemptionTypes` a call reported.
@@ -66,21 +68,22 @@ pub(crate) fn wire_form(entry: &TaxExemptionType) -> Value {
     })
 }
 
-/// The states a pinned entry applies in, by their two-letter postal codes: the
-/// charitable entry's own list, as a recorded `GetTaxExemptionTypes` response
-/// publishes it.
+/// The states the `501C` entry applies in, by their two-letter postal codes: that
+/// entry's own list, as a recorded `GetTaxExemptionTypes` response publishes it.
 const CHARITABLE_ORGANIZATION_STATES: &[&str] = &[
     "AZ", "CO", "CT", "DC", "FL", "GA", "ID", "IL", "IN", "KS", "KY", "LA", "MA", "MD", "MI", "MN",
     "MO", "MS", "ND", "NE", "NJ", "NV", "NY", "OH", "OK", "PA", "RI", "SC", "SD", "TN", "TX", "UT",
     "VA", "VT", "WI", "WV", "WY",
 ];
 
-/// The states every other pinned entry applies in: the US jurisdictions that
-/// levy a general sales tax, which is the widest list a category can carry.
-const SALES_TAX_STATES: &[&str] = &[
-    "AL", "AR", "AZ", "CA", "CO", "CT", "DC", "FL", "GA", "HI", "IA", "ID", "IL", "IN", "KS", "KY",
-    "LA", "MA", "MD", "ME", "MI", "MN", "MO", "MS", "NC", "ND", "NE", "NJ", "NM", "NV", "NY", "OH",
-    "OK", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VA", "VT", "WA", "WI", "WV", "WY",
+/// The states the `Agriculture Production` entry applies in: that entry's own
+/// list, as a recorded `GetTaxExemptionTypes` response publishes it — a different
+/// set of states from the entry above (it carries PR, and carries neither CA nor
+/// DC), which is why no entry may be given the list another one carries.
+const AGRICULTURE_PRODUCTION_STATES: &[&str] = &[
+    "AL", "AR", "AZ", "CO", "CT", "FL", "GA", "HI", "IA", "ID", "IL", "IN", "KS", "KY", "LA", "MA",
+    "MD", "ME", "MI", "MN", "MO", "MS", "NC", "NE", "NJ", "NV", "NY", "OH", "OK", "PA", "PR", "RI",
+    "SC", "TN", "TX", "UT", "VA", "VT", "WA", "WI", "WV", "WY",
 ];
 
 /// The catalog this service publishes, pinned LITERALLY:
@@ -88,44 +91,20 @@ const SALES_TAX_STATES: &[&str] = &[
 ///
 /// Written out here rather than read from `state::TAX_EXEMPTION_TYPE_CATALOG`, so a
 /// regression in the published collection — an emptied catalog, a dropped entry, a
-/// reworded or duplicated description, a jurisdiction that moved — fails this test
-/// instead of being restated by it. What AWS pins is the first entry outright (its
-/// token and its per-state list) and the per-state SHAPE of every entry's
-/// `applicableJurisdictions`; the wording of the remaining entries and the order
-/// are this emulator's own, as `state::TAX_EXEMPTION_TYPE_CATALOG` documents, and
-/// this table is what holds both stable.
+/// reworded or duplicated description, a jurisdiction that moved, an entry given a
+/// country-wide default list rather than its own — fails this test instead of being
+/// restated by it.
+///
+/// Every row is an entry of the collection the service publishes, taken member for
+/// member from a recorded `GetTaxExemptionTypes` response: a type is named by one
+/// short token carried identically in `displayName` and `description`, and each
+/// entry carries its own per-state `applicableJurisdictions`.
 const PINNED_CATALOG: &[(&str, &str, &[&str])] = &[
     ("501C", "501C", CHARITABLE_ORGANIZATION_STATES),
     (
-        "Direct Pay Permit",
-        "Holder of a direct pay permit that remits sales and use tax directly to the taxing \
-         authority",
-        SALES_TAX_STATES,
-    ),
-    (
-        "Educational Institution",
-        "Accredited school, college or university exempt from sales and use tax",
-        SALES_TAX_STATES,
-    ),
-    (
-        "Federal Government",
-        "US federal government body exempt from sales and use tax",
-        SALES_TAX_STATES,
-    ),
-    (
-        "Reseller",
-        "Purchases for resale, held under a resale certificate",
-        SALES_TAX_STATES,
-    ),
-    (
-        "State or Local Government",
-        "US state, county or municipal government body exempt from sales and use tax",
-        SALES_TAX_STATES,
-    ),
-    (
-        "Tribal Government",
-        "Federally recognized tribal government body exempt from sales and use tax",
-        SALES_TAX_STATES,
+        "Agriculture Production",
+        "Agriculture Production",
+        AGRICULTURE_PRODUCTION_STATES,
     ),
 ];
 
@@ -293,52 +272,179 @@ async fn every_entry_satisfies_the_modelled_constraints() {
     }
 }
 
-/// The exemption categories AWS documents a certificate for, each as the phrase
-/// that NAMES the category ("resale", "federal government", "501C"), looked
-/// up in the `description` — the member `PutTaxExemptionRequest$exemptionType`
-/// identifies a type by ("Use the supported tax exemption type description") — so
-/// the check is about the category being published rather than about this
-/// emulator's display prose. Source: AWS Billing and Cost Management User Guide,
-/// "Tax exemption" / "Managing your tax exemptions": US sales-tax exemptions held
-/// by a reseller, a federal government body or a charitable organization among
-/// others, the last of which the service's own catalog tokens name `501C`.
-const DOCUMENTED_CATEGORIES: &[&str] = &["resale", "federal government", "501C"];
-
-/// RULE: the published catalog covers the documented exemption categories, each
-/// one applicable in the jurisdiction AWS offers it in.
+/// RULE: a published entry names its type by ONE short catalog token, carried
+/// identically in `displayName` and `description` — the published form of both
+/// members, and the token `PutTaxExemptionRequest$exemptionType` names a type by
+/// ("Use the supported tax exemption type description",
+/// `smithy_query(query="doc", shape="PutTaxExemptionRequest",
+/// member="exemptionType")`).
 #[tokio::test]
-async fn the_documented_categories_are_published() {
+async fn every_entry_names_its_type_by_one_token() {
     let answer = read_catalog(&json!({})).await;
     let reported = listed(&answer);
+    assert!(
+        !reported.is_empty(),
+        "case \"the published catalog\": expected a populated collection, got {reported:?}"
+    );
 
-    for category in DOCUMENTED_CATEGORIES {
-        let entry = reported
-            .iter()
-            .find(|entry| {
-                entry
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .is_some_and(|description| {
-                        description.to_lowercase().contains(&category.to_lowercase())
-                    })
-            })
-            .unwrap_or_else(|| {
-                panic!("case {category:?}: expected the catalog to publish it, got {reported:?}")
-            });
-        let countries: Vec<&str> = entry
+    for (index, entry) in reported.iter().enumerate() {
+        let case = format!("entry {index}");
+        assert_eq!(
+            entry.get("displayName").and_then(Value::as_str),
+            entry.get("description").and_then(Value::as_str),
+            "case {case:?}: expected one token carried by both members, got {entry}"
+        );
+    }
+}
+
+/// RULE: each entry's `applicableJurisdictions` is its OWN per-state list — one
+/// `Authority` per state whose taxing authority grants the category, never a
+/// country-wide wildcard and never the list another entry carries.
+#[tokio::test]
+async fn every_entry_carries_its_own_per_state_jurisdictions() {
+    let reported = listed(&read_catalog(&json!({})).await);
+    assert!(
+        reported.len() > 1,
+        "case \"the published catalog\": expected the published collection, got {reported:?}"
+    );
+
+    let mut seen: Vec<(String, Vec<Value>)> = Vec::new();
+    for (index, entry) in reported.iter().enumerate() {
+        let name = entry
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let case = format!("entry {index} ({name})");
+        let held = entry
             .get("applicableJurisdictions")
             .and_then(Value::as_array)
-            .map(|authorities| {
-                authorities
-                    .iter()
-                    .filter_map(|authority| authority.get("country").and_then(Value::as_str))
-                    .collect()
-            })
+            .cloned()
             .unwrap_or_default();
         assert!(
-            countries.contains(&"US"),
-            "case {category:?}: expected a US jurisdiction, got {countries:?}"
+            !held.is_empty(),
+            "case {case:?}: a published type applies somewhere, got {entry}"
         );
+        for authority in &held {
+            assert!(
+                authority.get("state").and_then(Value::as_str).is_some(),
+                "case {case:?}: a sales-and-use-tax exemption is granted by a state's own \
+                 authority, so every jurisdiction names a state, got {authority}"
+            );
+        }
+        for (other, other_held) in &seen {
+            assert_ne!(
+                &held, other_held,
+                "case {case:?}: expected this entry's own jurisdictions, got the list {other:?} \
+                 carries"
+            );
+        }
+        seen.push((name, held));
+    }
+}
+
+/// One admission row: the type a submission names, the state it claims it in, and
+/// whether the published collection grants that type there.
+///
+/// The states are written out rather than read from the catalog, so a row fails if
+/// an entry's published list moves — and they span a state both entries name, one
+/// only the first names, one only the second names, one neither names though the
+/// state levies the tax, and one no US sales tax is levied in. No row is the
+/// `(type, state)` pair any issue cited.
+const ADMISSION: &[(&str, &str, bool)] = &[
+    ("501C", "AZ", true),
+    ("Agriculture Production", "AZ", true),
+    ("501C", "SD", true),
+    ("Agriculture Production", "SD", false),
+    ("501C", "DC", true),
+    ("Agriculture Production", "DC", false),
+    ("501C", "HI", false),
+    ("Agriculture Production", "HI", true),
+    ("501C", "WA", false),
+    ("Agriculture Production", "WA", true),
+    ("501C", "PR", false),
+    ("Agriculture Production", "PR", true),
+    ("501C", "CA", false),
+    ("Agriculture Production", "CA", false),
+    ("501C", "OR", false),
+    ("Agriculture Production", "OR", false),
+];
+
+/// RULE's other side: the published collection is also what a submission's
+/// jurisdiction is admitted against, so a published type is granted in the states
+/// ITS entry names and refused everywhere else — and the record a granted
+/// submission reads back as carries that entry's own jurisdictions.
+#[tokio::test]
+async fn a_published_type_is_granted_only_in_the_states_its_own_entry_names() {
+    let account = engine::emulator_account_id();
+    for (exemption_type, state, admitted) in ADMISSION.iter().copied() {
+        let case = format!("{exemption_type} claimed in US/{state}");
+        let router = emulator();
+        let answer = call(
+            &router,
+            "PutTaxExemption",
+            &json!({
+                "accountIds": [account],
+                "authority": { "country": "US", "state": state },
+                "exemptionType": exemption_type,
+                "exemptionCertificate": crate::tax_exemptions::certificate("certificate.pdf"),
+            }),
+        )
+        .await;
+        let held = crate::tax_exemptions::reported_exemptions(
+            &call(&router, "ListTaxExemptions", &json!({})).await,
+            account,
+        );
+
+        if admitted {
+            assert_eq!(
+                (answer.status, answer.error_code.as_str()),
+                (200, ""),
+                "case {case:?}: the entry names this state, so the claim stands, got {answer:?}"
+            );
+            assert_eq!(
+                held.len(),
+                1,
+                "case {case:?}: the submission must be recorded, got {held:?}"
+            );
+            // The record is held under the published entry, with that entry's own
+            // jurisdictions rather than another entry's or a country-wide list.
+            let recorded = held[0]
+                .get("taxExemptionType")
+                .cloned()
+                .unwrap_or(Value::Null);
+            assert_eq!(
+                recorded,
+                pinned_entry(exemption_type),
+                "case {case:?}: expected the published entry {}, got {recorded}",
+                pinned_entry(exemption_type)
+            );
+        } else {
+            assert_eq!(
+                (answer.status, answer.error_code.as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: the entry does not name this state, so the claim is refused, got \
+                 {answer:?}"
+            );
+            assert_eq!(
+                (
+                    answer.get("errorCode").as_str(),
+                    answer.get("message").as_str(),
+                    field_list(&answer),
+                ),
+                (
+                    Some(ERROR_CODE_FIELD_VALIDATION_FAILED),
+                    Some(EXEMPTION_AUTHORITY_NOT_SUPPORTED),
+                    vec!["AUTHORITY".to_string()],
+                ),
+                "case {case:?}: expected the refusal class's own envelope, got {:?}",
+                answer.body
+            );
+            assert!(
+                held.is_empty(),
+                "case {case:?}: a refused submission records nothing, got {held:?}"
+            );
+        }
     }
 }
 

@@ -4243,86 +4243,51 @@ pub type JurisdictionRow = (&'static str, Option<&'static str>);
 /// the model's `TaxExemptionType` shape.
 pub type TaxExemptionTypeRow = (&'static str, &'static str, &'static [JurisdictionRow]);
 
-/// The tax exemption types this service supports, each with the jurisdictions it
+/// The tax exemption types this service publishes, each with the jurisdictions it
 /// applies in.
 ///
-/// Hand-written because the model declares no shape enumerating them: `TaxExemptionType`
-/// is a free-form structure, and the only thing the model says about which values are
-/// legal is `PutTaxExemptionRequest$exemptionType`'s "Use the supported tax exemption type
-/// description" (`smithy_query(query="doc", shape="PutTaxExemptionRequest",
-/// member="exemptionType")`) — i.e. the `description` of an entry of THIS catalog is the
-/// token a caller names an exemption type by, so the descriptions below are the catalog's
-/// identifying values and are kept distinct from one another.
+/// A table rather than a stored record because the collection belongs to the
+/// SERVICE: no operation of this service creates, updates or deletes an entry.
+/// The model enumerates no value set for one — `TaxExemptionType` is a free-form
+/// structure (`smithy_query(query="shape", shape="TaxExemptionType")`) — so what
+/// the service PUBLISHES is the only authority for the entry set, the order, each
+/// entry's text and each entry's jurisdictions, and every row below is an entry of
+/// that published collection taken member for member from it:
 ///
-/// What is claimed to match AWS:
+/// * a type is named by ONE short catalog token, carried identically in
+///   `displayName` and `description`, which is the published form of both members
+///   and the token `PutTaxExemptionRequest$exemptionType` names a type by ("Use
+///   the supported tax exemption type description",
+///   `smithy_query(query="doc", shape="PutTaxExemptionRequest",
+///   member="exemptionType")`);
+/// * `applicableJurisdictions` is that entry's OWN list — one `Authority` per
+///   state whose taxing authority grants the category, since a US
+///   sales-and-use-tax exemption is granted per state — and two categories are not
+///   granted in the same set of states, so no entry carries a list shared with
+///   another or a country-wide wildcard;
+/// * the entries are in `displayName` order, as the collection is published.
 ///
-/// * the FIRST entry outright. The service's own catalog token for the charitable
-///   category is `501C`, carried by both `displayName` and `description`, and it applies
-///   in the states [`CHARITABLE_ORGANIZATION_JURISDICTIONS`] names — one `Authority` per
-///   state, as a recorded `GetTaxExemptionTypes` response publishes it.
-/// * the SHAPE of every entry: `applicableJurisdictions` enumerates one `Authority` per
-///   STATE the type applies in, because a US sales-and-use-tax exemption is granted by a
-///   state's own taxing authority and the category is not offered in every state — which
-///   is what the authority check of a submission reads
-///   ([`check_exemption_authority`]).
-/// * the categories themselves: those AWS accepts a certificate for (AWS Billing and Cost
-///   Management User Guide, "Tax exemption" / "Managing your tax exemptions": tax
-///   exemptions are offered for United States sales tax, under the certificate categories
-///   a reseller, a direct-pay permit holder, a federal, state, local or tribal government
-///   body, an educational institution or a charitable organization holds).
-///
-/// What is NOT claimed: the `displayName` and `description` WORDING of every entry but the
-/// first, the per-state list of those entries, and the number and order of the entries.
-/// The model states no sentence for either member, so each is this emulator's own phrasing
-/// of a documented category, sorted by `displayName` so the collection is enumerated one
-/// stable way; the states those categories carry are the jurisdictions that levy the tax
-/// at all ([`US_SALES_TAX_JURISDICTIONS`]), which is the widest list a category can have
-/// and the only one that follows from a published fact. A client that keys off the prose
-/// rather than off a type it already read from this catalog is reading wording the real
-/// service words differently.
-///
-/// A submission is still admitted on the constraints the model states for `exemptionType`
-/// whether or not this table spells its token the same way (see
-/// [`submitted_exemption_type`]); what the table decides about a write is where a type it
-/// DOES publish applies ([`check_exemption_authority`]).
+/// Only entries whose published content is established are carried here. This
+/// emulator composes none of its own: a category whose published token or
+/// per-state list is not available is ABSENT rather than invented, because an
+/// invented entry publishes a type no client can name against the real service and
+/// decides a submission's admission from states the service never published for
+/// it. A token this table does not publish is still admitted and recorded as the
+/// caller spelled it ([`submitted_exemption_type`]) — the collection decides where
+/// a type it DOES publish applies ([`check_exemption_authority`]) and says nothing
+/// about any other.
 pub const TAX_EXEMPTION_TYPE_CATALOG: &[TaxExemptionTypeRow] = &[
     ("501C", "501C", CHARITABLE_ORGANIZATION_JURISDICTIONS),
     (
-        "Direct Pay Permit",
-        "Holder of a direct pay permit that remits sales and use tax directly to the taxing \
-         authority",
-        US_SALES_TAX_JURISDICTIONS,
-    ),
-    (
-        "Educational Institution",
-        "Accredited school, college or university exempt from sales and use tax",
-        US_SALES_TAX_JURISDICTIONS,
-    ),
-    (
-        "Federal Government",
-        "US federal government body exempt from sales and use tax",
-        US_SALES_TAX_JURISDICTIONS,
-    ),
-    (
-        "Reseller",
-        "Purchases for resale, held under a resale certificate",
-        US_SALES_TAX_JURISDICTIONS,
-    ),
-    (
-        "State or Local Government",
-        "US state, county or municipal government body exempt from sales and use tax",
-        US_SALES_TAX_JURISDICTIONS,
-    ),
-    (
-        "Tribal Government",
-        "Federally recognized tribal government body exempt from sales and use tax",
-        US_SALES_TAX_JURISDICTIONS,
+        "Agriculture Production",
+        "Agriculture Production",
+        AGRICULTURE_PRODUCTION_JURISDICTIONS,
     ),
 ];
 
-/// The jurisdictions the charitable-organization entry of
-/// [`TAX_EXEMPTION_TYPE_CATALOG`] applies in — one `Authority` per state, as a
-/// recorded `GetTaxExemptionTypes` response publishes them for that type.
+/// The jurisdictions the `501C` entry of [`TAX_EXEMPTION_TYPE_CATALOG`] applies
+/// in — one `Authority` per state, as a recorded `GetTaxExemptionTypes` response
+/// publishes them for that type.
 pub const CHARITABLE_ORGANIZATION_JURISDICTIONS: &[JurisdictionRow] = &[
     ("US", Some("AZ")),
     ("US", Some("CO")),
@@ -4363,19 +4328,17 @@ pub const CHARITABLE_ORGANIZATION_JURISDICTIONS: &[JurisdictionRow] = &[
     ("US", Some("WY")),
 ];
 
-/// The jurisdictions every other entry of [`TAX_EXEMPTION_TYPE_CATALOG`] applies
-/// in: the US jurisdictions that levy a general sales tax at all, by their
-/// two-letter postal codes — the fifty states and the District of Columbia less
-/// Alaska, Delaware, Montana, New Hampshire and Oregon, which impose no general
-/// sales tax, so no exemption from one is granted there.
-pub const US_SALES_TAX_JURISDICTIONS: &[JurisdictionRow] = &[
+/// The jurisdictions the `Agriculture Production` entry of
+/// [`TAX_EXEMPTION_TYPE_CATALOG`] applies in — one `Authority` per state, as a
+/// recorded `GetTaxExemptionTypes` response publishes them for that type. A
+/// different set of states from the entry above it, which is why each entry
+/// carries its own list and none is derived from a country-wide default.
+pub const AGRICULTURE_PRODUCTION_JURISDICTIONS: &[JurisdictionRow] = &[
     ("US", Some("AL")),
     ("US", Some("AR")),
     ("US", Some("AZ")),
-    ("US", Some("CA")),
     ("US", Some("CO")),
     ("US", Some("CT")),
-    ("US", Some("DC")),
     ("US", Some("FL")),
     ("US", Some("GA")),
     ("US", Some("HI")),
@@ -4394,18 +4357,16 @@ pub const US_SALES_TAX_JURISDICTIONS: &[JurisdictionRow] = &[
     ("US", Some("MO")),
     ("US", Some("MS")),
     ("US", Some("NC")),
-    ("US", Some("ND")),
     ("US", Some("NE")),
     ("US", Some("NJ")),
-    ("US", Some("NM")),
     ("US", Some("NV")),
     ("US", Some("NY")),
     ("US", Some("OH")),
     ("US", Some("OK")),
     ("US", Some("PA")),
+    ("US", Some("PR")),
     ("US", Some("RI")),
     ("US", Some("SC")),
-    ("US", Some("SD")),
     ("US", Some("TN")),
     ("US", Some("TX")),
     ("US", Some("UT")),

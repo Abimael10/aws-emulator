@@ -180,18 +180,18 @@ impl Submission {
 /// The submissions the rule is asserted over.
 const SUBMISSIONS: &[Submission] = &[
     Submission {
-        case: "one account, a published description, a country-wide jurisdiction",
+        case: "one account, a published token, a country-wide jurisdiction",
         accounts: &["000000000001"],
-        exemption_type: "Purchases for resale, held under a resale certificate",
+        exemption_type: "501C",
         country: "US",
         state: None,
         document_name: "resale.pdf",
         document_bytes: 1,
     },
     Submission {
-        case: "several accounts, one of them named twice, a published display name in a state",
+        case: "several accounts, one of them named twice, a published token in a state",
         accounts: &["000000000002", "000000000003", "000000000002"],
-        exemption_type: "Reseller",
+        exemption_type: "Agriculture Production",
         country: "US",
         state: Some("OH"),
         document_name: "resale-certificate.PDF",
@@ -525,7 +525,7 @@ struct Refusal {
 const REFUSALS: &[Refusal] = &[
     Refusal {
         case: "a published type claimed in a state no entry names",
-        exemption_type: "Reseller",
+        exemption_type: "501C",
         authority: || json!({ "country": "US", "state": "AK" }),
     },
     Refusal {

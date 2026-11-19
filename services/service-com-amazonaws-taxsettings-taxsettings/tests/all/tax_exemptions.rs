@@ -28,12 +28,13 @@
 //! * reading is a report: it changes neither the exemptions nor anything beside
 //!   them;
 //! * a submission's `exemptionType` and `authority` are admitted on the
-//!   constraints the model states for them rather than against the collection
-//!   `GetTaxExemptionTypes` publishes, whose wording is this emulator's own: a
-//!   token that names a published entry is recorded as that entry, any other
-//!   token as submitted, and the only refusal left is the blank `Authority$state`
-//!   the model's pattern forbids (`exemption_type_admission.rs` spans that class
-//!   to the modelled bounds).
+//!   constraints the model states for them rather than against the wording of the
+//!   collection `GetTaxExemptionTypes` publishes: a token that names a published
+//!   entry is recorded as that entry, any other token as submitted, and the only
+//!   refusal left for an unpublished token is the blank `Authority$state` the
+//!   model's pattern forbids (`exemption_type_admission.rs` spans that class to the
+//!   modelled bounds, and `tax_exemption_types.rs` the jurisdictions a PUBLISHED
+//!   entry is granted in).
 //!
 //! The tables below span the classes those rules generalise over — the kinds of
 //! evidence an account is in the family (the caller's own, a stored TRN, stored
@@ -41,8 +42,9 @@
 //! registration, another exemption) against how many it names (one, several, the
 //! model's `@length` bound of 550, and duplicates), the number of accounts a read
 //! names (one, its own `@length` bound of five, one past it, and duplicates), the
-//! catalog entry an exemption was granted
-//! under and whether it is named by its description or its display name, the
+//! type an exemption was granted under (each published entry, and a token the
+//! collection does not publish) and the case and padding its token is spelled in,
+//! the
 //! authority's shape (a country, a country and a state, either re-cased or
 //! padded), which dates a record carries, every value of
 //! `EntityExemptionAccountStatus` crossed with an expiration in the past, in the
@@ -62,9 +64,10 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::ops::types::{Authority, TaxExemptionType};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    find_exemption_type, tax_exemption_type_catalog, ComAmazonawsTaxsettingsTaxsettingsState,
-    StoredTaxExemption, EXEMPTION_STATUS_EXPIRED, EXEMPTION_STATUS_NONE, EXEMPTION_STATUS_PENDING,
-    EXEMPTION_STATUS_VALID, MAX_STORED_EXEMPTIONS, TAX_EXEMPTIONS_PAGE_BOUNDS,
+    find_exemption_type, submitted_exemption_type, tax_exemption_type_catalog,
+    ComAmazonawsTaxsettingsTaxsettingsState, StoredTaxExemption, EXEMPTION_STATUS_EXPIRED,
+    EXEMPTION_STATUS_NONE, EXEMPTION_STATUS_PENDING, EXEMPTION_STATUS_VALID,
+    MAX_STORED_EXEMPTIONS, TAX_EXEMPTIONS_PAGE_BOUNDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -108,10 +111,10 @@ fn catalog_entry(index: usize) -> TaxExemptionType {
         .unwrap_or_else(|| panic!("the published catalog has an entry {index}"))
 }
 
-/// One stored exemption: the catalog entry at `type_index`, held in `authority`,
-/// recorded with `status`, effective `effective` and expiring `expiration`.
+/// One stored exemption: held under `exemption_type` in `authority`, recorded
+/// with `status`, effective `effective` and expiring `expiration`.
 fn exemption(
-    type_index: usize,
+    exemption_type: TaxExemptionType,
     authority: Authority,
     status: &str,
     effective: Option<SystemTime>,
@@ -119,12 +122,20 @@ fn exemption(
 ) -> StoredTaxExemption {
     StoredTaxExemption {
         authority,
-        exemption_type: catalog_entry(type_index),
+        exemption_type,
         effective_date: effective,
         expiration_date: expiration,
         system_effective_date: effective,
         status: status.to_string(),
     }
+}
+
+/// The `TaxExemptionType` a record is held under when the submission named a
+/// token the collection does NOT publish: the token itself, applicable in the
+/// jurisdiction the submission named (`state::submitted_exemption_type`) — the
+/// other kind of type a stored record can carry beside a published entry.
+fn submitted_type(token: &str, authority: &Authority) -> TaxExemptionType {
+    submitted_exemption_type(token, authority)
 }
 
 /// An authority: a country, and a state where the exemption is a state one.
@@ -158,7 +169,7 @@ fn epoch_secs(instant: SystemTime) -> f64 {
 /// record's own members.
 fn a_valid_exemption() -> StoredTaxExemption {
     exemption(
-        0,
+        catalog_entry(0),
         authority("US", None),
         EXEMPTION_STATUS_VALID,
         Some(at(-3_600)),
@@ -436,15 +447,16 @@ struct Projection {
 async fn every_stored_exemption_is_reported_member_for_member() {
     let (router, engine) = emulator_with_engine();
 
-    // The rows differ along the authority's shape, the catalog entry the
-    // exemption was granted under, which dates the record carries, and how many
-    // exemptions one account holds — not along the account id.
+    // The rows differ along the authority's shape, the type the exemption was
+    // granted under (each published entry, and a token the collection does not
+    // publish), which dates the record carries, and how many exemptions one
+    // account holds — not along the account id.
     let rows = vec![
         Projection {
             case: "one country-wide exemption with both dates",
             account_id: "000000000001",
             exemptions: vec![exemption(
-                0,
+                catalog_entry(0),
                 authority("US", None),
                 EXEMPTION_STATUS_VALID,
                 Some(at(-86_400)),
@@ -455,7 +467,10 @@ async fn every_stored_exemption_is_reported_member_for_member() {
             case: "an exemption held in one state, with no expiration",
             account_id: "000000000002",
             exemptions: vec![exemption(
-                4,
+                submitted_type(
+                    "Exemption certificate on file",
+                    &authority("US", Some("Washington")),
+                ),
                 authority("US", Some("Washington")),
                 EXEMPTION_STATUS_VALID,
                 Some(at(-7_200)),
@@ -466,7 +481,7 @@ async fn every_stored_exemption_is_reported_member_for_member() {
             case: "an exemption carrying no date at all",
             account_id: "000000000003",
             exemptions: vec![exemption(
-                2,
+                catalog_entry(1),
                 authority("US", None),
                 EXEMPTION_STATUS_PENDING,
                 None,
@@ -478,21 +493,24 @@ async fn every_stored_exemption_is_reported_member_for_member() {
             account_id: "000000000004",
             exemptions: vec![
                 exemption(
-                    1,
+                    catalog_entry(1),
                     authority("US", None),
                     EXEMPTION_STATUS_VALID,
                     Some(at(-600)),
                     Some(at(600)),
                 ),
                 exemption(
-                    3,
+                    catalog_entry(0),
                     authority("US", Some("Texas")),
                     EXEMPTION_STATUS_PENDING,
                     Some(at(-60)),
                     None,
                 ),
                 exemption(
-                    5,
+                    submitted_type(
+                        "Diplomatic Mission",
+                        &authority("US", Some("New York")),
+                    ),
                     authority("US", Some("New York")),
                     EXEMPTION_STATUS_NONE,
                     None,
@@ -664,7 +682,7 @@ async fn an_exemption_is_reported_expired_once_its_expiration_has_passed() {
             &engine,
             account_id,
             vec![exemption(
-                0,
+                catalog_entry(0),
                 authority("US", None),
                 recorded,
                 Some(at(-86_400)),
@@ -741,7 +759,7 @@ async fn reading_exemptions_changes_nothing() {
         vec![
             a_valid_exemption(),
             exemption(
-                2,
+                catalog_entry(1),
                 authority("US", Some("Oregon")),
                 EXEMPTION_STATUS_PENDING,
                 Some(at(-120)),
@@ -831,6 +849,10 @@ struct Submission {
     /// `.pdf`, `.jpg` or `.png` suffix in either case
     /// (`smithy_query(query="shape", shape="ExemptionCertificate")`).
     document_name: &'static str,
+    /// Whether the token names an entry of the collection the service publishes,
+    /// which decides what the record is held under: that entry, or the token
+    /// itself applicable in the jurisdiction submitted.
+    published: bool,
     expected_display_name: &'static str,
     expected_description: &'static str,
     expected_country: &'static str,
@@ -852,10 +874,18 @@ impl Submission {
         })
     }
 
-    /// The `taxExemptionType` the listing must report for it: the catalog's
-    /// entry, as `tax_exemption_types.rs` pins that collection literally.
+    /// The `taxExemptionType` the listing must report for it: the published
+    /// entry the token names, as `tax_exemption_types.rs` pins that collection
+    /// literally, or the token itself for a submission naming no published entry.
     fn expected_type(&self) -> Value {
-        crate::tax_exemption_types::pinned_entry(self.expected_display_name)
+        if self.published {
+            return crate::tax_exemption_types::pinned_entry(self.expected_display_name);
+        }
+        json!({
+            "displayName": self.expected_display_name,
+            "description": self.expected_description,
+            "applicableJurisdictions": [self.expected_authority()],
+        })
     }
 
     /// The `authority` the listing must report for it.
@@ -871,30 +901,32 @@ impl Submission {
 /// The submissions the round-trip table makes.
 ///
 /// The rows differ along what the rule generalises over: how many accounts one
-/// submission names, which published entry the type is (four of the seven, none
-/// of them cited by any issue), whether it is named by its `description` or its
-/// `displayName` and in which case, whether the jurisdiction carries a state, and
-/// which of the three file extensions the certificate uses.
+/// submission names, whether the token names a published entry (each of the two
+/// the collection carries) or none at all, the case and padding it is spelled in,
+/// whether the jurisdiction carries a state, and which of the three file
+/// extensions the certificate uses.
 const SUBMISSIONS: &[Submission] = &[
     Submission {
-        case: "one account, the type named by its description, no state",
+        case: "one account, a published token, the country alone",
         accounts: &["000000000001"],
-        exemption_type: "Purchases for resale, held under a resale certificate",
+        exemption_type: "Agriculture Production",
         country: "US",
         state: None,
-        document_name: "resale-certificate.pdf",
-        expected_display_name: "Reseller",
-        expected_description: "Purchases for resale, held under a resale certificate",
+        document_name: "farm-certificate.pdf",
+        published: true,
+        expected_display_name: "Agriculture Production",
+        expected_description: "Agriculture Production",
         expected_country: "US",
         expected_state: None,
     },
     Submission {
-        case: "three accounts, the type named by its display name, with a state",
+        case: "three accounts, a published token, with a state it applies in",
         accounts: &["000000000002", "000000000003", "000000000004"],
         exemption_type: "501C",
         country: "US",
         state: Some("NY"),
         document_name: "charity.JPG",
+        published: true,
         expected_display_name: "501C",
         expected_description: "501C",
         expected_country: "US",
@@ -903,27 +935,26 @@ const SUBMISSIONS: &[Submission] = &[
     Submission {
         case: "a lower-cased country code and a padded state",
         accounts: &["000000000005"],
-        exemption_type: "educational institution",
+        exemption_type: "  agriculture production  ",
         country: "us",
         state: Some("  TX  "),
         document_name: "school.png",
-        expected_display_name: "Educational Institution",
-        expected_description: "Accredited school, college or university exempt from sales and use \
-                               tax",
+        published: true,
+        expected_display_name: "Agriculture Production",
+        expected_description: "Agriculture Production",
         expected_country: "US",
         expected_state: Some("TX"),
     },
     Submission {
-        case: "a tribal government exemption for two accounts",
+        case: "a token the collection does not publish, for two accounts",
         accounts: &["000000000006", "000000000007"],
-        exemption_type: "Federally recognized tribal government body exempt from sales and use \
-                         tax",
+        exemption_type: "Tribal Government",
         country: "US",
         state: Some("AZ"),
         document_name: "tribal.pdf",
+        published: false,
         expected_display_name: "Tribal Government",
-        expected_description: "Federally recognized tribal government body exempt from sales and \
-                               use tax",
+        expected_description: "Tribal Government",
         expected_country: "US",
         expected_state: Some("AZ"),
     },
@@ -1070,18 +1101,21 @@ async fn an_exemption_is_identified_by_its_type_and_its_jurisdiction() {
     let submissions: &[(&str, Value, usize)] = &[
         (
             "the first exemption",
-            json!({ "exemptionType": "Reseller", "authority": { "country": "US" } }),
+            json!({ "exemptionType": "501C", "authority": { "country": "US" } }),
             1,
         ),
         (
             "a second type in the same jurisdiction",
-            json!({ "exemptionType": "Direct Pay Permit", "authority": { "country": "US" } }),
+            json!({
+                "exemptionType": "Agriculture Production",
+                "authority": { "country": "US" },
+            }),
             2,
         ),
         (
             "the first type in another state",
             json!({
-                "exemptionType": "Reseller",
+                "exemptionType": "501C",
                 "authority": { "country": "US", "state": "OH" },
             }),
             3,
@@ -1089,7 +1123,7 @@ async fn an_exemption_is_identified_by_its_type_and_its_jurisdiction() {
         (
             "the same type in the same state again",
             json!({
-                "exemptionType": "Reseller",
+                "exemptionType": "501C",
                 "authority": { "country": "US", "state": "OH" },
             }),
             3,
@@ -1097,15 +1131,15 @@ async fn an_exemption_is_identified_by_its_type_and_its_jurisdiction() {
         (
             "the same state spelled in another case",
             json!({
-                "exemptionType": "Reseller",
+                "exemptionType": "501C",
                 "authority": { "country": "us", "state": "oh" },
             }),
             3,
         ),
         (
-            "the same type named by its description instead",
+            "the same type's token padded and re-cased",
             json!({
-                "exemptionType": "Purchases for resale, held under a resale certificate",
+                "exemptionType": "  501c  ",
                 "authority": { "country": "US", "state": " OH " },
             }),
             3,
@@ -1712,17 +1746,17 @@ async fn listing_the_exemptions_changes_nothing() {
 #[tokio::test]
 async fn every_exemption_type_the_model_admits_is_recorded() {
     // The rows differ along how the value relates to the published collection: a
-    // display name, a description, either re-cased or padded, and tokens that
-    // name no entry of it at all.
+    // token it publishes, one of those re-cased and padded, and tokens that name
+    // no entry of it at all.
     let cases: &[(&str, &str)] = &[
-        ("a display name", "Reseller"),
+        ("a published token", "501C"),
+        ("the published token of another entry", "Agriculture Production"),
         (
-            "a description",
-            "Purchases for resale, held under a resale certificate",
+            "a padded, re-cased published token",
+            "  aGRICULTURE pRODUCTION  ",
         ),
-        ("a padded, re-cased display name", "  dIRECT pAY pERMIT  "),
         ("a type the collection does not publish", "Diplomatic Mission"),
-        ("a prefix of a published description", "Purchases for resale"),
+        ("a prefix of a published token", "Agriculture"),
         ("a shape name rather than a type", "TaxExemptionType"),
     ];
 
