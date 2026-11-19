@@ -137,6 +137,19 @@ const S3_PUT_OBJECT_ACTION: &str = "s3:PutObject";
 /// instead ([`content_encoding`]).
 const DELIVERED_CONTENT_TYPE: &str = "application/octet-stream";
 
+/// The `ChecksumAlgorithm` every delivered object is written under.
+///
+/// A delivery uploads the object through the same `s3:PutObject` call any other AWS client
+/// makes ([`S3_PUT_OBJECT_ACTION`]), and such a call names a checksum algorithm of its own:
+/// `CRC32` is the one computed for a request whose `ChecksumAlgorithm` member is unset,
+/// which is why a delivered object is stored with a `CRC32` checksum rather than the
+/// algorithm Amazon S3 falls back to for an upload that supplies no checksum at all. The
+/// object is written WHOLE, so the type that checksum carries is the full-object one — which
+/// is the object store's own rule for a single write
+/// ([`::service_com_amazonaws_s3_amazons3::state::stored_object_checksum`]), not restated
+/// here.
+const DELIVERED_CHECKSUM_ALGORITHM: &str = "CRC32";
+
 /// The vendor field of a Firehose stream ARN, which is what the Region a delivery asks its
 /// authorization question in is read out of ([`delivery_region`]).
 const FIREHOSE_ARN_VENDOR: &str = "firehose";
@@ -2545,13 +2558,14 @@ fn write_objects<Eng: Send + Sync + 'static>(
             // The entity tag is computed from the bytes the object is stored with,
             // exactly as it is for an object written through `PutObject`.
             etag: ::service_com_amazonaws_s3_amazons3::state::object_etag(&object.body),
-            // A delivery names no checksum algorithm and writes the object whole, so the
-            // object store settles the checksum such a write carries — its default
-            // algorithm over all of the bytes — through its own function for it, and a
-            // read or a listing of the delivered object reports what the same bytes put
-            // through `PutObject` report.
+            // A delivery writes the object whole, through an upload that names its own
+            // checksum algorithm ([`DELIVERED_CHECKSUM_ALGORITHM`]), so the object store
+            // settles the checksum such a write carries — that algorithm's digest over all
+            // of the bytes, as a full-object checksum — through its own function for it, and
+            // a read or a listing of the delivered object reports what the same bytes put
+            // through `PutObject` under the same algorithm report.
             checksum: ::service_com_amazonaws_s3_amazons3::state::stored_object_checksum(
-                None,
+                Some(DELIVERED_CHECKSUM_ALGORITHM),
                 &object.body,
             ),
             body: object.body,
