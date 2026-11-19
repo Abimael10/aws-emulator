@@ -88,8 +88,14 @@ fn create_body(role_arn: &str) -> Value {
 }
 
 /// Create a connector at `region` naming a role IAM holds, trusts and permits to federate,
-/// answering its id.
-async fn create_connector(router: &MultiServiceRouter, case: &str, region: &str, role: &str) -> String {
+/// answering its id. Shared with the sibling suite that pins what a delete does to a
+/// connector a write has already touched ([`crate::cloud_connector_delete_is_final`]).
+pub(crate) async fn create_connector(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    role: &str,
+) -> String {
     create_federating_role(router, case, role).await;
     let (status, created) = call_in_region(
         router,
