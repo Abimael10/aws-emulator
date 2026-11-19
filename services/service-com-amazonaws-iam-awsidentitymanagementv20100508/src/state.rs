@@ -43,6 +43,9 @@ pub mod service_specific_credential_mint;
 pub mod simulated_decisions;
 pub mod ssh_public_keys;
 pub mod statement_positions;
+/// The temporary credentials this account has minted and what their CLASS decides: which
+/// kind of credential an access key id names, read by this service's own gate.
+pub mod temporary_credentials;
 pub mod trust_policy;
 pub mod trust_policy_identity_principals;
 pub mod trust_policy_principal_forms;
@@ -72,6 +75,7 @@ pub use role_templates::*;
 pub use service_specific_credential_mint::*;
 pub use ssh_public_keys::*;
 pub use statement_positions::*;
+pub use temporary_credentials::*;
 pub use trust_policy::*;
 pub use trust_policy_identity_principals::*;
 pub use trust_policy_principal_forms::*;

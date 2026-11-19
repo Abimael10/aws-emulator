@@ -66,6 +66,8 @@ x509-cert = "0.2"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares tests/all/main.rs's suite modules, one per tests/all/<name>.rs.
+automod = { workspace = true }
 hex = { workspace = true }
 # The SAML suite signs its own authentication responses, so it needs a real key pair and a
 # real certificate to publish in the provider's metadata: `rcgen` mints both, as it does for

@@ -94,12 +94,18 @@
 //!
 //! ## The callers that are not IAM users
 //!
+//! * **A credential whose CLASS cannot call IAM at all.** The ban AWS states per class of
+//!   temporary credential — a federated-user credential "cannot call any IAM operations",
+//!   and a `GetSessionToken` credential cannot "unless MFA authentication information is
+//!   included in the request" — is a fact about the credential and not a document, so it is
+//!   decided before any policy is read and no `Allow` anywhere lifts it
+//!   ([`class_refusal`], over the class the mint recorded in
+//!   [`super::TemporaryCredentialRecord`]).
 //! * **A credential this account holds no identity for.** The emulator's own published
 //!   credential is not a key this account's `access_keys` map holds, and no role session
 //!   was vended for it. It carries no identity-based policies at all, which is the position
 //!   AWS account root credentials are in, so such a request is allowed rather than refused
-//!   on evidence that does not exist. The same holds for a session credential of an
-//!   identity that is not a role of this account — a federated user — and for a role
+//!   on evidence that does not exist. The same holds for a role
 //!   session whose role has since been deleted.
 //! * **A principal holding a grant this emulator cannot read.** An AWS-managed policy is
 //!   owned by AWS, so the account's store holds no document for it and
@@ -112,6 +118,9 @@
 //!   it caps nothing rather than refusing what AWS would permit.
 
 use ::service_common::iam_authorization::{self as iam, Decision};
+use ::service_common::temporary_credential_classes::{
+    PRINCIPAL_TYPE_CONDITION_KEY, TemporaryCredentialClass,
+};
 
 use crate::ops::types::{DelegationRequest, Role, Tag, User};
 use crate::scaffolded::AccessDenied;
@@ -511,6 +520,20 @@ fn request_context(
             published.push(PRINCIPAL_TAG_PREFIX);
         }
     }
+    // What the CLASS of the presented credential answers `aws:PrincipalType` with: a role
+    // session is an `AssumedRole`, and an IAM user's own long-term key is a `User`. Answered
+    // for every request this gate decides, because the signing credential was resolved
+    // before anything was decided, so a clause over the key decides rather than standing
+    // undecided. The third class a credential can be, a federated user, never reaches a
+    // decision here: such a credential may not call IAM at all ([`class_refusal`]).
+    let class = match caller {
+        Caller::User(_) => None,
+        Caller::RoleSession { .. } => Some(TemporaryCredentialClass::AssumedRole),
+    };
+    context.extend(::service_common::temporary_credential_classes::principal_type_conditions(
+        Some(::service_common::temporary_credential_classes::principal_type(class)),
+    ));
+    published.push(PRINCIPAL_TYPE_CONDITION_KEY);
     // The tags of the entity the request addresses, under both spellings of the key: one
     // tag, two names for it. Declared only where that tag set is the account's to read.
     if let Some(tags) = store.resource_tags(resource) {
@@ -645,6 +668,12 @@ fn authorize_request(
     policy_arn: Option<&str>,
 ) -> Result<(), AccessDenied> {
     let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    // Whether a credential of the class presented may call IAM AT ALL, which is decided
+    // before any document is read: the ban is a property of the credential and no `Allow`
+    // in any policy lifts it ([`class_refusal`]).
+    if let Some(refused) = class_refusal(store, &access_key_id, action, resource, named_as) {
+        return Err(refused);
+    }
     // A credential this account holds no IAM user for carries no identity-based
     // policies, so there is nothing to judge it on (see the module docs).
     let Some(signer) = signing_principal(store, &access_key_id) else {
@@ -998,4 +1027,50 @@ fn signing_principal<'a>(
         // so a managed session policy edited since the mint scopes by what it says NOW.
         scope: super::session_scoping_documents(Some(store), &session.scope),
     })
+}
+
+/// Why the CLASS of the credential a request presented may not call IAM at all, as the
+/// refusal the operation answers — or `None` for a credential whose class is under no such
+/// ban, which is every one this gate then judges on documents.
+///
+/// AWS states the ban per class of temporary credential, and the two classes it names differ
+/// in it ([`TemporaryCredentialClass::may_call_iam`]): a federated-user credential "cannot
+/// call any IAM operations", and a `GetSessionToken` credential cannot "unless MFA
+/// authentication information is included in the request". It is a fact about the CREDENTIAL
+/// and not a document, so it is decided before any policy is read and no `Allow` anywhere
+/// lifts it — which is also why the refusal names the no-grant diagnosis: no identity-based
+/// policy can grant such a credential an IAM action.
+///
+/// Which class a credential is, is read from the record the mint left
+/// ([`super::TemporaryCredentialRecord`]); a key the account holds no such record for is a
+/// long-term credential, which is under no ban.
+///
+/// A READ: the store is only consulted.
+fn class_refusal(
+    store: &IamState,
+    access_key_id: &str,
+    action: &str,
+    resource: &str,
+    named_as: &str,
+) -> Option<AccessDenied> {
+    let credential = store.temporary_credential(access_key_id, super::now())?;
+    if credential.may_call_iam() {
+        return None;
+    }
+    let principal = credential.principal_arn.clone();
+    ::tracing::info!(
+        audit = true,
+        outcome = "refused_access_denied",
+        principal = %principal,
+        action = %action,
+        resource = %resource,
+        explicit_deny = false,
+        "a credential of this class cannot call IAM"
+    );
+    Some(not_authorized(
+        &principal,
+        action,
+        named_as,
+        &format!("because no identity-based policy allows the {action} action"),
+    ))
 }

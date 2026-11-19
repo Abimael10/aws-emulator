@@ -145,6 +145,17 @@ const LEADING_KEYS_CONDITION_KEY: &str = "dynamodb:LeadingKeys";
 /// tag `tenant`.
 const PRINCIPAL_TAG_CONDITION_KEY_FAMILY: &str = "aws:PrincipalTag/";
 
+/// The global condition key naming the CLASS of the credential the request was signed with —
+/// the workspace's one spelling of it
+/// ([`::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY`]).
+///
+/// It is a fact about the CREDENTIAL rather than about the identity whose documents are in
+/// force: the same IAM user is behind a long-term key (`User`), a session of a role it
+/// assumed (`AssumedRole`) and a federated-user session (`FederatedUser`), and a statement
+/// conditioned on this key selects exactly one of those.
+const PRINCIPAL_TYPE_CONDITION_KEY: &str =
+    ::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY;
+
 /// The condition key whose values are the attributes a data-plane call names: one entry per
 /// top-level attribute name the call's projection or its item carries, which is what a
 /// fine-grained statement scopes a caller to some of an item's attributes with.
@@ -232,6 +243,11 @@ pub struct Caller {
     /// carry be decided rather than left undecided. A long-term credential's tags live in
     /// IAM and are not read here, so such a caller declares nothing about them.
     pub tags_known: bool,
+    /// The CLASS of the credential the request was signed with, as STS reports it for that
+    /// credential (`sts_store::Caller::principal_type`): the value
+    /// [`PRINCIPAL_TYPE_CONDITION_KEY`] answers with. `None` for a request this gate
+    /// resolved no credential for, which carries no value for the key at all.
+    pub principal_type: Option<&'static str>,
     /// The condition keys the web identity this credential was minted by exchanging
     /// publishes, as STS recorded them on the session: the values a
     /// `<provider>:<claim>` clause, and a policy variable naming one, hold for a request
@@ -295,6 +311,9 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
                 caller.tags.clone(),
                 caller.session_policies.clone(),
                 caller.federated_claims.clone(),
+                // WHICH CLASS of credential signed this request, read through STS's one
+                // answer for it (`sts_store::Caller::principal_type`).
+                Some(caller.principal_type()),
             )
         }),
         // No STS store on this engine: the credential names no session, so it speaks for
@@ -309,6 +328,9 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
             Vec::new(),
             sts_store::SessionPolicies::default(),
             Vec::new(),
+            // No session registry to have minted a temporary credential: the key presented is
+            // a long-term one, which is the class a credential of no session is.
+            Some(::service_common::temporary_credential_classes::PRINCIPAL_TYPE_USER),
         )),
     };
     // An expired session credential speaks for nobody: it carries no documents and no
@@ -323,6 +345,7 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
         tags,
         session_policies,
         federated_claims,
+        principal_type,
     )) = resolved
     else {
         return Caller {
@@ -338,6 +361,7 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
         tags,
         tags_known,
         federated_claims,
+        principal_type,
         ..Caller::default()
     };
     // An assumed-role session is also named by the ARN of the role it is a session of,
@@ -731,6 +755,15 @@ fn principal_context(caller: &Caller) -> Vec<(String, String)> {
         })
         .collect();
     context.extend(caller.federated_claims.iter().cloned());
+    // The CLASS of credential the request was signed with, which is what a statement
+    // conditioned on `aws:PrincipalType` selects on — rendered by the workspace's one
+    // rendering of that key, and nothing at all for a request this gate resolved no
+    // credential for.
+    context.extend(
+        ::service_common::temporary_credential_classes::principal_type_conditions(
+            caller.principal_type,
+        ),
+    );
     context
 }
 
@@ -740,6 +773,9 @@ fn principal_published_keys(caller: &Caller) -> Vec<&str> {
     let mut published = Vec::new();
     if caller.tags_known {
         published.push(PRINCIPAL_TAG_CONDITION_KEY_FAMILY);
+    }
+    if caller.principal_type.is_some() {
+        published.push(PRINCIPAL_TYPE_CONDITION_KEY);
     }
     published.extend(sts_store::federated_claim_keys(&caller.federated_claims));
     published

@@ -390,9 +390,18 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     let action = format!("{ACTION_PREFIX}:{operation}");
     let caller = caller(engine, ctx);
     let documents = Documents::of(&caller);
+    // The keys the REQUEST carries, plus the CLASS of the credential it was signed with,
+    // which is what a statement conditioned on `aws:PrincipalType` selects on and which this
+    // gate holds for every request whose credential it resolved.
+    let mut context = conditions.to_vec();
+    context.extend(
+        ::service_common::temporary_credential_classes::principal_type_conditions(
+            caller.principal_type,
+        ),
+    );
     let asked = Asked {
         action: &action,
-        conditions,
+        conditions: &context,
     };
     // An action that supports no resource-level permissions is judged over EVERY resource,
     // and a refusal of it names no resource because there is none to name.
@@ -429,6 +438,13 @@ struct Asked<'a> {
     /// The condition keys the request carries a value for, as `(key, value)` pairs.
     conditions: &'a [(String, String)],
 }
+
+/// The condition keys a decision of this gate DECLARES it answers: the class of the
+/// credential the request was signed with, which this gate holds for every request whose
+/// credential it resolved — so a clause over it is decided rather than left undecided. Every
+/// other key keeps the undecided reading, which refuses nothing.
+const PUBLISHED_CONDITION_KEYS: &[&str] =
+    &[::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY];
 
 /// Every document in force on the caller, PARSED ONCE for the whole request.
 ///
@@ -498,7 +514,9 @@ fn decide(
     // `Principal` element would be matched against; an identity-based document states no
     // such element, so the decision below rests on the action, the resource and the
     // condition keys the request carries.
-    let request = iam::Request::new(action, judged, &caller.principals).with_context(asked.conditions);
+    let request = iam::Request::new(action, judged, &caller.principals)
+        .with_context(asked.conditions)
+        .with_published_keys(PUBLISHED_CONDITION_KEYS);
     let identity_said = iam::identity_decision_prepared(&documents.identity, &request);
     let granted = identity_grants(
         caller,
@@ -575,7 +593,8 @@ fn decide_over_any_resource(
 ) -> Result<(), Denied> {
     let action = asked.action;
     let request = iam::Request::new(action, EVERY_RESOURCE, &caller.principals)
-        .with_context(asked.conditions);
+        .with_context(asked.conditions)
+        .with_published_keys(PUBLISHED_CONDITION_KEYS);
     let identity_said = iam::identity_decision_prepared(&documents.identity, &request);
     let granted = identity_grants(
         caller,
@@ -666,6 +685,11 @@ struct Caller {
     /// every long-term access key, and every session minted without session policies —
     /// which is a credential capped by nothing.
     scope: sts_store::ScopingPolicies,
+    /// The CLASS of the credential the request was signed with, as STS reports it for that
+    /// credential (`sts_store::Caller::principal_type`): the value the global condition key
+    /// naming the calling principal's type answers with. `None` for a request this gate
+    /// resolved no credential for, which carries no value for the key at all.
+    principal_type: Option<&'static str>,
     /// Set when this request presents the account's own published credential, which holds
     /// no IAM policies (see the module docs).
     account_credential: bool,
@@ -769,15 +793,22 @@ fn caller<Eng: Send + Sync + 'static>(
             ctx.credential_store(),
             sts_store::ambient_identity(),
         )
-        .map(|caller| (caller.identity, caller.session_policies)),
+        .map(|caller| {
+            (
+                caller.principal_type(),
+                caller.identity,
+                caller.session_policies,
+            )
+        }),
         // No STS store on this engine: the only identity a request can present is the
         // account's own published credential, which no mint scoped.
         None => Ok((
+            ::service_common::temporary_credential_classes::PRINCIPAL_TYPE_USER,
             sts_store::ambient_identity(),
             sts_store::SessionPolicies::default(),
         )),
     };
-    let (identity, session_policies) = match resolved {
+    let (principal_type, identity, session_policies) = match resolved {
         Ok(resolved) => resolved,
         // The session credential has expired, so it speaks for nobody: no documents, no
         // principal spelling, and every action it asks for falls to the default deny. The
@@ -798,6 +829,9 @@ fn caller<Eng: Send + Sync + 'static>(
         principals: vec![identity.arn.clone()],
         arn: identity.arn,
         user_id: identity.user_id,
+        // WHICH CLASS of credential signed this request, read through STS's one answer for
+        // it: the value `aws:PrincipalType` is decided against.
+        principal_type: Some(principal_type),
         // The inline document the mint passed scopes the credential whether or not an IAM
         // store is there; where there is one, the scope is re-read below so a managed
         // session policy counts at the version in force NOW.

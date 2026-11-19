@@ -231,8 +231,18 @@ fn decided(
     resource: &str,
 ) -> Option<String> {
     // An identity-based document states no `Principal` element, so the decision rests on
-    // the action and the resource the request addressed.
-    let request = iam::Request::new(action, resource, &[]);
+    // the action and the resource the request addressed — and on the CLASS of the credential
+    // presented, which is what a statement conditioned on `aws:PrincipalType` selects on.
+    // That key is answered, and declared answered, for every request whose credential this
+    // gate resolved, so such a clause decides rather than standing undecided.
+    let context = ::service_common::temporary_credential_classes::principal_type_conditions(
+        caller.principal_type,
+    );
+    let published =
+        [::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY];
+    let request = iam::Request::new(action, resource, &[])
+        .with_context(&context)
+        .with_published_keys(&published);
     let said = iam::identity_decision_prepared(documents, &request);
     // Whether anything the principal carries grants the call at all. A caller this gate
     // does not bound is granted by definition, but an explicit `Deny` in a document that
@@ -303,6 +313,11 @@ struct Caller {
     /// as they read at the instant of this request. Empty for a credential no mint scoped —
     /// every long-term access key — which is a credential capped by nothing.
     scope: sts_store::ScopingPolicies,
+    /// The CLASS of the credential the request was signed with, as STS reports it for that
+    /// credential (`sts_store::Caller::principal_type`): the value the global condition key
+    /// naming the calling principal's type answers with. `None` for a request this gate
+    /// resolved no credential for, which carries no value for the key at all.
+    principal_type: Option<&'static str>,
     /// Set when this request presents the account's own published credential, which holds
     /// no IAM policies (see the module docs).
     account_credential: bool,
@@ -397,6 +412,9 @@ fn caller<Eng: Send + Sync + 'static>(engine: &Eng, ctx: &OperationContext<'_>) 
     let federated_session = resolved.federating_user_arn.is_some();
     let mut caller = Caller {
         account_credential: resolved.identity.arn == sts_store::ambient_identity().arn,
+        // WHICH CLASS of credential signed this request, read through STS's one answer for it
+        // (`sts_store::Caller::principal_type`).
+        principal_type: Some(resolved.principal_type()),
         arn: resolved.identity.arn,
         // The inline document the mint passed scopes the credential whether or not an IAM
         // store is there; where there is one, the scope is re-read below so a managed

@@ -246,7 +246,7 @@ fn decide<Eng: Send + Sync + 'static>(
     // for nobody populates neither.
     let mut conditions = conditions.clone();
     if !caller.principals.is_empty() {
-        conditions.add_caller(&caller.identity_arn);
+        conditions.add_caller(&caller.identity_arn, caller.principal_type);
     }
     let conditions = &conditions;
     // The principal spellings travel with the request because that is what a statement's
@@ -569,6 +569,11 @@ struct Caller {
     /// long-term access key, and every session minted without session policies — which is a
     /// credential capped by nothing.
     scope: sts_store::ScopingPolicies,
+    /// The CLASS of the credential the request was signed with, as STS reports it for that
+    /// credential (`sts_store::Caller::principal_type`): what the condition key naming the
+    /// calling principal's type answers with. `None` for a credential that speaks for
+    /// nobody, whose key is then not populated at all.
+    principal_type: Option<&'static str>,
     /// Set when this request presents the account's own published credential, which holds
     /// no IAM policies (see the module docs).
     account_credential: bool,
@@ -622,17 +627,25 @@ fn caller<Eng: Send + Sync + 'static>(
             ctx.credential_store(),
             sts_store::ambient_identity(),
         )
-        .map(|caller| (caller.identity, caller.role_arn, caller.session_policies)),
+        .map(|caller| {
+            (
+                caller.principal_type(),
+                caller.identity,
+                caller.role_arn,
+                caller.session_policies,
+            )
+        }),
         // No STS store on this engine: the only identity a request can present is the
         // account's own published credential, which is a session of no role and which no
         // mint scoped.
         None => Ok((
+            ::service_common::temporary_credential_classes::PRINCIPAL_TYPE_USER,
             sts_store::ambient_identity(),
             None,
             sts_store::SessionPolicies::default(),
         )),
     };
-    let (identity, session_role_arn, session_policies) = match resolved {
+    let (principal_type, identity, session_role_arn, session_policies) = match resolved {
         Ok(resolved) => resolved,
         // The session credential has expired, so it speaks for nobody: no documents, no
         // principal spelling, and every action it asks for falls to the default deny. The
@@ -648,6 +661,7 @@ fn caller<Eng: Send + Sync + 'static>(
                 documents: Vec::new(),
                 boundary: None,
                 scope: sts_store::ScopingPolicies::default(),
+                principal_type: None,
                 account_credential: false,
                 unreadable_attachment: false,
             };
@@ -665,6 +679,7 @@ fn caller<Eng: Send + Sync + 'static>(
         // store is there; where there is one, the scope is re-read below so a managed session
         // policy counts at the version in force NOW.
         scope: sts_store::session_scoping_documents(None, &session_policies),
+        principal_type: Some(principal_type),
         unreadable_attachment: false,
     };
     let Some(iam) = iam_store::service_state(engine) else {

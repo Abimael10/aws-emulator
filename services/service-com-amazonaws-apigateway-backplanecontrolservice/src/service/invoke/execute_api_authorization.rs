@@ -144,6 +144,11 @@ pub struct SigningCaller {
     /// grant gives this request ([`sts_store::ScopingPolicies`]). A credential no mint scoped
     /// — every long-term access key — caps nothing.
     scope: sts_store::ScopingPolicies,
+    /// The CLASS of the credential the request was signed with, as STS reports it for that
+    /// credential (`sts_store::Caller::principal_type`): the value the global condition key
+    /// naming the calling principal's type answers with. `None` for a request this gate
+    /// resolved no credential for, which carries no value for the key at all.
+    principal_type: Option<&'static str>,
     /// Set when this request presents the account's own published credential, which holds no
     /// IAM policies (see the module docs).
     account_credential: bool,
@@ -191,6 +196,19 @@ impl SigningCaller {
     #[must_use]
     pub fn spellings(&self) -> &[String] {
         &self.spellings
+    }
+
+    /// The condition context every decision about this caller is taken over: the CLASS of the
+    /// credential it signed with, which is what a statement conditioned on `aws:PrincipalType`
+    /// selects on. Empty for a credential this gate resolved nobody for.
+    ///
+    /// `pub` for the reason [`Self::spellings`] is: the CONTROL plane's gate decides over the
+    /// same caller this module resolves, so the two planes answer the key alike.
+    #[must_use]
+    pub fn conditions(&self) -> Vec<(String, String)> {
+        ::service_common::temporary_credential_classes::principal_type_conditions(
+            self.principal_type,
+        )
     }
 
     /// Whether nothing the identity-based decision found can refuse this caller once no
@@ -278,8 +296,12 @@ pub fn signing_caller<Eng: Send + Sync + 'static>(
     });
     // No STS store on this engine: the only identity a request can present is the account's
     // own published credential, which no mint scoped.
-    let (identity, session_policies) = match resolved {
-        Some(Ok(caller)) => (caller.identity.clone(), caller.session_policies.clone()),
+    let (principal_type, identity, session_policies) = match resolved {
+        Some(Ok(caller)) => (
+            Some(caller.principal_type()),
+            caller.identity.clone(),
+            caller.session_policies.clone(),
+        ),
         // The session credential has expired, so it speaks for nobody: no documents, no
         // principal spelling, and the invoke it asks for is refused as an expired credential
         // rather than as an authorization failure. The key id it presented is NOT quoted back,
@@ -293,6 +315,7 @@ pub fn signing_caller<Eng: Send + Sync + 'static>(
                 documents: Vec::new(),
                 boundary: None,
                 scope: sts_store::ScopingPolicies::default(),
+                principal_type: None,
                 account_credential: false,
                 unreadable_attachment: false,
                 expired: true,
@@ -301,6 +324,7 @@ pub fn signing_caller<Eng: Send + Sync + 'static>(
             };
         }
         None => (
+            Some(::service_common::temporary_credential_classes::PRINCIPAL_TYPE_USER),
             sts_store::ambient_identity(),
             sts_store::SessionPolicies::default(),
         ),
@@ -317,6 +341,9 @@ pub fn signing_caller<Eng: Send + Sync + 'static>(
         // an engine carrying no IAM store cannot read scopes nothing, while the inline
         // document the mint passed scopes the session whether or not a store is there.
         scope: sts_store::session_scoping_documents(None, &session_policies),
+        // WHICH CLASS of credential signed this request, read through STS's one answer for it
+        // (`sts_store::Caller::principal_type`).
+        principal_type,
         unreadable_attachment: false,
         expired: false,
         identity,
@@ -399,7 +426,17 @@ pub fn refusal(
     // The resource the SENTENCE reports is the masked one the endpoint publishes, while the
     // DECISION is taken about the method's own ARN — which is what a statement names it by.
     let reported = call.reported_resource();
-    let request = iam::Request::new(INVOKE_ACTION, &method_arn, &caller.spellings);
+    // The decision rests on the action, the method ARN, the principal spellings — and the
+    // CLASS of the credential presented, which is what a statement conditioned on
+    // `aws:PrincipalType` selects on. That key is answered, and declared answered, for every
+    // request whose credential this gate resolved, so such a clause decides rather than
+    // standing undecided.
+    let context = caller.conditions();
+    let published =
+        [::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY];
+    let request = iam::Request::new(INVOKE_ACTION, &method_arn, &caller.spellings)
+        .with_context(&context)
+        .with_published_keys(&published);
     let reason = refusing_reason(caller, &request, INVOKE_ACTION, resource_policy_said)?;
     Some(not_authorized(&caller.arn, &reported, &reason))
 }
@@ -533,6 +570,11 @@ mod tests {
             documents: documents.iter().map(|document| (*document).to_string()).collect(),
             boundary: None,
             scope: sts_store::ScopingPolicies::default(),
+            // A session of a role, which is the class `aws:PrincipalType` answers
+            // `AssumedRole` for.
+            principal_type: Some(
+                ::service_common::temporary_credential_classes::PRINCIPAL_TYPE_ASSUMED_ROLE,
+            ),
             account_credential: false,
             unreadable_attachment: false,
             expired: false,

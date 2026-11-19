@@ -304,6 +304,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // like it inherited the deleted one's policies.
         store.role_attached_policies.remove(&key);
         store.role_inline_policies.remove(&key);
+        // "Deleting a role … will immediately invalidate any existing temporary credentials
+        // issued for that role" (IAM User Guide, *Deleting roles or instance profiles*): the
+        // role is the principal those credentials speak for, so once it is gone they speak
+        // for nobody. The account's records of them go with the role
+        // (`withdraw_role_credentials`), and each credential itself is withdrawn from the
+        // emulator's credential store — which is what stops it being accepted whichever
+        // service it is presented to, rather than only by the services that read this store.
+        // Recreating a role under the same name therefore does not restore them.
+        let withdrawn = store.withdraw_role_credentials(&resource);
+        drop(store);
+        let credentials = ctx.credential_store();
+        for access_key_id in &withdrawn {
+            if let Err(error) = credentials.delete(access_key_id) {
+                ::tracing::warn!(
+                    operation = "DeleteRole",
+                    reason = ?error,
+                    "a credential issued for the deleted role was not held by the credential \
+                     store"
+                );
+            }
+        }
+        // A credential-revoking call leaves a record of itself: how many of the role's
+        // credentials were withdrawn and under which call, never any secret material.
+        if !withdrawn.is_empty() {
+            ::tracing::info!(
+                audit = true,
+                operation = "DeleteRole",
+                outcome = "credentials_withdrawn",
+                withdrawn = withdrawn.len(),
+                "the temporary credentials issued for the deleted role were withdrawn"
+            );
+        }
 
         Ok(DeleteRoleOutput)
     }

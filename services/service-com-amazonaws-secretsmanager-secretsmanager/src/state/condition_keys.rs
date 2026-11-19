@@ -64,6 +64,17 @@ pub const PRINCIPAL_ARN_KEY: &str = "aws:PrincipalArn";
 /// account the principal belongs to" (IAM's global condition keys).
 pub const PRINCIPAL_ACCOUNT_KEY: &str = "aws:PrincipalAccount";
 
+/// The global condition key naming the CLASS of the credential the request was signed with —
+/// the workspace's one spelling of it
+/// ([`::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY`]).
+///
+/// It is a fact about the CREDENTIAL rather than about the identity whose permissions are in
+/// force: the same IAM user is behind a long-term key (`User`), a session of a role it
+/// assumed (`AssumedRole`) and a federated-user session (`FederatedUser`), and a statement
+/// conditioned on this key selects exactly one of those.
+pub const PRINCIPAL_TYPE_KEY: &str =
+    ::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY;
+
 /// The `Name` a create states for the secret.
 pub const NAME_KEY: &str = "secretsmanager:Name";
 
@@ -237,10 +248,23 @@ impl Conditions {
     /// role" ([`PRINCIPAL_ARN_KEY`], IAM's global condition keys). The gate reads it off the
     /// caller it resolved (`crate::state::authorization`), so a policy that locks a secret
     /// to one role is satisfied by every session of that role.
-    pub fn add_caller(&mut self, principal_arn: &str) {
+    /// `principal_type` is the CLASS of the credential the request was signed with, as STS
+    /// reports it for that credential (`sts_store::Caller::principal_type`) — read there
+    /// rather than decided here, so every service handed the same credential answers the key
+    /// alike. `None` for a request whose credential speaks for no principal, whose key is
+    /// then not populated either.
+    pub fn add_caller(&mut self, principal_arn: &str, principal_type: Option<&str>) {
         self.publish(PRINCIPAL_ARN_KEY);
         self.values
             .push((PRINCIPAL_ARN_KEY.to_string(), principal_arn.to_string()));
+        if let Some(class) = principal_type {
+            self.publish(PRINCIPAL_TYPE_KEY);
+            self.values.extend(
+                ::service_common::temporary_credential_classes::principal_type_conditions(Some(
+                    class,
+                )),
+            );
+        }
         let account = ::service_common::arn::parse(principal_arn)
             .map(|arn| arn.account)
             .filter(|account| !account.is_empty());

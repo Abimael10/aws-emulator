@@ -172,6 +172,29 @@ pub enum SessionKind {
     FederationToken,
 }
 
+impl SessionKind {
+    /// Which CLASS of temporary credential a session of this kind is, as every service that
+    /// decides a request signed with one names it
+    /// ([`::service_common::temporary_credential_classes`]).
+    ///
+    /// One mapping, so what `aws:PrincipalType` answers for such a request and which calls
+    /// the credential may make are read from the same classification wherever they are
+    /// asked.
+    #[must_use]
+    pub fn credential_class(self) -> CredentialClass {
+        match self {
+            Self::AssumedRole => CredentialClass::AssumedRole,
+            Self::SessionToken => CredentialClass::SessionToken,
+            Self::FederationToken => CredentialClass::FederatedUser,
+        }
+    }
+}
+
+/// The class of credential a session's kind makes it: the workspace's one classification of
+/// a temporary credential, re-exported here because the mint that classifies one is this
+/// service's.
+pub use ::service_common::temporary_credential_classes::TemporaryCredentialClass as CredentialClass;
+
 /// The session policies ONE mint passed, which scope the session's permissions down, and
 /// the resolution of what they SAY at the instant of a request.
 ///
@@ -1174,6 +1197,23 @@ pub struct Caller {
 }
 
 impl Caller {
+    /// What the global condition key `aws:PrincipalType` answers for a request this
+    /// credential signs: the CLASS of the credential presented
+    /// ([`::service_common::temporary_credential_classes::principal_type`]) — `AssumedRole`
+    /// for a role session, `FederatedUser` for a federated-user session, and `User` for an
+    /// IAM user's own credential, which is what both a `GetSessionToken` session and a
+    /// long-term access key are.
+    ///
+    /// ONE reading beside the one rendering, so every service that resolves a credential
+    /// here answers the key alike and a statement conditioned on it selects the same class
+    /// wherever it is decided.
+    #[must_use]
+    pub fn principal_type(&self) -> &'static str {
+        ::service_common::temporary_credential_classes::principal_type(
+            self.kind.map(SessionKind::credential_class),
+        )
+    }
+
     /// A caller presenting no session credential: the long-term identity `identity`.
     fn long_term(identity: Identity) -> Self {
         Self {
@@ -1409,8 +1449,10 @@ pub fn iam_state<Eng: Send + Sync + 'static>(
     ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
 }
 
-/// Record, in the IAM store of the same engine, the role session the credential `minted`
-/// was vended for, so a request signed with it is judged on that role's policies.
+/// Record, in the IAM store of the same engine, the facts about the credential `minted`
+/// that a service deciding a request signed with it reads: the CLASS of credential it is,
+/// and — for a session of a role — the role session it was vended for, so the request is
+/// judged on that role's policies.
 ///
 /// Which principal an access key id speaks for is a question about the account's
 /// identities, and IAM answers it: its own authorizer resolves a long-term key through the
@@ -1422,24 +1464,45 @@ pub fn iam_state<Eng: Send + Sync + 'static>(
 /// decision needs travel: the principal the session is, the role it is of, the scope it
 /// was minted with and the tags it carries.
 ///
-/// Nothing is recorded for a session that is not a role's — `GetSessionToken` and
-/// `GetFederationToken` vend no `role_arn` — and nothing at all when the engine carries no
-/// IAM store. Call it with the session registry's lock already GIVEN UP, so no handler
-/// holds the IAM lock and the session lock at once.
-pub fn publish_role_session(
+/// The CLASS travels for every mint, including the two kinds that are no role's session
+/// ([`IamState::record_temporary_credential`]): which kind of credential was presented is
+/// what `aws:PrincipalType` answers and what the bans AWS states per class are decided
+/// from, and neither is a document, so neither can travel with the scope.
+///
+/// Nothing is recorded at all when the engine carries no IAM store. Call it with the session
+/// registry's lock already GIVEN UP, so no handler holds the IAM lock and the session lock
+/// at once.
+pub fn publish_minted_credential(
     iam: Option<&::engine::ServiceState<IamState>>,
     minted: &MintedSession,
     now: SystemTime,
 ) {
-    let (Some(iam), Some(role_arn)) = (iam, minted.session.role_arn.as_ref()) else {
+    let Some(iam) = iam else {
         return;
     };
-    iam.lock().record_role_session(
+    let now_stamp = ::aws_smithy_types::DateTime::from_secs(unix_seconds(now));
+    let expires =
+        ::aws_smithy_types::DateTime::from_secs(unix_seconds(minted.session.expires_at));
+    let mut store = iam.lock();
+    store.record_temporary_credential(
+        &minted.session.access_key_id,
+        ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::TemporaryCredentialRecord {
+            class: minted.session.kind.credential_class(),
+            principal_arn: minted.session.identity.arn.clone(),
+            mfa_authenticated: minted.session.mfa_authenticated,
+            expires,
+        },
+        now_stamp,
+    );
+    let Some(role_arn) = minted.session.role_arn.as_ref() else {
+        return;
+    };
+    store.record_role_session(
         &minted.session.access_key_id,
         ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::RoleSessionRecord {
             session_arn: minted.session.identity.arn.clone(),
             role_arn: role_arn.clone(),
-            expires: ::aws_smithy_types::DateTime::from_secs(unix_seconds(minted.session.expires_at)),
+            expires,
             // The scope the mint passed travels with the session, because a session policy
             // caps what the role's own policies grant and the gate that reads those
             // policies is the one that has to read this too (see [`SessionPolicies`]).
@@ -1451,7 +1514,7 @@ pub fn publish_role_session(
             // as the request submitted them.
             tags: minted.session.tags.clone(),
         },
-        ::aws_smithy_types::DateTime::from_secs(unix_seconds(now)),
+        now_stamp,
     );
 }
 
@@ -1826,13 +1889,12 @@ pub fn assume_role_multi_factor_auth_present(
     caller.multi_factor_auth_present()
 }
 
-/// How `aws:PrincipalType` names the calling principal's kind.
+/// How `aws:PrincipalType` names the calling principal's kind — the workspace's one
+/// rendering of it ([`Caller::principal_type`]).
 fn caller_principal_type(kind: Option<SessionKind>) -> &'static str {
-    match kind {
-        Some(SessionKind::AssumedRole) => "AssumedRole",
-        Some(SessionKind::FederationToken) => "FederatedUser",
-        Some(SessionKind::SessionToken) | None => "User",
-    }
+    ::service_common::temporary_credential_classes::principal_type(
+        kind.map(SessionKind::credential_class),
+    )
 }
 
 /// The registry of web identity tokens THIS emulator issued, in the same shared engine:
@@ -2578,7 +2640,7 @@ pub fn mint_session<Eng: Send + Sync + 'static>(
 /// A credential that is a session of a role is judged on the policies in force on THAT role
 /// — "the temporary security credentials … have the permissions of the role"
 /// (`AssumeRole`) — whichever operation vended it, so the record a service resolves a
-/// temporary credential's principal through ([`publish_role_session`]) belongs to every
+/// temporary credential's principal through ([`publish_minted_credential`]) belongs to every
 /// mint, not only to this service's own operations. Those operations publish it themselves
 /// because each holds the registry lock across its own later checks; everything else mints
 /// through here, so a session minted outside this service speaks for its role exactly as an
@@ -2597,7 +2659,7 @@ pub fn mint_role_session<Eng: Send + Sync + 'static>(
         let mut held = registry.lock();
         mint_session(engine, store, &mut held, now, request)?
     };
-    publish_role_session(iam_state(engine).as_ref(), &minted, now);
+    publish_minted_credential(iam_state(engine).as_ref(), &minted, now);
     Ok(minted)
 }
 
@@ -2641,8 +2703,9 @@ pub fn remember_audited_session<Eng: Send + Sync + 'static>(
         .remember(session.access_key_id.clone(), audited_session(session), now);
 }
 
-/// Forget a session the account's session directory holds — for a mint this service gave
-/// up again, so the directory never names a credential no caller was handed.
+/// Forget a session the account's SHARED directories hold — its audit view — for a mint
+/// this service gave up again, so the directory never names a credential no caller was
+/// handed.
 pub fn forget_audited_session<Eng: Send + Sync + 'static>(engine: &Eng, access_key_id: &str) {
     if let Some(directory) = session_audit_directory(engine) {
         directory.lock().forget(access_key_id);

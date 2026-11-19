@@ -93,11 +93,23 @@ pub fn issuance_is_unauthorized<Eng: Send + Sync + 'static>(
     certificate_authority_arn: &str,
 ) -> bool {
     let caller = caller(engine, ctx);
+    // The decision rests on the action, the certificate authority it is taken on, the
+    // principal spellings — and the CLASS of the credential presented, which is what a
+    // statement conditioned on `aws:PrincipalType` selects on. That key is answered, and
+    // declared answered, for every request whose credential this gate resolved, so such a
+    // clause decides rather than standing undecided.
+    let context = ::service_common::temporary_credential_classes::principal_type_conditions(
+        caller.principal_type,
+    );
+    let published =
+        [::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY];
     let request = iam::Request::new(
         ISSUE_CERTIFICATE_ACTION,
         certificate_authority_arn,
         &caller.principals,
-    );
+    )
+    .with_context(&context)
+    .with_published_keys(&published);
     // What the identity's OWN documents say about this issuance.
     if iam::identity_decision(&caller.documents, &request) == Decision::Denied {
         return true;
@@ -157,6 +169,11 @@ struct Caller {
     /// identity's documents grant, resolved at the instant of the request. A credential no
     /// mint scoped is capped by nothing.
     scope: iam_store::ScopingPolicies,
+    /// The CLASS of the credential the request was signed with, as STS reports it for that
+    /// credential (`sts_store::Caller::principal_type`): the value the global condition key
+    /// naming the calling principal's type answers with. `None` for a request this gate
+    /// resolved no credential for, which carries no value for the key at all.
+    principal_type: Option<&'static str>,
 }
 
 impl Caller {
@@ -189,26 +206,34 @@ fn caller<Eng: Send + Sync + 'static>(
 ) -> Caller {
     let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
     let identity = match sts_store::service_state(engine) {
-        Some(sts) => sts_store::resolve_caller(
+        Some(sts) => sts_store::resolve_request_caller(
             &mut sts.lock(),
             &access_key_id,
             SystemTime::now(),
             ctx.credential_store(),
-        ),
+            sts_store::ambient_identity(),
+        )
+        .map(|caller| (caller.principal_type(), caller.identity)),
         // No STS store on this engine: the only identity a request can present is the
         // account's own published credential.
-        None => Ok(sts_store::ambient_identity()),
+        None => Ok((
+            ::service_common::temporary_credential_classes::PRINCIPAL_TYPE_USER,
+            sts_store::ambient_identity(),
+        )),
     };
     // An expired session credential speaks for nobody: it carries no document, so nothing it
     // asks for is allowed — and in the assembled emulator the layer that authenticates a
     // request has already refused it before any handler runs.
-    let Ok(identity) = identity else {
+    let Ok((principal_type, identity)) = identity else {
         return Caller::default();
     };
 
     let mut caller = Caller {
         account_credential: identity.arn == sts_store::ambient_identity().arn,
         principals: vec![identity.arn.clone()],
+        // WHICH CLASS of credential signed this request, read through STS's one answer for it
+        // (`sts_store::Caller::principal_type`).
+        principal_type: Some(principal_type),
         ..Caller::default()
     };
     let Some(iam) = iam_store::service_state(engine) else {

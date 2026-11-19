@@ -139,7 +139,16 @@ pub fn denial<Eng: Send + Sync + 'static>(
     if caller.expired() {
         return Some(unauthorized(&caller.arn, &action, &resource, EXPIRED));
     }
-    let request = iam::Request::new(&action, &resource, caller.spellings());
+    // The decision rests on the action, the resource the request addressed, the principal
+    // spellings — and the CLASS of the credential presented, which the caller answers for
+    // (`SigningCaller::conditions`), so a statement conditioned on `aws:PrincipalType`
+    // decides here exactly as it does on the data plane beside it.
+    let context = caller.conditions();
+    let published =
+        [::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY];
+    let request = iam::Request::new(&action, &resource, caller.spellings())
+        .with_context(&context)
+        .with_published_keys(&published);
     // IAM's own evaluation ORDER — explicit denies, then the grant, then each cap — is the
     // one this crate already applies to the `execute-api` data plane, asked here rather
     // than restated: this control plane publishes no resource-based policy of its own, so

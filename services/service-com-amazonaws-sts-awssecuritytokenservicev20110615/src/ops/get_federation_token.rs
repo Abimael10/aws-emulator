@@ -435,6 +435,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (session_token_utilization, session_token_size) =
             crate::state::session_token_metrics(&minted.credentials);
+        // Which CLASS of credential this call vends is what a service deciding a request
+        // signed with it reads — a federated-user credential answers `aws:PrincipalType` as
+        // one and may not call IAM at all
+        // (`crate::state::publish_minted_credential`). The session lock is given up first,
+        // so this handler never holds the IAM lock and the session lock at once.
+        drop(registry);
+        crate::state::publish_minted_credential(
+            crate::state::iam_state(&*self.engine).as_ref(),
+            &minted,
+            now,
+        );
         Ok(GetFederationTokenOutput {
             credentials: Some(minted.credentials),
             federated_user: Some(FederatedUser {

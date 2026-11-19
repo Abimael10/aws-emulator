@@ -361,7 +361,17 @@ struct Caller {
     /// The condition keys the web identity this credential was minted by exchanging publishes,
     /// as STS recorded them on the session. Empty for a credential no such exchange minted.
     federated_claims: Vec<(String, String)>,
+    /// The CLASS of the credential the request was signed with, as STS reports it for that
+    /// credential (`sts_store::Caller::principal_type`): the value the global condition key
+    /// naming the calling principal's type answers with. `None` for a request this gate
+    /// resolved no credential for, which carries no value for the key at all.
+    principal_type: Option<&'static str>,
 }
+
+/// The condition key naming the CLASS of the credential a request was signed with — the
+/// workspace's one spelling of it.
+const PRINCIPAL_TYPE_CONDITION_KEY: &str =
+    ::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY;
 
 /// The condition key family a principal's session tags answer for, as IAM publishes it.
 const PRINCIPAL_TAG_CONDITION_KEY_FAMILY: &str = "aws:PrincipalTag/";
@@ -387,6 +397,14 @@ impl Caller {
             })
             .collect();
         context.extend(self.federated_claims.iter().cloned());
+        // The CLASS of credential the request was signed with, which is what a statement
+        // conditioned on `aws:PrincipalType` selects on — and nothing at all for a request
+        // this gate resolved no credential for.
+        context.extend(
+            ::service_common::temporary_credential_classes::principal_type_conditions(
+                self.principal_type,
+            ),
+        );
         context
     }
 
@@ -397,6 +415,9 @@ impl Caller {
             published.push(PRINCIPAL_TAG_CONDITION_KEY_FAMILY);
         }
         published.extend(sts_store::federated_claim_keys(&self.federated_claims));
+        if self.principal_type.is_some() {
+            published.push(PRINCIPAL_TYPE_CONDITION_KEY);
+        }
         published
     }
 
@@ -506,12 +527,15 @@ struct Resolved {
     tags_known: bool,
     federated_claims: Vec<(String, String)>,
     session_policies: sts_store::SessionPolicies,
+    /// The CLASS of credential it is (see [`Caller::principal_type`]).
+    principal_type: &'static str,
 }
 
 impl From<sts_store::Caller> for Resolved {
     fn from(caller: sts_store::Caller) -> Self {
         Self {
             policies_arn: caller.identity_policies_arn().to_string(),
+            principal_type: caller.principal_type(),
             arn: caller.identity.arn,
             role_arn: caller.role_arn,
             tags: caller.tags,
@@ -553,6 +577,9 @@ fn caller<Eng: Send + Sync + 'static>(engine: &Eng, ctx: &OperationContext<'_>) 
             tags_known: false,
             federated_claims: Vec::new(),
             session_policies: sts_store::SessionPolicies::default(),
+            // No session registry to have minted a temporary credential: the key presented is
+            // a long-term one, which is the class a credential of no session is.
+            principal_type: ::service_common::temporary_credential_classes::PRINCIPAL_TYPE_USER,
         }),
     };
     // An expired session credential speaks for nobody: it carries no document, so every action
@@ -571,6 +598,7 @@ fn caller<Eng: Send + Sync + 'static>(engine: &Eng, ctx: &OperationContext<'_>) 
         tags: resolved.tags,
         tags_known: resolved.tags_known,
         federated_claims: resolved.federated_claims,
+        principal_type: Some(resolved.principal_type),
         ..Caller::default()
     };
     // An assumed-role session is also named by the ARN of the role it is a session of, which is

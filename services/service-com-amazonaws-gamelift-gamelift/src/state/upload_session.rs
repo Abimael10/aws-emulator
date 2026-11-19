@@ -153,6 +153,11 @@ pub fn vend<Eng: Send + Sync + 'static>(
         )
         .ok()?
     };
+    // Which CLASS of credential this vend minted, for the service that decides a request
+    // signed with it: a federated-user credential, which may not call IAM at all
+    // (`sts_store::publish_minted_credential`). The session registry's guard is given up
+    // first, so no caller holds the IAM lock and the session lock at once.
+    sts_store::publish_minted_credential(sts_store::iam_state(engine).as_ref(), &minted, now);
     Some(VendedUploadCredentials {
         access_key_id: minted.credentials.access_key_id,
         secret_access_key: minted.credentials.secret_access_key,

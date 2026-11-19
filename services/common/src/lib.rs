@@ -755,6 +755,11 @@ pub mod sql_wire_planes;
 /// The ONE home for the two refusals the resource-tagging layer in front of a service
 /// answers with, for every service whose recordings show that layer's own error classes.
 pub mod tagging_refusal;
+/// The CLASS of a temporary credential — what `aws:PrincipalType` answers for a request it
+/// signs, and whether a credential of that class may call IAM at all — written by the
+/// service that MINTS such a credential and read by the services that decide a request
+/// signed with one.
+pub mod temporary_credential_classes;
 /// The ONE token bucket an emulated service meters a caller-driven request rate with, for
 /// every service whose model publishes a rate-and-burst pair.
 pub mod token_bucket;

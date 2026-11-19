@@ -263,7 +263,7 @@ impl Target {
     ) -> Option<String> {
         let boundary = caller.boundary.as_ref()?;
         let named = acted_on.unwrap_or(ANY_RESOURCE);
-        let request = iam::Request::new(action, named, &caller.principals);
+        let request = caller.request(action, named, &caller.principals);
         match iam::identity_decision(::std::slice::from_ref(boundary), &request) {
             Decision::Allowed => None,
             Decision::Denied => Some(BOUNDARY_DENY.to_string()),
@@ -286,7 +286,7 @@ impl Target {
     fn scoped(&self, caller: &Caller, action: &str) -> Decision {
         let mut decided = Decision::NotStated;
         for named in self.named_resources() {
-            let request = iam::Request::new(action, named, &caller.principals);
+            let request = caller.request(action, named, &caller.principals);
             match caller.scope.decision(&request) {
                 Decision::Denied => return Decision::Denied,
                 Decision::Allowed => decided = Decision::Allowed,
@@ -327,7 +327,7 @@ impl Target {
         let mut resource = Decision::NotStated;
         let denied_by = caller.denied_spellings();
         for named in self.named_resources() {
-            let request = iam::Request::new(action, named, &caller.principals);
+            let request = caller.request(action, named, &caller.principals);
             match iam::identity_decision(&caller.documents, &request) {
                 Decision::Denied => identity = Decision::Denied,
                 Decision::Allowed if identity != Decision::Denied => identity = Decision::Allowed,
@@ -338,7 +338,7 @@ impl Target {
             };
             // The deny pass, over every spelling that can be denied; what it says about a
             // grant is not read, because its spellings are wider than a grant's.
-            let denial = iam::Request::new(action, named, &denied_by);
+            let denial = caller.request(action, named, &denied_by);
             if iam::resource_decision(policy, &denial) == Decision::Denied {
                 resource = Decision::Denied;
                 continue;
@@ -494,9 +494,36 @@ pub struct Caller {
     /// policies, a principal carrying an attachment whose document this emulator does not
     /// hold, and an engine with no IAM store at all (see the module docs).
     identity_unbounded: bool,
+    /// The condition context every decision about this request is taken over: the CLASS of
+    /// the credential it was signed with, which is what a statement conditioned on
+    /// `aws:PrincipalType` selects on. Empty for a request this gate resolved no credential
+    /// for, which carries no value for the key at all.
+    conditions: Vec<(String, String)>,
 }
 
+/// The condition keys a decision of this gate DECLARES it answers: the class of the
+/// credential the request was signed with, which it holds for every request whose credential
+/// it resolved — so a clause over it is decided rather than left undecided.
+const PUBLISHED_CONDITION_KEYS: &[&str] =
+    &[::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY];
+
 impl Caller {
+    /// One decision's request: `action` on `resource`, asked for the principal spellings
+    /// `principals`, in this caller's condition context and declaring the keys it answers.
+    ///
+    /// ONE place, so every leg of a decision about this caller — the identity-based pass, the
+    /// resource-policy passes, the scope and the boundary — asks about the same request and
+    /// publishes the same keys.
+    fn request<'a>(
+        &'a self,
+        action: &'a str,
+        resource: &'a str,
+        principals: &'a [String],
+    ) -> iam::Request<'a> {
+        iam::Request::new(action, resource, principals)
+            .with_context(&self.conditions)
+            .with_published_keys(PUBLISHED_CONDITION_KEYS)
+    }
     /// Every spelling a `Deny` about this caller may name it by: its own, and its
     /// account's.
     fn denied_spellings(&self) -> Vec<String> {
@@ -545,6 +572,11 @@ pub fn caller<Eng: Send + Sync + 'static>(
             boundary: None,
             scope: sts_store::ScopingPolicies::default(),
             identity_unbounded: true,
+            // No session registry to have minted a temporary credential: the key presented
+            // is a long-term one, which is the class a credential of no session is.
+            conditions: ::service_common::temporary_credential_classes::principal_type_conditions(
+                Some(::service_common::temporary_credential_classes::PRINCIPAL_TYPE_USER),
+            ),
         };
     };
     // A long-term access key speaks for the IAM user that holds it, which is the identity
@@ -583,6 +615,10 @@ pub fn caller<Eng: Send + Sync + 'static>(
             // identity it speaks for, which is the IAM user that holds a long-term
             // access key — STS's own answer for which that is.
             identity_arn = Some(resolved.identity_policies_arn().to_string());
+            // WHICH CLASS of credential signed this request, read through STS's one answer
+            // for it (`sts_store::Caller::principal_type`), before the resolved caller is
+            // broken up below.
+            let principal_type = resolved.principal_type();
             // What the MINT of this credential scoped it to, which caps whatever those
             // policies grant; the documents it stands for are read below.
             session_policies = resolved.session_policies;
@@ -599,6 +635,12 @@ pub fn caller<Eng: Send + Sync + 'static>(
                     || resolved.identity.arn == sts_store::ambient_identity().arn,
                 account_principals: iam::account_principals(&resolved.identity.arn),
                 principals,
+                // WHICH CLASS of credential signed this request, read through STS's one
+                // answer for it (`sts_store::Caller::principal_type`).
+                conditions:
+                    ::service_common::temporary_credential_classes::principal_type_conditions(
+                        Some(principal_type),
+                    ),
                 arn: resolved.identity.arn,
                 documents: Vec::new(),
                 boundary: None,
@@ -617,6 +659,9 @@ pub fn caller<Eng: Send + Sync + 'static>(
             boundary: None,
             scope: sts_store::ScopingPolicies::default(),
             identity_unbounded: false,
+            // A credential that speaks for nobody carries no class either: the key is
+            // reported absent rather than answered as some class.
+            conditions: Vec::new(),
         },
     };
     // What that principal may do, and what its credential was scoped to: both out of the

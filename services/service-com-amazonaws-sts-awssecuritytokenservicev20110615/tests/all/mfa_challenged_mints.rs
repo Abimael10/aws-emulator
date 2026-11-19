@@ -97,7 +97,10 @@ fn given_user(engine: &engine::InMemoryEngine) -> String {
 /// Provision a virtual MFA device through IAM's own `CreateVirtualMFADevice` and enable it for
 /// `user_name` with the two codes it emits — the enrolment a holder of the device performs.
 /// Answers the device's serial number and its base32 seed.
-async fn given_enabled_device(
+///
+/// `pub(crate)` because the credential-class suite beside this one enrols a device exactly this
+/// way: one enrolment, so the two suites cannot provision a device differently.
+pub(crate) async fn given_enabled_device(
     router: &MultiServiceRouter,
     user_name: &str,
     device_name: &str,
@@ -151,7 +154,10 @@ async fn given_enabled_device(
 /// The pass code a device provisioned with `seed` emits in the time step `step`, computed here
 /// rather than asked of either service (see the module docs): RFC 6238's TOTP over RFC 4226's
 /// HOTP, HMAC-SHA-1 of the counter, dynamically truncated and taken to six digits.
-fn pass_code(seed: &str, step: u64) -> String {
+///
+/// `pub(crate)` for the reason [`given_enabled_device`] is: one computation of the code, so no
+/// suite of this crate can compute a different one.
+pub(crate) fn pass_code(seed: &str, step: u64) -> String {
     use hmac::Mac;
 
     let key = data_encoding::BASE32_NOPAD
@@ -172,7 +178,7 @@ fn pass_code(seed: &str, step: u64) -> String {
 }
 
 /// The time step the instant `now` falls in.
-fn current_step(now: SystemTime) -> u64 {
+pub(crate) fn current_step(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH)
         .expect("the clock is past the epoch")
         .as_secs()

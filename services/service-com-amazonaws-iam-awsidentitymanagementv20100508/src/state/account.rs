@@ -535,6 +535,13 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// [`Self::record_role_session`]. At most [`MAX_ROLE_SESSIONS`] entries, which the
     /// same write keeps by pruning the records the clock has already expired.
     pub role_sessions: BTreeMap<String, RoleSessionRecord>,
+    /// Access key id -> the CLASS of the temporary credential that key names, for every
+    /// temporary credential this account has minted. See [`TemporaryCredentialRecord`]: it
+    /// answers what kind of credential a request was signed with, which is a different
+    /// question from [`Self::role_sessions`]' "whose policies judge it" and is answered for
+    /// the two classes that are no role's session at all. Written by the same mint that
+    /// writes a role session ([`Self::record_temporary_credential`]), and keyed alike.
+    pub temporary_credentials: BTreeMap<String, TemporaryCredentialRecord>,
     /// `CertificateId` -> the signing certificate's record, including [`name_key`] of
     /// the user that holds it. `UploadSigningCertificate` is what fills this map,
     /// `ListSigningCertificates` pages over it, `UpdateSigningCertificate` moves one
@@ -951,6 +958,7 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             group_inline_policies: BTreeMap::new(),
             access_keys: BTreeMap::new(),
             role_sessions: BTreeMap::new(),
+            temporary_credentials: BTreeMap::new(),
             signing_certificates: BTreeMap::new(),
             ssh_public_keys: BTreeMap::new(),
             login_profiles: BTreeMap::new(),

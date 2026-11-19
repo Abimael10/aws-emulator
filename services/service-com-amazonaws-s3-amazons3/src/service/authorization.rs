@@ -134,6 +134,17 @@ const PRINCIPAL_ACCOUNT_KEY: &str = "aws:PrincipalAccount";
 /// session is decided for that session and for no other.
 const USER_ID_KEY: &str = "aws:userid";
 
+/// The global condition key naming the CLASS of the principal that signed the request — the
+/// workspace's one spelling of it
+/// ([`::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY`]).
+///
+/// It is answered from the CREDENTIAL presented rather than from the identity it speaks for:
+/// the same IAM user is behind a long-term key (`User`), a role session of a role it assumed
+/// (`AssumedRole`) and a federated-user session (`FederatedUser`), and a statement
+/// conditioned on this key selects exactly one of those.
+const PRINCIPAL_TYPE_KEY: &str =
+    ::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY;
+
 /// The global condition key naming the Region the request was made TO: "aws:RequestedRegion
 /// — the Region that was called in the request" (AWS General Reference, *Global condition
 /// context keys*).
@@ -259,6 +270,7 @@ pub const PUBLISHED_CONDITION_KEYS: &[&str] = &[
     PRINCIPAL_ARN_KEY,
     PRINCIPAL_ACCOUNT_KEY,
     USER_ID_KEY,
+    PRINCIPAL_TYPE_KEY,
     REQUESTED_REGION_KEY,
     MULTI_FACTOR_AUTH_PRESENT_KEY,
     TOKEN_ISSUE_TIME_KEY,
@@ -293,15 +305,16 @@ pub const CALLER_FREE_CONDITION_KEYS: &[&str] = &[
 ];
 
 /// The keys of [`PUBLISHED_CONDITION_KEYS`] that only the FULL gate can answer — who the
-/// caller is, which account it belongs to, its unique id, whether its credential was
-/// MFA-backed, and the Region the request addressed, which that gate reads off the request
-/// itself — which are the difference between the two lists above; see
-/// `the_two_published_lists_differ_by_the_caller_keys`.
+/// caller is, which account it belongs to, its unique id, the class of credential it signed
+/// with, whether that credential was MFA-backed, and the Region the request addressed, which
+/// that gate reads off the request itself — which are the difference between the two lists
+/// above; see `the_two_published_lists_differ_by_the_caller_keys`.
 #[cfg(test)]
 const CALLER_CONDITION_KEYS: &[&str] = &[
     PRINCIPAL_ARN_KEY,
     PRINCIPAL_ACCOUNT_KEY,
     USER_ID_KEY,
+    PRINCIPAL_TYPE_KEY,
     REQUESTED_REGION_KEY,
     MULTI_FACTOR_AUTH_PRESENT_KEY,
     TOKEN_ISSUE_TIME_KEY,

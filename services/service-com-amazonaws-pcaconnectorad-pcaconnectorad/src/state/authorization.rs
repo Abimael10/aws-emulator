@@ -159,7 +159,9 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     let caller = caller(engine, ctx);
     let refusal = || Some(iam::not_authorized_to_perform(&caller.arn, &action, resource));
     // Every key the decision may read: the ones that name the principal the request was
-    // signed by. A credential that speaks for nobody populates neither.
+    // signed by, and the CLASS of the credential it was signed with, which is what a
+    // statement conditioned on `aws:PrincipalType` selects on. A credential that speaks for
+    // nobody populates none of them.
     let mut context: Vec<(String, String)> = Vec::new();
     if !caller.principals.is_empty() {
         context.push((PRINCIPAL_ARN_KEY.to_string(), caller.arn.clone()));
@@ -169,6 +171,11 @@ pub fn authorize<Eng: Send + Sync + 'static>(
             }
         }
     }
+    context.extend(
+        ::service_common::temporary_credential_classes::principal_type_conditions(
+            caller.principal_type,
+        ),
+    );
     // The keys the request DECLARES it models, which is what gives IAM's empty-set reading
     // something to decide: every key it carries a value for.
     let published: Vec<&str> = context.iter().map(|(key, _)| key.as_str()).collect();
@@ -225,6 +232,11 @@ struct Caller {
     /// called with, resolved to the documents in force now. A credential no mint scoped is
     /// capped by nothing.
     scope: sts_store::ScopingPolicies,
+    /// The CLASS of the credential the request was signed with, as STS reports it for that
+    /// credential (`sts_store::Caller::principal_type`): the value the global condition key
+    /// naming the calling principal's type answers with. `None` for a request this gate
+    /// resolved no credential for, which carries no value for the key at all.
+    principal_type: Option<&'static str>,
     /// Set when this request presents the account's own published credential, which holds
     /// no IAM policies (see the module docs).
     account_credential: bool,
@@ -276,15 +288,22 @@ fn caller<Eng: Send + Sync + 'static>(
             ctx.credential_store(),
             sts_store::ambient_identity(),
         )
-        .map(|caller| (caller.identity, caller.session_policies)),
+        .map(|caller| {
+            (
+                caller.principal_type(),
+                caller.identity,
+                caller.session_policies,
+            )
+        }),
         // No STS store on this engine: the only identity a request can present is the
         // account's own published credential, which no mint scoped.
         None => Ok((
+            ::service_common::temporary_credential_classes::PRINCIPAL_TYPE_USER,
             sts_store::ambient_identity(),
             sts_store::SessionPolicies::default(),
         )),
     };
-    let (identity, session_policies) = match resolved {
+    let (principal_type, identity, session_policies) = match resolved {
         Ok(resolved) => resolved,
         // The session credential has expired, so it speaks for nobody: no documents, no
         // principal spelling, and every action it asks for falls to the default deny. The
@@ -299,6 +318,7 @@ fn caller<Eng: Send + Sync + 'static>(
                 documents: Vec::new(),
                 boundary: None,
                 scope: sts_store::ScopingPolicies::default(),
+                principal_type: None,
                 account_credential: false,
             };
         }
@@ -314,6 +334,9 @@ fn caller<Eng: Send + Sync + 'static>(
         // store is there; where there is one, the scope is re-read below so a managed
         // session policy counts at the version in force NOW.
         scope: sts_store::session_scoping_documents(None, &session_policies),
+        // WHICH CLASS of credential signed this request, read through STS's one answer for it
+        // (`sts_store::Caller::principal_type`).
+        principal_type: Some(principal_type),
     };
     let Some(iam) = iam_store::service_state(engine) else {
         return caller;

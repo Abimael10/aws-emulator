@@ -329,6 +329,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (session_token_utilization, session_token_size) =
             crate::state::session_token_metrics(&minted.credentials);
+        // Which CLASS of credential this call vends is what a service deciding a request
+        // signed with it reads — a `GetSessionToken` credential answers `aws:PrincipalType`
+        // as the IAM user it is of, and may not call IAM unless this mint was MFA-backed
+        // (`crate::state::publish_minted_credential`). The session lock is given up first,
+        // so this handler never holds the IAM lock and the session lock at once.
+        drop(registry);
+        crate::state::publish_minted_credential(
+            crate::state::iam_state(&*self.engine).as_ref(),
+            &minted,
+            now,
+        );
         Ok(GetSessionTokenOutput {
             credentials: Some(minted.credentials),
             session_token_utilization: Some(session_token_utilization),

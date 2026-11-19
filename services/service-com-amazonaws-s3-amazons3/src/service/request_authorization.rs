@@ -324,6 +324,11 @@ pub struct Caller {
     /// registry recorded it (`sts_store::Caller::token_issue_time`), and `None` for a
     /// long-term access key, which belongs to no session and carries no value for the key.
     pub token_issue_time: Option<String>,
+    /// What the request's CLASS-OF-CREDENTIAL key answers for the credential presented: the
+    /// class STS reports for it (`sts_store::Caller::principal_type`) — `AssumedRole`,
+    /// `FederatedUser` or `User` — and `None` for a request this gate resolved no credential
+    /// for, whose key is then absent exactly as its principal ARN is.
+    pub principal_type: Option<&'static str>,
     /// Set when the identity whose documents are in force for this request is the account's
     /// own published credential, which holds no IAM policies (see the module docs) — the
     /// credential itself, and a session it minted, whose permissions are the intersection of
@@ -468,6 +473,10 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
                 // exactly for a credential it minted.
                 caller.kind.is_some(),
                 caller.tags.clone(),
+                // WHICH CLASS of credential signed this request, read through STS's one
+                // answer for it (`sts_store::Caller::principal_type`): the value
+                // `aws:PrincipalType` is decided against.
+                Some(caller.principal_type()),
             )
         }),
         // No STS store on this engine: the credential names no session, so it speaks for the
@@ -482,6 +491,9 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
             None,
             false,
             Vec::new(),
+            // No session registry to have minted a temporary credential: the key presented
+            // is a long-term one, which is the class a credential of no session is.
+            Some(::service_common::temporary_credential_classes::PRINCIPAL_TYPE_USER),
         )),
     };
     // An expired session credential speaks for nobody: it carries no documents and no
@@ -496,6 +508,7 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
         token_issue_time,
         tags_known,
         tags,
+        principal_type,
     )) = resolved
     else {
         return Caller {
@@ -524,6 +537,7 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
         requested_region,
         multi_factor_auth_present,
         token_issue_time,
+        principal_type,
         tags,
         tags_known,
         ..Caller::default()
@@ -989,6 +1003,14 @@ fn caller_conditions(caller: &Caller, conditions: &[(String, String)]) -> Vec<(S
     context.extend(authorization::multi_factor_auth_conditions(
         caller.multi_factor_auth_present,
     ));
+    // The CLASS of credential the request was signed with, which is what a statement
+    // conditioned on `aws:PrincipalType` selects on — and nothing at all for a request this
+    // gate resolved no credential for.
+    context.extend(
+        ::service_common::temporary_credential_classes::principal_type_conditions(
+            caller.principal_type,
+        ),
+    );
     // The instant the session the credential belongs to was issued, which is what a statement
     // revoking the sessions issued before a cut-off is decided against — and nothing at all
     // for a long-term key, which belongs to no session.

@@ -238,6 +238,11 @@ struct Caller {
     /// every long-term access key, and every session minted without session policies — which
     /// is a credential capped by nothing.
     scope: sts_store::ScopingPolicies,
+    /// The CLASS of the credential the request was signed with, as STS reports it for that
+    /// credential (`sts_store::Caller::principal_type`): the value the global condition key
+    /// naming the calling principal's type answers with. `None` for a request this gate
+    /// resolved no credential for, which carries no value for the key at all.
+    principal_type: Option<&'static str>,
     /// Set when this request presents the account's own published credential, which holds no
     /// IAM policies (see the module docs).
     account_credential: bool,
@@ -272,8 +277,19 @@ impl Caller {
     /// order IAM reads them.
     fn refusal(&self, action: &str, resource: &str) -> Option<String> {
         // An identity-based document states no `Principal` element, so the decision rests on
-        // the action and the resource the request addressed.
-        let request = iam::Request::new(action, resource, &[]);
+        // the action and the resource the request addressed — and on the CLASS of the
+        // credential presented, which is what a statement conditioned on `aws:PrincipalType`
+        // selects on. That key is answered, and declared answered, for every request whose
+        // credential this gate resolved, so such a clause decides rather than standing
+        // undecided.
+        let context = ::service_common::temporary_credential_classes::principal_type_conditions(
+            self.principal_type,
+        );
+        let published =
+            [::service_common::temporary_credential_classes::PRINCIPAL_TYPE_CONDITION_KEY];
+        let request = iam::Request::new(action, resource, &[])
+            .with_context(&context)
+            .with_published_keys(&published);
         let said = iam::identity_decision(&self.documents, &request);
         let granted = iam::is_allowed(said, Decision::NotStated)
             || (said != Decision::Denied && self.identity_is_unbounded());
@@ -358,15 +374,25 @@ fn caller<Eng: Send + Sync + 'static>(
             ctx.credential_store(),
             long_term.clone(),
         )
-        .map(|caller| (caller.identity, caller.session_policies)),
+        .map(|caller| {
+            (
+                caller.principal_type(),
+                caller.identity,
+                caller.session_policies,
+            )
+        }),
         // No session registry on this engine: the only identity a request can present is the
         // one its long-term key resolves to, which no mint scoped.
-        None => Ok((long_term, sts_store::SessionPolicies::default())),
+        None => Ok((
+            ::service_common::temporary_credential_classes::PRINCIPAL_TYPE_USER,
+            long_term,
+            sts_store::SessionPolicies::default(),
+        )),
     };
     // An expired session credential speaks for nobody: it carries no document, so every
     // action it asks for is refused — and the refusal names the credential's STATE rather
     // than the key id that was presented, which this module never quotes back.
-    let (identity, session_policies) = match resolved {
+    let (principal_type, identity, session_policies) = match resolved {
         Ok(resolved) => resolved,
         Err(_) => {
             return Caller {
@@ -378,6 +404,9 @@ fn caller<Eng: Send + Sync + 'static>(
 
     let mut caller = Caller {
         account_credential: identity.arn == sts_store::ambient_identity().arn,
+        // WHICH CLASS of credential signed this request, read through STS's one answer for it
+        // (`sts_store::Caller::principal_type`).
+        principal_type: Some(principal_type),
         arn: identity.arn,
         // The inline document the mint passed scopes the credential whether or not an IAM
         // store is there; where there is one, the scope is re-read below so a managed session
