@@ -1464,3 +1464,471 @@ async fn the_single_write_and_the_batch_write_store_into_one_keyspace() {
         "one id written by both writes is one geofence"
     );
 }
+
+// --- how the rings of ONE polygon may sit relative to each other ---------------
+//
+// RULE: a polygon geometry is stored only when each of its linear rings is simple
+// (it does not intersect itself), no two rings of that polygon share a point, and
+// every interior ring lies wholly inside the exterior ring and inside no other
+// interior ring; a polygon that breaks any of those is refused naming the polygon
+// itself, because the requirement is about how its rings sit relative to each
+// other. Source: the `GeofenceGeometry$Polygon` doc's note list ("No ring is
+// permitted to intersect itself", "Rings must not touch or cross each other", "All
+// interior rings must be fully contained within the exterior ring", "Interior rings
+// must not contain other interior rings"), which the `MultiPolygon` member repeats
+// for each of its component polygons.
+//
+// The tables below span what that rule generalises over: how many interior rings a
+// polygon carries, whether the exterior ring is convex, whether a ring lists a
+// vertex twice, how many corners a ring actually draws, which relation between two
+// rings is broken (self-crossing, touching, crossing, coinciding, nesting, lying
+// outside), and whether the polygon is the geometry itself or a component of a
+// multipolygon — including a multipolygon whose COMPONENTS share a point, which is
+// not a ring requirement.
+
+/// The sentence a polygon whose rings sit wrongly relative to each other is refused
+/// with, for the polygon reached by `member`: the note list in one sentence, with the
+/// member path the only variable part.
+fn ring_requirement(member: &str) -> String {
+    format!(
+        "'{member}' rings must not intersect themselves, must not touch or cross each other, \
+         and every interior ring must be fully contained within the exterior ring and within \
+         no other interior ring."
+    )
+}
+
+/// A closed, counter-clockwise rectangle, the shape an exterior ring takes.
+fn ccw_rectangle(west: f64, south: f64, east: f64, north: f64) -> Value {
+    json!([
+        [west, south],
+        [east, south],
+        [east, north],
+        [west, north],
+        [west, south],
+    ])
+}
+
+/// A closed, CLOCKWISE rectangle, the shape an interior ring takes: the same corners
+/// listed the other way round.
+fn cw_rectangle(west: f64, south: f64, east: f64, north: f64) -> Value {
+    json!([
+        [west, south],
+        [west, north],
+        [east, north],
+        [east, south],
+        [west, south],
+    ])
+}
+
+/// A closed ring that CROSSES itself away from its own vertices: its fourth edge
+/// runs back across its first one. Wound counter-clockwise, so the only thing it
+/// breaks is simplicity.
+fn self_crossing_ring() -> Value {
+    json!([[0.0, 0.0], [0.04, 0.0], [0.01, 0.03], [0.01, -0.01], [0.0, 0.0]])
+}
+
+/// One accepted ring-topology row: the polygon geometry a write carries.
+struct AcceptedTopology {
+    case: &'static str,
+    geofence_id: &'static str,
+    geometry: fn() -> Value,
+}
+
+/// The ring topologies a polygon MAY have.
+fn accepted_topologies() -> Vec<AcceptedTopology> {
+    vec![
+        AcceptedTopology {
+            case: "two interior rings side by side inside the exterior ring",
+            geofence_id: "two-holes",
+            geometry: || {
+                json!({
+                    "Polygon": [
+                        ccw_rectangle(-0.1, -0.1, 0.1, 0.1),
+                        cw_rectangle(-0.07, -0.02, -0.03, 0.02),
+                        cw_rectangle(0.03, -0.02, 0.07, 0.02),
+                    ]
+                })
+            },
+        },
+        AcceptedTopology {
+            case: "a concave exterior ring",
+            geofence_id: "l-shaped",
+            geometry: || {
+                json!({
+                    "Polygon": [[
+                        [0.0, 0.0],
+                        [0.04, 0.0],
+                        [0.04, 0.02],
+                        [0.02, 0.02],
+                        [0.02, 0.04],
+                        [0.0, 0.04],
+                        [0.0, 0.0],
+                    ]]
+                })
+            },
+        },
+        AcceptedTopology {
+            case: "a ring that lists one vertex twice in a row",
+            geofence_id: "repeated.vertex",
+            // A vertex listed twice draws a zero-length edge, which is no edge of
+            // the ring: the ring it describes is the same simple one.
+            geometry: || {
+                json!({
+                    "Polygon": [[
+                        [0.0, 0.0],
+                        [0.02, 0.0],
+                        [0.02, 0.0],
+                        [0.02, 0.02],
+                        [0.0, 0.0],
+                    ]]
+                })
+            },
+        },
+        AcceptedTopology {
+            case: "a multipolygon component carrying an interior ring",
+            geofence_id: "component-hole",
+            geometry: || {
+                json!({
+                    "MultiPolygon": [
+                        [ccw_rectangle(10.0, 10.0, 10.2, 10.2)],
+                        [
+                            ccw_rectangle(-10.2, -10.2, -10.0, -10.0),
+                            cw_rectangle(-10.15, -10.15, -10.05, -10.05),
+                        ],
+                    ]
+                })
+            },
+        },
+        AcceptedTopology {
+            case: "two multipolygon components sharing a point",
+            geofence_id: "touching-components",
+            // The ring requirements are each polygon's own: the model bounds how
+            // much the components of one multipolygon may intersect each other
+            // ("Each edge of a component `Polygon` must intersect no more than 5
+            // edges from other `Polygons`") rather than keeping them apart.
+            geometry: || {
+                json!({
+                    "MultiPolygon": [
+                        [[[0.0, 0.0], [0.02, 0.0], [0.02, 0.02], [0.0, 0.0]]],
+                        [[[0.0, 0.0], [-0.02, -0.02], [0.0, -0.02], [0.0, 0.0]]],
+                    ]
+                })
+            },
+        },
+    ]
+}
+
+/// One refused ring-topology row: the polygon geometry, and the member a refusal
+/// about it names — the polygon the broken relation is between the rings of.
+struct RefusedTopology {
+    case: &'static str,
+    geometry: fn() -> Value,
+    member: &'static str,
+}
+
+/// The ring topologies a polygon may NOT have.
+fn refused_topologies() -> Vec<RefusedTopology> {
+    vec![
+        RefusedTopology {
+            case: "an exterior ring crossing itself away from its vertices",
+            geometry: || json!({ "Polygon": [self_crossing_ring()] }),
+            member: RING_MEMBER,
+        },
+        RefusedTopology {
+            case: "an interior ring coinciding with the exterior ring",
+            geometry: || {
+                json!({
+                    "Polygon": [
+                        ccw_rectangle(0.0, 0.0, 0.04, 0.04),
+                        cw_rectangle(0.0, 0.0, 0.04, 0.04),
+                    ]
+                })
+            },
+            member: RING_MEMBER,
+        },
+        RefusedTopology {
+            case: "an interior ring crossing the exterior ring",
+            geometry: || {
+                json!({
+                    "Polygon": [
+                        ccw_rectangle(0.0, 0.0, 0.04, 0.04),
+                        cw_rectangle(0.03, 0.01, 0.05, 0.03),
+                    ]
+                })
+            },
+            member: RING_MEMBER,
+        },
+        RefusedTopology {
+            case: "two interior rings touching each other at one point",
+            geometry: || {
+                json!({
+                    "Polygon": [
+                        ccw_rectangle(-0.1, -0.1, 0.1, 0.1),
+                        [[0.0, 0.0], [-0.04, -0.02], [-0.04, 0.02], [0.0, 0.0]],
+                        [[0.0, 0.0], [0.04, 0.02], [0.04, -0.02], [0.0, 0.0]],
+                    ]
+                })
+            },
+            member: RING_MEMBER,
+        },
+        RefusedTopology {
+            case: "one interior ring nested inside another interior ring",
+            geometry: || {
+                json!({
+                    "Polygon": [
+                        ccw_rectangle(-0.1, -0.1, 0.1, 0.1),
+                        cw_rectangle(-0.05, -0.05, 0.05, 0.05),
+                        cw_rectangle(-0.02, -0.02, 0.02, 0.02),
+                    ]
+                })
+            },
+            member: RING_MEMBER,
+        },
+        RefusedTopology {
+            case: "an exterior ring enclosing no area at all",
+            // Every vertex on one line: the ring encloses nothing, so it is not a
+            // ring whose orientation can be read.
+            geometry: || {
+                json!({
+                    "Polygon": [[
+                        [0.0, 0.0],
+                        [0.01, 0.01],
+                        [0.02, 0.02],
+                        [0.0, 0.0],
+                    ]]
+                })
+            },
+            member: RING_MEMBER,
+        },
+        RefusedTopology {
+            case: "a ring listing one point four times",
+            // Closed, and at the modelled minimum of four vertices, but it draws no
+            // corner at all.
+            geometry: || json!({ "Polygon": [[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]] }),
+            member: RING_MEMBER,
+        },
+        RefusedTopology {
+            case: "a ring drawing a single line segment",
+            // Two corners: a segment out and back, which encloses nothing.
+            geometry: || {
+                json!({
+                    "Polygon": [[
+                        [0.0, 0.0],
+                        [0.0, 0.0],
+                        [0.01, 0.01],
+                        [0.0, 0.0],
+                    ]]
+                })
+            },
+            member: RING_MEMBER,
+        },
+        RefusedTopology {
+            case: "a ring listing two points back and forth",
+            geometry: || {
+                json!({
+                    "Polygon": [[
+                        [0.0, 0.0],
+                        [0.01, 0.01],
+                        [0.0, 0.0],
+                        [0.01, 0.01],
+                        [0.0, 0.0],
+                    ]]
+                })
+            },
+            member: RING_MEMBER,
+        },
+        RefusedTopology {
+            case: "a self-crossing ring in the second component of a multipolygon",
+            // Each component polygon is checked on its own, so the refusal names
+            // the component the broken ring belongs to.
+            geometry: || {
+                json!({
+                    "MultiPolygon": [
+                        [ccw_rectangle(1.0, 1.0, 1.02, 1.02)],
+                        [self_crossing_ring()],
+                    ]
+                })
+            },
+            member: "Geometry.MultiPolygon[1]",
+        },
+    ]
+}
+
+#[tokio::test]
+async fn every_ring_topology_a_polygon_may_have_is_stored_and_read_back() {
+    let router = emulator();
+    create_collection(&router, "fences").await;
+
+    for case in accepted_topologies() {
+        let written = put_geofence(
+            &router,
+            "fences",
+            case.geofence_id,
+            (case.geometry)(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            written.status, 200,
+            "case {:?}: PutGeofence must store a polygon whose rings sit legally, got {} {:?}",
+            case.case, written.status, written.body
+        );
+
+        let read = get_geofence(&router, "fences", case.geofence_id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {:?}: the stored geofence must be readable, got {} {:?}",
+            case.case, read.status, read.body
+        );
+        let read = read.json();
+        let expected = normalized(&(case.geometry)());
+        assert_eq!(
+            read.get("Geometry").map(normalized),
+            Some(expected.clone()),
+            "case {:?}: expected the geometry it was put with {expected}, got {read}",
+            case.case
+        );
+        assert_eq!(
+            read.get("Status").and_then(Value::as_str),
+            Some("ACTIVE"),
+            "case {:?}: a stored geofence is one the system has indexed, got {read}",
+            case.case
+        );
+    }
+
+    let expected = i64::try_from(accepted_topologies().len()).expect("the table fits in an i64");
+    assert_eq!(
+        geofence_count(&router, "fences").await,
+        expected,
+        "the collection must report one geofence per accepted ring topology"
+    );
+}
+
+#[tokio::test]
+async fn every_ring_topology_a_polygon_may_not_have_is_refused_by_both_writes() {
+    // The sentence is the same one the single-ring rows are refused with, so the
+    // table's literal and the member-path form cannot drift apart.
+    assert_eq!(
+        ring_requirement(RING_MEMBER),
+        RING_REQUIREMENT,
+        "the member-path form of the ring requirement must be the pinned sentence"
+    );
+
+    let router = emulator();
+    create_collection(&router, "fences").await;
+
+    for (index, refused) in refused_topologies().into_iter().enumerate() {
+        let expected = ring_requirement(refused.member);
+        let geofence_id = format!("refused-{index}");
+
+        // The single write has no per-entry channel: the whole request is refused.
+        let answered = put_geofence(
+            &router,
+            "fences",
+            &geofence_id,
+            (refused.geometry)(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            answered.status, 400,
+            "case {:?}: a polygon whose rings sit illegally must be a 400, got {} {:?}",
+            refused.case, answered.status, answered.body
+        );
+        assert_eq!(
+            answered.error_code(),
+            "ValidationException",
+            "case {:?}: expected ValidationException, got {:?}",
+            refused.case,
+            answered.body
+        );
+        assert_eq!(
+            answered.message(),
+            expected,
+            "case {:?}: expected message {expected:?}, got {:?}",
+            refused.case,
+            answered.message()
+        );
+        let body = answered.json();
+        assert_eq!(
+            body.get("fieldList")
+                .and_then(Value::as_array)
+                .map(|entries| entries
+                    .iter()
+                    .map(|entry| (
+                        entry
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        entry
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    ))
+                    .collect::<Vec<_>>()),
+            Some(vec![(refused.member.to_string(), expected.clone())]),
+            "case {:?}: fieldList must name the polygon the refusal is about and repeat the sentence, got {body}",
+            refused.case
+        );
+
+        // The batch write reports the same sentence per entry inside a 200.
+        let batched = batch_put(
+            &router,
+            "fences",
+            json!([{ "GeofenceId": geofence_id, "Geometry": (refused.geometry)() }]),
+        )
+        .await;
+        assert_eq!(
+            batched.status, 200,
+            "case {:?}: a refused entry is still a 200, got {} {:?}",
+            refused.case, batched.status, batched.body
+        );
+        let body = batched.json();
+        assert!(
+            list(refused.case, &body, "Successes").is_empty(),
+            "case {:?}: the refused entry must not be reported a success, got {body}",
+            refused.case
+        );
+        let errors = list(refused.case, &body, "Errors");
+        assert_eq!(
+            errors.len(),
+            1,
+            "case {:?}: the refused entry must be reported once, got {errors:?}",
+            refused.case
+        );
+        let error = errors[0].get("Error").unwrap_or_else(|| {
+            panic!(
+                "case {:?}: expected an Error member, got {:?}",
+                refused.case, errors[0]
+            )
+        });
+        assert_eq!(
+            error.get("Code").and_then(Value::as_str),
+            Some(VALIDATION_ERROR),
+            "case {:?}: expected Error.Code {VALIDATION_ERROR}, got {error}",
+            refused.case
+        );
+        assert_eq!(
+            error.get("Message").and_then(Value::as_str),
+            Some(expected.as_str()),
+            "case {:?}: expected Error.Message {expected:?}, got {error}",
+            refused.case
+        );
+
+        // Neither write stored anything.
+        let read = get_geofence(&router, "fences", &geofence_id).await;
+        assert_eq!(
+            read.status, 404,
+            "case {:?}: a refused write must store nothing, got {} {:?}",
+            refused.case, read.status, read.body
+        );
+    }
+
+    assert_eq!(
+        geofence_count(&router, "fences").await,
+        0,
+        "a collection every write was refused for must hold no geofence"
+    );
+}

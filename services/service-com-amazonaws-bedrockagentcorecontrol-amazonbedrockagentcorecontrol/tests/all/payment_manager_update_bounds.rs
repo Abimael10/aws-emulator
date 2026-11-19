@@ -536,7 +536,10 @@ async fn an_absent_id_of_the_modelled_form_is_answered_by_the_store_at_either_bo
         );
         assert_eq!(
             text(&refused.body, "message"),
-            format!("Payment manager with ID {absent} does not exist"),
+            // The one sentence the whole payment-manager registry words a manager it
+            // cannot find with, pinned by `payment_manager_not_found_wording.rs`:
+            // the fixed text followed by the id the path carried.
+            format!("Payment manager not found: {absent}"),
             "case {case:?}: unexpected not-found message, got {}",
             refused.body
         );

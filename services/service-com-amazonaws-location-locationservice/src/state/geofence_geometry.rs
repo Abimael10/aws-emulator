@@ -22,12 +22,13 @@
 //! `Circle` and a `Geobuf` are `@sensitive` in the model, so no value read from a
 //! request appears in a refusal.
 //!
-//! The intersection requirements a polygon's rings have to satisfy are checked with
-//! the `geo` crate's geometry predicates rather than hand-rolled here.
+//! The intersection, containment and orientation requirements a polygon's rings have
+//! to satisfy are read from the `cavalier_contours` crate's closed-polyline
+//! predicates — a self-intersection scan, a polyline-to-polyline intersection search,
+//! a winding number and a signed area — rather than hand-rolled here.
 
-use geo::geometry::{Coord, LineString, Polygon};
-use geo::winding_order::{Winding, WindingOrder};
-use geo::{Intersects, Validation};
+use cavalier_contours::core::math::Vector2;
+use cavalier_contours::polyline::{PlineCreation, PlineSource, PlineSourceMut, Polyline};
 
 use crate::ops::types::{Circle, GeofenceGeometry};
 
@@ -240,7 +241,7 @@ fn validate_polygon(
             ),
         ));
     }
-    let mut checked: Vec<LineString<f64>> = Vec::with_capacity(rings.len());
+    let mut checked: Vec<Polyline<f64>> = Vec::with_capacity(rings.len());
     for (index, ring) in rings.iter().enumerate() {
         if ring.len() < MIN_RING_VERTICES {
             return Err(GeometryRefusal::new(
@@ -266,12 +267,9 @@ fn validate_polygon(
         }
         let mut coords = Vec::with_capacity(ring.len());
         for vertex in ring {
-            let [longitude, latitude] = super::wgs84_position(vertex)
+            let position = super::wgs84_position(vertex)
                 .map_err(|why| GeometryRefusal::new(path.ring(index), why))?;
-            coords.push(Coord {
-                x: longitude,
-                y: latitude,
-            });
+            coords.push(position);
         }
         // "the first and last vertex are the same (to form a closed boundary)".
         if coords.first() != coords.last() {
@@ -284,12 +282,20 @@ fn validate_polygon(
             ));
         }
         validate_meridian_span(&path.ring(index), &coords)?;
-        checked.push(LineString::new(coords));
+        let closed = closed_ring(&coords);
+        // A ring drawing fewer than three corners encloses no area, so it is not a
+        // ring whose orientation, self-intersections or containment can be read at
+        // all: it is refused here, with the same sentence a ring enclosing no area
+        // is refused with below, rather than asked a question about a shape it does
+        // not have.
+        if closed.vertex_count() < MIN_RING_CORNERS {
+            return Err(rings_must_not_intersect(path));
+        }
+        checked.push(closed);
     }
 
     // The exterior ring is the one listed first, "before any interior rings".
-    let mut listed = checked.iter().cloned();
-    let Some(exterior) = listed.next() else {
+    let Some((exterior, interiors)) = checked.split_first() else {
         // Unreachable through the request boundary (`len 1..250`), stated rather
         // than assumed so nothing below reads an empty list.
         return Err(GeometryRefusal::new(
@@ -300,34 +306,109 @@ fn validate_polygon(
             ),
         ));
     };
-    let interiors: Vec<LineString<f64>> = listed.collect();
 
-    validate_winding(&path.ring(0), &exterior, EXTERIOR_WINDING, path)?;
+    validate_winding(&path.ring(0), exterior, EXTERIOR_WINDING, path)?;
     for (index, interior) in interiors.iter().enumerate() {
         // Interior rings are listed after the exterior one, so the first interior
         // ring is the geometry's ring 1.
         validate_winding(&path.ring(index + 1), interior, INTERIOR_WINDING, path)?;
     }
 
+    // "No ring is permitted to intersect itself."
+    if checked.iter().any(PlineSource::scan_for_self_intersect) {
+        return Err(rings_must_not_intersect(path));
+    }
+
     // "Rings must not touch or cross each other": two rings that share even a
-    // single point are refused, which geometric validity alone would admit.
+    // single point are refused, which enclosed area alone would admit.
     for (index, ring) in checked.iter().enumerate() {
         if checked
             .iter()
             .skip(index + 1)
-            .any(|other| ring.intersects(other))
+            .any(|other| rings_intersect(ring, other))
         {
             return Err(rings_must_not_intersect(path));
         }
     }
 
-    // "All interior rings must be fully contained within the exterior ring",
-    // "Interior rings must not contain other interior rings", "No ring is permitted
-    // to intersect itself" — the conditions a polygon is geometrically valid under.
-    if !Polygon::new(exterior, interiors).is_valid() {
-        return Err(rings_must_not_intersect(path));
+    // "All interior rings must be fully contained within the exterior ring" and
+    // "Interior rings must not contain other interior rings". No two rings share a
+    // point by here, so each one lies wholly inside or wholly outside another and a
+    // single vertex of it places all of it.
+    for (index, interior) in interiors.iter().enumerate() {
+        let Some(inside) = first_vertex(interior) else {
+            return Err(rings_must_not_intersect(path));
+        };
+        if !encloses(exterior, inside) {
+            return Err(rings_must_not_intersect(path));
+        }
+        for other in interiors.iter().skip(index + 1) {
+            let Some(other_inside) = first_vertex(other) else {
+                return Err(rings_must_not_intersect(path));
+            };
+            if encloses(interior, other_inside) || encloses(other, inside) {
+                return Err(rings_must_not_intersect(path));
+            }
+        }
     }
     Ok(())
+}
+
+/// Fewest corners a ring has to draw to enclose any area: three, a triangle. A ring
+/// listing the same point four times, or two points back and forth, draws fewer.
+const MIN_RING_CORNERS: usize = 3;
+
+/// The bulge of a straight edge: a linear ring's edges are line segments, never arcs.
+const BULGE_STRAIGHT: f64 = 0.0;
+
+/// One linear ring as the predicates below read it: a CLOSED polyline over the ring's
+/// vertices.
+///
+/// A closed polyline carries the edge from its last vertex back to its first one
+/// implicitly, so the ring's repeated closing vertex is dropped; a vertex repeating
+/// the one before it is dropped too, since a zero-length edge is no edge of the ring
+/// and a vertex a request lists twice does not change the ring's shape.
+fn closed_ring(vertices: &[[f64; 2]]) -> Polyline<f64> {
+    let mut ring: Polyline<f64> = Polyline::with_capacity(vertices.len(), true);
+    let mut previous: Option<[f64; 2]> = None;
+    // The ring is closed by here, so its last vertex repeats its first one.
+    for vertex in vertices.iter().take(vertices.len().saturating_sub(1)) {
+        if previous == Some(*vertex) {
+            continue;
+        }
+        ring.add(vertex[0], vertex[1], BULGE_STRAIGHT);
+        previous = Some(*vertex);
+    }
+    ring
+}
+
+/// Whether two rings share any point at all — crossing at one, touching at one, or
+/// running along each other.
+fn rings_intersect(ring: &Polyline<f64>, other: &Polyline<f64>) -> bool {
+    let found = ring.find_intersects(other);
+    !found.basic_intersects.is_empty() || !found.overlapping_intersects.is_empty()
+}
+
+/// The first vertex of a ring, as the point a containment test is asked about, or
+/// `None` for a ring that draws no corner at all — which a ring reaching here cannot
+/// be ([`MIN_RING_CORNERS`]), stated as a value rather than assumed.
+fn first_vertex(ring: &Polyline<f64>) -> Option<Vector2<f64>> {
+    ring.get(0).map(|vertex| Vector2::new(vertex.x, vertex.y))
+}
+
+/// Whether `ring` encloses `point`, whichever way the ring is wound.
+fn encloses(ring: &Polyline<f64>, point: Vector2<f64>) -> bool {
+    ring.winding_number(point) != 0
+}
+
+/// The sequence a ring's vertices are listed in, read from the sign of the area the
+/// ring encloses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindingOrder {
+    /// The sequence an exterior ring is listed in: positive enclosed area.
+    CounterClockwise,
+    /// The sequence an interior ring is listed in: negative enclosed area.
+    Clockwise,
 }
 
 /// The sequence the vertices of an exterior ring must be listed in, per the
@@ -359,11 +440,11 @@ fn rings_must_not_intersect(path: &PolygonPath) -> GeometryRefusal {
 /// orientation can be read: it is refused with the polygon's own ring requirements.
 fn validate_winding(
     ring_path: &str,
-    ring: &LineString<f64>,
+    ring: &Polyline<f64>,
     required: WindingOrder,
     path: &PolygonPath,
 ) -> Result<(), GeometryRefusal> {
-    match ring.winding_order() {
+    match winding_order(ring) {
         Some(order) if order == required => Ok(()),
         Some(_) => Err(GeometryRefusal::new(
             ring_path,
@@ -373,6 +454,20 @@ fn validate_winding(
             ),
         )),
         None => Err(rings_must_not_intersect(path)),
+    }
+}
+
+/// The sequence a ring's vertices are listed in, or `None` when the ring encloses no
+/// area at all and so has no sequence to read: the signed area a closed polyline
+/// encloses is positive counter-clockwise and negative clockwise.
+fn winding_order(ring: &Polyline<f64>) -> Option<WindingOrder> {
+    let enclosed = ring.area();
+    if enclosed > 0.0 {
+        Some(WindingOrder::CounterClockwise)
+    } else if enclosed < 0.0 {
+        Some(WindingOrder::Clockwise)
+    } else {
+        None
     }
 }
 
@@ -395,10 +490,10 @@ const MAX_EDGE_LONGITUDE_SPAN: f64 = LONGITUDE_DOMAIN_WIDTH / 2.0;
 ///
 /// Source: the `GeofenceGeometry` doc's note — "Amazon Location doesn't currently
 /// support polygons that cross the antimeridian."
-fn validate_meridian_span(ring_path: &str, ring: &[Coord<f64>]) -> Result<(), GeometryRefusal> {
+fn validate_meridian_span(ring_path: &str, ring: &[[f64; 2]]) -> Result<(), GeometryRefusal> {
     let crosses = ring
         .windows(2)
-        .any(|edge| (edge[1].x - edge[0].x).abs() > MAX_EDGE_LONGITUDE_SPAN);
+        .any(|edge| (edge[1][0] - edge[0][0]).abs() > MAX_EDGE_LONGITUDE_SPAN);
     if crosses {
         return Err(GeometryRefusal::new(
             ring_path,

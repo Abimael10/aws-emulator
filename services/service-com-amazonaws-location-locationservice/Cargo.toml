@@ -25,9 +25,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Polygon geometry checks for geofence writes: ring self-intersection, interior-ring
-# containment and ring crossing (the `geo` crate's OGC validity), plus winding order.
-geo = { version = "0.33", default-features = false }
+# Polygon geometry checks for geofence writes: ring self-intersection, ring-to-ring
+# touching or crossing, interior-ring containment (winding number) and the signed area
+# a ring's winding order is read from, all from the crate's closed-polyline predicates.
+cavalier_contours = "0.9"
 # PNG codec for the map sprite sheet a sprite read serves as `image/png`, and for
 # the raster map tiles a raster basemap's tile read serves.
 png = "0.17"
