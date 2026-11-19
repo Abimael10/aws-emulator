@@ -102,8 +102,13 @@ async fn poll<Eng: Send + Sync + 'static>(
         // key's and the clock's together, so it is taken wherever a due outcome is
         // materialised rather than only where a caller reaches it.
         super::encryption::fail_due_runs_the_key_refuses(&**engine, super::now());
-        let (task, role_arn) = {
+        let (parked, task, role_arn) = {
             let mut store = state.lock();
+            // The job as it stands BEFORE this pass settles, so the settle can be told
+            // from the job ending: a task the settle CLOSES — because it ran out of the
+            // time it was allowed, or because the execution waiting at it is gone — is
+            // no longer in the store afterwards.
+            let parked = store.job_tasks.get(execution_arn).cloned();
             store.settle(super::now());
             let task = store.job_tasks.get(execution_arn).cloned();
             let machine = store
@@ -111,9 +116,25 @@ async fn poll<Eng: Send + Sync + 'static>(
                 .get(execution_arn)
                 .and_then(|execution| store.state_machines.get(&execution.state_machine_arn));
             let role_arn = machine.map_or_else(String::new, |machine| machine.role_arn.clone());
-            (task, role_arn)
+            (parked, task, role_arn)
         };
         let Some(task) = task else {
+            // The task is gone: whatever the job is still doing is waited for by
+            // nobody, so the job is STOPPED rather than left running behind the task
+            // that started it — the same thing that happens to a job a failed state
+            // abandoned ([`integration::stop_abandoned`]). A job that had already
+            // ended ignores the call.
+            if let Some(parked) = parked {
+                let (call, request) = integration::stopping(
+                    parked.api,
+                    parked.family,
+                    parked.job,
+                    &parked.job_id,
+                    &parked.naming,
+                );
+                let _answered =
+                    integration::call_api(callback, &parked.region, &call, &request).await;
+            }
             return;
         };
 

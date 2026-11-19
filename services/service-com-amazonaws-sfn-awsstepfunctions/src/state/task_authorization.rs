@@ -106,7 +106,7 @@ use ::std::sync::Arc;
 use ::service_common::iam_authorization::{self as iam, Decision};
 
 use super::integration::{
-    access_request, Api, Call, Denied, Failed, Family, Handovers, MapRuns, RoleGate,
+    access_request, Activities, Api, Call, Denied, Failed, Family, Handovers, MapRuns, RoleGate,
     TASK_FAILED_ERROR,
 };
 
@@ -469,6 +469,9 @@ pub struct Acting {
     /// be minted, which leaves the calls signed with the credential the framework hands
     /// this emulator's handlers.
     pub signing: Option<super::execution_role_session::RoleSession>,
+    /// What answers whether this emulator holds the activity a `Task` state's
+    /// `Resource` names ([`super::activity_resources::activities`]).
+    pub activities: Option<Activities>,
 }
 
 /// Debug without disclosing anything either closure reads: a connection holds
@@ -481,6 +484,7 @@ impl ::std::fmt::Debug for Acting {
             .field("connections", &self.connections.is_some())
             .field("handovers", &self.handovers.is_some())
             .field("map_runs", &self.map_runs.is_some())
+            .field("activities", &self.activities.is_some())
             .field("signing", &self.signing.is_some())
             .finish()
     }
@@ -529,6 +533,7 @@ pub fn acting<Eng: Send + Sync + 'static>(
         // each under a Map Run of its own: only the call that continues an attempt
         // carries the Map Runs it is continuing ([`Acting::map_runs`]).
         map_runs: None,
+        activities: super::activity_resources::activities(engine),
         signing,
     }
 }

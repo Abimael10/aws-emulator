@@ -488,8 +488,9 @@ async fn a_runaway_template_is_stopped_by_the_ceilings_on_one_visit() {
         ),
         (
             // An expression whose single step this emulator cannot bound is refused
-            // before it is evaluated: a regular-expression literal, `$distinct` and
-            // `$pad` are the three.
+            // before it is evaluated: a regular-expression literal and `$distinct` are
+            // the two, beside a `$pad` whose own width is past what the state may
+            // build.
             "an expression carrying a regular-expression literal",
             json!("{% $match('xxx', /x+/) %}"),
             NOT_EVALUATED,
@@ -500,8 +501,8 @@ async fn a_runaway_template_is_stopped_by_the_ceilings_on_one_visit() {
             NOT_EVALUATED,
         ),
         (
-            "an expression carrying $pad",
-            json!("{% $pad('x', 16) %}"),
+            "an expression whose $pad builds more than a state's document may carry",
+            json!("{% $pad('x', 1000000) %}"),
             NOT_EVALUATED,
         ),
         (

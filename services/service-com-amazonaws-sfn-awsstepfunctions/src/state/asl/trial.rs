@@ -210,6 +210,11 @@ impl Interpreter<'_> {
         let state = test.state;
         let state_type = state.get("Type").and_then(Value::as_str).unwrap_or_default();
         let context = self.context_for(&Scope::default(), test.name, Duration::ZERO);
+        // "The set will include variables assigned in the state and variables set up as
+        // test state input": the request's own set is in scope for the paths of the
+        // state under test, installed for this trial exactly as it is for a state of a
+        // walk ([`variables`]).
+        let _scope = VariableScope::of(&self.variables);
 
         if let Some(language) = state.get("QueryLanguage").and_then(Value::as_str) {
             if !QUERY_LANGUAGES.contains(&language) {
@@ -324,7 +329,20 @@ impl Interpreter<'_> {
                         &context,
                         &mut inspection,
                     ),
-                    None => self.output_value(state, effective.clone(), &context),
+                    None => {
+                        // The `Assign` of whichever decided the transition, for a
+                        // `Choice` state: the rule that matched, or the state itself
+                        // where none did — exactly as the walk reads it
+                        // ([`Interpreter::jsonpath_assign`]).
+                        let owner = chosen
+                            .as_ref()
+                            .and_then(|chosen| chosen.rule.as_ref())
+                            .map_or(state, |(_, rule)| rule);
+                        match self.jsonpath_assign(owner, &effective, &context) {
+                            Ok(()) => self.output_value(state, effective.clone(), &context),
+                            Err(failure) => Err(failure),
+                        }
+                    }
                 },
             },
             Err(failure) => Err(failure),
@@ -447,11 +465,11 @@ impl Interpreter<'_> {
         }
     }
 
-    /// The result-side filters over a state's raw result — `ResultSelector`,
-    /// `ResultPath` against the state's own raw input, then `OutputPath` — recording
-    /// what the state carried after each one.
+    /// The result-side filters over a state's raw result — `ResultSelector`, the
+    /// state's own `Assign`, `ResultPath` against the state's own raw input, then
+    /// `OutputPath` — recording what the state carried after each one.
     pub(super) fn place_recorded(
-        &self,
+        &mut self,
         state: &Map<String, Value>,
         state_type: &str,
         raw: &Value,
@@ -467,6 +485,9 @@ impl Interpreter<'_> {
         // RECEIVES it, so a state whose type has no such filter — or that declares
         // none — reports its raw result there rather than nothing at all.
         inspection.after_result_selector = Some(self.echo(&selected));
+        // And the state's own `Assign` reads that same document, as it does in a walk
+        // ([`Interpreter::produced`]).
+        self.jsonpath_assign(state, &selected, context)?;
         let placed = path_result(state, raw, selected)?;
         inspection.after_result_path = Some(self.echo(&placed));
         self.output_value(state, placed, context)
@@ -543,7 +564,13 @@ impl Interpreter<'_> {
                 JSONATA => {
                     self.jsonata_output(catcher, &effective, None, Some(&error_output), context)
                 }
-                _ => self.place_result(catcher, raw, error_output, context, true),
+                // The catcher's own `Assign` reads the error output it was handed in
+                // this language too, as it does in the walk
+                // ([`Interpreter::catch_or_fail`]).
+                _ => match self.jsonpath_assign(catcher, &error_output, context) {
+                    Ok(()) => self.place_result(catcher, raw, error_output, context, true),
+                    Err(failure) => Err(failure),
+                },
             };
             let output = match output {
                 Ok(output) => output,

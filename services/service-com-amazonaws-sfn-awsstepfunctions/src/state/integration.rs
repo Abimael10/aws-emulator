@@ -2137,6 +2137,17 @@ pub trait CallbackHandovers: Send + Sync {
 /// See [`CallbackHandovers`].
 pub type Handovers = ::std::sync::Arc<dyn CallbackHandovers>;
 
+/// Whether this emulator holds the ACTIVITY an ARN names, for the walk that reaches a
+/// `Task` state whose `Resource` is one.
+///
+/// "An activity is a worker — a program — that you host": the task such a state
+/// schedules is queued under the activity a `CreateActivity` call created, so a
+/// `Resource` naming one that does not exist names no queue for a worker to poll. The
+/// activities live in this service's own store and are reached through the engine the
+/// operation holds ([`super::activity_resources`]), so the walk knows nothing of either
+/// and only asks.
+pub type Activities = ::std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// The Map Run a Distributed Map state of the execution being walked is ALREADY
 /// running, for a walk that CONTINUES an attempt rather than beginning one.
 ///
@@ -2347,6 +2358,18 @@ pub trait Tasks: Send + Sync {
     /// runs, under a Map Run of its own.
     fn map_run(&self, _occurrence: usize, _label: &str) -> Option<ResumedMapRun> {
         None
+    }
+
+    /// Whether this emulator HOLDS the activity `arn` names, which is what a `Task`
+    /// state scheduling a task for it needs ([`Activities`]).
+    ///
+    /// Asked BEFORE the task is scheduled: a `Resource` naming an activity that does
+    /// not exist names no queue a worker could poll, so nothing is scheduled for it and
+    /// the state fails. The default answers that it does, for a walk with no store to
+    /// ask — which is evidence of nothing, so the task is scheduled exactly as it was
+    /// before.
+    fn activity(&self, _arn: &str) -> bool {
+        true
     }
 }
 
@@ -3021,6 +3044,9 @@ struct Dispatcher {
     /// running ([`MapRuns`]); `None` for a walk that begins an attempt, whose every
     /// Map state starts a Map Run of its own.
     map_runs: Option<MapRuns>,
+    /// What answers whether this emulator holds the activity a `Task` state's
+    /// `Resource` names ([`Activities`]); `None` for a walk with no store to ask.
+    activities: Option<Activities>,
 }
 
 /// What decides whether the execution role a walk runs as may make one integration
@@ -3204,6 +3230,12 @@ impl Tasks for Dispatcher {
     fn map_run(&self, occurrence: usize, label: &str) -> Option<ResumedMapRun> {
         self.map_runs.as_ref()?(occurrence, label)
     }
+
+    fn activity(&self, arn: &str) -> bool {
+        self.activities
+            .as_ref()
+            .is_none_or(|activities| activities(arn))
+    }
 }
 
 /// Run `work` — one interpretation of a definition — on a blocking thread, serving
@@ -3268,6 +3300,7 @@ where
     let connections = acting.connections;
     let handed = acting.handovers;
     let resumed_map_runs = acting.map_runs;
+    let known_activities = acting.activities;
     // WHO the calls of this walk are made as: a session of the state machine's
     // execution role, which is the identity Step Functions does an execution's work as
     // ([`super::execution_role_session`]).
@@ -3279,6 +3312,7 @@ where
             role,
             handovers: handed,
             map_runs: resumed_map_runs,
+            activities: known_activities,
         };
         work(&dispatcher)
     });

@@ -723,20 +723,17 @@ async fn a_resource_no_call_is_made_for_fails_rather_than_being_faked() {
 }
 
 /// A `Task` state carrying a member whose semantics this emulator does not
-/// interpret is not run either — the rule the walk applies at every state — so a
-/// heartbeat or another role is reported rather than quietly ignored.
+/// interpret is not run either — the rule the walk applies at every state — so
+/// another role to make the call as is reported rather than quietly ignored.
 #[tokio::test]
 async fn a_task_member_this_emulator_does_not_interpret_is_not_ignored() {
     let chain = Chain::new();
     chain.create_table("members").await;
     let parameters = json!({ "TableName": "members", "Item": { "pk": { "S": "m-1" } } });
-    let cases: [(&str, Value); 2] = [
-        ("HeartbeatSeconds", json!(60)),
-        (
-            "Credentials",
-            json!({ "RoleArn": "arn:aws:iam::000000000000:role/Other" }),
-        ),
-    ];
+    let cases: [(&str, Value); 1] = [(
+        "Credentials",
+        json!({ "RoleArn": "arn:aws:iam::000000000000:role/Other" }),
+    )];
 
     for (index, (member, value)) in cases.iter().enumerate() {
         let mut definition = task("arn:aws:states:::dynamodb:putItem", parameters.clone());

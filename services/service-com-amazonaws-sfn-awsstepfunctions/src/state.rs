@@ -356,6 +356,16 @@ pub const NOT_REDRIVABLE_DELETING: &str = "State machine is in DELETING status";
 /// "Execution history event limit exceeded."
 pub const NOT_REDRIVABLE_EVENT_LIMIT: &str = "Execution history event limit exceeded";
 
+/// The same ineligibility as [`NOT_REDRIVABLE_EVENT_LIMIT`], as the REFUSAL of a
+/// redrive words it.
+///
+/// RECORDED text: the two places this service reports an execution's ineligibility word
+/// the history-event limit differently — `redriveStatusReason` carries the sentence that
+/// member's own documentation lists, and `ExecutionNotRedrivable` states the limit the
+/// execution went past ([`not_redrivable_message`], which is where the two are mapped).
+pub const NOT_REDRIVABLE_EVENT_LIMIT_REFUSED: &str =
+    "Execution has exceeded the maximum history event limit";
+
 /// "Execution has exceeded the max execution time."
 pub const NOT_REDRIVABLE_MAX_EXECUTION_TIME: &str =
     "Execution has exceeded the max execution time";
@@ -2988,8 +2998,16 @@ pub fn resource_error_message(error_name: &str, arn: &str) -> String {
 /// `reason` is one of the `NOT_REDRIVABLE_*` values above, the same reason
 /// [`ComAmazonawsSfnAwsstepfunctionsState::not_redrivable_reason`] gives
 /// `DescribeExecution` for `redriveStatusReason` — which that member documents
-/// on its own, with no execution named, and so carries WITHOUT this wrapper.
+/// on its own, with no execution named, and so carries WITHOUT this wrapper. The
+/// refusal states ONE of them in its own words, which is what the mapping below is:
+/// a member's documented sentence and a refusal's recorded sentence about the same
+/// ineligibility are both this service's to report
+/// ([`NOT_REDRIVABLE_EVENT_LIMIT_REFUSED`]).
 pub fn not_redrivable_message(execution_arn: &str, reason: &str) -> String {
+    let reason = match reason {
+        NOT_REDRIVABLE_EVENT_LIMIT => NOT_REDRIVABLE_EVENT_LIMIT_REFUSED,
+        stated => stated,
+    };
     format!("Execution {execution_arn} invalid for redrive as: {reason}")
 }
 
@@ -4708,6 +4726,7 @@ fn round_up_to(value: i64, increment: i64) -> i64 {
     increments.saturating_mul(increment)
 }
 
+pub mod activity_resources;
 pub mod asl;
 pub mod callback_timeout;
 pub mod callbacks;

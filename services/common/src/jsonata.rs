@@ -48,7 +48,8 @@
 //!   having read a caller's text correctly;
 //! * the CONSTRUCTS whose single interpreter step has no bound the engine can
 //!   interrupt ([`UNBOUNDED_CONSTRUCT_NODES`]), refused on the engine's own parse
-//!   before anything is evaluated;
+//!   before anything is evaluated, and the WIDTH one such step is sized by
+//!   ([`unboundable_pad`]);
 //! * the DEPTH and the WALL CLOCK of the evaluation ([`MAX_EVALUATION_DEPTH`], the
 //!   caller's own millisecond allowance), and the MEMORY its values take
 //!   ([`MAX_EVALUATION_ARENA_BYTES`], installed on the arena so `bumpalo` refuses an
@@ -170,11 +171,14 @@ compile_error!(
 ///   literal, so this covers them while the same functions over plain strings are
 ///   evaluated);
 /// * `$distinct` compares each member against the ones before it, so its one step is
-///   QUADRATIC in a member count the arena ceiling alone does not bound;
-/// * `$pad` builds its result on the GLOBAL heap, sized by a NUMBER written in the
-///   expression rather than by any value it was given, so neither the arena's limit
-///   nor the answer ceiling precedes it and the system allocator's refusal ABORTS
-///   where the arena's unwinds.
+///   QUADRATIC in a member count the arena ceiling alone does not bound.
+///
+/// `$pad` is NOT on the list: it builds its result on the GLOBAL heap, sized by the
+/// WIDTH it is given rather than by any value it was given, so neither the arena's
+/// limit nor the answer ceiling precedes it — but that width is read off the same parse
+/// and held to what the evaluation may build ([`unboundable_pad`]), which is a bound
+/// ahead of the step, so a `$pad` whose width is inside it is evaluated and one whose
+/// width is larger, or is not written in the expression at all, is refused.
 ///
 /// EVERYTHING ELSE IS EVALUATED: the growth of every other function is charged to the
 /// arena, which refuses an over-ceiling layout before asking the system for it, and
@@ -191,8 +195,200 @@ compile_error!(
 const UNBOUNDED_CONSTRUCT_NODES: &[(&str, &str)] = &[
     ("Regex(", "a regular-expression literal"),
     (r#"Var("distinct")"#, "$distinct"),
-    (r#"Var("pad")"#, "$pad"),
 ];
+
+/// How one `$pad` call opens in the engine's own parse ([`unboundable_pad`]).
+const PAD_CALL: &str = r#"Function { name: "pad""#;
+
+/// How the `$pad` BINDING itself is written in that parse, wherever the expression
+/// reaches it: the callee of a call written `$pad(…)` is one, and so is a reference
+/// that hands the function somewhere else.
+const PAD_TERM: &str = r#"Var("pad")"#;
+
+/// Where the arguments of a call follow its name in that parse.
+const CALL_ARGUMENTS: &str = "args: [";
+
+/// How each argument of a call opens, and the field its own kind is written in.
+const ARGUMENT_KIND: &str = "kind: ";
+
+/// How a NUMBER literal is written in that parse.
+const NUMBER_LITERAL: &str = "Number(";
+
+/// Which argument of `$pad` is the width it builds its result to: "$pad(str, width
+/// [, char])".
+const PAD_WIDTH_ARGUMENT: usize = 1;
+
+/// The `$pad` this module cannot bound ahead of the step, as the refusal states it, or
+/// `None` when every way the expression reaches `$pad` is a call whose own width is a
+/// number no larger than `allowance`.
+///
+/// `$pad` is the one function whose single step allocates on the GLOBAL heap to a size
+/// the expression names rather than to the size of a value it was handed, so the arena's
+/// own limit does not precede it and the system allocator's refusal of a vast layout
+/// ends the process rather than unwinding into a refusal. The width is therefore read
+/// off the engine's parse BEFORE anything is evaluated and held to the bytes this
+/// evaluation may build at all.
+///
+/// It FAILS CLOSED, in every direction the parse can be read: the only shape that is
+/// evaluated is a call WRITTEN as `$pad(str, <number>, …)` whose number is inside the
+/// allowance. A width the expression computes, a call whose rendering cannot be read to
+/// the end, a call that does not write a width where this function reads one — a chained
+/// or piped invocation — and a reference that reaches the binding WITHOUT calling it
+/// there (binding it to a variable, handing it to a higher-order function) are each
+/// refused, since none of them names a width this reading can bound. That is what the
+/// count below holds: every appearance of the binding must be the callee of a call this
+/// scan bounded, so no other way of reaching `$pad` is evaluated.
+fn unboundable_pad(rendered: &str, allowance: usize) -> Option<String> {
+    let mut bounded = 0usize;
+    for opened in unquoted_matches(rendered, PAD_CALL) {
+        let rest = &rendered[opened + PAD_CALL.len()..];
+        let Some(arguments) = rest.find(CALL_ARGUMENTS) else {
+            return Some("a call this emulator cannot read the width of".to_string());
+        };
+        let Some(listed) = balanced(&rest[arguments + CALL_ARGUMENTS.len()..], b']') else {
+            return Some("a call this emulator cannot read the width of".to_string());
+        };
+        match argument_kind(listed, PAD_WIDTH_ARGUMENT) {
+            // A call that writes no width where this reading takes one — the width
+            // piped in by a chain, or supplied by a partial application — names no
+            // number to hold to the allowance.
+            None => return Some("a call that writes its width elsewhere".to_string()),
+            Some(kind) => match literal_number(kind) {
+                Some(width) if width.abs() <= allowance as f64 => bounded += 1,
+                Some(width) => return Some(format!("a width of {width}")),
+                None => return Some("a width it computes".to_string()),
+            },
+        }
+    }
+    // And every OTHER way the expression reaches the binding: a reference that is not
+    // the callee of one of the calls above is a `$pad` whose width this reading never
+    // saw, so the expression is not evaluated for it.
+    match unquoted_matches(rendered, PAD_TERM).len() > bounded {
+        true => Some("a reference this emulator cannot read a width for".to_string()),
+        false => None,
+    }
+}
+
+/// Where `needle` appears in `rendered` OUTSIDE a string literal the rendering quotes,
+/// as the byte offsets those appearances begin at.
+///
+/// The rendering of a parse quotes every string the expression itself carries, escaping
+/// the quotes inside it, so a caller's own literal can spell any text this module looks
+/// for. Matching such a literal would COUNT it: a literal spelling a bounded call would
+/// answer for a reference that is really there, which is the one direction this reading
+/// must not fail in. So only an appearance the rendering wrote as structure is matched,
+/// and everything a caller's data can spell is skipped.
+///
+/// `needle` must open with an ASCII byte, which every term this module looks for does:
+/// that is what makes an offset it matches at a character boundary of `rendered`.
+fn unquoted_matches(rendered: &str, needle: &str) -> Vec<usize> {
+    let opens = match needle.as_bytes().first() {
+        Some(byte) if byte.is_ascii() => *byte,
+        _ => return Vec::new(),
+    };
+    let mut found = Vec::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for (offset, byte) in rendered.as_bytes().iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if quoted => escaped = true,
+            b'"' => quoted = !quoted,
+            found_byte
+                if !quoted
+                    && *found_byte == opens
+                    && rendered[offset..].starts_with(needle) =>
+            {
+                found.push(offset);
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// The text up to the `closing` delimiter that balances the list or object `rendered`
+/// opens, with the nesting inside it and the delimiters written inside a string
+/// literal ignored, or `None` for a rendering that does not close.
+fn balanced(rendered: &str, closing: u8) -> Option<&str> {
+    let bytes = rendered.as_bytes();
+    let mut depth = 0_usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (offset, byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if quoted => escaped = true,
+            b'"' => quoted = !quoted,
+            _ if quoted => {}
+            b'[' | b'{' | b'(' => depth += 1,
+            b']' | b'}' | b')' if depth > 0 => depth -= 1,
+            found if *found == closing => return Some(&rendered[..offset]),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `kind` of the argument at `index` of the rendered argument list `listed`: the
+/// text from that argument's own `kind` field to the end of its rendering.
+///
+/// Each argument is one node, rendered as an object of its own, so the arguments are the
+/// commas of the list at its OWN nesting level and each one's kind is the first `kind`
+/// field inside it — the kinds of the nodes nested in it come after.
+fn argument_kind(listed: &str, index: usize) -> Option<&str> {
+    let mut depth = 0_usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut at = 0_usize;
+    let mut start = 0_usize;
+    let bytes = listed.as_bytes();
+    for (offset, byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if quoted => escaped = true,
+            b'"' => quoted = !quoted,
+            _ if quoted => {}
+            b'[' | b'{' | b'(' => depth += 1,
+            b']' | b'}' | b')' if depth > 0 => depth -= 1,
+            b',' if depth == 0 => {
+                if at == index {
+                    return kind_of(&listed[start..offset]);
+                }
+                at += 1;
+                start = offset + 1;
+            }
+            _ => {}
+        }
+    }
+    match at == index {
+        true => kind_of(&listed[start..]),
+        false => None,
+    }
+}
+
+/// The text of one argument's own `kind` field, from that field to the end of the
+/// argument's rendering.
+fn kind_of(argument: &str) -> Option<&str> {
+    let at = argument.find(ARGUMENT_KIND)?;
+    Some(&argument[at + ARGUMENT_KIND.len()..])
+}
+
+/// The value of a NUMBER literal `kind`, or `None` for a kind that is not one.
+fn literal_number(kind: &str) -> Option<f64> {
+    let written = kind.strip_prefix(NUMBER_LITERAL)?;
+    let end = written.find(')')?;
+    written[..end].parse().ok()
+}
 
 /// Why an expression was not evaluated.
 ///
@@ -370,6 +566,15 @@ fn contained(
             return Err(Refused::NotEvaluated(format!(
                 "'{text}' uses {construct}, whose cost this emulator cannot bound, so it was not \
                  evaluated"
+            )));
+        }
+        // And the one step whose cost is a WIDTH the expression names: read off that
+        // same parse and held to what this evaluation may build at all.
+        if let Some(width) = unboundable_pad(&format!("{:?}", parsed.ast()), expression.allowance) {
+            return Err(Refused::NotEvaluated(format!(
+                "'{text}' uses $pad with {width}, which this emulator cannot bound against the {} \
+                 bytes this evaluation may build, so it was not evaluated",
+                expression.allowance
             )));
         }
         for (name, value) in expression.variables {
@@ -815,8 +1020,57 @@ mod tests {
                 "NotEvaluated",
             ),
             (
-                "an expression carrying $pad",
-                "$pad('x', 8)",
+                "an expression carrying a $pad wider than the allowance it was given",
+                "$pad('x', 2048)",
+                json!({}),
+                1024,
+                "NotEvaluated",
+            ),
+            (
+                "an expression whose $pad computes the width it builds to",
+                "$pad('x', 4 * 2)",
+                json!({}),
+                1024,
+                "NotEvaluated",
+            ),
+            (
+                // The binding reached without being called there: the width this
+                // reading never saw.
+                "an expression that binds $pad to a variable and calls the binding",
+                "( $p := $pad; $p('x', 1e12) )",
+                json!({}),
+                1024,
+                "NotEvaluated",
+            ),
+            (
+                "an expression that hands $pad to a higher-order function",
+                "$map(['x'], $pad)",
+                json!({}),
+                1024,
+                "NotEvaluated",
+            ),
+            (
+                // The chain pipes the string in, so the width is not where this
+                // reading takes one.
+                "an expression that pipes a string into $pad",
+                "'x' ~> $pad(1e12)",
+                json!({}),
+                1024,
+                "NotEvaluated",
+            ),
+            (
+                // One bounded call does not answer for the aliased one beside it.
+                "an expression that calls $pad boundedly and also aliases it",
+                "$pad('x', 8) & ( $p := $pad; $p('y', 1e12) )",
+                json!({}),
+                1024,
+                "NotEvaluated",
+            ),
+            (
+                // A literal spelling this module's own reading of the parse is the
+                // caller's DATA, so it answers for nothing.
+                "an expression whose literal spells a bounded call beside an aliased $pad",
+                "'Function { name: \"pad\", args: [kind: Number(1)]' & ( $p := $pad; $p('y', 1e12) )",
                 json!({}),
                 1024,
                 "NotEvaluated",

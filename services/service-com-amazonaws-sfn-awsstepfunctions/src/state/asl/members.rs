@@ -13,6 +13,13 @@ use super::*;
 /// member is not executed: the member changes what the state does, and running the
 /// state while ignoring it would report an outcome the definition does not describe.
 ///
+/// `Assign` is a member of BOTH query languages — the block that stores the execution's
+/// variables, written as that language's own expressions: a payload template here
+/// ([`Interpreter::jsonpath_assign`]) and a JSONata template in the other
+/// ([`jsonata_members`]) — so every type that may carry it in one may carry it in the
+/// other. A `Fail` state carries none of the two languages' data-flow members at all,
+/// and so none of this one either.
+///
 /// A `Task`'s members depend on WHICH work its `Resource` names, so the type alone
 /// does not decide them: this answers the ACTIVITY task's set, and
 /// [`INTEGRATION_TASK_MEMBERS`] the service-integration call's.
@@ -23,6 +30,7 @@ pub(super) fn executable_members(state_type: &str) -> &'static [&'static str] {
             "Type",
             "Comment",
             "QueryLanguage",
+            "Assign",
             "InputPath",
             "Parameters",
             "Result",
@@ -35,6 +43,7 @@ pub(super) fn executable_members(state_type: &str) -> &'static [&'static str] {
             "Type",
             "Comment",
             "QueryLanguage",
+            "Assign",
             "InputPath",
             "OutputPath",
             "Seconds",
@@ -48,12 +57,20 @@ pub(super) fn executable_members(state_type: &str) -> &'static [&'static str] {
             "Type",
             "Comment",
             "QueryLanguage",
+            "Assign",
             "InputPath",
             "OutputPath",
             "Choices",
             "Default",
         ],
-        "Succeed" => &["Type", "Comment", "QueryLanguage", "InputPath", "OutputPath"],
+        "Succeed" => &[
+            "Type",
+            "Comment",
+            "QueryLanguage",
+            "Assign",
+            "InputPath",
+            "OutputPath",
+        ],
         "Fail" => &[
             "Type",
             "Comment",
@@ -77,6 +94,7 @@ pub(super) fn executable_members(state_type: &str) -> &'static [&'static str] {
             "Type",
             "Comment",
             "QueryLanguage",
+            "Assign",
             "Resource",
             "InputPath",
             "Parameters",
@@ -101,6 +119,7 @@ pub(super) fn executable_members(state_type: &str) -> &'static [&'static str] {
             "Type",
             "Comment",
             "QueryLanguage",
+            "Assign",
             "InputPath",
             "Parameters",
             "ItemReader",
@@ -130,6 +149,7 @@ pub(super) fn executable_members(state_type: &str) -> &'static [&'static str] {
             "Type",
             "Comment",
             "QueryLanguage",
+            "Assign",
             "InputPath",
             "Parameters",
             "Branches",
@@ -149,15 +169,18 @@ pub(super) fn executable_members(state_type: &str) -> &'static [&'static str] {
 /// carry: the ones that decide the request the call carries, what becomes of its
 /// answer, and how a failed call is handled.
 ///
-/// `HeartbeatSeconds`/`HeartbeatSecondsPath` and `Credentials` are deliberately
-/// absent: a heartbeat is owed by an activity or a callback task, whose outcome
-/// arrives after the call this emulator makes ([`CALLBACK_TASK_MEMBERS`] is that
-/// task's own set), and `Credentials` asks for the call to be made under another
-/// role, which this emulator does not assume.
+/// `HeartbeatSeconds`/`HeartbeatSecondsPath` is among them: the member is a `Task`
+/// state's, whatever work its `Resource` names, and the window it declares closes at
+/// its own length for a task nothing heartbeats — which is every task whose work this
+/// emulator performs itself ([`Interpreter::task_state`] holds such a task to whichever
+/// of the two spans the state declared runs out first). `Credentials` is deliberately
+/// absent: it asks for the call to be made under another role, which this emulator does
+/// not assume.
 pub(super) const INTEGRATION_TASK_MEMBERS: &[&str] = &[
     "Type",
     "Comment",
     "QueryLanguage",
+    "Assign",
     "Resource",
     "InputPath",
     "Parameters",
@@ -168,6 +191,8 @@ pub(super) const INTEGRATION_TASK_MEMBERS: &[&str] = &[
     "Catch",
     "TimeoutSeconds",
     "TimeoutSecondsPath",
+    "HeartbeatSeconds",
+    "HeartbeatSecondsPath",
     "Next",
     "End",
 ];
@@ -184,6 +209,7 @@ pub(super) const CALLBACK_TASK_MEMBERS: &[&str] = &[
     "Type",
     "Comment",
     "QueryLanguage",
+    "Assign",
     "Resource",
     "InputPath",
     "Parameters",
@@ -286,9 +312,10 @@ pub(super) fn jsonata_members(state_type: &str, activity: bool) -> &'static [&'s
         ],
         "Succeed" => &["Type", "Comment", "QueryLanguage", "Assign", "Output"],
         "Fail" => &["Type", "Comment", "QueryLanguage", "Error", "Cause"],
-        // An ACTIVITY task's work is a worker's, so it carries the heartbeat an
-        // integration call cannot owe — the same split [`executable_members`] makes for
-        // the other language, for the same reasons.
+        // An ACTIVITY task's work is a worker's, which is what SENDS the heartbeats the
+        // member's window is measured between; a task whose work this emulator performs
+        // itself carries the member too, with a window nothing heartbeats
+        // ([`INTEGRATION_TASK_MEMBERS`]).
         "Task" if activity => &[
             "Type",
             "Comment",
@@ -313,6 +340,7 @@ pub(super) fn jsonata_members(state_type: &str, activity: bool) -> &'static [&'s
             "Resource",
             "Arguments",
             "TimeoutSeconds",
+            "HeartbeatSeconds",
             "Retry",
             "Catch",
             "Next",

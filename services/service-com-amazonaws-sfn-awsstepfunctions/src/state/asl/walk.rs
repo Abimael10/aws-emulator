@@ -21,6 +21,18 @@ use serde_json::{Map, Value};
 
 use super::*;
 
+/// What an `Assign` block would leave behind: the scope it would install, and what the
+/// state carrying it reports as having assigned.
+///
+/// The two are different documents: the SCOPE is every variable in force after the block,
+/// which is what the states after it read, while what is reported is "a map of variable
+/// name and value as a serialized JSON representation" of the block's OWN members, which
+/// is what the event the state is left by carries.
+struct Assigned {
+    variables: BTreeMap<String, Value>,
+    reported: BTreeMap<String, String>,
+}
+
 impl Interpreter<'_> {
     /// `value` as this service reports it: [`echoed_payload`] against the document
     /// the caller supplied to THIS walk.
@@ -657,6 +669,12 @@ impl Interpreter<'_> {
         }
 
         let context = self.context_for(scope, name, at);
+        // The variables in scope for THIS state, installed on the thread for its turn:
+        // a JSONPath reference reads one as the first term of a path, and the paths of
+        // this state are evaluated by plain functions the walk reaches through several
+        // layers ([`variables`]). A state nested inside this one installs its own and
+        // puts this one back, which is how the language scopes an `Assign`.
+        let _scope = VariableScope::of(&self.variables);
         let effective = self
             .input_value(state, &raw, &context)
             .map_err(|failure| failure.clone().at(at))?;
@@ -714,18 +732,26 @@ impl Interpreter<'_> {
                     .choose(state, language, &effective, &context)
                     .map_err(|failure| failure.at(at))?;
                 // "Output ... you can also specify Output in a Choice rule", and the
-                // same for `Assign`: a JSONata `Choice` puts out what the SELECTED
-                // rule's own members decided, and what the state's own decided only
-                // where no rule matched ([`Interpreter::choice_output`]). A JSONPath
-                // rule carries neither, so that language's state puts out what every
-                // other state does.
+                // same for `Assign`: a `Choice` puts out — and assigns — what the
+                // SELECTED rule's own members decided, and what the state's own
+                // decided only where no rule matched
+                // ([`Interpreter::choice_output`]). A JSONPath rule carries no
+                // `Output`, so that language's state puts out what every other state
+                // written in it does.
                 let value = match language {
                     JSONATA => self
                         .choice_output(state, chosen.rule.as_ref(), &effective, &context)
                         .map_err(|failure| failure.at(at))?,
-                    _ => self
-                        .produced(state, language, &raw, &effective, None, &context, false)
-                        .map_err(|failure| failure.at(at))?,
+                    _ => {
+                        let owner = chosen
+                            .rule
+                            .as_ref()
+                            .map_or(state, |(_, rule)| rule);
+                        self.jsonpath_assign(owner, &effective, &context)
+                            .map_err(|failure| failure.at(at))?;
+                        self.output_value(state, effective.clone(), &context)
+                            .map_err(|failure| failure.at(at))?
+                    }
                 };
                 self.push_exited("ChoiceStateExited", name, at, &value);
                 Ok(StateStep {
@@ -803,10 +829,10 @@ impl Interpreter<'_> {
 
     /// What a state PUTS OUT, in the query language it is written in.
     ///
-    /// JSONPath places the state's result through `ResultSelector`, `ResultPath` and
-    /// `OutputPath`; JSONata evaluates the state's `Assign` and then its `Output`.
-    /// One seam for both, so every state type's output follows the rule of the
-    /// language that state is written in.
+    /// JSONPath places the state's result through `ResultSelector`, `Assign`,
+    /// `ResultPath` and `OutputPath`; JSONata evaluates the state's `Assign` and then
+    /// its `Output`. One seam for both, so every state type's output follows the rule
+    /// of the language that state is written in.
     ///
     /// `result` is what the state's own work produced, and `None` for a state that
     /// produces none and carries its input through (a `Pass`, a `Wait`, a `Choice`, a
@@ -826,9 +852,157 @@ impl Interpreter<'_> {
             return self.jsonata_output(state, effective, result.as_ref(), None, context);
         }
         match result {
-            Some(result) => self.place_result(state, raw, result, context, with_selector),
-            None => self.output_value(state, effective.clone(), context),
+            Some(result) => {
+                let selected = select_result(state, result, context, with_selector)?;
+                // The state's own `Assign` is evaluated over what its work PRODUCED,
+                // which is also the document a `ResultSelector` has just filtered, and
+                // before the result is placed: `ResultPath` and `OutputPath` select
+                // from the state's data, while the assignments read the state's result
+                // ([`Interpreter::jsonpath_assign`]).
+                self.jsonpath_assign(state, &selected, context)?;
+                let placed = path_result(state, raw, selected)?;
+                self.output_value(state, placed, context)
+            }
+            None => {
+                // A state that produces no result of its own carries its input
+                // through, so that input is what its assignments read.
+                self.jsonpath_assign(state, effective, context)?;
+                self.output_value(state, effective.clone(), context)
+            }
         }
+    }
+
+    /// Apply the `Assign` of a state, a `Choice` rule or a `Catch` catcher written in
+    /// JSONPath, over the document `read` that node's expressions select from.
+    ///
+    /// "Assign ... store values in variables": the block is a PAYLOAD TEMPLATE in this
+    /// language — "if any field within the Payload Template ... has a name ending with
+    /// the characters '.$', its value is transformed according to rules below and the
+    /// field is renamed to strip the '.$' suffix" — so a member named `"total.$"`
+    /// assigns `total` the value its path or intrinsic selected, and every other member
+    /// assigns the literal the definition wrote. The variables outlive the state, which
+    /// is what a later state's paths read them through ([`variables`]).
+    ///
+    /// Each member is one variable and they are evaluated IN ORDER, so an assignment
+    /// reads the ones written before it — the rule the other language's `Assign` follows
+    /// too ([`Interpreter::jsonata_assign`]). All of them spend from the ONE budget a
+    /// payload template is given, so a state cannot build more than one document however
+    /// many variables it declares.
+    ///
+    /// A block that cannot be built assigns NOTHING: the values are rendered into a copy
+    /// of the scope and installed once, so no later state reads half of one state's
+    /// assignments.
+    pub(super) fn jsonpath_assign(
+        &mut self,
+        node: &Map<String, Value>,
+        read: &Value,
+        context: &Value,
+    ) -> Result<(), Failure> {
+        let Some(assignments) = node.get(ASSIGN_MEMBER) else {
+            return Ok(());
+        };
+        let assignments = assignments.as_object().ok_or_else(|| {
+            runtime(format!("'{ASSIGN_MEMBER}' must be a JSON object of variables"))
+        })?;
+        let built = self.build_assignments(assignments, read, context);
+        let Assigned {
+            variables,
+            reported,
+        } = match built {
+            Ok(built) => built,
+            Err(failure) => {
+                // A block that cannot be built assigns NOTHING: the members before the
+                // one that failed were installed for the members after it to read, so
+                // the scope the REST of this state's expressions read is put back as
+                // the state found it — it is the scope `self.variables` still holds.
+                VariableScope::reinstall(&self.variables);
+                return Err(failure);
+            }
+        };
+        self.variables = variables;
+        // What THIS state assigned, for the event it is left by: a state that assigns
+        // nothing reports nothing, whatever the scope around it holds.
+        self.assigned.extend(reported);
+        Ok(())
+    }
+
+    /// [`Interpreter::jsonpath_assign`]'s own work: the scope the block would leave and
+    /// what it assigned, or the failure it could not be built past.
+    ///
+    /// The members are installed on the thread AS THEY ARE BUILT, because an assignment
+    /// reads the ones written before it; the caller is what puts the scope back where a
+    /// member failed.
+    fn build_assignments(
+        &self,
+        assignments: &Map<String, Value>,
+        read: &Value,
+        context: &Value,
+    ) -> Result<Assigned, Failure> {
+        let mut budget = TemplateBudget::of_one_payload();
+        let mut variables = self.variables.clone();
+        let mut reported = BTreeMap::new();
+        for (member, template) in assignments {
+            budget.spend(member.len() + 3)?;
+            let (variable, value) = match member.strip_suffix(".$") {
+                Some(variable) => {
+                    let text = template.as_str().ok_or_else(|| {
+                        named(
+                            PARAMETER_PATH_ERROR,
+                            format!(
+                                "'{member}' must be a JSONPath or intrinsic-function string, not \
+                                 {template}"
+                            ),
+                        )
+                    })?;
+                    budget.charge_path()?;
+                    (variable, template_expression(member, text, read, context)?)
+                }
+                None => (
+                    member.as_str(),
+                    render_template(template, read, context, 1, &mut budget)?,
+                ),
+            };
+            // A variable is a document the execution retains and a later state reads,
+            // so it is measured against the same ceiling every document this walk
+            // produces is measured against.
+            budget.spend(measure_payload(&value, UNNAMED_PRODUCER)?)?;
+            // The variable is in scope for the assignments after it, which is what the
+            // paths and the intrinsics of those members read it through. ONE variable
+            // is bound rather than the scope re-installed, so a block of many members
+            // costs the sum of its members and not their count times the scope's size.
+            VariableScope::bind(variable, &value);
+            reported.insert(variable.to_string(), value.to_string());
+            variables.insert(variable.to_string(), value);
+        }
+        // And the variables the execution would then hold TOGETHER are held to the
+        // space an execution's variables have.
+        Self::measured_variable_space(&variables)?;
+        Ok(Assigned {
+            variables,
+            reported,
+        })
+    }
+
+    /// Hold what an `Assign` would leave in scope to the bytes an execution's variables
+    /// may carry together ([`MAX_VARIABLE_BYTES`]).
+    ///
+    /// Measured over the whole SCOPE rather than over what one state wrote, because the
+    /// quota is the space the execution's variables occupy: a variable assigned a second
+    /// value takes the place of its first, and the variables of a state machine the walk
+    /// has left are not in scope at all, so both free the space they held.
+    pub(super) fn measured_variable_space(
+        variables: &BTreeMap<String, Value>,
+    ) -> Result<(), Failure> {
+        let mut bytes = 0usize;
+        for value in variables.values() {
+            // Each variable is measured against what ONE document may carry as well,
+            // which is the per-variable half of the same quota.
+            bytes = bytes.saturating_add(measure_payload(value, UNNAMED_PRODUCER)?);
+            if bytes > MAX_VARIABLE_BYTES {
+                return Err(named(DATA_LIMIT_ERROR, variable_space_exceeded()));
+            }
+        }
+        Ok(())
     }
 
     /// A JSONata state's `Assign`, and then the `Output` those assignments feed.
@@ -939,6 +1113,9 @@ impl Interpreter<'_> {
             assigned.insert(variable.clone(), value.to_string());
             variables.insert(variable.clone(), value);
         }
+        // And the variables the execution would then hold TOGETHER are held to the
+        // space an execution's variables have ([`MAX_VARIABLE_BYTES`]).
+        Self::measured_variable_space(&variables)?;
         self.variables = variables;
         // What THIS state assigned, for the event it is left by: a state that assigns
         // nothing reports nothing, whatever the scope around it holds.
@@ -1089,6 +1266,17 @@ impl Interpreter<'_> {
         let input = self
             .task_request(state, language, &effective, context)
             .map_err(|failure| failure.at(at))?;
+        // "GetActivityTask ... used by workers to retrieve a task (with the specified
+        // activity ARN) which has been scheduled for execution by a running state
+        // machine": the task is queued UNDER the activity, so a `Resource` naming one
+        // this emulator does not hold names no queue a worker could ever poll. Nothing
+        // is scheduled for it and the state fails, rather than the execution waiting
+        // for a worker that can never be handed the task. Asked once the state's own
+        // members have been read, so a definition whose task could not be BUILT reports
+        // that instead.
+        if !self.tasks.activity(resource) {
+            return Err(runtime(super::activity_does_not_exist(resource)).at(at));
+        }
         self.push_entered("TaskStateEntered", name, at, raw);
         self.push("ActivityScheduled", name, at);
         // Something has already CLOSED this state's task, so the walk applies that
@@ -1939,14 +2127,11 @@ impl Interpreter<'_> {
             })?;
             return Ok(Chosen {
                 next: next.to_string(),
-                // The rule that matched is the one whose own `Assign` and `Output`
-                // apply; a JSONPath rule carries neither. Its own place in the
-                // definition is where those members are written
-                // ([`choice_rule_field`]), which is what a diagnosis about one names.
-                rule: match language {
-                    JSONATA => Some((index, rule.clone())),
-                    _ => None,
-                },
+                // The rule that matched is the one whose own `Assign` applies — and,
+                // in JSONata, its `Output` too. Its own place in the definition is
+                // where those members are written ([`choice_rule_field`]), which is
+                // what a diagnosis about one names.
+                rule: Some((index, rule.clone())),
             });
         }
         match state.get("Default").and_then(Value::as_str) {
@@ -2113,6 +2298,18 @@ impl Interpreter<'_> {
         let heartbeat = self
             .task_seconds(state, language, "HeartbeatSeconds", &effective, context)
             .map_err(|failure| self.task_fault(name, &work, failure, at))?;
+        // "HeartbeatSeconds […] If more time than the specified seconds elapses between
+        // heartbeats from the task, this state fails with a States.Timeout error name":
+        // the heartbeats of a task are sent by whoever is DOING its work, and the work
+        // of a service integration is performed by this emulator itself — so no
+        // heartbeat arrives for one and the window the member declares closes at its own
+        // length. What bounds such a task is therefore whichever of the two spans the
+        // state declared runs out first, while each member is still REPORTED as the
+        // definition wrote it.
+        let bounded = match (within, heartbeat.map(Duration::from_secs)) {
+            (Some(timeout), Some(heartbeat)) => Some(timeout.min(heartbeat)),
+            (timeout, heartbeat) => timeout.or(heartbeat),
+        };
         // The job a run-a-job integration started has ENDED: what it ended as is this
         // state's own outcome, so the state reports it instead of starting the job a
         // second time. The events up to here are the ones the call that parked the
@@ -2366,7 +2563,7 @@ impl Interpreter<'_> {
             // so that a sibling's is started beside it: the turn unwinds, and the walk
             // takes it up again at this very state once the call answers
             // ([`Interpreter::perform_call`]).
-            let Some((answered, began)) = me.perform_call(&call, called, me.call_within(within))
+            let Some((answered, began)) = me.perform_call(&call, called, me.call_within(bounded))
             else {
                 return (Err(unwound()), at);
             };
@@ -2461,7 +2658,11 @@ impl Interpreter<'_> {
                         acts_on: job.acts_on_named(&request, &job_id),
                         submitted: result.clone(),
                         at,
-                        timeout_seconds: within.map(|within| within.as_secs()),
+                        // The bound the job is held to is the shorter of the two spans
+                        // the state declared: nothing heartbeats a job this service
+                        // polls, so a `HeartbeatSeconds` closes its window at its own
+                        // length.
+                        timeout_seconds: bounded.map(|bounded| bounded.as_secs()),
                         // Filled in as the walk unwinds: each concurrent state the
                         // suspension passes through records its own frame
                         // ([`Interpreter::run_branches`]).
@@ -2643,7 +2844,26 @@ impl Interpreter<'_> {
         let batcher = state.get("ItemBatcher");
         let concurrency = self
             .number_member(state, language, "MaxConcurrency", &effective, context, 0.0)
-            .map_err(|failure| failure.at(at))? as usize;
+            .map_err(|failure| failure.at(at))?;
+        // The figure is held to the range the member carries BEFORE the state runs
+        // under it: a `MaxConcurrency` past that range names no bound an iteration
+        // count could ever be, so the state fails for it rather than running under a
+        // bound the definition did not write ([`MAX_MAP_CONCURRENCY`]). The member the
+        // definition wrote is the one the diagnosis names, as everywhere else the two
+        // forms are alternatives.
+        if concurrency > MAX_MAP_CONCURRENCY as f64 || concurrency.fract() != 0.0 {
+            let wrote = match state.contains_key("MaxConcurrency") {
+                true => "MaxConcurrency",
+                false => "MaxConcurrencyPath",
+            };
+            return Err(runtime(referenced_value_must_be(
+                wrote,
+                &bounded_concurrency(),
+                &json!(concurrency),
+            ))
+            .at(at));
+        }
+        let concurrency = concurrency as usize;
         let tolerated_count = self
             .number_member(
                 state,
@@ -3596,14 +3816,20 @@ impl Interpreter<'_> {
             // output is the error output", placed through the catcher's own
             // `ResultPath` — or, in JSONata, through the catcher's own `Output` and
             // `Assign`, which are the two places `$states.errorOutput` is in scope.
+            // The catcher's `Assign` is evaluated the same way in the other language:
+            // over the ERROR OUTPUT the catcher was handed, since that is the document
+            // its own members read.
             let error_output = failure.payload();
             let value = match language {
                 JSONATA => self
                     .jsonata_output(catcher, effective, None, Some(&error_output), context)
                     .map_err(|failure| failure.at(at))?,
-                _ => self
-                    .place_result(catcher, raw, error_output, context, true)
-                    .map_err(|failure| failure.at(at))?,
+                _ => {
+                    self.jsonpath_assign(catcher, &error_output, context)
+                        .map_err(|failure| failure.at(at))?;
+                    self.place_result(catcher, raw, error_output, context, true)
+                        .map_err(|failure| failure.at(at))?
+                }
             };
             self.push_exited(left, name, at, &value);
             return Ok(StateStep {

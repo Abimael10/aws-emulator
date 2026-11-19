@@ -206,9 +206,14 @@ mod members;
 // names stay reachable unqualified from here.
 mod trial;
 mod walk;
+// The variables one walk has assigned, as the JSONPath half of the language reads them:
+// one concern in a file of its own, whose names stay reachable unqualified from here and
+// from the walk.
+mod variables;
 mod work_events;
 mod work_meter;
 use members::*;
+use variables::*;
 pub use diagnose::*;
 pub use trial::*;
 // The ceiling on the PRODUCT the ceilings below bound factor by factor, and the
@@ -557,6 +562,19 @@ pub(super) const ISO_INSTANT: &str = "an ISO 8601 instant";
 /// must carry: a number, and never a negative one.
 pub(super) const NON_NEGATIVE_NUMBER: &str = "a non-negative number";
 
+/// The largest `MaxConcurrency` a `Map` state can run under: the member is an `int32`
+/// on the wire — `MaxConcurrency` (range 0..), the field a Map Run reports its own
+/// concurrency through — so a figure past it names no bound the state could be run
+/// under.
+pub const MAX_MAP_CONCURRENCY: i64 = i32::MAX as i64;
+
+/// What a `Map` state's `MaxConcurrency` must carry: "an upper bound on how many
+/// invocations of the Iterator may run in parallel", inside the range the member
+/// carries ([`MAX_MAP_CONCURRENCY`]).
+pub(super) fn bounded_concurrency() -> String {
+    format!("a whole number from 0 to {MAX_MAP_CONCURRENCY}")
+}
+
 /// How [`referenced_value_must_be_a_string`] opens, which is what tells it from every
 /// other cause ([`names_its_state`]).
 const REFERENCED_VALUE_OPENING: &str = "The value referenced by ";
@@ -643,6 +661,8 @@ fn names_its_state(cause: &str) -> bool {
         || cause.starts_with(FUNCTION_ERROR_OPENING)
         || cause.starts_with(REFERENCED_VALUE_OPENING)
         || cause.starts_with(super::integration::UNUSABLE_PARAMETERS_OPENING)
+        || (cause.starts_with(ACTIVITY_MISSING_OPENING)
+            && cause.ends_with(ACTIVITY_MISSING_CLOSING))
         || names_a_parameter(cause)
 }
 
@@ -799,6 +819,27 @@ const TERMINAL_EVENT_RESERVE: usize = 1;
 /// in.
 pub const MAX_STATE_NAME_CHARS: usize = 80;
 
+/// The diagnosis a `Task` state whose `Resource` names an activity this emulator does
+/// not hold fails with: the activity, by the ARN the `Resource` named it with.
+///
+/// RECORDED text. A task is queued UNDER its activity and handed out by a
+/// `GetActivityTask` on that same ARN, so a `Resource` naming an activity that does not
+/// exist names no queue at all: the execution fails at the state rather than waiting for
+/// a worker that can never be handed the task. The state names itself around it
+/// ([`executing_state`], through [`names_its_state`]), because a definition may schedule
+/// tasks for several activities. The ARN is the caller's own, so it is clipped by
+/// [`echoed`].
+pub(super) fn activity_does_not_exist(arn: &str) -> String {
+    format!("{ACTIVITY_MISSING_OPENING}{} {ACTIVITY_MISSING_CLOSING}", echoed(arn))
+}
+
+/// How [`activity_does_not_exist`] opens and closes, which is what tells that diagnosis
+/// from every other cause ([`names_its_state`]).
+const ACTIVITY_MISSING_OPENING: &str = "The activity ";
+
+/// See [`ACTIVITY_MISSING_OPENING`].
+const ACTIVITY_MISSING_CLOSING: &str = "does not exist.";
+
 /// The most bytes a state's output may carry: the maximum the modelled
 /// `SensitiveData` shape that `input`/`output` target accepts (0..262144).
 ///
@@ -808,6 +849,30 @@ pub const MAX_STATE_NAME_CHARS: usize = 80;
 /// state past the limit, with ASL's own [`DATA_LIMIT_ERROR`], rather than being
 /// allowed to grow until the run finishes.
 pub const MAX_PAYLOAD_BYTES: usize = 262_144;
+
+/// The most bytes the variables an execution has assigned may hold TOGETHER.
+///
+/// AWS quota ("Maximum size of all variables in an execution"), the same figure as the
+/// one document ceiling beside it and a limit of its own: it is measured over the
+/// variables IN SCOPE, so assigning a variable a second value frees what its first one
+/// held and leaving the state machine that assigned them — a `Map` iteration, a
+/// `Parallel` branch — frees all of theirs, which is how the language scopes an
+/// `Assign`. An assignment that would leave more than this in scope fails the state
+/// with ASL's own [`DATA_LIMIT_ERROR`] and assigns nothing.
+pub const MAX_VARIABLE_BYTES: usize = 262_144;
+
+/// The diagnosis an `Assign` that would leave more than [`MAX_VARIABLE_BYTES`] bytes of
+/// variables in scope fails with.
+///
+/// It names the quota it went past, as every other ceiling this module holds a run to
+/// does: what a reader has to be told is that the variables the execution would then
+/// hold are larger than the space an execution's variables have.
+pub(super) fn variable_space_exceeded() -> String {
+    format!(
+        "the variables this state assigns leave more than the {MAX_VARIABLE_BYTES} bytes of \
+         variables an execution may hold in scope"
+    )
+}
 
 /// The most levels a state's document may nest.
 ///
@@ -1658,11 +1723,11 @@ struct StateStep {
 /// decided it.
 struct Chosen {
     next: String,
-    /// The rule that MATCHED, for a JSONata `Choice`: its own POSITION in the state's
-    /// `Choices` array, which is where its members are written, and the rule itself —
-    /// whose `Assign` and `Output` are the state's, applied over the state's own
-    /// ([`Interpreter::choice_output`]). `None` where the `Default` was taken, and for
-    /// a JSONPath rule, which carries neither.
+    /// The rule that MATCHED: its own POSITION in the state's `Choices` array, which is
+    /// where its members are written, and the rule itself — whose `Assign` is the
+    /// state's, and whose `Output` is too for a JSONata rule
+    /// ([`Interpreter::choice_output`]). `None` where the `Default` was taken, since
+    /// then no rule decided the transition and the state's own members apply.
     rule: Option<(usize, Map<String, Value>)>,
 }
 
@@ -3760,6 +3825,13 @@ fn finite_seconds(retrier: &Map<String, Value>, member: &str) -> Option<f64> {
 /// jitter — drawn uniformly from zero up to that capped figure
 /// ([`jittered_seconds`]).
 ///
+/// The figure that arithmetic reaches is TRUNCATED to whole seconds: `BackoffRate` is
+/// "a number which is >= 1.0", so the product of an integer interval and it is a
+/// fraction of a second as often as not, and the service waits the whole seconds of it
+/// — the fraction is dropped rather than rounded up, so a wait is never longer than the
+/// figure the retrier's own members reached. The band full jitter then draws from is
+/// that truncated figure, since what the strategy spreads is the wait the retrier owes.
+///
 /// The product is of two numbers the definition chose, so it can overflow to infinity
 /// (or to NaN, when a zero interval meets an infinite backoff). A wait no longer than
 /// the longest one this service waits for is what such a retrier gets: the figure
@@ -3780,6 +3852,10 @@ fn retry_delay_seconds(retrier: &Map<String, Value>, taken: u64) -> f64 {
     } else {
         MAX_WAIT_SECONDS as f64
     };
+    // The whole seconds of the figure the retrier's own members reached: a computed
+    // wait of 7.5 seconds is waited as 7, and one shorter than a second is not waited
+    // at all.
+    let computed = computed.trunc().max(0.0);
     if jitters_fully(retrier) {
         jittered_seconds(computed)
     } else {
@@ -3874,7 +3950,14 @@ pub fn activity_retry_any(
         }
         return Some((
             index,
-            Duration::from_secs_f64(retry_delay_seconds(retrier, spent)),
+            // The figure is already finite and inside [`MAX_WAIT_SECONDS`], whatever a
+            // definition writes in the retrier's own members; the conversion is
+            // nevertheless written so it CANNOT panic, because a caller-sized figure
+            // must not be able to take the process down — a delay that somehow left
+            // that range waits no time at all, exactly as the walk's own retry loop
+            // converts it.
+            Duration::try_from_secs_f64(retry_delay_seconds(retrier, spent))
+                .unwrap_or(Duration::ZERO),
         ));
     }
     None
@@ -4066,10 +4149,7 @@ fn path_result(
 /// expressions, so the template can never build more than a state's output may carry
 /// nor evaluate more expressions than one visit to a state is allowed.
 fn payload_template(node: &Value, input: &Value, context: &Value) -> Result<Value, Failure> {
-    let mut budget = TemplateBudget {
-        bytes: MAX_PAYLOAD_BYTES,
-        paths: MAX_TEMPLATE_PATHS,
-    };
+    let mut budget = TemplateBudget::of_one_payload();
     render_template(node, input, context, 1, &mut budget)
 }
 
@@ -4080,6 +4160,18 @@ struct TemplateBudget {
 }
 
 impl TemplateBudget {
+    /// The allowance ONE payload template is given: what a state's document may carry,
+    /// and the expressions one visit to a state may evaluate.
+    ///
+    /// Read in two places, so a template and the `Assign` block beside it — which is a
+    /// payload template of this language too
+    /// ([`Interpreter::jsonpath_assign`]) — are bounded by the same figures.
+    fn of_one_payload() -> Self {
+        Self {
+            bytes: MAX_PAYLOAD_BYTES,
+            paths: MAX_TEMPLATE_PATHS,
+        }
+    }
     /// Spend `bytes` of what the template may still build.
     fn spend(&mut self, bytes: usize) -> Result<(), Failure> {
         match self.bytes.checked_sub(bytes) {

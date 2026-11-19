@@ -671,6 +671,7 @@ fn a_call_from_a_chain_at_the_depth_ceiling_is_not_made() {
             role: None,
             handovers: None,
             map_runs: None,
+            activities: None,
         };
         let answer = dispatcher.perform(&call, &::serde_json::json!({}), None);
         let Err(failed) = answer else {
@@ -719,6 +720,7 @@ fn a_call_that_cannot_be_handed_over_is_not_reported_as_a_timeout() {
         role: None,
         handovers: None,
         map_runs: None,
+        activities: None,
     };
 
     let answer = dispatcher.perform(&call, &::serde_json::json!({}), None);
@@ -757,6 +759,7 @@ fn a_call_that_does_not_answer_inside_its_bound_times_the_task_out() {
         role: None,
         handovers: None,
         map_runs: None,
+        activities: None,
     };
     let within = Duration::from_millis(50);
 

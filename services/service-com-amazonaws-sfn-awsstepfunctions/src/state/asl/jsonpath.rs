@@ -144,6 +144,24 @@ pub(super) fn select_optional(
     if is_context_path(path) {
         return select_path(&path[1..], context);
     }
+    // A path whose first term is `$<name>` reads the VARIABLE of that name — the
+    // values an `Assign` stored ([`variable_reference`]) — and the rest of it selects
+    // a place inside that value, exactly as it would inside the state's own data. A
+    // variable nothing reaching this state assigned carries no value, so such a path
+    // selects nothing, which is the same answer a path the document does not carry
+    // gives.
+    if let Some((name, into)) = variable_reference(path) {
+        // Reading a variable is work the definition asked for, exactly as evaluating a
+        // path into the state's own data is: the text is charged here, so a reference
+        // the scope does not carry is not a free leaf ([`select_path`] charges the rest).
+        if !spend_work(u64::try_from(path.len()).unwrap_or(u64::MAX)) {
+            return Err(out_of_work());
+        }
+        let Some(value) = scoped_variable(name) else {
+            return Ok(None);
+        };
+        return select_path(&format!("${into}"), &value);
+    }
     match path.strip_prefix('$') {
         Some(_) => select_path(path, input),
         None => Err(runtime(format!(
@@ -460,6 +478,14 @@ pub(super) fn condition_matches_at(
              service evaluates"
         )));
     }
+    // Every NODE of the tree is charged, not only the paths and the globs its leaves
+    // evaluate: the leaf count of an `And`/`Or` tree is the PRODUCT of its breadth over
+    // its depth, each of which is bounded on its own, and a leaf can be answered without
+    // reading any document at all (a presence test over a variable nothing assigned). So
+    // the traversal itself is what bounds the tree ([`work_meter`]).
+    if !spend_work(1) {
+        return Err(out_of_work());
+    }
     if let Some(conditions) = rule.get("And") {
         for condition in nested_conditions(conditions, "And")? {
             if !condition_matches_at(condition, input, context, depth + 1)? {
@@ -491,7 +517,10 @@ pub(super) fn condition_matches_at(
         })?;
     let (operator, operand) = rule
         .iter()
-        .find(|(key, _)| !matches!(key.as_str(), "Variable" | "Next" | "Comment"))
+        // The members that are not comparators: the path the rule tests, where it
+        // sends the execution, the comment it carries, and the variables it assigns
+        // on the way there ("you can use Assign in a Choice rule").
+        .find(|(key, _)| !matches!(key.as_str(), "Variable" | "Next" | "Comment" | "Assign"))
         .ok_or_else(|| {
             runtime(format!(
                 "the choice rule on '{variable}' carries no comparator"

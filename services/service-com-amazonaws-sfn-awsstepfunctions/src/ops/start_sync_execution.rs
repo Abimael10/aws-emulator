@@ -492,7 +492,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // parks at nothing.
         let unwaitable = "a synchronous execution cannot wait for an activity worker's reply, so \
                           the activity task this definition schedules was not run";
-        let outcome = match planned.pending {
+        let mut outcome = match planned.pending {
             Some(outcome) => outcome,
             None => {
                 let previous = history.last();
@@ -518,6 +518,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         };
+
+        // A run the state machine's own `TimeoutSeconds` ended reports that timeout as
+        // the failure THIS response carries: "error — The error code of the failure" is
+        // the member a synchronous caller reads an unsuccessful run's reason off, and
+        // what ended this one is the language's own timeout name. An asynchronous
+        // execution carries the status alone, because the caller reads the timeout off
+        // the status and the run's history instead.
+        if outcome.status == crate::state::EXECUTION_STATUS_TIMED_OUT && outcome.error.is_none() {
+            outcome.error = Some(crate::state::asl::TIMEOUT_ERROR.to_string());
+        }
 
         // The execution stopped when the walk finished — and never before the offsets
         // the definition's own `Wait` states declare, which the walk accumulates
