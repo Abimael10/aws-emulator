@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(record) = store.archives.get_mut(&input.archive_id) else {
             return Err(DeleteArchiveErrorModeled::ValidationException(ValidationException {
-                message: Some(format!("Archive {} not found.", input.archive_id)),
+                message: Some(crate::state::archive_not_found_message(&input.archive_id)),
             })
             .into());
         };

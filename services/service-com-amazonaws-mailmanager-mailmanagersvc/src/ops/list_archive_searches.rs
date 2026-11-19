@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListArchiveSearches
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListArchiveSearches`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Returns a list of email archive search jobs.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListArchiveSearches::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +109,13 @@ impl From<ListArchiveSearchesErrorModeled> for ListArchiveSearchesError {
     }
 }
 
+/// The page size this listing uses when the caller names none: the maximum the model's
+/// `PageSize` range allows
+/// (`smithy_query(query="operation",operation="ListArchiveSearches")` reports
+/// `range {min: 1, max: 50}`), which is how every paginated read of this service answers a
+/// request that states no size.
+const MAX_PAGE_SIZE: i32 = 50;
+
 /// The `ListArchiveSearches` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,18 +152,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListArchiveSearches` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListArchiveSearchesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListArchiveSearches"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the service is always mounted on the shared
+            // `InMemoryEngine`. Answered with a modelled retryable error rather than a
+            // 501, which would claim the operation is unwritten.
+            return Err(ListArchiveSearchesErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `PageSize` is modelled `range(1..50)`, so the boundary validator is the
+        // enforcement point and has already refused anything outside it; the modelled
+        // maximum stands in when the caller names none. The clamp is belt-and-braces for
+        // that unreachable case, so a page can never be zero-sized (an empty page carrying
+        // a `NextToken` would make a paging caller loop forever).
+        let requested = input
+            .page_size
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        let page_size = usize::try_from(requested).unwrap_or(1);
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        // `@readonly`: the one write a report is allowed is the removal the clock already
+        // owes — an archive whose pending-deletion window has elapsed was due to be gone at
+        // this instant whether or not anybody called. A search job's own progress is NOT
+        // written: its state is read off the clock and the instant its completion fell due.
+        store.purge_permanently_deleted(now);
+
+        // The archive is resolved the same way by every archive-scoped job operation.
+        if let Err(refusal) = store.check_archive_for_job(&input.archive_id) {
+            return Err(match refusal {
+                crate::state::ArchiveJobRefusal::NotFound => {
+                    crate::scaffolded::Scaffolded::modeled_with_status(
+                        ListArchiveSearchesErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(crate::state::ARCHIVE_NOT_FOUND.to_string()),
+                            },
+                        ),
+                        crate::state::ARCHIVE_JOB_LOOKUP_STATUS,
+                    )
+                }
+                crate::state::ArchiveJobRefusal::NotActive => {
+                    ListArchiveSearchesErrorModeled::ValidationException(ValidationException {
+                        message: Some(crate::state::ARCHIVE_NOT_ACTIVE.to_string()),
+                    })
+                    .into()
+                }
+            });
+        }
+
+        let scope = crate::state::archive_job_page_scope(&input.archive_id);
+
+        // A `NextToken` is this operation's own output, so only a value THIS store minted
+        // for THIS archive's walk names a position in it. Anything else — a token from
+        // another emulator run, one issued for another archive, one a caller built — is
+        // refused with the modelled `ValidationException` rather than answered with a
+        // plausible page the caller never asked for.
+        let resume_from = match input.next_token.as_deref() {
+            None => String::new(),
+            Some(token) => {
+                let Some(resume) = crate::state::decode_page_token(&store.page_token_key, token)
+                    .and_then(|cursor| cursor.strip_prefix(&scope).map(str::to_string))
+                else {
+                    return Err(ListArchiveSearchesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some("NextToken is not a valid pagination token.".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                resume
+            }
+        };
+
+        // The search jobs are keyed by `SearchId` in a `BTreeMap`, so this walk is in one
+        // stable order and the position a token carries is simply the id to resume at — the
+        // range starts directly at that key rather than rescanning from the front. One
+        // extra job is taken to decide whether a further page exists, and is not reported.
+        // An archive on which no search has been started yields an EMPTY list, which is
+        // what a listing of zero items is: a success.
+        let mut page: Vec<&crate::state::SearchJobRecord> = store
+            .archive_searches
+            .range(resume_from..)
+            .map(|(_, job)| job)
+            .filter(|job| job.archive_id == input.archive_id)
+            .take(page_size.saturating_add(1))
+            .collect();
+
+        let next_token = page.get(page_size).map(|job| {
+            crate::state::encode_page_token(
+                &store.page_token_key,
+                &format!("{scope}{}", job.search_id),
+            )
+        });
+        page.truncate(page_size);
+
+        Ok(ListArchiveSearchesOutput {
+            searches: Some(
+                page.into_iter()
+                    .map(|job| SearchSummary {
+                        search_id: Some(job.search_id.clone()),
+                        status: Some(job.status(now)),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

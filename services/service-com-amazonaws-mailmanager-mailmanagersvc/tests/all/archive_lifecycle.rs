@@ -10,12 +10,20 @@
 //! (every modelled `RetentionPeriod`, several `ArchiveName` shapes, several
 //! archive-count/`PageSize` combinations, each published `PageSize` bound and one past
 //! it). The archive the bootstrap issue happened to name is one row among them.
+//!
+//! The archive's JOB plane — the search and export jobs started on an archive and the
+//! listings that report them — is the second half of this file, from
+//! `a_minted_archive_id_satisfies_the_constrained_archive_id_shape` on.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_mailmanager_mailmanagersvc::ops::types::RETENTION_PERIOD_VALUES;
-use service_com_amazonaws_mailmanager_mailmanagersvc::state::MAX_ARCHIVES;
+use service_com_amazonaws_mailmanager_mailmanagersvc::state::{
+    self, ExportJobRecord, ARCHIVE_JOB_COMPLETION_MILLIS, EXPORT_STATE_COMPLETED,
+    EXPORT_STATE_QUEUED, MAX_ARCHIVES, SEARCH_STATE_COMPLETED, SEARCH_STATE_QUEUED,
+};
 use service_com_amazonaws_mailmanager_mailmanagersvc::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -28,6 +36,11 @@ const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 /// One emulator holding one MailManager service on one shared engine.
 struct Harness {
     router: MultiServiceRouter,
+    /// The SAME engine the service is mounted on, so a test can place in this service's
+    /// store a record only an operation that is still a scaffold would write (an archive
+    /// EXPORT job: `StartArchiveExport` is unwritten, while `ListArchiveExports` reports
+    /// what the store holds).
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Harness {
@@ -37,8 +50,8 @@ impl Harness {
         // The signature itself is not under test here, and the fixed test credential
         // below is not this process's signing key.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
     }
 
     /// Call one operation and return `(http status, parsed body)`.
@@ -894,5 +907,872 @@ async fn create_archive_refuses_names_outside_the_modelled_constraints() {
     assert_eq!(
         status, 400,
         "case \"no ArchiveName\": the required member must be enforced, got {status} {out:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The archive's JOB plane: the search and export jobs an archive carries.
+// ---------------------------------------------------------------------------------------
+
+/// How long the search suites below wait for a job's completion to fall due before giving
+/// up. Generously past [`ARCHIVE_JOB_COMPLETION_MILLIS`], since what is being waited for is
+/// a CONDITION (the job reports `COMPLETED`) and not a duration: a loaded host may take
+/// much longer than the span to get round to the next call.
+const COMPLETION_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often the search suites look again while waiting for that condition.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The two instants the modelled search range is asked over. Any pair inside
+/// `Timestamp`'s range does; these are epoch seconds a day apart.
+const RANGE_FROM: f64 = 1_761_000_000.0;
+/// See [`RANGE_FROM`].
+const RANGE_TO: f64 = 1_761_086_400.0;
+
+/// Whether `candidate` satisfies the lexical form the model's `ArchiveId` declares:
+/// `@length 3..66` and `@pattern ^a-[\w]{1,64}$`
+/// (`smithy_query(query="shape",shape="ArchiveId")`). `\w` is `[A-Za-z0-9_]`.
+///
+/// Spelled out rather than compiled: this crate pulls in no regex engine, and the shape is
+/// a literal prefix and one character class.
+fn is_modelled_archive_id(candidate: &str) -> bool {
+    let Some(body) = candidate.strip_prefix("a-") else {
+        return false;
+    };
+    (3..=66).contains(&candidate.len())
+        && (1..=64).contains(&body.len())
+        && body
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// A `StartArchiveSearch` request body over [`RANGE_FROM`]..[`RANGE_TO`].
+fn search_request(archive_id: &str, max_results: i64, filters: Option<Value>) -> Value {
+    let mut body = json!({
+        "ArchiveId": archive_id,
+        "FromTimestamp": RANGE_FROM,
+        "ToTimestamp": RANGE_TO,
+        "MaxResults": max_results,
+    });
+    if let Some(filters) = filters {
+        body["Filters"] = filters;
+    }
+    body
+}
+
+/// The `State` of a `SearchStatus`/`ExportStatus` in a response body.
+fn job_state(status: &Value) -> &str {
+    status["State"].as_str().unwrap_or("<no State>")
+}
+
+/// Start a search on `archive_id` and return its `SearchId`, failing the test on a refusal.
+async fn start_search(harness: &Harness, archive_id: &str) -> String {
+    let (status, out) = harness
+        .call("StartArchiveSearch", search_request(archive_id, 10, None))
+        .await;
+    assert_eq!(
+        status, 200,
+        "StartArchiveSearch on {archive_id} must answer 200, got {status} {out:?}"
+    );
+    out["SearchId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("StartArchiveSearch returned no SearchId: {out:?}"))
+        .to_string()
+}
+
+/// `GetArchiveSearch` on `search_id`, looked at again until its `State` is `COMPLETED` or
+/// [`COMPLETION_DEADLINE`] passes. The CONDITION is waited for, never a fixed time.
+async fn poll_until_completed(harness: &Harness, search_id: &str) -> Value {
+    let deadline = Instant::now() + COMPLETION_DEADLINE;
+    loop {
+        let (status, out) = harness
+            .call("GetArchiveSearch", json!({ "SearchId": search_id }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "GetArchiveSearch on {search_id} must answer 200, got {status} {out:?}"
+        );
+        if job_state(&out["Status"]) == SEARCH_STATE_COMPLETED {
+            return out;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {search_id:?}: the search never reported {SEARCH_STATE_COMPLETED}, last read \
+             {out:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Place archive export jobs in this service's store, each due to complete at the given
+/// instant.
+///
+/// `StartArchiveExport` is still a scaffold, so this is the only way to hold an export job
+/// in the store — and it is what makes the `ListArchiveExports` assertions below a test of
+/// a PROJECTION of state rather than of a constant empty list.
+fn place_export_jobs(harness: &Harness, archive_id: &str, jobs: &[(&str, i64)]) {
+    let store = state::service_state(&*harness.engine).expect("this service's store");
+    let mut store = store.lock();
+    for (export_id, completes_at_millis) in jobs {
+        store.archive_exports.insert(
+            (*export_id).to_string(),
+            ExportJobRecord {
+                export_id: (*export_id).to_string(),
+                archive_id: archive_id.to_string(),
+                submitted_at_millis: completes_at_millis
+                    .saturating_sub(ARCHIVE_JOB_COMPLETION_MILLIS),
+                completes_at_millis: *completes_at_millis,
+            },
+        );
+    }
+}
+
+/// The `NextToken` the first one-job page of `archive_id`'s export listing carries.
+async fn first_export_page_token(harness: &Harness, archive_id: &str) -> String {
+    let (status, page) = harness
+        .call(
+            "ListArchiveExports",
+            json!({ "ArchiveId": archive_id, "PageSize": 1 }),
+        )
+        .await;
+    assert_eq!(status, 200, "a first page must answer 200, got {page:?}");
+    page["NextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a first page of two jobs must carry a NextToken: {page:?}"))
+        .to_string()
+}
+
+/// The `ArchiveId` this service mints satisfies the CONSTRAINED `ArchiveId` shape, so every
+/// operation that takes the identifier back accepts the value `CreateArchive` handed out.
+///
+/// The rule covers the whole archive-scoped surface, not one operation: the row set is
+/// several freshly minted ids, each fed to every operation this crate serves that binds
+/// either `ArchiveId` shape.
+#[tokio::test]
+async fn a_minted_archive_id_satisfies_the_constrained_archive_id_shape() {
+    let harness = Harness::new();
+
+    let mut minted: Vec<String> = Vec::new();
+    for name in ["job-plane-a", "job-plane-b", "job-plane-c"] {
+        let archive_id = harness.create(json!({ "ArchiveName": name })).await;
+        assert!(
+            is_modelled_archive_id(&archive_id),
+            "case {name:?}: the minted ArchiveId must satisfy the modelled length and \
+             pattern, got {archive_id:?}"
+        );
+
+        // Every operation that takes an `ArchiveId` must accept it, including the three
+        // that bind the CONSTRAINED shape.
+        for operation in ["GetArchive", "ListArchiveExports", "ListArchiveSearches"] {
+            let (status, out) = harness
+                .call(operation, json!({ "ArchiveId": archive_id }))
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {name:?} ({operation}): the minted ArchiveId must be accepted, got \
+                 {status} {out:?}"
+            );
+        }
+        let (status, out) = harness
+            .call("StartArchiveSearch", search_request(&archive_id, 10, None))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?} (StartArchiveSearch): the minted ArchiveId must be accepted, got \
+             {status} {out:?}"
+        );
+
+        minted.push(archive_id);
+    }
+
+    let unique: std::collections::BTreeSet<&String> = minted.iter().collect();
+    assert_eq!(
+        unique.len(),
+        minted.len(),
+        "two archives must never share an id, got {minted:?}"
+    );
+}
+
+/// `StartArchiveSearch` records a search job and hands back a `SearchId`, and
+/// `GetArchiveSearch` reads the SAME request back: the archive, the range, the result cap
+/// and the filters, whatever shape they had.
+///
+/// Rows span what the rule generalises over: the result cap at both ends of
+/// `SearchMaxResults`'s modelled `range 0..1000` and inside it, and every shape of
+/// `ArchiveFilters` the model admits (absent, an include condition, an exclude condition,
+/// both at once).
+#[tokio::test]
+async fn start_archive_search_records_a_job_every_read_reports_back() {
+    let harness = Harness::new();
+    let archive_id = harness.create(json!({ "ArchiveName": "search-round-trip" })).await;
+
+    let include = json!({
+        "Include": [{
+            "StringExpression": {
+                "Evaluate": { "Attribute": "SUBJECT" },
+                "Operator": "CONTAINS",
+                "Values": ["invoice"],
+            }
+        }]
+    });
+    let unless = json!({
+        "Unless": [{
+            "BooleanExpression": {
+                "Evaluate": { "Attribute": "HAS_ATTACHMENTS" },
+                "Operator": "IS_TRUE",
+            }
+        }]
+    });
+    let both = json!({ "Include": include["Include"], "Unless": unless["Unless"] });
+
+    // (case, MaxResults, Filters) — the modelled range's two bounds, a value inside it,
+    // and each filter shape.
+    let cases: [(&str, i64, Option<Value>); 5] = [
+        ("no filters, smallest cap", 0, None),
+        ("no filters, largest cap", 1000, None),
+        ("an include condition", 25, Some(include)),
+        ("an exclude condition", 1, Some(unless)),
+        ("both filter lists", 500, Some(both)),
+    ];
+
+    let mut search_ids: Vec<String> = Vec::new();
+    for (case, max_results, filters) in cases {
+        let request = search_request(&archive_id, max_results, filters.clone());
+        let (status, out) = harness.call("StartArchiveSearch", request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: StartArchiveSearch must answer 200, got {status} {out:?}"
+        );
+        let search_id = out["SearchId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no SearchId in {out:?}"))
+            .to_string();
+        assert!(
+            (1..=64).contains(&search_id.len()),
+            "case {case:?}: SearchId must satisfy the modelled 1..64 length, got {search_id:?}"
+        );
+
+        let (status, read) = harness
+            .call("GetArchiveSearch", json!({ "SearchId": search_id }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetArchiveSearch must answer 200, got {status} {read:?}"
+        );
+        assert_eq!(
+            read["ArchiveId"].as_str(),
+            Some(archive_id.as_str()),
+            "case {case:?}: the job must report the archive it was started on, got {read:?}"
+        );
+        assert_eq!(
+            read["MaxResults"].as_i64(),
+            Some(max_results),
+            "case {case:?}: MaxResults must round-trip, got {read:?}"
+        );
+        assert_eq!(
+            read["FromTimestamp"].as_f64(),
+            Some(RANGE_FROM),
+            "case {case:?}: FromTimestamp must round-trip, got {read:?}"
+        );
+        assert_eq!(
+            read["ToTimestamp"].as_f64(),
+            Some(RANGE_TO),
+            "case {case:?}: ToTimestamp must round-trip, got {read:?}"
+        );
+        match filters {
+            None => assert!(
+                read.get("Filters").is_none_or(Value::is_null),
+                "case {case:?}: a job started without filters must report none, got {read:?}"
+            ),
+            Some(filters) => assert_eq!(
+                read["Filters"], filters,
+                "case {case:?}: Filters must round-trip, got {read:?}"
+            ),
+        }
+
+        // The status is an invariant at every instant: a job reports a completion instant
+        // exactly when it reports itself completed.
+        let state = job_state(&read["Status"]).to_string();
+        assert!(
+            [SEARCH_STATE_QUEUED, SEARCH_STATE_COMPLETED].contains(&state.as_str()),
+            "case {case:?}: a submitted job is queued or completed, got {read:?}"
+        );
+        assert!(
+            read["Status"]["SubmissionTimestamp"]
+                .as_f64()
+                .is_some_and(|instant| instant > 0.0),
+            "case {case:?}: the job must report when it was submitted, got {read:?}"
+        );
+        assert_eq!(
+            read["Status"]["CompletionTimestamp"].as_f64().is_some(),
+            state == SEARCH_STATE_COMPLETED,
+            "case {case:?}: a CompletionTimestamp is reported exactly when the job is \
+             {SEARCH_STATE_COMPLETED}, got {read:?}"
+        );
+
+        search_ids.push(search_id);
+    }
+
+    // Every job started above is accounted for by the listing, each with its own status.
+    let (status, listed) = harness
+        .call("ListArchiveSearches", json!({ "ArchiveId": archive_id }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "ListArchiveSearches must answer 200, got {status} {listed:?}"
+    );
+    let reported: Vec<&str> = listed["Searches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("Searches must be a list, got {listed:?}"))
+        .iter()
+        .map(|summary| {
+            assert!(
+                summary["Status"]["SubmissionTimestamp"].as_f64().is_some(),
+                "every listed search must carry its status, got {summary:?}"
+            );
+            summary["SearchId"].as_str().unwrap_or("<no SearchId>")
+        })
+        .collect();
+    for search_id in &search_ids {
+        assert!(
+            reported.contains(&search_id.as_str()),
+            "case {search_id:?}: the listing must account for every started search, got \
+             {reported:?}"
+        );
+    }
+    assert_eq!(
+        reported.len(),
+        search_ids.len(),
+        "the listing must report exactly the started searches, got {reported:?}"
+    );
+}
+
+/// A submitted search is not a finished one: it completes when the clock says so, and both
+/// the job read and the listing then report the same completion.
+#[tokio::test]
+async fn a_submitted_search_completes_on_the_clock_and_reports_both_timestamps() {
+    let harness = Harness::new();
+    let archive_id = harness.create(json!({ "ArchiveName": "search-completion" })).await;
+    let search_id = start_search(&harness, &archive_id).await;
+
+    let completed = poll_until_completed(&harness, &search_id).await;
+    let submitted_at = completed["Status"]["SubmissionTimestamp"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no SubmissionTimestamp in {completed:?}"));
+    let completed_at = completed["Status"]["CompletionTimestamp"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no CompletionTimestamp in {completed:?}"));
+    // The span is read off the two instants the service itself reports, not off the test's
+    // own clock: a completion that fell due at submission time would mean no caller could
+    // ever observe the job running.
+    let span_seconds = (ARCHIVE_JOB_COMPLETION_MILLIS as f64) / 1000.0;
+    assert!(
+        completed_at - submitted_at >= span_seconds,
+        "case {search_id:?}: completion must fall due a whole span after submission, got \
+         {submitted_at} then {completed_at}"
+    );
+
+    // Reading a finished job again reports the same instants: nothing moved because it was
+    // read.
+    let again = poll_until_completed(&harness, &search_id).await;
+    assert_eq!(
+        again["Status"], completed["Status"],
+        "case {search_id:?}: a completed job's status must not move between reads, got \
+         {again:?}"
+    );
+
+    let (status, listed) = harness
+        .call("ListArchiveSearches", json!({ "ArchiveId": archive_id }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "ListArchiveSearches must answer 200, got {status} {listed:?}"
+    );
+    let summary = &listed["Searches"][0];
+    assert_eq!(
+        summary["SearchId"].as_str(),
+        Some(search_id.as_str()),
+        "the listing must report the started search, got {listed:?}"
+    );
+    assert_eq!(
+        job_state(&summary["Status"]),
+        SEARCH_STATE_COMPLETED,
+        "the listing must report the completion the job read reports, got {listed:?}"
+    );
+    assert_eq!(
+        summary["Status"], completed["Status"],
+        "the listing and the job read must report ONE status, got {listed:?}"
+    );
+}
+
+/// `ListArchiveExports` projects the export jobs the store holds for the archive named:
+/// zero of them is an empty list and a success, and each job carries the state its
+/// completion instant gives it.
+#[tokio::test]
+async fn list_archive_exports_projects_the_export_jobs_of_its_archive() {
+    let harness = Harness::new();
+    let archive_id = harness.create(json!({ "ArchiveName": "export-listing" })).await;
+    let other_archive = harness.create(json!({ "ArchiveName": "export-listing-other" })).await;
+
+    // An archive on which no export has been started.
+    let (status, out) = harness
+        .call("ListArchiveExports", json!({ "ArchiveId": archive_id }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "a listing of zero export jobs is a success, got {status} {out:?}"
+    );
+    assert_eq!(
+        out["Exports"],
+        json!([]),
+        "Exports must be present and empty, got {out:?}"
+    );
+    assert!(
+        out.get("NextToken").is_none_or(Value::is_null),
+        "an exhausted listing carries no NextToken, got {out:?}"
+    );
+
+    // Rows: one job whose completion already fell due and two that are still due, so both
+    // modelled states are covered without waiting for either.
+    let now = state::now_millis();
+    let jobs: [(&str, i64); 3] = [
+        ("ex-0001", now - ARCHIVE_JOB_COMPLETION_MILLIS),
+        ("ex-0002", now + 60_000),
+        ("ex-0003", now + 60_000),
+    ];
+    place_export_jobs(&harness, &archive_id, &jobs);
+    // A job of ANOTHER archive must not be reported by this archive's listing.
+    place_export_jobs(&harness, &other_archive, &[("ex-9999", now + 60_000)]);
+
+    let (status, out) = harness
+        .call("ListArchiveExports", json!({ "ArchiveId": archive_id }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "ListArchiveExports must answer 200, got {status} {out:?}"
+    );
+    let reported = out["Exports"]
+        .as_array()
+        .unwrap_or_else(|| panic!("Exports must be a list, got {out:?}"));
+    assert_eq!(
+        reported.len(),
+        jobs.len(),
+        "the listing must report exactly this archive's jobs, got {out:?}"
+    );
+    for (export_id, completes_at_millis) in jobs {
+        let summary = reported
+            .iter()
+            .find(|summary| summary["ExportId"].as_str() == Some(export_id))
+            .unwrap_or_else(|| panic!("case {export_id:?}: not reported, got {out:?}"));
+        let expected_state = if completes_at_millis <= now {
+            EXPORT_STATE_COMPLETED
+        } else {
+            EXPORT_STATE_QUEUED
+        };
+        assert_eq!(
+            job_state(&summary["Status"]),
+            expected_state,
+            "case {export_id:?}: expected state {expected_state}, got {summary:?}"
+        );
+        assert_eq!(
+            summary["Status"]["CompletionTimestamp"].as_f64().is_some(),
+            expected_state == EXPORT_STATE_COMPLETED,
+            "case {export_id:?}: a CompletionTimestamp is reported exactly when the job is \
+             {EXPORT_STATE_COMPLETED}, got {summary:?}"
+        );
+    }
+
+    // Paging walks the same jobs exactly once, whatever the page size.
+    for page_size in [1_usize, 2, 3, 50] {
+        let mut seen: Vec<String> = Vec::new();
+        let mut next_token: Option<String> = None;
+        loop {
+            let mut request = json!({ "ArchiveId": archive_id, "PageSize": page_size });
+            if let Some(token) = &next_token {
+                request["NextToken"] = json!(token);
+            }
+            let (status, page) = harness.call("ListArchiveExports", request).await;
+            assert_eq!(
+                status, 200,
+                "case {page_size:?}: a page must answer 200, got {status} {page:?}"
+            );
+            let items = page["Exports"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {page_size:?}: no Exports in {page:?}"));
+            assert!(
+                items.len() <= page_size,
+                "case {page_size:?}: a page must not exceed the size asked for, got {}",
+                items.len()
+            );
+            seen.extend(
+                items
+                    .iter()
+                    .map(|item| item["ExportId"].as_str().unwrap_or_default().to_string()),
+            );
+            next_token = page["NextToken"].as_str().map(str::to_string);
+            if next_token.is_none() {
+                break;
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "ex-0001".to_string(),
+                "ex-0002".to_string(),
+                "ex-0003".to_string()
+            ],
+            "case {page_size:?}: paging must walk every job exactly once, got {seen:?}"
+        );
+    }
+}
+
+/// An archive-scoped job operation refuses an `ArchiveId` that names no archive the same
+/// way whichever operation was called, and refuses one outside the modelled shape before
+/// any handler runs.
+#[tokio::test]
+async fn the_job_operations_refuse_an_archive_id_that_names_no_archive() {
+    let harness = Harness::new();
+
+    // Rows: values inside `ArchiveId`'s modelled shape that this service never minted —
+    // the shortest the 3..66 length admits, a plausible minted-looking one, and the
+    // longest.
+    let unknown: [(&str, String); 3] = [
+        ("the shortest id the length admits", "a-x".to_string()),
+        (
+            "a plausible minted id",
+            format!("a-{}", "0123456789abcdef".repeat(2)),
+        ),
+        ("the longest id the length admits", format!("a-{}", "w".repeat(64))),
+    ];
+    for (case, archive_id) in &unknown {
+        for operation in ["ListArchiveExports", "ListArchiveSearches"] {
+            let (status, out) = harness
+                .call(operation, json!({ "ArchiveId": archive_id }))
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?} ({operation}): an unknown archive is refused as a request \
+                 fault, got {status} {out:?}"
+            );
+            assert_eq!(
+                error_code(&out),
+                "ResourceNotFoundException",
+                "case {case:?} ({operation}): unexpected error code, got {out:?}"
+            );
+            assert_eq!(
+                out["Message"].as_str(),
+                Some(state::ARCHIVE_NOT_FOUND),
+                "case {case:?} ({operation}): unexpected message, got {out:?}"
+            );
+        }
+        let (status, out) = harness
+            .call("StartArchiveSearch", search_request(archive_id, 10, None))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?} (StartArchiveSearch): an unknown archive is refused, got {status} \
+             {out:?}"
+        );
+        assert_eq!(
+            error_code(&out),
+            "ResourceNotFoundException",
+            "case {case:?} (StartArchiveSearch): unexpected error code, got {out:?}"
+        );
+    }
+
+    // Rows: values OUTSIDE the modelled shape — no `a-` prefix, a character the pattern
+    // excludes, and one past the length. These are refused by the boundary validator,
+    // which is what makes the minted form above a requirement.
+    let malformed: [(&str, String); 4] = [
+        ("no prefix", "0123456789abcdef".repeat(2)),
+        ("a dash in the body", "a-not-a-word-body".to_string()),
+        ("too short", "a-".to_string()),
+        ("one past the length", format!("a-{}", "w".repeat(65))),
+    ];
+    for (case, archive_id) in &malformed {
+        for operation in ["ListArchiveExports", "ListArchiveSearches"] {
+            let (status, out) = harness
+                .call(operation, json!({ "ArchiveId": archive_id }))
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?} ({operation}): an ArchiveId outside the model must be refused, \
+                 got {status} {out:?}"
+            );
+            assert_eq!(
+                error_code(&out),
+                "ValidationException",
+                "case {case:?} ({operation}): unexpected error code, got {out:?}"
+            );
+        }
+    }
+}
+
+/// `PageSize` is enforced at both published bounds for the job listings, and a value past
+/// either is refused before any handler runs.
+#[tokio::test]
+async fn the_job_listings_enforce_the_modelled_page_size_range() {
+    let harness = Harness::new();
+    let archive_id = harness.create(json!({ "ArchiveName": "job-page-size" })).await;
+
+    // `PageSize` is `range 1..50`: both bounds are served, both values one past are not.
+    for operation in ["ListArchiveExports", "ListArchiveSearches"] {
+        for page_size in [1, 50] {
+            let (status, out) = harness
+                .call(
+                    operation,
+                    json!({ "ArchiveId": archive_id, "PageSize": page_size }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {page_size} ({operation}): a page size the model admits must be served, \
+                 got {status} {out:?}"
+            );
+        }
+        for page_size in [0, 51] {
+            let (status, out) = harness
+                .call(
+                    operation,
+                    json!({ "ArchiveId": archive_id, "PageSize": page_size }),
+                )
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {page_size} ({operation}): a page size past the modelled range must be \
+                 refused, got {status} {out:?}"
+            );
+        }
+    }
+}
+
+/// A `NextToken` is the listing's OWN output: a value it never issued for THIS archive's
+/// walk names no position in it and is refused.
+#[tokio::test]
+async fn the_job_listings_refuse_a_continuation_token_they_did_not_issue() {
+    let harness = Harness::new();
+    let archive_id = harness.create(json!({ "ArchiveName": "job-token-scope" })).await;
+    let other_archive = harness.create(json!({ "ArchiveName": "job-token-scope-other" })).await;
+
+    // Two jobs on each archive, so each listing really issues a token for its own walk.
+    let now = state::now_millis();
+    place_export_jobs(
+        &harness,
+        &archive_id,
+        &[("tok-0001", now - 1), ("tok-0002", now - 1)],
+    );
+    place_export_jobs(
+        &harness,
+        &other_archive,
+        &[("tok-8001", now - 1), ("tok-8002", now - 1)],
+    );
+
+    let mine = first_export_page_token(&harness, &archive_id).await;
+    let another_archives = first_export_page_token(&harness, &other_archive).await;
+
+    // The token this walk issued is accepted, and resumes it.
+    let (status, page) = harness
+        .call(
+            "ListArchiveExports",
+            json!({ "ArchiveId": archive_id, "PageSize": 1, "NextToken": mine }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"the walk's own token\": must resume the walk, got {status} {page:?}"
+    );
+
+    // Rows: a value that is not a token at all, one this store never authenticated, a
+    // truncated one, and one issued for ANOTHER archive's walk.
+    let cases: [(&str, String); 4] = [
+        ("not a token at all", "not-a-token".to_string()),
+        ("an unauthenticated cursor", hex::encode("a-x\u{1f}ex-0001")),
+        ("a truncated token", mine[..mine.len() - 2].to_string()),
+        ("another archive's token", another_archives),
+    ];
+    for (case, token) in cases {
+        let (status, out) = harness
+            .call(
+                "ListArchiveExports",
+                json!({ "ArchiveId": archive_id, "NextToken": token }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a token this walk never issued must be refused, got {status} \
+             {out:?}"
+        );
+        assert_eq!(
+            error_code(&out),
+            "ValidationException",
+            "case {case:?}: unexpected error code, got {out:?}"
+        );
+    }
+}
+
+/// An archive marked for deletion serves no job operations, and its jobs are no longer
+/// reachable: the archive takes its search and export plane with it.
+#[tokio::test]
+async fn a_pending_deletion_archive_serves_no_job_operations() {
+    let harness = Harness::new();
+    let archive_id = harness.create(json!({ "ArchiveName": "job-plane-deleted" })).await;
+    let search_id = start_search(&harness, &archive_id).await;
+    let now = state::now_millis();
+    place_export_jobs(&harness, &archive_id, &[("del-0001", now - 1)]);
+
+    let (status, out) = harness
+        .call("DeleteArchive", json!({ "ArchiveId": archive_id }))
+        .await;
+    assert_eq!(status, 200, "DeleteArchive must answer 200, got {status} {out:?}");
+
+    for operation in ["ListArchiveExports", "ListArchiveSearches"] {
+        let (status, out) = harness
+            .call(operation, json!({ "ArchiveId": archive_id }))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {operation:?}: an archive that is not active serves no listing, got {status} \
+             {out:?}"
+        );
+        assert_eq!(
+            error_code(&out),
+            "ValidationException",
+            "case {operation:?}: unexpected error code, got {out:?}"
+        );
+        assert_eq!(
+            out["Message"].as_str(),
+            Some(state::ARCHIVE_NOT_ACTIVE),
+            "case {operation:?}: unexpected message, got {out:?}"
+        );
+    }
+
+    let (status, out) = harness
+        .call("StartArchiveSearch", search_request(&archive_id, 10, None))
+        .await;
+    assert_eq!(
+        status, 400,
+        "case \"StartArchiveSearch\": an archive that is not active takes no new job, got \
+         {status} {out:?}"
+    );
+
+    let (status, out) = harness
+        .call("GetArchiveSearch", json!({ "SearchId": search_id }))
+        .await;
+    assert_eq!(
+        status, 400,
+        "case \"GetArchiveSearch\": a job of an archive that is not active is unreachable, got \
+         {status} {out:?}"
+    );
+    assert_eq!(
+        error_code(&out),
+        "ValidationException",
+        "case \"GetArchiveSearch\": unexpected error code, got {out:?}"
+    );
+    assert_eq!(
+        out["Message"].as_str(),
+        Some(state::SEARCH_ID_INVALID),
+        "case \"GetArchiveSearch\": unexpected message, got {out:?}"
+    );
+}
+
+/// A `SearchId` this service never minted is refused, whatever shape it has inside the
+/// modelled 1..64 length.
+#[tokio::test]
+async fn get_archive_search_refuses_a_search_id_it_never_minted() {
+    let harness = Harness::new();
+    // Rows: both ends of `SearchId`'s modelled 1..64 length and a plausible minted-looking
+    // value in between.
+    let cases: [(&str, String); 3] = [
+        ("one character", "x".to_string()),
+        ("a plausible minted id", "0123456789abcdef".repeat(2)),
+        ("the longest id the length admits", "s".repeat(64)),
+    ];
+    for (case, search_id) in cases {
+        let (status, out) = harness
+            .call("GetArchiveSearch", json!({ "SearchId": search_id }))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: an unknown SearchId must be refused, got {status} {out:?}"
+        );
+        assert_eq!(
+            error_code(&out),
+            "ValidationException",
+            "case {case:?}: unexpected error code, got {out:?}"
+        );
+        assert_eq!(
+            out["Message"].as_str(),
+            Some(state::SEARCH_ID_INVALID),
+            "case {case:?}: unexpected message, got {out:?}"
+        );
+    }
+
+    // One past the modelled length is refused before any handler runs.
+    let (status, out) = harness
+        .call("GetArchiveSearch", json!({ "SearchId": "s".repeat(65) }))
+        .await;
+    assert_eq!(
+        status, 400,
+        "case \"one past the length\": the modelled length must be enforced, got {status} \
+         {out:?}"
+    );
+}
+
+/// The search-job store is BOUNDED: a submit past the quota is refused with the modelled
+/// `ServiceQuotaExceededException` and records nothing.
+#[tokio::test]
+async fn start_archive_search_refuses_a_submit_past_the_search_quota() {
+    let harness = Harness::new();
+    let archive_id = harness.create(json!({ "ArchiveName": "search-quota" })).await;
+
+    // Filled through the store rather than through the operation: the quota is what is
+    // under test, not the thousand submits it takes to reach it.
+    {
+        let store = state::service_state(&*harness.engine).expect("this service's store");
+        let mut store = store.lock();
+        let now = state::now_millis();
+        for index in 0..state::MAX_ARCHIVE_SEARCHES {
+            let search_id = format!("quota-{index:06}");
+            store.archive_searches.insert(
+                search_id.clone(),
+                state::SearchJobRecord {
+                    search_id,
+                    archive_id: archive_id.clone(),
+                    filters: None,
+                    from_timestamp: aws_smithy_types::DateTime::from_millis(now),
+                    to_timestamp: aws_smithy_types::DateTime::from_millis(now),
+                    max_results: 1,
+                    submitted_at_millis: now,
+                    completes_at_millis: now,
+                },
+            );
+        }
+    }
+
+    let (status, out) = harness
+        .call("StartArchiveSearch", search_request(&archive_id, 10, None))
+        .await;
+    assert_eq!(
+        status, 402,
+        "a submit past the search quota must be refused, got {status} {out:?}"
+    );
+    assert_eq!(
+        error_code(&out),
+        "ServiceQuotaExceededException",
+        "unexpected error code, got {out:?}"
+    );
+
+    let (status, listed) = harness
+        .call(
+            "ListArchiveSearches",
+            json!({ "ArchiveId": archive_id, "PageSize": 50 }),
+        )
+        .await;
+    assert_eq!(status, 200, "the listing must still be served, got {listed:?}");
+    assert_eq!(
+        listed["Searches"].as_array().map(Vec::len),
+        Some(50),
+        "the refusal must not have disturbed the jobs already stored, got {listed:?}"
     );
 }

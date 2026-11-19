@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetArchiveSearch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetArchiveSearch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Retrieves the details and current status of a specific email archive search job.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetArchiveSearch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +144,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetArchiveSearch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetArchiveSearchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetArchiveSearch"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the service is always mounted on the shared
+            // `InMemoryEngine`. Answered with a modelled retryable error rather than a
+            // 501, which would claim the operation is unwritten.
+            return Err(GetArchiveSearchErrorModeled::ThrottlingException(ThrottlingException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        // `@readonly`: the one write a report is allowed is the removal the clock already
+        // owes, which takes the searches of a permanently deleted archive with it.
+        store.purge_permanently_deleted(now);
+
+        // A `SearchId` is served only while the archive it searched still serves job
+        // operations: a job of an archive that is gone, or marked for deletion, is no
+        // longer reachable, and is reported exactly as one that was never minted.
+        let job = store
+            .archive_searches
+            .get(&input.search_id)
+            .filter(|job| store.check_archive_for_job(&job.archive_id).is_ok());
+        let Some(job) = job else {
+            return Err(GetArchiveSearchErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::SEARCH_ID_INVALID.to_string()),
+            })
+            .into());
+        };
+
+        Ok(GetArchiveSearchOutput {
+            archive_id: Some(job.archive_id.clone()),
+            filters: job.filters.clone(),
+            from_timestamp: Some(job.from_timestamp),
+            to_timestamp: Some(job.to_timestamp),
+            max_results: Some(job.max_results),
+            status: Some(job.status(now)),
+        })
     }
 }

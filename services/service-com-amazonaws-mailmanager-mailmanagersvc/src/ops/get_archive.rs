@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.archives.get(&input.archive_id) else {
             return Err(GetArchiveErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Archive {} not found.", input.archive_id)),
+                    message: Some(crate::state::archive_not_found_message(&input.archive_id)),
                 },
             )
             .into());

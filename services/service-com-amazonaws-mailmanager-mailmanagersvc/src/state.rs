@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{ArchiveRetention, Tag};
+use crate::ops::types::{ArchiveFilters, ArchiveRetention, ExportStatus, SearchStatus, Tag};
 
 /// The two `ArchiveState` values this service's model declares; see
 /// `crate::ops::types::ARCHIVE_STATE_VALUES`, which is generated from the model's
@@ -29,6 +29,17 @@ pub const ARCHIVE_STATE_PENDING_DELETION: &str = "PENDING_DELETION";
 /// entering the pending deletion state, regardless of the configured retention period",
 /// and `Archive$ArchiveState` repeats "will be permanently deleted in 30 days".
 pub const PENDING_DELETION_WINDOW_MILLIS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// The prefix every `ArchiveId` this service mints carries.
+///
+/// The identifier an archive is created as is modelled by TWO shapes: `ArchiveIdString`
+/// (`@length 1..66`, no pattern), which `CreateArchive` returns it through, and the
+/// tighter `ArchiveId` (`@length 3..66`, `@pattern ^a-[\w]{1,64}$`), which every
+/// archive-scoped job operation accepts it through. The constrained one is authoritative
+/// about the lexical form of the identifier space, so a minted id carries this prefix and
+/// a body of word characters: the value handed out is then accepted by every operation
+/// that takes it back.
+pub const ARCHIVE_ID_PREFIX: &str = "a-";
 
 /// The `RetentionPeriod` recorded for an archive created without a `Retention`.
 ///
@@ -87,6 +98,61 @@ pub struct ArchiveRecord {
     /// [`PENDING_DELETION_WINDOW_MILLIS`] after the call. `None` while the archive is
     /// `ACTIVE`.
     pub pending_deletion_at_millis: Option<i64>,
+}
+
+/// How an archive-scoped job operation (an archive search, an archive export) words the
+/// refusal of an `ArchiveId` that resolves to no stored archive.
+///
+/// The text is entirely fixed and echoes no id back — a job operation states that the
+/// archive it was asked about is not there, not which value it was handed. Carried by the
+/// modelled `ResourceNotFoundException` ("Occurs when a requested resource is not found")
+/// at [`ARCHIVE_JOB_LOOKUP_STATUS`].
+pub const ARCHIVE_NOT_FOUND: &str = "Archive not found.";
+
+/// The HTTP status an archive-scoped job operation answers an `ArchiveId` it cannot resolve
+/// with.
+///
+/// These operations classify an archive that is not there as a fault in the REQUEST, so the
+/// status line is the one a caller-input failure carries even though the error shape it
+/// carries is modelled `@httpError 404`: the error code names the condition, the status says
+/// whose fault it is — the same reading this service applies to an address-list lookup (see
+/// [`ADDRESS_LIST_LOOKUP_STATUS`]). Returned through
+/// `crate::scaffolded::Scaffolded::modeled_with_status`, which keeps the modelled shape, its
+/// `Message` member and its wire error code and changes only the status.
+pub const ARCHIVE_JOB_LOOKUP_STATUS: u16 = 400;
+
+/// How an archive RESOURCE operation (`GetArchive`, `UpdateArchive`, `DeleteArchive`)
+/// words the refusal of an `ArchiveId` that resolves to no stored archive.
+///
+/// The fixed text is "Archive " followed by " not found." and the one variable part is the
+/// id the request named, copied verbatim — the same answer whichever of the three did the
+/// resolving. A job operation states the condition without the id instead; see
+/// [`ARCHIVE_NOT_FOUND`].
+pub fn archive_not_found_message(archive_id: &str) -> String {
+    format!("Archive {archive_id} not found.")
+}
+
+/// How an archive-scoped job operation words the refusal of an archive that is stored but
+/// no longer [`ARCHIVE_STATE_ACTIVE`].
+///
+/// The text is entirely fixed and names no id: an archive in `PENDING_DELETION` is one
+/// "marked for deletion ... No further modifications can be made in this state" (the
+/// model's `Archive$ArchiveState`), so it neither starts new jobs nor reports the jobs it
+/// held. Carried by the modelled `ValidationException`, which is `@httpError 400`.
+pub const ARCHIVE_NOT_ACTIVE: &str = "Archive is not active.";
+
+/// Why an archive-scoped job operation (an archive search or an archive export) refuses
+/// the `ArchiveId` it was handed; see
+/// [`ComAmazonawsMailmanagerMailmanagersvcState::check_archive_for_job`]. Each operation
+/// models its own error enum, so the resolution is shared here and the wording of the
+/// refusal is built by the handler out of [`archive_not_found_message`] and
+/// [`ARCHIVE_NOT_ACTIVE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveJobRefusal {
+    /// No archive of that id is stored.
+    NotFound,
+    /// An archive of that id is stored, but it is not [`ARCHIVE_STATE_ACTIVE`].
+    NotActive,
 }
 
 /// One stored address list: "a list of emails and domains that are used in MailManager
@@ -278,6 +344,154 @@ pub struct ImportJobRecord {
     pub error: Option<String>,
 }
 
+/// The `SearchState` values an archive search job of this emulator reports; see
+/// `crate::ops::types::SEARCH_STATE_VALUES`, generated from the model's `SearchState`
+/// enum.
+///
+/// A job starts `QUEUED`: `StartArchiveSearch` only SUBMITS the search — its output is a
+/// `SearchId` and nothing else — and the model's `SearchStatus$CompletionTimestamp` is
+/// "the timestamp of when the search completed (if finished)", so a job that has just been
+/// submitted is not finished.
+pub const SEARCH_STATE_QUEUED: &str = "QUEUED";
+/// See [`SEARCH_STATE_QUEUED`]: the state a search job reaches once its completion is due.
+pub const SEARCH_STATE_COMPLETED: &str = "COMPLETED";
+
+/// The `ExportState` values an archive export job of this emulator reports; see
+/// `crate::ops::types::EXPORT_STATE_VALUES`, generated from the model's `ExportState`
+/// enum. The reasoning is [`SEARCH_STATE_QUEUED`]'s: a submitted job is not a finished
+/// one.
+pub const EXPORT_STATE_QUEUED: &str = "QUEUED";
+/// See [`EXPORT_STATE_QUEUED`]: the state an export job reaches once its completion is
+/// due.
+pub const EXPORT_STATE_COMPLETED: &str = "COMPLETED";
+
+/// How long after it is submitted an archive job (a search, an export) completes.
+///
+/// CHOSEN, not documented: the model publishes no duration for either job, and the
+/// non-terminal `QUEUED` state together with the optional `CompletionTimestamp` is what
+/// says a submitted job is still running. The span is never zero, so a caller that reads
+/// the job straight back still observes the state a real client polls through, and it is
+/// never slept for: the instant it falls due is stored on the record
+/// ([`SearchJobRecord::completes_at_millis`]) and the state is read off the clock.
+pub const ARCHIVE_JOB_COMPLETION_MILLIS: i64 = 3_000;
+
+/// The most archive search jobs this emulator keeps, i.e. its per-account search-job
+/// quota.
+///
+/// `StartArchiveSearch` models `ServiceQuotaExceededException` ("Occurs when an operation
+/// exceeds a predefined service quota or limit") precisely because the real service caps
+/// concurrent searches. The model does not state the number, so this value is CHOSEN on
+/// the same reasoning as [`MAX_ARCHIVES`]: a search record is a handful of fields and its
+/// filters, so this many bound the store to a trivial amount of memory while leaving
+/// ordinary use far from the ceiling.
+pub const MAX_ARCHIVE_SEARCHES: usize = 1_000;
+
+/// One stored archive search job: "a search job for an archive" — what
+/// `StartArchiveSearch` submits, `GetArchiveSearch` reads back and `ListArchiveSearches`
+/// projects into a `SearchSummary`.
+///
+/// The two timestamp BOUNDS are kept as the modelled `Timestamp` the caller supplied
+/// rather than as epoch milliseconds (what this module keeps every instant it mints
+/// itself in): they are echoed back verbatim by `GetArchiveSearch`, so storing them as
+/// handed over is what keeps the value a caller reads identical to the one it sent.
+#[derive(Debug, Clone)]
+pub struct SearchJobRecord {
+    pub search_id: String,
+    /// The archive this job searches. The job is bound to it: the archive going away takes
+    /// its searches with it (see
+    /// [`ComAmazonawsMailmanagerMailmanagersvcState::purge_permanently_deleted`]).
+    pub archive_id: String,
+    pub filters: Option<ArchiveFilters>,
+    pub from_timestamp: ::aws_smithy_types::DateTime,
+    pub to_timestamp: ::aws_smithy_types::DateTime,
+    pub max_results: i32,
+    pub submitted_at_millis: i64,
+    /// When this job's completion falls due: [`ARCHIVE_JOB_COMPLETION_MILLIS`] after it
+    /// was submitted.
+    pub completes_at_millis: i64,
+}
+
+impl SearchJobRecord {
+    /// This job's `SearchState` at `now_millis`.
+    pub fn state(&self, now_millis: i64) -> &'static str {
+        if now_millis >= self.completes_at_millis {
+            SEARCH_STATE_COMPLETED
+        } else {
+            SEARCH_STATE_QUEUED
+        }
+    }
+
+    /// This job's modelled `SearchStatus` at `now_millis`.
+    ///
+    /// `CompletionTimestamp` is the instant the completion fell due, not the instant it
+    /// was first read: the job completed when the clock said so whether or not anybody
+    /// was looking, so two reads of a finished job report the same timestamp.
+    pub fn status(&self, now_millis: i64) -> SearchStatus {
+        SearchStatus {
+            submission_timestamp: Some(timestamp(self.submitted_at_millis)),
+            completion_timestamp: (now_millis >= self.completes_at_millis)
+                .then(|| timestamp(self.completes_at_millis)),
+            state: Some(self.state(now_millis).to_string()),
+            // "An error message if the search failed": nothing fails a search here, so no
+            // job carries one.
+            error_message: None,
+        }
+    }
+}
+
+/// One stored archive export job: what `StartArchiveExport` submits and
+/// `ListArchiveExports` projects into an `ExportSummary` (`ExportId` and `Status`).
+///
+/// It holds what the identity and the status of a job are read off — the job's own id, the
+/// archive it belongs to, and the two instants its state is computed from. The members
+/// only an export's DESTINATION read needs (`GetArchiveExport` reports the filters, the
+/// bounds and the `ExportDestinationConfiguration` too) belong to the operation that
+/// writes them.
+#[derive(Debug, Clone)]
+pub struct ExportJobRecord {
+    pub export_id: String,
+    /// The archive this job exports from; bound to it exactly as
+    /// [`SearchJobRecord::archive_id`] is.
+    pub archive_id: String,
+    pub submitted_at_millis: i64,
+    /// When this job's completion falls due; see [`SearchJobRecord::completes_at_millis`].
+    pub completes_at_millis: i64,
+}
+
+impl ExportJobRecord {
+    /// This job's `ExportState` at `now_millis`.
+    pub fn state(&self, now_millis: i64) -> &'static str {
+        if now_millis >= self.completes_at_millis {
+            EXPORT_STATE_COMPLETED
+        } else {
+            EXPORT_STATE_QUEUED
+        }
+    }
+
+    /// This job's modelled `ExportStatus` at `now_millis`; see
+    /// [`SearchJobRecord::status`].
+    pub fn status(&self, now_millis: i64) -> ExportStatus {
+        ExportStatus {
+            submission_timestamp: Some(timestamp(self.submitted_at_millis)),
+            completion_timestamp: (now_millis >= self.completes_at_millis)
+                .then(|| timestamp(self.completes_at_millis)),
+            state: Some(self.state(now_millis).to_string()),
+            error_message: None,
+        }
+    }
+}
+
+/// How `GetArchiveSearch` words the refusal of a `SearchId` that resolves to no search job
+/// this store serves — one that was never minted, and one whose archive is gone or no
+/// longer [`ARCHIVE_STATE_ACTIVE`].
+///
+/// The text is entirely fixed and echoes no id back: it states that the `SearchId` member
+/// is not acceptable, which is why this is the modelled `ValidationException` (already
+/// `@httpError 400`) — `GetArchiveSearch` models no `ResourceNotFoundException` at all, so
+/// a `SearchId` that names nothing is a fault in the request. The same shape of answer this
+/// service gives for an import job's id (see [`IMPORT_JOB_ID_INVALID`]).
+pub const SEARCH_ID_INVALID: &str = "Invalid SearchId";
+
 /// Per-service state for com-amazonaws-mailmanager-mailmanagersvc. A handler reaches it through [`service_state`].
 ///
 /// Every map is a `BTreeMap`, so `ListArchives` walks the archives in one stable,
@@ -325,6 +539,22 @@ pub struct ComAmazonawsMailmanagerMailmanagersvcState {
     /// [`ComAmazonawsMailmanagerMailmanagersvcState::mint_import_job_id`]; see
     /// [`Self::archive_sequence`].
     pub import_job_sequence: u64,
+    /// Archive search jobs by `SearchId`, across every archive.
+    ///
+    /// A `BTreeMap`, so `ListArchiveSearches` walks one archive's jobs in one stable order
+    /// and a continuation token can name the `SearchId` to resume at. Bounded by
+    /// [`MAX_ARCHIVE_SEARCHES`].
+    pub archive_searches: BTreeMap<String, SearchJobRecord>,
+    /// Monotonic counter feeding
+    /// [`ComAmazonawsMailmanagerMailmanagersvcState::mint_search_id`]; see
+    /// [`Self::archive_sequence`].
+    pub archive_search_sequence: u64,
+    /// Archive export jobs by `ExportId`, across every archive — the jobs
+    /// `ListArchiveExports` reports. Ordered and keyed exactly as [`Self::archive_searches`]
+    /// is, and written by `StartArchiveExport`, which is still a scaffold: an archive on
+    /// which no export has been started has none, which is a listing of zero jobs and not a
+    /// failure.
+    pub archive_exports: BTreeMap<String, ExportJobRecord>,
     /// The secret THIS store's pagination tokens are authenticated under; see
     /// [`encode_page_token`].
     pub page_token_key: PageTokenKey,
@@ -364,13 +594,43 @@ impl ComAmazonawsMailmanagerMailmanagersvcState {
         let live: std::collections::BTreeSet<String> = self.archives.keys().cloned().collect();
         self.idempotency
             .retain(|_, create| live.contains(&create.resource_id));
+        // A job belongs to its archive: once the archive is permanently gone there is
+        // nothing left for a search or an export of it to report on.
+        self.archive_searches
+            .retain(|_, job| live.contains(&job.archive_id));
+        self.archive_exports
+            .retain(|_, job| live.contains(&job.archive_id));
     }
 
-    /// Mint a fresh `ArchiveId`: 32 lowercase hex characters (see [`mint_id`]), well
-    /// inside `ArchiveIdString`'s modelled 1..66 length.
+    /// Whether this store serves archive-scoped job operations (an archive search, an
+    /// archive export) on `archive_id`, and why not when it does not.
+    ///
+    /// Shared by every operation that names an archive to start or report a job on, so the
+    /// four of them resolve one `ArchiveId` the same way: an id that is stored and `ACTIVE`
+    /// is served, and the two ways it is not are told apart for the caller.
+    pub fn check_archive_for_job(&self, archive_id: &str) -> Result<(), ArchiveJobRefusal> {
+        match self.archives.get(archive_id) {
+            None => Err(ArchiveJobRefusal::NotFound),
+            Some(record) if record.archive_state != ARCHIVE_STATE_ACTIVE => {
+                Err(ArchiveJobRefusal::NotActive)
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Mint a fresh `ArchiveId`: the [`ARCHIVE_ID_PREFIX`] and 32 lowercase hex characters
+    /// (see [`mint_id`]).
+    ///
+    /// 34 characters of `a-` and word characters, which satisfy BOTH shapes the identifier
+    /// travels as: `ArchiveIdString`'s modelled 1..66 length, which `CreateArchive` returns
+    /// it through, and `ArchiveId`'s 3..66 length and `^a-[\w]{1,64}$` pattern, which every
+    /// archive-scoped job operation takes it back through.
     pub fn mint_archive_id(&mut self, now_millis: i64) -> String {
         self.archive_sequence = self.archive_sequence.wrapping_add(1);
-        mint_id(self.archive_sequence, now_millis)
+        format!(
+            "{ARCHIVE_ID_PREFIX}{}",
+            mint_id(self.archive_sequence, now_millis)
+        )
     }
 
     /// Mint a fresh `AddressListId`, the same way [`Self::mint_archive_id`] mints an
@@ -387,6 +647,14 @@ impl ComAmazonawsMailmanagerMailmanagersvcState {
     pub fn mint_import_job_id(&mut self, now_millis: i64) -> String {
         self.import_job_sequence = self.import_job_sequence.wrapping_add(1);
         mint_id(self.import_job_sequence, now_millis)
+    }
+
+    /// Mint a fresh `SearchId`, the same way [`Self::mint_archive_id`] mints an archive id:
+    /// 32 lowercase hex characters, well inside `SearchId`'s modelled 1..64 length (the
+    /// shape declares no pattern).
+    pub fn mint_search_id(&mut self, now_millis: i64) -> String {
+        self.archive_search_sequence = self.archive_search_sequence.wrapping_add(1);
+        mint_id(self.archive_search_sequence, now_millis)
     }
 }
 
@@ -429,6 +697,18 @@ pub fn encode_page_token(key: &PageTokenKey, cursor: &str) -> String {
 /// not match the cursor it travels with, and one whose cursor is not UTF-8.
 pub fn decode_page_token(key: &PageTokenKey, token: &str) -> Option<String> {
     key.cursor_of(&::hex::decode(token).ok()?)
+}
+
+/// The walk a continuation token of an archive-scoped job listing (`ListArchiveSearches`,
+/// `ListArchiveExports`) belongs to: the archive being listed, ahead of the position
+/// itself.
+///
+/// A token continues ONE walk, so the position it carries travels with the archive it was
+/// issued for and a token presented to another archive's listing names no position in it.
+/// `ArchiveId` is `@pattern ^a-[\w]{1,64}$`, so an id cannot carry the separator and the
+/// boundary between the scope and the position is unambiguous.
+pub fn archive_job_page_scope(archive_id: &str) -> String {
+    format!("{archive_id}\u{1f}")
 }
 
 /// The message a handler reports when the shared store cannot be reached.
