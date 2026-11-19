@@ -28,7 +28,10 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 /// if the function's configuration and code haven't changed since the last
 /// version", so a distinct description is what makes each publish a distinct
 /// snapshot with its own number.
-async fn given_function(emulator: &Emulator, name: &str, versions: usize) {
+///
+/// Answers the `FunctionArn` AWS Lambda minted for it, which is what the ARN in a
+/// Lambda refusal about one of its aliases is built from.
+async fn given_function(emulator: &Emulator, name: &str, versions: usize) -> String {
     let (status, body) = emulator
         .lambda(
             "POST",
@@ -60,6 +63,10 @@ async fn given_function(emulator: &Emulator, name: &str, versions: usize) {
             "case {name:?}: PublishVersion must publish version {version}, got {status} {body:?}"
         );
     }
+    body["FunctionArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {name:?}: CreateFunction answered no FunctionArn"))
+        .to_string()
 }
 
 /// Create the alias the deployment moves, invoking `version` and splitting its
@@ -497,4 +504,282 @@ async fn a_shift_with_no_lambda_beside_the_service_fails_the_deployment() {
         deployment_id.starts_with("d-"),
         "case {case:?}: expected the deployment to have been accepted, got {deployment_id:?}"
     );
+}
+
+/// The ARN AWS Lambda mints for a function of `name` in the Region this suite's
+/// requests are scoped to, spelled off the ARN it minted for a function it DID
+/// create: only the resource name differs, so no ARN is written by hand here.
+fn sibling_function_arn(created: &str, name: &str) -> String {
+    let (prefix, _) = created
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("the created function's ARN {created:?} names a resource"));
+    format!("{prefix}:{name}")
+}
+
+/// The sentence AWS Lambda's READ of an alias answers when the function holds no
+/// alias of that name: a fixed lead-in and the fully-qualified alias ARN the
+/// request asked about, which is the function's own ARN qualified by the alias
+/// name.
+fn alias_not_found_message(function_arn: &str, alias: &str) -> String {
+    format!("Cannot find alias arn: {function_arn}:{alias}")
+}
+
+/// The sentence AWS Lambda answers when the request names no function it holds,
+/// naming the ARN the request resolved to.
+fn function_not_found_message(function_arn: &str) -> String {
+    format!("Function not found: {function_arn}")
+}
+
+/// What AWS Lambda answers for the read of one alias: the HTTP status and the
+/// message of the body, under either casing the JSON envelopes spell it in.
+async fn alias_read(emulator: &Emulator, function: &str, alias: &str) -> (u16, String) {
+    let (status, body) = emulator
+        .lambda(
+            "GET",
+            &format!("{FUNCTIONS_URI}/{function}/aliases/{alias}"),
+            Value::Null,
+        )
+        .await;
+    let message = body["message"]
+        .as_str()
+        .or_else(|| body["Message"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    (status, message)
+}
+
+/// The names of the aliases AWS Lambda holds for `function`, as `ListAliases`
+/// reports them — the collection an alias that was never created must stay out of.
+async fn alias_names(emulator: &Emulator, function: &str) -> Vec<String> {
+    let (status, body) = emulator
+        .lambda(
+            "GET",
+            &format!("{FUNCTIONS_URI}/{function}/aliases"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "ListAliases for {function} must succeed, got {status} {body:?}"
+    );
+    body["Aliases"]
+        .as_array()
+        .map(|aliases| {
+            aliases
+                .iter()
+                .filter_map(|alias| alias["Name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One row of the unresolved-reference table: what the AppSpec POINTS AT that AWS
+/// Lambda does not hold.
+struct Reference {
+    /// What the row is about.
+    case: &'static str,
+    /// The function the AppSpec's `Name` property names.
+    function: &'static str,
+    /// The alias its `Alias` property names, which no `CreateAlias` ever created.
+    alias: &'static str,
+    /// Its `TargetVersion`.
+    target: &'static str,
+    /// Whether AWS Lambda holds the function the row names, which is what decides
+    /// which absence its read of that alias reports.
+    function_exists: bool,
+}
+
+/// RULE: the Lambda resources an AppSpec names are RESOLVED, never created — a
+/// deployment whose declared shift names a function, an alias or a version AWS
+/// Lambda does not hold reports the failure as its own terminal outcome and creates
+/// none of them, so the alias it merely named is still absent afterwards and every
+/// alias the function does hold still invokes the version, and splits its
+/// invocations the way, it did before.
+#[tokio::test]
+async fn an_unresolved_appspec_reference_creates_nothing_in_lambda() {
+    let emulator = Emulator::with_lambda();
+    let group = given_lambda_group(&emulator, "referenced").await;
+    let function_arn = given_function(&emulator, "handler", 3).await;
+    // The one alias the function DOES hold, which no row's AppSpec names: it
+    // carries weighted routing of its own, so a failed deployment that cleared it
+    // would show up here.
+    given_alias(
+        &emulator,
+        "handler",
+        "live",
+        "2",
+        Some(json!({"3": 0.25})),
+    )
+    .await;
+
+    // Rows differ along which referent is missing and along how the missing alias
+    // name is spelled — the model's `Alias` admits letters, digits, '-' and '_'
+    // (`smithy_query(query="shape",shape="Alias")` of the Lambda model) — and the
+    // last row's function is missing as well, so the absence Lambda reports for
+    // the read differs too.
+    let cases: &[Reference] = &[
+        Reference {
+            case: "an alias nothing created",
+            function: "handler",
+            alias: "ghost",
+            target: "3",
+            function_exists: true,
+        },
+        Reference {
+            case: "an alias whose name carries a hyphen",
+            function: "handler",
+            alias: "ghost-two",
+            target: "3",
+            function_exists: true,
+        },
+        Reference {
+            case: "an alias whose name mixes case with an underscore",
+            function: "handler",
+            alias: "Ghost_three",
+            target: "3",
+            function_exists: true,
+        },
+        Reference {
+            case: "an alias nothing created, targeting a version nothing published",
+            function: "handler",
+            alias: "ghost4",
+            target: "9",
+            function_exists: true,
+        },
+        Reference {
+            case: "an alias of a function nothing created",
+            function: "absent",
+            alias: "ghost5",
+            target: "3",
+            function_exists: false,
+        },
+    ];
+
+    for case in cases {
+        let revision = app_spec_revision(&app_spec_yaml(
+            case.function,
+            case.alias,
+            "2",
+            case.target,
+        ));
+        let deployment_id = deploy(&emulator, "referenced", &group, revision).await;
+        // The verdict is the deployment's own terminal state, not a refusal of the
+        // call that created it.
+        assert!(
+            deployment_id.starts_with("d-"),
+            "case {:?}: expected the deployment to have been accepted, got {deployment_id:?}",
+            case.case
+        );
+        let info = terminal_deployment(&emulator, &deployment_id, case.case).await;
+        let expected_message = invalid_lambda_function_message(case.function);
+        assert_eq!(
+            (
+                info["status"].as_str(),
+                info["errorInformation"]["code"].as_str(),
+                info["errorInformation"]["message"].as_str(),
+            ),
+            (
+                Some("Failed"),
+                Some("INVALID_LAMBDA_FUNCTION"),
+                Some(expected_message.as_str()),
+            ),
+            "case {:?}: expected a Failed deployment carrying the INVALID_LAMBDA_FUNCTION \
+             information, got {info:?}",
+            case.case
+        );
+
+        // Effect absent: the alias the AppSpec merely named is still not there, so
+        // the read of it answers the same absence it answered before the
+        // deployment.
+        let expected_absence = if case.function_exists {
+            alias_not_found_message(&function_arn, case.alias)
+        } else {
+            function_not_found_message(&sibling_function_arn(&function_arn, case.function))
+        };
+        let (status, message) = alias_read(&emulator, case.function, case.alias).await;
+        assert_eq!(
+            (status, message.as_str()),
+            (404, expected_absence.as_str()),
+            "case {:?}: expected the named alias to be absent with {expected_absence:?}, got \
+             {status} {message:?}",
+            case.case
+        );
+
+        // Effect absent: the alias the AppSpec did not name is untouched — same
+        // version, same weighted routing.
+        let untouched = alias_of(&emulator, "handler", "live").await;
+        assert_eq!(
+            (
+                untouched["FunctionVersion"].as_str(),
+                &untouched["RoutingConfig"]["AdditionalVersionWeights"],
+            ),
+            (Some("2"), &json!({"3": 0.25})),
+            "case {:?}: expected the unnamed alias left as it was, got {untouched:?}",
+            case.case
+        );
+    }
+
+    // And nothing was added to the collection either: the function holds exactly
+    // the alias that was created through `CreateAlias`.
+    let held = alias_names(&emulator, "handler").await;
+    assert_eq!(
+        held,
+        vec!["live".to_string()],
+        "expected the function to hold only the alias that was created, got {held:?}"
+    );
+}
+
+/// RULE: whether the alias an AppSpec names EXISTS — account state, not the
+/// document's shape — is what decides the deployment's outcome: one AppSpec,
+/// differing in nothing but that name, fails against a name nothing created and
+/// succeeds against one that was created, moving it to the AppSpec's
+/// `TargetVersion`.
+#[tokio::test]
+async fn alias_existence_alone_decides_the_outcome() {
+    let emulator = Emulator::with_lambda();
+    let group = given_lambda_group(&emulator, "existence").await;
+    let function_arn = given_function(&emulator, "handler", 3).await;
+    given_alias(&emulator, "handler", "live", "2", None).await;
+
+    // Rows differ only in the alias name inside one AppSpec, and in whether AWS
+    // Lambda holds it: the last row repeats the missing name AFTER a shift that
+    // worked, so a deployment that succeeded cannot have made it resolvable.
+    let cases: &[(&str, &str, bool)] = &[
+        ("a name nothing created", "ghost", false),
+        ("the name that was created", "live", true),
+        (
+            "a name nothing created, after a shift that worked",
+            "ghost",
+            false,
+        ),
+    ];
+
+    for (case, alias, exists) in cases {
+        let revision = app_spec_revision(&app_spec_yaml("handler", alias, "2", "3"));
+        let deployment_id = deploy(&emulator, "existence", &group, revision).await;
+        let info = terminal_deployment(&emulator, &deployment_id, case).await;
+        let expected_status = if *exists { "Succeeded" } else { "Failed" };
+        assert_eq!(
+            info["status"].as_str(),
+            Some(expected_status),
+            "case {case:?}: expected the deployment to end {expected_status}, got {info:?}"
+        );
+        if *exists {
+            let moved = alias_of(&emulator, "handler", alias).await;
+            assert_eq!(
+                moved["FunctionVersion"].as_str(),
+                Some("3"),
+                "case {case:?}: expected the alias at the AppSpec's TargetVersion, got {moved:?}"
+            );
+        } else {
+            let expected_absence = alias_not_found_message(&function_arn, alias);
+            let (status, message) = alias_read(&emulator, "handler", alias).await;
+            assert_eq!(
+                (status, message.as_str()),
+                (404, expected_absence.as_str()),
+                "case {case:?}: expected the named alias to be absent with \
+                 {expected_absence:?}, got {status} {message:?}"
+            );
+        }
+    }
 }
