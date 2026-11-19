@@ -145,6 +145,36 @@ pub fn prefix_list_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E
     Scaffolded::service_error(PREFIX_LIST_LIMIT_EXCEEDED, 400, message)
 }
 
+/// EC2's error code for a modification whose entry set would not fit the maximum number of
+/// entries the prefix list may hold.
+///
+/// A class of its own, not the `InvalidParameterValue` a malformed CIDR block or an
+/// out-of-range size earns: the request is well formed and asks for more room than the list
+/// has, which is the one cause a caller answers by RAISING `MaxEntries` and asking again.
+/// `ModifyManagedPrefixList` declares no error in the model
+/// (`smithy_query(query="operation",operation="ModifyManagedPrefixList")` answers `errors:
+/// []`), so the code is a wire value.
+pub const PREFIX_LIST_MAX_ENTRIES_EXCEEDED: &str = "PrefixListMaxEntriesExceeded";
+
+/// Refuse a modification whose resulting entry set would not fit the maximum number of
+/// entries in effect for the list: HTTP 400 [`PREFIX_LIST_MAX_ENTRIES_EXCEEDED`].
+///
+/// The sentence is fixed and the two parenthesised numbers are the request's: how many
+/// entries the modification would leave the list holding (`entries_after`), and the maximum
+/// it would have to fit in (`max_entries`) — the list's stored `MaxEntries`, or the one the
+/// request asks for when it is the size that is being modified.
+pub fn prefix_list_max_entries_exceeded<E>(entries_after: usize, max_entries: i32) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        PREFIX_LIST_MAX_ENTRIES_EXCEEDED,
+        400,
+        format!(
+            "You've reached the maximum number of entries for the prefix list. This \
+             modification saves ({entries_after}) entries and the maximum number of entries \
+             for this prefix list is ({max_entries})."
+        ),
+    )
+}
+
 /// Does the Region `region` PUBLISH a prefix list carrying the id `prefix_list_id`?
 ///
 /// The one question an operation that writes a prefix list asks about an id its own store holds

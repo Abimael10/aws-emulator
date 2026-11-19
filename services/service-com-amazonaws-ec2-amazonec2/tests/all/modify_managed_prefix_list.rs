@@ -28,8 +28,9 @@
 //!    changes nothing: an id that is no prefix list id, an id nothing the caller can see
 //!    carries, a list Amazon Web Services publishes rather than the account owning, a request
 //!    naming no modification at all, a name outside the documented constraints, a maximum size
-//!    asked for together with an entry change or outside the documented floor, an entry change
-//!    that would take the list past its maximum, a CIDR block of the other family, a block the
+//!    asked for together with an entry change or outside the documented floor, a modification
+//!    whose entry set would not fit the maximum in effect — the maximum lowered or the entries
+//!    added, each refused with the cap's own class — a CIDR block of the other family, a block the
 //!    list already carries, a block it does not carry, a `CurrentVersion` that is not the
 //!    version the list stands at, a list whose creation is still in progress, and the
 //!    synchronization flag on a list no IPAM prefix list resolver target manages.
@@ -41,8 +42,8 @@ use std::time::Duration;
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, FIRST_PREFIX_LIST_VERSION,
     MAX_PREFIX_LIST_NAME_CHARS, PREFIX_LIST_ADDRESS_FAMILY_IPV4, PREFIX_LIST_ADDRESS_FAMILY_IPV6,
-    PREFIX_LIST_STATE_CREATE_COMPLETE, PREFIX_LIST_STATE_CREATE_IN_PROGRESS,
-    RESERVED_PREFIX_LIST_NAME_PREFIX, TRANSITION_DELAY,
+    PREFIX_LIST_MAX_ENTRIES_EXCEEDED, PREFIX_LIST_STATE_CREATE_COMPLETE,
+    PREFIX_LIST_STATE_CREATE_IN_PROGRESS, RESERVED_PREFIX_LIST_NAME_PREFIX, TRANSITION_DELAY,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -554,6 +555,27 @@ async fn the_clock_settles_a_revised_list_into_modify_complete() {
     );
 }
 
+/// The state `DescribeManagedPrefixLists` reports for `prefix_list_id` once it is `wanted`:
+/// the state is looked at AGAIN in a loop until it has moved or a deadline far past
+/// [`TRANSITION_DELAY`] passes, so the wait is for the CONDITION rather than for a span of the
+/// clock and a loaded host cannot turn "not yet" into a failure.
+async fn poll_until_state(
+    router: &MultiServiceRouter,
+    case: &str,
+    prefix_list_id: &str,
+    wanted: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + TRANSITION_DELAY * 40;
+    loop {
+        let body = describe_one(router, case, prefix_list_id).await;
+        let state = element(&body, "state").unwrap_or_default();
+        if state == wanted || std::time::Instant::now() >= deadline {
+            break state;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Rule 5: a request this operation cannot serve is refused with EC2's code for that class and
 /// changes nothing.
 #[tokio::test]
@@ -570,8 +592,21 @@ async fn a_request_the_operation_cannot_serve_is_refused_and_changes_nothing() {
     )
     .await;
     // The creation the clock owes is settled first: a list still being created is refused for
-    // its STATE whatever else the row names, which is the case asserted on its own next.
-    tokio::time::sleep(past_the_transition()).await;
+    // its STATE whatever else the row names, which is the case asserted on its own next. The
+    // wait is for that CONDITION — the state the describe reports — and not for a span of the
+    // clock, so a loaded host cannot turn "not yet" into a failure.
+    let settled = poll_until_state(
+        &router,
+        "the refusal rows",
+        &prefix_list_id,
+        PREFIX_LIST_STATE_CREATE_COMPLETE,
+    )
+    .await;
+    assert_eq!(
+        settled, PREFIX_LIST_STATE_CREATE_COMPLETE,
+        "the refusal rows: the list under test must have settled before the rows run, got \
+         {settled:?}"
+    );
 
     // A list whose creation is still owed to the clock has no settled entry set for a revision
     // to start from: created and revised with no wait in between, so the state it is refused
@@ -702,6 +737,8 @@ async fn a_request_the_operation_cannot_serve_is_refused_and_changes_nothing() {
             400,
             "InvalidParameterValue",
         ),
+        // A modification whose entry set would not fit the maximum in effect is its own
+        // error class, whichever side of the comparison the request moves.
         (
             "a maximum size below the entries the list holds".to_string(),
             vec![
@@ -709,7 +746,7 @@ async fn a_request_the_operation_cannot_serve_is_refused_and_changes_nothing() {
                 param("MaxEntries", "1"),
             ],
             400,
-            "InvalidParameterValue",
+            PREFIX_LIST_MAX_ENTRIES_EXCEEDED,
         ),
         (
             "entries that would take the list past its maximum".to_string(),
@@ -718,7 +755,7 @@ async fn a_request_the_operation_cannot_serve_is_refused_and_changes_nothing() {
                 param("AddEntry.1.Cidr", "10.12.0.0/16"),
             ],
             400,
-            "InvalidParameterValue",
+            PREFIX_LIST_MAX_ENTRIES_EXCEEDED,
         ),
         (
             "a block of the other address family".to_string(),

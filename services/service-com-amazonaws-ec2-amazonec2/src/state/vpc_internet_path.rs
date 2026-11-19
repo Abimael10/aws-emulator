@@ -348,6 +348,27 @@ pub fn invalid_association_id_not_found<E>(association_id: &str) -> Scaffolded<E
     )
 }
 
+/// Refuse taking away the IMPLICIT association of a VPC's main route table: HTTP 400
+/// `InvalidParameterValue`, naming the association id the REQUEST carried.
+///
+/// "Your VPC automatically comes with a main route table", and every subnet with no
+/// association of its own uses it, so that association is not one a caller made and not one a
+/// caller can take away — a subnet would then be governed by no route table at all. The id
+/// RESOLVES (`DescribeRouteTables` reports it with `Main` set), so this is a refusal about
+/// WHICH association was named and not about an id nothing carries
+/// ([`invalid_association_id_not_found`] is that one).
+///
+/// EC2's model declares no error for `DisassociateRouteTable`, so the code is a wire value:
+/// the request named a value the parameter cannot take, which is what `InvalidParameterValue`
+/// is. The sentence is fixed but for the id, which the caller sent and a stored main
+/// association carries.
+pub fn main_route_table_association_not_disassociable<E>(association_id: &str) -> Scaffolded<E> {
+    super::invalid_parameter_value(format!(
+        "cannot disassociate the main route table association {echoed}",
+        echoed = super::echoed_resource_id(association_id),
+    ))
+}
+
 /// Refuse an association the subnet already has: HTTP 400
 /// [`super::RESOURCE_ALREADY_ASSOCIATED`] as well, since "each subnet in your VPC must be
 /// associated with a route table" and with exactly one — changing which one is
@@ -1185,27 +1206,6 @@ impl ComAmazonawsEc2Amazonec2State {
             .collect()
     }
 
-    /// The explicit association `association_id` names, whichever table holds it.
-    ///
-    /// A READ, so a disassociate can refuse an id that names no association before it
-    /// changes anything. The implicit association of a main table is not one a caller can
-    /// name: "the ID of the association representing the CURRENT association between the
-    /// route table and subnet or gateway" (`DisassociateRouteTableRequest$AssociationId`)
-    /// is an association a caller made.
-    pub fn explicit_route_table_association(
-        &self,
-        association_id: &str,
-    ) -> Option<RouteTableAssociation> {
-        self.route_tables
-            .values()
-            .flat_map(|route_table| route_table.associations.iter().flatten())
-            .find(|association| {
-                association.main != Some(true)
-                    && association.route_table_association_id.as_deref() == Some(association_id)
-            })
-            .cloned()
-    }
-
     /// Drop the explicit association `association_id`, and answer whether one was dropped.
     ///
     /// The reverse of [`Self::associate_subnet_with_route_table`]: "after you perform this
@@ -1242,8 +1242,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// A READ, and the resolver for an operation that may name either: "you can also use this
     /// operation to change which table is the main route table in the VPC. Specify the main
     /// route table's association ID and the route table ID of the new main route table"
-    /// (`ReplaceRouteTableAssociation`). [`Self::explicit_route_table_association`] is the
-    /// narrower read, for the operations whose id must name an association a caller made.
+    /// (`ReplaceRouteTableAssociation`), and for the one that may name only an association a
+    /// caller MADE (`DisassociateRouteTable`), which reads the record's own `Main` member to
+    /// refuse the implicit one — so an id that resolves is never reported as unknown.
     pub fn route_table_association(&self, association_id: &str) -> Option<RouteTableAssociation> {
         self.route_tables
             .values()

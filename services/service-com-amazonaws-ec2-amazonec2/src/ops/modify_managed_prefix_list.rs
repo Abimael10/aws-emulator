@@ -415,15 +415,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The maximum number of entries for the prefix list" is the most the list may
             // hold, so neither adding entries past it nor lowering it below the entries the
             // list already holds is applied. The two can never be asked for together (refused
-            // above), so the ceiling asked about is the one this request leaves in place.
+            // above), so the ceiling asked about is the one this request leaves in place. A
+            // well-formed request that asks for more room than the list has is its own error
+            // class — the one a caller answers by raising the maximum and asking again — so it
+            // is refused with [`state::PREFIX_LIST_MAX_ENTRIES_EXCEEDED`] rather than with the
+            // code a value the parameter cannot take earns.
             let max_entries = input.max_entries.unwrap_or(held_max_entries);
             if entries.len() > usize::try_from(max_entries).unwrap_or(usize::MAX) {
-                return Err(state::invalid_parameter_value(format!(
-                    "The prefix list '{prefix_list_id}' would carry {count} entries, which is \
-                     more than its maximum of {max_entries} entries",
-                    prefix_list_id = input.prefix_list_id,
-                    count = entries.len(),
-                )));
+                return Err(state::prefix_list_max_entries_exceeded(
+                    entries.len(),
+                    max_entries,
+                ));
             }
 
             // What this revision would retain, counted by the ONE definition of a prefix

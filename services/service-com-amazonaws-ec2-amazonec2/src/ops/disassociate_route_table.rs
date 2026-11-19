@@ -206,15 +206,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // "The association ID representing the current association between the route table
-        // and subnet or gateway" (`AssociationId`): an id no association carries is a
-        // refusal, not a no-op — a caller that disassociates twice has to be able to tell
-        // the one it performed from the one it did not. The implicit association of a main
-        // route table is not an association a caller made, so it is not one this takes away.
-        if store
-            .explicit_route_table_association(&input.association_id)
-            .is_none()
-        {
-            return Err(state::invalid_association_id_not_found(&input.association_id));
+        // and subnet or gateway" (`AssociationId`): the id is resolved against EVERY
+        // association a stored table carries — the implicit association of a main table as
+        // well as one an `AssociateRouteTable` made — so each of the two causes a request can
+        // have is reported as itself.
+        //
+        // The implicit association of a main route table is not one this takes away: it is
+        // what a subnet with no association of its own uses, so a request naming it is
+        // refused for naming THAT association rather than reported as an id nothing carries.
+        // An id no stored association carries at all is the refusal, not a no-op — a caller
+        // that disassociates twice has to be able to tell the one it performed from the one
+        // it did not.
+        match store.route_table_association(&input.association_id) {
+            Some(association) if association.main == Some(true) => {
+                return Err(state::main_route_table_association_not_disassociable(
+                    &input.association_id,
+                ));
+            }
+            Some(_) => {}
+            None => {
+                return Err(state::invalid_association_id_not_found(&input.association_id));
+            }
         }
 
         // The request is one that would have succeeded, so a dry run stops HERE: "If you
