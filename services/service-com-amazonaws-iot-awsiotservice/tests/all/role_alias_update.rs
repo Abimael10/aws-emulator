@@ -25,12 +25,26 @@
 //! neither), where in the modelled `range 900..43200` the duration sits (each published
 //! bound and a value between them), the form and length of the alias name, whether the
 //! create carried tags, and the region the calls are signed for.
+//!
+//! Replacing "exactly the members the request carried" is a FOLD over however many
+//! updates a caller makes, so the tables below also span the SEQUENCE: after any run of
+//! updates the record holds, for each member, the latest value an update named for it and
+//! the created value for every member none named — which makes repeating one update a
+//! no-op on everything but the record's last-modified stamp — and a member no
+//! `UpdateRoleAlias` request can name at all, such as the alias's tag set, survives every
+//! update untouched.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+// The one query-value percent-encoder this test crate has: `ListTagsForResource` binds
+// its `resourceArn` to the query string, so an ARN's separators travel encoded exactly as
+// an SDK client sends them.
+use crate::describe_endpoint::percent_encode;
 
 /// The region the harness signs for unless a case names another.
 const REGION: &str = "us-east-1";
@@ -94,6 +108,32 @@ impl Reply {
     /// A numeric member of that description.
     fn described_number(&self, name: &str) -> Option<f64> {
         self.described(name).and_then(Value::as_f64)
+    }
+
+    /// The reported tag set, keyed by `Tag$Key`, or `None` when the response carries no
+    /// `tags` member at all.
+    ///
+    /// The same walk as `authorizer_registry::resource_tagging`'s reader of a tag set,
+    /// which is where the first copy of it lives: the two cannot be one `pub(crate)`
+    /// helper, because a shared test module of this crate would have to be declared in
+    /// `tests/all.rs`, which this tree does not accept an edit to.
+    fn tags(&self) -> Option<BTreeMap<String, Option<String>>> {
+        Some(
+            self.body
+                .get("tags")?
+                .as_array()?
+                .iter()
+                .map(|tag| {
+                    (
+                        tag.get("Key")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        tag.get("Value").and_then(Value::as_str).map(str::to_string),
+                    )
+                })
+                .collect(),
+        )
     }
 }
 
@@ -175,6 +215,24 @@ impl Emulator {
         self.call("DELETE", &format!("/role-aliases/{name}"), None, REGION)
             .await
     }
+
+    /// `ListTagsForResource`: `GET /tags?resourceArn={resourceArn}` — the reader of the
+    /// tag set a role alias carries, which no `UpdateRoleAlias` member names.
+    async fn list_tags(&self, resource_arn: &str, region: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!("/tags?resourceArn={}", percent_encode(resource_arn)),
+            None,
+            region,
+        )
+        .await
+    }
+}
+
+/// The ARN of a role alias, as `CreateRoleAlias` mints it in the region the call was
+/// signed for: `arn:aws:iot:<region>:<account>:rolealias/<roleAlias>`.
+fn role_alias_arn(region: &str, name: &str) -> String {
+    format!("arn:aws:iot:{region}:{ACCOUNT_ID}:rolealias/{name}")
 }
 
 /// The sentence every operation addressing ONE role alias refuses a name the account
@@ -316,10 +374,7 @@ async fn an_update_rewrites_only_the_members_it_names() {
             Some(case.name.as_str()),
             "case {label:?}: the update must report the alias it wrote, got {updated:?}"
         );
-        let expected_arn = format!(
-            "arn:aws:iot:{}:{ACCOUNT_ID}:rolealias/{}",
-            case.region, case.name
-        );
+        let expected_arn = role_alias_arn(case.region, &case.name);
         assert_eq!(
             updated.text("roleAliasArn"),
             Some(expected_arn.clone()),
@@ -605,6 +660,375 @@ async fn an_update_whose_duration_is_outside_the_modelled_range_is_refused() {
         assert_eq!(
             before.body, after.body,
             "case {duration}: a refused update must write nothing, got {after:?}"
+        );
+    }
+}
+
+/// One step of a run of updates: the body the request carries, and the record the alias
+/// must report once it has been applied.
+struct Step {
+    update: Value,
+    expected_role_arn: &'static str,
+    expected_duration: i64,
+}
+
+/// One create followed by a RUN of updates, which is what "replaces exactly the members
+/// the request carried" means over more than one call.
+struct SequenceCase {
+    label: &'static str,
+    name: &'static str,
+    region: &'static str,
+    create: Value,
+    steps: Vec<Step>,
+}
+
+/// The runs the fold is asserted over. They span the length of the run, which subset of
+/// the two optional members each step names, the order the members are named in, a step
+/// repeated unchanged, the duration's position in the modelled range, the form and length
+/// of the name, whether the create carried tags, and the region.
+fn sequence_cases() -> Vec<SequenceCase> {
+    vec![
+        SequenceCase {
+            label: "the role ARN replaced twice, then a step naming neither member",
+            name: "arn_then_arn_then_none",
+            region: REGION,
+            create: json!({
+                "roleArn": "arn:aws:iam::000000000000:role/first",
+                "credentialDurationSeconds": 1_800,
+            }),
+            steps: vec![
+                Step {
+                    update: json!({ "roleArn": "arn:aws:iam::000000000000:role/second" }),
+                    expected_role_arn: "arn:aws:iam::000000000000:role/second",
+                    expected_duration: 1_800,
+                },
+                Step {
+                    update: json!({ "roleArn": "arn:aws:iam::000000000000:role/third" }),
+                    expected_role_arn: "arn:aws:iam::000000000000:role/third",
+                    expected_duration: 1_800,
+                },
+                Step {
+                    update: json!({}),
+                    expected_role_arn: "arn:aws:iam::000000000000:role/third",
+                    expected_duration: 1_800,
+                },
+            ],
+        },
+        SequenceCase {
+            label: "each member in turn, then both at once, from a create naming no duration",
+            name: "duration_then_arn_then_both",
+            region: REGION,
+            create: json!({ "roleArn": "arn:aws:iam::000000000000:role/first" }),
+            steps: vec![
+                Step {
+                    update: json!({ "credentialDurationSeconds": MIN_CREDENTIAL_DURATION_SECONDS }),
+                    expected_role_arn: "arn:aws:iam::000000000000:role/first",
+                    expected_duration: MIN_CREDENTIAL_DURATION_SECONDS,
+                },
+                Step {
+                    update: json!({ "roleArn": "arn:aws:iam::000000000000:role/second" }),
+                    expected_role_arn: "arn:aws:iam::000000000000:role/second",
+                    expected_duration: MIN_CREDENTIAL_DURATION_SECONDS,
+                },
+                Step {
+                    update: json!({
+                        "roleArn": "arn:aws:iam::000000000000:role/third",
+                        "credentialDurationSeconds": MAX_CREDENTIAL_DURATION_SECONDS,
+                    }),
+                    expected_role_arn: "arn:aws:iam::000000000000:role/third",
+                    expected_duration: MAX_CREDENTIAL_DURATION_SECONDS,
+                },
+            ],
+        },
+        SequenceCase {
+            label: "the duration walked across the range while the ARN is named once",
+            name: "Duration_Walk=1,2@host-9",
+            region: "eu-west-1",
+            create: json!({
+                "roleArn": "arn:aws:iam::000000000000:role/first",
+                "credentialDurationSeconds": MAX_CREDENTIAL_DURATION_SECONDS,
+            }),
+            steps: vec![
+                Step {
+                    update: json!({ "credentialDurationSeconds": MIN_CREDENTIAL_DURATION_SECONDS }),
+                    expected_role_arn: "arn:aws:iam::000000000000:role/first",
+                    expected_duration: MIN_CREDENTIAL_DURATION_SECONDS,
+                },
+                Step {
+                    update: json!({ "roleArn": "arn:aws:iam::000000000000:role/second" }),
+                    expected_role_arn: "arn:aws:iam::000000000000:role/second",
+                    expected_duration: MIN_CREDENTIAL_DURATION_SECONDS,
+                },
+                Step {
+                    update: json!({ "credentialDurationSeconds": 21_600 }),
+                    expected_role_arn: "arn:aws:iam::000000000000:role/second",
+                    expected_duration: 21_600,
+                },
+                Step {
+                    update: json!({ "credentialDurationSeconds": MAX_CREDENTIAL_DURATION_SECONDS }),
+                    expected_role_arn: "arn:aws:iam::000000000000:role/second",
+                    expected_duration: MAX_CREDENTIAL_DURATION_SECONDS,
+                },
+            ],
+        },
+        SequenceCase {
+            label: "the same update repeated three times over a tagged alias",
+            name: "repeated_update",
+            region: "ap-southeast-2",
+            create: json!({
+                "roleArn": "arn:aws:iam::000000000000:role/first",
+                "credentialDurationSeconds": 3_600,
+                "tags": [{ "Key": "team", "Value": "platform" }],
+            }),
+            steps: (0..3)
+                .map(|_| Step {
+                    update: json!({
+                        "roleArn": "arn:aws:iam::000000000000:role/second",
+                        "credentialDurationSeconds": 7_200,
+                    }),
+                    expected_role_arn: "arn:aws:iam::000000000000:role/second",
+                    expected_duration: 7_200,
+                })
+                .collect(),
+        },
+        SequenceCase {
+            label: "nothing but steps naming neither member, on the shortest legal name",
+            name: "a",
+            region: REGION,
+            create: json!({ "roleArn": "arn:aws:iam::000000000000:role/first" }),
+            steps: vec![
+                Step {
+                    update: json!({}),
+                    expected_role_arn: "arn:aws:iam::000000000000:role/first",
+                    expected_duration: DEFAULT_CREDENTIAL_DURATION_SECONDS,
+                },
+                Step {
+                    update: json!({}),
+                    expected_role_arn: "arn:aws:iam::000000000000:role/first",
+                    expected_duration: DEFAULT_CREDENTIAL_DURATION_SECONDS,
+                },
+            ],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_run_of_updates_leaves_the_latest_value_named_for_each_member() {
+    for case in sequence_cases() {
+        let label = case.label;
+        let name = case.name;
+        // A fresh emulator per row, so the run below is applied to the record this row
+        // created.
+        let emulator = Emulator::new();
+
+        let created = emulator.create_in(name, &case.create, case.region).await;
+        assert_eq!(
+            created.status, 200,
+            "case {label:?}: CreateRoleAlias must succeed, got {created:?}"
+        );
+        let before = emulator.describe(name).await;
+        assert_eq!(
+            before.status, 200,
+            "case {label:?}: the created alias must be readable, got {before:?}"
+        );
+        let expected_arn = role_alias_arn(case.region, name);
+
+        // The moment the record was created: every step's last-modified stamp is at or
+        // after it, since the record cannot have been modified before it existed.
+        let created_at = before
+            .described_number("creationDate")
+            .unwrap_or_else(|| panic!("case {label:?}: the create reported no creationDate"));
+        // The stamp every step must leave at or after where the previous one left it:
+        // "the UNIX timestamp of when the role alias was last modified" moves forward
+        // with each write and never backwards.
+        let mut previous_modified_at = before
+            .described_number("lastModifiedDate")
+            .unwrap_or_else(|| panic!("case {label:?}: the create reported no lastModifiedDate"));
+
+        for (index, step) in case.steps.iter().enumerate() {
+            let step_label = format!("{label} (step {index})");
+            let updated = emulator.update_in(name, &step.update, case.region).await;
+            assert_eq!(
+                updated.status, 200,
+                "case {step_label:?}: UpdateRoleAlias must succeed, got {updated:?}"
+            );
+            assert_eq!(
+                updated.text("roleAlias").as_deref(),
+                Some(name),
+                "case {step_label:?}: the update must report the alias it wrote, got \
+                 {updated:?}"
+            );
+            assert_eq!(
+                updated.text("roleAliasArn"),
+                Some(expected_arn.clone()),
+                "case {step_label:?}: the update must report the ARN the create minted, \
+                 got {updated:?}"
+            );
+
+            let after = emulator.describe(name).await;
+            assert_eq!(
+                after.status, 200,
+                "case {step_label:?}: the updated alias must be readable, got {after:?}"
+            );
+            assert_eq!(
+                after.described("roleArn").and_then(Value::as_str),
+                Some(step.expected_role_arn),
+                "case {step_label:?}: expected roleArn {:?}, got {after:?}",
+                step.expected_role_arn
+            );
+            assert_eq!(
+                after.described_number("credentialDurationSeconds"),
+                Some(step.expected_duration as f64),
+                "case {step_label:?}: expected credentialDurationSeconds {}, got {after:?}",
+                step.expected_duration
+            );
+            // The alias's identity and its owner are not update members, so however many
+            // updates ran, they are still what the create wrote.
+            for unchanged in ["roleAlias", "roleAliasArn", "owner", "creationDate"] {
+                assert_eq!(
+                    before.described(unchanged),
+                    after.described(unchanged),
+                    "case {step_label:?}: a run of updates must leave {unchanged} as the \
+                     create wrote it, got {after:?}"
+                );
+            }
+
+            let modified_at = after.described_number("lastModifiedDate").unwrap_or_else(|| {
+                panic!("case {step_label:?}: the read reported no lastModifiedDate")
+            });
+            assert!(
+                modified_at >= previous_modified_at,
+                "case {step_label:?}: expected lastModifiedDate at or after the previous \
+                 write's ({previous_modified_at}), got {modified_at}"
+            );
+            assert!(
+                modified_at >= created_at,
+                "case {step_label:?}: expected lastModifiedDate at or after creationDate \
+                 ({created_at}), got {modified_at}"
+            );
+            previous_modified_at = modified_at;
+        }
+    }
+}
+
+/// One alias created with a tag set, to be updated: a label, the name, the `tags` the
+/// create carried, and the tag set the alias must still report after the update.
+struct TagCase {
+    label: &'static str,
+    name: &'static str,
+    create: Value,
+    update: Value,
+    expected_tags: Vec<(&'static str, Option<&'static str>)>,
+}
+
+/// The tag sets the "an update replaces only the members it names" rule is asserted over
+/// for a member NO `UpdateRoleAlias` request can name. They span the size of the tag set
+/// (none, one, several), a tag carrying no value, and which update members the request
+/// carries.
+fn tag_cases() -> Vec<TagCase> {
+    vec![
+        TagCase {
+            label: "an alias the create tagged with nothing",
+            name: "untagged",
+            create: json!({ "roleArn": "arn:aws:iam::000000000000:role/first" }),
+            update: json!({
+                "roleArn": "arn:aws:iam::000000000000:role/second",
+                "credentialDurationSeconds": 7_200,
+            }),
+            expected_tags: vec![],
+        },
+        TagCase {
+            label: "an alias carrying one tag, updated on its duration alone",
+            name: "one_tag",
+            create: json!({
+                "roleArn": "arn:aws:iam::000000000000:role/first",
+                "tags": [{ "Key": "team", "Value": "platform" }],
+            }),
+            update: json!({ "credentialDurationSeconds": MAX_CREDENTIAL_DURATION_SECONDS }),
+            expected_tags: vec![("team", Some("platform"))],
+        },
+        TagCase {
+            label: "an alias carrying several tags, one of them valueless",
+            name: "several_tags",
+            create: json!({
+                "roleArn": "arn:aws:iam::000000000000:role/first",
+                "credentialDurationSeconds": MIN_CREDENTIAL_DURATION_SECONDS,
+                "tags": [
+                    { "Key": "env", "Value": "test" },
+                    { "Key": "owner", "Value": "devices" },
+                    { "Key": "marker" },
+                ],
+            }),
+            update: json!({ "roleArn": "arn:aws:iam::000000000000:role/second" }),
+            expected_tags: vec![
+                ("env", Some("test")),
+                ("marker", None),
+                ("owner", Some("devices")),
+            ],
+        },
+        TagCase {
+            label: "an alias carrying one tag, updated on neither member",
+            name: "no_op_update",
+            create: json!({
+                "roleArn": "arn:aws:iam::000000000000:role/first",
+                "tags": [{ "Key": "env", "Value": "test" }],
+            }),
+            update: json!({}),
+            expected_tags: vec![("env", Some("test"))],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn an_update_leaves_the_tags_the_create_wrote_in_place() {
+    for case in tag_cases() {
+        let label = case.label;
+        let name = case.name;
+        let emulator = Emulator::new();
+
+        let created = emulator.create(name, &case.create).await;
+        assert_eq!(
+            created.status, 200,
+            "case {label:?}: CreateRoleAlias must succeed, got {created:?}"
+        );
+
+        let arn = role_alias_arn(REGION, name);
+        let expected: BTreeMap<String, Option<String>> = case
+            .expected_tags
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.map(str::to_string)))
+            .collect();
+
+        let before = emulator.list_tags(&arn, REGION).await;
+        assert_eq!(
+            before.status, 200,
+            "case {label:?}: ListTagsForResource must succeed, got {before:?}"
+        );
+        assert_eq!(
+            before.tags().unwrap_or_default(),
+            expected,
+            "case {label:?}: expected the created tag set {expected:?}, got {before:?}"
+        );
+
+        let updated = emulator.update(name, &case.update).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {label:?}: UpdateRoleAlias must succeed, got {updated:?}"
+        );
+
+        // `tags` is not an `UpdateRoleAlias` member, so an update can neither add, drop
+        // nor rewrite one: the tag set is still what the create wrote.
+        let after = emulator.list_tags(&arn, REGION).await;
+        assert_eq!(
+            after.status, 200,
+            "case {label:?}: ListTagsForResource must succeed after the update, got \
+             {after:?}"
+        );
+        assert_eq!(
+            after.tags().unwrap_or_default(),
+            expected,
+            "case {label:?}: an update must leave the tag set {expected:?} in place, got \
+             {after:?}"
         );
     }
 }
