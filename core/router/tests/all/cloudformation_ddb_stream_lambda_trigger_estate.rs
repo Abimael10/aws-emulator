@@ -352,7 +352,10 @@ async fn embedded_stream_grant(router: &MultiServiceRouter, role: &str) -> Strin
 /// logs to a default log group named `/aws/lambda/<function name>`". A group no run has created
 /// yet is no messages rather than a failure: that is exactly what a client polling for a marker
 /// that has not arrived sees.
-async fn log_messages(router: &MultiServiceRouter, function: &str) -> Vec<String> {
+///
+/// `pub(crate)` because every suite that polls a deployed function's own output needs exactly
+/// this read, and a second copy of it drifts from this one.
+pub(crate) async fn log_messages(router: &MultiServiceRouter, function: &str) -> Vec<String> {
     let group = format!("{LAMBDA_LOG_GROUP_PREFIX}{function}");
     let answered = logs(router, "FilterLogEvents", json!({"logGroupName": group})).await;
     if answered.status != 200 {

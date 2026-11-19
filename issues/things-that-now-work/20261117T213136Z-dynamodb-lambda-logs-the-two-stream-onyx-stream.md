@@ -7,6 +7,24 @@ Issue-Commit: 73f43511fc01379d7b1558031a9504e64eee8ef3
 
 # dynamodb__lambda__logs: the two-stream Onyx stream-processing lifecycle reaches no verdict — the deploy phase never converges and the check hangs to the 60 s cap
 
+> _Resolution: the cause as REPORTED — "the deploy phase never converges", i.e. no terminal
+> stack status and no stream delivery — is not present at this commit, and
+> `core/router/tests/all/cfn_multi_stream_lambda_logged_lifecycle.rs` now pins what the report
+> says AWS does: the CreateStack of this estate reaches a terminal `CREATE_COMPLETE` with every
+> declared resource created, `ListEventSourceMappings` reports one mapping per declared table
+> stream with the declared `StartingPosition`/`BatchSize`/`MaximumRetryAttempts`, and a write to
+> each table is delivered to the handler whose per-record line lands in `/aws/lambda/<function>`
+> — over one, two and three streams. What remains is the recorded run's WALL CLOCK: the
+> six-phase scenario does not finish inside the harness's own 60 s cap, which this report itself
+> records as "recorded behavior only" with no AWS-published latency, so no AWS rule fixes it.
+> That residual is NOT claimed to be free of emulator-side contributors: one measured on the way
+> — a stack bringing up its INDEPENDENT resources one coming-up window apart instead of together
+> — is filed as
+> `issues/things-that-do-not-work/20261119T000000Z-cloudformation-independent-stack-resources-come-up-one-window-apart.md`,
+> together with the companion fix in the stack's failed-create bookkeeping that it needs, and the
+> replay of this check will keep timing out until a later change makes the whole lifecycle fit
+> the cap._
+
 > _Note: this issue was identified against the code base at commit `73f43511fc01379d7b1558031a9504e64eee8ef3`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

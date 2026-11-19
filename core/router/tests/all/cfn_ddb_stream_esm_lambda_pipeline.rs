@@ -292,7 +292,10 @@ async fn deploy(
 /// The wait is on that CONDITION, looking again until it holds or `giving_up_at` passes, so
 /// the completion a stack's resources owe is never named by a fixed sleep. The sibling's wait
 /// is for ONE wanted status, which a refused stack would be waited out for.
-async fn settled(
+///
+/// `pub(crate)` because every suite that deploys a stack and then reads whatever status it
+/// settled in needs exactly this, and a second copy of it drifts from this one.
+pub(crate) async fn settled(
     router: &MultiServiceRouter,
     stack: &str,
     giving_up_at: Instant,
@@ -307,7 +310,13 @@ async fn settled(
 }
 
 /// Every `(logical id, reason)` the stack recorded a refused resource create under.
-async fn create_failures(router: &MultiServiceRouter, stack: &str) -> Vec<(String, String)> {
+///
+/// `pub(crate)` for the reason [`settled`] is: a suite that reads why a deployment did not
+/// settle the way it expected needs this exact read.
+pub(crate) async fn create_failures(
+    router: &MultiServiceRouter,
+    stack: &str,
+) -> Vec<(String, String)> {
     let (status, events) =
         cloudformation(router, "DescribeStackEvents", &[("StackName", stack)]).await;
     assert_eq!(
