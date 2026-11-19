@@ -7,8 +7,9 @@
 //!
 //! 1. A stack identifier a request carries is checked against CloudFormation's own
 //!    constraints for it — at least one character, and the name-or-ARN expression, which the
-//!    WHOLE of the value has to be rather than merely carry, unless the value is the bare
-//!    unique id the service mints for a stack — BEFORE
+//!    WHOLE of the value has to be rather than merely carry, unless the value is a form the
+//!    OPERATION takes beside it (the bare unique id the service mints for a stack, which the
+//!    operation whose member is `stackNameOrId` takes) — BEFORE
 //!    the stack is resolved, and a value that breaks them is refused with the aggregated
 //!    `<n> validation errors detected: …` envelope naming the member path the operation
 //!    states, one clause per constraint broken, rather than with a stack-not-found message.
@@ -30,7 +31,8 @@
 //! crossed with
 //! every operation whose identifier member this service checks itself; the admitted side over
 //! the values the check admits that no stack carries — names, a stack ARN and the unique id a
-//! stack id ends in, whichever hexadecimal character it begins with, pinned on its own by
+//! stack id ends in, the digit-led spelling of which is admitted by the operation whose member
+//! takes that form, pinned on its own by
 //! `stack_unique_id_identifiers.rs`; the
 //! absent-member side over four operations and three different required members; and the
 //! physical-id side over a live stack, the same stack once deleted, and an id nothing ever
@@ -224,35 +226,43 @@ const MALFORMED: &[(&str, &str)] = &[
 
 /// Identifiers the check DOES admit — so each one reaches the lookup — that no stack of the
 /// Region carries: names nothing created in the forms the expression's name alternative
-/// admits, and the unique id a stack id ends in, whichever hexadecimal character it begins
-/// with, which `stack_unique_id_identifiers.rs` pins on its own.
-const ADMITTED_BUT_ABSENT: &[(&str, &str)] = &[
-    ("a name nothing created", "identifier-absent"),
-    ("a one-character name", "z"),
-    ("a name of letters, digits and hyphens", "Stack-9-absent"),
+/// admits, and the unique id a stack id ends in. The third column is whether the form is
+/// admitted ONLY by the operation whose member is `stackNameOrId`, which takes a minted unique
+/// id beside the name and the ARN — a digit-led unique id is no name run, so every other
+/// operation refuses it for its own shape, which `stack_unique_id_identifiers.rs` pins.
+const ADMITTED_BUT_ABSENT: &[(&str, &str, bool)] = &[
+    ("a name nothing created", "identifier-absent", false),
+    ("a one-character name", "z", false),
+    ("a name of letters, digits and hyphens", "Stack-9-absent", false),
     (
         "the letter-led unique id a stack id ends in",
         "af2504e0-4f89-11d3-9a0c-0305e82c3301",
+        false,
     ),
     (
         "that form in upper-case hexadecimal",
         "0E81D159-090A-7B61-9856-04D0999CB465",
+        true,
     ),
     (
         "that form with a non-hexadecimal letter",
         "ag2504e0-4f89-11d3-9a0c-0305e82c3301",
+        false,
     ),
     (
         "a letter-led unique id with no groups at all",
         "ae81d159090a7b61985604d0999cb465",
+        false,
     ),
     (
         "the digit-led unique id a stack id ends in",
         "0e81d159-090a-7b61-9856-04d0999cb465",
+        true,
     ),
     (
         "a digit-led unique id with no groups at all",
         "0e81d159090a7b61985604d0999cb465",
+        true,
     ),
 ];
 
@@ -327,11 +337,13 @@ async fn a_well_formed_identifier_still_reaches_the_stack_lookup() {
     // expression's other alternative admits. Each reaches the lookup, so each operation
     // answers its OWN not-found refusal rather than a constraint clause.
     let absent_id = format!("{stack_id}-absent");
-    let mut absent: Vec<(&str, &str)> = ADMITTED_BUT_ABSENT.to_vec();
-    absent.push(("a stack id no stack carries", absent_id.as_str()));
-    for (case, identifier) in absent {
+    let mut absent: Vec<(&str, &str, bool)> = ADMITTED_BUT_ABSENT.to_vec();
+    absent.push(("a stack id no stack carries", absent_id.as_str(), false));
+    for (case, identifier, only_at_stack_name_or_id) in absent {
         for row in IDENTIFIER_ROWS {
-            if !row.refuses_an_absent_stack {
+            if !row.refuses_an_absent_stack
+                || (only_at_stack_name_or_id && row.path != "stackNameOrId")
+            {
                 continue;
             }
             let case = format!("{} naming {case}", row.action);

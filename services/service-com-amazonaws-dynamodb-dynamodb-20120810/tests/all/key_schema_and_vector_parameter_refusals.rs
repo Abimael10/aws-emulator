@@ -72,10 +72,16 @@ const HASH_AFTER_RANGE: &str = "One or more parameter values were invalid: All H
 
 /// The fixed TEXT of the sentence a key schema earns when an element of it has no
 /// `AttributeDefinitions` entry — the table's own key schema and a secondary index's alike —
-/// up to the two bracketed lists that follow it.
+/// up to the two bracketed lists that follow it. A declaration carrying FEWER definitions than
+/// the schema has elements earns [`KEY_WITHOUT_DEFINITION`] instead.
 const UNDEFINED_KEY_PREFIX: &str =
     "One or more parameter values were invalid: Some index key attributes are not defined in \
      AttributeDefinitions. Keys: [";
+
+/// The fixed sentence a declaration that cannot have one attribute definition per key element
+/// earns: it carries fewer definitions than the schema has elements, so the two lists cannot
+/// line up however the names are matched.
+const KEY_WITHOUT_DEFINITION: &str = "Invalid KeySchema: Some index key attribute have no definition";
 
 /// The fixed sentence a `Dimensions` outside the published range earns.
 const DIMENSION_RANGE: &str =
@@ -235,12 +241,13 @@ async fn a_partition_key_after_a_sort_key_is_refused_with_the_order_rule() {
     }
 }
 
-/// Rule 2: a TABLE key attribute with no definition earns the same parameter-value sentence a
-/// secondary index's does — the whole key schema beside every declared definition — whatever
-/// else the declaration carries, for a request that declared at least as many definitions as
-/// the schema has elements.
+/// Rule 2: a TABLE key attribute with no definition earns the same sentence a secondary
+/// index's does, and WHICH of the two it is follows from the count the request declared: the
+/// whole key schema beside every declared definition — whatever else the declaration carries
+/// — for a request that declared at least as many definitions as the schema has elements,
+/// and the fixed fact about the schema for one that declared fewer.
 #[tokio::test]
-async fn a_table_key_with_no_definition_reports_both_lists() {
+async fn a_table_key_with_no_definition_reports_the_sentence_its_count_earns() {
     let router = emulator();
 
     // Rows differ along WHICH element has no definition, how long the schema is, what
@@ -300,28 +307,38 @@ async fn a_table_key_with_no_definition_reports_both_lists() {
         }
         let (status, body) = call(&router, "CreateTable", request).await;
         let said = refusal(case, status, &body);
-        assert!(
-            said.starts_with(UNDEFINED_KEY_PREFIX),
-            "case {case:?}: expected the parameter-value template, got {said:?}"
-        );
-        // Both lists carry exactly the names the request declared, whatever order they are
-        // reported in: the whole table key schema, and every declared definition.
-        let (keys_reported, definitions_reported) = reported_lists(&said);
-        let mut sorted_keys = keys_reported.clone();
-        sorted_keys.sort();
-        let mut expected_keys = named(key_schema);
-        expected_keys.sort();
-        let mut sorted_definitions = definitions_reported.clone();
-        sorted_definitions.sort();
-        let mut expected_definitions: Vec<String> =
-            declared.iter().map(|name| (*name).to_string()).collect();
-        expected_definitions.sort();
-        assert_eq!(
-            (sorted_keys, sorted_definitions),
-            (expected_keys, expected_definitions),
-            "case {case:?}: expected the table's whole key schema beside every declared name, \
-             got {said:?}"
-        );
+        if declared.len() < key_schema.len() {
+            // Fewer definitions than elements: no matching of the names gives every element
+            // one, so the fixed fact about the schema is what is stated and there are no
+            // lists to reconcile.
+            assert_eq!(
+                said, KEY_WITHOUT_DEFINITION,
+                "case {case:?}: expected {KEY_WITHOUT_DEFINITION:?}, got {said:?}"
+            );
+        } else {
+            assert!(
+                said.starts_with(UNDEFINED_KEY_PREFIX),
+                "case {case:?}: expected the parameter-value template, got {said:?}"
+            );
+            // Both lists carry exactly the names the request declared, whatever order they are
+            // reported in: the whole table key schema, and every declared definition.
+            let (keys_reported, definitions_reported) = reported_lists(&said);
+            let mut sorted_keys = keys_reported.clone();
+            sorted_keys.sort();
+            let mut expected_keys = named(key_schema);
+            expected_keys.sort();
+            let mut sorted_definitions = definitions_reported.clone();
+            sorted_definitions.sort();
+            let mut expected_definitions: Vec<String> =
+                declared.iter().map(|name| (*name).to_string()).collect();
+            expected_definitions.sort();
+            assert_eq!(
+                (sorted_keys, sorted_definitions),
+                (expected_keys, expected_definitions),
+                "case {case:?}: expected the table's whole key schema beside every declared \
+                 name, got {said:?}"
+            );
+        }
         if *case == "an undefined key beside a definition nothing uses" {
             // The recorded order for these names: neither list follows the request.
             assert_eq!(

@@ -900,10 +900,10 @@ async fn a_schema_defect_is_worded_over_the_request_and_the_tables_own_schema() 
             "Invalid KeySchema: Some index key attribute have no definition".to_string(),
         ),
         (
-            // The sets differ BOTH ways round — a key with no definition beside a
-            // definition no key schema uses — and the sentence is the same one: a key with
-            // nothing declared for it is what the primary key cannot be built from,
-            // whatever else the declaration carries.
+            // As many definitions as elements, and the sets differ BOTH ways round — a key
+            // with no definition beside a definition no key schema uses: the declaration
+            // carries enough definitions to go round, so what is stated is the two lists the
+            // caller has to reconcile, neither in the order the request stated it.
             "a table key attribute with no definition beside an unused definition",
             json!({
                 "TableName": "UndefinedTableKeyAndExtra",

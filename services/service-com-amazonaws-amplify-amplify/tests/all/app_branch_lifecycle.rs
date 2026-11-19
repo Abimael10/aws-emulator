@@ -37,21 +37,35 @@ pub(crate) const ACCOUNT_ID: &str = "000000000000";
 pub(crate) const REGION: &str = "us-east-1";
 
 /// The address an app announces its hosting under, which is what `App$defaultDomain`
-/// carries: the one name Amplify publishes per app, the app's own id as the leading label of
-/// AWS's hosting zone (`<appId>.amplifyapp.com`), whatever endpoint the create was addressed
-/// at.
+/// carries: the ADDRESS this emulator is reached at, which is the one address a client told
+/// the domain can dial.
 ///
 /// Written here independently of the service, so a suite pins the announced address and not
-/// the code that composes it.
+/// the code that composes it: a request that addressed an endpoint of its own is announced
+/// that endpoint, and one that addressed a host naming some SERVICE — a caller resolving
+/// AWS's own hostnames — is announced the address this process is served at, which for this
+/// in-process harness, serving no port at all, is the host of the base an unserved emulator
+/// publishes (`smithy_server_runtime::UNSERVED_URL_BASE`, a name RFC 6761 reserves so
+/// nothing resolves it).
 ///
 /// `pub(crate)` so the sibling suites that assert the announced domain and compose a site's
 /// address from it read the one spelling rather than each writing it.
-pub(crate) fn announced_domain(endpoint: &str, app_id: &str) -> String {
-    // The endpoint a client addressed does not reach the value: an app announces its own id
-    // under the hosting zone however the create was addressed, which is what the rows that
-    // address it differently assert.
-    let _ = endpoint;
-    format!("{app_id}.amplifyapp.com")
+pub(crate) fn announced_domain(endpoint: &str) -> String {
+    let host = endpoint.rsplit('@').next().unwrap_or(endpoint);
+    let bare = match host.find(']') {
+        Some(end) => &host[1..end],
+        None => host.split(':').next().unwrap_or(host),
+    }
+    .to_ascii_lowercase();
+    let names_an_aws_endpoint = [".amazonaws.com", ".amazonaws.com.cn", ".api.aws", ".on.aws"]
+        .iter()
+        .any(|suffix| bare.ends_with(suffix));
+    if names_an_aws_endpoint {
+        return smithy_server_runtime::UNSERVED_URL_BASE
+            .trim_start_matches("https://")
+            .to_string();
+    }
+    endpoint.to_string()
 }
 
 /// One response, reduced to what a client branches on.
@@ -544,7 +558,7 @@ async fn create_app_mints_and_persists_a_record_get_app_reads_back_field_for_fie
         );
         assert_eq!(
             string_member(&app, "defaultDomain"),
-            announced_domain(&format!("amplify.{REGION}.amazonaws.com"), &app_id),
+            announced_domain(&format!("amplify.{REGION}.amazonaws.com")),
             "case {label:?}: defaultDomain must be the hosting domain this app announces, \
              got {:?}",
             app.get("defaultDomain")

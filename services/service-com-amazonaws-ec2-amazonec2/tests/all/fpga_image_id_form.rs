@@ -10,8 +10,9 @@
 //! 400 `InvalidFpgaImageID.Malformed` and the FPGA-image kind's own sentence,
 //! `Image ID '<value>' is invalid.`, built from the value the REQUEST sent; an id inside that
 //! form which the account holds no AFI under is answered by the OPERATION's own refusal —
-//! `InvalidFpgaImageID.NotFound` for the operations that resolve one named AFI, so a client
-//! can tell a typo from a missing image
+//! `InvalidFpgaImageID.NotFound` for the operations that resolve one named AFI of their own
+//! Region, so a client can tell a typo from a missing image, and the unreadable-id refusal
+//! from the copy, whose source is named by a Region and an id together
 //! (`super::fpga_image_unresolvable_id_refusals` holds that per-operation table). The null
 //! (all-zero) id is outside the form because the mint counts from one, so no AFI can ever
 //! hold it.
@@ -74,13 +75,13 @@ fn resolver_params(action: &str, fpga_image_id: &str) -> Params {
     }
 }
 
-/// The operations that resolve ONE named AFI: each keeps the malformed answer apart from the
-/// not-found one.
+/// The operations that resolve ONE named AFI: each judges the id's FORM before looking it up.
 ///
-/// The not-found SENTENCE is the answering operation's own — the delete, the reset and the
-/// copy word it `Image ID '<id>' not found.`, the attribute describe with EC2's common
-/// missing-id sentence — so the table carries one expected sentence per operation
-/// ([`regional_not_found_message`]).
+/// What an id inside that form which names no AFI earns is the answering operation's own
+/// ([`unresolved_answer`]): the delete and the reset word it `Image ID '<id>' not found.`, the
+/// attribute describe uses EC2's common missing-id sentence, and the COPY — whose source is
+/// named by a Region and an id together, an addressing this service resolves only for the AFIs
+/// it holds — answers the unreadable-id refusal it answers every unresolved source with.
 const REGIONAL_RESOLVERS: [&str; 4] = [
     "DeleteFpgaImage",
     "ResetFpgaImageAttribute",
@@ -88,14 +89,23 @@ const REGIONAL_RESOLVERS: [&str; 4] = [
     "CopyFpgaImage",
 ];
 
-/// The not-found sentence `action` answers an id inside the issued form that names no AFI
-/// with. Written out here, independently of the service, so the suite pins the sentence and
+/// The code and sentence `action` answers an id inside the issued form that names no AFI
+/// with. Written out here, independently of the service, so the suite pins the refusal and
 /// not the code that composes it.
-fn regional_not_found_message(action: &str, fpga_image_id: &str) -> String {
-    if action == "DescribeFpgaImageAttribute" {
-        format!("The fpga-image ID '{fpga_image_id}' does not exist")
-    } else {
-        format!("Image ID '{fpga_image_id}' not found.")
+fn unresolved_answer(action: &str, fpga_image_id: &str) -> (&'static str, String) {
+    match action {
+        "CopyFpgaImage" => (
+            INVALID_FPGA_IMAGE_ID_MALFORMED,
+            format!("Image ID '{fpga_image_id}' is invalid."),
+        ),
+        "DescribeFpgaImageAttribute" => (
+            INVALID_FPGA_IMAGE_ID_NOT_FOUND,
+            format!("The fpga-image ID '{fpga_image_id}' does not exist"),
+        ),
+        _ => (
+            INVALID_FPGA_IMAGE_ID_NOT_FOUND,
+            format!("Image ID '{fpga_image_id}' not found."),
+        ),
     }
 }
 
@@ -246,10 +256,11 @@ async fn an_afi_id_outside_the_issued_form_is_refused_as_malformed() {
 }
 
 /// RULE: an id INSIDE the issued form that names no stored AFI is answered by the OPERATION's
-/// own refusal — the not-found code, with that operation's sentence, from every operation
-/// that resolves one named AFI.
+/// own refusal — the not-found code with that operation's sentence from the operations that
+/// resolve one named AFI of their own Region, and the unreadable-id refusal from the copy,
+/// whose source is named by a Region and an id together.
 #[tokio::test]
-async fn an_afi_id_inside_the_issued_form_is_answered_as_not_found() {
+async fn an_afi_id_inside_the_issued_form_is_answered_by_each_operations_own_refusal() {
     let (router, _engine) = emulator();
 
     for (case, fpga_image_id) in unknown_rows() {
@@ -261,15 +272,15 @@ async fn an_afi_id_inside_the_issued_form_is_answered_as_not_found() {
                 "case {case:?} on {action}: expected HTTP {REFUSAL_STATUS}, got {status} with \
                  body {body}"
             );
+            let (expected_code, expected_message) = unresolved_answer(action, &fpga_image_id);
             let answered_code = error_code(&body);
             assert_eq!(
-                answered_code, INVALID_FPGA_IMAGE_ID_NOT_FOUND,
+                answered_code, expected_code,
                 "case {case:?} on {action}: expected the code \
-                 {INVALID_FPGA_IMAGE_ID_NOT_FOUND:?}, got {answered_code:?} in {body}"
+                 {expected_code:?}, got {answered_code:?} in {body}"
             );
-            // The missing-resource wording is the answering OPERATION's own, and it names the
-            // id the REQUEST carried rather than the malformed sentence.
-            let expected_message = regional_not_found_message(action, &fpga_image_id);
+            // The wording is the answering OPERATION's own, and it names the
+            // id the REQUEST carried.
             let message = error_message(&body);
             assert_eq!(
                 message, expected_message,
@@ -323,7 +334,7 @@ async fn a_stored_afi_id_resolves_until_the_delete_removes_it() {
     // The id is still inside the form, so what changed is the resource: both readers answer
     // the missing AFI, not a malformed id — each in its own sentence.
     for action in ["DeleteFpgaImage", "DescribeFpgaImageAttribute"] {
-        let expected_message = regional_not_found_message(action, &fpga_image_id);
+        let (expected_code, expected_message) = unresolved_answer(action, &fpga_image_id);
         let params = resolver_params(action, &fpga_image_id);
         let (status, body) = op(&router, action, &params).await;
         assert_eq!(
@@ -333,9 +344,9 @@ async fn a_stored_afi_id_resolves_until_the_delete_removes_it() {
         );
         let answered_code = error_code(&body);
         assert_eq!(
-            answered_code, INVALID_FPGA_IMAGE_ID_NOT_FOUND,
+            answered_code, expected_code,
             "case {fpga_image_id:?} on {action} after the delete: expected the code \
-             {INVALID_FPGA_IMAGE_ID_NOT_FOUND:?}, got {answered_code:?} in {body}"
+             {expected_code:?}, got {answered_code:?} in {body}"
         );
         let message = error_message(&body);
         assert_eq!(

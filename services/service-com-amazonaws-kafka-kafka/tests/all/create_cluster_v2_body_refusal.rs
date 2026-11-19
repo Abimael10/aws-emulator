@@ -4,9 +4,9 @@
 //! its place in the order of decisions.
 //!
 //! The rule under test: a `CreateClusterV2` body that names BOTH cluster types describes two
-//! different clusters, so it is no create Amazon MSK can read at all — it is refused on the
-//! SELECTION, with HTTP 400 `BadRequestException`, MSK's one fixed sentence for asking for
-//! more than one cluster type and NO
+//! different clusters, so it is no create Amazon MSK can READ at all — it is refused on the
+//! BODY, with HTTP 400 `BadRequestException`, MSK's one fixed sentence for a body it will not
+//! read and NO
 //! `invalidParameter`, because no single member is at fault. That decision is taken on the
 //! body alone, so it comes BEFORE every decision taken on a member's value or on the
 //! registry: a body naming both kinds reads the same sentence whether one of the blocks
@@ -31,11 +31,12 @@ use serde_json::{json, Value};
 use crate::kafka_harness::{assert_name_already_exists, Emulator, Reply};
 use crate::refusal_wording::PARAMETERS_NOT_VALID;
 
-/// MSK's fixed sentence for a create that asks for more than one cluster type, written out
+/// MSK's fixed sentence for a create whose body names both cluster types, written out
 /// here rather than read from the service's own constant, so the wording is pinned by this
-/// suite instead of by the code under test.
-const ONE_CLUSTER_TYPE_MESSAGE: &str =
-    "You can specify only one cluster type, either provisioned or serverless.";
+/// suite instead of by the code under test: the two members are ALTERNATIVES, so a body
+/// carrying both is a body MSK will not read, and the sentence it states about such a body
+/// names nothing of the request.
+const ONE_CLUSTER_TYPE_MESSAGE: &str = "Invalid request body";
 
 /// MSK's fixed sentence for a create that names NO cluster type, and the parameter it blames.
 const NO_CLUSTER_TYPE_MESSAGE: &str =

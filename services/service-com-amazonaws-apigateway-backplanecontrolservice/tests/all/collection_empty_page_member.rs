@@ -10,9 +10,11 @@
 //!
 //! The rule, asserted over a SET of inputs rather than one call: a listing reports "the
 //! current page of elements from this collection" as a LIST a client counts — for every
-//! collection of this service, a page that holds nothing is a success carrying that member
-//! as the EMPTY list, so a client counts the page it was served rather than branching on a
-//! member that is not there (`crate::emptied_collection_page_member::empty_page_body`).
+//! collection of this service whose empty page carries the member, a page that holds nothing
+//! is a success carrying that member as the EMPTY list, so a client counts the page it was
+//! served rather than branching on a member that is not there
+//! (`crate::emptied_collection_page_member::empty_page_body`, which also names the
+//! collections answered the other way).
 //!
 //! The rows span the collections of this service a caller fills and empties again,
 //! crossed with the two ways a page comes to hold nothing while the listing still
@@ -325,7 +327,7 @@ async fn a_listing_narrowed_to_no_element_reports_the_empty_page_member() {
 }
 
 #[tokio::test]
-async fn every_paginated_listing_of_this_service_reports_its_page_as_a_list() {
+async fn every_paginated_listing_of_this_service_reports_its_page_as_the_listing_answers_it() {
     // The rule holds for EVERY listing of this service, so the rows below are all of them,
     // read on one emulator holding one API, one usage plan and one domain name and nothing
     // else — which is how the rows differ along what the rule generalises over: a
@@ -419,9 +421,19 @@ async fn every_paginated_listing_of_this_service_reports_its_page_as_a_list() {
 
     for (case, uri, held) in &rows {
         let body = listed(&gateway, uri, case).await;
-        let reported = body
-            .get("item")
-            .unwrap_or_else(|| panic!("case {case}: expected the page member, got {body:?}"));
+        // Whether an EMPTY page carries the member at all is the LISTING's own answer, named
+        // once by the shared reading of an empty page.
+        let empty_page_carries_the_member =
+            crate::emptied_collection_page_member::empty_page_body(case)
+                .get("item")
+                .is_some();
+        let Some(reported) = body.get("item") else {
+            assert!(
+                !empty_page_carries_the_member && *held == Some(0),
+                "case {case}: expected the page member, got {body:?}"
+            );
+            continue;
+        };
         let elements = reported
             .as_array()
             .unwrap_or_else(|| panic!("case {case}: the page member must be a list, got {reported:?}"));

@@ -10,6 +10,12 @@
 //! the VPC's DEFAULT ACL: that one is the ACL the VPC itself came with
 //! ([`crate::state::ComAmazonawsEc2Amazonec2State::insert_default_network_acl`]).
 //!
+//! THIS operation's answer states each entry's `icmpTypeCode` and `portRange` as
+//! present-and-empty elements where the rule carries neither
+//! ([`crate::state::created_network_acl_reported`]), which is what its own recording shows; a
+//! READ of the stored ACL reports only the members its rules carry, which is what the read's
+//! recording shows.
+//!
 //! A `ClientToken` is idempotent only for the request it was first given with: replayed
 //! with the same parameters it reports the ACL it already minted, and replayed with any
 //! different parameter it is refused with `IdempotentParameterMismatch` ([`same_request`]).
@@ -257,10 +263,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::dry_run_operation());
         }
 
-        // The ACL that token already minted, exactly as it is stored now.
+        // The ACL that token already minted, exactly as it is stored now, in the shape this
+        // operation's own answer carries ([`state::created_network_acl_reported`]).
         if let Some(network_acl) = replayed {
             return Ok(CreateNetworkAclOutput {
-                network_acl: Some(network_acl),
+                network_acl: Some(state::created_network_acl_reported(network_acl)),
                 client_token: input.client_token,
             });
         }
@@ -288,14 +295,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The answer is the record as it was stored, so `CreateNetworkAcl` and
-        // `DescribeNetworkAcls` cannot drift apart.
+        // `DescribeNetworkAcls` cannot drift apart on what the ACL HOLDS — reported in the
+        // shape this operation's answer carries, which states each entry's `icmpTypeCode` and
+        // `portRange` as empty elements where the rule has neither
+        // ([`state::created_network_acl_reported`]).
         let Some(network_acl) = store.network_acls.get(&network_acl_id).cloned() else {
             return Err(state::internal_error(
                 "the network ACL just created could not be read back",
             ));
         };
         Ok(CreateNetworkAclOutput {
-            network_acl: Some(network_acl),
+            network_acl: Some(state::created_network_acl_reported(network_acl)),
             // "Unique, case-sensitive identifier to ensure the idempotency of the request.
             // Only returned if a client token was provided in the request"
             // (`CreateNetworkAclResult$ClientToken`): the token the REQUEST carried, echoed,

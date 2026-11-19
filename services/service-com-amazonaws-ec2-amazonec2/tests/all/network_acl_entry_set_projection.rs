@@ -9,17 +9,23 @@
 //! The rule under test: a network ACL's reported `entrySet` is that ACL's whole stored rule
 //! table, projected ONE way — the egress rules first, then the ingress rules, each by
 //! ascending rule number — and every reported entry carries the rule number, protocol, action,
-//! direction and range it was written with. The two sub-structures depend on WHO wrote the
-//! rule and NOT on who wrote it: an entry carries "the ICMP type and code"
+//! direction and range it was written with. The two sub-structures depend on the RULE and not
+//! on who wrote it: an entry carries "the ICMP type and code"
 //! (`NetworkAclEntry$IcmpTypeCode`) and "the range of ports the rule applies to"
-//! (`$PortRange`) only where the rule names one, and NEITHER for a rule whose protocol has no
-//! ports and no ICMP numbers — which is every one of the IMPLICIT entries the service itself
-//! writes onto an ACL (the catch-all deny every ACL ends with, and the allow-everything pair a
-//! VPC's default ACL comes with), because each of them is a rule over every protocol.
+//! (`$PortRange`) only where the rule names one, and a rule whose protocol has no ports and no
+//! ICMP numbers — which is every one of the IMPLICIT entries the service itself writes onto an
+//! ACL (the catch-all deny every ACL ends with, and the allow-everything pair a VPC's default
+//! ACL comes with) — carries neither.
+//!
+//! WHETHER such a member is written as an empty element or left out altogether belongs to the
+//! OPERATION: `CreateNetworkAcl`'s own answer states both as present-and-empty elements,
+//! while every READ of a stored ACL leaves out the members its rules do not carry. Each is
+//! what that operation's own recording shows.
 //!
 //! So the list `CreateNetworkAcl` answers, the list `DescribeNetworkAcls` answers for that
 //! same ACL — named by id, selected by a filter, or listed with the whole store — and the
-//! list the ACL holds after each rule a caller adds or removes are all the SAME list. The
+//! list the ACL holds after each rule a caller adds or removes are all the SAME list of RULES.
+//! The
 //! rows below differ along everything that rule generalises over: whether the ACL is the one
 //! its VPC came with or one a caller created, the direction, the rule number (including each
 //! published bound of the range a caller may write), the protocol (every protocol, TCP, UDP,
@@ -238,8 +244,8 @@ impl Rule {
 }
 
 /// One rule-32767 entry every network ACL ends with, in the direction `egress` names: the
-/// catch-all deny over every protocol and every IPv4 address, an IMPLICIT entry that carries
-/// an empty port range and an empty ICMP type and code.
+/// catch-all deny over every protocol and every IPv4 address, an IMPLICIT entry whose rule
+/// carries no port range and no ICMP type and code.
 fn catch_all(egress: bool) -> ReportedEntry {
     every_protocol_entry(DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER, egress, RULE_ACTION_DENY)
 }
@@ -255,9 +261,9 @@ fn allow_everything(egress: bool) -> ReportedEntry {
 }
 
 /// An entry over every protocol and every IPv4 address — the shape both entries a network ACL
-/// is created with take. Such an entry has no ports and no ICMP numbers, so it reports NEITHER
-/// member: an empty port range would read as a port restriction the rule does not carry, and
-/// that is the same reading a rule a caller writes over every protocol gets.
+/// is created with take. Such an entry has no ports and no ICMP numbers, so a READ of it
+/// reports NEITHER member; the create's own answer states both as empty elements
+/// ([`as_the_create_answers_them`]).
 fn every_protocol_entry(rule_number: i32, egress: bool, rule_action: &str) -> ReportedEntry {
     ReportedEntry {
         rule_number: rule_number.to_string(),
@@ -269,6 +275,20 @@ fn every_protocol_entry(rule_number: i32, egress: bool, rule_action: &str) -> Re
         port_range: None,
         icmp_type_code: None,
     }
+}
+
+/// `entries` as `CreateNetworkAcl`'s own answer states them: each member the rule does not
+/// carry written as a present-but-EMPTY element rather than left out, which is the one
+/// difference between the create's answer and every read of the same stored ACL.
+fn as_the_create_answers_them(entries: &[ReportedEntry]) -> Vec<ReportedEntry> {
+    entries
+        .iter()
+        .map(|entry| ReportedEntry {
+            port_range: entry.port_range.clone().or(Some((None, None))),
+            icmp_type_code: entry.icmp_type_code.clone().or(Some((None, None))),
+            ..entry.clone()
+        })
+        .collect()
 }
 
 /// The entries a network ACL a CALLER created comes with: the catch-all deny in each
@@ -437,18 +457,20 @@ async fn every_reader_projects_the_entries_an_acl_is_created_with_the_same_way()
         assert_every_reader(&router, case, &network_acl_id, vpc_id, &default_entries).await;
     }
 
-    // An ACL a CALLER created: the catch-all deny in each direction and nothing else — and
-    // the create's own answer is the list every reader goes on to report.
+    // An ACL a CALLER created: the catch-all deny in each direction and nothing else — the
+    // create answering each entry's two optional members as empty elements, and every reader
+    // going on to report the same rules with the members those rules do not carry left out.
     for (case, vpc_id) in [
         ("an ACL created in the default VPC", default_vpc.as_str()),
         ("an ACL created in a VPC of its own", made_vpc.as_str()),
     ] {
         let (network_acl_id, created) = create_acl(&router, case, vpc_id).await;
         let expected = created_acl_entries();
+        let answered = as_the_create_answers_them(&expected);
         assert_eq!(
             created.as_slice(),
-            expected.as_slice(),
-            "case {case:?}: CreateNetworkAcl must answer {expected:?}, got {created:?}"
+            answered.as_slice(),
+            "case {case:?}: CreateNetworkAcl must answer {answered:?}, got {created:?}"
         );
         assert_every_reader(&router, case, &network_acl_id, vpc_id, &expected).await;
     }

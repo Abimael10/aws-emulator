@@ -15,8 +15,12 @@
 //!    * `DescribeFpgaImages` makes the SAME answer as for a value that is no AFI id at all:
 //!      it reports on "the AFIs available to you", so it judges the id it was given rather
 //!      than resolving one resource of the account's own Region;
-//!    * `CopyFpgaImage`, `DeleteFpgaImage` and `ResetFpgaImageAttribute`, which act on ONE
-//!      named AFI, answer `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not found.`;
+//!    * `CopyFpgaImage` makes that same answer: its source is named by a REGION and an id
+//!      together, which is an addressing this service resolves only for the AFIs it holds, so
+//!      a source it cannot resolve is an id it cannot read rather than a stored AFI that is
+//!      missing;
+//!    * `DeleteFpgaImage` and `ResetFpgaImageAttribute`, which act on ONE named AFI OF THEIR
+//!      OWN REGION, answer `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not found.`;
 //!    * `DescribeFpgaImageAttribute` answers that same code with EC2's common missing-id
 //!      sentence instead, naming the `fpga-image` resource type.
 //! 3. The two readings are about the ID and not about the operation's subject: the id of a
@@ -91,7 +95,7 @@ fn unreadable_message(fpga_image_id: &str) -> String {
 /// Every operation that resolves an AFI id, with the answer it makes for an id inside the
 /// issued form that resolves to no AFI.
 const RESOLVERS: [(&str, Unresolved); 5] = [
-    ("CopyFpgaImage", Unresolved::NotFoundImageId),
+    ("CopyFpgaImage", Unresolved::Unreadable),
     ("DescribeFpgaImages", Unresolved::Unreadable),
     ("DeleteFpgaImage", Unresolved::NotFoundImageId),
     ("ResetFpgaImageAttribute", Unresolved::NotFoundImageId),

@@ -3,15 +3,17 @@
 //! How this service answers a stack identifier written as a stack's UNIQUE ID — the segment
 //! a stack id (`arn:…:stack/<name>/<unique-id>`) ends in — over the awsQuery wire.
 //!
-//! **The rule every case here holds the service to:** the bare unique id CloudFormation mints
-//! for a stack is one of the forms the service takes as addressing a stack, beside the stack
-//! name and the stack ARN, so such a value reaches the stack LOOKUP — and since only a stack's
-//! name and its whole stack id address a stack, the request is answered as the stack it does
-//! not name (`Stack with id <value> does not exist`). Which hexadecimal character the id begins
-//! with is no part of that decision: the alphabet spans digits and letters, so one id of the
-//! kind is every id of the kind, in either case of hexadecimal and whether the digits are
-//! grouped 8-4-4-4-12 or not. A hexadecimal run that is NOT that id's width or grouping is no
-//! identifier of any form, and earns the constraint refusal instead.
+//! **The rule every case here holds the service to:** which FORMS a stack identifier may take
+//! is the operation's own. Every operation takes the name-or-ARN expression its refusal quotes,
+//! so a unique id LED BY A LETTER is a name run and is resolved everywhere; the operation whose
+//! validator names the member `StackNameOrId` takes one form more — the bare unique id
+//! CloudFormation mints for a stack, whichever hexadecimal character it begins with, in either
+//! case and whether its digits are grouped 8-4-4-4-12 or not — while an operation whose member
+//! is `StackName` refuses a unique id the expression does not describe for its own shape. An
+//! identifier that IS taken as addressing a stack reaches the LOOKUP, and since only a stack's
+//! name and its whole stack id address a stack, it is answered as the stack it does not name
+//! (`Stack with id <value> does not exist`). A hexadecimal run that is NOT a unique id's width
+//! or grouping is no identifier of any form, and earns the constraint refusal everywhere.
 //!
 //! What the identifier check reads is the FORM of the value alone, so each row's answer is
 //! decided by the form and not by the store. The shape of the constraint refusal itself
@@ -37,12 +39,14 @@ const POLICY: &str = r#"{"Statement":[{"Effect":"Allow","Action":"Update:*",
      "Principal":"*","Resource":"*"}]}"#;
 
 /// One operation that takes a stack identifier this service checks itself: the members it
-/// needs besides `StackName`, and whether a request naming a LIVE stack is served (a mutation
-/// is left out of that control, since it would move the stack the other rows read).
+/// needs besides `StackName`, whether a request naming a LIVE stack is served (a mutation
+/// is left out of that control, since it would move the stack the other rows read), and
+/// whether its validator takes the bare unique id as an addressing form.
 struct UniqueIdRow {
     action: &'static str,
     extra: &'static [(&'static str, &'static str)],
     serves_a_live_stack: bool,
+    takes_a_unique_id: bool,
 }
 
 const ROWS: &[UniqueIdRow] = &[
@@ -50,56 +54,77 @@ const ROWS: &[UniqueIdRow] = &[
         action: "ListStackResources",
         extra: &[],
         serves_a_live_stack: true,
+        // The one operation whose validator names the member `StackNameOrId`, which takes a
+        // minted unique id beside the name and the ARN.
+        takes_a_unique_id: true,
     },
     UniqueIdRow {
         action: "DescribeStackResources",
         extra: &[],
         serves_a_live_stack: true,
+        takes_a_unique_id: false,
     },
     UniqueIdRow {
         action: "DescribeStacks",
         extra: &[],
         serves_a_live_stack: true,
+        takes_a_unique_id: false,
     },
     UniqueIdRow {
         action: "GetTemplate",
         extra: &[],
         serves_a_live_stack: true,
+        takes_a_unique_id: false,
     },
     UniqueIdRow {
         action: "DescribeStackResource",
         extra: &[("LogicalResourceId", "First")],
         serves_a_live_stack: true,
+        takes_a_unique_id: false,
     },
     UniqueIdRow {
         action: "DescribeStackEvents",
         extra: &[],
         serves_a_live_stack: true,
+        takes_a_unique_id: false,
     },
     UniqueIdRow {
         action: "GetStackPolicy",
         extra: &[],
         serves_a_live_stack: true,
+        takes_a_unique_id: false,
     },
     UniqueIdRow {
         action: "CancelUpdateStack",
         extra: &[],
         serves_a_live_stack: false,
+        takes_a_unique_id: false,
     },
-    // Two operations that WRITE: a unique id is no identifier for them either, so the rule
-    // holds for the mutating reads of a stack as well as the reporting ones. Neither is
-    // crossed with the live stack, since a write would move the stack the rows above read.
+    // Two operations that WRITE: the rule holds for the mutating reads of a stack as well as
+    // the reporting ones. Neither is crossed with the live stack, since a write would move the
+    // stack the rows above read.
     UniqueIdRow {
         action: "SetStackPolicy",
         extra: &[("StackPolicyBody", POLICY)],
         serves_a_live_stack: false,
+        takes_a_unique_id: false,
     },
     UniqueIdRow {
         action: "UpdateStack",
         extra: &[("TemplateBody", TEMPLATE)],
         serves_a_live_stack: false,
+        takes_a_unique_id: false,
     },
 ];
+
+/// Whether `identifier` is a stack NAME as the expression every operation quotes describes one:
+/// a letter, then letters, digits and hyphens. Written here independently of the service, so
+/// the rows pin the rule and not the code.
+fn is_a_name_run(identifier: &str) -> bool {
+    let mut characters = identifier.chars();
+    characters.next().is_some_and(|first| first.is_ascii_alphabetic())
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
 
 /// A unique id nothing ever minted, in the 8-4-4-4-12 hexadecimal form a stack id ends in and
 /// starting with a DIGIT.
@@ -145,14 +170,14 @@ async fn a_live_stack(name: &str) -> (smithy_server_runtime::MultiServiceRouter,
 }
 
 #[tokio::test]
-async fn a_stack_unique_id_is_resolved_whatever_character_it_begins_with() {
+async fn a_stack_unique_id_is_resolved_where_the_operation_takes_that_form() {
     let (router, stack_id, minted) = a_live_stack("unique-id-live").await;
 
     // The minted id's own leading character is random hexadecimal, so both sides of the
     // character the value BEGINS with are built from it: the same 8-4-4-4-12 value led by a
     // digit and led by a letter. Neither addresses the stack — only a name or a whole stack id
-    // does — so each is resolved and reported as the stack that is not there, in either case
-    // of hexadecimal and with the digits grouped or not.
+    // does — so one the operation TAKES is resolved and reported as the stack that is not
+    // there, while one it does not take is refused for its own shape.
     let digit_led = format!("0{}", &minted[1..]);
     let letter_led = format!("a{}", &minted[1..]);
     let upper = digit_led.to_ascii_uppercase();
@@ -189,16 +214,24 @@ async fn a_stack_unique_id_is_resolved_whatever_character_it_begins_with() {
                 "case {case:?}: expected <Code>ValidationError</Code>, got {body}"
             );
             let message = xml_text(&body, "Message").unwrap_or_default();
-            assert!(
-                message.contains("does not exist") && message.contains(identifier),
-                "case {case:?}: expected the stack-not-found sentence naming {identifier:?}, \
-                 got {message:?}"
-            );
+            if is_a_name_run(identifier) || row.takes_a_unique_id {
+                assert!(
+                    message.contains("does not exist") && message.contains(identifier),
+                    "case {case:?}: expected the stack-not-found sentence naming \
+                     {identifier:?}, got {message:?}"
+                );
+            } else {
+                assert!(
+                    message.contains("validation error")
+                        && message.contains("regular expression pattern"),
+                    "case {case:?}: expected the constraint refusal, got {message:?}"
+                );
+            }
         }
     }
 
-    // ...and the forms that DO address the stack are still served, so admitting the bare
-    // unique id costs none of them.
+    // ...and the forms that DO address the stack are still served, so neither reading costs
+    // any of them.
     for (case, identifier) in [
         ("its name", "unique-id-live"),
         ("its whole stack id", stack_id.as_str()),

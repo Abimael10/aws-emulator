@@ -3022,11 +3022,24 @@ impl Page {
     /// element at all, one a caller emptied, a filter that selects none, and the window a
     /// caller that walked to the end asks for.
     ///
-    /// One copy for EVERY `position`/`limit` collection of this service — the base path
-    /// mappings of a domain name included — so no two listings can disagree about what an
-    /// empty page looks like.
+    /// One copy for every `position`/`limit` collection of this service whose empty page
+    /// carries the member. The collections whose empty page carries NO member report theirs
+    /// through [`Page::reported_held_items`] below.
     pub fn reported_items<Element>(&self, items: Vec<Element>) -> Option<Vec<Element>> {
         Some(items)
+    }
+
+    /// The page of elements for a listing that answers an EMPTY page with no member at all:
+    /// the list while the page holds something, and nothing once it holds nothing — so such
+    /// an answer is the bare object, with no list, no cursor and no page-size echo.
+    ///
+    /// Which of the two readings a listing uses is a property of that LISTING and nothing
+    /// about the page: this service answers an empty page one way for some collections and
+    /// the other way for others, so the two readings live side by side here and each listing
+    /// names the one its own answer is. The base path mappings of a domain name are the
+    /// collection answered this way.
+    pub fn reported_held_items<Element>(&self, items: Vec<Element>) -> Option<Vec<Element>> {
+        (!items.is_empty()).then_some(items)
     }
 }
 

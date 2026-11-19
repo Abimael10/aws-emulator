@@ -3,15 +3,15 @@
 //! How this service words a refusal ABOUT ONE PARTICULAR service level objective, over both
 //! ways a name can be wrong.
 //!
-//! The rule under test: the two ways a name can be wrong are worded differently, because only
-//! one of them is ABOUT a resource:
+//! The rule under test: both ways a name can be wrong are worded with the ONE sentence this
+//! service states about one particular service level objective — the capitalised type name, the
+//! ARN that addresses the objective in single quotes, and a predicate, closed by a period —
+//! and what differs between them is the PREDICATE:
 //!
-//! * a create under a name the store ALREADY HOLDS states that a resource with the same
-//!   identifier is already there, and names no identifier at all — not the name it sent, not
-//!   the ARN of the record that holds it;
-//! * a read of a name the store does NOT hold states the ARN the request addressed, in this
-//!   service's sentence about one particular SLO: the capitalised type name, the ARN in single
-//!   quotes and the predicate for a resource that is not there, closed by a period.
+//! * a create under a name the store ALREADY HOLDS states the ARN of the objective holding that
+//!   name, and the predicate for a resource that is already there;
+//! * a read of a name the store does NOT hold states the ARN the request addressed, and the
+//!   predicate for a resource that is not there.
 //!
 //! The refused create writes nothing, which the round trip below checks by reading the stored
 //! record back unchanged through the ARN the admitted create returned.
@@ -25,7 +25,7 @@
 
 use serde_json::{json, Value};
 
-use crate::refusal_prose::NAME_ALREADY_TAKEN;
+use crate::refusal_prose::name_already_taken;
 use crate::resource_tags::{slo_arn, SLO_RESOURCE_TYPE};
 use crate::slo_evaluation_kind::request_based_sli_config;
 use crate::slo_lifecycle::{call, create, name_path_segment, router, sli_config};
@@ -88,16 +88,17 @@ fn rows() -> Vec<Row> {
 }
 
 /// The sentence a read of an SLO this service does NOT hold is refused with: the type name, the
-/// ARN in single quotes and the predicate for a resource that is not there — the refusal that
-/// IS about one particular resource, unlike the conflict ([`NAME_ALREADY_TAKEN`]).
+/// ARN in single quotes and the predicate for a resource that is not there — the same sentence
+/// the conflict states, under the other predicate
+/// ([`crate::refusal_prose::name_already_taken`]).
 fn name_not_held(arn: &str) -> String {
     format!("{SLO_RESOURCE_TYPE} with arn '{arn}' does not exist.")
 }
 
-/// RULE: the conflict a taken name earns states that the identifier is already in use, and
-/// names neither the name the request sent nor the ARN of the objective that holds it.
+/// RULE: the conflict a taken name earns names the ARN of the objective that holds it, under
+/// the predicate for a resource that is already there.
 #[tokio::test]
-async fn a_taken_name_is_refused_without_naming_the_objective_that_holds_it() {
+async fn a_taken_name_is_refused_naming_the_objective_that_holds_it() {
     for row in rows() {
         let router = router();
         let mut stored = row.stored.clone();
@@ -134,19 +135,15 @@ async fn a_taken_name_is_refused_without_naming_the_objective_that_holds_it() {
             row.case
         );
         let message = answer["Message"].as_str().unwrap_or_default().to_string();
+        let expected = name_already_taken(&stored_arn);
         assert_eq!(
-            message, NAME_ALREADY_TAKEN,
-            "case {}: expected {NAME_ALREADY_TAKEN:?}, got {message:?}",
+            message, expected,
+            "case {}: expected {expected:?}, got {message:?}",
             row.case
         );
 
-        // The conflict is about the identifier, not about a resource: the sentence names
-        // neither the stored record's ARN nor the name the request sent.
-        assert!(
-            !message.contains(stored_arn.as_str()) && !message.contains(row.name.as_str()),
-            "case {}: expected a sentence naming no identifier, got {message:?}",
-            row.case
-        );
+        // The two predicates are what tell the two refusals apart: this one is about an
+        // objective that IS there.
         assert_ne!(
             message,
             name_not_held(&stored_arn),
@@ -187,10 +184,9 @@ async fn a_taken_name_is_refused_without_naming_the_objective_that_holds_it() {
     }
 }
 
-/// RULE, the refusal that IS about a resource: a read of a name the store does not hold states
-/// the ARN the request addressed and the predicate for a resource that is not there — so a
-/// caller that cannot resolve a resource learns which one, and a caller whose identifier is
-/// taken learns no identifier.
+/// RULE, the other predicate: a read of a name the store does not hold states the ARN the
+/// request addressed and the predicate for a resource that is not there — so a caller learns
+/// which objective is meant either way, and the predicate says which way it is wrong.
 ///
 /// The rows are the same name forms, none of them created, so what differs from the test above
 /// is only whether the store holds the name.
@@ -219,7 +215,8 @@ async fn a_name_the_store_does_not_hold_is_refused_under_the_other_predicate() {
             row.case
         );
         assert_ne!(
-            message, NAME_ALREADY_TAKEN,
+            message,
+            name_already_taken(&arn),
             "case {}: expected the sentence for a resource that is not there, got {message:?}",
             row.case
         );

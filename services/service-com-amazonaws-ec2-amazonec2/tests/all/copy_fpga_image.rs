@@ -5,14 +5,15 @@
 //!
 //! The rules under test are:
 //!
-//! 1. A SOURCE AFI THE COPY CANNOT RESOLVE IS REFUSED BY THE MALFORMED-BEFORE-NOT-FOUND
-//!    PAIR every operation that takes an AFI id answers: 400
-//!    `InvalidFpgaImageID.Malformed` with the id kind's `Image ID '<id>' is invalid.` for a
-//!    value that is not an AFI id at all, and 400 `InvalidFpgaImageID.NotFound` with
-//!    `Image ID '<id>' not found.` for an id inside the issued form the store holds no AFI
-//!    under — whether an id names a stored AFI is a fact of the store rather than of the
-//!    id's form, so the two causes are told apart. The same id table is run through the
-//!    operations that resolve one named AFI, which answer it the same way.
+//! 1. A SOURCE AFI THE COPY CANNOT RESOLVE IS REFUSED WITH ONE ANSWER, whatever is wrong
+//!    with it: 400 `InvalidFpgaImageID.Malformed` with the id kind's `Image ID '<id>' is
+//!    invalid.`. The copy's source is named by a REGION and an id together, which is an
+//!    addressing this service resolves only for the AFIs it holds, so a source it cannot
+//!    resolve is reported as an id it cannot READ rather than as a stored AFI that is
+//!    missing. The operations that act on an AFI OF THEIR OWN REGION are the contrast: the
+//!    same id table run through them is answered by the id kind's malformed-before-not-found
+//!    pair, `Image ID '<id>' not found.` under `InvalidFpgaImageID.NotFound` for an id inside
+//!    the issued form that the store holds no AFI under.
 //! 2. `SourceRegion` HAS TO NAME A REGION of the account's partition — "the Region that
 //!    contains the source AFI" — so a value that names none is refused with
 //!    `InvalidParameterValue` naming the value that is no Region's name.
@@ -107,9 +108,11 @@ fn stored_afi_count(engine: &engine::InMemoryEngine) -> usize {
 // RULE 1: a source the copy cannot resolve
 // ---------------------------------------------------------------------------
 
-/// `(case, the source id, the code every operation that resolves one named AFI answers it
-/// with)`. The ids differ along prefix, suffix length and alphabet, and the two accepted id
-/// FORMS (8 and 17 hex digits) are the rows answered as not found.
+/// `(case, the id, the code the operations that resolve one named AFI OF THEIR OWN REGION
+/// answer it with)`. The ids differ along prefix, suffix length and alphabet, and the two
+/// accepted id FORMS (8 and 17 hex digits) are the rows those operations answer as not found
+/// — where the COPY answers every row with the one refusal it has for a source it cannot
+/// resolve.
 fn unresolvable_source_rows() -> [(&'static str, &'static str, &'static str); 9] {
     [
         (
@@ -148,15 +151,14 @@ fn unresolvable_source_rows() -> [(&'static str, &'static str, &'static str); 9]
     ]
 }
 
-/// Every source id `CopyFpgaImage` cannot resolve is refused by the malformed-before-not-found
-/// pair — the id kind's unreadable sentence for a value that is no AFI id, and the not-found
-/// sentence for an id inside the issued form nothing is stored under — and nothing is stored
-/// by a refusal.
+/// Every source id `CopyFpgaImage` cannot resolve is refused with the ONE answer this
+/// operation has for such a source — the id kind's unreadable sentence — and nothing is
+/// stored by a refusal.
 #[tokio::test]
-async fn a_source_the_copy_cannot_resolve_is_refused_malformed_before_not_found() {
+async fn a_source_the_copy_cannot_resolve_is_refused_as_an_id_it_cannot_read() {
     let (router, engine) = emulator();
 
-    for (case, source_fpga_image_id, expected_code) in unresolvable_source_rows() {
+    for (case, source_fpga_image_id, _) in unresolvable_source_rows() {
         let (status, body) = op(&router, "CopyFpgaImage", &copy_params(source_fpga_image_id)).await;
         assert_eq!(
             status, 400,
@@ -164,15 +166,11 @@ async fn a_source_the_copy_cannot_resolve_is_refused_malformed_before_not_found(
         );
         assert_eq!(
             error_code(&body),
-            expected_code,
-            "case {case:?}: expected {expected_code}, got {body}"
+            UNRESOLVABLE_SOURCE_CODE,
+            "case {case:?}: expected {UNRESOLVABLE_SOURCE_CODE}, got {body}"
         );
         let message = unescaped(&element(&body, "Message").unwrap_or_default());
-        let expected_message = if expected_code == UNKNOWN_SOURCE_CODE {
-            format!("Image ID '{source_fpga_image_id}' not found.")
-        } else {
-            format!("Image ID '{source_fpga_image_id}' is invalid.")
-        };
+        let expected_message = format!("Image ID '{source_fpga_image_id}' is invalid.");
         assert_eq!(
             message, expected_message,
             "case {case:?}: expected the message {expected_message:?}, got {message:?}"
@@ -185,6 +183,64 @@ async fn a_source_the_copy_cannot_resolve_is_refused_malformed_before_not_found(
         "a refused copy stores no AFI, got {} stored",
         stored_afi_count(&engine)
     );
+}
+
+/// RULE 1, the Region half: the copy's ONE refusal for an unresolved source is the same
+/// whatever Region the request named it in — and a source the store DOES hold is copied from
+/// either way, so the refusal is about the id and not about the Region member.
+///
+/// The rows differ along the Region named: the one signed for, and three others of the
+/// account's partition.
+#[tokio::test]
+async fn an_unresolved_source_is_refused_the_same_way_in_every_region() {
+    let (router, engine) = emulator();
+    let source = seed_source(&engine, "source-afi");
+    let catalog = regions_in_partition_of(REGION);
+
+    for (case, source_region) in [
+        ("the Region the call is signed for", REGION),
+        ("another Region of the partition", "us-east-1"),
+        ("a Region in another geography", "eu-central-1"),
+        ("a Region whose code has three words", "ap-northeast-3"),
+    ] {
+        assert!(
+            catalog.contains(&source_region),
+            "case {case:?}: {source_region} has to be in the partition's Region catalog, got \
+             {catalog:?}"
+        );
+        let params = vec![
+            p("SourceFpgaImageId", UNKNOWN_FPGA_IMAGE_ID),
+            p("SourceRegion", source_region),
+        ];
+        let (status, body) = op(&router, "CopyFpgaImage", &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            UNRESOLVABLE_SOURCE_CODE,
+            "case {case:?}: expected {UNRESOLVABLE_SOURCE_CODE}, got {body}"
+        );
+        let message = unescaped(&element(&body, "Message").unwrap_or_default());
+        let expected_message = format!("Image ID '{UNKNOWN_FPGA_IMAGE_ID}' is invalid.");
+        assert_eq!(
+            message, expected_message,
+            "case {case:?}: expected the message {expected_message:?}, got {message:?}"
+        );
+
+        // The control, on the same Region: the source the store DOES hold is copied from.
+        let params = vec![
+            p("SourceFpgaImageId", &source),
+            p("SourceRegion", source_region),
+        ];
+        let (status, body) = op(&router, "CopyFpgaImage", &params).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the stored source to be copied, got {status} with body \
+             {body}"
+        );
+    }
 }
 
 /// The pair is the ID's and not one operation's: the operations that resolve an AFI of the

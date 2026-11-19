@@ -290,25 +290,42 @@ async fn the_config_read_refuses_an_id_no_control_holds() {
 
     // Rows: the retired id, the stored id with its last character changed, the stored id in
     // lower case, a token shaped like no id this service mints, and the control's name
-    // rather than its id.
+    // rather than its id. WHICH sentence each earns is decided by whether the value could
+    // ADDRESS a control at all: an id of the form this service issues one in could — one it
+    // issued for a control and retired included — so it is the control reported absent, while
+    // a value of any other form is the identifier this route reports it cannot read.
     let mut flipped: Vec<char> = id.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'A' { 'B' } else { 'A' };
-    let absent: [(&str, String); 5] = [
-        ("an id a delete retired", retired_id.clone()),
+    let absent: [(&str, String, &str); 5] = [
+        (
+            "an id a delete retired",
+            retired_id.clone(),
+            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
+        ),
         (
             "the stored id with one character changed",
             flipped.into_iter().collect(),
+            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
         ),
-        ("the stored id in lower case", id.to_lowercase()),
-        ("a token that is no control id", "not-a-control-id".to_string()),
+        (
+            "the stored id in lower case",
+            id.to_lowercase(),
+            "Id format is invalid",
+        ),
+        (
+            "a token that is no control id",
+            "not-a-control-id".to_string(),
+            "Id format is invalid",
+        ),
         (
             "a control name rather than an id",
             present_name.to_string(),
+            "Id format is invalid",
         ),
     ];
 
-    for (case, candidate) in absent {
+    for (case, candidate, expected) in absent {
         let answer = get_control_config(&router, &candidate).await;
         assert_eq!(
             answer.status, 404,
@@ -321,7 +338,6 @@ async fn the_config_read_refuses_an_id_no_control_holds() {
             "case {case}: expected NoSuchOriginAccessControl for {candidate:?}, got {}",
             answer.raw
         );
-        let expected = NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE;
         assert_eq!(
             answer.root().find_text("Message"),
             Some(expected),

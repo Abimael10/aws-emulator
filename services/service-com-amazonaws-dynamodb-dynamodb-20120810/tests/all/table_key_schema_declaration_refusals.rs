@@ -55,7 +55,8 @@ type OverLengthRow<'r> = (&'r str, &'r str, Elements<'r>);
 /// One row of the definition table: the case, the table it names, the schema it sends, the
 /// attributes the request declares, and the sentence that request earns — `None` where the
 /// sentence is the one rendered over both lists ([`assert_undefined_keys`]), whose order is a
-/// property of the NAMES rather than of the request.
+/// property of the NAMES rather than of the request, and `Some` for the sentences that
+/// interpolate nothing ([`KEY_WITHOUT_DEFINITION`] and the role refusal).
 type DefinitionRow<'r> = (
     &'r str,
     &'r str,
@@ -116,6 +117,11 @@ fn over_length(key_schema: &[(&str, &str)]) -> String {
     )
 }
 
+/// AWS's fixed sentence for a declaration that cannot have one attribute definition per key
+/// element — it carries fewer definitions than the schema has elements — spelled out here
+/// rather than taken from the crate, so a reworded refusal fails this suite.
+const KEY_WITHOUT_DEFINITION: &str = "Invalid KeySchema: Some index key attribute have no definition";
+
 /// AWS's sentence for a key element the request declares no definition for, up to the two
 /// bracketed lists that follow it: the whole key schema at fault, then every declared
 /// attribute name. Stated for a request that declared at least as many definitions as the
@@ -123,12 +129,6 @@ fn over_length(key_schema: &[(&str, &str)]) -> String {
 const UNDEFINED_KEY_PREFIX: &str =
     "One or more parameter values were invalid: Some index key attributes are not defined in \
      AttributeDefinitions. Keys: [";
-
-/// AWS's fixed sentence for a schema the request declared FEWER definitions than it has
-/// elements for: one of them is left with no definition of its own whatever the names say,
-/// and the sentence interpolates nothing.
-const KEY_WITHOUT_DEFINITION: &str = "Invalid KeySchema: Some index key attribute have no \
-                                      definition";
 
 /// Assert `said` is that sentence, over exactly the key schema's attribute names and exactly
 /// the declared ones. The ORDER each list is rendered in is a property of the names, pinned

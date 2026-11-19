@@ -11,23 +11,25 @@
 //! NoSuchOriginAccessControl]`) answers that one code and its 404 for every `Id` it cannot
 //! resolve, so the MESSAGE is all that tells the two conditions apart:
 //!
-//! * a value this account holds as a resource of ANOTHER kind of the one identifier form
-//!   CloudFront draws a distribution, a streaming distribution, an origin access identity and
-//!   an origin access control from was issued for THAT kind — that is the identifier the
-//!   service reports it cannot read, "Id format is invalid";
-//! * every OTHER value the store holds no control under is the control reported ABSENT — "The
-//!   specified origin access control does not exist." — whatever the value's FORM: the
-//!   alphabet, the namespace letter and the minted width are no part of the decision, so a
-//!   lower-cased identifier, a UUID, a bare word and a domain name all read that sentence.
+//! * a value that could ADDRESS an origin access control — written in the form CloudFront
+//!   issues one in, and not one this account issued for another kind of the one identifier
+//!   form a distribution, a streaming distribution, an origin access identity and an origin
+//!   access control share — is the control reported ABSENT, "The specified origin access
+//!   control does not exist.": the control it names is simply not there. An identifier this
+//!   account issued for a control and no longer holds is such a value, because the kind that
+//!   issued an identifier is recorded at its mint and outlives the resource;
+//! * every OTHER value is the identifier the service reports it cannot read, "Id format is
+//!   invalid": one issued for another kind of that shared form, and one written in no form
+//!   this service issues an identifier in at all.
 //!
 //! The rows span what the rule generalises over: the unreadable rows carry the minted
 //! identifiers of TWO other kinds of that form (a distribution's and an origin access
-//! identity's), and the absent rows vary the form of a value nothing answers to — the control's
-//! own identifier with a character changed, an identifier of the form that was never minted, a
-//! public key identifier (a kind outside that form), bodies wider and narrower than the one
-//! this service issues, an unminted namespace letter, a body of digits alone, and five values
-//! written in no alphabet CloudFront mints an identifier in (a minted identifier in lower case,
-//! a UUID, a bare word, a caller reference, a domain name). Every row is driven through all
+//! identity's), a kind of this service drawn from ANOTHER form (a public key), bodies wider
+//! and narrower than the one this service issues, an unminted namespace letter, a body of
+//! digits alone, and five values written in no alphabet CloudFront mints an identifier in (a
+//! minted identifier in lower case, a UUID, a bare word, a caller reference, a domain name);
+//! the absent rows carry the control's own identifier with a character changed and an
+//! identifier of that form that was never minted. Every row is driven through all
 //! four operations, and the live resources are read back afterwards to show the refusals
 //! touched nothing.
 //!
@@ -209,9 +211,14 @@ fn assert_refusal(answer: &Answer, case: &str, message: &str) {
     );
 }
 
-/// The identifiers this account holds as a resource of another kind of the shared form: each
-/// was issued for that kind, so an origin access control route cannot read it.
+/// The identifiers this route cannot read: one issued for another kind of the shared form,
+/// and every value written in no form this service issues an identifier in at all.
 fn issued_for_another_kind(live: &Live) -> Vec<(String, String)> {
+    let held = &live.control_id;
+    let body = &held[1..];
+    let mut short = held.clone();
+    short.pop();
+
     vec![
         (
             "a distribution's own minted identifier".to_string(),
@@ -220,32 +227,6 @@ fn issued_for_another_kind(live: &Live) -> Vec<(String, String)> {
         (
             "an origin access identity's own minted identifier".to_string(),
             live.origin_access_identity_id.clone(),
-        ),
-    ]
-}
-
-/// The values nothing of the shared form answers to, which are therefore the control reported
-/// absent: the rows vary the namespace letter, the body width and the resource kind, and
-/// include a kind of this service whose identifiers are drawn from ANOTHER form (a public key),
-/// which this route is not the reader of.
-fn no_resource_answers_to(live: &Live) -> Vec<(String, String)> {
-    let held = &live.control_id;
-    let body = &held[1..];
-    let mut changed: Vec<char> = held.chars().collect();
-    if let Some(last) = changed.last_mut() {
-        *last = if *last == 'A' { 'B' } else { 'A' };
-    }
-    let mut short = held.clone();
-    short.pop();
-
-    vec![
-        (
-            "the control's own identifier with its last character changed".to_string(),
-            changed.into_iter().collect(),
-        ),
-        (
-            "an identifier of the shared form that was never minted".to_string(),
-            format!("E{}", "0".repeat(body.len())),
         ),
         (
             "a public key identifier, a kind drawn from another form".to_string(),
@@ -271,9 +252,32 @@ fn no_resource_answers_to(live: &Live) -> Vec<(String, String)> {
     ]
 }
 
-/// The values that are written in no identifier alphabet CloudFront issues one in. The form is
-/// no part of this route's decision, so each of them is the control reported ABSENT: the rows
-/// vary HOW the alphabet is broken.
+/// The values that COULD address an origin access control — written in the form this service
+/// issues one in — which no control answers to: each is the control reported ABSENT. The rows
+/// vary how the value came to name no control.
+fn no_resource_answers_to(live: &Live) -> Vec<(String, String)> {
+    let held = &live.control_id;
+    let body = &held[1..];
+    let mut changed: Vec<char> = held.chars().collect();
+    if let Some(last) = changed.last_mut() {
+        *last = if *last == 'A' { 'B' } else { 'A' };
+    }
+
+    vec![
+        (
+            "the control's own identifier with its last character changed".to_string(),
+            changed.into_iter().collect(),
+        ),
+        (
+            "an identifier of the shared form that was never minted".to_string(),
+            format!("E{}", "0".repeat(body.len())),
+        ),
+    ]
+}
+
+/// The values that are written in no identifier alphabet CloudFront issues one in. Such a
+/// value could address no origin access control, so each of them is the identifier this route
+/// reports it cannot READ: the rows vary HOW the alphabet is broken.
 fn outside_the_identifier_alphabet(live: &Live) -> Vec<(String, String)> {
     vec![
         (
@@ -297,7 +301,7 @@ fn outside_the_identifier_alphabet(live: &Live) -> Vec<(String, String)> {
 }
 
 #[tokio::test]
-async fn an_identifier_issued_for_another_kind_of_the_shared_form_is_reported_unreadable() {
+async fn an_identifier_that_could_address_no_origin_access_control_is_unreadable() {
     let router = emulator();
     let live = live(&router).await;
 
@@ -319,11 +323,11 @@ async fn an_identifier_issued_for_another_kind_of_the_shared_form_is_reported_un
     );
 }
 
-/// RULE: the form of an id is no part of the decision — a value written in no alphabet
-/// CloudFront mints an identifier in reads the absent-control sentence like any other id the
-/// store holds no control under.
+/// RULE: the form of an id is what tells the two sentences apart — a value written in no
+/// alphabet CloudFront mints an identifier in could address no control, so it reads the
+/// identifier this route cannot READ.
 #[tokio::test]
-async fn a_value_this_service_issues_no_identifier_in_is_the_absent_control() {
+async fn a_value_this_service_issues_no_identifier_in_is_unreadable() {
     let router = emulator();
     let live = live(&router).await;
 
@@ -335,7 +339,7 @@ async fn a_value_this_service_issues_no_identifier_in_is_the_absent_control() {
             assert_refusal(
                 &answer,
                 &format!("{op:?} with {case} ({id:?})"),
-                NO_SUCH_CONTROL,
+                UNREADABLE_IDENTIFIER,
             );
         }
     }
@@ -348,8 +352,69 @@ async fn a_value_this_service_issues_no_identifier_in_is_the_absent_control() {
     );
 }
 
+/// RULE, over a value this account really DID issue for a control: an identifier a delete
+/// retired could still address a control of this account, so it is the control reported
+/// ABSENT — while the identifier of another kind of the shared form, live or deleted, is the
+/// one this route cannot read. Driven through all four operations addressed by an `Id`.
 #[tokio::test]
-async fn every_other_identifier_the_store_holds_nothing_under_is_the_absent_control() {
+async fn a_deleted_controls_own_identifier_is_the_absent_control() {
+    let router = emulator();
+    let live = live(&router).await;
+
+    // This route's own kind, created and then deleted.
+    let control = table()[0].with_name("the control this test deletes", "oac-readability-dead");
+    let created = create_control(&router, &control.xml()).await;
+    assert_eq!(
+        created.status, 201,
+        "case creating the control to delete: expected HTTP 201, got {} with {}",
+        created.status, created.raw
+    );
+    let dead_control_id = created.root().text_at("Id").unwrap_or_default().to_string();
+    let deleted_control = call(
+        &router,
+        "DELETE",
+        &format!("/{API_VERSION}/origin-access-control/{dead_control_id}"),
+        None,
+        Some(created.header("etag")),
+    )
+    .await;
+    assert_eq!(
+        deleted_control.status, 204,
+        "case deleting the control: expected HTTP 204, got {} with {}",
+        deleted_control.status, deleted_control.raw
+    );
+
+    for op in OPS {
+        for (case, id, message) in [
+            (
+                "a deleted origin access control's own identifier",
+                dead_control_id.as_str(),
+                NO_SUCH_CONTROL,
+            ),
+            (
+                "a live origin access identity's identifier",
+                live.origin_access_identity_id.as_str(),
+                UNREADABLE_IDENTIFIER,
+            ),
+        ] {
+            let answer = op
+                .send(&router, id, &live.control_document, &live.control_etag)
+                .await;
+            assert_refusal(&answer, &format!("{op:?} with {case} ({id:?})"), message);
+        }
+    }
+
+    // And the control the account really holds is still readable at its own identifier.
+    let read = get_control(&router, &live.control_id).await;
+    assert_eq!(
+        read.status, 200,
+        "case the live control: expected it to survive every refusal, got {} with {}",
+        read.status, read.raw
+    );
+}
+
+#[tokio::test]
+async fn an_identifier_that_could_address_a_control_and_names_none_is_the_absent_control() {
     let router = emulator();
     let live = live(&router).await;
 

@@ -20,13 +20,15 @@
 //! expression is quoted unanchored, as the service states it.
 //!
 //! An admitted value is RESOLVED, and one that names no stack is answered as the missing stack
-//! it is ([`super::stack_does_not_exist`] and the forms beside it). The bare unique id a stack
-//! id (`arn:…:stack/<name>/<unique-id>`) ENDS in addresses no stack, and it reaches the lookup
-//! all the same: it is a value CloudFormation itself MINTED for the stack, so it is one of the
-//! forms the service takes as addressing one ([`is_a_minted_unique_id`]). Which character a
-//! hexadecimal id happens to begin with is no part of the decision — one id of a kind is every
-//! id of that kind — so both a letter-led and a digit-led unique id are answered as the stack
-//! they do not name.
+//! it is ([`super::stack_does_not_exist`] and the forms beside it). WHICH forms are admitted is
+//! the OPERATION's own: every operation holds the value to the expression it quotes, and the
+//! one whose validator names the member `StackNameOrId` ([`STACK_NAME_OR_ID_PATH`]) takes one
+//! form more — the bare unique id a stack id (`arn:…:stack/<name>/<unique-id>`) ends in
+//! ([`is_a_minted_unique_id`]) — so there a unique id reaches the lookup and is answered as the
+//! stack it does not name. An operation whose member is `StackName` takes the expression and
+//! nothing besides, so a unique id the expression does not describe (one led by a digit) is
+//! refused there for its own shape, while one it does describe (one led by a letter, which is
+//! a name run) is resolved like any other name.
 //!
 //! ## Why the check lives here and not at the boundary
 //!
@@ -94,15 +96,16 @@ fn stated_expression() -> Option<&'static ::regex::Regex> {
         .as_ref()
 }
 
-/// Whether CloudFormation takes `identifier` as naming a stack at all: whether the WHOLE value
-/// is one of the forms the expression it states ([`STACK_IDENTIFIER_PATTERN`]) describes — a
-/// stack name (a letter followed by letters, digits and hyphens) or a stack ARN — or the bare
-/// unique id CloudFormation mints for a stack ([`is_a_minted_unique_id`]). Such a value is
-/// RESOLVED, so one that names no stack is answered as a missing stack; a value of any other
-/// form is answered for its own shape.
-fn is_an_addressable_form(identifier: &str) -> bool {
+/// Whether CloudFormation takes `identifier` as naming a stack at all, for the operation whose
+/// validator states that identifier at `member_path`: whether the WHOLE value is one of the
+/// forms the expression it states ([`STACK_IDENTIFIER_PATTERN`]) describes — a stack name (a
+/// letter followed by letters, digits and hyphens) or a stack ARN — or, for the operation that
+/// takes one form more, the bare unique id CloudFormation mints for a stack
+/// ([`is_a_minted_unique_id`]). Such a value is RESOLVED, so one that names no stack is
+/// answered as a missing stack; a value of any other form is answered for its own shape.
+fn is_an_addressable_form(member_path: &str, identifier: &str) -> bool {
     stated_expression().is_none_or(|expression| expression.is_match(identifier))
-        || is_a_minted_unique_id(identifier)
+        || (member_path == STACK_NAME_OR_ID_PATH && is_a_minted_unique_id(identifier))
 }
 
 /// How many hexadecimal characters the unique id CloudFormation mints for a stack carries
@@ -117,11 +120,11 @@ const UNIQUE_ID_GROUP_BOUNDARIES: [usize; 4] = [8, 12, 16, 20];
 /// that id written as [`UNIQUE_ID_HEX_DIGITS`] hexadecimal characters, in either case, grouped
 /// 8-4-4-4-12 by hyphens or ungrouped.
 ///
-/// This is a FORM the service takes as addressing a stack beside the name and the ARN, because
-/// it is a value the service itself mints and hands back inside a stack id. The hexadecimal
-/// alphabet spans both digits and letters, so which of the two an id starts with says nothing
-/// about the KIND of value it is: a decision that read the first character would admit some of
-/// the ids this service mints and refuse the rest.
+/// This is the one form BESIDE the name and the ARN that the operation taking `StackNameOrId`
+/// admits ([`is_an_addressable_form`]), because it is a value the service itself mints and hands
+/// back inside a stack id. The hexadecimal alphabet spans both digits and letters, so which of
+/// the two an id starts with says nothing about the KIND of value it is — that is why this form
+/// is read as a whole rather than off its first character.
 fn is_a_minted_unique_id(identifier: &str) -> bool {
     let grouped = UNIQUE_ID_GROUP_BOUNDARIES
         .iter()
@@ -161,7 +164,7 @@ pub fn malformed_identifier(member_path: &str, identifier: &str) -> Option<Strin
         sensitive: false,
     };
     let mut violations: Vec<Violation> = Vec::new();
-    if !is_an_addressable_form(identifier) {
+    if !is_an_addressable_form(member_path, identifier) {
         violations.push(clause(ViolationKind::Pattern(
             STACK_IDENTIFIER_PATTERN.to_string(),
         )));
@@ -203,10 +206,10 @@ mod tests {
 
     /// RULE: the expression CloudFormation states for a stack identifier describes the WHOLE
     /// value, so a value that IS a stack name or a stack ARN is admitted and reaches the
-    /// lookup — as does the bare unique id this service mints for a stack, whichever
-    /// hexadecimal character it begins with — and a value of any other form is refused for
-    /// its own shape; a value breaking BOTH constraints is reported with both clauses, the
-    /// expression first.
+    /// lookup, and a value of any other form is refused for its own shape — with ONE form
+    /// more admitted for the operation whose member is `StackNameOrId`, the bare unique id
+    /// this service mints for a stack, whichever hexadecimal character it begins with. A
+    /// value breaking BOTH constraints is reported with both clauses, the expression first.
     #[test]
     fn an_identifier_is_admitted_by_the_services_own_expression() {
         for admitted in [
@@ -215,22 +218,42 @@ mod tests {
             "Stack9",
             "arn:aws:cloudformation:us-east-1:123456789012:stack/a/0",
             "arn:aws-cn:cloudformation:cn-north-1:123456789012:stack/a/0",
-            // The unique id a stack id ends in, though no stack carries them: a value this
-            // service MINTS, grouped and ungrouped, in either case and whichever hexadecimal
-            // character it opens with. Each is resolved, so each is answered as the stack it
-            // does not name.
+            // A unique id LED BY A LETTER is a name run as the expression describes it, so it
+            // is admitted at every member — grouped, ungrouped and in either case.
             "af2504e0-4f89-11d3-9a0c-0305e82c3301",
             "AF2504E0-4F89-11D3-9A0C-0305E82C3301",
             // A value the whole of which is a name run, though no stack carries it.
             "ae81d159090a7b61985604d0999cb465",
-            "0e81d159-090a-7b61-9856-04d0999cb465",
-            "0E81D159-090A-7B61-9856-04D0999CB465",
-            "0e81d159090a7b61985604d0999cb465",
         ] {
             assert_eq!(
                 malformed_identifier(STACK_NAME_PATH, admitted),
                 None,
                 "case {admitted:?}: expected the identifier to be admitted"
+            );
+        }
+        // The one form the `StackNameOrId` member takes beside those: the bare unique id this
+        // service mints, whichever hexadecimal character it opens with. Each is resolved
+        // there, and refused for its own shape at a `StackName` member when the expression
+        // does not describe it.
+        for digit_led in [
+            "0e81d159-090a-7b61-9856-04d0999cb465",
+            "0E81D159-090A-7B61-9856-04D0999CB465",
+            "0e81d159090a7b61985604d0999cb465",
+        ] {
+            assert_eq!(
+                malformed_identifier(STACK_NAME_OR_ID_PATH, digit_led),
+                None,
+                "case {digit_led:?}: expected a minted unique id to be admitted at \
+                 'stackNameOrId'"
+            );
+            assert_eq!(
+                malformed_identifier(STACK_NAME_PATH, digit_led),
+                Some(format!(
+                    "1 validation error detected: Value '{digit_led}' at 'stackName' failed to \
+                     satisfy constraint: Member must satisfy regular expression pattern: \
+                     {STACK_IDENTIFIER_PATTERN}"
+                )),
+                "case {digit_led:?}: expected the expression clause at 'stackName'"
             );
         }
         for (case, refused) in [
@@ -263,16 +286,18 @@ mod tests {
             ),
             ("an ARN of a partition no stack carries", "arn aws:x"),
         ] {
-            let expected = Some(format!(
-                "1 validation error detected: Value '{refused}' at 'stackName' failed to \
-                 satisfy constraint: Member must satisfy regular expression pattern: \
-                 {STACK_IDENTIFIER_PATTERN}"
-            ));
-            assert_eq!(
-                malformed_identifier(STACK_NAME_PATH, refused),
-                expected,
-                "case {case:?}: expected the expression clause alone"
-            );
+            for member_path in [STACK_NAME_PATH, STACK_NAME_OR_ID_PATH] {
+                let expected = Some(format!(
+                    "1 validation error detected: Value '{refused}' at '{member_path}' failed \
+                     to satisfy constraint: Member must satisfy regular expression pattern: \
+                     {STACK_IDENTIFIER_PATTERN}"
+                ));
+                assert_eq!(
+                    malformed_identifier(member_path, refused),
+                    expected,
+                    "case {case:?} at {member_path:?}: expected the expression clause alone"
+                );
+            }
         }
         let expected = Some(format!(
             "2 validation errors detected: Value '' at 'stackNameOrId' failed to satisfy \

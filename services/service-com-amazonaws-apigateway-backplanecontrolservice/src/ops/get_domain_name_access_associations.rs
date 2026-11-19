@@ -9,8 +9,7 @@
 //! association — one that never created one, one whose last was deleted or rejected, or one
 //! whose `resourceOwner` filter selects none — is answered an EMPTY `items` list, so a
 //! client reads "this private custom domain name has no access association" off a list it
-//! can count rather than off an absent member. That is the one rule every collection of
-//! this service reports its page under ([`crate::state::Page::reported_items`]).
+//! can count rather than off an absent member ([`crate::state::Page::reported_items`]).
 //!
 //! ## Shape of an operation
 //!
@@ -185,9 +184,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         Ok(Paged::new(
             GetDomainNameAccessAssociationsOutput {
-                // Present whatever the page holds, which is the one rule every collection
-                // of this service reports its page under
-                // ([`crate::state::Page::reported_items`]).
+                // Present whatever the page holds, which is how this collection reports
+                // its page ([`crate::state::Page::reported_items`]).
                 items: page.reported_items(items),
                 position: page.next_position.clone(),
             },

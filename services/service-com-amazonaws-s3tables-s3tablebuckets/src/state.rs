@@ -1101,7 +1101,7 @@ pub struct TableLocation {
 /// unbroken run of lowercase hexadecimal characters of exactly that width —
 /// neither an identifier's hyphenated-UUID spelling nor a decimal number, whose
 /// spelling would be as wide as the value it happened to draw. Stated once here,
-/// so every operation that mints a table's token mints one class of value.
+/// so every operation that mints a version token mints one class of value.
 const TOKEN_STAMP_BYTES: usize = 10;
 
 /// Per-service state for com-amazonaws-s3tables-s3tablebuckets. A handler reaches it through [`service_state`].
@@ -1247,12 +1247,12 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
     /// A fresh `versionToken` for a replication configuration — a table
     /// bucket's or a single table's — minted on every write of one.
     ///
-    /// The configuration's token is a value in the id form [`Self::mint_id`]
-    /// lays out, which is the form the recorded responses for these
-    /// sub-resources carry; a TABLE's own token is a different class of value
-    /// ([`Self::mint_version_token`]), so the two are minted apart.
+    /// The same opaque token form a TABLE's own version token takes
+    /// ([`Self::mint_version_token`]), which is the form the recorded responses of
+    /// this service's version tokens carry, minted in its own domain so no two
+    /// tokens of one store collide.
     pub fn mint_replication_version_token(&mut self) -> String {
-        self.mint_id("table-bucket-replication-version")
+        self.mint_opaque_token("table-bucket-replication-version")
     }
 
     /// A fresh id for a table's metadata file, which names the file under the

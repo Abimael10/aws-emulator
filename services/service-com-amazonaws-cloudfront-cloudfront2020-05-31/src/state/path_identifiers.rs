@@ -10,14 +10,13 @@
 //! makes is that resource kind's own recorded contract:
 //!
 //! * the FORM — how much of the way CloudFront writes that kind's identifiers a route reads of
-//!   the value, which is a property of the value alone. The origin access control reads NONE
-//!   of the form, its recorded refusals answering the absent control for a value written in no
-//!   alphabet CloudFront mints an identifier in; the two field-level encryption records read
-//!   the whole form their identifiers are ISSUED in — the record's own namespace letter over a
-//!   body of the issued width ([`super::is_field_level_encryption_config_id`],
+//!   the value, which is a property of the value alone. The two field-level encryption records
+//!   read the whole form their identifiers are ISSUED in — the record's own namespace letter
+//!   over a body of the issued width ([`super::is_field_level_encryption_config_id`],
 //!   [`super::is_field_level_encryption_profile_id`],
-//!   [`super::unresolved_field_level_encryption_config`]); the distribution reads the whole
-//!   form its ids are minted in ([`super::is_distribution_id`] and its neighbours);
+//!   [`super::unresolved_field_level_encryption_config`]); the distribution and the origin
+//!   access control read the whole form their ids are minted in
+//!   ([`super::is_distribution_id`] and its neighbours);
 //! * which KIND an identifier belongs to, for the family CloudFront draws from ONE form. A
 //!   distribution, a streaming distribution, an origin access identity and an origin access
 //!   control all carry an `E` followed by an identifier body of the same width and alphabet,
@@ -118,18 +117,14 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// The modelled `NoSuchOriginAccessControl` an operation ADDRESSED by an origin access
     /// control `Id` answers an identifier it could not resolve.
     ///
-    /// This route reads NO form of the value: the `Id` is a plain `string` in the model, and the
-    /// recorded refusal of a control the account does not hold answers the ABSENT-control
-    /// sentence for an identifier written in no alphabet CloudFront mints one in, so the
-    /// alphabet, the namespace letter and the width are no part of the decision. The only thing
-    /// read is the KIND, out of the store: a value this account holds as another kind of the
-    /// `E`-form family was issued for THAT kind and is the identifier this operation reports it
-    /// cannot read, while every other value it cannot resolve is the control that is absent.
+    /// The same two halves every other kind of this service reads
+    /// ([`Self::addresses`]): a value that could ADDRESS an origin access control — written
+    /// in the form CloudFront issues one in, and not one this account holds as another kind
+    /// of the `E`-form family — is a control that is simply not there, so it earns the
+    /// absent-control sentence; every other value is the identifier this operation reports it
+    /// cannot read.
     pub fn unresolved_origin_access_control(&self, id: &str) -> NoSuchOriginAccessControl {
-        let addresses_a_control = self
-            .entity_kind(id)
-            .is_none_or(|held| held == EntityKind::OriginAccessControl);
-        if addresses_a_control {
+        if self.addresses(EntityKind::OriginAccessControl, id) {
             no_such_origin_access_control()
         } else {
             NoSuchOriginAccessControl {

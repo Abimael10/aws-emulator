@@ -141,11 +141,12 @@ pub(crate) fn assert_canonical_uuid(value: &str, what: &str, case: &str) {
 /// read from the crate under test, so this suite pins the form itself.
 pub(crate) const VERSION_TOKEN_CHARACTERS: usize = 20;
 
-/// Assert `value` is a token in the form this service mints a table's `versionToken` in:
-/// exactly [`VERSION_TOKEN_CHARACTERS`] lowercase hexadecimal characters, unbroken — no
-/// hyphen or other separator, no uppercase character, and the same width whatever the
-/// token's value — and so neither a hyphenated UUID nor a decimal number nor any other
-/// value carrying structure a client could read something out of.
+/// Assert `value` is a token in the form this service mints a `versionToken` in — a table's
+/// own and a replication configuration's alike: exactly [`VERSION_TOKEN_CHARACTERS`]
+/// lowercase hexadecimal characters, unbroken — no hyphen or other separator, no uppercase
+/// character, and the same width whatever the token's value — and so neither a hyphenated
+/// UUID nor a decimal number nor any other value carrying structure a client could read
+/// something out of.
 pub(crate) fn assert_table_version_token(value: &str, what: &str, case: &str) {
     let characters = value.chars().count();
     let lowercase_hex = !value.is_empty()

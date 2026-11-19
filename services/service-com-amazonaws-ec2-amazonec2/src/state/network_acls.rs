@@ -167,6 +167,38 @@ pub fn network_acl_entry_already_exists<E>(rule_number: i32) -> Scaffolded<E> {
     )
 }
 
+/// `network_acl` as the CREATE answers it, where a READ of the same record omits two of each
+/// entry's members.
+///
+/// `CreateNetworkAcl`'s own answer carries every entry's `icmpTypeCode` and `portRange` as
+/// PRESENT-AND-EMPTY elements for a rule that states no ICMP numbers and no ports — which the
+/// implicit catch-all deny entries an ACL is created with are — while a read of a stored ACL
+/// reports only the members its rules carry ([`reported_network_acl_entry`]). The two answers
+/// are each what their own recording shows, so the presence of those elements is a fact of
+/// the OPERATION answering rather than of the entry: a client deserializing the create's
+/// answer finds the elements it expects, and one reading a stored ACL finds the members the
+/// rules really have.
+///
+/// The ONE place the create's shape is applied, so the create and its `ClientToken` replay
+/// cannot answer one ACL two ways.
+pub fn created_network_acl_reported(
+    mut network_acl: crate::state::NetworkAcl,
+) -> crate::state::NetworkAcl {
+    if let Some(entries) = network_acl.entries.as_mut() {
+        for entry in entries.iter_mut() {
+            entry.icmp_type_code.get_or_insert(IcmpTypeCode {
+                r#type: None,
+                code: None,
+            });
+            entry.port_range.get_or_insert(PortRange {
+                from: None,
+                to: None,
+            });
+        }
+    }
+    network_acl
+}
+
 /// The word AWS names a network ACL rule's direction with: an `egress` rule or an `ingress`
 /// rule — "Each network ACL has a set of numbered ingress rules and a separate set of
 /// numbered egress rules" (`CreateNetworkAclEntry`), and a refusal about one entry names

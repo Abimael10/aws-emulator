@@ -28,10 +28,9 @@ use crate::kafka_harness::{Emulator, Reply};
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create whose body names BOTH cluster types: the sentence it refuses a
-/// selection of more than one cluster type with.
-const ONE_CLUSTER_TYPE_MESSAGE: &str =
-    "You can specify only one cluster type, either provisioned or serverless.";
+/// What MSK answers a create whose body names BOTH cluster types: the sentence it states
+/// about a body it will not read, the two members being alternatives rather than a pair.
+const ONE_CLUSTER_TYPE_MESSAGE: &str = "Invalid request body";
 
 /// A `provisioned` block asking for `brokers` brokers.
 fn provisioned(brokers: u64) -> Value {

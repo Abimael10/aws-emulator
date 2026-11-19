@@ -8,14 +8,15 @@
 //!
 //! Three rules this handler keeps:
 //!
-//! 1. a source AFI this copy cannot resolve is refused by the malformed-before-not-found
-//!    PAIR every operation that takes an AFI id answers: 400 `InvalidFpgaImageID.Malformed`
-//!    naming the id for a value that is not an AFI id at all
-//!    ([`crate::state::invalid_fpga_image_id_malformed`]), read before there is anything to
-//!    look up, and 400 `InvalidFpgaImageID.NotFound`
-//!    ([`crate::state::invalid_fpga_image_id_not_found`]) for an id inside the issued form
-//!    this store holds no AFI under — the reading `DeleteFpgaImage` and
-//!    `ResetFpgaImageAttribute` give an AFI id of their own Region;
+//! 1. a source AFI this copy cannot resolve is refused with ONE answer, whatever is wrong
+//!    with it: 400 `InvalidFpgaImageID.Malformed` naming the id
+//!    ([`crate::state::invalid_fpga_image_id_malformed`]). The copy's source is named by a
+//!    REGION and an id together (`CopyFpgaImageRequest$SourceRegion` and
+//!    `$SourceFpgaImageId`), which is an addressing this service resolves only for the AFIs
+//!    it holds, so a source it cannot resolve is reported as an id it cannot READ rather than
+//!    as a stored AFI that is missing — unlike the operations that act on an AFI OF THEIR OWN
+//!    REGION (`DeleteFpgaImage`, `ResetFpgaImageAttribute`), which tell the two apart with the
+//!    malformed-before-not-found pair of the id kind;
 //! 2. "The Region that contains the source AFI" (`CopyFpgaImageRequest$SourceRegion`) has
 //!    to name a Region of the account's partition, so a value that names no Region is
 //!    refused with `InvalidParameterValue` rather than copied from. It is VALIDATED ONLY:
@@ -121,16 +122,18 @@ impl From<CopyFpgaImageErrorModeled> for CopyFpgaImageError {
     }
 }
 
-/// Refuse a copy whose source id is not an AFI id AT ALL: HTTP 400
+/// Refuse a copy whose source id this call cannot RESOLVE: HTTP 400
 /// `InvalidFpgaImageID.Malformed`, naming the id the request sent.
 ///
-/// The FIRST half of the malformed-before-not-found pair every operation that takes an AFI id
-/// answers: a value outside the issued form names no AFI, so it is refused before there is
-/// anything to look up, and an id INSIDE that form this store holds no AFI under is answered
-/// with the second half ([`crate::state::invalid_fpga_image_id_not_found`]) instead — the
-/// reading `DeleteFpgaImage` and `ResetFpgaImageAttribute` give an AFI id, which a source id
-/// is no different from: whether an id names a stored AFI is a fact of the store and not of
-/// the id's form, so the two causes are told apart as AWS tells them apart.
+/// The copy's ONE answer for a source it cannot resolve, whatever is wrong with it: a value
+/// outside the issued form, read before there is anything to look up, and an id inside that
+/// form that resolves to no AFI. The copy's source is named by a REGION and an id together,
+/// an addressing this service resolves only for the AFIs it holds, so an unresolved source is
+/// an id this call cannot read rather than a stored AFI that is missing — which is what
+/// separates this operation from the ones that act on an AFI OF THEIR OWN REGION
+/// (`DeleteFpgaImage`, `ResetFpgaImageAttribute`), where an id inside the issued form that
+/// the store holds no AFI under is answered `InvalidFpgaImageID.NotFound`
+/// ([`crate::state::invalid_fpga_image_id_not_found`]).
 ///
 /// What it answers with is the one [`crate::state::invalid_fpga_image_id_malformed`] every
 /// unreadable-AFI refusal of this service words — the code and the `Image ID '<id>' is
@@ -138,17 +141,6 @@ impl From<CopyFpgaImageErrorModeled> for CopyFpgaImageError {
 /// copy path cannot word an unreadable AFI id a second way.
 fn unresolvable_source_fpga_image_id(fpga_image_id: &str) -> CopyFpgaImageError {
     crate::state::invalid_fpga_image_id_malformed(fpga_image_id)
-}
-
-/// Refuse a copy whose source id IS an AFI id and names no AFI of this store: HTTP 400
-/// `InvalidFpgaImageID.NotFound`, naming the id the request sent.
-///
-/// The second half of that pair, worded by the one
-/// [`crate::state::invalid_fpga_image_id_not_found`] every missing-AFI refusal of this
-/// service answers — the code and the `Image ID '<id>' not found.` sentence — so no reader
-/// of a missing AFI words it a second way.
-fn unknown_source_fpga_image_id(fpga_image_id: &str) -> CopyFpgaImageError {
-    crate::state::invalid_fpga_image_id_not_found(fpga_image_id)
 }
 
 /// The `CopyFpgaImage` operation.
@@ -288,17 +280,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The copy's source is an AFI of this account's store, which is keyed by AFI id
-        // alone — "an AFI carries no Region member of its own", so nothing about resolving
-        // one depends on a Region: the `SourceRegion` checked above is validated, not
-        // resolved against, since this emulator keeps no per-Region AFI store. An id the
-        // store holds no AFI under is an id that names nothing rather than an id that cannot
-        // be read, so it earns the NOT-FOUND half of the pair
-        // ([`unknown_source_fpga_image_id`]) — the form check above has already answered
-        // every value outside the issued form with the malformed half.
+        // alone — "an AFI carries no Region member of its own", so resolving one reads no
+        // Region: the store holds the AFIs of the Region this call was signed for, and the
+        // `SourceRegion` checked above is validated rather than resolved against.
+        //
+        // A source this call cannot resolve earns the ONE refusal this operation answers for
+        // such a source ([`unresolvable_source_fpga_image_id`]), the same one the form check
+        // above answers every value outside the issued form with: the source is named by a
+        // Region and an id together, so an id that resolves to no AFI of this store is an id
+        // this call cannot read rather than a stored AFI that is missing.
         let source = store
             .fpga_images
             .get(&input.source_fpga_image_id)
-            .ok_or_else(|| unknown_source_fpga_image_id(&input.source_fpga_image_id))?
+            .ok_or_else(|| unresolvable_source_fpga_image_id(&input.source_fpga_image_id))?
             .clone();
 
         // "The name for the new AFI. The default is the name of the source AFI"

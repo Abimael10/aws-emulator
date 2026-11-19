@@ -18,17 +18,14 @@
 //! asserted here are the ones no other suite pins to that form:
 //!
 //! * a `ListNamespaces` row's `namespaceId`;
-//! * the `versionToken` of a table bucket's replication configuration, both the one the
-//!   first `PutTableBucketReplication` mints and the one a conditional re-put advances it
-//!   to;
 //! * the table id the table's `warehouseLocation` is named for, and the metadata-file id
 //!   inside its `metadataLocation`, as `GetTable` and `GetTableMetadataLocation` report
 //!   them.
 //!
-//! A TABLE's own `versionToken` is NOT one of them: it is an opaque token rather than an
-//! identifier, minted in the token form `wire_forms.rs` states
-//! ([`assert_table_version_token`]), which is what the read of the table's metadata
-//! location is pinned to below.
+//! A VERSION TOKEN is NOT one of them — neither a table's own nor a replication
+//! configuration's: it is an opaque token rather than an identifier, minted in the token
+//! form `wire_forms.rs` states ([`assert_table_version_token`]), which the read of the
+//! table's metadata location and the two replication puts below are pinned to.
 //!
 //! The `id` of a table bucket's metrics configuration is NOT one of them: that
 //! configuration covers the whole bucket and the service names it with a fixed
@@ -423,7 +420,7 @@ async fn a_configuration_read_reports_canonical_uuid_identifiers() {
             .await;
         assert_eq!(put.status, 200, "case {case:?}: PutTableBucketReplication: {put:?}");
         let token = put.text("versionToken");
-        assert_canonical_uuid(&token, "a replication configuration's versionToken", case);
+        assert_table_version_token(&token, "a replication configuration's versionToken", case);
         let read = emulator
             .get_table_bucket_replication(fixture.region, &bucket_arn)
             .await;
@@ -454,7 +451,7 @@ async fn a_configuration_read_reports_canonical_uuid_identifiers() {
             "case {case:?}: the conditional PutTableBucketReplication: {advanced:?}"
         );
         let advanced_token = advanced.text("versionToken");
-        assert_canonical_uuid(
+        assert_table_version_token(
             &advanced_token,
             "the versionToken a conditional replication put advances to",
             case,

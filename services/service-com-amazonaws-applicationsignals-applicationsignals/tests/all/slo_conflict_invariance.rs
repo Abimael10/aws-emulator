@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The INVARIANCE of the taken-name conflict: one sentence shape for every refused create.
+//! The INVARIANCE of the taken-name conflict: one sentence SHAPE for every refused create.
 //!
 //! The rule under test: a create whose `Name` is already stored is refused
-//! `ConflictException` with this service's fixed sentence for a taken identifier — "A resource
-//! with the same identifier already exists" — which has no variable part at all. So the
-//! message a client reads carries nothing of the REFUSED request: not its description, not its
-//! service level indicator, not the goal or the tags it sent — and nothing of the record that
-//! holds the name either.
+//! `ConflictException` with the one sentence this service states about one particular
+//! objective — the type name, the objective's ARN in single quotes and the predicate for a
+//! resource that is already there — whose only variable part is that ARN. So the message a
+//! client reads carries nothing else of the REFUSED request: not its description, not its
+//! service level indicator, not the goal or the tags it sent.
 //!
 //! Where [`super::refusal_prose`] pins the WORDING of that sentence, this suite pins its
 //! invariance: a table of refused creates that differ in everything a conflict could have
-//! been worded from must read the same sentence, and nothing of the refused body or of the
-//! stored record may appear in it. The rows differ along the name's form (the character classes
+//! been worded from must read the same sentence about the same objective, and nothing of the
+//! refused body may appear in it. The rows differ along the name's form (the character classes
 //! the modelled `ServiceLevelObjectiveName` pattern `^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$`
 //! admits, including its shortest name), along which SLI member the stored record and the
 //! refused request carry, and along the rest of the refused body.
@@ -22,7 +22,7 @@
 
 use serde_json::{json, Value};
 
-use crate::refusal_prose::{assert_name_already_taken, NAME_ALREADY_TAKEN};
+use crate::refusal_prose::{assert_name_already_taken, name_already_taken};
 use crate::slo_evaluation_kind::request_based_sli_config;
 use crate::slo_lifecycle::{call, create, name_path_segment, router, sli_config};
 
@@ -76,9 +76,9 @@ fn rows() -> Vec<Row> {
 }
 
 /// RULE: every refused create reads the one sentence about the record that holds the name,
-/// and nothing of the refused request reaches it.
+/// and nothing else of the refused request reaches it.
 #[tokio::test]
-async fn every_taken_identifier_refusal_reads_one_fixed_sentence() {
+async fn every_taken_identifier_refusal_reads_one_sentence_about_the_stored_record() {
     let mut messages: Vec<(&str, String, String)> = Vec::new();
 
     for row in rows() {
@@ -111,9 +111,9 @@ async fn every_taken_identifier_refusal_reads_one_fixed_sentence() {
             row.case
         );
         let message = answer["Message"].as_str().unwrap_or_default().to_string();
-        assert_name_already_taken(row.case, &message);
-        // Nothing of the REFUSED request is in the sentence, and no identifier either.
-        for withheld in ["a different description", "95", "team", stored_arn.as_str()] {
+        assert_name_already_taken(row.case, &message, &stored_arn);
+        // Nothing of the REFUSED request is in the sentence beside the objective's ARN.
+        for withheld in ["a different description", "95", "team"] {
             assert!(
                 !message.contains(withheld),
                 "case {}: expected a sentence carrying no {withheld:?}, got {message:?}",
@@ -154,10 +154,11 @@ async fn every_taken_identifier_refusal_reads_one_fixed_sentence() {
         );
     }
 
-    // One sentence over every row, byte for byte.
-    for (case, _stored_arn, message) in &messages {
+    // One sentence over every row, byte for byte, about that row's own objective.
+    for (case, stored_arn, message) in &messages {
+        let expected = name_already_taken(stored_arn);
         assert_eq!(
-            message, NAME_ALREADY_TAKEN,
+            message, &expected,
             "case {case}: expected every refused create to read one sentence, got {message:?}"
         );
     }

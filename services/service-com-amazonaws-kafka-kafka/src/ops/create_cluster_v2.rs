@@ -133,19 +133,17 @@ const CLUSTER_TYPE_MEMBER: &str = "clusterType";
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create whose body names BOTH cluster types: one fixed sentence,
-/// stating that only one of the two kinds may be asked for and naming nothing of the
-/// request.
+/// What MSK answers a create whose body names BOTH cluster types: the fixed sentence it
+/// states about a body it will not read, naming nothing of the request.
 ///
-/// A body naming BOTH cluster types describes two different clusters, so there is no
-/// member a caller could repair on its own — either of them is a cluster MSK would
-/// make — and the refusal names no `invalidParameter`
-/// ([`one_cluster_type_only`]), where a create naming NEITHER blames
-/// the cluster-type parameter the request left unset ([`NO_CLUSTER_TYPE_MESSAGE`]). The
-/// two answers differ in both message and `invalidParameter`, so a client can tell the
-/// two input errors apart.
-const ONE_CLUSTER_TYPE_MESSAGE: &str =
-    "You can specify only one cluster type, either provisioned or serverless.";
+/// The two cluster-type members are ALTERNATIVES, so a body carrying both describes two
+/// different clusters and is no create MSK can read at all: the refusal is taken on the body
+/// before any member is validated, which is why it names neither member and carries no
+/// `invalidParameter` ([`unreadable_cluster_body`]). A create naming NEITHER kind is a body
+/// MSK does read — it simply makes no selection — so that one blames the cluster-type
+/// parameter the request left unset ([`NO_CLUSTER_TYPE_MESSAGE`]). The two answers differ in
+/// both message and `invalidParameter`, so a client can tell the two input errors apart.
+const UNREADABLE_BODY_MESSAGE: &str = "Invalid request body";
 
 /// The member a serverless body carries its VPC configurations — and so the
 /// subnets each one is reached through — in, as the wire spells it.
@@ -252,10 +250,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (Some(request), None) => ClusterBody::Provisioned(Box::new(request)),
             (None, Some(request)) => ClusterBody::Serverless(request),
             // A body naming BOTH kinds asks for two clusters at once, which is no
-            // create MSK can read: it refuses the SELECTION, in the one sentence it
-            // words a body that asks for more than one cluster type and with no member
-            // named ([`one_cluster_type_only`]).
-            (Some(_), Some(_)) => return Err(one_cluster_type_only()),
+            // create MSK can READ: it refuses the BODY, in the one sentence it states about
+            // a body it will not read and with no member named
+            // ([`unreadable_cluster_body`]).
+            (Some(_), Some(_)) => return Err(unreadable_cluster_body()),
             // A body naming NEITHER kind names no cluster type at all, and either
             // member would have named one, so the refusal blames the abstract
             // parameter MSK names rather than one of the two alternatives.
@@ -613,14 +611,13 @@ fn bad_request(parameter: &str, message: String) -> CreateClusterV2Error {
 }
 
 /// Refuse a create whose body names BOTH cluster types: the modeled
-/// `BadRequestException` carrying MSK's one sentence for a body that asks for more than one
-/// cluster type ([`ONE_CLUSTER_TYPE_MESSAGE`]) and NO `invalidParameter`, because the
-/// decision is taken on the SELECTION the request carried rather than on one member a caller
-/// could repair on its own.
-fn one_cluster_type_only() -> CreateClusterV2Error {
+/// `BadRequestException` carrying MSK's one sentence for a body it will not read
+/// ([`UNREADABLE_BODY_MESSAGE`]) and NO `invalidParameter`, because the decision is taken on
+/// the BODY the request carried rather than on one member a caller could repair on its own.
+fn unreadable_cluster_body() -> CreateClusterV2Error {
     CreateClusterV2ErrorModeled::BadRequestException(BadRequestException {
         invalid_parameter: None,
-        message: Some(ONE_CLUSTER_TYPE_MESSAGE.to_string()),
+        message: Some(UNREADABLE_BODY_MESSAGE.to_string()),
     })
     .into()
 }

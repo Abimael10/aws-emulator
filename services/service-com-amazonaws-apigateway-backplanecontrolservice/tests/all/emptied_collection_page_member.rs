@@ -14,9 +14,10 @@
 //!
 //! The rule, asserted over a TABLE of collections rather than one listing: a collection
 //! emptied of its last element answers with the page member (`item` on the wire) as the
-//! EMPTY list, and with neither a cursor nor a page-size echo beside it — for every
-//! collection of this service, the base path mappings of a domain name included
-//! ([`empty_page_body`]). The DEPLOYMENTS collection is asserted the same way by
+//! EMPTY list, and with neither a cursor nor a page-size echo beside it — except for the
+//! collections whose empty page carries no member at all, which answer the bare JSON object
+//! ([`empty_page_body`], which is where the two are told apart: it is a property of the
+//! LISTING, not of the page). The DEPLOYMENTS collection is asserted the same way by
 //! `crate::deployment_collection`, which owns it.
 //!
 //! Each row reaches the empty collection by DELETING the one element it created, not by
@@ -177,15 +178,25 @@ async fn emptied(gateway: &Gateway, collection: &str) -> String {
     }
 }
 
-/// The whole body `collection` answers once it holds no element.
+/// The collections of this service whose empty page carries NO member at all, listed by the
+/// operation that lists each: such a listing answers the bare JSON object.
 ///
-/// EVERY collection of this service reports its page member as the empty list — "the current
-/// page of elements from this collection" is a list a client counts — and nothing beside it:
-/// no `item` of any element, no cursor and no page-size echo.
+/// Every other collection of this service answers an empty page with its page member as the
+/// empty list, so which of the two a listing answers is a property of that LISTING rather
+/// than of the page ([`empty_page_body`]).
+const EMPTY_PAGE_CARRIES_NO_MEMBER: &[&str] = &["GetBasePathMappings"];
+
+/// The whole body `collection` answers once it holds no element: the page member as the
+/// EMPTY list — "the current page of elements from this collection" is a list a client
+/// counts — and nothing beside it, no cursor and no page-size echo; or the bare object for
+/// the collections whose empty page carries no member at all
+/// ([`EMPTY_PAGE_CARRIES_NO_MEMBER`]).
 ///
 /// `pub(crate)` so the sibling `collection_empty_page_member` suite reads the same spelling.
 pub(crate) fn empty_page_body(collection: &str) -> Value {
-    let _ = collection;
+    if EMPTY_PAGE_CARRIES_NO_MEMBER.contains(&collection) {
+        return json!({});
+    }
     json!({ "item": [] })
 }
 

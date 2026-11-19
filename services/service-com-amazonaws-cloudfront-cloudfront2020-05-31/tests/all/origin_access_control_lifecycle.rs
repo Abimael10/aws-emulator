@@ -495,21 +495,20 @@ async fn create_persists_the_configuration_every_read_then_reports() {
         .first()
         .map(|(_, id)| id.clone())
         .unwrap_or_else(|| panic!("the table must create at least one control"));
-    // Each row is an id no control holds: every one earns the absent-control sentence, the FORM
-    // of the value being no part of the decision.
+    // Each row is an id no control holds. WHICH sentence it earns is decided by whether the
+    // value could ADDRESS a control at all: an id of the form this service issues one in
+    // could, so it is the control reported absent, while a value of any other form is the
+    // identifier this route reports it cannot read.
     for (id, expected) in [
         ("E1AAAAAAAAAAAA", NO_SUCH_CONTROL_MESSAGE),
-        ("not-an-id", NO_SUCH_CONTROL_MESSAGE),
-        ("0", NO_SUCH_CONTROL_MESSAGE),
+        ("not-an-id", "Id format is invalid"),
+        ("0", "Id format is invalid"),
         (
             distribution_id.to_lowercase().as_str(),
-            NO_SUCH_CONTROL_MESSAGE,
+            "Id format is invalid",
         ),
-        ("W1AAAAAAAAAAAA", NO_SUCH_CONTROL_MESSAGE),
-        (
-            "00000000-0000-0000-0000-000000000000",
-            NO_SUCH_CONTROL_MESSAGE,
-        ),
+        ("W1AAAAAAAAAAAA", "Id format is invalid"),
+        ("00000000-0000-0000-0000-000000000000", "Id format is invalid"),
     ] {
         let missing = get_control(&router, id).await;
         assert_eq!(

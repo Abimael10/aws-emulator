@@ -59,9 +59,9 @@ const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
 /// What MSK answers a create whose body names BOTH cluster types: the fixed sentence it
-/// words a selection of more than one cluster type in, which names no member at all.
-const ONE_CLUSTER_TYPE_MESSAGE: &str =
-    "You can specify only one cluster type, either provisioned or serverless.";
+/// states about a body it will not read, which names no member at all — the two cluster-type
+/// members are alternatives, so a body carrying both is no create it can read.
+const ONE_CLUSTER_TYPE_MESSAGE: &str = "Invalid request body";
 
 /// What MSK answers a request whose `CurrentVersion` is not a version token at all.
 const INVALID_CURRENT_VERSION_MESSAGE: &str = "Invalid parameter currentVersion.";

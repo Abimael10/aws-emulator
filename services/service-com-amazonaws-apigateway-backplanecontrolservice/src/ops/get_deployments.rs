@@ -7,7 +7,7 @@
 //! The page member is reported whatever the page holds: an api that holds no deployment is
 //! answered an EMPTY `items` list — a client reads "nothing is deployed" off a list it can
 //! count rather than off an absent member — which is what
-//! [`crate::state::Page::reported_items`] reports for every collection of this service.
+//! [`crate::state::Page::reported_items`] reports for this collection.
 //!
 //! ## Shape of an operation
 //!
@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         Ok(Paged::new(
             GetDeploymentsOutput {
-                // The page member is reported whatever the page holds (the one shared
+                // The page member is reported whatever the page holds (the shared
                 // [`crate::state::Page::reported_items`]), so an api that holds no
                 // deployment is answered the EMPTY list rather than no member at all.
                 items: page.reported_items(items),
