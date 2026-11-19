@@ -31,6 +31,15 @@
 //!    every service in this tree refuses an unauthorized request with, so two services handed
 //!    the same documents answer alike and word the refusal alike.
 //!
+//! A request also carries the CONDITION KEYS it publishes a value about
+//! ([`authorize_caller_with_conditions`]): the values of its own input a statement's `Condition`
+//! element is written over, which is how a grant narrowed to one of them covers only the calls
+//! that carry it. A key the operation MODELS travels whether or not the request named a value
+//! for it ([`::service_common::iam_authorization::Request::with_published_keys`]), so a
+//! statement conditioned on a value the request omitted is decided on that absence rather than
+//! left undecidable — which is what makes a grant written over such a key constrain the call
+//! that supplies none.
+//!
 //! The resource is the ARN the REQUEST addresses, built from the request alone, so the
 //! decision does not depend on whether that resource exists — which is also what keeps a
 //! refused call from telling an unauthorized caller what the account holds. A request that
@@ -88,16 +97,44 @@ pub fn authorize_caller<Eng: Send + Sync + 'static>(
     operation: &str,
     resource: &str,
 ) -> Result<(), AccessDeniedException> {
+    authorize_caller_with_conditions(engine, ctx, operation, resource, &[], &[])
+}
+
+/// [`authorize_caller`], for an operation that publishes CONDITION KEYS about its own request.
+///
+/// `context` are the `(key, value)` pairs the request carries a value for, and `published` the
+/// keys the operation MODELS — every key it would publish a value for, named whether or not
+/// this request supplied one, which is what lets a statement conditioned on a key the request
+/// omitted be decided on that absence instead of staying undecidable (see the module docs).
+/// Both are empty for the operations that publish none, which is what [`authorize_caller`]
+/// asks.
+pub fn authorize_caller_with_conditions<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    resource: &str,
+    context: &[(String, String)],
+    published: &[&str],
+) -> Result<(), AccessDeniedException> {
     let action = format!("{ACTION_PREFIX}:{operation}");
-    authorize_action(&caller(engine, ctx), &action, resource)
+    authorize_action(
+        &caller(engine, ctx),
+        &action,
+        resource,
+        context,
+        published,
+    )
 }
 
 /// The decision itself, over a principal already read: separated from the reading above so it
-/// is a pure function of the documents, the action and the resource.
+/// is a pure function of the documents, the action, the resource and the request's condition
+/// context.
 fn authorize_action(
     caller: &Caller,
     action: &str,
     resource: &str,
+    context: &[(String, String)],
+    published: &[&str],
 ) -> Result<(), AccessDeniedException> {
     let refusal = |reason: &str| {
         AccessDeniedException::new(iam::not_authorized_by_identity_policy(
@@ -110,7 +147,9 @@ fn authorize_action(
     // The principal spellings travel with the request because that is what a statement's
     // `Principal` element is matched against; an identity-based document states no such
     // element, so the decision rests on the action and the resource.
-    let request = iam::Request::new(action, resource, &caller.principals);
+    let request = iam::Request::new(action, resource, &caller.principals)
+        .with_context(context)
+        .with_published_keys(published);
     let identity_said = iam::identity_decision(&caller.documents, &request);
     // Taken FIRST: an explicit `Deny` in a document that CAN be read refuses the request
     // whatever else the principal carries — including a grant this emulator cannot read, which
@@ -216,7 +255,7 @@ mod tests {
 
         for (case, documents, permitted) in rows {
             let held: Vec<&str> = documents.iter().map(String::as_str).collect();
-            let answered = authorize_action(&principal(&held), action, resource);
+            let answered = authorize_action(&principal(&held), action, resource, &[], &[]);
             match (permitted, answered) {
                 (true, Ok(())) => {}
                 (false, Err(denial)) => assert!(
@@ -226,6 +265,70 @@ mod tests {
                 ),
                 (expected, answered) => {
                     panic!("case {case:?}: expected permitted={expected}, got {answered:?}")
+                }
+            }
+        }
+    }
+
+    /// RULE: a statement whose `Condition` is written over a key the OPERATION models is
+    /// decided against the value this request published for it — including against the
+    /// ABSENCE of a value, where the request named none — so a grant narrowed to one value
+    /// covers only the calls that carry it.
+    #[test]
+    fn a_grant_conditioned_on_a_published_key_is_decided_on_the_value_the_request_carries() {
+        let action = "lambda:CreateFunction";
+        let resource = "arn:aws:lambda:us-east-1:000000000000:function:orders";
+        let approved = "arn:aws:lambda:us-east-1:000000000000:code-signing-config:csc-0123456789abcdef0";
+        let other = "arn:aws:lambda:us-east-1:000000000000:code-signing-config:csc-fedcba98765432100";
+        let key = super::super::CODE_SIGNING_CONFIG_ARN_CONDITION_KEY;
+        let published = super::super::CODE_SIGNING_CONFIG_CONDITION_KEYS;
+        // The documents each row is judged on: a grant narrowed to the approved value, one
+        // that holds where the request carries no value (`IfExists`), one that asks for the
+        // key's ABSENCE (`Null`), and the unconditioned grant.
+        let equals = format!(
+            r#"{{"Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"*",
+                "Condition":{{"StringEquals":{{"{key}":"{approved}"}}}}}}]}}"#
+        );
+        let if_exists = format!(
+            r#"{{"Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"*",
+                "Condition":{{"StringEqualsIfExists":{{"{key}":"{approved}"}}}}}}]}}"#
+        );
+        let absent = format!(
+            r#"{{"Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"*",
+                "Condition":{{"Null":{{"{key}":"true"}}}}}}]}}"#
+        );
+        let unconditioned =
+            format!(r#"{{"Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"*"}}]}}"#);
+        // (case, the document in force, the value the request published, whether it is served)
+        let rows: &[(&str, &String, Option<&str>, bool)] = &[
+            ("the approved value under an equality", &equals, Some(approved), true),
+            ("another value under that equality", &equals, Some(other), false),
+            ("no value at all under that equality", &equals, None, false),
+            ("the approved value under IfExists", &if_exists, Some(approved), true),
+            ("another value under IfExists", &if_exists, Some(other), false),
+            ("no value at all under IfExists", &if_exists, None, true),
+            ("no value at all where absence is asked for", &absent, None, true),
+            ("a value where absence is asked for", &absent, Some(approved), false),
+            ("no value at all under no condition", &unconditioned, None, true),
+            ("a value under no condition", &unconditioned, Some(approved), true),
+        ];
+
+        for (case, document, carried, served) in rows {
+            let context: Vec<(String, String)> = carried
+                .map(|value| vec![(key.to_string(), value.to_string())])
+                .unwrap_or_default();
+            let held = [document.as_str()];
+            let answered =
+                authorize_action(&principal(&held), action, resource, &context, published);
+            match (served, answered) {
+                (true, Ok(())) => {}
+                (false, Err(denial)) => assert!(
+                    denial.message.ends_with(&iam::no_identity_policy_allows(action)),
+                    "case {case:?}: expected the default-deny rule to be named, got {:?}",
+                    denial.message
+                ),
+                (expected, answered) => {
+                    panic!("case {case:?}: expected served={expected}, got {answered:?}")
                 }
             }
         }

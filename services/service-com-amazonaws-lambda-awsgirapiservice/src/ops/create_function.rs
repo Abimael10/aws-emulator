@@ -352,6 +352,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // IAM decides this call before the service looks at what it asks for: the action is
+        // this operation's own name under this service's prefix, and the resource is the
+        // function this create is ABOUT TO create, which is the resource such a call names
+        // (`crate::state::caller_authorization`). The request also publishes the condition key
+        // its own `CodeSigningConfigArn` member carries — the configuration this create asks
+        // for, and the key's ABSENCE when it asks for none, since the member is optional and
+        // that absence is a fact about the request (see
+        // [`crate::state::code_signing_conditions`]) — so a grant narrowed to an approved
+        // configuration covers only the creates that name it. A caller the documents in force
+        // do not allow is refused 403 `AccessDeniedException` here, so nothing is created.
+        // Taken before this service's store is locked, which is the lock order the gate
+        // documents, and before the name is resolved, which is the order AWS decides in: the
+        // IAM layer sits in front of the service's own reading of the request, so a caller the
+        // documents do not allow learns nothing about what this account holds and nothing
+        // about whether the name it sent is one this service would have accepted. A value that
+        // addresses no function of this endpoint therefore has no ARN to be judged on and is
+        // decided against the any-resource wildcard, exactly as IAM writes the resource of
+        // such a request (`crate::state::invoke_authorization::ANY_RESOURCE`).
+        crate::state::authorize_caller_with_conditions(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::invoke_authorization::addressed_resource(
+                &crate::state::request_region(ctx),
+                &input.function_name,
+                None,
+            ),
+            &crate::state::code_signing_config_conditions(input.code_signing_config_arn.as_deref()),
+            crate::state::CODE_SIGNING_CONFIG_CONDITION_KEYS,
+        )?;
+
         let reference = crate::state::parse_function_reference(&input.function_name)
             .ok_or_else(|| invalid_parameter(format!(
                 "1 validation error detected: Value '{}' at 'functionName' failed to satisfy \

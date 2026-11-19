@@ -175,6 +175,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // IAM decides this call before the service looks at what it asks for: the action is
+        // this operation's own name under this service's prefix, and the resource is the
+        // function the association is put on (`crate::state::caller_authorization`). The
+        // request publishes the condition key its own required `CodeSigningConfigArn` member
+        // carries — the configuration it attaches (see
+        // [`crate::state::code_signing_conditions`]) — so a grant narrowed to an approved
+        // configuration covers only the calls that attach it. A caller the documents in force
+        // do not allow is refused 403 `AccessDeniedException` here, so nothing is attached.
+        // Taken before this service's store is locked, which is the lock order the gate
+        // documents.
+        crate::state::authorize_caller_with_conditions(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::invoke_authorization::addressed_resource(
+                &crate::state::request_region(ctx),
+                &input.function_name,
+                None,
+            ),
+            &crate::state::code_signing_config_conditions(Some(&input.code_signing_config_arn)),
+            crate::state::CODE_SIGNING_CONFIG_CONDITION_KEYS,
+        )?;
+
         let reference =
             crate::state::parse_function_reference(&input.function_name).ok_or_else(|| {
                 invalid_parameter(format!(

@@ -181,7 +181,10 @@ fn form_encode(value: &str) -> String {
 }
 
 /// The text of the first `<tag>` element of an XML body.
-fn xml_element(body: &str, tag: &str) -> Option<String> {
+///
+/// `pub(crate)` so a sibling suite that reads an `awsQuery` answer — `AssumeRole`'s minted
+/// access key id, say — takes this one reading rather than writing a second scanner.
+pub(crate) fn xml_element(body: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = body.find(&open)? + open.len();

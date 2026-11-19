@@ -349,7 +349,17 @@ pub use invoke_authorization::{
 /// whose reading of the request's principal it shares. It is re-exported here for the same
 /// reason as [`capacity_provider`]: a handler names it as `crate::state::…`.
 pub mod caller_authorization;
-pub use caller_authorization::authorize_caller;
+pub use caller_authorization::{authorize_caller, authorize_caller_with_conditions};
+
+/// The CONDITION KEY a call that names a code-signing configuration publishes into that
+/// decision — the value of its own member, which a policy writer narrows the grant by — lives
+/// in [`code_signing_conditions`], beside the gate that carries it. It is re-exported here for
+/// the same reason as [`capacity_provider`]: a handler names it as `crate::state::…`.
+pub mod code_signing_conditions;
+pub use code_signing_conditions::{
+    code_signing_config_conditions, CODE_SIGNING_CONFIG_ARN_CONDITION_KEY,
+    CODE_SIGNING_CONFIG_CONDITION_KEYS,
+};
 
 /// Whether a request may address a layer that belongs to ANOTHER account — the decision every
 /// operation on a layer takes before it resolves the name it was given — lives in
