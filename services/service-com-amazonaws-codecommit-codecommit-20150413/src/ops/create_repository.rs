@@ -7,7 +7,11 @@
 //! (`crate::state::DEFAULT_ENCRYPTION_KEY_ALIAS`), and the key the request's
 //! selector names is resolved against KMS before it is stored
 //! (`crate::state::resolve_encryption_key`), so the metadata reports the key
-//! itself rather than the selector it was named by.
+//! itself rather than the selector it was named by. Creating the repository under
+//! that key is CodeCommit taking the key into use, so a selector resolving to a key
+//! KMS reports disabled is refused with the modelled
+//! `EncryptionKeyDisabledException` and no repository is created
+//! (`crate::state::disabled_encryption_key_named`).
 //!
 //! ## Shape of an operation
 //!
@@ -351,6 +355,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             input.kms_key_id.as_deref(),
         );
+
+        // A key KMS reports DISABLED cannot be used, and encrypting the new
+        // repository under it is exactly taking it into use — so the create is
+        // refused and the account holds no repository under this name. The judgement
+        // is the one reading of a key's state this crate has, the same one the
+        // rotation and every call on a repository's contents are gated by.
+        if let Some(disabled) =
+            crate::state::disabled_encryption_key_named(&*self.engine, &region, &kms_key_id)
+        {
+            return Err(
+                CreateRepositoryErrorModeled::EncryptionKeyDisabledException(disabled).into(),
+            );
+        }
 
         let repository = crate::state::Repository::new(
             &input.repository_name,

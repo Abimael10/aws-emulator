@@ -187,9 +187,11 @@ pub fn resolve_encryption_key<Eng: Send + Sync + 'static>(
 }
 
 /// How this service words `EncryptionKeyDisabledException`: the fixed words around
-/// the key the repository is encrypted under, which is the refusal's one variable
-/// part — the key is read from the repository's own record, never from the request,
-/// because a call that names no key at all is refused in exactly the same terms.
+/// the KEY the refused call would have used, which is the refusal's one variable part
+/// — the key the repository is encrypted under for a call on its contents, and the
+/// key the request's selector resolved to for a call that points the repository at
+/// one. Never the selector a request happened to name it by, so a call that names no
+/// key at all is refused in exactly the same terms.
 pub fn encryption_key_disabled_message(kms_key_id: &str) -> String {
     format!("KMS key {kms_key_id} is disabled")
 }
@@ -236,11 +238,40 @@ pub fn disabled_encryption_key<Eng: Send + Sync + 'static>(
     engine: &Eng,
     repository: &Repository,
 ) -> Option<EncryptionKeyDisabledException> {
+    disabled_encryption_key_named(engine, &repository.region, &repository.kms_key_id)
+}
+
+/// The refusal a call that has to USE the key `kms_key_id` answers while KMS reports
+/// that key disabled, or `None` while the key is usable.
+///
+/// The one reading of a key's state this service has, which is why both the calls on a
+/// repository's CONTENTS ([`disabled_encryption_key`]) and the calls that POINT a
+/// repository at a key ask it: encrypting a repository under a key needs that key, so a
+/// key KMS cannot use is the modelled `EncryptionKeyDisabledException` ("The encryption
+/// key is disabled", client, 400) whichever of them asked. `kms_key_id` is a selector in
+/// any of the forms KMS documents for `KeyId`, or the key a selector already resolved
+/// to; `repository_region` is the Region to look for it in when the value names none of
+/// its own ([`encryption_key_region`]).
+///
+/// Whether the key is disabled is KMS's own answer, read from the KMS store on the same
+/// shared engine, so `kms:DisableKey` and `kms:EnableKey` are what move this gate —
+/// nothing is cached here. A selector KMS holds no key for (a key in an account or a key
+/// store this emulator does not keep) disables nothing: there is no key state to read,
+/// and a call AWS serves is not refused for want of one.
+///
+/// LOCKING: this takes the KMS store's lock and no other, and no KMS operation reaches
+/// into the CodeCommit store, so a handler asking while it holds this service's own
+/// guard can never take the two in the opposite order.
+pub fn disabled_encryption_key_named<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    repository_region: &str,
+    kms_key_id: &str,
+) -> Option<EncryptionKeyDisabledException> {
     use ::service_com_amazonaws_kms_trentservice::state as kms_store;
 
     let keys = kms_store::service_state(engine)?;
-    let region = encryption_key_region(&repository.kms_key_id, &repository.region);
-    let disabled = match keys.lock().resolve(region, &repository.kms_key_id) {
+    let region = encryption_key_region(kms_key_id, repository_region);
+    let disabled = match keys.lock().resolve(region, kms_key_id) {
         // The state a READER of the key reports, which is the state its own
         // `kms:DescribeKey` answers with.
         kms_store::KeyRef::Found(key) => {
@@ -249,7 +280,7 @@ pub fn disabled_encryption_key<Eng: Send + Sync + 'static>(
         _ => false,
     };
     disabled.then(|| EncryptionKeyDisabledException {
-        message: Some(encryption_key_disabled_message(&repository.kms_key_id)),
+        message: Some(encryption_key_disabled_message(kms_key_id)),
     })
 }
 

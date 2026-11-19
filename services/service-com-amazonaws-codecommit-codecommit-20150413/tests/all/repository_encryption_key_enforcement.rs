@@ -15,12 +15,21 @@
 //! the key the repository holds, and serves no content and lands no commit; the gate
 //! is the key's CURRENT state, so enabling it again serves the very same calls.
 //!
+//! The same key state gates the calls that SET which key a repository depends on:
+//! creating the repository under a key (`CreateRepository`) or rotating it onto one
+//! (`UpdateRepositoryEncryptionKey`) takes that key into use, so a `kmsKeyId`
+//! resolving to a key KMS reports `Disabled` is refused in the same code and the
+//! same words and changes nothing — the repository stays on the key it already had,
+//! and a refused create mints no repository.
+//!
 //! The table spans what the rule generalises over rather than one recorded call:
 //! every operation of this service that reads or writes a repository's git data —
 //! reads and writes, single-object and whole-tree, the merge surface included — and,
 //! beside it, the dimensions the gate must NOT key on: which selector form the
-//! repository was created with, whether another repository under another key is
-//! touched at all, and how many times the key is disabled and enabled again.
+//! repository was created with or is pointed at (every form KMS documents for
+//! `KeyId`), whether another repository under another key is touched at all, whether
+//! the key named is one KMS holds at all, and how many times the key is disabled and
+//! enabled again.
 
 use std::sync::Arc;
 
@@ -628,6 +637,269 @@ async fn the_gate_follows_the_key_the_repository_holds_whichever_form_named_it()
         &key_arn,
     )
     .await;
+}
+
+/// The four forms KMS documents for `KeyId`, each naming ONE key: its bare id, its
+/// ARN, an alias of it and that alias's ARN
+/// (`smithy_query(query="doc",shape="UpdateRepositoryEncryptionKeyInput",member="kmsKeyId")`
+/// sends a caller to that list). Answered as (why the row is there, the selector).
+async fn selector_forms(
+    router: &MultiServiceRouter,
+    alias_name: &str,
+    key_id: &str,
+    key_arn: &str,
+) -> Vec<(&'static str, String)> {
+    kms(
+        router,
+        "CreateAlias",
+        &json!({ "AliasName": alias_name, "TargetKeyId": key_id }),
+    )
+    .await;
+    vec![
+        ("a bare key id", key_id.to_string()),
+        ("a key ARN", key_arn.to_string()),
+        ("an alias name", alias_name.to_string()),
+        (
+            "an alias ARN",
+            format!(
+                "arn:aws:kms:{REGION}:{}:{alias_name}",
+                engine::emulator_account_id()
+            ),
+        ),
+    ]
+}
+
+/// The key `GetRepository` reports the repository is encrypted under.
+async fn reported_key(router: &MultiServiceRouter, repository: &str) -> String {
+    let got = ok(router, "GetRepository", &json!({ "repositoryName": repository })).await;
+    string_at(&got, "/repositoryMetadata/kmsKeyId")
+}
+
+/// Assert `operation` with `body` is refused for the disabled key `key_arn`, in the
+/// code and the words this service words that refusal with.
+async fn refuses_for_the_key(
+    router: &MultiServiceRouter,
+    why: &str,
+    operation: &str,
+    body: &Value,
+    key_arn: &str,
+) {
+    let (code, message) = error_with_message(router, operation, body, 400).await;
+    assert_eq!(
+        code, DISABLED,
+        "case {why:?} ({operation}): expected {DISABLED}, got {code:?} saying {message:?}"
+    );
+    assert_eq!(
+        message,
+        disabled_message(key_arn),
+        "case {why:?} ({operation}): expected the disabled-key sentence, got {message:?}"
+    );
+}
+
+/// Rotating a repository onto a key consults THAT key's state: the rotation takes the
+/// key into use, so a selector resolving to a key KMS reports `Disabled` is refused
+/// and the repository goes on holding the key it had. The rows are the four selector
+/// forms, each naming the same disabled key, and the gate is read per call — the same
+/// rotations serve once the key is enabled again.
+#[tokio::test]
+async fn a_rotation_onto_a_disabled_key_is_refused_and_the_repository_keeps_its_key() {
+    let router = emulator();
+    let (target_id, target_arn) = given_key(&router, "the key a rotation aims at").await;
+    let (_, in_effect_arn) = given_key(&router, "the key the repositories hold").await;
+    let rows = selector_forms(
+        &router,
+        "alias/codecommit-rotation-target",
+        &target_id,
+        &target_arn,
+    )
+    .await;
+
+    key_state_moved_to(&router, &target_id, false).await;
+
+    // One repository per row, each created under a key that is NOT the disabled one:
+    // those creates serve, so the gate follows the key a call names rather than
+    // switching the service off.
+    let repositories: Vec<String> = (0..rows.len())
+        .map(|row| format!("rotate-onto-disabled-{row}"))
+        .collect();
+    for ((why, _), repository) in rows.iter().zip(&repositories) {
+        ok(
+            &router,
+            "CreateRepository",
+            &json!({ "repositoryName": repository, "kmsKeyId": in_effect_arn }),
+        )
+        .await;
+        assert_eq!(
+            reported_key(&router, repository).await,
+            in_effect_arn,
+            "case {why:?}: the repository must be created under the enabled key"
+        );
+    }
+
+    for ((why, selector), repository) in rows.iter().zip(&repositories) {
+        let body = json!({ "repositoryName": repository, "kmsKeyId": selector });
+        refuses_for_the_key(
+            &router,
+            why,
+            "UpdateRepositoryEncryptionKey",
+            &body,
+            &target_arn,
+        )
+        .await;
+        assert_eq!(
+            reported_key(&router, repository).await,
+            in_effect_arn,
+            "case {why:?} ({selector}): a refused rotation must leave the repository on the \
+             key it had"
+        );
+    }
+
+    // The gate is the key's CURRENT state: every one of those rotations serves once
+    // KMS reports the key enabled, and each reports the key itself.
+    key_state_moved_to(&router, &target_id, true).await;
+    for ((why, selector), repository) in rows.iter().zip(&repositories) {
+        let rotated = ok(
+            &router,
+            "UpdateRepositoryEncryptionKey",
+            &json!({ "repositoryName": repository, "kmsKeyId": selector }),
+        )
+        .await;
+        assert_eq!(
+            rotated.get("kmsKeyId").and_then(Value::as_str),
+            Some(target_arn.as_str()),
+            "case {why:?} ({selector}): the accepted rotation must report the key now in \
+             effect, got {rotated}"
+        );
+        assert_eq!(
+            rotated.get("originalKmsKeyId").and_then(Value::as_str),
+            Some(in_effect_arn.as_str()),
+            "case {why:?} ({selector}): the accepted rotation must report the key left \
+             behind, got {rotated}"
+        );
+        assert_eq!(
+            reported_key(&router, repository).await,
+            target_arn,
+            "case {why:?} ({selector}): the rotated repository must hold the new key"
+        );
+    }
+
+    // Disabled a second time, the same call is refused again — a rotation onto the key
+    // the repository already holds included, which still takes that key into use.
+    key_state_moved_to(&router, &target_id, false).await;
+    let body = json!({ "repositoryName": repositories[0], "kmsKeyId": target_arn });
+    refuses_for_the_key(
+        &router,
+        "disabled a second time",
+        "UpdateRepositoryEncryptionKey",
+        &body,
+        &target_arn,
+    )
+    .await;
+    assert_eq!(
+        reported_key(&router, &repositories[0]).await,
+        target_arn,
+        "case {:?}: the refused rotation must leave the repository exactly as it was",
+        "disabled a second time"
+    );
+}
+
+/// Creating a repository under a key consults that key's state for the same reason:
+/// the create encrypts the repository under the key, so a selector resolving to a
+/// disabled key is refused and the account holds no repository under that name.
+#[tokio::test]
+async fn a_create_under_a_disabled_key_mints_no_repository() {
+    let router = emulator();
+    let (key_id, key_arn) = given_key(&router, "the key a create asks for").await;
+    let rows = selector_forms(
+        &router,
+        "alias/codecommit-create-target",
+        &key_id,
+        &key_arn,
+    )
+    .await;
+
+    key_state_moved_to(&router, &key_id, false).await;
+
+    let repositories: Vec<String> = (0..rows.len())
+        .map(|row| format!("create-under-disabled-{row}"))
+        .collect();
+    for ((why, selector), repository) in rows.iter().zip(&repositories) {
+        let body = json!({ "repositoryName": repository, "kmsKeyId": selector });
+        refuses_for_the_key(&router, why, "CreateRepository", &body, &key_arn).await;
+        let code = crate::repository_lifecycle::error(
+            &router,
+            "GetRepository",
+            &json!({ "repositoryName": repository }),
+            400,
+        )
+        .await;
+        assert_eq!(
+            code, "RepositoryDoesNotExistException",
+            "case {why:?} ({selector}): a refused create must mint no repository"
+        );
+    }
+
+    // And the same creates serve once the key is usable, each reporting the key the
+    // repository is encrypted under.
+    key_state_moved_to(&router, &key_id, true).await;
+    for ((why, selector), repository) in rows.iter().zip(&repositories) {
+        let created = ok(
+            &router,
+            "CreateRepository",
+            &json!({ "repositoryName": repository, "kmsKeyId": selector }),
+        )
+        .await;
+        assert_eq!(
+            created
+                .pointer("/repositoryMetadata/kmsKeyId")
+                .and_then(Value::as_str),
+            Some(key_arn.as_str()),
+            "case {why:?} ({selector}): the created repository must report its key, got \
+             {created}"
+        );
+        assert_eq!(
+            reported_key(&router, repository).await,
+            key_arn,
+            "case {why:?} ({selector}): the stored repository must hold that key"
+        );
+    }
+}
+
+/// A selector KMS holds no key for disables nothing: there is no key state to read,
+/// so a call AWS serves is not refused for want of one.
+#[tokio::test]
+async fn a_key_kms_holds_no_record_of_refuses_nothing() {
+    let router = emulator();
+    let unheld_arn = crate::harness::kms_key_arn_of("1234abcd-12ab-34cd-56ef-1234567890ab");
+    let unheld_id = "fedcba98-7654-3210-fedc-ba9876543210";
+
+    let created = ok(
+        &router,
+        "CreateRepository",
+        &json!({ "repositoryName": "unheld-key", "kmsKeyId": unheld_arn }),
+    )
+    .await;
+    assert_eq!(
+        created
+            .pointer("/repositoryMetadata/kmsKeyId")
+            .and_then(Value::as_str),
+        Some(unheld_arn.as_str()),
+        "case {:?}: the create must serve and hold the key as named, got {created}",
+        "a key ARN KMS holds no key for"
+    );
+
+    let rotated = ok(
+        &router,
+        "UpdateRepositoryEncryptionKey",
+        &json!({ "repositoryName": "unheld-key", "kmsKeyId": unheld_id }),
+    )
+    .await;
+    assert_eq!(
+        rotated.get("kmsKeyId").and_then(Value::as_str),
+        Some(crate::harness::kms_key_arn_of(unheld_id).as_str()),
+        "case {:?}: the rotation must serve and report that key, got {rotated}",
+        "a key id KMS holds no key for"
+    );
 }
 
 #[tokio::test]

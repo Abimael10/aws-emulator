@@ -12,20 +12,21 @@
 //! over — and a key selector that names no KMS key is refused, leaving the
 //! repository exactly as it was.
 //!
-//! Of the modelled errors, this handler reports the two it can judge: a
-//! `repositoryName` the account does not hold (`RepositoryDoesNotExistException`)
-//! and a `kmsKeyId` that selects no key in any form KMS documents for `KeyId`
-//! (`EncryptionKeyInvalidIdException`). `EncryptionKeyRequiredException` is
+//! Of the modelled errors, this handler reports the three it can judge: a
+//! `repositoryName` the account does not hold (`RepositoryDoesNotExistException`),
+//! a `kmsKeyId` that selects no key in any form KMS documents for `KeyId`
+//! (`EncryptionKeyInvalidIdException`) and a `kmsKeyId` that resolves to a key KMS
+//! cannot use because it is disabled (`EncryptionKeyDisabledException`): pointing a
+//! repository at a key is CodeCommit taking that key into use, so a key in KMS's
+//! `Disabled` state is refused and the repository is left on the key it already had
+//! (`crate::state::disabled_encryption_key_named`).
+//! `EncryptionKeyRequiredException` is
 //! unreachable — the model makes `kmsKeyId` required under a pattern no blank
 //! value satisfies, so the boundary validator refuses it first. The rest
-//! (`EncryptionKeyDisabledException`, `…NotFoundException`,
+//! (`…NotFoundException`,
 //! `…UnavailableException`, `…AccessDeniedException`, `…InvalidUsageException`,
-//! `EncryptionIntegrityChecksFailedException`) are the STATE of a KMS key, which
-//! CodeCommit resolves when it actually encrypts or decrypts the repository
-//! rather than when it is pointed at a key: a rotation onto a key that is
-//! disabled is accepted, and the disabled key surfaces on the repository's later
-//! data access. This emulator's CodeCommit does not resolve key state at all, so
-//! it reports none of them.
+//! `EncryptionIntegrityChecksFailedException`) are states and grants of a KMS key
+//! this emulator's KMS does not keep, so it reports none of them.
 //!
 //! ## Shape of an operation
 //!
@@ -257,6 +258,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             Some(input.kms_key_id.as_str()),
         );
+
+        // A key KMS reports DISABLED cannot be used, and pointing the repository at
+        // it is exactly taking it into use — so the rotation is refused before the
+        // store is written and the repository goes on depending on the key it has.
+        // The judgement is the one reading of a key's state this crate has, the same
+        // one every call on a repository's contents is gated by.
+        if let Some(disabled) =
+            crate::state::disabled_encryption_key_named(&*self.engine, &region, &kms_key_id)
+        {
+            return Err(
+                UpdateRepositoryEncryptionKeyErrorModeled::EncryptionKeyDisabledException(disabled)
+                    .into(),
+            );
+        }
 
         // The write: the stored repository now depends on the requested key, which
         // is what every later read of its metadata reports. The key it leaves
