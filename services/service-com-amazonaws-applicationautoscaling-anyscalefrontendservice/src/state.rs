@@ -194,13 +194,14 @@ pub struct ScalingPolicyRecord {
     pub predictive_config: Option<PredictiveScalingPolicyConfiguration>,
     pub alarms: Vec<Alarm>,
     pub creation_time: SystemTime,
-    /// The alarm transitions this policy has already been EXECUTED for: the instant, in epoch
-    /// seconds, each alarm last moved into `ALARM` for an execution this service performed,
+    /// The alarm invocations this policy has already been EXECUTED for: the instant, in epoch
+    /// seconds, of the last invocation of each alarm this service performed an execution for,
     /// by alarm name.
     ///
-    /// One transition fires one execution, so this is what makes a breach idempotent: a later
-    /// pass performs an alarm's transition only when it is newer than the one recorded here
-    /// (see [`policy_execution`]).
+    /// One invocation fires one execution, so this is what makes a breach idempotent: a later
+    /// pass performs an alarm's invocation only when it is newer than the one recorded here.
+    /// An alarm that STAYS in `ALARM` keeps invoking its actions at its own evaluation cadence,
+    /// so a breach that does not let up is executed again and again (see [`policy_execution`]).
     pub executed_transitions: BTreeMap<String, f64>,
     /// When this policy last moved the capacity of the resource it scales, which is the
     /// instant its `Cooldown` is measured from.
