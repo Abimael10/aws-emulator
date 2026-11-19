@@ -11,24 +11,28 @@ use super::*;
 /// the "AWS WAF quotas" page of the AWS WAF Developer Guide), and the `QuotaCode`s that
 /// catalog is keyed on.
 ///
-/// Two rows are published as quotas OF A RESOURCE rather than of the account: the web ACL
-/// capacity units of one web ACL and the API Gateway REST API associations of one web ACL
-/// may be raised for an individual resource as well as account-wide, so each names the
-/// level AWS publishes it as adjustable at and the resource type that plane applies to
-/// ([`QuotaRow::adjustable_at`]), and reports the RESOURCE scope on every record of it,
-/// because the plane it is counted on is the resource whichever record is read
+/// Two rows are published as quotas OF A RESOURCE rather than of the account: the AWS
+/// AppSync GraphQL API associations and the API Gateway REST API associations of one
+/// regional web ACL may be raised for an individual resource as well as account-wide, so
+/// each names the level AWS publishes it as adjustable at and the resource type that plane
+/// applies to ([`QuotaRow::adjustable_at`]), and reports the RESOURCE scope on every record
+/// of it, because the plane it is counted on is the resource whichever record is read
 /// ([`QuotaRow::counted_per_resource`]).
 ///
 /// The recorded listing states the quota published under `L-B32E8672` (the API Gateway
-/// REST API associations of one regional web ACL, 100, scoped to the web ACL) and under
+/// REST API associations of one regional web ACL, 100, scoped to the web ACL), under
 /// `L-D6DA96AE` (the account's regional IP sets, 100, metered by the `AWS/Usage`
-/// `ResourceCount` of that plane over the window those counts are published over). The
-/// rule-group capacity and the `GetSampledRequests` rate this catalog used to key on those
-/// two codes are NOT published here, and neither is the code it used to key the account's
-/// IP sets on (`L-08788A4E`): no source available here states AWS's code for the first two
-/// or AWS's quota for the last one, so they are left to the default-quota-set gap rather
-/// than served under another quota's code. A row whose published `Description` no source
-/// available here states carries none, rather than a sentence this emulator words itself.
+/// `ResourceCount` of that plane over the window those counts are published over), under
+/// `L-5B2F9B11` (the AWS AppSync GraphQL API associations of one regional web ACL, 100,
+/// scoped to the web ACL the same way) and under `L-D95DED7E` (the inspectable request-body
+/// size, in kilobytes, of the protections it names, 64, NOT adjustable). The rule-group
+/// capacity, the `GetSampledRequests` rate, the web ACL's capacity units and the retained
+/// managed-rule-group versions this catalog used to key on those codes are NOT published
+/// here, and neither is the code it used to key the account's IP sets on (`L-08788A4E`): no
+/// source available here states AWS's code for the first group or AWS's quota for the last
+/// one, so they are left to the default-quota-set gap rather than served under another
+/// quota's code. A row whose published `Description` no source available here states
+/// carries none, rather than a sentence this emulator words itself.
 pub(in crate::state) fn wafv2_quotas() -> Vec<QuotaRow> {
     vec![
         quota("Custom response bodies per web ACL", 50.0)
@@ -76,13 +80,17 @@ pub(in crate::state) fn wafv2_quotas() -> Vec<QuotaRow> {
             .code("L-45C90A8A")
             .fixed()
             .describe("The maximum number of logging configurations on one web ACL."),
-        // The capacity of one web ACL, which AWS publishes as adjustable for an
-        // individual web ACL as well as for the account, counted on the web ACL.
-        quota("Web ACL capacity units (WCU) per web ACL", 1500.0)
-            .code("L-5B2F9B11")
-            .adjustable_at(LEVEL_ALL, "AWS::WAFv2::WebACL")
-            .counted_per_resource()
-            .describe("The maximum number of web ACL capacity units used by one web ACL."),
+        // The AWS AppSync GraphQL API associations of ONE regional web ACL, which AWS
+        // publishes as adjustable for an individual web ACL as well as for the account,
+        // counted on the web ACL.
+        quota(
+            "Maximum number of AWS AppSync GraphQL API associations per web ACL in WAF for \
+             regional",
+            100.0,
+        )
+        .code("L-5B2F9B11")
+        .adjustable_at(LEVEL_ALL, "AWS::WAFv2::WebACL")
+        .counted_per_resource(),
         quota("Managed rule groups per web ACL", 10.0)
             .code("L-5E8DF1EF")
             .fixed()
@@ -191,13 +199,16 @@ pub(in crate::state) fn wafv2_quotas() -> Vec<QuotaRow> {
                     ("Type", "Resource"),
                 ],
             )),
-        quota("Versions retained per managed rule group", 3.0)
-            .code("L-D95DED7E")
-            .fixed()
-            .describe(
-                "The number of static versions of a managed rule group that remain \
-                 available.",
-            ),
+        // The request body AWS WAF inspects for the protections the quota's own name
+        // lists, which the service publishes in kilobytes with the unit in that name.
+        quota(
+            "Maximum size in kilobytes of a web request body that can be inspected for \
+             CloudFront, API Gateway, Amazon Cognito, App Runner, and Verified Access \
+             protections",
+            64.0,
+        )
+        .code("L-D95DED7E")
+        .fixed(),
         quota("Rules per rule group", 100.0)
             .code("L-D9F31E8A")
             .fixed()

@@ -60,20 +60,40 @@ const SNS_USAGE_SERVICE: &str = "SNS";
 ///
 /// The recorded listing states which action's rate is published under `L-4738DDCE`
 /// (`CreatePlatformApplication`, 900 per second), under `L-FF07E5EA`
-/// (`ConfirmSubscription`, 900 per second) and under `L-390AADBE`
-/// (`ListSubscriptionsByTopic`, published as NOT adjustable). The `GetEndpointAttributes`,
-/// `VerifySMSSandboxPhoneNumber` and `DeleteSMSSandboxPhoneNumber` rates this catalog used
-/// to key on those three codes are NOT published here, and neither are the codes it used
-/// to key those three actions on (`L-154ECCA7`, `L-039289D5`, `L-93CEC191`): no source
-/// available here states AWS's code for the first three or AWS's quota for the last three,
-/// so they are left to the default-quota-set gap rather than served under another quota's
-/// code.
+/// (`ConfirmSubscription`, 900 per second), under `L-390AADBE`
+/// (`ListSubscriptionsByTopic`, published as NOT adjustable), under `L-B6107771`
+/// (`SetSubscriptionAttributes`, 900 per second) and under `L-876E1222`
+/// (`GetSubscriptionAttributes`); it also states that the account's PENDING SUBSCRIPTION
+/// plane is published under `L-1A43D3DB`, as a counted plane metered by the `AWS/Usage`
+/// `ResourceCount` of the service rather than as one of these rates. The
+/// `GetEndpointAttributes`, `VerifySMSSandboxPhoneNumber`, `DeleteSMSSandboxPhoneNumber`,
+/// `PutDataProtectionPolicy`, `ListSMSSandboxPhoneNumbers` and `CreateSMSSandboxPhoneNumber`
+/// rates this catalog used to key on those codes are NOT published here, and neither are
+/// the codes it used to key those actions and that plane on (`L-154ECCA7`, `L-039289D5`,
+/// `L-93CEC191`, `L-BF824DE9`, `L-6635B4C9`, `L-A4340BCD`): no source available here states
+/// AWS's code for the first group or AWS's quota for the second, so they are left to the
+/// default-quota-set gap rather than served under another quota's code.
 pub(in crate::state) fn sns_quotas() -> Vec<QuotaRow> {
     vec![
         sns_transaction_rate("L-01EACE54", "AddPermission", 30.0),
         sns_transaction_rate("L-038DA0E0", "CheckIfPhoneNumberIsOptedOut", 30.0),
         sns_transaction_rate("L-19F66BE5", "CreatePlatformEndpoint", 15.0),
-        sns_transaction_rate("L-1A43D3DB", "CreateSMSSandboxPhoneNumber", 30.0),
+        // The account's PENDING SUBSCRIPTION plane: a counted plane rather than a rate,
+        // so it carries no rate window, and CloudWatch publishes its usage as the
+        // service's `AWS/Usage` RESOURCE count rather than as a call count. The series
+        // the count is published under is the one dimension of it no source available
+        // here states, so the metric carries the dimensions the class does state and
+        // names no series.
+        quota("Pending Subscriptions per Account", 5000.0)
+            .code("L-1A43D3DB")
+            .metric(usage_metric(
+                SNS_USAGE_SERVICE,
+                &[("Class", "None"), ("Type", "Resource")],
+            ))
+            .describe(
+                "The maximum number of pending subscriptions per AWS account, across all \
+                 regions.",
+            ),
         sns_transaction_rate("L-21C7FFA6", "CreateTopic", 30.0),
         sns_transaction_rate("L-2EE2434F", "DeleteEndpoint", 15.0),
         sns_transaction_rate("L-2FE42A3E", "DeletePlatformApplication", 15.0),
@@ -91,13 +111,12 @@ pub(in crate::state) fn sns_quotas() -> Vec<QuotaRow> {
         sns_transaction_rate("L-4EE37BC0", "GetPlatformApplicationAttributes", 15.0),
         sns_transaction_rate("L-61103206", "GetSMSAttributes", 30.0),
         sns_transaction_rate("L-6521CF3A", "GetSMSSandboxAccountStatus", 30.0),
-        sns_transaction_rate("L-6635B4C9", "GetSubscriptionAttributes", 30.0),
         sns_transaction_rate("L-6A04D1EB", "GetTopicAttributes", 30.0),
         sns_transaction_rate("L-7B7E3FB8", "ListEndpointsByPlatformApplication", 30.0),
         sns_transaction_rate("L-7E62C088", "ListOriginationNumbers", 30.0),
         sns_transaction_rate("L-820458B0", "ListPhoneNumbersOptedOut", 30.0),
         sns_transaction_rate("L-856966E8", "ListPlatformApplications", 15.0),
-        sns_transaction_rate("L-876E1222", "ListSMSSandboxPhoneNumbers", 30.0),
+        sns_transaction_rate("L-876E1222", "GetSubscriptionAttributes", 30.0),
         sns_transaction_rate("L-93308085", "ListSubscriptions", 30.0),
         sns_transaction_rate("L-9A72FF33", "ListTagsForResource", 100.0),
         sns_transaction_rate("L-9D5EC8F7", "ListTopics", 30.0),
@@ -113,20 +132,13 @@ pub(in crate::state) fn sns_quotas() -> Vec<QuotaRow> {
             .fixed()
             .describe("The size, in bytes, of a published message."),
         sns_transaction_rate("L-A30AD1BE", "OptInPhoneNumber", 30.0),
-        quota("Pending Subscriptions per Account", 5000.0)
-            .code("L-A4340BCD")
-            .describe(
-                "The maximum number of subscriptions awaiting confirmation in this account \
-                 in the current Region.",
-            ),
         sns_transaction_rate("L-AB928142", "Publish", 30_000.0),
         sns_transaction_rate("L-B3509C67", "PublishBatch", 30_000.0),
-        sns_transaction_rate("L-B6107771", "PutDataProtectionPolicy", 30.0),
+        sns_transaction_rate("L-B6107771", "SetSubscriptionAttributes", 900.0),
         sns_transaction_rate("L-B96EDA7D", "RemovePermission", 30.0),
         sns_transaction_rate("L-B98ECD3E", "SetEndpointAttributes", 15.0),
         sns_transaction_rate("L-BBD4D2FF", "SetPlatformApplicationAttributes", 15.0),
         sns_transaction_rate("L-BCD4AAF3", "SetSMSAttributes", 30.0),
-        sns_transaction_rate("L-BF824DE9", "SetSubscriptionAttributes", 30.0),
         sns_transaction_rate("L-C1E19420", "SetTopicAttributes", 30.0),
         sns_transaction_rate("L-CC5551AD", "Subscribe", 100.0),
         quota("Subscriptions per Topic", 12_500_000.0)

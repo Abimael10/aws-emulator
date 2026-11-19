@@ -72,7 +72,7 @@ const CATALOGS: &[Catalog] = &[
     Catalog {
         service_code: "sns",
         service_name: "Amazon Simple Notification Service (Amazon SNS)",
-        quota_count: 45,
+        quota_count: 42,
         withdrawn: &[
             "TopicsPerAccount",
             "SubscriptionsPerTopic",
@@ -84,6 +84,13 @@ const CATALOGS: &[Catalog] = &[
             "L-154ECCA7",
             "L-039289D5",
             "L-93CEC191",
+            // The three codes it used to key the SetSubscriptionAttributes and
+            // GetSubscriptionAttributes rates and the account's pending-subscription
+            // plane on, which the recorded listing publishes those three quotas under
+            // OTHER codes.
+            "L-BF824DE9",
+            "L-6635B4C9",
+            "L-A4340BCD",
         ],
     },
     Catalog {
@@ -177,22 +184,21 @@ const CATALOGS: &[Catalog] = &[
 /// `Description` is an optional member, so such a row publishes none; wording one here
 /// would be this emulator's sentence rather than the service's.
 const DESCRIPTION_WITHHELD: &[(&str, &str)] = &[
-    ("sqs", "L-81970B52"),
-    ("sqs", "L-BF2A6161"),
-    ("sso", "L-2FDFC908"),
-    ("sso", "L-D519A297"),
-    ("storagegateway", "L-311F8856"),
-    ("storagegateway", "L-6D83F84B"),
-    ("storagegateway", "L-87640A7E"),
-    ("storagegateway", "L-F3EDDF8C"),
+    ("sso", "L-89954265"),
+    ("sso", "L-C4FCA052"),
     ("vpc", "L-42B9C2CA"),
     ("vpc", "L-5F53652F"),
     ("vpc", "L-CA6CC422"),
     ("vpc-lattice", "L-5FF8F9B9"),
-    ("vpc-lattice", "L-87FCA9B2"),
+    ("vpc-lattice", "L-6095700C"),
+    ("vpc-lattice", "L-CA6A1CC5"),
+    ("wafv2", "L-5B2F9B11"),
     ("wafv2", "L-B32E8672"),
     ("wafv2", "L-D6DA96AE"),
+    ("wafv2", "L-D95DED7E"),
     ("workspaces", "L-40A36AF9"),
+    ("workspaces", "L-63F14199"),
+    ("workspaces", "L-8C70C791"),
     ("workspaces", "L-BD784BE1"),
     ("xray", "L-428FB8E0"),
     ("xray", "L-8C0C998A"),
@@ -200,7 +206,10 @@ const DESCRIPTION_WITHHELD: &[(&str, &str)] = &[
 ];
 
 /// The `UsageMetric` a pinned row publishes, where it publishes one.
-enum Metric {
+///
+/// `pub(crate)` so the sibling suite that pins the recorded bindings of these same ten
+/// services describes a metric through this one shape rather than a second copy of it.
+pub(crate) enum Metric {
     /// No usage metric at all.
     None,
     /// The `AWS/Usage` `CallCount` of the API a request rate throttles, under the
@@ -215,6 +224,10 @@ enum Metric {
         usage_service: &'static str,
         resource: &'static str,
     },
+    /// The `AWS/Usage` `ResourceCount` of a counted plane whose `Resource` SERIES no
+    /// source available here states: the row publishes the dimensions the class states
+    /// and names no series, rather than a series this emulator invents for it.
+    ResourcesWithoutSeries { usage_service: &'static str },
 }
 
 /// One published row, with every member AWS publishes for it.
@@ -316,11 +329,11 @@ const ROWS: &[Row] = &[
     Row {
         service_code: "sso",
         quota_code: "L-89954265",
-        quota_name: "Inline policy size per permission set",
-        value: 32_768.0,
-        unit: "Bytes",
-        adjustable: false,
-        description: "The maximum size, in bytes, of the inline policy of a permission set.",
+        quota_name: "Number of permission sets allowed per AWS account",
+        value: 500.0,
+        unit: "None",
+        adjustable: true,
+        description: "",
         period: None,
         metric: Metric::None,
         resource_plane: None,
@@ -402,7 +415,7 @@ const ROWS: &[Row] = &[
         value: 5000.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of network interfaces in this account in the current \
+        description: "The maximum number of network interfaces per Availability Zone in a \
                       Region.",
         period: None,
         metric: Metric::None,
@@ -415,7 +428,7 @@ const ROWS: &[Row] = &[
         value: 10.0,
         unit: "Kilobytes",
         adjustable: false,
-        description: "",
+        description: "The maximum size of a JSON file in an Auth policy.",
         period: None,
         metric: Metric::None,
         resource_plane: None,
@@ -435,11 +448,12 @@ const ROWS: &[Row] = &[
     Row {
         service_code: "wafv2",
         quota_code: "L-5B2F9B11",
-        quota_name: "Web ACL capacity units (WCU) per web ACL",
-        value: 1500.0,
+        quota_name: "Maximum number of AWS AppSync GraphQL API associations per web ACL in WAF \
+                     for regional",
+        value: 100.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of web ACL capacity units used by one web ACL.",
+        description: "",
         period: None,
         metric: Metric::None,
         resource_plane: Some(("AWS::WAFv2::WebACL", "ALL")),
@@ -502,11 +516,11 @@ const ROWS: &[Row] = &[
     Row {
         service_code: "xray",
         quota_code: "L-D781C0FD",
-        quota_name: "Trace document size",
+        quota_name: "Segment document size",
         value: 64.0,
         unit: "Kilobytes",
         adjustable: false,
-        description: "The maximum size, in KB, of one trace segment document.",
+        description: "The maximum size for segment documents.",
         period: None,
         metric: Metric::None,
         resource_plane: None,
@@ -514,7 +528,9 @@ const ROWS: &[Row] = &[
 ];
 
 /// The `UsageMetric` a row's [`Metric`] publishes, as the wire reports it.
-fn metric_json(metric: &Metric) -> Value {
+///
+/// `pub(crate)` for the same reason [`Metric`] is.
+pub(crate) fn metric_json(metric: &Metric) -> Value {
     match metric {
         Metric::None => Value::Null,
         Metric::Calls { usage_service, api } => json!({
@@ -526,6 +542,16 @@ fn metric_json(metric: &Metric) -> Value {
                 "Class": "None",
                 "Resource": api,
                 "Type": "API",
+            },
+        }),
+        Metric::ResourcesWithoutSeries { usage_service } => json!({
+            "MetricNamespace": "AWS/Usage",
+            "MetricName": "ResourceCount",
+            "MetricStatisticRecommendation": "Maximum",
+            "MetricDimensions": {
+                "Service": usage_service,
+                "Class": "None",
+                "Type": "Resource",
             },
         }),
         Metric::Resources {
@@ -1108,7 +1134,7 @@ const BINDINGS: &[Binding] = &[
     Binding {
         service_code: "vpc",
         quota_code: "L-8312C5BB",
-        quota_name: "Expiry time for an unaccepted VPC peering connection request",
+        quota_name: "VPC peering connection request expiry hours",
         value: 168.0,
         unit: "None",
         adjustable: false,
@@ -1249,7 +1275,7 @@ const BINDINGS: &[Binding] = &[
     Binding {
         service_code: "xray",
         quota_code: "L-C6B6F05D",
-        quota_name: "Annotations per trace",
+        quota_name: "Indexed annotations per trace",
         value: 50.0,
         unit: "None",
         adjustable: false,
@@ -1269,31 +1295,53 @@ const UNPUBLISHED: &[(&str, &str)] = &[
     ("sns", "GetEndpointAttributes Transactions per Second"),
     ("sns", "VerifySMSSandboxPhoneNumber Transactions per Second"),
     ("sns", "DeleteSMSSandboxPhoneNumber Transactions per Second"),
+    ("sns", "PutDataProtectionPolicy Transactions per Second"),
+    ("sns", "ListSMSSandboxPhoneNumbers Transactions per Second"),
+    ("sns", "CreateSMSSandboxPhoneNumber Transactions per Second"),
     ("sqs", "Message Size"),
     ("sqs", "Message Retention Period"),
     ("sqs", "Transactions per Second per API Action"),
     ("sqs", "FIFO Queue Transactions per Second"),
+    ("sqs", "In Flight Messages per Standard Queue"),
+    ("sqs", "In Flight Messages per FIFO Queue"),
+    ("sqs", "Tags per Queue"),
+    ("sqs", "Batch Entries per Batch Request"),
     ("sso", "AWS managed policies per permission set"),
     ("sso", "Trusted token issuers per instance"),
+    ("sso", "Inline policy size per permission set"),
     ("storagegateway", "Maximum size of a stored volume"),
     ("storagegateway", "Virtual tapes per gateway"),
     ("storagegateway", "Cache disks per gateway"),
     ("storagegateway", "Maximum size of a virtual tape"),
+    ("storagegateway", "Volumes per snapshot schedule"),
+    ("storagegateway", "Total cached volume storage per gateway"),
+    ("storagegateway", "Automatic tape creation policies per gateway"),
+    ("timestream", "Query timeout"),
+    ("timestream", "Magnetic store retention"),
     ("vpc", "Entries per customer-managed prefix list"),
     ("vpc", "Customer-managed prefix lists per Region"),
     ("vpc", "Peered Network Address Usage"),
     ("vpc", "References to a prefix list per resource type"),
     ("vpc-lattice", "Service networks per account"),
     ("vpc-lattice", "Header match conditions per rule"),
+    ("vpc-lattice", "Auth policies per resource"),
+    ("vpc-lattice", "Listeners per service"),
+    ("vpc-lattice", "Target groups per account"),
     ("wafv2", "Web ACL capacity units (WCU) per rule group"),
     ("wafv2", "Rate of GetSampledRequests requests"),
     ("wafv2", "IP sets per Region"),
+    ("wafv2", "Web ACL capacity units (WCU) per web ACL"),
+    ("wafv2", "Versions retained per managed rule group"),
     ("workspaces", "Connection alias associations per alias"),
     ("workspaces", "Rate of DescribeAccount requests"),
+    ("workspaces", "Rate of CreateTags requests"),
+    ("workspaces", "Certificate-based authentication certificates per directory"),
     ("xray", "Sampling rules"),
     ("xray", "Rate of BatchGetTraces requests"),
     ("xray", "Rate of PutTraceSegments requests"),
     ("xray", "Rate of GetTraceSummaries requests"),
+    ("xray", "Rate of PutTelemetryRecords requests"),
+    ("xray", "Trace retention"),
 ];
 
 /// Every member of the row published under a code is the one the service publishes for

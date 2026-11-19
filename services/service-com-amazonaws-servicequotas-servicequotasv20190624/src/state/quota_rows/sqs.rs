@@ -21,20 +21,32 @@ use super::*;
 /// The recorded listing states the quota published under `L-98134C75` (`Attributes per
 /// Message`, 10, with the sentence SQS words it with), under `L-81970B52` (`Message Size
 /// in S3 Bucket`, 2 Gigabytes), under `L-BBEFA6CF` (`Queue Policy Size`, 8192 Bytes, NOT
-/// adjustable) and under `L-BF2A6161` (`UTF-8 Queue Tag Value Length`, 256). The message
-/// size, the retention period and the two transaction rates this catalog used to key on
-/// those four codes are NOT published here, and neither are the codes it used to key the
-/// message-attribute count and the policy size on (`L-6A03DCE9`, `L-A7816957`): no source
-/// available here states AWS's code for the first four or AWS's quota for the last two, so
-/// they are left to the default-quota-set gap rather than served under another quota's
-/// code. A row whose published `Description` no source available here states carries none,
-/// rather than a sentence this emulator words itself.
+/// adjustable), under `L-BF2A6161` (`UTF-8 Queue Tag Value Length`, 256), under
+/// `L-9F628B95` (`Statements per Queue Policy`, 20), under `L-4FF3DAAF` (`Batched Message
+/// ID Length`, 80), under `L-B2A3B9D5` (`Message Invisibility Period`, 0 Seconds) and
+/// under `L-2DA3E3B2` (`Message Retention Time`, in seconds). The message size, the two
+/// transaction rates, the two in-flight-message planes, the queue tag count and the
+/// batch-entry count this catalog used to key on those eight codes are NOT published here,
+/// and neither are the codes it used to key the message-attribute count and the policy
+/// size on (`L-6A03DCE9`, `L-A7816957`): no source available here states AWS's code for the
+/// first group or AWS's quota for the last two, so they are left to the
+/// default-quota-set gap rather than served under another quota's code. A row whose
+/// published `Description` no source available here states carries none, rather than a
+/// sentence this emulator words itself.
 pub(in crate::state) fn sqs_quotas() -> Vec<QuotaRow> {
     vec![
-        quota("Batch Entries per Batch Request", 10.0)
+        // The retention of ONE message. The quota is published in seconds, at the four
+        // days a queue retains a message by default (the "Amazon SQS message retention
+        // period" of the Amazon SQS Developer Guide), with the fourteen-day ceiling in
+        // the quota's own text rather than in its value.
+        quota("Message Retention Time", 345_600.0)
             .code("L-2DA3E3B2")
+            .unit("Seconds")
             .fixed()
-            .describe("The number of entries in a batch request."),
+            .describe(
+                "The length of time, in seconds, for which Amazon SQS retains a message if \
+                 it isn't deleted. The maximum is 14 days (1,209,600 seconds).",
+            ),
         quota("Delay Queue Delay", 900.0)
             .code("L-49DA5CEC")
             .unit("Seconds")
@@ -47,10 +59,10 @@ pub(in crate::state) fn sqs_quotas() -> Vec<QuotaRow> {
                 "The number of times a message is received before a redrive policy moves \
                  it to the dead-letter queue.",
             ),
-        quota("In Flight Messages per FIFO Queue", 20_000.0)
+        quota("Batched Message ID Length", 80.0)
             .code("L-4FF3DAAF")
             .fixed()
-            .describe("The number of in flight messages for a FIFO queue."),
+            .describe("The length of a batched message ID."),
         quota("Message Group ID Length", 128.0)
             .code("L-79B6240C")
             .fixed()
@@ -58,23 +70,30 @@ pub(in crate::state) fn sqs_quotas() -> Vec<QuotaRow> {
         quota("Message Size in S3 Bucket", 2.0)
             .code("L-81970B52")
             .unit("Gigabytes")
-            .fixed(),
+            .fixed()
+            .describe("The size of a message, in gigabytes, in an Amazon S3 bucket."),
         quota("Attributes per Message", 10.0)
             .code("L-98134C75")
             .fixed()
             .describe("The number of attributes added to a message."),
-        quota("In Flight Messages per Standard Queue", 120_000.0)
+        quota("Statements per Queue Policy", 20.0)
             .code("L-9F628B95")
             .fixed()
-            .describe("The number of in flight messages for a standard queue."),
+            .describe("The number of statements in a queue policy."),
         quota("Queue Name Length", 80.0)
             .code("L-A01B4DF0")
             .fixed()
             .describe("The number of characters in a queue name."),
-        quota("Tags per Queue", 50.0)
+        // The window a consumed message stays hidden for, which SQS publishes at the zero
+        // a queue applies by default.
+        quota("Message Invisibility Period", 0.0)
             .code("L-B2A3B9D5")
+            .unit("Seconds")
             .fixed()
-            .describe("The number of tags on a queue."),
+            .describe(
+                "The length of time, in seconds, for which a message consumed from a queue \
+                 remains invisible to other consumers.",
+            ),
         quota("Queue Policy Size", 8192.0)
             .code("L-BBEFA6CF")
             .unit("Bytes")
@@ -82,7 +101,8 @@ pub(in crate::state) fn sqs_quotas() -> Vec<QuotaRow> {
             .describe("The size, in bytes, of a queue policy."),
         quota("UTF-8 Queue Tag Value Length", 256.0)
             .code("L-BF2A6161")
-            .fixed(),
+            .fixed()
+            .describe("The length of a UTF-8 queue tag value."),
         quota("Long Polling Wait Time", 20.0)
             .code("L-C491D5A4")
             .unit("Seconds")

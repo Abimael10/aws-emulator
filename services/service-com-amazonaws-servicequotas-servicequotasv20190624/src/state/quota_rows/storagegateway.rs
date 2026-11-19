@@ -21,11 +21,16 @@ use super::*;
 /// The recorded listing states the quota published under `L-311F8856` (the largest virtual
 /// tape, 15, with the unit in the name), under `L-6D83F84B` (the cached volume gateway's
 /// upload-buffer minimum, 150), under `L-87640A7E` (the tape gateway's upload-buffer
-/// minimum, 150) and under `L-F3EDDF8C` (the tape gateway's cache minimum, 150). The
-/// stored-volume size, the virtual-tape count, the cache-disk count and the tag count this
-/// catalog used to key on those four codes are NOT published here, and neither is the code
-/// it used to key the virtual-tape size on (`L-6F75AC83`): no source available here states
-/// AWS's code for the first four or AWS's quota for the last one, so they are left to the
+/// minimum, 150), under `L-F3EDDF8C` (the tape gateway's cache minimum, 150), under
+/// `L-F5915598` (the file gateway's cache MAXIMUM, 64, with the unit in the name), under
+/// `L-4951D254` (the total size of the tapes of one virtual tape library, 1, with the unit
+/// in the name) and under `L-C86341FE` (the longest path, 1024 Bytes), beside the sentence
+/// the service words each of those with. The stored-volume size, the virtual-tape count,
+/// the cache-disk count, the tag count, the snapshot-schedule volume count, the cached
+/// volume storage of a gateway and the automatic tape creation policy count this catalog
+/// used to key on those seven codes are NOT published here, and neither is the code it used
+/// to key the virtual-tape size on (`L-6F75AC83`): no source available here states AWS's
+/// code for the first group or AWS's quota for the last one, so they are left to the
 /// default-quota-set gap rather than served under another quota's code. A row whose
 /// published `Description` no source available here states carries none, rather than a
 /// sentence this emulator words itself.
@@ -51,15 +56,14 @@ pub(in crate::state) fn storagegateway_quotas() -> Vec<QuotaRow> {
             .describe("The maximum size, in TiB, of one cached volume."),
         quota("Max size of a virtual tape in TiB", 15.0)
             .code("L-311F8856")
-            .fixed(),
-        quota("Total cached volume storage per gateway", 1024.0)
-            .code("L-4951D254")
-            .unit("TiB")
             .fixed()
-            .describe(
-                "The maximum total size, in TiB, of the cached volumes of one volume \
-                 gateway.",
-            ),
+            .describe("Maximum size of a virtual tape"),
+        // The tapes of ONE virtual tape library, whose unit the service names IN the
+        // quota's own name and publishes `Unit` `None` for.
+        quota("Total size of tapes in a virtual tape library in PiB", 1.0)
+            .code("L-4951D254")
+            .fixed()
+            .describe("Total size of all tapes in a virtual tape library (VTL)"),
         quota("Total stored volume storage per gateway", 512.0)
             .code("L-5308FBCA")
             .unit("TiB")
@@ -79,7 +83,8 @@ pub(in crate::state) fn storagegateway_quotas() -> Vec<QuotaRow> {
             .describe("The maximum size, in TiB, of one file written through a file share."),
         quota("Cached volume gateway Upload Buffer Minimum in GiB", 150.0)
             .code("L-6D83F84B")
-            .fixed(),
+            .fixed()
+            .describe("Minimum upload buffer size for Cached Volume Gateway"),
         quota("Minimum size of a virtual tape", 100.0)
             .code("L-761F1680")
             .unit("Gigabytes")
@@ -101,7 +106,8 @@ pub(in crate::state) fn storagegateway_quotas() -> Vec<QuotaRow> {
             .describe("The maximum number of snapshot schedules per volume."),
         quota("Tape gateway Upload Buffer Minimum in GiB", 150.0)
             .code("L-87640A7E")
-            .fixed(),
+            .fixed()
+            .describe("Minimum upload buffer size for Tape Gateway"),
         quota("Upload buffer disks per gateway", 20.0)
             .code("L-96D17DE9")
             .fixed()
@@ -124,12 +130,12 @@ pub(in crate::state) fn storagegateway_quotas() -> Vec<QuotaRow> {
                 "The maximum number of custom tape pools in this account in the current \
                  Region.",
             ),
-        quota("Automatic tape creation policies per gateway", 1.0)
+        // The longest path a gateway serves, which the service publishes in Bytes.
+        quota("Path length", 1024.0)
             .code("L-C86341FE")
+            .unit("Bytes")
             .fixed()
-            .describe(
-                "The maximum number of automatic tape creation policies per tape gateway.",
-            ),
+            .describe("Maximum path length"),
         quota("Bandwidth rate limit schedule intervals per gateway", 20.0)
             .code("L-CEFD39A0")
             .fixed()
@@ -143,11 +149,14 @@ pub(in crate::state) fn storagegateway_quotas() -> Vec<QuotaRow> {
             .describe("The maximum number of clients allowed by one NFS file share."),
         quota("Tape gateway Cache Minimum in GiB", 150.0)
             .code("L-F3EDDF8C")
-            .fixed(),
-        quota("Volumes per snapshot schedule", 1.0)
+            .fixed()
+            .describe("Minimum cache size for Tape Gateway"),
+        // The cache of ONE file gateway, whose unit the service names IN the quota's own
+        // name and publishes `Unit` `None` for.
+        quota("File gateway Cache Maximum in TiB", 64.0)
             .code("L-F5915598")
             .fixed()
-            .describe("The maximum number of volumes covered by one snapshot schedule."),
+            .describe("Maximum cache size for File Gateway"),
         quota("Audit logs per file share", 1.0)
             .code("L-FF1BE522")
             .fixed()

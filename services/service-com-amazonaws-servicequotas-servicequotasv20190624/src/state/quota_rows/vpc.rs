@@ -27,8 +27,11 @@ use super::*;
 /// addresses of one NAT gateway, 2), under `L-42B9C2CA` (the VPC Block Public Access
 /// exclusions of the Region, 50, NOT adjustable), under `L-CA6CC422` (the `resource` VPC
 /// endpoints of one VPC, 500) and under `L-8312C5BB` (the expiry of an unaccepted VPC
-/// peering connection request, NOT adjustable, with the hours in the quota's own text
-/// rather than in `Unit`). The prefix-list entry count, the prefix-list count, the peered
+/// peering connection request, NOT adjustable, published as `VPC peering connection
+/// expiry hours` with the hours in the quota's own text rather than in `Unit`). It also
+/// states the sentence the service publishes for the gateway-endpoint plane of a Region,
+/// the Network Address Usage of one VPC, the security groups of a Region and the network
+/// interfaces of an Availability Zone. The prefix-list entry count, the prefix-list count, the peered
 /// Network Address Usage and the prefix-list reference count this catalog used to key on
 /// those four codes are NOT published here, and neither is the code it used to key the
 /// peering-request expiry on (`L-2C462E13`): no source available here states AWS's code
@@ -74,8 +77,8 @@ pub(in crate::state) fn vpc_quotas() -> Vec<QuotaRow> {
         quota("Gateway VPC endpoints per Region", 20.0)
             .code("L-1B52E74A")
             .describe(
-                "The maximum number of gateway VPC endpoints per Region. This quota is \
-                 enforced per VPC.",
+                "The maximum number of gateway VPC endpoints per Region. The maximum is \
+                 255 gateway endpoints per VPC.",
             ),
         quota("Interface VPC endpoints per VPC", 50.0)
             .code("L-29B6F2EB")
@@ -133,12 +136,12 @@ pub(in crate::state) fn vpc_quotas() -> Vec<QuotaRow> {
         quota("Active VPC peering connections per VPC", 50.0)
             .code("L-7E9ECCDB")
             .describe("The maximum number of active VPC peering connections per VPC."),
-        quota("Expiry time for an unaccepted VPC peering connection request", 168.0)
+        quota("VPC peering connection request expiry hours", 168.0)
             .code("L-8312C5BB")
             .fixed()
             .describe(
-                "The time, in hours, after which an unaccepted VPC peering connection \
-                 request expires.",
+                "The maximum number of hours after which an unaccepted VPC peering \
+                 connection request expires. The default value is 168 hours (one week).",
             ),
         quota("IPv4 CIDR blocks per VPC", 5.0)
             .code("L-83CA0A9D")
@@ -178,10 +181,7 @@ pub(in crate::state) fn vpc_quotas() -> Vec<QuotaRow> {
             .describe("The maximum number of network ACLs per VPC."),
         quota("Network Address Usage", 64_000.0)
             .code("L-BB24F6E5")
-            .describe(
-                "The maximum Network Address Usage of the resources in one VPC and the VPCs \
-                 it is peered with in the same Region.",
-            ),
+            .describe("The maximum Network Address Usage for a single VPC."),
         quota("VPC endpoints of type 'resource' per VPC", 500.0).code("L-CA6CC422"),
         quota("Traffic mirror sessions per Region", 10_000.0)
             .code("L-CD17FD4B")
@@ -198,7 +198,7 @@ pub(in crate::state) fn vpc_quotas() -> Vec<QuotaRow> {
         quota("Network interfaces per Region", 5000.0)
             .code("L-DF5E4CA3")
             .describe(
-                "The maximum number of network interfaces in this account in the current \
+                "The maximum number of network interfaces per Availability Zone in a \
                  Region.",
             ),
         quota("Traffic mirror filters per Region", 10_000.0)
@@ -209,10 +209,7 @@ pub(in crate::state) fn vpc_quotas() -> Vec<QuotaRow> {
             ),
         quota("VPC security groups per Region", 2500.0)
             .code("L-E79EC296")
-            .describe(
-                "The maximum number of VPC security groups in this account in the current \
-                 Region.",
-            ),
+            .describe("The maximum number of VPC security groups per Region."),
         // The VPC plane of the Region, which AWS publishes with all three of the optional
         // members a `ServiceQuota` can carry: a description, the CloudWatch usage metric
         // the count is measured by, and the window that metric is published over.

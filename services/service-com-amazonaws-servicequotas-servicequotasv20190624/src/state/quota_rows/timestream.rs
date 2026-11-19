@@ -34,9 +34,10 @@ fn timestream_request_rate(code: &str, api_name: &str, per_second: f64) -> Quota
 /// which is the "Quotas" page of the Amazon Timestream Developer Guide), and the
 /// `QuotaCode`s that catalog is keyed on. The recorded default-quota listing of
 /// `timestream` states which API's rate is published under `L-F07A9AB4` (`ListBatchLoadTasks`,
-/// 5 per second), under `L-798CB19D` (`CreateScheduledQuery`, 1 per second) and under
-/// `L-C49D398A` (`CreateBatchLoadTask`), beside the wording and the adjustability of the
-/// whole rate class ([`timestream_request_rate`]).
+/// 5 per second), under `L-798CB19D` (`CreateScheduledQuery`, 1 per second), under
+/// `L-C49D398A` (`CreateBatchLoadTask`), under `L-C0E9F2ED` (`ExecuteScheduledQuery`, 5 per
+/// second) and under `L-8DFD99E7` (`UpdateAccountSettings`, 1 per second), beside the
+/// wording and the adjustability of the whole rate class ([`timestream_request_rate`]).
 ///
 /// Timestream publishes the planes of its data model — the databases, the tables, the
 /// shape of one record and the retention of each store — beside the request rate of each
@@ -45,11 +46,12 @@ fn timestream_request_rate(code: &str, api_name: &str, per_second: f64) -> Quota
 /// and the `AWS/Usage` `CallCount` of the API it throttles; a row that measures something
 /// carries the unit AWS publishes it in rather than being a bare count.
 ///
-/// The `WriteRecords` request rate, the dimension-name length and the records one
-/// `WriteRecords` request takes are NOT published here: the codes this catalog used to key
-/// them on are the three the recorded listing publishes the batch-load and scheduled-query
-/// rates under, and no source available here states AWS's code for them, so they are left
-/// to the default-quota-set gap rather than served under another quota's code.
+/// The `WriteRecords` request rate, the dimension-name length, the records one
+/// `WriteRecords` request takes, the query timeout and the magnetic-store retention are NOT
+/// published here: the codes this catalog used to key them on are the five the recorded
+/// listing publishes the batch-load, scheduled-query and account-settings rates under, and
+/// no source available here states AWS's code for them, so they are left to the
+/// default-quota-set gap rather than served under another quota's code.
 pub(in crate::state) fn timestream_quotas() -> Vec<QuotaRow> {
     let rate = timestream_request_rate;
     vec![
@@ -84,13 +86,7 @@ pub(in crate::state) fn timestream_quotas() -> Vec<QuotaRow> {
         rate("L-8892F7F6", "ListDatabases", 10.0),
         rate("L-89E3B36D", "ListTables", 10.0),
         rate("L-8BF444C0", "ListTagsForResource", 10.0),
-        quota("Magnetic store retention", 73_000.0)
-            .code("L-8DFD99E7")
-            .unit("Days")
-            .describe(
-                "The maximum time, in days, that a table retains data in its magnetic \
-                 store.",
-            ),
+        rate("L-8DFD99E7", "UpdateAccountSettings", 1.0),
         quota("Measure name length", 256.0)
             .code("L-8FD9593E")
             .unit("Bytes")
@@ -112,11 +108,7 @@ pub(in crate::state) fn timestream_quotas() -> Vec<QuotaRow> {
             .unit("Bytes")
             .fixed()
             .describe("The maximum length, in bytes, of one query string."),
-        quota("Query timeout", 60.0)
-            .code("L-C0E9F2ED")
-            .unit("Minutes")
-            .fixed()
-            .describe("The time, in minutes, after which a running query is cancelled."),
+        rate("L-C0E9F2ED", "ExecuteScheduledQuery", 5.0),
         rate("L-C49D398A", "CreateBatchLoadTask", 1.0),
         rate("L-F07A9AB4", "ListBatchLoadTasks", 5.0),
         quota("Scheduled queries per account", 10_000.0)

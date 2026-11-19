@@ -21,13 +21,16 @@ use super::*;
 /// published over ([`graphics_bundle`]).
 ///
 /// The recorded listing states the quota published under `L-40A36AF9`
-/// (`Graphics.g6.4xlarge WorkSpaces`) and under `L-BD784BE1` (`Graphics.g6.16xlarge
-/// WorkSpaces`), both metered by that bundle's resource count. The connection-alias
-/// association count and the `DescribeAccount` rate this catalog used to key on those two
-/// codes are NOT published here: no source available here states AWS's code for them, so
-/// they are left to the default-quota-set gap rather than served under another quota's
-/// code. A row whose published `Description` no source available here states carries none,
-/// rather than a sentence this emulator words itself.
+/// (`Graphics.g6.4xlarge WorkSpaces`), under `L-BD784BE1` (`Graphics.g6.16xlarge
+/// WorkSpaces`), under `L-63F14199` (`Graphics.g7.2xlarge WorkSpaces`) and under
+/// `L-8C70C791` (the General Purpose Value streaming instances of the account's WorkSpaces
+/// Pools, 50), every one of them metered by that plane's resource count. The
+/// connection-alias association count, the `DescribeAccount` and `CreateTags` rates and
+/// the per-directory certificate count this catalog used to key on those codes are NOT
+/// published here: no source available here states AWS's code for them, so they are left
+/// to the default-quota-set gap rather than served under another quota's code. A row whose
+/// published `Description` no source available here states carries none, rather than a
+/// sentence this emulator words itself.
 pub(in crate::state) fn workspaces_quotas() -> Vec<QuotaRow> {
     let rate = |code: &str, api: &str, per_second: f64| {
         request_rate(code, WORKSPACES_USAGE_SERVICE, api, per_second)
@@ -124,17 +127,21 @@ pub(in crate::state) fn workspaces_quotas() -> Vec<QuotaRow> {
             .code("L-5782CB4D")
             .fixed()
             .describe("The maximum number of tags on one WorkSpaces resource."),
-        quota("Certificate-based authentication certificates per directory", 1.0)
-            .code("L-63F14199")
-            .fixed()
-            .describe(
-                "The maximum number of certificate-based authentication certificates on one \
-                 directory.",
-            ),
+        // The Graphics.g7.2xlarge bundle plane, published like the other bundle rows:
+        // the series its count is published under follows the one the recorded
+        // `Graphics.g6.4xlarge` and `Graphics.g6.16xlarge` rows carry.
+        graphics_bundle("L-63F14199", "Graphics.g7.2xlarge", "GraphicsG72xlargeWorkSpace"),
         rate("L-6E205E73", "AssociateIpGroups", 5.0),
         rate("L-70A02F17", "AuthorizeIpRules", 5.0),
         rate("L-843E43DA", "CreateIpGroup", 5.0),
-        rate("L-8C70C791", "CreateTags", 5.0),
+        // The streaming-instance plane of the account's WorkSpaces Pools, metered by that
+        // plane's own resource count rather than by a call count.
+        metered_plane(
+            "L-8C70C791",
+            "General Purpose Value streaming instances for WorkSpaces Pools".to_string(),
+            50.0,
+            "GeneralPurposeValueStreamingInstancesForWorkSpacesPool",
+        ),
         rate("L-925915DC", "CreateWorkspaces", 5.0),
         rate("L-9A67B5CB", "DeleteIpGroup", 5.0),
         rate("L-9C1F7EB2", "DeleteTags", 5.0),
@@ -168,12 +175,29 @@ const WORKSPACES_USAGE_SERVICE: &str = "WorkSpaces";
 /// bundle the account may run in the Region.
 ///
 /// SOURCE: the recorded default-quota listing of `workspaces`, which publishes such a row
-/// under the name `<Bundle> WorkSpaces`, at the zero a new account starts at, adjustable,
-/// and metered by the `AWS/Usage` `ResourceCount` of that bundle's own `Resource` series
-/// over the window those counts are published over. Those are the quota's published
-/// members, so one constructor fills them and two rows of the class cannot drift apart.
+/// under the name `<Bundle> WorkSpaces`, at the zero a new account starts at, and metered
+/// like every other plane of the account ([`metered_plane`]). Those are the quota's
+/// published members, so one constructor fills them and two rows of the class cannot drift
+/// apart.
 fn graphics_bundle(code: &str, bundle: &str, usage_resource: &str) -> QuotaRow {
-    quota(format!("{bundle} WorkSpaces"), 0.0)
+    metered_plane(code, format!("{bundle} WorkSpaces"), 0.0, usage_resource)
+}
+
+/// One Amazon WorkSpaces plane CloudWatch publishes a RESOURCE COUNT for: how many of
+/// that plane's resources the account may run in the Region.
+///
+/// SOURCE: the recorded default-quota listing of `workspaces`, which publishes such a row
+/// as adjustable and metered by the `AWS/Usage` `ResourceCount` of the plane's own
+/// `Resource` series, over the window those counts are published over. It is the class the
+/// bundle planes and the pool streaming-instance planes share, so one constructor fills it
+/// and two rows of the class cannot drift apart.
+fn metered_plane(
+    code: &str,
+    quota_name: String,
+    value: f64,
+    usage_resource: &str,
+) -> QuotaRow {
+    quota(quota_name, value)
         .code(code)
         .metric(usage_metric(
             WORKSPACES_USAGE_SERVICE,

@@ -17,27 +17,31 @@ use super::*;
 /// one row published as a RATE carries the one-second window AWS publishes it over.
 ///
 /// The recorded listing states the quota published under `L-87FCA9B2` (the size of one
-/// auth policy, in Kilobytes, NOT adjustable) and under `L-5FF8F9B9` (the resource
-/// configurations of the Region, 2000). The service-network count and the header-match
-/// condition count this catalog used to key on those two codes are NOT published here: no
-/// source available here states AWS's code for them, so they are left to the
-/// default-quota-set gap rather than served under another quota's code. A row whose
-/// published `Description` no source available here states carries none, rather than a
-/// sentence this emulator words itself.
+/// auth policy, in Kilobytes, NOT adjustable, with the sentence the service words it
+/// with), under `L-5FF8F9B9` (the resource configurations of the Region, 2000), under
+/// `L-0DCA4434` (the resource gateways of one VPC, 500, adjustable), under `L-6095700C`
+/// (the resource configurations of one service network, 500) and under `L-CA6A1CC5` (the
+/// security groups of one association, 5, NOT adjustable). The service-network count, the
+/// header-match condition count, the per-resource auth-policy count, the per-service
+/// listener count and the account's target-group count this catalog used to key on those
+/// codes are NOT published here: no source available here states AWS's code for them, so
+/// they are left to the default-quota-set gap rather than served under another quota's
+/// code. A row whose published `Description` no source available here states carries none,
+/// rather than a sentence this emulator words itself.
 pub(in crate::state) fn vpc_lattice_quotas() -> Vec<QuotaRow> {
     vec![
-        quota("Auth policies per resource", 1.0)
+        quota("Resource gateways per VPC", 500.0)
             .code("L-0DCA4434")
-            .fixed()
-            .describe("The maximum number of auth policies on one VPC Lattice resource."),
+            .describe(
+                "The maximum number of resource gateways in a VPC. For additional capacity \
+                 and limit increases, contact AWS Support.",
+            ),
         quota("Certificate associations per service", 1.0)
             .code("L-3DEC3B9F")
             .fixed()
             .describe("The maximum number of certificates associated with one service."),
         quota("Resource configurations per AWS Region", 2000.0).code("L-5FF8F9B9"),
-        quota("Listeners per service", 10.0)
-            .code("L-6095700C")
-            .describe("The maximum number of listeners on one service."),
+        quota("Resource Configurations per service network", 500.0).code("L-6095700C"),
         quota("Requests per second per service", 10_000.0)
             .code("L-620C821E")
             .period(1, "SECOND")
@@ -51,7 +55,8 @@ pub(in crate::state) fn vpc_lattice_quotas() -> Vec<QuotaRow> {
         quota("Auth policy size", 10.0)
             .code("L-87FCA9B2")
             .unit("Kilobytes")
-            .fixed(),
+            .fixed()
+            .describe("The maximum size of a JSON file in an Auth policy."),
         quota("Service networks per VPC", 5.0)
             .code("L-89DEA27F")
             .describe("The maximum number of service networks one VPC is associated with."),
@@ -65,11 +70,9 @@ pub(in crate::state) fn vpc_lattice_quotas() -> Vec<QuotaRow> {
             .code("L-BB11C6B9")
             .fixed()
             .describe("The maximum number of tags on one VPC Lattice resource."),
-        quota("Target groups per account", 1000.0)
+        quota("Security groups per association", 5.0)
             .code("L-CA6A1CC5")
-            .describe(
-                "The maximum number of target groups in this account in the current Region.",
-            ),
+            .fixed(),
         quota("Target groups per rule", 2.0)
             .code("L-CF78395E")
             .fixed()
