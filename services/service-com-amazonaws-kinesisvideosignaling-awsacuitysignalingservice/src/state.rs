@@ -236,6 +236,27 @@ pub fn forget_channel_of<Eng: Send + Sync + 'static>(engine: &Eng, arn: &str) ->
     store.forget_channel(arn)
 }
 
+/// Whether the channel `arn` names is one THIS emulator holds — the read seam a plane
+/// that SERVES an existing channel resolves existence through.
+///
+/// The registry is seeded by whoever creates the channel ([`register_channel_of`]) and
+/// emptied by whoever deletes it ([`forget_channel_of`]), so it is the one place a channel
+/// ARN resolves for every plane of this service family: a plane that kept a registry of
+/// its own would answer `ResourceNotFoundException` for a channel the control plane
+/// reports as existing. Read through [`ComAmazonawsKinesisvideosignalingAwsacuitysignalingserviceState::resolve_channel`],
+/// so this answer and the two routes of this crate agree on what resolves.
+///
+/// `false` for an ARN that is not a signaling-channel ARN, for one no registered channel
+/// carries, and when this emulator carries no store for this service at all — in none of
+/// those cases is there a channel to serve.
+pub fn knows_channel_of<Eng: Send + Sync + 'static>(engine: &Eng, arn: &str) -> bool {
+    let Some(state) = service_state(engine) else {
+        return false;
+    };
+    let store = state.lock();
+    store.resolve_channel(arn).is_ok()
+}
+
 /// What came of handing one message to a channel's MASTER peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MasterDelivery {

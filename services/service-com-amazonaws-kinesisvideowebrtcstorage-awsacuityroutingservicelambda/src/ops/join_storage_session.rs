@@ -7,9 +7,9 @@
 //! The call is not idempotent: every call counts as a join, the most recent producer
 //! takes precedence over the incumbent one, and each call pushes ONE freshly generated
 //! `SDP_OFFER` down the channel's signaling plane to the producing device attached
-//! there ("an offer is sent once per each call"). State lives in
-//! [`crate::state`]; this operation is also where a channel ARN becomes a channel
-//! this emulator knows (see `known_channels` there).
+//! there ("an offer is sent once per each call"). State lives in [`crate::state`]; the
+//! channel itself is the control plane's resource, so a `channelArn` naming no
+//! signaling channel it holds is reported as `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -231,13 +231,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Authorization comes before the resource is resolved or anything is
+        // recorded: a caller the account's policies do not permit learns nothing
+        // about the channel and joins nothing.
+        if let Some(refusal) = crate::state::authorization_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.channel_arn,
+        ) {
+            return Err(JoinStorageSessionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(refusal),
+                },
+            )
+            .into());
+        }
+
+        // The channel has to be one the control plane holds: this call creates a
+        // SESSION for an existing channel, never the channel.
+        if !crate::state::knows_channel(&*self.engine, &input.channel_arn) {
+            return Err(JoinStorageSessionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No signaling channel '{}' found in account {} for region {}",
+                        arn.name, arn.account_id, arn.region
+                    )),
+                },
+            )
+            .into());
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // This call provides the ARN of the signaling channel, so the channel is
-        // one this emulator knows from here on; the session is created when the
-        // channel has none, and a join of an existing session rotates the producer,
-        // because "the most recent client request takes precedence". A join that
-        // would take the store past its channel limit is refused instead.
+        // The session is created when the channel has none, and a join of an existing
+        // session rotates the producer, because "the most recent client request takes
+        // precedence". A join that would take the store past its session limit is
+        // refused instead.
         let generation = match store.join_as_producer(&input.channel_arn, now) {
             Ok(generation) => generation,
             Err(refused) => {

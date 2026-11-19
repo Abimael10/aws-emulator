@@ -45,10 +45,11 @@ const REGION: &str = "us-east-1";
 /// The stream the control plane creates up front, then every other row reads against.
 const STREAM_NAME: &str = "routing-check-stream";
 
-/// A signaling-channel ARN satisfying the modelled `ChannelArn` `@pattern`
-/// `^arn:(aws[a-zA-Z-]*):kinesisvideo:[a-z0-9-]+:[0-9]+:[a-z]+/[a-zA-Z0-9_.-]+/[0-9]+$`.
-const CHANNEL_ARN: &str =
-    "arn:aws:kinesisvideo:us-east-1:000000000000:channel/routing-check-channel/1700000000000";
+/// The signaling channel the control plane creates up front: the two WebRTC Storage rows
+/// and the two Signaling rows address a channel that EXISTS, since every plane of this
+/// family resolves a channel ARN against the registry `CreateSignalingChannel` populates,
+/// and a row has to reach the owning service's own answer rather than its not-found one.
+const CHANNEL_NAME: &str = "routing-check-channel";
 
 /// A SigV4 `Authorization` header whose credential scope names `signing_name`. The
 /// signature is never checked: the router here runs with request authentication off.
@@ -219,6 +220,36 @@ async fn every_kinesis_video_route_is_claimed_by_exactly_one_of_the_five_service
             panic!("case \"CreateStream\": expected a StreamARN, got {created_body}")
         });
 
+    // The signaling channel the channel-addressed rows below name. Its ARN is the one the
+    // control plane minted — the only kind of value that resolves in the registry every
+    // plane of this family reads — and the `/createSignalingChannel` 200 can likewise come
+    // from no other of the five.
+    let created = dispatch(
+        &router,
+        &Call::post(
+            "/createSignalingChannel",
+            &format!(r#"{{"ChannelName":"{CHANNEL_NAME}","ChannelType":"SINGLE_MASTER"}}"#),
+        ),
+    )
+    .await;
+    let created_status = created.status().as_u16();
+    let created_body = String::from_utf8_lossy(created.body()).to_string();
+    assert_eq!(
+        created_status, 200,
+        "case \"CreateSignalingChannel\": expected the control plane to serve it, got \
+         {created_status} {created_body}"
+    );
+    let channel_arn = serde_json::from_str::<serde_json::Value>(&created_body)
+        .ok()
+        .and_then(|json| {
+            json.get("ChannelARN")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            panic!("case \"CreateSignalingChannel\": expected a ChannelARN, got {created_body}")
+        });
+
     // (case, call, expectation). The rows span all five services' modelled path spaces,
     // differing along the one thing that separates them — the first URI path segment —
     // plus the endpoint host (which must not matter), the signing name (which must), and
@@ -374,11 +405,12 @@ async fn every_kinesis_video_route_is_claimed_by_exactly_one_of_the_five_service
         ),
         (
             // WebRTC Storage's `/joinStorageSession` is implemented and answers an empty
-            // 200 for a well-formed channel ARN — an answer no peer's route produces.
+            // 200 for a channel the control plane holds — an answer no peer's route
+            // produces.
             "webrtc storage JoinStorageSession",
             Call::post(
                 "/joinStorageSession",
-                &format!(r#"{{"channelArn":"{CHANNEL_ARN}"}}"#),
+                &format!(r#"{{"channelArn":"{channel_arn}"}}"#),
             ),
             Expect::Answer(200, None),
         ),
@@ -386,19 +418,19 @@ async fn every_kinesis_video_route_is_claimed_by_exactly_one_of_the_five_service
             "webrtc storage JoinStorageSessionAsViewer",
             Call::post(
                 "/joinStorageSessionAsViewer",
-                &format!(r#"{{"channelArn":"{CHANNEL_ARN}","clientId":"viewer-1"}}"#),
+                &format!(r#"{{"channelArn":"{channel_arn}","clientId":"viewer-1"}}"#),
             ),
-            Expect::ExactlyOneClaimant,
+            Expect::Answer(200, None),
         ),
         (
             // Signaling binds both its operations under `/v1/…`, a first segment no other
-            // Kinesis Video model uses. Both are served from that crate's own channel
-            // registry now; this suite asserts only the selection, and the signaling
-            // crate's own suite asserts what each answers.
+            // Kinesis Video model uses. Both are served from the same channel registry;
+            // this suite asserts only the selection, and the signaling crate's own suite
+            // asserts what each answers.
             "signaling GetIceServerConfig",
             Call::post(
                 "/v1/get-ice-server-config",
-                &format!(r#"{{"ChannelARN":"{CHANNEL_ARN}"}}"#),
+                &format!(r#"{{"ChannelARN":"{channel_arn}"}}"#),
             ),
             Expect::ExactlyOneClaimant,
         ),
@@ -407,7 +439,7 @@ async fn every_kinesis_video_route_is_claimed_by_exactly_one_of_the_five_service
             Call::post(
                 "/v1/send-alexa-offer-to-master",
                 &format!(
-                    r#"{{"ChannelARN":"{CHANNEL_ARN}","SenderClientId":"alexa","MessagePayload":"b2ZmZXI="}}"#
+                    r#"{{"ChannelARN":"{channel_arn}","SenderClientId":"alexa","MessagePayload":"b2ZmZXI="}}"#
                 ),
             ),
             Expect::ExactlyOneClaimant,

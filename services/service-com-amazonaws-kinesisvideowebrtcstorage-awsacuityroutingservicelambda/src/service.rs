@@ -45,6 +45,18 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The error code this service's front door names for a request body it cannot accept.
+///
+/// Not a shape of this model — no operation of it declares one and the service's common
+/// errors do not name it — because it is the FRONT DOOR's refusal rather than an
+/// operation's: the body never reached a handler. It is the one code this service emits
+/// for that class, so a client has exactly one to branch on.
+pub const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+
+/// What [`BAD_REQUEST_EXCEPTION`] says: entirely fixed text, with nothing of the request
+/// in it.
+pub const INVALID_REQUEST_BODY: &str = "Invalid request body";
+
 /// Whether this service serves the request these `parts` came from.
 ///
 /// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable
@@ -136,17 +148,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // This service models no `ValidationException`, which is the code the framework
+        // would otherwise name for a value that breaks a modelled constraint, and no
+        // operation of it declares one either ("AccessDeniedException",
+        // "ClientLimitExceededException", "InvalidArgumentException",
+        // "ResourceNotFoundException" — `smithy_query(query="service_info")`). What its
+        // front door answers a body it cannot accept is `BadRequestException`
+        // ([`BAD_REQUEST_EXCEPTION`]) with one fixed sentence: a caller branches on the
+        // code, and this is the only code this service emits for a malformed body.
+        //
+        // The sentence states NOTHING of the request — not the member, not the value the
+        // caller sent and not the model's regular expression — which is what the
+        // framework's own constraint report would echo back.
+        //
+        // An authentication refusal keeps the framework's wording: it is refused before
+        // this service is reached, and is not a statement about the body at all.
+        match refusal {
+            Refusal::Invalid(_) => Some(Refused {
+                code: BAD_REQUEST_EXCEPTION.to_string(),
+                message: INVALID_REQUEST_BODY.to_string(),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

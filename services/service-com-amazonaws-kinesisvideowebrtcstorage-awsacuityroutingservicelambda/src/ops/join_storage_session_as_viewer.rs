@@ -3,10 +3,10 @@
 //! @op JoinStorageSessionAsViewer
 //!
 //! Joins the caller to a signaling channel's WebRTC storage session as a playback
-//! **viewer**, registered under its `clientId`. The session is the one
-//! `JoinStorageSession` created for that channel — the two operations share
-//! [`crate::state`] — and a channel this emulator has no registration for is
-//! reported as `ResourceNotFoundException`.
+//! **viewer**, registered under its `clientId`. The session is the one the channel's
+//! first join of either kind created — the two operations share [`crate::state`] —
+//! and a `channelArn` naming no signaling channel the control plane holds is reported
+//! as `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -221,12 +221,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // A viewer join does not provide a signaling channel this emulator can
-        // learn about: the channel has to be one it already holds a registration
-        // for, or there is nothing to join.
-        if !store.knows_channel(&input.channel_arn) {
+        // Authorization comes before the resource is resolved or anything is
+        // recorded: a caller the account's policies do not permit learns nothing
+        // about the channel and joins nothing.
+        if let Some(refusal) = crate::state::authorization_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.channel_arn,
+        ) {
+            return Err(
+                JoinStorageSessionAsViewerErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(refusal),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The channel has to be one the control plane holds: a viewer join creates a
+        // SESSION, never a channel.
+        if !crate::state::knows_channel(&*self.engine, &input.channel_arn) {
             return Err(
                 JoinStorageSessionAsViewerErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -239,6 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
         // "If there's no existing session for the channel, create a new streaming
         // session"; a repeat join with the same clientId takes precedence over the
         // viewer's earlier join rather than adding a second entry. A join that

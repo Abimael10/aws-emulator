@@ -174,6 +174,33 @@ pub const CHANNEL_NOT_FOUND_MESSAGE: &str = "The requested channel is not found 
 /// its HTTP 404, and the message is an example.
 pub const STREAM_NOT_FOUND_MESSAGE: &str = "The requested stream is not found or not active.";
 
+/// How this service words the `ResourceInUseException` of a media-storage UPDATE.
+///
+/// The failure class `UpdateMediaStorageConfiguration` declares it for — the stream is
+/// already mapped to another channel, or either resource is not `ACTIVE` — carries ONE
+/// sentence, entirely fixed: the pair it refuses about is named by kind and not by ARN,
+/// so the refusal discloses neither the stream nor the channel holding it.
+pub const MEDIA_STORAGE_IN_USE_MESSAGE: &str =
+    "The channel/stream is currently not available for this operation because it is being updated.";
+
+/// How this service words the `ResourceInUseException` of a channel DELETE blocked by its
+/// media-storage configuration.
+///
+/// A different operation refuses a different thing — the delete of a channel still
+/// ingesting into a stream — so it carries its own sentence, and it states what the caller
+/// has to do first. Entirely fixed text: no part of it comes from the request or the store.
+pub const MEDIA_STORAGE_ENABLED_DELETE_MESSAGE: &str =
+    "Disable MediaStorageConfiguration to delete the channel";
+
+/// How this service words a `NoDataRetentionException`.
+///
+/// The runtime message of the failure class, which is NOT the modelled shape's
+/// documentation ("The Stream data retention in hours is equal to zero"): a shape's doc
+/// describes the class to a reader of the model, while this is the sentence the service
+/// answers with. Entirely fixed text — the retention it refuses about is zero by
+/// definition of the class.
+pub const ZERO_DATA_RETENTION_MESSAGE: &str = "The stream data retention is set to 0 hours.";
+
 /// The resource KIND a signaling channel's ARN names, as the first segment of the
 /// resource field the modeled `ResourceARN` pattern leaves open
 /// (`…:[a-z]+/[a-zA-Z0-9_.-]+/[0-9]+`) — see [`channel_arn`].

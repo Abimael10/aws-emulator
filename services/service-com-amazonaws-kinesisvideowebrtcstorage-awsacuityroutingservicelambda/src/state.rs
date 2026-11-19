@@ -5,10 +5,15 @@
 //! The service binds two operations — `JoinStorageSession` (the video producing
 //! device, i.e. the master) and `JoinStorageSessionAsViewer` (a playback viewer) —
 //! and both outputs are empty structures, so everything a caller can observe about
-//! a join is carried here: which signaling channels this emulator knows, and the
-//! WebRTC storage session each of them has.
+//! a join is carried here: the WebRTC storage session each signaling channel has.
+//!
+//! WHICH signaling channels exist is NOT held here. A channel is created by
+//! `kinesisvideo:CreateSignalingChannel` and deleted by its `DeleteSignalingChannel`,
+//! so its existence is a fact of the control plane that mints it; both joins resolve a
+//! `channelArn` against the ONE registry that create populates ([`knows_channel`])
+//! rather than against a set of this crate's own, which no create ever writes to.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 /// The SDP offer one join of a storage session is sent.
@@ -65,10 +70,17 @@ pub const MAX_OFFERS_PER_SESSION: usize = 128;
 ///
 /// A `SINGLE_MASTER` signaling channel — the only type that ingests WebRTC media,
 /// per this operation's own modelled docs — carries one video producing device and
-/// up to ten concurrent viewers. A viewer join past that is refused with the
-/// modelled `ClientLimitExceededException`, which also bounds the per-session
-/// viewer map, whose keys are the caller's `clientId`.
-pub const MAX_VIEWERS_PER_SESSION: usize = 10;
+/// the viewers of its STORAGE session. The model states no number ("Multiple viewers
+/// are able to playback real-time media"); recorded behaviour does: the third
+/// distinct `clientId` is admitted and the fourth is refused, where plain signaling
+/// admits ten viewers per channel. A viewer join past it is refused with the modelled
+/// `ClientLimitExceededException`, which also bounds the per-session viewer map,
+/// whose keys are the caller's `clientId`.
+pub const MAX_VIEWERS_PER_SESSION: usize = 3;
+
+/// What the service answers a viewer join the session has no slot left for: fixed
+/// text, with nothing of the request or of the store in it.
+pub const VIEWER_LIMIT_MESSAGE: &str = "Maximum number of viewers connected to the session!";
 
 /// Why a join could not be admitted: one of the limits above is already reached.
 ///
@@ -90,9 +102,7 @@ impl JoinRefused {
             Self::ChannelLimit => format!(
                 "the limit of {MAX_SIGNALING_CHANNELS} signaling channels with a storage session has been reached"
             ),
-            Self::ViewerLimit => format!(
-                "the limit of {MAX_VIEWERS_PER_SESSION} viewers for this signaling channel's session has been reached"
-            ),
+            Self::ViewerLimit => VIEWER_LIMIT_MESSAGE.to_string(),
         }
     }
 }
@@ -308,29 +318,20 @@ impl StorageSession {
 /// Per-service state for com-amazonaws-kinesisvideowebrtcstorage-awsacuityroutingservicelambda. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKinesisvideowebrtcstorageAwsacuityroutingservicelambdaState {
-    /// The signaling channels this emulator knows, by ARN.
-    ///
-    /// A signaling channel is created by `kinesisvideo:CreateSignalingChannel`,
-    /// which lives in another service's crate and is still a scaffold, so the only
-    /// call that tells this service a channel exists is `JoinStorageSession` —
-    /// the one that, per the modelled docs, "provides the ARN of the signaling
-    /// channel" when a streaming session has to be created. A channel ARN this set
-    /// does not hold is one the emulator has no registration for, which the
-    /// handlers report as the modelled `ResourceNotFoundException`.
-    ///
-    /// Bounded with `sessions` below: [`Self::join_as_producer`] is the only path
-    /// that adds to either, and it refuses past [`MAX_SIGNALING_CHANNELS`].
-    pub known_channels: HashSet<String>,
     /// Storage sessions keyed by signaling channel ARN.
+    ///
+    /// A session is created by the FIRST join of either kind on a channel the
+    /// control plane holds ("Both a video producing device and viewers can join a
+    /// session first and wait for other participants"), so this map holds a session
+    /// only for channels that exist; the existence question itself is answered by
+    /// [`knows_channel`], not from here.
+    ///
+    /// Bounded at [`MAX_SIGNALING_CHANNELS`]: the keys come from the request, so
+    /// every path that may insert one passes [`Self::reserve_channel`] first.
     pub sessions: HashMap<String, StorageSession>,
 }
 
 impl ComAmazonawsKinesisvideowebrtcstorageAwsacuityroutingservicelambdaState {
-    /// Whether `channel_arn` names a signaling channel this emulator knows.
-    pub fn knows_channel(&self, channel_arn: &str) -> bool {
-        self.known_channels.contains(channel_arn)
-    }
-
     /// The channel's session, if it has one.
     pub fn session(&self, channel_arn: &str) -> Option<&StorageSession> {
         self.sessions.get(channel_arn)
@@ -342,21 +343,22 @@ impl ComAmazonawsKinesisvideowebrtcstorageAwsacuityroutingservicelambdaState {
         self.sessions.len()
     }
 
-    /// Register `channel_arn` and record a video-producing-device join on its
-    /// session, creating the session when the channel has none yet — "If there's
-    /// no existing session for the channel, a new streaming session needs to be
-    /// created". Returns the producer's new generation.
+    /// Record a video-producing-device join on the channel's session, creating the
+    /// session when the channel has none yet — "If there's no existing session for
+    /// the channel, a new streaming session needs to be created". Returns the
+    /// producer's new generation.
     ///
-    /// Refused with [`JoinRefused::ChannelLimit`] when the channel is new and the
-    /// store already holds [`MAX_SIGNALING_CHANNELS`] of them: this is the only
-    /// path that adds a channel, so that is the bound on both collections.
+    /// Refused with [`JoinRefused::ChannelLimit`] when the channel has no session
+    /// yet and the store already holds [`MAX_SIGNALING_CHANNELS`] of them.
+    ///
+    /// The caller decides whether the channel EXISTS ([`knows_channel`]); that is a
+    /// different answer (`ResourceNotFoundException`) from a limit.
     pub fn join_as_producer(
         &mut self,
         channel_arn: &str,
         now: SystemTime,
     ) -> Result<u64, JoinRefused> {
         self.reserve_channel(channel_arn)?;
-        self.known_channels.insert(channel_arn.to_string());
         Ok(self.session_or_create(channel_arn, now).join_as_producer(now))
     }
 
@@ -377,9 +379,8 @@ impl ComAmazonawsKinesisvideowebrtcstorageAwsacuityroutingservicelambdaState {
     /// the session when the channel has none yet. Returns how many times that
     /// `clientId` has joined, or the limit that refused it.
     ///
-    /// The caller decides whether the channel is one this emulator knows
-    /// ([`knows_channel`](Self::knows_channel)); that is a different answer
-    /// (`ResourceNotFoundException`) from a limit.
+    /// The caller decides whether the channel EXISTS ([`knows_channel`]); that is a
+    /// different answer (`ResourceNotFoundException`) from a limit.
     pub fn join_as_viewer(
         &mut self,
         channel_arn: &str,
@@ -410,6 +411,38 @@ impl ComAmazonawsKinesisvideowebrtcstorageAwsacuityroutingservicelambdaState {
             .entry(channel_arn.to_string())
             .or_insert_with(|| StorageSession::new(channel_arn, now))
     }
+}
+
+/// Whether IAM lets a request perform `kinesisvideo:<operation>` on the channel ARN it
+/// addresses, and the sentence that says why not when it does not.
+///
+/// Both operations model `AccessDeniedException` — "You do not have required permissions
+/// to perform this operation" — so a join is authorized BEFORE it reads or writes
+/// anything. The decision needs the SESSION a credential speaks for (STS's store) and the
+/// identity-based POLICIES in force on that principal (IAM's), and the one reading of
+/// those two stores for this service family's `kinesisvideo` actions already serves the
+/// signaling data plane: it is shared from there rather than copied, so one action prefix,
+/// one principal resolution and one refusal sentence serve every plane of this family.
+///
+/// Called BEFORE this service's own store is locked, so no two stores are held at once.
+pub use ::service_com_amazonaws_kinesisvideosignaling_awsacuitysignalingservice::state::authorization_refusal;
+
+/// Whether `channel_arn` names a signaling channel THIS emulator holds.
+///
+/// A signaling channel is a resource of the Kinesis Video Streams control plane:
+/// `CreateSignalingChannel` mints it and `DeleteSignalingChannel` removes it. Both are
+/// in another crate, and each keeps the ONE registry every plane of this service family
+/// resolves a channel ARN against, so existence is read from there — a registry of this
+/// crate's own would answer `ResourceNotFoundException` for a channel a caller just
+/// created and read back as `ACTIVE`.
+///
+/// Read BEFORE this service's own store is locked, so the two stores are never held at
+/// once.
+pub fn knows_channel<Eng: Send + Sync + 'static>(engine: &Eng, channel_arn: &str) -> bool {
+    ::service_com_amazonaws_kinesisvideosignaling_awsacuitysignalingservice::state::knows_channel_of(
+        engine,
+        channel_arn,
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

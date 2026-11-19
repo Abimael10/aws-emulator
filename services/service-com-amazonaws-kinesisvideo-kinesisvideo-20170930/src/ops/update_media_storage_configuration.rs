@@ -232,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     UpdateMediaStorageConfigurationErrorModeled::NoDataRetentionException(
                         NoDataRetentionException {
                             message: Some(
-                                "The Stream data retention in hours is equal to zero.".to_string(),
+                                crate::state::ZERO_DATA_RETENTION_MESSAGE.to_string(),
                             ),
                         },
                     )
@@ -244,37 +244,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // another channel's media: both are the cases `ResourceInUseException` is
             // modeled for ("already mapped to a different Kinesis Video Stream
             // resource, or if the provided input StreamARN or ChannelARN is not in
-            // Active status").
+            // Active status"), and both carry that class's one fixed sentence — which
+            // names neither resource, so this refusal discloses nothing of the store.
             if stream.status != crate::state::STATUS_ACTIVE
                 || channel_status != crate::state::STATUS_ACTIVE
             {
                 return Err(
                     UpdateMediaStorageConfigurationErrorModeled::ResourceInUseException(
                         ResourceInUseException {
-                            message: Some(format!(
-                                "The channel {channel_name} and the stream {} must both be \
-                                 {} before their media storage configuration can be updated.",
-                                stream.stream_name,
-                                crate::state::STATUS_ACTIVE
-                            )),
+                            message: Some(
+                                crate::state::MEDIA_STORAGE_IN_USE_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into(),
                 );
             }
 
-            if let Some(other) = store
+            if store
                 .mapped_resources(&stream_arn)
                 .into_iter()
                 .filter_map(|item| item.arn)
-                .find(|arn| arn != &channel_arn)
+                .any(|arn| arn != channel_arn)
             {
                 return Err(
                     UpdateMediaStorageConfigurationErrorModeled::ResourceInUseException(
                         ResourceInUseException {
-                            message: Some(format!(
-                                "The stream {stream_arn} is already mapped to {other}."
-                            )),
+                            message: Some(
+                                crate::state::MEDIA_STORAGE_IN_USE_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into(),

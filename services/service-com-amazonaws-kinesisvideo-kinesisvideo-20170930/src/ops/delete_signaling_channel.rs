@@ -185,6 +185,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
+        // A channel still linked to a stream is ingesting into it, so the delete is
+        // refused while its media-storage configuration is ENABLED — the interlock an
+        // operator or IaC flow relies on, and one of the cases
+        // `ResourceInUseException` is modeled for ("the input StreamARN or ChannelARN
+        // in CLOUD_STORAGE_MODE is already mapped to a different Kinesis Video Stream
+        // resource"). The caller disables the configuration and deletes it then.
+        if channel.media_storage_status == crate::state::MEDIA_STORAGE_ENABLED {
+            return Err(DeleteSignalingChannelErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(
+                        crate::state::MEDIA_STORAGE_ENABLED_DELETE_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         // The optimistic-concurrency check: a `CurrentVersion` that is not the stored one
         // means the caller is acting on a stale read, so the channel is left intact.
         // "If you don't specify the channel's current version, the most recent version is

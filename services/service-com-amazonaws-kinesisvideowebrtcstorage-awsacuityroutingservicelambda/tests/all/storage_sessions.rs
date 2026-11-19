@@ -4,9 +4,14 @@
 //! through the same `MultiServiceRouter::dispatch` the production front door uses.
 //!
 //! Both operations answer an EMPTY body, so "it worked" is only observable through
-//! the shared store: the session `JoinStorageSession` creates for a channel is the
-//! session `JoinStorageSessionAsViewer` registers a viewer on. Every test here
-//! asserts the wire answer AND the state the call left behind.
+//! the shared store: the session the channel's first join creates is the session
+//! every later join of either kind lands on. Every test here asserts the wire answer
+//! AND the state the call left behind.
+//!
+//! The channel itself is NOT this service's resource: it is created by the Kinesis
+//! Video control plane, which seeds the one signaling registry both joins resolve a
+//! `channelArn` against, so each case puts its channel there first
+//! ([`register_channel`]) exactly as that create does.
 //!
 //! One thing a producer join does is observable to a PEER rather than to the caller:
 //! the SDP offer it pushes down the channel's signaling plane. Those cases mount the
@@ -34,13 +39,14 @@ use webrtc_storage::state::{
 
 /// Signaling channel ARNs spanning what the modelled `@pattern` on `ChannelArn`
 /// (`^arn:(aws[a-zA-Z-]*):kinesisvideo:[a-z0-9-]+:[0-9]+:[a-z]+/[a-zA-Z0-9_.-]+/[0-9]+$`,
-/// from `smithy_query(query="operation",operation="JoinStorageSession")`) admits:
-/// several partitions, regions, account ids, name spellings and creation times.
+/// from `smithy_query(query="operation",operation="JoinStorageSession")`) admits of the
+/// ARNs a signaling channel of this emulator can CARRY: several regions, account ids,
+/// name spellings and creation times.
 const CHANNEL_ARNS: &[&str] = &[
     "arn:aws:kinesisvideo:us-east-1:123456789012:channel/demo-channel/1700000000000",
     "arn:aws:kinesisvideo:eu-west-2:000000000000:channel/edge.cam_01-A/1",
-    "arn:aws-cn:kinesisvideo:cn-north-1:210987654321:channel/c/9999999999999",
-    "arn:aws-us-gov:kinesisvideo:us-gov-west-1:111122223333:channel/Gov_Cam.2/1762000000000",
+    "arn:aws:kinesisvideo:cn-north-1:210987654321:channel/c/9999999999999",
+    "arn:aws:kinesisvideo:us-gov-west-1:111122223333:channel/Gov_Cam.2/1762000000000",
 ];
 
 /// An answer from the emulator: the HTTP status and the wire error code
@@ -139,11 +145,11 @@ impl Emulator {
         self.with_session(channel_arn, |session| session.is_none())
     }
 
+    /// Whether the channel is one this emulator HOLDS — read from the registry the
+    /// Kinesis Video control plane's `CreateSignalingChannel` writes and its
+    /// `DeleteSignalingChannel` empties, which is where both joins resolve existence.
     fn knows_channel(&self, channel_arn: &str) -> bool {
-        self.engine
-            .state::<StorageState>()
-            .lock()
-            .knows_channel(channel_arn)
+        signaling::state::knows_channel_of(&*self.engine, channel_arn)
     }
 
     fn viewer_ids(&self, channel_arn: &str) -> BTreeSet<String> {
@@ -155,33 +161,54 @@ impl Emulator {
     }
 }
 
-/// The whole happy path, per channel: a viewer cannot join a channel this emulator
-/// has no registration for; a producer join registers it and creates the session;
-/// the viewer join then lands on THAT session; and a second producer join
-/// supersedes the first rather than erroring or no-op'ing.
+/// The whole happy path, per channel: on a channel the control plane holds, a VIEWER
+/// may open the session before any video producing device has joined; the producer
+/// join then lands on THAT session; a second clientId is a second viewer and a repeat
+/// one is the same viewer; and a second producer join supersedes the first rather
+/// than erroring or no-op'ing.
 #[tokio::test]
-async fn a_producer_join_creates_the_session_every_later_join_lands_on() {
+async fn either_participant_opens_the_session_every_later_join_lands_on() {
     let emulator = Emulator::new();
 
     for channel_arn in CHANNEL_ARNS {
-        // Step 1 — nothing is known about the channel yet, so a viewer join fails.
-        let before = emulator.join_as_viewer(channel_arn, "viewer-1").await;
-        assert_eq!(
-            before,
-            Answer {
-                status: 404,
-                error_code: Some("ResourceNotFoundException".to_owned()),
-            },
-            "case {channel_arn:?}: a viewer join before any producer join must be 404 \
-             ResourceNotFoundException, got {before:?}"
-        );
+        // Step 1 — the channel exists on the control plane, and the VIEWER joins
+        // first: "Both a video producing device and viewers can join a session
+        // first and wait for other participants."
+        register_channel(&emulator, channel_arn);
+        let first = emulator.join_as_viewer(channel_arn, "viewer-1").await;
         assert!(
-            emulator.has_no_session(channel_arn),
-            "case {channel_arn:?}: a refused viewer join must record no session, got {:?}",
-            emulator.with_session(channel_arn, |s| s.cloned())
+            first.ok(),
+            "case {channel_arn:?}: expected 200 from a viewer join before any producer \
+             join, got {first:?}"
         );
+        emulator.with_session(channel_arn, |session| {
+            let session = session.unwrap_or_else(|| {
+                panic!("case {channel_arn:?}: the viewer join recorded no session")
+            });
+            assert_eq!(
+                session.channel_arn, *channel_arn,
+                "case {channel_arn:?}: the session is keyed by the ARN as supplied, got {:?}",
+                session.channel_arn
+            );
+            assert_eq!(
+                session.join_count, 0,
+                "case {channel_arn:?}: a viewer join is not a producer join, so the \
+                 session has served none, got {}",
+                session.join_count
+            );
+            assert!(
+                session.producer.is_none(),
+                "case {channel_arn:?}: no video producing device has joined yet, got {:?}",
+                session.producer
+            );
+            assert_eq!(
+                session.viewers.keys().collect::<Vec<_>>(),
+                vec!["viewer-1"],
+                "case {channel_arn:?}: the viewer that joined must be on the session"
+            );
+        });
 
-        // Step 2 — the producer join registers the channel and creates the session.
+        // Step 2 — the producer join lands on the session the viewer opened.
         let producer = emulator.join_as_producer(channel_arn).await;
         assert!(
             producer.ok(),
@@ -192,11 +219,6 @@ async fn a_producer_join_creates_the_session_every_later_join_lands_on() {
             let session = session.unwrap_or_else(|| {
                 panic!("case {channel_arn:?}: JoinStorageSession recorded no session")
             });
-            assert_eq!(
-                session.channel_arn, *channel_arn,
-                "case {channel_arn:?}: the session is keyed by the ARN as supplied, got {:?}",
-                session.channel_arn
-            );
             assert_eq!(
                 session.join_count, 1,
                 "case {channel_arn:?}: expected join_count 1 after one producer join, got {}",
@@ -210,21 +232,14 @@ async fn a_producer_join_creates_the_session_every_later_join_lands_on() {
                 "case {channel_arn:?}: expected producer generation 1, got {}",
                 producer.generation
             );
-            assert!(
-                session.viewers.is_empty(),
-                "case {channel_arn:?}: a producer join must register no viewers, got {:?}",
+            assert_eq!(
+                session.viewers.len(),
+                1,
+                "case {channel_arn:?}: a producer join must register no viewer and drop \
+                 none, got {:?}",
                 session.viewers.keys().collect::<Vec<_>>()
             );
         });
-
-        // Step 3 — the SAME viewer join now succeeds: its outcome changed because
-        // of step 2, which is the whole point of sharing one store.
-        let after = emulator.join_as_viewer(channel_arn, "viewer-1").await;
-        assert!(
-            after.ok(),
-            "case {channel_arn:?}: expected 200 from JoinStorageSessionAsViewer after a \
-             producer join, got {after:?}"
-        );
 
         // Step 4 — a second clientId is a second viewer, not a replacement.
         let second = emulator.join_as_viewer(channel_arn, "viewer-2").await;
@@ -310,12 +325,11 @@ async fn a_producer_join_creates_the_session_every_later_join_lands_on() {
     }
 }
 
-/// A viewer join is refused for any channel ARN this emulator holds no
-/// registration for — including ARNs that differ from a known one in a single
-/// segment, so the decision is made from the stored channel and not from the ARN's
-/// shape.
+/// BOTH joins are refused for any channel ARN the control plane holds no channel
+/// for — including ARNs that differ from a held one in a single segment, so the
+/// decision is made from the registry and not from the ARN's shape.
 #[tokio::test]
-async fn a_viewer_join_for_an_unregistered_channel_is_not_found() {
+async fn a_join_of_a_channel_the_control_plane_does_not_hold_is_not_found() {
     let known = "arn:aws:kinesisvideo:us-east-1:123456789012:channel/demo-channel/1700000000000";
     // Each row changes exactly one segment of `known`: name, region, account,
     // creation time, partition.
@@ -328,41 +342,53 @@ async fn a_viewer_join_for_an_unregistered_channel_is_not_found() {
     ];
 
     let emulator = Emulator::new();
+    register_channel(&emulator, known);
     assert!(
         emulator.join_as_producer(known).await.ok(),
-        "the known channel must be registered by its producer join"
+        "the channel the control plane holds must accept a producer join"
     );
 
     for channel_arn in unknown {
-        let answer = emulator.join_as_viewer(channel_arn, "viewer-1").await;
-        assert_eq!(
-            answer,
-            Answer {
-                status: 404,
-                error_code: Some("ResourceNotFoundException".to_owned()),
-            },
-            "case {channel_arn:?}: expected 404 ResourceNotFoundException, got {answer:?}"
-        );
+        for (role, answer) in [
+            (
+                "JoinStorageSessionAsViewer",
+                emulator.join_as_viewer(channel_arn, "viewer-1").await,
+            ),
+            (
+                "JoinStorageSession",
+                emulator.join_as_producer(channel_arn).await,
+            ),
+        ] {
+            assert_eq!(
+                answer,
+                Answer {
+                    status: 404,
+                    error_code: Some("ResourceNotFoundException".to_owned()),
+                },
+                "case {channel_arn:?} on {role}: expected 404 ResourceNotFoundException, \
+                 got {answer:?}"
+            );
+        }
         assert!(
             !emulator.knows_channel(channel_arn),
-            "case {channel_arn:?}: a refused viewer join must not register the channel"
+            "case {channel_arn:?}: a refused join must not bring the channel into being"
         );
         assert!(
             emulator.has_no_session(channel_arn),
-            "case {channel_arn:?}: a refused viewer join must create no session"
+            "case {channel_arn:?}: a refused join must create no session"
         );
     }
 
-    // The registered channel is untouched by every refusal above.
+    // The channel that exists is untouched by every refusal above.
     assert_eq!(
         emulator.viewer_ids(known),
         BTreeSet::new(),
-        "refused joins on other ARNs must not land on the registered channel"
+        "refused joins on other ARNs must not land on the held channel"
     );
     assert_eq!(
         emulator.with_session(known, |s| s.expect("session").join_count),
         1,
-        "refused joins on other ARNs must not touch the registered channel's session"
+        "refused joins on other ARNs must not touch the held channel's session"
     );
 }
 
@@ -438,6 +464,7 @@ async fn an_arn_that_cannot_name_a_signaling_channel_is_an_invalid_argument() {
         "arn:aws:kinesisvideo:us-east-1:123456789012:channel/{}/1700000000000",
         "n".repeat(256)
     );
+    register_channel(&emulator, &at_bound);
     let answer = emulator.join_as_producer(&at_bound).await;
     assert!(
         answer.ok(),
@@ -446,17 +473,19 @@ async fn an_arn_that_cannot_name_a_signaling_channel_is_an_invalid_argument() {
     );
 }
 
-/// Values outside the modelled constraints are refused by the framework before any
-/// handler runs: 400, never a 501 and never a success. The rows walk each
-/// constraint the model declares — `channelArn`'s pattern, and `clientId`'s
+/// Values outside the modelled constraints are refused by this service's FRONT DOOR
+/// before any handler runs: 400 `BadRequestException` — the one code this service
+/// emits for a body it cannot accept — never a 501 and never a success. The rows walk
+/// each constraint the model declares: `channelArn`'s pattern, and `clientId`'s
 /// pattern and 1..256 length.
 #[tokio::test]
 async fn values_outside_the_modelled_constraints_are_refused_with_400() {
     let known = "arn:aws:kinesisvideo:us-east-1:123456789012:channel/demo-channel/1700000000000";
     let emulator = Emulator::new();
+    register_channel(&emulator, known);
     assert!(
         emulator.join_as_producer(known).await.ok(),
-        "the known channel must be registered by its producer join"
+        "the channel the control plane holds must accept a producer join"
     );
 
     // (case, channelArn, clientId) — a `None` clientId exercises JoinStorageSession.
@@ -482,10 +511,11 @@ async fn values_outside_the_modelled_constraints_are_refused_with_400() {
             answer,
             Answer {
                 status: 400,
-                error_code: Some("ValidationException".to_owned()),
+                error_code: Some(webrtc_storage::service::BAD_REQUEST_EXCEPTION.to_owned()),
             },
-            "case {case:?}: a modelled-constraint violation must be refused by the \
-             framework with 400 ValidationException, got {answer:?}"
+            "case {case:?}: a modelled-constraint violation must be refused by the front \
+             door with 400 {}, got {answer:?}",
+            webrtc_storage::service::BAD_REQUEST_EXCEPTION
         );
     }
 
@@ -530,12 +560,22 @@ async fn join_counts_track_the_calls_whatever_the_interleaving() {
         rng_state
     };
 
-    let clients = ["cam.a", "cam_b", "cam-c", "c4"];
+    // As many distinct clientIds as one session admits ([`MAX_VIEWERS_PER_SESSION`]),
+    // so every join in the interleaving is one the quota allows.
+    let clients = ["cam.a", "cam_b", "cam-c"];
+    assert_eq!(
+        clients.len(),
+        webrtc_storage::state::MAX_VIEWERS_PER_SESSION,
+        "the interleaving drives one client per viewer slot"
+    );
     let emulator = Emulator::new();
+    for channel_arn in CHANNEL_ARNS {
+        register_channel(&emulator, channel_arn);
+    }
 
     // The independent model this test checks the emulator against.
     let mut expected_producer_joins = vec![0_u64; CHANNEL_ARNS.len()];
-    let mut expected_viewer_joins = vec![[0_u64; 4]; CHANNEL_ARNS.len()];
+    let mut expected_viewer_joins = vec![[0_u64; 3]; CHANNEL_ARNS.len()];
 
     for step in 0..STEPS {
         let roll = next();
@@ -611,9 +651,10 @@ async fn join_counts_track_the_calls_whatever_the_interleaving() {
     }
 }
 
-/// The two limits that keep request-keyed state bounded are enforced through the
-/// modelled `ClientLimitExceededException`, and only for a join that would ADD an
-/// entry: a repeat join of something already recorded still succeeds.
+/// The viewer quota of a storage session, and the bound that keeps request-keyed
+/// state from growing without end, are enforced through the modelled
+/// `ClientLimitExceededException`, and only for a join that would ADD an entry: a
+/// repeat join of something already recorded still succeeds.
 #[tokio::test]
 async fn joins_past_a_limit_are_refused_with_client_limit_exceeded() {
     let limit_exceeded = Answer {
@@ -623,9 +664,10 @@ async fn joins_past_a_limit_are_refused_with_client_limit_exceeded() {
     let channel_arn =
         "arn:aws:kinesisvideo:us-east-1:123456789012:channel/demo-channel/1700000000000";
     let emulator = Emulator::new();
+    register_channel(&emulator, channel_arn);
     assert!(
         emulator.join_as_producer(channel_arn).await.ok(),
-        "the channel must be registered by its producer join"
+        "the channel the control plane holds must accept a producer join"
     );
 
     // Every viewer up to the per-channel maximum is admitted.
@@ -679,9 +721,10 @@ async fn joins_past_a_limit_are_refused_with_client_limit_exceeded() {
         );
     });
 
-    // The channel limit, the same way: fill the store to its maximum through the
+    // The session bound, the same way: fill the store to its maximum through the
     // state API (the request path would be the same calls), then drive the next
-    // join over HTTP.
+    // join over HTTP for a channel the control plane DOES hold, so the refusal is
+    // the bound and not a missing channel.
     let filler = Emulator::new();
     let now = std::time::SystemTime::now();
     {
@@ -703,32 +746,30 @@ async fn joins_past_a_limit_are_refused_with_client_limit_exceeded() {
     }
     let one_too_many =
         "arn:aws:kinesisvideo:us-east-1:123456789012:channel/one-too-many/1700000000000";
+    register_channel(&filler, one_too_many);
     let answer = filler.join_as_producer(one_too_many).await;
     assert_eq!(
         answer, limit_exceeded,
-        "case one channel past the limit: expected 400 ClientLimitExceededException, \
+        "case one session past the bound: expected 400 ClientLimitExceededException, \
          got {answer:?}"
     );
     assert!(
-        !filler.knows_channel(one_too_many),
-        "case one channel past the limit: the refused channel must not be registered"
-    );
-    assert!(
         filler.has_no_session(one_too_many),
-        "case one channel past the limit: the refused channel must have no session"
+        "case one session past the bound: the refused channel must have no session"
     );
 
-    // A channel already in the store still accepts a producer join at the limit.
+    // A channel that already has a session still accepts a producer join at the bound.
     let existing = "arn:aws:kinesisvideo:us-east-1:123456789012:channel/c0/1700000000000";
+    register_channel(&filler, existing);
     let answer = filler.join_as_producer(existing).await;
     assert!(
         answer.ok(),
-        "case repeat producer join at the channel limit: expected 200, got {answer:?}"
+        "case repeat producer join at the session bound: expected 200, got {answer:?}"
     );
     assert_eq!(
         filler.with_session(existing, |s| s.expect("session").join_count),
         2,
-        "case repeat producer join at the channel limit: the join must have been counted"
+        "case repeat producer join at the session bound: the join must have been counted"
     );
 }
 
@@ -1021,34 +1062,31 @@ async fn every_producer_join_pushes_its_own_sdp_offer_to_the_channels_master() {
 }
 
 /// A join with no producing device attached to receive the offer is still a join: the call
-/// succeeds and the session records the offer it sent, whether the channel's signaling
-/// plane holds a connection for it or holds no record of the channel at all.
+/// succeeds and the session records the offer it sent, whether or not the channel's
+/// signaling plane holds a connection for it.
 #[tokio::test]
 async fn a_join_with_no_attached_device_still_records_the_offer_it_sent() {
-    // (case, channelArn, whether the signaling registry holds the channel)
-    let rows: &[(&str, &str, bool)] = &[
+    // (case, channelArn). Every row is a channel the control plane holds, which is what
+    // makes the join a join; what they differ along is where the channel lives and how its
+    // name is spelled.
+    let rows: &[(&str, &str)] = &[
         (
-            "a registered channel nobody is connected to",
+            "a channel nobody is connected to",
             "arn:aws:kinesisvideo:us-east-1:123456789012:channel/registered-idle/1700000000000",
-            true,
         ),
         (
-            "a channel the signaling plane holds no record of",
-            "arn:aws:kinesisvideo:us-east-1:123456789012:channel/unregistered/1700000000001",
-            false,
+            "another channel in the same region",
+            "arn:aws:kinesisvideo:us-east-1:123456789012:channel/idle.two_B/1700000000001",
         ),
         (
-            "a channel in another partition, which that registry does not name",
-            "arn:aws-cn:kinesisvideo:cn-north-1:210987654321:channel/c/9999999999999",
-            false,
+            "a one-character name in another region",
+            "arn:aws:kinesisvideo:cn-north-1:210987654321:channel/c/9999999999999",
         ),
     ];
 
     let emulator = Emulator::with_signaling_plane();
-    for (case, channel_arn, registered) in rows {
-        if *registered {
-            register_channel(&emulator, channel_arn);
-        }
+    for (case, channel_arn) in rows {
+        register_channel(&emulator, channel_arn);
         let answer = emulator.join_as_producer(channel_arn).await;
         assert!(
             answer.ok(),
