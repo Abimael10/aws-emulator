@@ -266,6 +266,11 @@ pub use scheduled_query_executions::*;
 mod anomaly_detectors;
 pub use anomaly_detectors::*;
 
+/// The BATCHES of an import task — the subsets of its events, grouped by event time — as they
+/// are stored, advanced by the clock and reported.
+mod import_batches;
+pub use import_batches::*;
+
 /// The OpenSearch Service integrations, their S3-table sources and the scheduled queries
 /// this account holds, as they are stored.
 mod integration_records;
@@ -1225,6 +1230,12 @@ pub struct ImportTaskRecord {
     /// `Import$errorMessage` — "Error message related to any failed imports". Only a
     /// FAILED task carries one.
     pub error_message: Option<String>,
+    /// The batches this import groups its events into — "the individual batches within an
+    /// import task", which `DescribeImportTaskBatches` reports — in the event-time order the
+    /// import walks them in. Derived from the task's own event-time window when it is created
+    /// ([`import_batch_records`]), because a batch is a part of the import rather than a
+    /// resource any request creates.
+    pub batches: Vec<ImportBatchRecord>,
 }
 
 impl ImportTaskRecord {
@@ -1252,6 +1263,12 @@ impl ImportTaskRecord {
             last_updated_time_ms: creation_time_ms,
             completion_due_ms: Some(creation_time_ms.saturating_add(IMPORT_COMPLETION_DELAY_MS)),
             error_message: None,
+            batches: import_batch_records(
+                import_id,
+                import_filter.and_then(|filter| filter.start_event_time),
+                import_filter.and_then(|filter| filter.end_event_time),
+                creation_time_ms,
+            ),
         }
     }
 
@@ -1283,21 +1300,21 @@ impl ImportTaskRecord {
         }
     }
 
-    /// Materialise the status change the clock owes this task: a running import whose
+    /// Materialise the status changes the clock owes this task: a running import whose
     /// completion instant has passed is `COMPLETED`, updated AT that instant and not at
-    /// the time something happened to look.
+    /// the time something happened to look — and the batches it is grouped into move with it
+    /// ([`Self::materialize_due_batch_transitions`]).
     pub fn materialize_due_transitions(&mut self, now_ms: i64) {
-        if self.is_terminal() {
-            return;
+        if !self.is_terminal() {
+            if let Some(due) = self.completion_due_ms {
+                if due <= now_ms {
+                    self.import_status = IMPORT_STATUS_COMPLETED.to_string();
+                    self.last_updated_time_ms = due;
+                    self.completion_due_ms = None;
+                }
+            }
         }
-        let Some(due) = self.completion_due_ms else {
-            return;
-        };
-        if due <= now_ms {
-            self.import_status = IMPORT_STATUS_COMPLETED.to_string();
-            self.last_updated_time_ms = due;
-            self.completion_due_ms = None;
-        }
+        self.materialize_due_batch_transitions(now_ms);
     }
 }
 

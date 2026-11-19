@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeImportTaskBatches
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeImportTaskBatches`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeImportTaskBatches::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the batches of one import task from [`crate::state`]: every batch of the task the
+//! request names whose status the request asked for, in the event-time order the import walks
+//! them in, one `limit`-sized page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +76,10 @@
 //! * `InvalidParameterException` (HTTP 400) — A parameter is specified incorrectly.
 //! * `ResourceNotFoundException` (HTTP 400) — The specified resource does not exist.
 //! * `ThrottlingException` (HTTP 400) — The request was throttled because of quota limits.
+//! * `ServiceUnavailableException` (HTTP 500) — The service cannot complete the request.
+//!   Widened in through `extra_errors` (see below): this SERVICE models the shape and other
+//!   operations of it declare it, so an unreachable shared store has a modelled server
+//!   failure to answer with rather than being reported as a client's mistake.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -96,7 +95,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatchlogs-logs-201
 // here — hence the `DescribeImportTaskBatchesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatchlogs#DescribeImportTaskBatches")]
+// `extra_errors` widens the set with `ServiceUnavailableException` — "The service cannot
+// complete the request", a shape this SERVICE models and other operations of it declare,
+// which this operation's own `errors` list omits. It is what an unreachable shared store
+// is answered with, so a store this handler cannot read is never reported as a client's
+// mistake.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatchlogs#DescribeImportTaskBatches",
+    extra_errors = ["ServiceUnavailableException"]
+)]
 #[derive(Debug)]
 pub enum DescribeImportTaskBatchesErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -104,6 +111,7 @@ pub enum DescribeImportTaskBatchesErrorModeled {
     InvalidParameterException(InvalidParameterException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
+    ServiceUnavailableException(ServiceUnavailableException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -118,6 +126,52 @@ pub type DescribeImportTaskBatchesError = crate::scaffolded::Scaffolded<Describe
 impl From<DescribeImportTaskBatchesErrorModeled> for DescribeImportTaskBatchesError {
     fn from(modeled: DescribeImportTaskBatchesErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeImportTaskBatches";
+
+/// Where the next page resumes: the `batchId` of the last batch returned, plus the task and
+/// the status filter of the enumeration it belongs to. A continuation that changes either is
+/// refused, because the token is only a position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    import_id: String,
+    batch_import_status: Option<Vec<String>>,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "importId": self.import_id,
+            "batchImportStatus": self.batch_import_status,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        let batch_import_status = match value.get("batchImportStatus") {
+            Some(::serde_json::Value::Array(statuses)) => Some(
+                statuses
+                    .iter()
+                    .map(|status| status.as_str().map(ToString::to_string))
+                    .collect::<Option<Vec<String>>>()?,
+            ),
+            _ => None,
+        };
+        Some(Self {
+            import_id: value.get("importId")?.as_str()?.to_string(),
+            batch_import_status,
+            after: value.get("after")?.as_str()?.to_string(),
+        })
     }
 }
 
@@ -157,18 +211,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeImportTaskBatches` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeImportTaskBatchesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeImportTaskBatches"))
+        // `ctx` carries only request metadata; this operation reports on one stored task's
+        // batches and needs none of it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeImportTaskBatchesError::from(
+                DescribeImportTaskBatchesErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: &str| {
+            DescribeImportTaskBatchesError::from(
+                DescribeImportTaskBatchesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        // An import runs asynchronously, so the statuses this call reports — the task's and
+        // those of the batches it is grouped into — are the ones the clock has already made
+        // due: materialised before the read, never moved on because of it.
+        store.materialize_due_import_transitions(crate::state::now_ms());
+
+        // "The ID of the import task to get batch information for": the one required input,
+        // and it names a resource of this service, so an id no task carries is a missing
+        // resource rather than an empty page — stated in the sentence CloudWatch Logs words
+        // that condition in for an import it holds none under.
+        let Some(task) = store.import_tasks.get(&input.import_id) else {
+            return Err(
+                DescribeImportTaskBatchesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::NO_MATCHING_IMPORT_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid(crate::state::INVALID_NEXT_TOKEN_MESSAGE));
+                };
+                if cursor.import_id != input.import_id
+                    || cursor.batch_import_status != input.batch_import_status
+                {
+                    return Err(invalid(crate::state::INVALID_NEXT_TOKEN_MESSAGE));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // One enumeration of this task's batches, in the event-time order the import walks
+        // them in, of those the request asked for. `batchImportStatus` is an "optional filter
+        // to list import batches by their status" that "accepts multiple status values", so a
+        // batch matches when its status is any of the named ones, and a filter naming none
+        // excludes nothing. The member targets the modelled `ImportStatus` enum, so the
+        // boundary validator has already refused a status outside it.
+        let wanted = input
+            .batch_import_status
+            .as_deref()
+            .filter(|statuses| !statuses.is_empty());
+        let matching: Vec<&crate::state::ImportBatchRecord> = task
+            .batches
+            .iter()
+            .filter(|batch| wanted.is_none_or(|statuses| statuses.contains(&batch.status)))
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => {
+                let Some(position) = matching
+                    .iter()
+                    .position(|batch| batch.batch_id == cursor.after)
+                else {
+                    return Err(invalid(crate::state::INVALID_NEXT_TOKEN_MESSAGE));
+                };
+                position.saturating_add(1)
+            }
+            None => 0,
+        };
+        // "The maximum number of import batches to return in the response. Default: 10".
+        // `limit` is modelled `range 1..50`, so the boundary validator has already refused a
+        // value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(
+            input
+                .limit
+                .unwrap_or(crate::state::DEFAULT_IMPORT_BATCH_LIMIT),
+        )
+        .unwrap_or(0)
+        .max(1);
+        let first = first.min(matching.len());
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        // "Not present if there are no additional results to retrieve."
+        let next_token = page.last().filter(|_| last < matching.len()).map(|batch| {
+            Cursor {
+                import_id: input.import_id.clone(),
+                batch_import_status: input.batch_import_status.clone(),
+                after: batch.batch_id.clone(),
+            }
+            .encode()
+        });
+
+        Ok(DescribeImportTaskBatchesOutput {
+            // Both of the output's identifying members are the TASK's, read off the record
+            // rather than echoed from the request: "the ID of the import task" and "the ARN
+            // of the source being imported from".
+            import_id: Some(task.import_id.clone()),
+            import_source_arn: Some(task.import_source_arn.clone()),
+            import_batches: Some(page.iter().map(|batch| batch.reported()).collect()),
+            next_token,
+        })
     }
 }
