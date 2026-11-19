@@ -76,9 +76,15 @@ const MODELLED_VALIDATION_SHAPE: &str = "com.amazonaws.connecthealth#ValidationE
 /// The wire error code that shape renders with on this service's restJson1 protocol.
 const VALIDATION_CODE: &str = "ValidationException";
 
-/// The body member this service reports an exception's detail text in: the Smithy member
-/// name every exception shape of this model declares (`message`, no `@jsonName`).
-const DETAIL_MEMBER: &str = "message";
+/// The body member a refusal of a SUBSCRIPTION call reports its detail text in: the key
+/// the plane serving those calls keys it by (`src/ops/types/exception_wire.rs`), which the
+/// `ListSubscriptions` rows below are answered under.
+const DETAIL_MEMBER: &str = "Message";
+
+/// The body member every other row reports it in: the member name the model spells, which
+/// the plane serving the domain and tagging calls keys it by, and which the framework's
+/// own envelope writes for a row the boundary walk refuses before a handler runs.
+const FRAMEWORK_DETAIL_MEMBER: &str = "message";
 
 /// One emulator: the shared engine, this service mounted on a router (for the callback a
 /// handler is given, and for the wire leg of each row) and the request metadata a handler
@@ -282,7 +288,17 @@ fn assert_refused_over_the_wire(case: &str, status: u16, body: &Value) {
         VALIDATION_CODE,
         "case {case:?}: expected {VALIDATION_CODE} over the wire, got {body}"
     );
-    let detail = body.get(DETAIL_MEMBER).and_then(Value::as_str);
+    let stated: Vec<&str> = [DETAIL_MEMBER, FRAMEWORK_DETAIL_MEMBER]
+        .into_iter()
+        .filter(|member| body.get(*member).is_some())
+        .collect();
+    assert_eq!(
+        stated.len(),
+        1,
+        "case {case:?}: a refusal states its detail text in exactly one member, got \
+         {stated:?} in {body}"
+    );
+    let detail = body.get(stated[0]).and_then(Value::as_str);
     assert!(
         detail.is_some_and(|text| !text.is_empty()),
         "case {case:?}: a refusal must say what was wrong in its {DETAIL_MEMBER}, got {body}"

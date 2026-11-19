@@ -517,6 +517,9 @@ async fn a_key_this_service_does_not_accept_is_refused_and_removes_nothing() {
         )
         .await;
     assert_eq!(status, 400, "an over-long key: got {status} with {body}");
+    // Both this bound and the reserved namespace below are answered by the plane serving
+    // the ARN-addressed tagging calls, which keys an error body's detail text as the model
+    // names the member (`src/ops/types/exception_wire.rs`).
     let message = body
         .get("message")
         .and_then(Value::as_str)

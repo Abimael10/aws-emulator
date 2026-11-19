@@ -50,10 +50,6 @@ const PAGE_SIZE_RANGE: (i64, i64) = (1, 100);
 /// page can be a partial one.
 const COLLECTION_SIZE: usize = 3;
 
-/// The body member a refused ConnectHealth call reports its detail text in: the Smithy
-/// member name every exception shape of this model declares (`message`, no `@jsonName`).
-const DETAIL_MEMBER: &str = "message";
-
 /// One paginated listing, as a case drives it.
 struct Listing {
     operation: &'static str,
@@ -103,14 +99,14 @@ impl Listing {
     }
 }
 
-/// The detail text of a refusal, failing with the whole body when it carries none.
+/// The detail text of a refusal, read through the one reader this test target shares
+/// ([`crate::domain_subscription_lifecycle::detail_text`]): the rows below span both
+/// listings, and the two are served by planes that key that text differently
+/// (`src/ops/types/exception_wire.rs`), which `tests/all/error_detail_member.rs` pins per
+/// plane. What this suite is about is the page each one serves and the words it refuses
+/// with.
 fn detail_text(case: &str, body: &Value) -> String {
-    body.get(DETAIL_MEMBER)
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: a refusal must carry a {DETAIL_MEMBER} member, got {body}")
-        })
-        .to_string()
+    crate::domain_subscription_lifecycle::detail_text(case, body)
 }
 
 /// AWS's standard constraint-violation sentence for one violation, written here

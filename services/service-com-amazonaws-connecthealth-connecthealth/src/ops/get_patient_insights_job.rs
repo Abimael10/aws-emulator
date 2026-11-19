@@ -232,6 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             GetPatientInsightsJobErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(message),
+                    ..Default::default()
                 },
             )
             .into()

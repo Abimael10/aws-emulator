@@ -103,9 +103,24 @@ pub type ActivateSubscriptionError = crate::scaffolded::Scaffolded<ActivateSubsc
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
 /// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
 /// this operation is implemented.
+///
+/// It is also where this operation states WHICH PLANE of ConnectHealth answers it: the
+/// subscription plane, which keys an error body's detail text `Message` rather than as the
+/// model names the member (`crate::ops::types::exception_wire`). Stated once, for every
+/// exception this operation can answer with, rather than at each place a refusal is built.
 impl From<ActivateSubscriptionErrorModeled> for ActivateSubscriptionError {
     fn from(modeled: ActivateSubscriptionErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        crate::scaffolded::Scaffolded::Modeled(crate::ops::types::exception_wire::answered_by_plane!(
+            ActivateSubscriptionErrorModeled,
+            modeled,
+            AnsweringPlane::Subscriptions,
+            [
+                AccessDeniedException,
+                InternalServerException,
+                ResourceNotFoundException,
+                ValidationException,
+            ]
+        ))
     }
 }
 
@@ -170,6 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &input.domain_id,
                         &input.subscription_id,
                     )),
+                    ..Default::default()
                 },
             )
             .into());

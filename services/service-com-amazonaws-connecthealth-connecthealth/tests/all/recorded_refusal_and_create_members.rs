@@ -7,16 +7,18 @@
 //! Three rules, each asserted over a TABLE of inputs rather than the one request the
 //! issue recorded:
 //!
-//! 1. Every refusal of this service reports the exception's detail text in the body member
-//!    the model declares — `message`, the Smithy member name of the one member each of its
-//!    exception shapes carries, with no `@jsonName`
-//!    (`smithy_query(query="shape",shape="ResourceNotFoundException,ValidationException,AccessDeniedException",
-//!    model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`),
-//!    which is the key restJson1 writes for a member that renames itself nowhere. No error
-//!    body of this service carries the text under any other key. The rows span the error
-//!    CLASSES this service answers (404, 400 from a handler's bound, 400 from the boundary
-//!    walk, 401) across the operations that answer them, so the rule is not keyed to the
-//!    two operations the corpus exercises.
+//! 1. Every refusal of this service reports the exception's detail text in ONE body
+//!    member, and never under a second key. WHICH key is decided by the PLANE that
+//!    answered: `Message` for the subscription plane
+//!    (`/domains/{domainId}/subscriptions…`), and `message` — the member name the model
+//!    spells — for the domain plane, the Medical Scribe streaming endpoint, the
+//!    ARN-addressed tagging calls and the patient-insights runtime endpoint, which is also
+//!    what the framework's own envelope writes for a request it refuses before any handler
+//!    runs (`src/ops/types/exception_wire.rs`, and
+//!    `vendor/smithy-server-runtime/src/pre_dispatch.rs`). The rows span the error CLASSES
+//!    this service answers (404, 400 from a handler's bound, 400 from the boundary walk,
+//!    401) across the operations that answer them and across both planes, so the rule is
+//!    not keyed to the two operations the corpus exercises.
 //! 2. `DeleteDomain` answers a `domainId` it resolves no domain for with its ONE modelled
 //!    error, `ResourceNotFoundException` at HTTP 404
 //!    (`smithy_query(query="operation",operation="DeleteDomain")` lists exactly that one),
@@ -48,16 +50,29 @@ use crate::domain_subscription_lifecycle::{
 };
 use crate::patient_insights_job_lifecycle::{minimal_body, start_path};
 
-/// The body member every exception shape of this model declares its detail text in.
-const DETAIL_MEMBER: &str = "message";
+/// The body member a refusal of a SUBSCRIPTION call reports its detail text in: the key
+/// that plane keys it by (`src/ops/types/exception_wire.rs`).
+const SUBSCRIPTION_PLANE_DETAIL: &str = "Message";
 
-/// The spelling no ConnectHealth response may use for it: a client reading the modelled
-/// member must not find the text under another key instead.
-const UNMODELLED_DETAIL_MEMBER: &str = "Message";
+/// The body member every other plane of this service reports it in — the member name the
+/// model spells — which is also what the framework's own refusal envelope writes for a
+/// request refused before any handler ran
+/// (`vendor/smithy-server-runtime/src/pre_dispatch.rs`).
+const MODEL_MEMBER_DETAIL: &str = "message";
+
+/// The other of the two keys: whichever one a row's answer must NOT carry, so one body
+/// never states its text twice.
+fn other_member(member: &str) -> &'static str {
+    if member == SUBSCRIPTION_PLANE_DETAIL {
+        MODEL_MEMBER_DETAIL
+    } else {
+        SUBSCRIPTION_PLANE_DETAIL
+    }
+}
 
 /// The modelled upper bound of `maxResults` on both list operations
 /// (`smithy_query(query="operation",operation="ListDomains,ListSubscriptions")` reports
-/// `range {min: 1, max: 100}`), so one past it is refused by the boundary walk.
+/// `range {min: 1, max: 100}`), so one past it is refused.
 const MAX_RESULTS_MAX: i64 = 100;
 
 /// How long [`poll_until_absent`] keeps looking: many times over the span
@@ -78,18 +93,19 @@ fn unresolvable_domain_id(prefix: &str, filler: char, len: usize) -> String {
     id
 }
 
-/// The detail text of an error body, asserting it is reported under the modelled member
-/// and under no other.
-fn detail_text(case: &str, body: &Value) -> String {
+/// The detail text of an error body, asserting it is reported under `member` — the key the
+/// layer that rendered this answer writes — and under no other.
+fn detail_text(case: &str, body: &Value, member: &str) -> String {
+    let forbidden = other_member(member);
     assert!(
-        body.get(UNMODELLED_DETAIL_MEMBER).is_none(),
-        "case {case:?}: no error body of this service may carry its text under \
-         {UNMODELLED_DETAIL_MEMBER}, got {body}"
+        body.get(forbidden).is_none(),
+        "case {case:?}: an error body states its text once, under {member}, never also \
+         under {forbidden}, got {body}"
     );
-    body.get(DETAIL_MEMBER)
+    body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_else(|| {
-            panic!("case {case:?}: the error body must carry a {DETAIL_MEMBER} member, got {body}")
+            panic!("case {case:?}: the error body must carry a {member} member, got {body}")
         })
         .to_string()
 }
@@ -131,6 +147,9 @@ struct Refusal {
     /// per-request diagnostic tail.
     opening: String,
     whole: bool,
+    /// The body member this row's answer reports its text in, which is decided by the
+    /// layer that renders it.
+    member: &'static str,
 }
 
 #[tokio::test]
@@ -159,30 +178,34 @@ async fn every_refusal_reports_its_detail_text_in_the_modelled_member() {
         unresolvable_domain_id("dom-", 'q', 25),
         unresolvable_domain_id("hai-", '0', 22),
     ] {
-        for (operation, method, path, body) in [
+        for (operation, method, path, body, member) in [
             (
                 "GetDomain",
                 "GET",
                 format!("/domain/{absent_domain}"),
                 None,
+                MODEL_MEMBER_DETAIL,
             ),
             (
                 "DeleteDomain",
                 "DELETE",
                 format!("/domain/{absent_domain}"),
                 None,
+                MODEL_MEMBER_DETAIL,
             ),
             (
                 "ListSubscriptions",
                 "GET",
                 format!("/domains/{absent_domain}/subscriptions"),
                 None,
+                SUBSCRIPTION_PLANE_DETAIL,
             ),
             (
                 "CreateSubscription",
                 "POST",
                 format!("/domains/{absent_domain}/subscriptions"),
                 Some(json!({})),
+                SUBSCRIPTION_PLANE_DETAIL,
             ),
         ] {
             rows.push(Refusal {
@@ -194,6 +217,7 @@ async fn every_refusal_reports_its_detail_text_in_the_modelled_member() {
                 code: "ResourceNotFoundException",
                 opening: domain_not_found_message(&absent_domain),
                 whole: true,
+                member,
             });
         }
     }
@@ -209,6 +233,7 @@ async fn every_refusal_reports_its_detail_text_in_the_modelled_member() {
             code: "ResourceNotFoundException",
             opening: format!("Subscription not found: {domain_id}/{absent_subscription}"),
             whole: true,
+            member: SUBSCRIPTION_PLANE_DETAIL,
         });
     }
     rows.push(Refusal {
@@ -224,6 +249,7 @@ async fn every_refusal_reports_its_detail_text_in_the_modelled_member() {
             "Resource not found: sessionId with ID {absent_session} does not exist"
         ),
         whole: true,
+        member: MODEL_MEMBER_DETAIL,
     });
     // 404 on an ARN the tagging operations resolve to no resource of this service.
     rows.push(Refusal {
@@ -235,15 +261,19 @@ async fn every_refusal_reports_its_detail_text_in_the_modelled_member() {
         code: "ResourceNotFoundException",
         opening: format!("Resource not found: {unresolvable_arn}"),
         whole: true,
+        member: MODEL_MEMBER_DETAIL,
     });
-    // 400 from the BOUNDARY walk: a page size one past the modelled range, on both
-    // listings, gets AWS's standard constraint sentence.
+    // 400 from the HANDLER's own bound: a page size one past the modelled range, on both
+    // listings, gets AWS's standard constraint sentence — rendered by the plane each
+    // listing belongs to (`src/ops/types/list_subscriptions_types.rs`), which is what
+    // decides the key it carries.
     let over_the_bound = MAX_RESULTS_MAX + 1;
-    for (operation, base) in [
-        ("ListDomains", "/domain".to_string()),
+    for (operation, base, member) in [
+        ("ListDomains", "/domain".to_string(), MODEL_MEMBER_DETAIL),
         (
             "ListSubscriptions",
             format!("/domains/{domain_id}/subscriptions"),
+            SUBSCRIPTION_PLANE_DETAIL,
         ),
     ] {
         rows.push(Refusal {
@@ -259,10 +289,12 @@ async fn every_refusal_reports_its_detail_text_in_the_modelled_member() {
                  {MAX_RESULTS_MAX}"
             ),
             whole: true,
+            member,
         });
     }
     // 400 from the boundary walk, reworded by this service: a `domainId` outside what
-    // `DomainId` declares, whose sentence carries a per-request diagnostic tail.
+    // `DomainId` declares, whose sentence carries a per-request diagnostic tail. The walk
+    // renders it, so the framework's envelope names the member it travels in.
     for (label, malformed) in [
         ("too short (19)", "dom-aaaaaaaaaaaaaaa"),
         ("uppercase, outside the character class", "dom-AAAAAAAAAAAAAAAA"),
@@ -276,6 +308,7 @@ async fn every_refusal_reports_its_detail_text_in_the_modelled_member() {
             code: "ValidationException",
             opening: format!("{malformed} is not a valid domain id."),
             whole: false,
+            member: MODEL_MEMBER_DETAIL,
         });
     }
     // 401 from the patient-insights runtime endpoint, whose refusal is one FIXED sentence
@@ -289,6 +322,7 @@ async fn every_refusal_reports_its_detail_text_in_the_modelled_member() {
         code: "AccessDeniedException",
         opening: DOMAIN_NOT_AUTHORIZED_MESSAGE.to_string(),
         whole: true,
+        member: MODEL_MEMBER_DETAIL,
     });
 
     for row in &rows {
@@ -303,7 +337,7 @@ async fn every_refusal_reports_its_detail_text_in_the_modelled_member() {
             row.status,
             row.code
         );
-        let text = detail_text(&row.case, &body);
+        let text = detail_text(&row.case, &body, row.member);
         if row.whole {
             assert_eq!(
                 text, row.opening,
@@ -376,7 +410,7 @@ async fn delete_domain_refuses_an_unresolvable_id_as_the_modelled_not_found() {
                  not-found, got {status} with {body}"
             );
             assert_eq!(
-                detail_text(case, &body),
+                detail_text(case, &body, MODEL_MEMBER_DETAIL),
                 domain_not_found_message(domain_id),
                 "case {case:?}, attempt {attempt}: the refusal must name the requested id, \
                  got {body}"

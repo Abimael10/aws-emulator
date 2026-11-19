@@ -28,10 +28,6 @@ use crate::domain_subscription_lifecycle::{error_code, string_at, Emulator};
 /// The Region every request of this suite is signed for.
 const REGION: &str = "us-west-2";
 
-/// The body member a refused ConnectHealth call reports its detail text in: the Smithy
-/// member name every exception shape of this model declares (`message`, no `@jsonName`).
-const DETAIL_MEMBER: &str = "message";
-
 /// The refusal both listings answer for a `nextToken` that is not a cursor this service
 /// issued for the collection being listed.
 const UNISSUED_TOKEN_DETAIL: &str = "nextToken is not a token this service issued";
@@ -92,14 +88,13 @@ fn respellings(case: &str, token: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// The detail text of a refusal, failing with the whole body when it carries none.
+/// The detail text of a refusal, read through the one reader this test target shares
+/// ([`crate::domain_subscription_lifecycle::detail_text`]): the rows below span both
+/// listings, which are served by planes that key that text differently
+/// (`src/ops/types/exception_wire.rs`, pinned per plane in
+/// `tests/all/error_detail_member.rs`). What this suite is about is the cursor.
 fn detail_text(case: &str, body: &Value) -> String {
-    body.get(DETAIL_MEMBER)
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: a refusal must carry a {DETAIL_MEMBER} member, got {body}")
-        })
-        .to_string()
+    crate::domain_subscription_lifecycle::detail_text(case, body)
 }
 
 /// The cursor keys one page reported, in the order it reported them.

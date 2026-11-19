@@ -13,12 +13,17 @@
 //! `pub mod <operation>;` per operation and glob-re-exports both, so a submodule
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
+//!
+//! One module is not a per-shape split but a per-CONCERN one: `exception_wire` holds every
+//! exception shape this service declares, because what an error body of this service looks
+//! like on the wire is one rule for all of them.
 
 pub mod activate_subscription_types;
 pub mod create_domain_types;
 pub mod create_subscription_types;
 pub mod deactivate_subscription_types;
 pub mod delete_domain_types;
+pub mod exception_wire;
 pub mod get_domain_types;
 pub mod get_medical_scribe_listening_session_types;
 pub mod get_patient_insights_job_types;
@@ -42,6 +47,8 @@ pub use create_subscription_types::*;
 pub use deactivate_subscription_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_domain_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use exception_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_domain_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

@@ -100,9 +100,25 @@ pub type ListSubscriptionsError = crate::scaffolded::Scaffolded<ListSubscription
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
 /// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
 /// this operation is implemented.
+///
+/// It is also where this operation states WHICH PLANE of ConnectHealth answers it: the
+/// subscription plane, which keys an error body's detail text `Message` rather than as the
+/// model names the member (`crate::ops::types::exception_wire`). Stated once, for every
+/// exception this operation can answer with — the modelled not-found of a parent domain as
+/// well as the page it cannot serve — rather than at each place a refusal is built.
 impl From<ListSubscriptionsErrorModeled> for ListSubscriptionsError {
     fn from(modeled: ListSubscriptionsErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        crate::scaffolded::Scaffolded::Modeled(crate::ops::types::exception_wire::answered_by_plane!(
+            ListSubscriptionsErrorModeled,
+            modeled,
+            AnsweringPlane::Subscriptions,
+            [
+                AccessDeniedException,
+                InternalServerException,
+                ResourceNotFoundException,
+                ValidationException,
+            ]
+        ))
     }
 }
 
@@ -186,6 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(crate::service::error_detail::domain_not_found_message(
                         &input.domain_id,
                     )),
+                    ..Default::default()
                 },
             )
             .into());

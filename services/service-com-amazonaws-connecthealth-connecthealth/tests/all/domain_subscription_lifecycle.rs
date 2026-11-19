@@ -243,6 +243,34 @@ pub(crate) fn string_at(body: &Value, member: &str) -> String {
         .to_string()
 }
 
+/// The two keys an error body of this service can carry its detail text under: `Message`,
+/// which the subscription plane keys it by, and `message`, the member name the model
+/// spells, which every other plane of this service and the framework's own refusal
+/// envelope key it by (`src/ops/types/exception_wire.rs`).
+pub(crate) const DETAIL_MEMBERS: [&str; 2] = ["Message", "message"];
+
+/// The detail text of an error body, from whichever of [`DETAIL_MEMBERS`] the plane that
+/// answered wrote it under — asserting the body states it under exactly ONE of them, so a
+/// client never has to read two keys for one answer.
+///
+/// WHICH key each plane carries is the rule, and it is pinned per operation in
+/// `tests/all/error_detail_member.rs`; a sibling suite about the TEXT a refusal states
+/// reads it through here rather than growing a copy of the reader, because its rows
+/// routinely span planes.
+pub(crate) fn detail_text(case: &str, body: &Value) -> String {
+    let stated: Vec<&str> = DETAIL_MEMBERS
+        .into_iter()
+        .filter(|member| body.get(*member).is_some())
+        .collect();
+    assert_eq!(
+        stated.len(),
+        1,
+        "case {case:?}: an error body states its detail text under exactly one of \
+         {DETAIL_MEMBERS:?}, got {stated:?} in {body}"
+    );
+    string_at(body, stated[0])
+}
+
 /// The member a reported subscription carries the instant of its last UPDATE in.
 pub(crate) const UPDATE_INSTANT_MEMBER: &str = "lastUpdatedAt";
 

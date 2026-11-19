@@ -6,19 +6,19 @@
 //! Every exception this service's model declares carries exactly one member, `message`
 //! targeting `String`, and NO `@jsonName`
 //! (`smithy_query(query="shape",shape="ResourceNotFoundException,ValidationException,AccessDeniedException,InternalServerException,ServiceQuotaExceededException,ThrottlingException,ConflictException",model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`),
-//! so on the restJson1 wire that text travels under the Smithy member name — `message`,
-//! lowercase — which is exactly what the framework's renderers write and what a generated
-//! client reads back into its exception. Nothing here rewrites a rendered body: the
-//! status, the discriminator (`__type` and the `x-amzn-errortype` header) and every
-//! member are the renderer's, and this module only supplies the sentence a handler puts
-//! in that member.
+//! and the KEY that text goes out under is decided by the PLANE that answers rather than
+//! by the sentence or the shape — `Message` for the subscription plane and `message` for
+//! the others, held once in [`crate::ops::types::exception_wire`]. Nothing here rewrites a
+//! rendered body: the status, the discriminator (`__type` and the `x-amzn-errortype`
+//! header) and every member are the renderer's, and this module only supplies the sentence
+//! a handler puts in that member.
 //!
 //! ```json
 //! HTTP/1.1 404 Not Found
 //! content-type: application/json
 //! x-amzn-errortype: ResourceNotFoundException
 //!
-//! {"message":"Subscription not found: dom-0123456789abcdef0123/sub-000000000000000000000"}
+//! {"__type":"ResourceNotFoundException","Message":"Subscription not found: dom-0123456789abcdef0123/sub-000000000000000000000"}
 //! ```
 //!
 //! It also renders, once, the text AWS gives a constraint violation a handler enforces

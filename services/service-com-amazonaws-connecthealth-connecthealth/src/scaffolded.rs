@@ -49,7 +49,9 @@ use smithy_server_runtime::OperationError;
 ///
 /// `with_xml_name("Message")` matches the casing the restXml / awsQuery error
 /// envelopes use, so the same value renders correctly on the XML protocols and as
-/// lowercase `message` on the JSON/CBOR ones.
+/// lowercase `message` on the JSON/CBOR ones — which is the keying every plane of this
+/// service but one uses for the shapes its model DOES declare
+/// (`crate::ops::types::exception_wire`).
 static NOT_IMPLEMENTED_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
         "smithy.framework#NotImplemented$message",
@@ -114,7 +116,8 @@ impl SerializableStruct for NotImplemented {
     }
 }
 
-/// The `message` member of the synthetic `ValidationException` error shape.
+/// The `message` member of the synthetic `ValidationException` error shape, keyed as the
+/// synthetic `NotImplemented` member above is keyed and for the same reason.
 static VALIDATION_EXCEPTION_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
         "smithy.framework#ValidationException$message",

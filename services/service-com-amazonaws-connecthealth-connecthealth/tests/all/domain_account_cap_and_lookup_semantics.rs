@@ -47,10 +47,6 @@ use service_com_amazonaws_connecthealth_connecthealth::state::{
 
 use super::domain_subscription_lifecycle::{error_code, string_at, Emulator};
 
-/// The body member ConnectHealth reports an exception's detail text in: the Smithy member
-/// name every exception shape of this model declares (`message`, no `@jsonName`).
-const DETAIL_MEMBER: &str = "message";
-
 /// How long the poll below keeps looking for the purge the clock owes: many times over
 /// the span `state::DOMAIN_DELETION_SPAN` owes, so a loaded host has room while a fast
 /// one never waits at all.
@@ -67,14 +63,14 @@ fn web_app_setup() -> Value {
     })
 }
 
-/// The detail text of an error body, failing with the whole body when it carries none.
+/// The detail text of an error body, read through the one reader this test target shares
+/// ([`crate::domain_subscription_lifecycle::detail_text`]): the rows below span this
+/// service's planes, which key that text differently
+/// (`src/ops/types/exception_wire.rs`, pinned per plane in
+/// `tests/all/error_detail_member.rs`). What this suite is about is the cap and the
+/// lookup.
 fn detail_text(case: &str, body: &Value) -> String {
-    body.get(DETAIL_MEMBER)
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: the error body must carry a {DETAIL_MEMBER} member, got {body}")
-        })
-        .to_string()
+    crate::domain_subscription_lifecycle::detail_text(case, body)
 }
 
 /// A well-formed `DomainId` that names nothing: `prefix` padded with `filler` to `len`.

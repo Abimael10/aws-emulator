@@ -1715,13 +1715,18 @@ pub fn decode_page_token(scope: &str, token: &str) -> Option<String> {
 /// The page-size bound a `@paginated` listing of this service enforces itself, and the
 /// page it serves when the caller asks for no `maxResults` (the maximum).
 ///
-/// Treat it as THIS EMULATOR's cap on one page: the generated "Modeled contract" header
-/// of each listing lists `maxResults` without a range, so the handler enforces the bound
-/// itself (refusing, never clamping) rather than relying on the boundary validator.
-/// `smithy_query(query="operation", operation="ListDomains,ListSubscriptions")` does
-/// report a `range {min: 1, max: 100}` for the member of BOTH listings, which is where
-/// these numbers come from — and why the bound is stated once, here, rather than per
-/// handler.
+/// The numbers are the MODEL's: `smithy_query(query="operation",
+/// operation="ListDomains,ListSubscriptions")` reports a `range {min: 1, max: 100}` for
+/// the member of both listings — stated once, here, rather than per handler. The HANDLER
+/// is what applies them (refusing, never clamping), because a refusal of a page size is
+/// one the PLANE serving the listing renders: the recorded refusal of one carries its
+/// detail text under that plane's own key
+/// ([`crate::ops::types::exception_wire`]), which only a modelled error answered by a
+/// handler carries. That is why the member carries `skip_validation` on both input
+/// shapes — the boundary walk would otherwise refuse the value first, in the framework's
+/// own envelope — and the clause itself is still the framework's
+/// ([`crate::service::error_detail::range_violation_message`]), so the words do not
+/// change with the place.
 pub const MIN_PAGE_SIZE: i32 = 1;
 pub const MAX_PAGE_SIZE: i32 = 100;
 
@@ -1854,6 +1859,10 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 pub fn store_unreachable(operation: &str) -> InternalServerException {
     InternalServerException {
         message: Some(format!("{operation} could not reach this service's store")),
+        // The sentence is all this builds: which wire key it travels under belongs to the
+        // plane that answers, stated by the operation
+        // (`crate::ops::types::exception_wire`).
+        ..Default::default()
     }
 }
 
@@ -1874,5 +1883,8 @@ pub fn store_unreachable(operation: &str) -> InternalServerException {
 pub fn invalid_request(detail: impl Into<String>) -> ValidationException {
     ValidationException {
         message: Some(detail.into()),
+        // As for [`store_unreachable`]: the sentence is built here and the plane that
+        // answers decides the wire key it travels under.
+        ..Default::default()
     }
 }

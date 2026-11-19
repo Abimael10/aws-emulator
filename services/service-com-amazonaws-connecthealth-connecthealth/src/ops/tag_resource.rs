@@ -245,6 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(crate::service::error_detail::resource_not_found_message(
                         &input.resource_arn,
                     )),
+                    ..Default::default()
                 },
             )
             .into());
@@ -275,6 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::service::error_detail::echoed(&input.resource_arn),
                         crate::state::MAX_TAGS_PER_RESOURCE
                     )),
+                    ..Default::default()
                 },
             )
         })?;

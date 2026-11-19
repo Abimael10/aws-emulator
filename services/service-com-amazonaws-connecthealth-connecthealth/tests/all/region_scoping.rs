@@ -44,7 +44,7 @@ use service_com_amazonaws_connecthealth_connecthealth::state::{
     MAX_DOMAINS_HELD, MAX_DOMAINS_PER_ACCOUNT, MAX_DOMAIN_REGIONS,
 };
 
-use crate::domain_subscription_lifecycle::{error_code, string_at, Emulator};
+use crate::domain_subscription_lifecycle::{detail_text, error_code, string_at, Emulator};
 use crate::resource_tagging::tags_path;
 
 /// The Regions every table below spans. Each satisfies the `[a-z0-9-]+` region segment
@@ -420,8 +420,8 @@ async fn every_operation_that_resolves_a_domain_refuses_one_of_another_region() 
                  got {status} {answered}"
             );
             assert_eq!(
-                answered.get("message").and_then(Value::as_str),
-                Some(detail.as_str()),
+                detail_text(&case, &answered),
+                *detail,
                 "case {case:?}: expected the detail text {detail:?}, got {answered}"
             );
             assert!(

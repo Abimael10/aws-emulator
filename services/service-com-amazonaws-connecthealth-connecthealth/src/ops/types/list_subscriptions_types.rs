@@ -11,7 +11,18 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-connecthealth-connecthealth.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connecthealth#ListSubscriptionsInput")]
+// `skip_validation = ["maxResults"]`: the page size is judged by the HANDLER, for the
+// reason stated once beside the other listing's input
+// (`super::list_domains_types::ListDomainsInput`) — a refusal of it is one the PLANE
+// serving this listing renders, so it is answered as the modelled `ValidationException`
+// rather than by the boundary walk, with the same clause either way
+// (`crate::state::Page::resolve`). RECORDED for this listing in particular: its refusal of
+// a page size above the bound carries the standard constraint sentence under the key the
+// subscription plane keys an error body by (`super::exception_wire`).
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.connecthealth#ListSubscriptionsInput",
+    skip_validation = ["maxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListSubscriptionsInput {
     pub domain_id: String,

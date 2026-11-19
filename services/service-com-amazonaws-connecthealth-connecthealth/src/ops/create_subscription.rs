@@ -111,9 +111,25 @@ pub type CreateSubscriptionError = crate::scaffolded::Scaffolded<CreateSubscript
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
 /// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
 /// this operation is implemented.
+///
+/// It is also where this operation states WHICH PLANE of ConnectHealth answers it: the
+/// subscription plane, which keys an error body's detail text `Message` rather than as the
+/// model names the member (`crate::ops::types::exception_wire`). Stated once, for every
+/// exception this operation can answer with, rather than at each place a refusal is built.
 impl From<CreateSubscriptionErrorModeled> for CreateSubscriptionError {
     fn from(modeled: CreateSubscriptionErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        crate::scaffolded::Scaffolded::Modeled(crate::ops::types::exception_wire::answered_by_plane!(
+            CreateSubscriptionErrorModeled,
+            modeled,
+            AnsweringPlane::Subscriptions,
+            [
+                AccessDeniedException,
+                InternalServerException,
+                ResourceNotFoundException,
+                ServiceQuotaExceededException,
+                ValidationException,
+            ]
+        ))
     }
 }
 
@@ -173,6 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(crate::service::error_detail::domain_not_found_message(
                     &input.domain_id,
                 )),
+                ..Default::default()
             })
             .into()
         };
@@ -191,6 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         input.domain_id,
                         crate::state::MAX_SUBSCRIPTIONS_PER_DOMAIN
                     )),
+                    ..Default::default()
                 },
             )
             .into());

@@ -40,7 +40,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_connecthealth_connecthealth::state::store_unreachable;
 use service_com_amazonaws_connecthealth_connecthealth::EmulatedService;
 
-use crate::domain_subscription_lifecycle::{dispatch_signed, error_code, Emulator};
+use crate::domain_subscription_lifecycle::{detail_text, dispatch_signed, error_code, Emulator};
 use crate::resource_tag_removal::untag_path;
 use crate::resource_tagging::tags_path;
 
@@ -196,14 +196,6 @@ fn every_operation() -> Vec<(&'static str, &'static str, String, Option<Value>)>
     ]
 }
 
-/// The detail text of a failure, in the member this service reports it in.
-fn detail(case: &str, body: &Value) -> String {
-    body.get("message")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("case {case:?}: the failure must carry a Message, got {body}"))
-        .to_string()
-}
-
 /// Every operation answers an unreachable store with the modelled server-side shape, on
 /// its own status, whatever engine the service was mounted on.
 #[tokio::test]
@@ -233,7 +225,7 @@ async fn every_operation_reports_an_unreachable_store_as_a_server_error() {
             let expected = store_unreachable(operation)
                 .message
                 .expect("the server error carries its detail text");
-            let reported = detail(&case, &answered);
+            let reported = detail_text(&case, &answered);
             assert_eq!(
                 reported, expected,
                 "case {case:?}: expected {expected:?}, got {reported:?}"

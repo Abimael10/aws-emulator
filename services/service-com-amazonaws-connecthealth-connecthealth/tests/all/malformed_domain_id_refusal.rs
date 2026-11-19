@@ -49,9 +49,16 @@ const REGION: &str = "us-west-2";
 /// The wire error code a refused domain id carries.
 const VALIDATION_CODE: &str = "ValidationException";
 
-/// The body member this service reports an exception's detail text in: the Smithy member
-/// name every exception shape of this model declares (`message`, no `@jsonName`).
-const DETAIL_MEMBER: &str = "message";
+/// The body member a refusal reports its detail text in for every plane of this service
+/// but one, and for a refusal the FRAMEWORK renders before any handler runs: the member
+/// name the model spells (`src/ops/types/exception_wire.rs`, and
+/// `vendor/smithy-server-runtime/src/pre_dispatch.rs` for the framework's own envelope).
+/// Every row of this suite that names a `domainId` is answered under it.
+const MODEL_MEMBER_DETAIL: &str = "message";
+
+/// The body member the SUBSCRIPTION plane reports it in — the one row below that plane
+/// answers, a page size it cannot serve.
+const SUBSCRIPTION_PLANE_DETAIL: &str = "Message";
 
 /// The FIXED text of this service's domain-id refusal, after the value the request
 /// supplied.
@@ -99,12 +106,13 @@ const HEADER_MEDIA_ENCODING: &str = "x-amzn-medscribe-media-encoding";
 /// A well-formed `ScribeSessionId` for the event-stream rows.
 const WELL_FORMED_STREAM_SESSION_ID: &str = "0000000a-1a2b-4c3d-8e4f-00000000000a";
 
-/// The detail text of an error body, under the member this service reports it in.
-fn detail_text(case: &str, body: &Value) -> String {
-    body.get(DETAIL_MEMBER)
+/// The detail text of an error body, under the member the layer that rendered it reports
+/// it in.
+fn detail_text(case: &str, body: &Value, member: &str) -> String {
+    body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_else(|| {
-            panic!("case {case:?}: the error body must carry a {DETAIL_MEMBER} member, got {body}")
+            panic!("case {case:?}: the error body must carry a {member} member, got {body}")
         })
         .to_string()
 }
@@ -257,7 +265,7 @@ async fn a_domain_id_the_service_cannot_read_is_refused_with_its_own_sentence() 
                 (400, VALIDATION_CODE),
                 "case {case:?}: expected 400 {VALIDATION_CODE}, got {status} with {refused}"
             );
-            let text = detail_text(&case, &refused);
+            let text = detail_text(&case, &refused, MODEL_MEMBER_DETAIL);
             assert!(
                 text.starts_with(&expected_opening),
                 "case {case:?}: expected a message starting {expected_opening:?}, got {text:?}"
@@ -317,7 +325,10 @@ async fn the_event_stream_operation_states_the_same_sentence() {
             VALIDATION_CODE,
             "case {case:?}: expected {VALIDATION_CODE}, got {refused}"
         );
-        let text = detail_text(&case, &refused);
+        // Answered by the operation itself rather than by the boundary walk, and by the
+        // Medical Scribe streaming plane, which keys the text as the model names the
+        // member.
+        let text = detail_text(&case, &refused, MODEL_MEMBER_DETAIL);
         let expected_opening = format!("{bad_id} {NOT_A_VALID_DOMAIN_ID}{DIAGNOSTIC_TAIL_OPENING}");
         assert!(
             text.starts_with(&expected_opening),
@@ -339,33 +350,40 @@ async fn the_sentence_reaches_no_other_members_refusal() {
 
     // One row per refusal the domain-id sentence must NOT reach: another member's value
     // outside its own bound (with a domain id this service minted), and a bad domain id
-    // alongside another bad member, where one sentence could only name one of them.
-    let rows: Vec<(&str, &str, String)> = vec![
+    // alongside another bad member, where one sentence could only name one of them. The
+    // third element is the member the row's answer reports its text in: the boundary walk
+    // and the domain plane spell it as the model names the member, while the page size is a
+    // bound the SUBSCRIPTION plane's handler applies and renders itself
+    // (`src/ops/types/list_subscriptions_types.rs`).
+    let rows: Vec<(&str, &str, String, &str)> = vec![
         (
             "a subscriptionId outside its own pattern",
             "GET",
             format!("/domains/{minted}/subscriptions/sub-not-a-subscription-id"),
+            MODEL_MEMBER_DETAIL,
         ),
         (
             "a maxResults above its own range",
             "GET",
             format!("/domains/{minted}/subscriptions?maxResults=101"),
+            SUBSCRIPTION_PLANE_DETAIL,
         ),
         (
-            "a bad domain id and a bad page size at once",
+            "a bad domain id and a bad subscription id at once",
             "GET",
-            format!("/domains/{bad_domain_id}/subscriptions?maxResults=101"),
+            format!("/domains/{bad_domain_id}/subscriptions/sub-not-a-subscription-id"),
+            MODEL_MEMBER_DETAIL,
         ),
     ];
 
-    for (case, method, path) in &rows {
+    for (case, method, path, member) in &rows {
         let (status, refused) = emulator.send(method, path, None).await;
         assert_eq!(
             (status, error_code(&refused).as_str()),
             (400, VALIDATION_CODE),
             "case {case:?}: expected 400 {VALIDATION_CODE}, got {status} with {refused}"
         );
-        let text = detail_text(case, &refused);
+        let text = detail_text(case, &refused, member);
         assert!(
             text.contains(GENERIC_CLAUSE_OPENING),
             "case {case:?}: expected the framework's own clause, got {text:?}"
@@ -397,7 +415,7 @@ async fn the_diagnostic_tail_is_per_request() {
             (400, VALIDATION_CODE),
             "case {case:?}: expected 400 {VALIDATION_CODE}, got {status} with {refused}"
         );
-        let text = detail_text(case, &refused);
+        let text = detail_text(case, &refused, MODEL_MEMBER_DETAIL);
         let tail = text
             .strip_prefix(&expected_opening)
             .unwrap_or_else(|| {

@@ -227,6 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(crate::service::error_detail::domain_not_found_message(
                         &input.domain_id,
                     )),
+                    ..Default::default()
                 },
             )
             .into());

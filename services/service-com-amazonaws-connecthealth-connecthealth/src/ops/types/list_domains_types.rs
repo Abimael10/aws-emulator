@@ -11,7 +11,22 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-connecthealth-connecthealth.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connecthealth#ListDomainsInput")]
+// `skip_validation = ["maxResults"]`: the page size this service refuses rather than
+// clamps is judged by the HANDLER (`crate::state::Page::resolve`, the one pagination
+// policy both listings obey), not by the boundary walk. RECORDED behaviour: a page size
+// outside the modelled `@range` is refused by the PLANE that serves the listing — the
+// recorded refusal of one carries its detail text under that plane's own key, which only a
+// refusal the plane renders can carry (`super::exception_wire`) — so the bound is enforced
+// where the service answers, as the `ValidationException` its model declares for invalid
+// client input. The sentence is unchanged either way: the handler renders it through the
+// framework's own violation renderer
+// (`crate::service::error_detail::range_violation_message`), so the clause, the value and
+// the bound read exactly as the boundary walk states them. `skip_validation` drops only
+// this member's constraint traits; it is still read into the same field.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.connecthealth#ListDomainsInput",
+    skip_validation = ["maxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListDomainsInput {
     pub status: Option<String>,

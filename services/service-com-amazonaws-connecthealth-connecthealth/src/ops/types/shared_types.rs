@@ -24,29 +24,13 @@ pub struct SubscriptionDescription {
     pub deactivated_at: Option<::aws_smithy_types::DateTime>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connecthealth#AccessDeniedException")]
-#[derive(Debug, Clone, Default)]
-pub struct AccessDeniedException {
-    pub message: Option<String>,
-}
-
-#[smithy_macros::smithy(shape = "com.amazonaws.connecthealth#InternalServerException")]
-#[derive(Debug, Clone, Default)]
-pub struct InternalServerException {
-    pub message: Option<String>,
-}
-
-#[smithy_macros::smithy(shape = "com.amazonaws.connecthealth#ResourceNotFoundException")]
-#[derive(Debug, Clone, Default)]
-pub struct ResourceNotFoundException {
-    pub message: Option<String>,
-}
-
-#[smithy_macros::smithy(shape = "com.amazonaws.connecthealth#ValidationException")]
-#[derive(Debug, Clone, Default)]
-pub struct ValidationException {
-    pub message: Option<String>,
-}
+// Every exception shape this service declares — `AccessDeniedException`,
+// `InternalServerException`, `ResourceNotFoundException`, `ValidationException`,
+// `ServiceQuotaExceededException`, `ThrottlingException` and `ConflictException` — is
+// declared in `super::exception_wire` instead of being expanded from the model here: the
+// key its detail text travels under is decided by the PLANE that answers and the expansion
+// derives every member's wire name from the model. See that module for why, and for what
+// it emits.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.connecthealth#EncryptionContext")]
 #[derive(Debug, Clone, Default)]
@@ -61,18 +45,6 @@ pub struct WebAppConfiguration {
     pub ehr_role: String,
     pub idc_application_id: String,
     pub idc_region: String,
-}
-
-#[smithy_macros::smithy(shape = "com.amazonaws.connecthealth#ServiceQuotaExceededException")]
-#[derive(Debug, Clone, Default)]
-pub struct ServiceQuotaExceededException {
-    pub message: Option<String>,
-}
-
-#[smithy_macros::smithy(shape = "com.amazonaws.connecthealth#ThrottlingException")]
-#[derive(Debug, Clone, Default)]
-pub struct ThrottlingException {
-    pub message: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.connecthealth#PatientInsightsPatientContext")]

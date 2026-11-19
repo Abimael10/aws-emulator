@@ -188,6 +188,7 @@ fn not_found(message: String) -> StartMedicalScribeListeningSessionErrorModeled 
     StartMedicalScribeListeningSessionErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
             message: Some(message),
+            ..Default::default()
         },
     )
 }
@@ -198,6 +199,7 @@ fn quota_exceeded(message: String) -> StartMedicalScribeListeningSessionErrorMod
     StartMedicalScribeListeningSessionErrorModeled::ServiceQuotaExceededException(
         ServiceQuotaExceededException {
             message: Some(message),
+            ..Default::default()
         },
     )
 }
@@ -207,6 +209,7 @@ fn internal(message: String) -> StartMedicalScribeListeningSessionErrorModeled {
     StartMedicalScribeListeningSessionErrorModeled::InternalServerException(
         InternalServerException {
             message: Some(message),
+            ..Default::default()
         },
     )
 }
@@ -332,6 +335,7 @@ impl<Eng: Send + Sync + 'static> StartMedicalScribeListeningSession<Eng> {
                 true,
                 &InternalServerException {
                     message: Some(NO_RECOGNISER.to_string()),
+                    ..Default::default()
                 },
                 &SCHEMA_INTERNAL_SERVER_EXCEPTION,
             )

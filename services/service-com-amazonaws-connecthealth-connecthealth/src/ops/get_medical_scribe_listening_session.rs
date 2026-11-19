@@ -192,6 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             GetMedicalScribeListeningSessionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(message),
+                    ..Default::default()
                 },
             )
             .into()

@@ -257,6 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::service::error_detail::DOMAIN_NOT_AUTHORIZED_MESSAGE
                                 .to_string(),
                         ),
+                        ..Default::default()
                     },
                 )
                 .into());
@@ -279,6 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::service::error_detail::REQUEST_VALIDATION_FAILED_MESSAGE
                                 .to_string(),
                         ),
+                        ..Default::default()
                     },
                 )
                 .into());
@@ -325,6 +327,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(StartPatientInsightsJobErrorModeled::ValidationException(
                     ValidationException {
                         message: Some(message.to_string()),
+                        ..Default::default()
                     },
                 )
                 .into());
@@ -365,6 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(
                         crate::service::error_detail::DOMAIN_NOT_AUTHORIZED_MESSAGE.to_string(),
                     ),
+                    ..Default::default()
                 },
             )
             .into());

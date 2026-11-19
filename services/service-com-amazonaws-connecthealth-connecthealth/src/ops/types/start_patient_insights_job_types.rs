@@ -32,9 +32,7 @@ pub struct StartPatientInsightsJobOutput {
     pub creation_time: Option<::aws_smithy_types::DateTime>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connecthealth#ConflictException")]
-#[derive(Debug, Clone, Default)]
-pub struct ConflictException {
-    pub message: Option<String>,
-}
+// `ConflictException` is declared in `super::exception_wire`, with every other exception
+// shape of this service, because the key its detail text travels under is decided by the
+// plane that answers rather than by the model's member name.
 

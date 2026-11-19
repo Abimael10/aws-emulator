@@ -371,6 +371,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          service ({} domains).",
                         crate::state::MAX_DOMAINS_HELD
                     )),
+                    ..Default::default()
                 },
             )
             .into());
@@ -396,6 +397,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "tags carries {count} entries, more than the maximum of {}",
                         crate::state::MAX_TAGS_PER_RESOURCE
                     )),
+                    ..Default::default()
                 },
             )
         })?;
