@@ -213,7 +213,7 @@ async fn import_task(
     graph_id: &str,
     source: &str,
 ) -> String {
-    let request = json!({"source": source, "roleArn": ROLE_ARN});
+    let request = json!({"source": source, "roleArn": ROLE_ARN, "format": "CSV"});
     let (status, started) = call(
         router,
         region,

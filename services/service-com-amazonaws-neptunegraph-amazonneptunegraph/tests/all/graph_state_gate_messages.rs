@@ -261,7 +261,11 @@ pub(crate) async fn graph_in_status(
                 case,
                 "POST",
                 &format!("/graphs/{id}/importtasks"),
-                Some(json!({"source": "s3://example-bucket/data/", "roleArn": ROLE_ARN})),
+                Some(json!({
+                    "source": "s3://example-bucket/data/",
+                    "roleArn": ROLE_ARN,
+                    "format": "CSV",
+                })),
                 "INITIALIZING",
                 201,
             )

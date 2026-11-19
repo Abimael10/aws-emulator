@@ -256,7 +256,7 @@ async fn plain_import_task(
         case,
         role_arn: ROLE_ARN,
         source: "s3://example-bucket/plain/",
-        format: None,
+        format: Some("CSV"),
         parquet_type: None,
         blank_node_handling: None,
     };
@@ -275,6 +275,7 @@ async fn create_graph_using_import_task(
         "graphName": graph_name,
         "source": "s3://example-bucket/created-with-the-graph/",
         "roleArn": ROLE_ARN,
+        "format": "CSV",
     });
     let (status, created) = call(router, region, "POST", "/importtasks", Some(request)).await;
     assert_eq!(
@@ -402,13 +403,14 @@ async fn list_import_tasks_reports_the_stored_tasks_of_the_region() {
 
     // The rows differ along what the import parameters generalise over: the modelled
     // `Format` values (`smithy_query(query="shape",shape="Format")` -> CSV, NTRIPLES,
-    // OPEN_CYPHER, PARQUET) including the absent one, the parquet type that goes with
-    // PARQUET, the source's shape, and the role's path form.
+    // OPEN_CYPHER, PARQUET), the parquet type that goes with PARQUET, the source's shape
+    // — including one that is no Amazon S3 location, which is the one form that carries
+    // no format at all — and the role's path form.
     let cases = vec![
         StartCase {
-            case: "no format, a plain role, a bucket prefix",
+            case: "a Neptune endpoint source with no format, a plain role",
             role_arn: ROLE_ARN,
-            source: "s3://example-bucket/no-format/",
+            source: "my-graph.cluster-abcdefghijkl.us-east-1.neptune.amazonaws.com",
             format: None,
             parquet_type: None,
             blank_node_handling: None,

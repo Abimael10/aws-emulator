@@ -81,6 +81,30 @@ pub const CANCELLATION_SPAN: Duration = Duration::from_millis(500);
 /// is stored and compared on read.
 pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_millis(120_000);
 
+/// How long an accepted query's run lasts in this emulator: the span after which the
+/// clock owes the query record its end.
+///
+/// A query is a unit of work this service accepts and then reports on through its own
+/// operations (`ListQueries`, `GetQuery`, `CancelQuery`), so — like the run of an
+/// accepted import task ([`IMPORT_RUN_SPAN`]) — its record is in flight for the span the
+/// clock owes it and is reclaimed once that span is up. The evaluation itself happens in
+/// this process over data this process holds, in a fraction of the time the real service
+/// spends on the same query, so the span rather than the microseconds an evaluator spent
+/// is what makes an accepted query observable: a caller that submits one and then lists,
+/// reads or cancels it finds it, exactly as it would on the real data plane. It is longer
+/// than the span a single status transition of this service is owed (`PROVISIONING_SPAN`
+/// and its siblings) because what has to fit inside it is a whole exchange rather than
+/// one read: a client that lists the graph's queries, reads the one it submitted and then
+/// cancels it.
+///
+/// The span is the RUN's, so it is owed whatever that run answered — exactly as an import
+/// task whose load failed still runs through its phases before reporting the failure. A
+/// run still asking when the span is up keeps its record until it stops
+/// ([`Query::end_run`]), while a cancel the clock has made due and a timeout that has run
+/// out each end the record earlier — so a cancel can only ever shorten a query's life. No
+/// handler ever sleeps for it: the due instant is stored and compared on read.
+pub const QUERY_RUN_SPAN: Duration = Duration::from_millis(3_000);
+
 /// How long after the `DeletePrivateGraphEndpoint` that accepts it a private graph
 /// endpoint's removal is owed: the endpoint answers `DELETING` until this span has
 /// passed, then the next read finds it gone.
@@ -1522,6 +1546,16 @@ pub struct Query {
     /// can only shorten its life, never extend it, and a query nobody cancels is reported
     /// for as long as it may run.
     pub times_out_at: Instant,
+    /// When the run this record reports is over, after which the record is reclaimed:
+    /// [`QUERY_RUN_SPAN`] after the query's admission, or the instant its evaluation
+    /// stopped if that is later ([`Self::end_run`]). `None` while the operation that
+    /// admitted the query has not reported its run as over.
+    pub ends_at: Option<Instant>,
+    /// The handle the evaluation of this query is stopped through, shared with the run
+    /// itself: accepting a cancel signals it, so a `CancelQuery` ends the work and not
+    /// just the record ([`Self::begin_cancellation`]). A record admitted by something
+    /// that is not running a query carries a handle nothing listens on.
+    pub cancellation: QueryCancellation,
 }
 
 impl Query {
@@ -1542,6 +1576,8 @@ impl Query {
             started_at: Some(now),
             terminates_at: None,
             times_out_at: now + DEFAULT_QUERY_TIMEOUT,
+            ends_at: None,
+            cancellation: QueryCancellation::new(),
         }
     }
 
@@ -1561,6 +1597,8 @@ impl Query {
             started_at: None,
             terminates_at: None,
             times_out_at: now + DEFAULT_QUERY_TIMEOUT,
+            ends_at: None,
+            cancellation: QueryCancellation::new(),
         }
     }
 
@@ -1594,13 +1632,30 @@ impl Query {
         }
         self.state = QueryState::Cancelling;
         self.terminates_at = Some(now + CANCELLATION_SPAN);
+        // The run itself is stopped, not just the record: the evaluation reads this
+        // handle at every question it asks the graph and stops asking.
+        self.cancellation.signal();
     }
 
-    /// Whether this query is over: either the cancellation the clock owes it has fallen
-    /// due, or its own timeout has run out ([`Self::times_out_at`]). Once it is, the
-    /// query has stopped and is no longer a query the service reports.
+    /// The run this record reports has stopped at `now`: the record is reclaimed once
+    /// the span the clock owes an accepted query's run is up ([`QUERY_RUN_SPAN`]), and
+    /// once this instant has passed when the span already has.
+    ///
+    /// Called by the operation that admitted the query, so a record never reports a run
+    /// the service has not accepted and never outlives one it is still performing.
+    pub fn end_run(&mut self, now: Instant) {
+        let owed = self.submitted_at + QUERY_RUN_SPAN;
+        self.ends_at = Some(if now > owed { now } else { owed });
+    }
+
+    /// Whether this query is over: the end of its run has fallen due ([`Self::ends_at`]),
+    /// the cancellation the clock owes it has fallen due, or its own timeout has run out
+    /// ([`Self::times_out_at`]). Once it is, the query has stopped and is no longer a
+    /// query the service reports.
     pub fn has_terminated(&self, now: Instant) -> bool {
-        now >= self.times_out_at || self.terminates_at.is_some_and(|due| now >= due)
+        now >= self.times_out_at
+            || self.terminates_at.is_some_and(|due| now >= due)
+            || self.ends_at.is_some_and(|due| now >= due)
     }
 
     /// How long the query waited before executing, in milliseconds: the span from its
@@ -1766,6 +1821,8 @@ pub struct ComAmazonawsNeptunegraphAmazonneptunegraphState {
     pub export_task_id_counter: u64,
     /// Feeds the VPC-endpoint-id generator, so ids are unique within a store.
     pub vpc_endpoint_id_counter: u64,
+    /// Feeds the query-id generator, so ids are unique within a store.
+    pub query_id_counter: u64,
 }
 
 impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
@@ -1803,6 +1860,25 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
                 scramble(self.import_task_id_counter) % BASE36_POW10,
             );
             if !self.holds_task_id(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Mint an id no query this store holds in flight is addressed by.
+    ///
+    /// The model puts no pattern on `queryId` (`smithy_query(query="operation",
+    /// operation="GetQuery")`: a bare `String`), so the id is spelled the way the service
+    /// spells a query's: the 8-4-4-4-12 hexadecimal form, scrambled off the counter the
+    /// same way every other id of this store is, so ids are not guessable neighbours
+    /// while still being a pure function of the counter. Queries are keyed per graph, so
+    /// the uniqueness checked here is across every graph: one id names at most one query
+    /// in this store, whichever graph a request addresses it on.
+    pub fn next_query_id(&mut self) -> String {
+        loop {
+            self.query_id_counter = self.query_id_counter.wrapping_add(1);
+            let id = encode_query_id(self.query_id_counter);
+            if !self.queries.values().any(|queries| queries.contains_key(&id)) {
                 return id;
             }
         }
@@ -2811,6 +2887,47 @@ pub fn import_source_requirement(source: &str) -> Option<String> {
     None
 }
 
+/// The sentence an import that locates its data in Amazon S3 and says nothing about how
+/// that data is written is refused with.
+///
+/// Fixed text that interpolates nothing from the request: the rule is about a PAIR of
+/// members rather than about one value, so there is no value to name in it.
+const S3_SOURCE_WITHOUT_FORMAT: &str = "Source format should be specified when Source type is S3.";
+
+/// The modelled `ValidationException` an import request that locates its data in Amazon
+/// S3 without naming a `format` earns, or `None` when the pair holds.
+///
+/// Documented member dependency: `format` "Specifies the format of Amazon S3 data to be
+/// imported" (`smithy_query(query="doc",shape="StartImportTaskInput",member="format")`),
+/// so it is what tells the load how the objects at an S3 location are WRITTEN — a
+/// location in an object store names bytes and nothing about their layout, while the
+/// other thing `source` may name, "a Neptune database endpoint or snapshot"
+/// (`smithy_query(query="doc",shape="StartImportTaskInput",member="source")`), carries
+/// its own structure and needs no format. So the member is required exactly when the
+/// source is an S3 location ([`is_s3_uri`]) and optional otherwise.
+///
+/// The member is NOT `@required` (`smithy_query(query="operation",
+/// operation="StartImportTask")`) — no modelled trait can express a dependency between
+/// two members — so the rule is refused by hand, stated ONCE here and reached by every
+/// operation that accepts an import `source` and `format` (`StartImportTask`,
+/// `CreateGraphUsingImportTask`), so the two cannot drift into different acceptance sets
+/// or different wording for one rule.
+///
+/// It is answered as a whole `ValidationException` rather than as a clause of the
+/// constraint envelope [`constraint_violation`] builds, because the service words this
+/// rule as one sentence about the request and not as a measurement of a member's value;
+/// the modelled `reason` beside it is still the one a member that does not satisfy a rule
+/// stated about it carries.
+pub fn import_format_requirement(source: &str, format: Option<&str>) -> Option<ValidationException> {
+    if format.is_some() || !is_s3_uri(source) {
+        return None;
+    }
+    Some(ValidationException {
+        message: S3_SOURCE_WITHOUT_FORMAT.to_string(),
+        reason: Some(CONSTRAINT_VIOLATION.to_string()),
+    })
+}
+
 /// The prefix the service reserves for import- and export-task ids, from the modelled
 /// `TaskId` pattern `^t-[a-z0-9]{10}$`.
 pub const TASK_ID_PREFIX: &str = "t-";
@@ -2818,6 +2935,16 @@ pub const TASK_ID_PREFIX: &str = "t-";
 /// The `statusReason` of an import task that stopped because it was cancelled.
 pub const IMPORT_CANCELLED_REASON: &str =
     "The import task was cancelled by a CancelImportTask request.";
+
+/// The sentence the caller of a query that was stopped by a `CancelQuery` request is
+/// answered with: the run it was waiting on did not finish, and why.
+///
+/// This service's own wording, worded like the `statusReason` of cancelled work
+/// elsewhere in it ([`IMPORT_CANCELLED_REASON`]) so a caller reads one grammar for "the
+/// request that stopped this": no recording of a cancelled query's own answer is
+/// available to take a sentence from, and the condition is reported under the modelled
+/// `reason` the model keeps for a cancelled query.
+pub const QUERY_CANCELLED_MESSAGE: &str = "The query was cancelled by a CancelQuery request.";
 
 /// The most export tasks one store holds.
 ///
@@ -2837,14 +2964,19 @@ pub const MAX_EXPORT_TASKS: usize = 100;
 
 /// The most queries one store holds in flight, across every graph.
 ///
-/// Emulator resource guard, NOT a quota AWS publishes, and the same bound
+/// Emulator resource guard, NOT a quota AWS publishes, and the same kind of bound
 /// [`MAX_GRAPHS`] puts on the graph map: the store is shared process-wide and grows by
 /// one entry per admitted query, so without a ceiling repeated query requests grow the
 /// emulator's memory without bound. Reaching it is reported by the operation that
 /// admits a query, from the message [`ComAmazonawsNeptunegraphAmazonneptunegraphState::insert_query`]
-/// hands back. Set well above any realistic use of a local emulator, and queries also
-/// leave the store on their own as the clock makes their end due.
-pub const MAX_QUERIES: usize = 100;
+/// hands back. Set higher than the other stores' ceilings because a query record is in
+/// flight for the span the clock owes its run ([`QUERY_RUN_SPAN`]) rather than until a
+/// caller reclaims it: what this bounds is how many queries one caller may have in
+/// flight at once, and it is set well above the queries a client submits within one such
+/// span. Each record carries at most [`MAX_QUERY_STRING_CHARS`] of text, so the two
+/// bounds together cap what the map can hold, and records leave it on their own as the
+/// clock makes their end due.
+pub const MAX_QUERIES: usize = 250;
 
 /// The most nodes one graph's data may hold.
 ///
@@ -4279,6 +4411,27 @@ fn encode_vpc_endpoint_id(counter: u64) -> String {
     let low = scramble(counter);
     let high = scramble(counter ^ 0x5DEE_CE66_D1B5_A1C3);
     format!("vpce-{:x}{low:016x}", high & 0xf)
+}
+
+/// Spell the id of the `counter`th query this store admitted in the 8-4-4-4-12
+/// hexadecimal form a query id takes, from three independently scrambled words of the
+/// counter: the model constrains the member not at all, so what identifies a query is
+/// whatever the operation that admitted it minted, and this spelling keeps one id per
+/// counter value without making neighbours guessable. The version and variant nibbles
+/// the form fixes are set, so a minted id is indistinguishable in shape from the ids the
+/// service answers with.
+fn encode_query_id(counter: u64) -> String {
+    let first = scramble(counter);
+    let second = scramble(counter ^ 0x2545_F491_4F6C_DD1D);
+    let third = scramble(counter ^ 0x9E37_79B9_7F4A_7C15);
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        first >> 32,
+        (first >> 16) & 0xffff,
+        first & 0x0fff,
+        0x8000 | (second & 0x3fff),
+        third & 0xffff_ffff_ffff
+    )
 }
 
 /// Spell `value` (already reduced below [`BASE36_POW10`]) as `prefix` plus exactly

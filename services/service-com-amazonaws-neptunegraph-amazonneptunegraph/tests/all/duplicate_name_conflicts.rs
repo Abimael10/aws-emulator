@@ -168,6 +168,7 @@ async fn create_graph_using_import(router: &MultiServiceRouter, case: &str, name
             "graphName": name,
             "roleArn": ROLE_ARN,
             "source": "s3://import-bucket/seed",
+            "format": "CSV",
         })),
     )
     .await;
@@ -287,6 +288,7 @@ async fn a_taken_graph_name_is_refused_from_the_requested_name_alone() {
                     "graphName": name,
                     "roleArn": ROLE_ARN,
                     "source": "s3://import-bucket/again",
+                    "format": "CSV",
                 }),
             ),
             (

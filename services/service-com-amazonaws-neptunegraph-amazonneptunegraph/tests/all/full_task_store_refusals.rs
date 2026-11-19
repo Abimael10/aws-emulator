@@ -197,6 +197,7 @@ fn plain_request(store: TaskStore, graph_id: &str) -> Value {
         TaskStore::Import => json!({
             "source": "s3://import-bucket/plain/",
             "roleArn": ROLE_ARN,
+            "format": "CSV",
         }),
     }
 }

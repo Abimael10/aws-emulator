@@ -219,7 +219,11 @@ async fn an_import_task_is_served_by_its_own_id_once_its_graph_is_gone() {
             "read-after-delete-plain",
             false,
             true,
-            json!({"source": "s3://example-bucket/plain/", "roleArn": ROLE_ARN}),
+            json!({
+                "source": "s3://example-bucket/plain/",
+                "roleArn": ROLE_ARN,
+                "format": "CSV",
+            }),
         ),
         (
             "a stopped task, its graph deleted with a final snapshot",
@@ -251,7 +255,7 @@ async fn an_import_task_is_served_by_its_own_id_once_its_graph_is_gone() {
             true,
             false,
             json!({
-                "source": "s3://example-bucket/neptune/",
+                "source": "my-graph.cluster-abcdefghijkl.us-east-1.neptune.amazonaws.com",
                 "roleArn": ROLE_ARN,
                 "importOptions": {
                     "neptune": {

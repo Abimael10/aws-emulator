@@ -39,15 +39,19 @@
 //! What a caller's query does choose is how much work it asks for, so every bound on
 //! that is stated here, on this side of the engine, and each is taken BEFORE the work it
 //! caps: the text one request may have read ([`super::MAX_QUERY_STRING_CHARS`]), how
-//! deep that text may nest ([`MAX_QUERY_NESTING_DEPTH`]), the rows a query's own
-//! literals may make ([`literal_rows`]), the candidate elements one evaluation may be
-//! handed ([`MAX_QUERY_WORK_UNITS`]) and the span it may spend being handed them
-//! ([`query_run_timeout`]). [`run_query`] takes no lock and reads no store, so the
-//! operation runs it with the store's guard already given up, off the thread that serves
-//! requests and under one of a bounded number of permits ([`MAX_CONCURRENT_QUERIES`]).
+//! deep that text may nest ([`MAX_QUERY_NESTING_DEPTH`]) and how many tokens it may
+//! carry at all ([`MAX_QUERY_TOKENS`]) — the pair that bounds how far one parse of it
+//! descends — the rows a query's own literals may make ([`literal_rows`]), the candidate
+//! elements one evaluation may be handed ([`MAX_QUERY_WORK_UNITS`]) and the span it may
+//! spend being handed them ([`query_run_timeout`]). [`run_query`] takes no lock and reads
+//! no store, so the operation runs it with the store's guard already given up, off the
+//! thread that serves requests and under one of a bounded number of permits
+//! ([`MAX_CONCURRENT_QUERIES`]).
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use ::cypher_parser::{CypherValue, GraphProvider, ResultSet};
@@ -66,6 +70,41 @@ pub enum Stopped {
     Exhausted,
     /// The span the query was given ran out while it was still asking.
     TimedOut,
+    /// The query it belongs to was cancelled while it was still asking.
+    Cancelled,
+}
+
+/// The handle one running evaluation is stopped through when the query it belongs to is
+/// cancelled.
+///
+/// A cancel arrives on ANOTHER request than the one that is running the query
+/// (`CancelQuery`), and the two share nothing but the record the store holds, so the
+/// record carries this handle: accepting a cancel signals it, and the evaluation reads it
+/// at every question it asks the graph ([`Budget::charge`]) and stops. It is the only
+/// thing the two requests share, so no store is locked and no evaluation is waited on to
+/// stop one.
+///
+/// Cloning a handle shares the one flag: every clone speaks for the same evaluation.
+#[derive(Debug, Clone, Default)]
+pub struct QueryCancellation(Arc<AtomicBool>);
+
+impl QueryCancellation {
+    /// A handle to an evaluation nothing has cancelled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stop the evaluation this handle speaks for, at the next question it asks.
+    pub fn signal(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the evaluation this handle speaks for has been cancelled.
+    #[must_use]
+    pub fn is_signalled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 /// What one evaluation may spend, and why it stopped if it did.
@@ -84,6 +123,8 @@ struct Budget {
     deadline: Instant,
     /// Why it stopped, once it has.
     stopped: Cell<Option<Stopped>>,
+    /// The cancel of the query this evaluation belongs to, once one has been accepted.
+    cancelled: QueryCancellation,
 }
 
 impl Budget {
@@ -95,6 +136,14 @@ impl Budget {
     /// surface it has.
     fn charge(&self, units: usize) -> bool {
         if self.stopped.get().is_some() {
+            return false;
+        }
+        // A cancel the service has accepted is read here, beside the deadline, because
+        // this is the one place the evaluation can be stopped from: a cancelled query
+        // stops ASKING rather than running to the end and answering a caller that is no
+        // longer owed an answer.
+        if self.cancelled.is_signalled() {
+            self.stopped.set(Some(Stopped::Cancelled));
             return false;
         }
         if Instant::now() >= self.deadline {
@@ -182,8 +231,18 @@ impl<'data> StoredGraph<'data> {
                 left: Cell::new(units),
                 deadline,
                 stopped: Cell::new(None),
+                cancelled: QueryCancellation::new(),
             },
         }
+    }
+
+    /// The same reading of the graph, stopped as soon as `cancellation` is signalled:
+    /// what the operation that admitted the query hands the evaluation so an accepted
+    /// `CancelQuery` really ends the work.
+    #[must_use]
+    pub fn cancelled_by(mut self, cancellation: QueryCancellation) -> Self {
+        self.budget.cancelled = cancellation;
+        self
     }
 
     /// Why the evaluation over this graph stopped, if it did.
@@ -402,6 +461,9 @@ pub enum QueryFailure {
     /// The query text nests deeper than this emulator reads
     /// ([`MAX_QUERY_NESTING_DEPTH`]).
     TooDeep { depth: usize, ceiling: usize },
+    /// The query text carries more tokens than one parse of this emulator's descends
+    /// through ([`MAX_QUERY_TOKENS`]).
+    TooManyTokens { tokens: usize, ceiling: usize },
     /// The result set is larger than this emulator answers with
     /// ([`MAX_QUERY_RESULT_ROWS`]).
     TooLarge { rows: usize, ceiling: usize },
@@ -409,7 +471,8 @@ pub enum QueryFailure {
     /// ([`UNSUPPORTED_CLAUSES`]).
     Unsupported { clause: &'static str },
     /// The evaluation was stopped before it had answered: it asked for more of the graph
-    /// than one query may read, or the span it was given ran out.
+    /// than one query may read, the span it was given ran out, or the query was
+    /// cancelled.
     Stopped(Stopped),
 }
 
@@ -459,8 +522,29 @@ pub const MAX_QUERY_WORK_UNITS: usize = 200_000;
 /// Emulator resource guard: the engine's parser descends through a nested expression, so
 /// a text nesting arbitrarily deep would recurse arbitrarily deep on a caller's input.
 /// The depth is counted off the text's own brackets ([`nesting_depth`]) BEFORE the parser
-/// sees it, and set well above any query a local emulator is asked to run.
+/// sees it, and set well above any query a local emulator is asked to run. Brackets are
+/// not the only construct a recursive-descent parser descends through, so this bound is
+/// one half of the pair that keeps the parse shallow: [`MAX_QUERY_TOKENS`] is the other.
 pub const MAX_QUERY_NESTING_DEPTH: usize = 64;
+
+/// The most tokens one query text may carry.
+///
+/// Emulator resource guard, and the other half of [`MAX_QUERY_NESTING_DEPTH`]: the
+/// engine's parser is recursive-descent, so it descends not only through a text's
+/// BRACKETS but through the prefix and infix constructs of its grammar — a chain of
+/// negations, of conjunctions, of property accesses or of list items recurses with no
+/// bracket anywhere in it, which a bracket depth cannot see. What bounds that descent
+/// whatever the construct is simply how many tokens the text has at all: a parse descends
+/// through a token at most once, so capping the count caps the recursion. The stack one
+/// evaluation is given ([`QUERY_STACK_BYTES`]) leaves several kilobytes per token of this
+/// count — room for the handful of frames a grammar's precedence levels take per token —
+/// where the text length alone would allow tens of thousands of them. An overflowing
+/// stack aborts the process rather than failing one request, which is why the count is
+/// measured BEFORE the parser sees the text ([`token_count`]) — and every PREFIX of a
+/// text that passed the bound is within it too, so the re-parses that word a refusal
+/// ([`expected_alternatives`]) are bounded by the same count. Set well above the tokens
+/// any query a local emulator is asked to run carries.
+pub const MAX_QUERY_TOKENS: usize = 2_048;
 
 /// How many queries this emulator evaluates AT ONCE.
 ///
@@ -523,6 +607,22 @@ pub fn nesting_depth(query: &str) -> usize {
         }
     }
     deepest
+}
+
+/// How many tokens `query` carries: the count one parse of it can descend through.
+///
+/// Counted over the ENGINE'S own tokens where the text lexes, so what is measured and
+/// what the parser then reads cannot disagree. A text the lexer CANNOT read is counted by
+/// its CHARACTERS instead, which can only OVER-state the count — every token is at least
+/// one character — the safe direction for a bound whose job is to keep a parser from
+/// descending through a caller's text, and the same reading [`nesting_depth`] takes for
+/// such a text.
+#[must_use]
+pub fn token_count(query: &str) -> usize {
+    match ::cypher_parser::lexer::tokenize(query) {
+        Ok(tokens) => tokens.len(),
+        Err(_) => query.chars().count(),
+    }
 }
 
 /// How deep the brackets of a text the lexer could not read nest, counted off its
@@ -691,6 +791,21 @@ pub fn run_query(
     query: &str,
     deadline: Instant,
 ) -> Result<Vec<u8>, QueryFailure> {
+    run_query_until(data, query, deadline, &QueryCancellation::new())
+}
+
+/// [`run_query`], stopped as soon as `cancellation` is signalled: the run of a query the
+/// store holds a record for, which `CancelQuery` can end while it is still asking.
+///
+/// The cancel is read at every question the evaluation asks the graph, so a cancelled
+/// query stops doing work and is reported as the cancelled query it is rather than
+/// answering results nobody is waiting for.
+pub fn run_query_until(
+    data: &GraphData,
+    query: &str,
+    deadline: Instant,
+    cancellation: &QueryCancellation,
+) -> Result<Vec<u8>, QueryFailure> {
     // Both text bounds are checked BEFORE the parser sees the text: `queryString` is
     // modelled as an unconstrained `String`, so these are what stop an arbitrarily large
     // or arbitrarily nested text from being parsed at all.
@@ -706,6 +821,17 @@ pub fn run_query(
         return Err(QueryFailure::TooDeep {
             depth,
             ceiling: MAX_QUERY_NESTING_DEPTH,
+        });
+    }
+    // A text's BRACKETS are not the only thing a recursive-descent parser descends
+    // through, so the depth above is paired with the count of tokens the text carries at
+    // all ([`MAX_QUERY_TOKENS`]): that is what bounds the descent of a chain of prefix or
+    // infix constructs, which nests without a bracket in it.
+    let tokens = token_count(query);
+    if tokens > MAX_QUERY_TOKENS {
+        return Err(QueryFailure::TooManyTokens {
+            tokens,
+            ceiling: MAX_QUERY_TOKENS,
         });
     }
     // The rows the query's own literals could expand to are counted from the TEXT and
@@ -730,15 +856,18 @@ pub fn run_query(
             });
         }
     };
-    let graph = StoredGraph::over_within(data, MAX_QUERY_WORK_UNITS, deadline);
-    let results = ::cypher_parser::execute(&graph, &parsed)
-        .map_err(|refused| QueryFailure::refused(query, refused))?;
+    let graph = StoredGraph::over_within(data, MAX_QUERY_WORK_UNITS, deadline)
+        .cancelled_by(cancellation.clone());
+    let executed = ::cypher_parser::execute(&graph, &parsed);
     // The evaluation may have been stopped while it was building: what the engine was
     // left holding is a SHORT answer, so the limit that stopped it is reported and the
-    // rows are dropped.
+    // rows are dropped. Read BEFORE the engine's own answer, because an evaluation the
+    // provider stopped answering may also leave the engine with an error about the short
+    // view it was handed, and why the run did not finish is what the caller needs back.
     if let Some(stopped) = graph.stopped() {
         return Err(QueryFailure::Stopped(stopped));
     }
+    let results = executed.map_err(|refused| QueryFailure::refused(query, refused))?;
     if results.rows.len() > MAX_QUERY_RESULT_ROWS {
         return Err(QueryFailure::TooLarge {
             rows: results.rows.len(),
@@ -1246,6 +1375,109 @@ mod tests {
             matches!(reported, Err(QueryFailure::Stopped(Stopped::TimedOut))),
             "case \"a query run past its deadline\": expected the timeout to be reported, \
              got {reported:?}"
+        );
+    }
+
+    /// RULE: a query the service has accepted a cancel for stops ASKING the graph, so a
+    /// cancelled run does no more work and is reported as the cancelled query it is
+    /// rather than answering the short result the engine was left holding.
+    ///
+    /// The rows span what the rule generalises over: a query that reads the graph through
+    /// a label scan and one that reads it through a traversal, each with the cancel
+    /// signalled before the run and again on a handle nothing signalled.
+    #[test]
+    fn a_cancelled_run_stops_asking_and_is_reported_as_cancelled() {
+        let data = two_cities();
+        // (case, the query text) — one that reads the graph through a label scan and one
+        // that reads it through a traversal: the cancel is read at every question either
+        // asks.
+        let rows = [
+            ("a label scan", "MATCH (c:city) RETURN c.name AS name"),
+            (
+                "a traversal",
+                "MATCH (a:city)-[:route]->(b:city) RETURN b.name AS name",
+            ),
+        ];
+        for (case, query) in rows {
+            for signalled in [true, false] {
+                let cancellation = QueryCancellation::new();
+                if signalled {
+                    cancellation.signal();
+                }
+                let reported = run_query_until(&data, query, soon(), &cancellation);
+                let cancelled =
+                    matches!(reported, Err(QueryFailure::Stopped(Stopped::Cancelled)));
+                assert_eq!(
+                    cancelled, signalled,
+                    "case {case:?} with the cancel signalled {signalled}: expected \
+                     cancelled {signalled}, got {reported:?}"
+                );
+            }
+        }
+    }
+
+    /// RULE: how far one parse of a text can descend is bounded before the parser sees
+    /// it, by the text's bracket depth AND by the number of tokens it carries at all —
+    /// because a chain of prefix or infix constructs nests with no bracket in it, and an
+    /// overflowing stack would end the process rather than the request.
+    ///
+    /// The rows span the constructs that nest without a bracket: a negation chain, a
+    /// conjunction chain, a property-access chain and a list of items, each past the
+    /// token bound and each well inside the bracket bound; and the same shapes at a
+    /// length an ordinary query reaches, which must NOT be refused for their count.
+    #[test]
+    fn a_text_is_bounded_by_its_token_count_as_well_as_by_its_brackets() {
+        let data = two_cities();
+        // (case, the text's unbracketed chain, how many of it the row repeats)
+        let chains = [
+            ("a negation chain", "NOT "),
+            ("a conjunction chain", "true AND "),
+            ("a property-access chain", "c.a"),
+            ("a list continuation", "1, "),
+        ];
+        for (case, chain) in chains {
+            // Past the bound: a text whose tokens outnumber what one parse descends
+            // through is refused for the count, with no bracket in it to be refused for.
+            let oversized = format!("RETURN {}true", chain.repeat(MAX_QUERY_TOKENS));
+            assert_eq!(
+                nesting_depth(&oversized),
+                0,
+                "case {case:?}: the row must carry no brackets, so only the token count \
+                 can bound it"
+            );
+            let refused = run_query(&data, &oversized, soon());
+            assert!(
+                matches!(
+                    refused,
+                    Err(QueryFailure::TooManyTokens {
+                        ceiling: MAX_QUERY_TOKENS,
+                        ..
+                    })
+                ),
+                "case {case:?} past the bound: expected the token count to be reported, \
+                 got {refused:?}"
+            );
+
+            // At a length an ordinary query reaches, the count refuses nothing: whatever
+            // the engine answers, it is not this bound.
+            let ordinary = format!("RETURN {}true", chain.repeat(4));
+            let answered = run_query(&data, &ordinary, soon());
+            assert!(
+                !matches!(answered, Err(QueryFailure::TooManyTokens { .. })),
+                "case {case:?} at an ordinary length: the token bound must not refuse it, \
+                 got {answered:?}"
+            );
+        }
+
+        // A text the lexer cannot read is counted by its characters, which can only
+        // over-state the tokens it carries — so an enormous unreadable text is refused
+        // for its count rather than handed to the parser.
+        let unreadable = "$".repeat(MAX_QUERY_TOKENS + 1);
+        let refused = run_query(&data, &unreadable, soon());
+        assert!(
+            matches!(refused, Err(QueryFailure::TooManyTokens { .. })),
+            "case \"an unreadable text past the bound\": expected the token count to be \
+             reported, got {refused:?}"
         );
     }
 

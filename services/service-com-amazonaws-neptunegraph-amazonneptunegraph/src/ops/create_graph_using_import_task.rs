@@ -329,6 +329,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The last of the request's own rules: data that lives in Amazon S3 is read in
+        // the layout `format` names, so the member is required exactly when `source`
+        // locates the data there. Stated ONCE, in
+        // `crate::state::import_format_requirement`, and reached by every operation that
+        // accepts an import `source` (`StartImportTask` too), so the two cannot accept
+        // different requests. The service words it as its own sentence rather than as a
+        // clause of the walk above, so it is answered on its own once that walk has
+        // nothing to report.
+        if let Some(refused) =
+            crate::state::import_format_requirement(&input.source, input.format.as_deref())
+        {
+            return Err(
+                CreateGraphUsingImportTaskErrorModeled::ValidationException(refused).into(),
+            );
+        }
+
         let region = crate::state::request_region(ctx);
 
         // The store-dependent refusals are taken with the lock held — and taken AGAIN

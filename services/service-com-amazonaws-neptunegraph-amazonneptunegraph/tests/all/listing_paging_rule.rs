@@ -195,6 +195,7 @@ async fn graph_with_import_task(router: &MultiServiceRouter, graph_name: &str) {
         "graphName": graph_name,
         "source": "s3://paging-bucket/import/",
         "roleArn": ROLE_ARN,
+        "format": "CSV",
     });
     let (status, created) = call(router, "POST", "/importtasks", Some(body.clone())).await;
     assert_eq!(

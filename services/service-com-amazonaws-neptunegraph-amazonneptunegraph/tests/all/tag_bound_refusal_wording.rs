@@ -379,6 +379,7 @@ async fn an_oversized_tag_key_is_refused_the_same_way_by_every_operation_that_st
                     "graphName": format!("key-import-graph-{index}"),
                     "source": "s3://example-bucket/data/",
                     "roleArn": ROLE_ARN,
+                    "format": "CSV",
                     "tags": tags,
                 }),
             ),

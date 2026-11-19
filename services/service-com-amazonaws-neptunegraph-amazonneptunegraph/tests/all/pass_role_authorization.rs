@@ -252,7 +252,11 @@ impl PassRoleOperation {
         match self {
             Self::StartImport => (
                 format!("/graphs/{graph_id}/importtasks"),
-                json!({ "source": "s3://import-bucket/data/", "roleArn": role_arn }),
+                json!({
+                    "source": "s3://import-bucket/data/",
+                    "roleArn": role_arn,
+                    "format": "CSV",
+                }),
             ),
             Self::CreateGraphUsingImport => (
                 "/importtasks".to_string(),
@@ -260,6 +264,7 @@ impl PassRoleOperation {
                     "graphName": graph_name,
                     "source": "s3://import-bucket/data/",
                     "roleArn": role_arn,
+                    "format": "CSV",
                 }),
             ),
             Self::StartExport => (

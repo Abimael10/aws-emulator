@@ -53,7 +53,8 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::{
 };
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{
-    service_state, GraphEdge, GraphNode, MAX_QUERY_STRING_CHARS, PROVISIONING_SPAN,
+    service_state, GraphEdge, GraphNode, CANCELLATION_SPAN, MAX_QUERY_STRING_CHARS,
+    PROVISIONING_SPAN,
 };
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::EmulatedService;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615 as sts;
@@ -1744,4 +1745,263 @@ async fn the_decision_follows_the_policies_the_account_holds_at_each_call() {
         refused,
     )
     .await;
+}
+
+/// `GET /queries` on one graph, asking for more results than any case here admits so the
+/// cap never decides what is reported. `state` filters the listing when a case names one.
+async fn list_queries(
+    router: &MultiServiceRouter,
+    graph_identifier: &str,
+    state: Option<&str>,
+) -> (u16, Value) {
+    let path = match state {
+        Some(state) => format!("/queries?maxResults=100&state={state}"),
+        None => "/queries?maxResults=100".to_string(),
+    };
+    call_as(
+        router,
+        AMBIENT_KEY,
+        "GET",
+        &path,
+        Some(graph_identifier),
+        None,
+    )
+    .await
+}
+
+/// `GET /queries/{queryId}` on one graph.
+async fn get_query(
+    router: &MultiServiceRouter,
+    graph_identifier: &str,
+    query_id: &str,
+) -> (u16, Value) {
+    call_as(
+        router,
+        AMBIENT_KEY,
+        "GET",
+        &format!("/queries/{query_id}"),
+        Some(graph_identifier),
+        None,
+    )
+    .await
+}
+
+/// `DELETE /queries/{queryId}` — the wire form of `CancelQuery`.
+async fn cancel_query(
+    router: &MultiServiceRouter,
+    graph_identifier: &str,
+    query_id: &str,
+) -> (u16, Value) {
+    call_as(
+        router,
+        AMBIENT_KEY,
+        "DELETE",
+        &format!("/queries/{query_id}"),
+        Some(graph_identifier),
+        None,
+    )
+    .await
+}
+
+/// The summaries one listing reported, as (id, queryString, state) triples.
+fn reported_queries(body: &Value) -> Vec<(String, String, String)> {
+    body["queries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the required member `queries` must be a list, got {body}"))
+        .iter()
+        .map(|summary| {
+            (
+                summary["id"].as_str().unwrap_or_default().to_string(),
+                summary["queryString"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                summary["state"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Poll `GetQuery` until the id resolves to nothing, which is how a query that has
+/// stopped is reported: `ValidationException` (400) "Supplied queryId <id> is invalid".
+///
+/// Waits for the CONDITION rather than for a span, with a deadline generous beside the
+/// spans the clock owes a cancelled query's end.
+async fn wait_until_the_query_is_gone(
+    router: &MultiServiceRouter,
+    case: &str,
+    graph_identifier: &str,
+    query_id: &str,
+) {
+    for _ in 0..80 {
+        let (status, body) = get_query(router, graph_identifier, query_id).await;
+        if status == 400 {
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {case:?}: a query id that resolves to nothing is a \
+                 ValidationException, got {body}"
+            );
+            let message = body["message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message,
+                format!("Supplied queryId {query_id} is invalid"),
+                "case {case:?}: unexpected message {message:?}"
+            );
+            return;
+        }
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the query to be reported or refused, got {status}: \
+             {body}"
+        );
+        tokio::time::sleep(CANCELLATION_SPAN / 4).await;
+    }
+    panic!("case {case:?}: the query {query_id} never stopped being reported");
+}
+
+/// RULE: a query this data plane accepts is a query IN FLIGHT on the graph it runs on
+/// for as long as the clock owes its run — so the three operations that report a graph's
+/// queries see it (`ListQueries` with its id, its text and the `RUNNING` state it was
+/// admitted in; `GetQuery` by that id), `CancelQuery` ends it, and once it has stopped
+/// the id resolves to nothing at all. A query is filed under ONE graph, so another
+/// graph's listing never reports it.
+///
+/// The rows span what the rule generalises over: the shape of the query text and what
+/// its run answered — a projection, a traversal over stored data, a text the engine
+/// cannot read, and a well-formed text naming a function it cannot evaluate — because
+/// what the run ANSWERS is not what decides whether the service took the query on.
+#[tokio::test]
+async fn an_accepted_query_is_in_flight_on_its_graph_until_its_run_is_over() {
+    let (router, engine) = emulator();
+    let (graph_id, _) = graph_in_service(&router, "query-in-flight").await;
+    let (bystander, _) = graph_in_service(&router, "query-in-flight-bystander").await;
+    seed(
+        &engine,
+        "query-in-flight",
+        &graph_id,
+        &[("n1", &["city"], &[("name", json!("Berlin"))])],
+        &[],
+    );
+
+    // (case, the query text, the status its run answers with)
+    let rows: &[(&str, &str, u16)] = &[
+        ("a projection", "RETURN 1 AS one", 200),
+        ("a traversal over the stored data", ANY_QUERY, 200),
+        ("a text the parser cannot read", "MATCH (n RETURN n", 400),
+        (
+            "a well-formed text naming a function the engine does not implement",
+            "UNWIND range(1, 10) AS a RETURN a",
+            400,
+        ),
+    ];
+
+    let mut minted: BTreeSet<String> = BTreeSet::new();
+    for (case, query, answered) in rows {
+        let (status, answer) = execute_query(&router, &graph_id, query).await;
+        assert_eq!(
+            status, *answered,
+            "case {case:?}: expected {answered} from ExecuteQuery, got {status}: {answer}"
+        );
+
+        // The query the call took on is in flight on its graph, carrying the text the
+        // request sent and the state it was admitted in. This and the read below are the
+        // only assertions here the run's span bounds, so the row makes them FIRST and in
+        // as few calls as it can: everything after the cancel waits for a condition
+        // instead.
+        let (list_status, listed) = list_queries(&router, &graph_id, Some("RUNNING")).await;
+        assert_eq!(
+            list_status, 200,
+            "case {case:?}: expected 200 from ListQueries, got {list_status}: {listed}"
+        );
+        let reported = reported_queries(&listed);
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {case:?}: expected exactly the query just submitted, got {reported:?}"
+        );
+        let (query_id, reported_text, state) = reported[0].clone();
+        assert_eq!(
+            reported_text, *query,
+            "case {case:?}: expected the submitted text, got {reported_text:?}"
+        );
+        assert_eq!(
+            state, "RUNNING",
+            "case {case:?}: expected the RUNNING state, got {state:?}"
+        );
+        assert!(
+            minted.insert(query_id.clone()),
+            "case {case:?}: the id {query_id} was already minted for another query"
+        );
+
+        // `GetQuery` reports the same record by that id.
+        let (read_status, one) = get_query(&router, &graph_id, &query_id).await;
+        assert_eq!(
+            read_status, 200,
+            "case {case:?}: expected 200 from GetQuery, got {read_status}: {one}"
+        );
+        assert_eq!(
+            one["queryString"],
+            json!(query),
+            "case {case:?}: expected the submitted text from GetQuery, got {one}"
+        );
+        assert_eq!(
+            one["state"],
+            json!("RUNNING"),
+            "case {case:?}: expected RUNNING from GetQuery, got {one}"
+        );
+
+        // The cancel is accepted and the query reports the cancellation in flight …
+        let (cancel_status, cancelled) = cancel_query(&router, &graph_id, &query_id).await;
+        assert_eq!(
+            cancel_status, 200,
+            "case {case:?}: expected 200 from CancelQuery, got {cancel_status}: \
+             {cancelled}"
+        );
+
+        // The record is filed under ONE graph, and the state filter is answered off the
+        // record itself — neither assertion depends on the span, because both are about
+        // what a listing must NOT report.
+        let (_, other) = list_queries(&router, &bystander, None).await;
+        assert_eq!(
+            reported_queries(&other),
+            Vec::new(),
+            "case {case:?}: a query of {graph_id} must not be listed under {bystander}, \
+             got {other}"
+        );
+        let (_, waiting) = list_queries(&router, &graph_id, Some("WAITING")).await;
+        assert_eq!(
+            reported_queries(&waiting),
+            Vec::new(),
+            "case {case:?}: the query never waited for a slot, so the WAITING filter \
+             reports none, got {waiting}"
+        );
+
+        // … and once it has stopped, the id resolves to nothing at all.
+        wait_until_the_query_is_gone(&router, case, &graph_id, &query_id).await;
+        let (_, emptied) = list_queries(&router, &graph_id, None).await;
+        assert_eq!(
+            reported_queries(&emptied),
+            Vec::new(),
+            "case {case:?}: a stopped query is no longer listed, got {emptied}"
+        );
+    }
+
+    // A query id this store never minted names no query either, on either graph: the
+    // namespace is per graph and a query is not a resource identifier a caller holds on
+    // to.
+    for (case, graph) in [("its own graph", &graph_id), ("another graph", &bystander)] {
+        let unknown = "00000000-0000-4000-8000-000000000000";
+        let (status, body) = get_query(&router, graph, unknown).await;
+        assert_eq!(
+            status, 400,
+            "case an id no query holds on {case}: expected 400, got {status}: {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message,
+            format!("Supplied queryId {unknown} is invalid"),
+            "case an id no query holds on {case}: unexpected message {message:?}"
+        );
+    }
 }

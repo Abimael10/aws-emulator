@@ -133,8 +133,11 @@ async fn cancel_import(router: &MultiServiceRouter, task_id: &str) -> (u16, Valu
 }
 
 /// The smallest request body `StartImportTask` accepts.
+///
+/// An Amazon S3 `source` carries a `format`: the member says how the data at that
+/// location is written, and the service refuses an S3 import that names none.
 fn minimal_import_body() -> Value {
-    json!({"source": "s3://example-bucket/data/", "roleArn": ROLE_ARN})
+    json!({"source": "s3://example-bucket/data/", "roleArn": ROLE_ARN, "format": "CSV"})
 }
 
 /// Poll one resource until it reports `AVAILABLE`. No handler ever sleeps; only this
@@ -229,8 +232,12 @@ async fn start_import_task_persists_the_record_and_reads_it_back() {
     );
     let cases: Vec<(&str, Value)> = vec![
         (
-            "only the required members",
-            json!({"source": "s3://example-bucket/plain/", "roleArn": ROLE_ARN}),
+            "the required members, with the format an S3 source needs",
+            json!({
+                "source": "s3://example-bucket/plain/",
+                "roleArn": ROLE_ARN,
+                "format": "CSV",
+            }),
         ),
         (
             "the CSV format, failing on error",
@@ -269,9 +276,13 @@ async fn start_import_task_persists_the_record_and_reads_it_back() {
             }),
         ),
         (
+            // A `source` that names "a Neptune database endpoint or snapshot"
+            // (`smithy_query(query="doc",shape="StartImportTaskInput",member="source")`)
+            // rather than an Amazon S3 location carries its own structure, so this row
+            // names no `format` at all.
             "import options for a Neptune source",
             json!({
-                "source": "s3://example-bucket/neptune/",
+                "source": "my-graph.cluster-abcdefghijkl.us-east-1.neptune.amazonaws.com",
                 "roleArn": ROLE_ARN,
                 "importOptions": {
                     "neptune": {
@@ -285,7 +296,11 @@ async fn start_import_task_persists_the_record_and_reads_it_back() {
         ),
         (
             "a source at the store's length bound",
-            json!({"source": source_at_bound, "roleArn": ROLE_ARN}),
+            json!({
+                "source": source_at_bound,
+                "roleArn": ROLE_ARN,
+                "format": "CSV",
+            }),
         ),
     ];
 
@@ -682,7 +697,7 @@ async fn start_import_task_refuses_a_request_the_rules_forbid() {
     let cases: Vec<(&str, Value, u16, &str)> = vec![
         (
             "a source at the store's bound",
-            json!({"source": at_bound, "roleArn": ROLE_ARN}),
+            json!({"source": at_bound, "roleArn": ROLE_ARN, "format": "CSV"}),
             201,
             "",
         ),
@@ -864,5 +879,146 @@ async fn an_import_needs_a_stored_graph_that_is_available() {
         json!(graph_id),
         "case the accepted task: expected graphId {graph_id:?}, got {}",
         read["graphId"]
+    );
+}
+
+/// The sentence the service refuses an Amazon S3 import that names no `format` with.
+/// Fixed text: it interpolates nothing from the request.
+const S3_NEEDS_A_FORMAT: &str = "Source format should be specified when Source type is S3.";
+
+/// RULE: `format` says how the data at an Amazon S3 location is written, so an import
+/// whose `source` locates its data there must name one — and the rule is about the
+/// REQUEST, so it is answered before the graph the request names is resolved. A `source`
+/// that names anything else (a Neptune database endpoint or snapshot) carries its own
+/// structure and needs no format.
+///
+/// The rows span what the rule generalises over: the forms an S3 location takes (a
+/// prefix, a single object, a bare bucket), every `format` value the model declares,
+/// every way a `graphIdentifier` can resolve (a serving graph, a well-formed id no graph
+/// holds), and a source that is no S3 location at all.
+#[tokio::test]
+async fn an_s3_import_must_say_what_format_its_data_is_written_in() {
+    let router = emulator();
+    let graph_id = graph_in_service(&router, "s3-format-rule").await;
+    // A well-formed `^g-[a-z0-9]{10}$` identifier this store holds no graph for: the
+    // request's own members are judged before it is resolved, so the rule answers the
+    // same whichever of the two a row names.
+    let absent_graph = "g-0000000000";
+
+    // Every S3 form, against both a graph that exists and one that does not: the
+    // refusal is the same sentence, with the same status and code, in all of them.
+    let s3_sources = [
+        "s3://example-bucket/prefix/",
+        "s3://example-bucket/one-object.csv",
+        "s3://example-bucket",
+    ];
+    for source in s3_sources {
+        for (case, target) in [
+            ("a serving graph", graph_id.as_str()),
+            ("a graph this store does not hold", absent_graph),
+        ] {
+            let (status, body) = start_import(
+                &router,
+                target,
+                json!({"source": source, "roleArn": ROLE_ARN}),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {source:?} against {case}: expected 400, got {status}: {body}"
+            );
+            let code = error_code(&body);
+            assert_eq!(
+                code, "ValidationException",
+                "case {source:?} against {case}: expected ValidationException, got \
+                 {code:?}: {body}"
+            );
+            let message = body["message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message, S3_NEEDS_A_FORMAT,
+                "case {source:?} against {case}: expected {S3_NEEDS_A_FORMAT:?}, got \
+                 {message:?}"
+            );
+        }
+    }
+
+    // The same request with each format the model declares is accepted, so the rule is
+    // about the member being ABSENT and not about one value of it. `NTRIPLES` carries the
+    // `blankNodeHandling` its own documented dependency requires.
+    let accepted: Vec<(&str, Value)> = vec![
+        (
+            "CSV",
+            json!({"source": "s3://example-bucket/csv/", "roleArn": ROLE_ARN, "format": "CSV"}),
+        ),
+        (
+            "OPEN_CYPHER",
+            json!({
+                "source": "s3://example-bucket/opencypher/",
+                "roleArn": ROLE_ARN,
+                "format": "OPEN_CYPHER",
+            }),
+        ),
+        (
+            "PARQUET",
+            json!({
+                "source": "s3://example-bucket/parquet/",
+                "roleArn": ROLE_ARN,
+                "format": "PARQUET",
+                "parquetType": "COLUMNAR",
+            }),
+        ),
+        (
+            "NTRIPLES",
+            json!({
+                "source": "s3://example-bucket/ntriples/",
+                "roleArn": ROLE_ARN,
+                "format": "NTRIPLES",
+                "blankNodeHandling": "convertToIri",
+            }),
+        ),
+        (
+            // Not an S3 location: "This can be an Amazon S3 path, or can point to a
+            // Neptune database endpoint or snapshot"
+            // (`smithy_query(query="doc",shape="StartImportTaskInput",member="source")`).
+            "a Neptune database endpoint and no format at all",
+            json!({
+                "source": "my-graph.cluster-abcdefghijkl.us-east-1.neptune.amazonaws.com",
+                "roleArn": ROLE_ARN,
+            }),
+        ),
+    ];
+    for (case, body) in accepted {
+        // Each row starts from a serving graph: an accepted import takes the graph
+        // through IMPORTING, which is a precondition on the NEXT row and not this rule.
+        wait_until_available(&router, &format!("/graphs/{graph_id}")).await;
+        let (status, started) = start_import(&router, &graph_id, body).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected 201, got {status}: {started}"
+        );
+    }
+
+    // And the member rule outranks the graph lookup: the same absent graph answers the
+    // missing resource it is once the request itself is in bounds, so a caller can tell
+    // "fix the request" from "that graph is gone".
+    let (status, body) = start_import(
+        &router,
+        absent_graph,
+        json!({
+            "source": "s3://example-bucket/prefix/",
+            "roleArn": ROLE_ARN,
+            "format": "CSV",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "case an absent graph with a complete request: expected 404, got {status}: {body}"
+    );
+    let code = error_code(&body);
+    assert_eq!(
+        code, "ResourceNotFoundException",
+        "case an absent graph with a complete request: expected \
+         ResourceNotFoundException, got {code:?}: {body}"
     );
 }

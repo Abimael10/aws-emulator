@@ -147,7 +147,7 @@ async fn start_import(router: &MultiServiceRouter, graph_id: &str) -> (u16, Valu
         "POST",
         &format!("/graphs/{graph_id}/importtasks"),
         &[],
-        Some(json!({"source": SOURCE, "roleArn": ROLE_ARN})),
+        Some(json!({"source": SOURCE, "roleArn": ROLE_ARN, "format": "CSV"})),
     )
     .await
 }

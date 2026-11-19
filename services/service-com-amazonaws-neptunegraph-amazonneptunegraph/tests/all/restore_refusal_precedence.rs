@@ -222,6 +222,7 @@ async fn create_graph_using_import(router: &MultiServiceRouter, case: &str, name
             "graphName": name,
             "roleArn": ROLE_ARN,
             "source": "s3://import-bucket/seed",
+            "format": "CSV",
         })),
     )
     .await;

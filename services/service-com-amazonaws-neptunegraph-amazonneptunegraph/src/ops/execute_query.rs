@@ -6,6 +6,13 @@
 //! whether the caller's IAM policies allow a query at all, whether the graph's own data
 //! plane is serving, and whether the query text parses.
 //!
+//! An accepted query is also ADMITTED to the store as a query in flight on its graph, so
+//! the three operations that report a graph's queries (`ListQueries`, `GetQuery`,
+//! `CancelQuery`) can see it, stop it and then refuse the id it has stopped under: the
+//! record carries the text the caller sent and the span the run was given, it is in
+//! flight for as long as the clock owes that run (`crate::state::QUERY_RUN_SPAN`), and an
+//! accepted cancel stops the evaluation itself rather than only the record.
+//!
 //! The query is lexed, parsed and evaluated by the `cypher-parser` crate, which reads
 //! the graph only through the trait `crate::state::StoredGraph` implements over the
 //! stored data: nothing here interprets the query text itself, and nothing is
@@ -243,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read with the store's guard already GIVEN UP — the guard is released at the end
         // of this block: an evaluation walks every node and edge the pattern reaches, and
         // no other caller of this service waits on it.
-        let data = {
+        let (graph_id, data) = {
             let (mut store, now) = crate::state::locked_store_now(&state);
             let serving = store
                 .settled_graph(&input.graph_identifier, &region, now)
@@ -254,8 +261,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            graph.data.clone()
+            (graph.id.clone(), graph.data.clone())
         };
+
+        // A text longer than one record of this store may carry is refused before the
+        // query is admitted at all: a query the service will not read never becomes a
+        // query in flight on the graph. Worded by the one builder every refusal of a run
+        // is worded by, so the bound reads the same wherever the text was measured.
+        let characters = input.query_string.chars().count();
+        if characters > crate::state::MAX_QUERY_STRING_CHARS {
+            return Err(query_refusal(crate::state::QueryFailure::TooLong {
+                characters,
+                ceiling: crate::state::MAX_QUERY_STRING_CHARS,
+            })
+            .into());
+        }
 
         // The evaluation is CPU-bound work whose cost the caller's own query chooses, so
         // four things hold it: a PERMIT, so the queries this service evaluates at once
@@ -268,8 +288,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ASKING rather than running on; and the same span again on the WAIT, so the
         // caller is answered at its deadline whatever the evaluation is doing. Nothing
         // here reads the query text: it is parsed and evaluated by the engine
-        // (`crate::state::run_query`), under the bounds that module states on what one
-        // request may read, nest, be handed and answer with.
+        // (`crate::state::run_query_until`), under the bounds that module states on what
+        // one request may read, nest, be handed and answer with.
         let Ok(permit) = crate::state::QUERY_SLOTS.try_acquire() else {
             return Err(ExecuteQueryErrorModeled::ThrottlingException(ThrottlingException {
                 message: format!(
@@ -282,12 +302,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let timeout = crate::state::query_run_timeout(input.query_timeout_milliseconds);
         let started = ::std::time::Instant::now();
         let deadline = started.checked_add(timeout).unwrap_or(started);
+
+        // The query is ADMITTED: the store files a record of it under the graph it runs
+        // on, so the operations that report a graph's queries — `ListQueries`, `GetQuery`
+        // and `CancelQuery` — can see this query, stop it, and then refuse the id it has
+        // stopped under. The record carries the text the caller sent and the span this
+        // run was given, and it reports `RUNNING`, because the permit above is held: this
+        // query is executing rather than queued behind another. The only thing that can
+        // turn the record away now is the store having no room for another in-flight query
+        // — the one other reason it refuses a record, a text past the length it carries,
+        // was refused above — and that is reported as the throttle it is, since the
+        // condition clears as the queries in flight end rather than being a fault of this
+        // request.
+        let (query_id, cancellation) = {
+            let (mut store, now) = crate::state::locked_store_now(&state);
+            let query_id = store.next_query_id();
+            let record =
+                crate::state::Query::running(&query_id, &graph_id, &input.query_string, now)
+                    .with_timeout(timeout);
+            let cancellation = record.cancellation.clone();
+            if let Err(full) = store.insert_query(record) {
+                return Err(ExecuteQueryErrorModeled::ThrottlingException(
+                    ThrottlingException { message: full },
+                )
+                .into());
+            }
+            (query_id, cancellation)
+        };
+
         let text = input.query_string.clone();
         let (answered, evaluating) = ::tokio::sync::oneshot::channel();
+        let evaluation_state = state.clone();
+        let evaluated_graph = graph_id.clone();
+        let evaluated_query = query_id.clone();
         let worker = ::std::thread::Builder::new()
             .stack_size(crate::state::QUERY_STACK_BYTES)
             .spawn(move || {
-                let run = crate::state::run_query(&data, &text, deadline);
+                let run = crate::state::run_query_until(&data, &text, deadline, &cancellation);
+                // The run this record reports is over, so the end of the record falls
+                // due. Reported by the THREAD that did the work rather than by the
+                // request that was waiting for it, so a query whose caller has gone away
+                // still stops being an in-flight query of its graph.
+                {
+                    let (mut store, now) = crate::state::locked_store_now(&evaluation_state);
+                    if let Some(query) =
+                        store.live_query_mut(&evaluated_graph, &evaluated_query, now)
+                    {
+                        query.end_run(now);
+                    }
+                }
                 // The permit is held for the whole run and released with this thread, so
                 // the bound counts the evaluations that are actually running.
                 drop(permit);
@@ -296,6 +359,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let _ = answered.send(run);
             });
         if worker.is_err() {
+            // Nothing ran, so the record this request admitted reports no run: its end
+            // falls due here, since the thread that would have reported it never started.
+            let (mut store, now) = crate::state::locked_store_now(&state);
+            if let Some(query) = store.live_query_mut(&graph_id, &query_id, now) {
+                query.end_run(now);
+            }
             return Err(ExecuteQueryErrorModeled::InternalServerException(
                 InternalServerException {
                     message: "the query could not be evaluated".to_string(),
@@ -361,6 +430,10 @@ const QUERY_TIMEOUT_REASON: &str = "QUERY_TIMEOUT";
 /// (`crate::ops::types::UNPROCESSABLE_EXCEPTION_REASON_VALUES`).
 const INTERNAL_LIMIT_REASON: &str = "INTERNAL_LIMIT_EXCEEDED";
 
+/// The modelled `ValidationException` reason for a query a `CancelQuery` request stopped
+/// before it had answered (`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`).
+const QUERY_CANCELLED_REASON: &str = "QUERY_CANCELLED";
+
 /// The modelled failure a query the engine could not answer is reported through.
 ///
 /// Each kind is a different fact about the request, so each carries the error and the
@@ -371,8 +444,8 @@ const INTERNAL_LIMIT_REASON: &str = "INTERNAL_LIMIT_EXCEEDED";
 ///   ([`crate::state::QueryFailure::Malformed`]), and one that parses and cannot be
 ///   EVALUATED is refused for the argument it names — both statements about the request,
 ///   which is why neither is a conflict and nothing is persisted;
-/// * a text longer or more deeply nested than this service reads is refused as the
-///   oversized query it is, before it is parsed, and one naming a CLAUSE this engine has
+/// * a text longer, more deeply nested or carrying more tokens than this service reads is
+///   refused as the oversized query it is, before it is parsed, and one naming a CLAUSE this engine has
 ///   no grammar for is refused as the unsupported operation it is rather than as a text
 ///   that does not parse — a well-formed query this endpoint does not run is not a
 ///   malformed one;
@@ -382,7 +455,11 @@ const INTERNAL_LIMIT_REASON: &str = "INTERNAL_LIMIT_EXCEEDED";
 ///   describes — the span under its own `QUERY_TIMEOUT` reason, the work and a result
 ///   past the rows this service answers with under the one that names an internal limit.
 ///   Each is reported rather than truncated, so no caller reads a short result as a
-///   complete one.
+///   complete one;
+/// * a query a `CancelQuery` request STOPPED answers no results either: the caller is
+///   told the run it was waiting on was cancelled, under the modelled reason the model
+///   keeps for exactly that — a statement about this query rather than about the
+///   service's capacity.
 fn query_refusal(refused: crate::state::QueryFailure) -> ExecuteQueryErrorModeled {
     match refused {
         crate::state::QueryFailure::Malformed(refusal) => {
@@ -410,6 +487,14 @@ fn query_refusal(refused: crate::state::QueryFailure) -> ExecuteQueryErrorModele
             ExecuteQueryErrorModeled::ValidationException(ValidationException {
                 message: format!(
                     "queryString may nest at most {ceiling} levels deep, got {depth}"
+                ),
+                reason: Some(QUERY_TOO_LARGE_REASON.to_string()),
+            })
+        }
+        crate::state::QueryFailure::TooManyTokens { tokens, ceiling } => {
+            ExecuteQueryErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "queryString may carry at most {ceiling} tokens, got {tokens}"
                 ),
                 reason: Some(QUERY_TOO_LARGE_REASON.to_string()),
             })
@@ -446,6 +531,12 @@ fn query_refusal(refused: crate::state::QueryFailure) -> ExecuteQueryErrorModele
                     crate::state::MAX_QUERY_WORK_UNITS
                 ),
                 reason: INTERNAL_LIMIT_REASON.to_string(),
+            })
+        }
+        crate::state::QueryFailure::Stopped(crate::state::Stopped::Cancelled) => {
+            ExecuteQueryErrorModeled::ValidationException(ValidationException {
+                message: crate::state::QUERY_CANCELLED_MESSAGE.to_string(),
+                reason: Some(QUERY_CANCELLED_REASON.to_string()),
             })
         }
     }

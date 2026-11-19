@@ -151,7 +151,11 @@ async fn stored_import_task(router: &MultiServiceRouter, graph_name: &str) -> St
         router,
         "POST",
         &format!("/graphs/{graph_id}/importtasks"),
-        Some(json!({"source": "s3://example-bucket/data/", "roleArn": ROLE_ARN})),
+        Some(json!({
+            "source": "s3://example-bucket/data/",
+            "roleArn": ROLE_ARN,
+            "format": "CSV",
+        })),
     )
     .await;
     assert_eq!(

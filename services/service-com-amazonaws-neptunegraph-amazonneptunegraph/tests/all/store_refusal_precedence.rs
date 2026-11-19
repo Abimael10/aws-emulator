@@ -121,6 +121,7 @@ impl Minting {
             Self::StartImportTask => json!({
                 "source": "s3://import-bucket/precedence/",
                 "roleArn": ROLE_ARN,
+                "format": "CSV",
             }),
             Self::CreateGraphSnapshot => json!({
                 "graphIdentifier": graph_id,

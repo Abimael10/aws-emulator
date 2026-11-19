@@ -300,11 +300,14 @@ impl ImportCase {
 /// the rules generalise over, not in its name alone.
 fn import_cases() -> Vec<ImportCase> {
     vec![
-        ImportCase::new(
-            "a bare CSV import from an S3 prefix, no bounds and no options",
-            "csv-from-s3",
-            "s3://import-bucket/csv/",
-        ),
+        ImportCase {
+            format: Some("CSV"),
+            ..ImportCase::new(
+                "a bare CSV import from an S3 prefix, no bounds and no options",
+                "csv-from-s3",
+                "s3://import-bucket/csv/",
+            )
+        },
         ImportCase {
             format: Some("CSV"),
             min_provisioned_memory: Some(256),
@@ -711,6 +714,7 @@ async fn a_create_using_import_outside_the_rules_is_refused() {
             "graphName": "already-taken",
             "roleArn": ROLE_ARN,
             "source": "s3://import-bucket/seed",
+            "format": "CSV",
         }),
     )
     .await;
@@ -772,7 +776,36 @@ async fn a_create_using_import_outside_the_rules_is_refused() {
         ),
         (
             "a source at the store's bound",
-            json!({"graphName": "source-at-bound", "roleArn": ROLE_ARN, "source": at_bound}),
+            json!({
+                "graphName": "source-at-bound",
+                "roleArn": ROLE_ARN,
+                "source": at_bound,
+                "format": "CSV",
+            }),
+            201,
+            "",
+        ),
+        (
+            // The format is what says how the data at an S3 location is written, so an
+            // S3 source with no format is refused — the same rule `StartImportTask`
+            // enforces, from the one statement of it in `crate::state`.
+            "an S3 source with no format",
+            json!({
+                "graphName": "s3-without-format",
+                "roleArn": ROLE_ARN,
+                "source": "s3://import-bucket/unspecified/",
+            }),
+            400,
+            "ValidationException",
+        ),
+        (
+            // Not an S3 location, so no format is needed.
+            "a Neptune endpoint source with no format",
+            json!({
+                "graphName": "neptune-without-format",
+                "roleArn": ROLE_ARN,
+                "source": "my-graph.cluster-abcdefghijkl.us-east-1.neptune.amazonaws.com",
+            }),
             201,
             "",
         ),
@@ -852,6 +885,7 @@ async fn a_create_using_import_outside_the_rules_is_refused() {
                 "graphName": "already-taken",
                 "roleArn": ROLE_ARN,
                 "source": "s3://import-bucket/again",
+                "format": "CSV",
             }),
             409,
             "ConflictException",
@@ -870,6 +904,27 @@ async fn a_create_using_import_outside_the_rules_is_refused() {
             "case {case:?}: expected the error code {expected_code:?}, got {body}"
         );
     }
+
+    // The S3-format rule is one sentence about the request, worded exactly as the
+    // service words it for every operation that takes an import `source`.
+    let (status, refused) = create_using_import(
+        &router,
+        json!({
+            "graphName": "s3-format-sentence",
+            "roleArn": ROLE_ARN,
+            "source": "s3://import-bucket/unspecified/",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case the S3-format sentence: expected 400, got {status}: {refused}"
+    );
+    let message = refused["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        message, "Source format should be specified when Source type is S3.",
+        "case the S3-format sentence: unexpected message {message:?}"
+    );
 }
 
 /// A refused create persists NEITHER record: no graph takes the name and no task is

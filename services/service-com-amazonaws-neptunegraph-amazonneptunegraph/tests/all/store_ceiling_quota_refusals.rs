@@ -493,6 +493,7 @@ fn rows(full: FullStore) -> Vec<CeilingCase> {
                         "graphName": "imported-one-too-many",
                         "source": "s3://import-bucket/plain/",
                         "roleArn": ROLE_ARN,
+                        "format": "CSV",
                     })
                 },
             },
@@ -546,6 +547,7 @@ fn rows(full: FullStore) -> Vec<CeilingCase> {
                         "graphName": "import-task-one-too-many",
                         "source": "s3://import-bucket/plain/",
                         "roleArn": ROLE_ARN,
+                        "format": "CSV",
                     })
                 },
             },
@@ -800,6 +802,7 @@ fn growth_request(full: FullStore, graph_id: &str, nth: u32) -> Value {
             "graphName": format!("boundary-import-{nth}"),
             "source": "s3://import-bucket/boundary/",
             "roleArn": ROLE_ARN,
+            "format": "CSV",
         }),
         FullStore::PrivateEndpoints => json!({
             "vpcId": format!("vpc-boundary{nth}"),

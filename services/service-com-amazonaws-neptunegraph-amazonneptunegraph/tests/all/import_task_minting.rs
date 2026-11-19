@@ -137,8 +137,12 @@ async fn graph_in_service(router: &MultiServiceRouter, name: &str) -> String {
 fn request_rows() -> Vec<(&'static str, Value)> {
     vec![
         (
-            "only the required members",
-            json!({"source": "s3://bucket-a/plain/", "roleArn": role_arn("PlainLoad")}),
+            "the required members, with the format an S3 source needs",
+            json!({
+                "source": "s3://bucket-a/plain/",
+                "roleArn": role_arn("PlainLoad"),
+                "format": "CSV",
+            }),
         ),
         (
             "the Gremlin CSV format",
@@ -175,9 +179,12 @@ fn request_rows() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
+            // A `source` naming a Neptune database endpoint rather than an Amazon S3
+            // location carries its own structure, so it needs no `format`
+            // (`smithy_query(query="doc",shape="StartImportTaskInput",member="source")`).
             "a Neptune source with import options",
             json!({
-                "source": "s3://bucket-f/neptune/",
+                "source": "my-graph.cluster-abcdefghijkl.us-east-1.neptune.amazonaws.com",
                 "roleArn": role_arn("NeptuneLoad"),
                 "importOptions": {
                     "neptune": {
@@ -303,7 +310,11 @@ async fn an_accepted_import_touches_only_its_own_target_graph() {
         &router,
         "POST",
         &format!("/graphs/{target}/importtasks"),
-        Some(json!({"source": "s3://bucket-g/data/", "roleArn": role_arn("TargetLoad")})),
+        Some(json!({
+            "source": "s3://bucket-g/data/",
+            "roleArn": role_arn("TargetLoad"),
+            "format": "CSV",
+        })),
     )
     .await;
     assert_eq!(

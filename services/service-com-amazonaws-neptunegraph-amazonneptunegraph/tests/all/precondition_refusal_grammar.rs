@@ -175,7 +175,7 @@ fn graph_precondition_request(
         "StartImportTask" => (
             "POST",
             format!("/graphs/{graph_id}/importtasks"),
-            Some(json!({"source": SOURCE, "roleArn": ROLE_ARN})),
+            Some(json!({"source": SOURCE, "roleArn": ROLE_ARN, "format": "CSV"})),
         ),
         "CreateGraphSnapshot" => (
             "POST",
@@ -377,7 +377,7 @@ async fn the_two_halves_of_the_import_precondition_read_as_one_sentence() {
         &router,
         "POST",
         &format!("/graphs/{creating}/importtasks"),
-        Some(json!({"source": SOURCE, "roleArn": ROLE_ARN})),
+        Some(json!({"source": SOURCE, "roleArn": ROLE_ARN, "format": "CSV"})),
     )
     .await;
     assert_refusal(
@@ -421,7 +421,7 @@ async fn the_two_halves_of_the_import_precondition_read_as_one_sentence() {
         &router,
         "POST",
         &format!("/graphs/{filled}/importtasks"),
-        Some(json!({"source": SOURCE, "roleArn": ROLE_ARN})),
+        Some(json!({"source": SOURCE, "roleArn": ROLE_ARN, "format": "CSV"})),
     )
     .await;
     assert_refusal(
@@ -571,7 +571,7 @@ async fn a_record_refused_by_its_own_status_words_the_action_and_that_status() {
         "a stopped import",
         "POST",
         &format!("/graphs/{import_graph}/importtasks"),
-        Some(json!({"source": SOURCE, "roleArn": ROLE_ARN})),
+        Some(json!({"source": SOURCE, "roleArn": ROLE_ARN, "format": "CSV"})),
         201,
         "INITIALIZING",
     )
@@ -602,7 +602,7 @@ async fn a_record_refused_by_its_own_status_words_the_action_and_that_status() {
         "a cancelling import",
         "POST",
         &format!("/graphs/{cancelling_graph}/importtasks"),
-        Some(json!({"source": SOURCE, "roleArn": ROLE_ARN})),
+        Some(json!({"source": SOURCE, "roleArn": ROLE_ARN, "format": "CSV"})),
         201,
         "INITIALIZING",
     )

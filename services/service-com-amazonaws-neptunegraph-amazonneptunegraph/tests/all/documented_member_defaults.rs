@@ -335,6 +335,7 @@ async fn every_graph_minting_operation_takes_the_same_documented_default() {
             "graphName": format!("minted-import-{index}"),
             "roleArn": ROLE_ARN,
             "source": "s3://import-bucket/seed",
+            "format": "CSV",
         });
         if let Some(requested) = requested {
             import_body["replicaCount"] = json!(requested);

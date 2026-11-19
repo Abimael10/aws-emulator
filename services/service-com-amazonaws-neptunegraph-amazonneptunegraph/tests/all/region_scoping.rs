@@ -883,7 +883,11 @@ async fn import_tasks_are_scoped_to_the_region_too() {
             region,
             "POST",
             &format!("/graphs/{graph_id}/importtasks"),
-            Some(json!({ "source": "s3://example-bucket/data/", "roleArn": ROLE_ARN })),
+            Some(json!({
+                "source": "s3://example-bucket/data/",
+                "roleArn": ROLE_ARN,
+                "format": "CSV",
+            })),
         )
         .await;
         assert_eq!(
@@ -925,7 +929,11 @@ async fn import_tasks_are_scoped_to_the_region_too() {
                     caller,
                     "POST",
                     &format!("/graphs/{graph_id}/importtasks"),
-                    Some(json!({ "source": "s3://example-bucket/data/", "roleArn": ROLE_ARN })),
+                    Some(json!({
+                        "source": "s3://example-bucket/data/",
+                        "roleArn": ROLE_ARN,
+                        "format": "CSV",
+                    })),
                 )
                 .await;
                 assert_eq!(
