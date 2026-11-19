@@ -26,7 +26,8 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    DescribeCertificateProviderOutput, CERTIFICATE_PROVIDER_OPERATION_VALUES,
+    CertificateProviderSummary, DescribeCertificateProviderOutput,
+    CERTIFICATE_PROVIDER_OPERATION_VALUES,
 };
 
 /// Every operation a certificate provider may be the account default for.
@@ -152,6 +153,18 @@ impl RegisteredCertificateProvider {
             account_default_for_operations: Some(self.account_default_for_operations.clone()),
             creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
             last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_date)),
+        }
+    }
+
+    /// The record as a LISTING reports it — `CertificateProviderSummary` carries the
+    /// provider's name and ARN ("The certificate provider summary",
+    /// `smithy_query(query="shape",shape="CertificateProviderSummary")`), both read off
+    /// the stored record, so a listing entry and the full read of the same provider
+    /// cannot drift.
+    pub fn summary(&self) -> CertificateProviderSummary {
+        CertificateProviderSummary {
+            certificate_provider_name: Some(self.certificate_provider_name.clone()),
+            certificate_provider_arn: Some(self.certificate_provider_arn.clone()),
         }
     }
 }

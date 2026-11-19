@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCertificateProviders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCertificateProviders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCertificateProviders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every certificate provider the account holds, name and ARN, ordered by the
+//! provider's name in the direction `ascendingOrder` names. A PURE READ: the rows are
+//! projected from the stored records and nothing here writes, so a later caller sees
+//! exactly what this one saw.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCertificateProviders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCertificateProvidersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCertificateProviders"))
+        // `ctx` carries request metadata only; this listing needs none of it.
+        let _ = ctx;
+
+        // The continuation token is resolved BEFORE the store is reached: a request whose
+        // `nextToken` is not one THIS listing issued is refused whatever the store holds.
+        let scope = listing_scope(input.ascending_order);
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token, &scope)?),
+            None => None,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCertificateProvidersErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+
+        // "Lists all your certificate providers in your Amazon Web Services account", so
+        // every record the account holds is a row of this listing, and nothing here
+        // writes: a later caller sees what this one saw.
+        let store = state.lock();
+
+        // The listing's order is the provider NAME — `ascendingOrder` is "Returns the list
+        // of certificate providers in ascending alphabetical order", so the name is the
+        // ordering key and the flag is its direction — as the rows the shared pager walks
+        // ([`crate::state::name_listing_rows`]).
+        let rows = crate::state::name_listing_rows(
+            store
+                .certificate_providers
+                .values()
+                .map(|provider| provider.certificate_provider_name.as_str()),
+            input.ascending_order,
+        );
+
+        // One page of that order, resumed after the position the caller's own token names
+        // ([`crate::state::page_of`]) — the same paging every other listing of this
+        // service uses, so a token is issued and read one way. This operation models no
+        // page-size member at all, so every request gets the largest page this service's
+        // listings admit.
+        let (page, next_token) = crate::state::page_of(
+            rows,
+            &scope,
+            resume_after.as_deref(),
+            crate::state::MAX_LIST_PAGE_SIZE as usize,
+        );
+
+        // Each entry is projected from the stored record, so what this listing reports and
+        // what `DescribeCertificateProvider` reports cannot drift.
+        Ok(ListCertificateProvidersOutput {
+            // `CertificateProviders` carries no length constraint, so an account holding
+            // no provider answers with an EMPTY list rather than an absent member: "the
+            // account holds none" is an answer, not a missing one.
+            certificate_providers: Some(
+                page.iter()
+                    .filter_map(|row| crate::state::name_listing_row_name(row))
+                    .filter_map(|name| store.certificate_providers.get(name))
+                    .map(crate::state::RegisteredCertificateProvider::summary)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The LISTING a continuation token belongs to: the direction it walks, so a token issued
+/// for one direction cannot resume the other from a position that means something else
+/// there.
+fn listing_scope(ascending_order: bool) -> String {
+    format!(
+        "certificateProviders/{direction}",
+        direction = if ascending_order { "a" } else { "d" }
+    )
+}
+
+/// The position a `nextToken` resumes after, or `InvalidRequestException` (HTTP 400, "The
+/// request is not valid") when the token is not one this listing issued.
+///
+/// The decoding is the one every listing of this service shares
+/// ([`crate::state::decode_page_marker`]) and every step of it is fallible on purpose: the
+/// token is caller-supplied, so nothing read out of it may panic the handler.
+fn decode_next_token(token: &str, scope: &str) -> Result<String, ListCertificateProvidersError> {
+    crate::state::decode_page_marker(token, scope).ok_or_else(|| {
+        ListCertificateProvidersErrorModeled::InvalidRequestException(InvalidRequestException {
+            message: Some("nextToken is not a continuation token of this listing".to_string()),
+        })
+        .into()
+    })
 }

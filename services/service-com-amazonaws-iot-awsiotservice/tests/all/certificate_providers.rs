@@ -2,8 +2,8 @@
 
 //! End-to-end HTTP coverage of CERTIFICATE PROVIDERS: `CreateCertificateProvider`, the
 //! `DescribeCertificateProvider` reader that proves what it persisted,
-//! `DeleteCertificateProvider`, and the rule that an operation has ONE account
-//! default.
+//! `ListCertificateProviders`, `DeleteCertificateProvider`, and the rule that an
+//! operation has ONE account default.
 //!
 //! Every case drives the real wire path — `MultiServiceRouter::dispatch` over a
 //! restJson1 request signed for the `iot` signing name — so what is asserted is what
@@ -20,7 +20,11 @@
 //! * a name the account holds no provider under is `ResourceNotFoundException` (404);
 //! * a name the account already holds a provider under is
 //!   `ResourceAlreadyExistsException` (409), worded with this family's own already-exists
-//!   sentence, and the stored provider is left as it was.
+//!   sentence, and the stored provider is left as it was;
+//! * a listing reports every provider the account holds — name and ARN, the ones the
+//!   create minted — in the direction `isAscendingOrder` names, answers an account that
+//!   holds none with an empty list, changes nothing a later caller sees, and refuses a
+//!   `nextToken` it did not issue with `InvalidRequestException` (400).
 
 use std::sync::Arc;
 
@@ -92,6 +96,19 @@ impl Emulator {
     async fn delete_provider(&self, name: &str) -> Reply {
         self.dispatch("DELETE", &format!("/certificate-providers/{name}"), None)
             .await
+    }
+
+    /// `ListCertificateProviders` with whatever query string the case asks for: the
+    /// operation binds `ascendingOrder` to `isAscendingOrder` and `nextToken` to
+    /// `nextToken`
+    /// (`smithy_query(query="operation",operation="ListCertificateProviders")`).
+    async fn list_providers(&self, query: &str) -> Reply {
+        let path = if query.is_empty() {
+            "/certificate-providers".to_string()
+        } else {
+            format!("/certificate-providers?{query}")
+        };
+        self.dispatch("GET", &path, None).await
     }
 
     /// The request body creating a provider that claims `operations`.
@@ -418,5 +435,205 @@ async fn one_provider_at_a_time_holds_an_operations_account_default() {
         "Certificate provider with name [holder] not found",
         "case deleting a provider the account does not hold: got {}",
         deleted_twice.text()
+    );
+}
+
+/// The ways a caller can ask for the listing's direction: the member is bound to the
+/// `isAscendingOrder` query parameter and defaults to false when the request names none
+/// (`smithy_query(query="operation",operation="ListCertificateProviders")`).
+///
+/// The direction cannot change the ORDER observed here, and that is a property of the
+/// resource rather than of the test: a provider is `@required` to claim exactly one
+/// operation's account default (`accountDefaultForOperations`, modelled `length 1..1`
+/// over the single-valued `CertificateProviderOperation` enum) and an operation has one
+/// default, so an account holds at most one certificate provider at a time. What the
+/// rows below assert is that the answer is the same whichever way the direction is
+/// asked for; the order the shared name ordering produces for many names is asserted
+/// where that ordering lives (`state::name_listing`).
+const LISTING_DIRECTIONS: [&str; 3] = ["", "isAscendingOrder=true", "isAscendingOrder=false"];
+
+/// RULE: the listing reports every certificate provider the account holds — the name and
+/// the ARN the create minted — and nothing else; an account holding none answers with an
+/// empty list, and the answer does not depend on how the direction was asked for.
+#[tokio::test]
+async fn the_listing_reports_the_certificate_providers_the_account_holds() {
+    let operation = CERTIFICATE_PROVIDER_OPERATIONS
+        .first()
+        .expect("the model declares at least one certificate provider operation");
+    // The names span the form `CertificateProviderName` admits (len 1..128, pattern
+    // `^[\w=,@-]+$`): a plain name, one using every character class the pattern allows,
+    // the shortest legal one, and the longest.
+    let longest = "p".repeat(128);
+    for name in ["issuer", "issuer_2-A=,@", "a", longest.as_str()] {
+        for query in LISTING_DIRECTIONS {
+            // Each row gets its own account: a provider claims an operation's account
+            // default, and an account holds one provider per operation.
+            let emulator = Emulator::new();
+
+            // An account that holds no provider: the member is present and empty, and the
+            // listing is not truncated.
+            let empty = emulator.list_providers(query).await;
+            assert_eq!(
+                empty.status,
+                200,
+                "case {name:?} {query:?} before the create: expected 200, got {} body {}",
+                empty.status,
+                empty.text()
+            );
+            assert_eq!(
+                empty.json()["certificateProviders"],
+                json!([]),
+                "case {name:?} {query:?} before the create: expected an empty list, got {}",
+                empty.text()
+            );
+            assert_eq!(
+                empty.json()["nextToken"],
+                Value::Null,
+                "case {name:?} {query:?} before the create: a listing that holds every \
+                 provider there is must not be truncated, got {}",
+                empty.text()
+            );
+
+            let created = emulator
+                .create_provider(name, &Emulator::claim(&[operation]))
+                .await;
+            assert_eq!(
+                created.status,
+                200,
+                "case {name:?} {query:?}: expected the create to answer 200, got {} body {}",
+                created.status,
+                created.text()
+            );
+
+            // The entry is the stored record: the name the create took and the ARN it
+            // minted, which is also the ARN the full read reports.
+            let listed = emulator.list_providers(query).await;
+            assert_eq!(
+                listed.status,
+                200,
+                "case {name:?} {query:?}: expected 200, got {} body {}",
+                listed.status,
+                listed.text()
+            );
+            assert_eq!(
+                listed.json()["certificateProviders"],
+                json!([{
+                    "certificateProviderName": name,
+                    "certificateProviderArn": created.json()["certificateProviderArn"],
+                }]),
+                "case {name:?} {query:?}: expected the created provider's name and ARN, got {}",
+                listed.text()
+            );
+            assert_eq!(
+                listed.json()["nextToken"],
+                Value::Null,
+                "case {name:?} {query:?}: a listing that holds every provider there is must \
+                 not be truncated, got {}",
+                listed.text()
+            );
+            assert_eq!(
+                emulator.describe_provider(name).await.json()["certificateProviderArn"],
+                listed.json()["certificateProviders"][0]["certificateProviderArn"],
+                "case {name:?} {query:?}: the listing and the full read must report one ARN, \
+                 got {}",
+                listed.text()
+            );
+
+            // A listing is a READ: asking again answers the same thing, and the provider it
+            // reported is still there to be read.
+            let again = emulator.list_providers(query).await;
+            assert_eq!(
+                again.json(),
+                listed.json(),
+                "case {name:?} {query:?}: a second listing must report what the first did, \
+                 got {}",
+                again.text()
+            );
+            assert_eq!(
+                emulator.describe_provider(name).await.status,
+                200,
+                "case {name:?} {query:?}: listing a provider must leave it readable"
+            );
+
+            // The provider leaves the listing with the record: a deleted provider is no
+            // longer one the account holds.
+            assert_eq!(
+                emulator.delete_provider(name).await.status,
+                200,
+                "case {name:?} {query:?}: expected the delete to answer 200"
+            );
+            let after_delete = emulator.list_providers(query).await;
+            assert_eq!(
+                after_delete.json()["certificateProviders"],
+                json!([]),
+                "case {name:?} {query:?} after the delete: expected an empty list, got {}",
+                after_delete.text()
+            );
+        }
+    }
+}
+
+/// RULE: a `nextToken` the listing itself did not issue is refused
+/// `InvalidRequestException` (400), whatever the account holds.
+#[tokio::test]
+async fn a_next_token_the_listing_did_not_issue_is_refused() {
+    let operation = CERTIFICATE_PROVIDER_OPERATIONS
+        .first()
+        .expect("the model declares at least one certificate provider operation");
+    let emulator = Emulator::new();
+    assert_eq!(
+        emulator
+            .create_provider("issuer", &Emulator::claim(&[operation]))
+            .await
+            .status,
+        200,
+        "the provider the refused listings are asked about must exist"
+    );
+
+    // Every row satisfies the modelled `Marker` pattern `^[A-Za-z0-9+/]+={0,2}$` — a token
+    // that does not is refused before the handler runs — and none of them is a token this
+    // listing handed out: the token is opaque, so the only token a caller can hold is one
+    // a previous page of the SAME listing gave it. The rows that are well-formed tokens of
+    // some other listing are built with the same encoder the handler decodes with.
+    let cases = [
+        ("a token of no listing at all", "ZZZZ".to_string()),
+        ("a token that names nothing", hex::encode("nope")),
+        (
+            "a token of another listing of this service",
+            hex::encode("authorizers/a/\u{1f}issuer"),
+        ),
+        (
+            "a token of the other direction of this listing",
+            hex::encode("certificateProviders/d\u{1f}issuer"),
+        ),
+    ];
+    for (case, token) in cases {
+        // The ascending direction is the one asked for, so the descending token above is a
+        // token of a listing other than this one.
+        let refused = emulator
+            .list_providers(&format!("isAscendingOrder=true&nextToken={token}"))
+            .await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case {case}: expected 400, got {} body {}",
+            refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            refused.error_code(),
+            "InvalidRequestException",
+            "case {case}: expected InvalidRequestException, got {}",
+            refused.text()
+        );
+    }
+
+    // The refusals changed nothing: the provider is still listed.
+    let listed = emulator.list_providers("isAscendingOrder=true").await;
+    assert_eq!(
+        listed.json()["certificateProviders"][0]["certificateProviderName"],
+        json!("issuer"),
+        "case after the refused tokens: the account must still hold its provider, got {}",
+        listed.text()
     );
 }
