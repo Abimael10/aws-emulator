@@ -61,7 +61,7 @@ const SUBNET_CIDRS: [(&str, &str); 2] = [("10.90.1.0/24", "us-east-1a"), ("10.90
 
 /// The body the listener's DEFAULT action answers with: the request reached the load
 /// balancer's own configuration, so nothing refused it at the edge.
-const LISTENER_BODY: &str = "LISTENER-OK";
+pub(crate) const LISTENER_BODY: &str = "LISTENER-OK";
 
 /// The body the listener's one RULE answers with. It answers it only for a request carrying
 /// the header a web ACL's `CustomRequestHandling` inserts, so this body is proof the inserted
@@ -69,7 +69,7 @@ const LISTENER_BODY: &str = "LISTENER-OK";
 const TAGGED_BODY: &str = "LISTENER-TAGGED";
 
 /// The header the blocking rules of this suite inspect.
-const BLOCK_HEADER: &str = "x-waf-block";
+pub(crate) const BLOCK_HEADER: &str = "x-waf-block";
 
 /// The header an inserting `Allow` configures, without the `x-amzn-waf-` prefix WAF puts on
 /// it ("for the header name `sample`, WAF inserts the header `x-amzn-waf-sample`" —
@@ -79,7 +79,7 @@ const INSERTED_HEADER_SENT: &str = "x-amzn-waf-tag";
 const INSERTED_VALUE: &str = "edge";
 
 /// The statuses WAF serves its terminating actions under.
-const BLOCK_STATUS: u16 = 403;
+pub(crate) const BLOCK_STATUS: u16 = 403;
 const CAPTCHA_STATUS: u16 = 405;
 const CHALLENGE_STATUS: u16 = 202;
 
@@ -105,7 +105,7 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The emulator as it is ASSEMBLED, on one engine: the load balancer that opens the published
 /// address and the WAFv2 that holds the binding are the ones this router mounts.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = aws_emulator_router::build_router(engine);
     // The signature is never checked here, as in every other suite of this crate; the
@@ -181,7 +181,11 @@ async fn elbv2(router: &MultiServiceRouter, action: &str, members: &[(&str, &str
 }
 
 /// One WAFv2 call over its `awsJson1_1` wire that must succeed.
-async fn waf_ok(router: &MultiServiceRouter, operation: &str, request: Value) -> Value {
+pub(crate) async fn waf_ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    request: Value,
+) -> Value {
     let http_request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -219,7 +223,7 @@ fn visibility(metric: &str) -> Value {
 /// A `ByteMatchStatement` over `field`, searching for `search` under `constraint`.
 /// `ByteMatchStatement$SearchString` is a blob, which travels base64-encoded in an awsJson
 /// body.
-fn byte_match(field: Value, search: &str, constraint: &str) -> Value {
+pub(crate) fn byte_match(field: Value, search: &str, constraint: &str) -> Value {
     json!({
         "ByteMatchStatement": {
             "SearchString": aws_smithy_types::base64::encode(search),
@@ -231,7 +235,7 @@ fn byte_match(field: Value, search: &str, constraint: &str) -> Value {
 }
 
 /// One rule at priority 0 carrying `rule_action` over `statement`.
-fn rule(name: &str, statement: Value, rule_action: Value) -> Value {
+pub(crate) fn rule(name: &str, statement: Value, rule_action: Value) -> Value {
     json!({
         "Name": name,
         "Priority": 0,
@@ -242,19 +246,19 @@ fn rule(name: &str, statement: Value, rule_action: Value) -> Value {
 }
 
 /// The web ACL one row puts in front of the load balancer.
-struct WebAclSpec {
+pub(crate) struct WebAclSpec {
     /// `WebACL$DefaultAction`.
-    default_action: Value,
+    pub(crate) default_action: Value,
     /// `WebACL$Rules`.
-    rules: Value,
+    pub(crate) rules: Value,
     /// `WebACL$CustomResponseBodies`, left off the request where the row configures none (the
     /// member takes at least one entry).
-    custom_response_bodies: Option<Value>,
+    pub(crate) custom_response_bodies: Option<Value>,
 }
 
 impl WebAclSpec {
     /// A web ACL whose default action allows, carrying `rules`.
-    fn allowing(rules: Value) -> Self {
+    pub(crate) fn allowing(rules: Value) -> Self {
         Self {
             default_action: json!({ "Allow": {} }),
             rules,
@@ -264,7 +268,11 @@ impl WebAclSpec {
 }
 
 /// Create the web ACL `spec` describes and answer its ARN.
-async fn create_web_acl(router: &MultiServiceRouter, name: &str, spec: &WebAclSpec) -> String {
+pub(crate) async fn create_web_acl(
+    router: &MultiServiceRouter,
+    name: &str,
+    spec: &WebAclSpec,
+) -> String {
     let mut body = json!({
         "Name": name,
         "Scope": "REGIONAL",
@@ -294,7 +302,7 @@ fn header_block() -> Value {
 /// The network the load balancers are placed in, through EC2 itself: a VPC with an internet
 /// gateway attached (an internet-facing load balancer can only be placed in a VPC that has
 /// one), two subnets and a security group. Answers the subnet ids and the group id.
-async fn network(router: &MultiServiceRouter) -> (Vec<String>, String) {
+pub(crate) async fn network(router: &MultiServiceRouter) -> (Vec<String>, String) {
     let vpc = element(&ec2(router, "CreateVpc", &[("CidrBlock", VPC_CIDR)]).await, "vpcId");
     let gateway = element(
         &ec2(router, "CreateInternetGateway", &[]).await,
@@ -345,7 +353,7 @@ async fn network(router: &MultiServiceRouter) -> (Vec<String>, String) {
 ///
 /// The listener answers [`LISTENER_BODY`] by default and [`TAGGED_BODY`] for a request
 /// carrying the header an inserting `Allow` puts on it.
-async fn load_balancer(
+pub(crate) async fn load_balancer(
     router: &MultiServiceRouter,
     name: &str,
     subnets: &[String],
@@ -448,7 +456,7 @@ async fn wait_until_active(router: &MultiServiceRouter, arn: &str) {
 /// is one of this emulator's own: a `host:port` on the interface the core binds — a bracketed
 /// host where that interface is IPv6 — rather than a name in Elastic Load Balancing's own
 /// zone, which resolves to nothing on this machine.
-fn dialable_port(case: &str, published: &str) -> u16 {
+pub(crate) fn dialable_port(case: &str, published: &str) -> u16 {
     let (host, port) = published.rsplit_once(':').unwrap_or_else(|| {
         panic!(
             "case {case:?}: the published address {published:?} names no port at all, so no \
@@ -481,9 +489,9 @@ fn dialable_port(case: &str, published: &str) -> u16 {
 }
 
 /// What one answer on the published address carried: its status line and the rest of it.
-struct Answered {
-    status: u16,
-    raw: String,
+pub(crate) struct Answered {
+    pub(crate) status: u16,
+    pub(crate) raw: String,
 }
 
 /// Dial the published address and exchange one request on it, as a client of that address
@@ -492,7 +500,7 @@ struct Answered {
 /// The PORT is taken from the published authority and asserted to be one the emulator itself
 /// published; the core binds its listeners on loopback (`EMULATOR_BIND_ADDRESS`, `127.0.0.1`
 /// by default), so the dial is to this machine.
-async fn exchange(
+pub(crate) async fn exchange(
     case: &str,
     published: &str,
     method: &str,
