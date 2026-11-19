@@ -12,7 +12,11 @@
 //! whose stored authentication is not the GitHub HMAC one this connection is made with
 //! is refused with the other error it models, `ValidationException`. Which webhooks
 //! those are is the one rule its sibling `DeregisterWebhookWithThirdParty` asks too
-//! ([`crate::state::ComAmazonawsCodepipelineCodepipeline20150709State::webhook_authentication`]).
+//! ([`crate::state::ComAmazonawsCodepipelineCodepipeline20150709State::webhook_connection`]).
+//! That authentication is the ONLY member of the webhook either operation turns on:
+//! `WebhookDefinition$targetPipeline` is a pipeline NAME `PutWebhook` stores without
+//! resolving it, so a webhook whose target pipeline the account does not hold is a
+//! state this service accepts and is not a precondition of this operation.
 //!
 //! The connection itself is held by the external tool, not by this service: this
 //! emulator reaches no external tool and serves no webhook trigger plane, so there is
@@ -161,19 +165,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Resolved against the stored webhooks under ONE guard, so the name, the
-        // webhook's authentication and the pipeline it targets are read from one
-        // snapshot of the store: only a webhook `PutWebhook` created can be
-        // registered. `WebhookNotFoundException` models no `message` member, so the
-        // code is the whole refusal.
+        // Resolved against the stored webhooks: only a webhook `PutWebhook` created
+        // can be registered. `WebhookNotFoundException` models no `message` member, so
+        // the code is the whole refusal.
         //
-        // The connection it makes with the external tool starts the webhook's target
-        // pipeline and is authenticated by the shared secret of its GitHub HMAC
-        // configuration — the one rule both third-party webhook operations ask the
-        // store with — so a webhook whose `targetPipeline` the account no longer
-        // holds, and one configured with any other `WebhookAuthenticationType`, are
-        // both refused with the operation's `ValidationException`, stating what
-        // blocked it.
+        // The connection it makes with the external tool is authenticated by the
+        // shared secret of the webhook's GitHub HMAC configuration — the one rule both
+        // third-party webhook operations ask the store with — so a webhook configured
+        // with any other `WebhookAuthenticationType` is refused with the operation's
+        // `ValidationException`, stating what blocked it. Nothing else about the
+        // webhook is a precondition: the `targetPipeline` of its definition is a name
+        // `PutWebhook` stores without resolving, so whether a pipeline of that name is
+        // held is not asked here.
         let connection = {
             let store = state.lock();
             store.webhook_connection(name)
@@ -186,21 +189,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        if let Some(target_pipeline) = &connection.dangling_target_pipeline {
-            return Err(
-                RegisterWebhookWithThirdPartyErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(
-                            crate::state::webhook_dangling_target_pipeline_message(
-                                name,
-                                target_pipeline,
-                            ),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
         if connection.authentication != crate::state::AUTHENTICATION_GITHUB_HMAC {
             return Err(
                 RegisterWebhookWithThirdPartyErrorModeled::ValidationException(

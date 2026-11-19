@@ -16,9 +16,10 @@
 //!   `WebhookDefinition$authentication` is any other `WebhookAuthenticationType` is
 //!   refused with `ValidationException` stating the requirement and the authentication
 //!   type the store holds for that webhook;
-//! * that connection starts the webhook's `targetPipeline`, so a webhook whose target
-//!   pipeline the account does not hold is refused with `ValidationException` naming the
-//!   webhook and the pipeline its definition references;
+//! * that authentication is the only member of the webhook either operation turns on:
+//!   the pipeline its `targetPipeline` names is not resolved, so a webhook whose target
+//!   pipeline the account does not hold is served exactly as one whose target pipeline
+//!   is held;
 //! * the webhook itself is left where it is: deregistering is not deleting.
 //!
 //! The rows span what the rules generalise over: the operation, names at both ends of
@@ -32,8 +33,8 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_codepipeline_codepipeline_20150709::state::{
-    webhook_authentication_unsupported_message, webhook_dangling_target_pipeline_message,
-    AUTHENTICATION_GITHUB_HMAC, AUTHENTICATION_IP, AUTHENTICATION_UNAUTHENTICATED,
+    webhook_authentication_unsupported_message, AUTHENTICATION_GITHUB_HMAC, AUTHENTICATION_IP,
+    AUTHENTICATION_UNAUTHENTICATED,
 };
 
 use crate::pipeline_lifecycle::{build_stage, Emulator, ROLE_ARN};
@@ -105,6 +106,19 @@ fn definition(name: &str, provider: &str, authentication: &str) -> Value {
     json!({
         "name": name,
         "targetPipeline": pipeline_name(provider),
+        "targetAction": "Src",
+        "filters": [{"jsonPath": "$.ref", "matchEquals": "refs/heads/main"}],
+        "authentication": authentication,
+        "authenticationConfiguration": authentication_configuration(authentication),
+    })
+}
+
+/// The same definition over an explicit `targetPipeline`, for the rows that vary how
+/// that reference relates to the pipelines the account holds.
+fn definition_targeting(name: &str, target_pipeline: &str, authentication: &str) -> Value {
+    json!({
+        "name": name,
+        "targetPipeline": target_pipeline,
         "targetAction": "Src",
         "filters": [{"jsonPath": "$.ref", "matchEquals": "refs/heads/main"}],
         "authentication": authentication,
@@ -273,9 +287,9 @@ async fn a_webhook_not_configured_with_github_hmac_is_not_supported() {
         }
     }
 
-    // A webhook whose target pipeline is GONE is a request neither operation serves:
-    // the connection they make and break starts that pipeline, so the dangling
-    // reference is refused with `ValidationException` naming both ends of it.
+    // A webhook whose target pipeline is GONE is served exactly as before: the pipeline
+    // a webhook's definition names is not resolved by either operation, so the state the
+    // account is in is not what decides them.
     let github_hook = format!("hook-github-{AUTHENTICATION_GITHUB_HMAC}");
     emulator
         .ok("DeletePipeline", &json!({"name": pipeline_name("GitHub")}))
@@ -285,36 +299,39 @@ async fn a_webhook_not_configured_with_github_hmac_is_not_supported() {
             .call(operation, &json!({"webhookName": github_hook}))
             .await;
         assert_eq!(
-            (
-                status,
-                response["__type"].as_str().unwrap_or_default().to_string()
-            ),
-            (REFUSAL_STATUS, "ValidationException".to_string()),
+            status, 200,
             "{operation}: a webhook referencing a pipeline the account no longer holds is \
-             refused, got {status} with {response}"
-        );
-        let expected =
-            webhook_dangling_target_pipeline_message(&github_hook, &pipeline_name("GitHub"));
-        assert_eq!(
-            response["message"].as_str(),
-            Some(expected.as_str()),
-            "{operation}: expected {expected:?}, got {response}"
-        );
-        // The wording itself, written out here so a reword of the handler's text fails
-        // this suite rather than following it.
-        assert_eq!(
-            expected,
-            format!(
-                "Webhook {github_hook} references a pipeline {} which does not exist",
-                pipeline_name("GitHub")
-            ),
-            "{operation}: the refusal states the reference that could not be resolved"
+             served, got {status} with {response}"
         );
     }
 
-    // The webhook itself is untouched by either refusal, and the same calls are served
-    // again once a pipeline of that name is held: what blocked them was the reference,
-    // not the webhook.
+    // And a webhook of another authentication type whose target pipeline is gone is
+    // still refused on its AUTHENTICATION, with the same sentence as before: the
+    // dangling reference neither adds nor replaces a refusal.
+    let ip_hook = format!("hook-github-{AUTHENTICATION_IP}");
+    for operation in [REGISTER, DEREGISTER] {
+        let (status, response) = emulator
+            .call(operation, &json!({"webhookName": ip_hook}))
+            .await;
+        let expected = webhook_authentication_unsupported_message(&ip_hook, AUTHENTICATION_IP);
+        assert_eq!(
+            (
+                status,
+                response["__type"].as_str().unwrap_or_default().to_string(),
+                response["message"].as_str().unwrap_or_default().to_string()
+            ),
+            (
+                REFUSAL_STATUS,
+                "ValidationException".to_string(),
+                expected.clone()
+            ),
+            "{operation}: the authentication refusal is what a dangling reference leaves \
+             in place, expected {expected:?}, got {status} with {response}"
+        );
+    }
+
+    // The webhook itself is untouched, and the same calls are served again once a
+    // pipeline of that name is held: nothing about either answer turned on it.
     emulator
         .ok(
             "CreatePipeline",
@@ -330,6 +347,110 @@ async fn a_webhook_not_configured_with_github_hmac_is_not_supported() {
             "{operation}: a stored GITHUB_HMAC webhook whose target pipeline is held is \
              served, got {status} with {answer}"
         );
+    }
+}
+
+/// RULE: a webhook's `WebhookDefinition$targetPipeline` is a pipeline NAME the service
+/// stores without resolving, so whether the account holds a pipeline of that name is not
+/// a precondition of either third-party operation: the only member of the webhook they
+/// turn on is its stored `authentication`, and the answer for a webhook whose target
+/// pipeline is absent is the same as for one whose target pipeline is held.
+///
+/// The rows span the authentication types `WebhookAuthenticationType` declares (the
+/// served one and both refused ones) against how the target pipeline came to be absent —
+/// never created, or deleted after the webhook was defined — and the held reference as
+/// the control.
+#[tokio::test]
+async fn a_dangling_target_pipeline_is_not_a_precondition_of_either_operation() {
+    // (case, targetPipeline, whether that pipeline is deleted before the call)
+    let references: Vec<(&str, String, bool)> = vec![
+        (
+            "a pipeline that was never created",
+            "never-created".to_string(),
+            false,
+        ),
+        (
+            "a pipeline deleted after the webhook was defined",
+            pipeline_name("GitHub"),
+            true,
+        ),
+        (
+            "a pipeline the account holds",
+            pipeline_name("GitHub"),
+            false,
+        ),
+    ];
+    // (authentication, whether the operations serve a webhook carrying it)
+    let authentications = [
+        (AUTHENTICATION_GITHUB_HMAC, true),
+        (AUTHENTICATION_IP, false),
+        (AUTHENTICATION_UNAUTHENTICATED, false),
+    ];
+
+    for (reference_case, target_pipeline, delete_pipeline) in references {
+        for (authentication, served) in authentications {
+            let emulator = emulator().await;
+            let name = format!("hook-{}", authentication.to_lowercase());
+            let case = format!("{authentication} targeting {reference_case}");
+            emulator
+                .ok(
+                    "PutWebhook",
+                    &json!({
+                        "webhook": definition_targeting(&name, &target_pipeline, authentication),
+                    }),
+                )
+                .await;
+            if delete_pipeline {
+                emulator
+                    .ok("DeletePipeline", &json!({"name": &target_pipeline}))
+                    .await;
+            }
+
+            for operation in [REGISTER, DEREGISTER] {
+                let (status, response) = emulator
+                    .call(operation, &json!({"webhookName": name}))
+                    .await;
+                if served {
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?} through {operation}: the pipeline the definition \
+                         names is not resolved, got {status} with {response}"
+                    );
+                    continue;
+                }
+                // The refusal the authentication type owes, unchanged by the reference:
+                // the same code and the same sentence whether the pipeline is held or
+                // not.
+                let expected = webhook_authentication_unsupported_message(&name, authentication);
+                assert_eq!(
+                    (
+                        status,
+                        response["__type"].as_str().unwrap_or_default().to_string(),
+                        response["message"].as_str().unwrap_or_default().to_string(),
+                    ),
+                    (
+                        REFUSAL_STATUS,
+                        "ValidationException".to_string(),
+                        expected.clone(),
+                    ),
+                    "case {case:?} through {operation}: expected {expected:?}, got \
+                     {status} with {response}"
+                );
+            }
+
+            // Neither answer touched the webhook: it is still listed under its name.
+            let listed = emulator.ok("ListWebhooks", &json!({})).await;
+            let names: Vec<&str> = listed["webhooks"]
+                .as_array()
+                .unwrap_or_else(|| panic!("ListWebhooks reports a list, got {listed}"))
+                .iter()
+                .filter_map(|item| item["definition"]["name"].as_str())
+                .collect();
+            assert!(
+                names.contains(&name.as_str()),
+                "case {case:?}: the webhook itself is left where it is, got {listed}"
+            );
+        }
     }
 }
 

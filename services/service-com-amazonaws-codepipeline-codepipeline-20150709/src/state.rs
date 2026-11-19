@@ -1319,20 +1319,17 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     /// What the third-party webhook operations resolve a webhook name to, or `None`
     /// when the account holds no webhook of that name.
     ///
-    /// The one question both of them put to the store, answered from ONE snapshot of
-    /// it: the connection they make and break is a GitHub HMAC one that starts the
-    /// webhook's target pipeline, so what decides whether either serves a webhook is
-    /// the authentication it was configured with
-    /// ([`webhook_authentication_unsupported_message`]) and whether the pipeline it
-    /// targets is still held ([`webhook_dangling_target_pipeline_message`]) — and the
-    /// name resolution, that authentication and that pipeline are all read together.
+    /// The one question both of them put to the store: the connection they make and
+    /// break is the GitHub HMAC one the webhook's own shared secret authenticates, so
+    /// what decides whether either serves a webhook is the authentication it was
+    /// configured with ([`webhook_authentication_unsupported_message`]) and nothing
+    /// else about it. `WebhookDefinition$targetPipeline` is a stored NAME that
+    /// `PutWebhook` accepts without resolving, so whether the account still holds a
+    /// pipeline of that name is not part of this answer.
     pub fn webhook_connection(&self, name: &str) -> Option<WebhookConnection> {
         let webhook = self.webhooks.get(name)?;
-        let target_pipeline = webhook.definition.target_pipeline.as_str();
         Some(WebhookConnection {
             authentication: webhook.definition.authentication.clone(),
-            dangling_target_pipeline: (!self.pipelines.contains_key(target_pipeline))
-                .then(|| target_pipeline.to_string()),
         })
     }
 
@@ -1774,11 +1771,9 @@ impl TagTarget {
 /// answers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookConnection {
-    /// The `WebhookDefinition$authentication` the stored webhook carries.
+    /// The `WebhookDefinition$authentication` the stored webhook carries — the one
+    /// member of the webhook either operation turns on.
     pub authentication: String,
-    /// `Some(targetPipeline)` when the pipeline the webhook targets is not held by
-    /// the account — the reference is dangling — and `None` while it is held.
-    pub dangling_target_pipeline: Option<String>,
 }
 
 /// One stored webhook: the definition exactly as the caller sent it, plus the
@@ -4343,20 +4338,6 @@ pub fn webhook_authentication_unsupported_message(name: &str, authentication: &s
         "Webhook {name} must be configured with {AUTHENTICATION_GITHUB_HMAC} authentication \
          type. Type is {authentication}."
     )
-}
-
-/// The message `ValidationException` carries for a webhook whose
-/// `WebhookDefinition$targetPipeline` names a pipeline the account does not hold.
-///
-/// A webhook is defined over a pipeline name, not over the pipeline itself, so the
-/// reference can be dangling — the webhook was defined before the pipeline, or the
-/// pipeline was deleted while the webhook stayed. The third-party operations connect
-/// and disconnect a webhook that must be able to START that pipeline, so a dangling
-/// reference is a request they cannot serve, and the refusal states both ends of the
-/// reference: the webhook the request named, and the `targetPipeline` the store holds
-/// for it.
-pub fn webhook_dangling_target_pipeline_message(name: &str, target_pipeline: &str) -> String {
-    format!("Webhook {name} references a pipeline {target_pipeline} which does not exist")
 }
 
 /// The message `InvalidWebhookAuthenticationParametersException` carries when the

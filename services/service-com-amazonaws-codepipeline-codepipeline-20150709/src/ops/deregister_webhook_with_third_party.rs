@@ -25,7 +25,11 @@
 //! `WebhookDefinition$authentication` is any other `WebhookAuthenticationType` is
 //! refused with `ValidationException`, the other error the operation models, stating
 //! the requirement and the authentication the webhook carries
-//! ([`crate::state::webhook_authentication_unsupported_message`]).
+//! ([`crate::state::webhook_authentication_unsupported_message`]). That is the ONLY
+//! condition it refuses besides the name not resolving: the webhook's
+//! `WebhookDefinition$targetPipeline` is a pipeline NAME `PutWebhook` stores without
+//! resolving it, so a webhook whose target pipeline the account does not hold is a
+//! state this service accepts and is not a precondition of this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,20 +173,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Resolved against the stored webhooks under ONE guard, so the name, the
-        // webhook's authentication and the pipeline it targets are read from one
-        // snapshot of the store: a well-formed name the account holds no webhook for
-        // is a terminal, handleable condition the model has an error for.
-        // `WebhookNotFoundException` models no `message` member, so the code is the
-        // whole refusal.
+        // Resolved against the stored webhooks: a well-formed name the account holds
+        // no webhook for is a terminal, handleable condition the model has an error
+        // for. `WebhookNotFoundException` models no `message` member, so the code is
+        // the whole refusal.
         //
-        // What this operation drops is a connection that would start the webhook's
-        // target pipeline, authenticated by the shared secret of its GitHub HMAC
-        // configuration — so a webhook whose `targetPipeline` the account no longer
-        // holds, and one configured with any other `WebhookAuthenticationType`, are
-        // both requests it does not serve. Those are the condition its
-        // `ValidationException` states, and each refusal reports what blocked it: the
-        // dangling pipeline reference, or the authentication type the webhook carries.
+        // What this operation drops is a connection authenticated by the shared secret
+        // of the webhook's GitHub HMAC configuration, so the ONE thing it then checks
+        // is the authentication the webhook carries: a webhook configured with any
+        // other `WebhookAuthenticationType` is the condition its `ValidationException`
+        // states. Nothing else about the webhook is a precondition — the
+        // `targetPipeline` of its definition is a name `PutWebhook` stores without
+        // resolving, so whether a pipeline of that name is held is not asked here.
         let connection = {
             let store = state.lock();
             store.webhook_connection(name)
@@ -195,21 +197,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        if let Some(target_pipeline) = &connection.dangling_target_pipeline {
-            return Err(
-                DeregisterWebhookWithThirdPartyErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(
-                            crate::state::webhook_dangling_target_pipeline_message(
-                                name,
-                                target_pipeline,
-                            ),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
         if connection.authentication != crate::state::AUTHENTICATION_GITHUB_HMAC {
             return Err(
                 DeregisterWebhookWithThirdPartyErrorModeled::ValidationException(
