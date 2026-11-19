@@ -14,12 +14,18 @@
 //! ARN has to equal the one the request named, so an id of a stored resource under
 //! another partition, Region or account addresses nothing here — the same reading the
 //! id-keyed operations perform (`crate::ops::get_recovery_plan`).
+//!
+//! An ARN that resolves to no resource is refused here too ([`not_found`]), once for the
+//! whole route: it is served ahead of any one resource's operations, so what it answers
+//! is its own not-found class rather than the `ResourceNotFoundException` an id-keyed
+//! operation of a resource raises.
 
 use std::collections::HashMap;
 
-use crate::ops::types::ResourceNotFoundException;
-
-use super::{recovery_plans, ComAmazonawsDrsElasticdisasterrecoveryserviceState};
+use super::{
+    launch_configuration_templates, recovery_plans,
+    ComAmazonawsDrsElasticdisasterrecoveryserviceState,
+};
 
 /// The resource part of a replication configuration template's ARN, as that resource's
 /// own ARN template spells it (the model's `ReplicationConfigurationTemplateResource`:
@@ -31,14 +37,6 @@ pub const REPLICATION_CONFIGURATION_TEMPLATE_ARN_PREFIX: &str =
 /// `source-server/{sourceServerID}`).
 pub const SOURCE_SERVER_ARN_PREFIX: &str = "source-server/";
 
-/// How this service names the source-server resource when it reports one in an error.
-pub const SOURCE_SERVER_RESOURCE_TYPE: &str = "Source Server";
-
-/// How a refusal names a resource whose KIND the ARN does not say: a `resourceArn` the
-/// tagging route resolved to nothing and whose resource part names none of this
-/// service's resource templates.
-pub const ANY_RESOURCE_TYPE: &str = "Resource";
-
 /// What a `resourceArn` the tagging route was handed addresses: one kind of resource of
 /// this service, carrying the id the store of that kind is keyed by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +45,8 @@ pub enum TaggedResource<'a> {
     RecoveryPlan(&'a str),
     /// `replication-configuration-template/{replicationConfigurationTemplateID}`.
     ReplicationConfigurationTemplate(&'a str),
+    /// `launch-configuration-template/{launchConfigurationTemplateID}`.
+    LaunchConfigurationTemplate(&'a str),
     /// `source-server/{sourceServerID}`.
     SourceServer(&'a str),
 }
@@ -66,19 +66,10 @@ impl<'a> TaggedResource<'a> {
         if let Some(id) = id_under(resource, REPLICATION_CONFIGURATION_TEMPLATE_ARN_PREFIX) {
             return Some(Self::ReplicationConfigurationTemplate(id));
         }
-        id_under(resource, SOURCE_SERVER_ARN_PREFIX).map(Self::SourceServer)
-    }
-
-    /// How this service names this kind of resource when it reports one in an error:
-    /// the `resourceType` of a refusal about it.
-    pub fn resource_type(self) -> &'static str {
-        match self {
-            Self::RecoveryPlan(_) => recovery_plans::RESOURCE_TYPE,
-            Self::ReplicationConfigurationTemplate(_) => {
-                super::REPLICATION_CONFIGURATION_TEMPLATE_RESOURCE_TYPE
-            }
-            Self::SourceServer(_) => SOURCE_SERVER_RESOURCE_TYPE,
+        if let Some(id) = id_under(resource, launch_configuration_templates::ARN_RESOURCE_PREFIX) {
+            return Some(Self::LaunchConfigurationTemplate(id));
         }
+        id_under(resource, SOURCE_SERVER_ARN_PREFIX).map(Self::SourceServer)
     }
 }
 
@@ -108,6 +99,11 @@ impl ComAmazonawsDrsElasticdisasterrecoveryserviceState {
                 .get(id)
                 .filter(|template| template.arn == resource_arn)
                 .map(|template| &template.tags),
+            TaggedResource::LaunchConfigurationTemplate(id) => self
+                .launch_configuration_templates
+                .get(id)
+                .filter(|template| template.arn == resource_arn)
+                .map(|template| &template.tags),
             TaggedResource::SourceServer(id) => self
                 .source_servers
                 .get(id)
@@ -115,26 +111,66 @@ impl ComAmazonawsDrsElasticdisasterrecoveryserviceState {
                 .map(|server| &server.tags),
         }
     }
-}
 
-/// The modelled `ResourceNotFoundException` (HTTP 404) for a `resourceArn` the tagging
-/// route resolved to no resource of this service.
-///
-/// The ONE place that refusal is built, so the read and the writes of the tagging route
-/// report the same thing. The route is handed an ARN and nothing else, so the refusal
-/// reports that ARN verbatim as its `resourceId` and names the kind of resource the ARN
-/// addresses — [`ANY_RESOURCE_TYPE`] when the ARN names no kind this service holds — in
-/// the sentence form this service's other not-found refusals carry: what was asked for,
-/// then that it was not found.
-pub fn not_found(resource_arn: &str) -> ResourceNotFoundException {
-    let resource_type = TaggedResource::in_arn(resource_arn).map(TaggedResource::resource_type);
-    ResourceNotFoundException {
-        message: Some(format!(
-            "{} with Arn: '{resource_arn}' was not found",
-            resource_type.unwrap_or(ANY_RESOURCE_TYPE)
-        )),
-        code: None,
-        resource_id: Some(resource_arn.to_string()),
-        resource_type: resource_type.map(std::string::ToString::to_string),
+    /// The same tag set, to CHANGE: the set the tagging route's write operations add to
+    /// and remove from, held by the resource itself.
+    ///
+    /// The write resolves an ARN through the same [`TaggedResource::in_arn`] reading as
+    /// the read above and hands back the resource's OWN set, so a tag written through
+    /// this route is the tag the resource's own reader reports — there is no second copy
+    /// of a resource's tags anywhere.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut HashMap<String, String>> {
+        match TaggedResource::in_arn(resource_arn)? {
+            TaggedResource::RecoveryPlan(id) => self
+                .recovery_plans
+                .get_mut(id)
+                .filter(|plan| plan.arn == resource_arn)
+                .map(|plan| &mut plan.tags),
+            TaggedResource::ReplicationConfigurationTemplate(id) => self
+                .replication_configuration_templates
+                .get_mut(id)
+                .filter(|template| template.arn == resource_arn)
+                .map(|template| &mut template.tags),
+            TaggedResource::LaunchConfigurationTemplate(id) => self
+                .launch_configuration_templates
+                .get_mut(id)
+                .filter(|template| template.arn == resource_arn)
+                .map(|template| &mut template.tags),
+            TaggedResource::SourceServer(id) => self
+                .source_servers
+                .get_mut(id)
+                .filter(|server| server.arn == resource_arn)
+                .map(|server| &mut server.tags),
+        }
     }
 }
+
+/// The whole message every operation of the tagging route answers a `resourceArn` it
+/// resolved to no resource with: fixed text, carrying nothing of the request — the route
+/// is handed an ARN and nothing else, and it reports neither the ARN nor the kind of
+/// resource it addresses.
+pub const NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The refusal (HTTP 404, error code `NotFoundException`) for a `resourceArn` the
+/// tagging route resolved to no resource of this service.
+///
+/// The ONE place that refusal is built, so the read and the writes of the route report
+/// the same thing for the same missing resource. It is NOT the
+/// `ResourceNotFoundException` the id-keyed operations of a resource raise: this route
+/// is served ahead of any one resource's operations — it takes no resource type, and one
+/// path serves every kind — and it states a resource it could not resolve as its own
+/// error class, which is what a client of the tagging route matches on
+/// (see [`crate::scaffolded::Scaffolded::not_found`]).
+pub fn not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::not_found(NOT_FOUND_MESSAGE)
+}
+
+/// How many tags one resource carries before the tagging route refuses to add another:
+/// "Each resource can have a maximum of 50 tags" (`TagResource`'s documentation, see
+/// `smithy_query(query="doc",shape="TagResource")`).
+///
+/// It is also what stops a caller growing one resource's tag set without end.
+pub const TAGS_PER_RESOURCE_LIMIT: usize = 50;

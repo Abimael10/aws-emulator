@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLaunchConfigurationTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLaunchConfigurationTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLaunchConfigurationTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `launchConfigurationTemplateID` and its ARN, stores every member the request
+//! supplied under that id, and answers 201 with the STORED record — so a following
+//! Describe reads back exactly what was created.
+//!
+//! A member whose value is outside the set its modelled enumeration lists never reaches
+//! this handler: the request body is checked against the model's schema before any
+//! operation runs, and this service states every failure of that check as one refusal
+//! (`crate::service`).
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +164,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLaunchConfigurationTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLaunchConfigurationTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLaunchConfigurationTemplate"))
+        // The ARN a template is reported under carries the Region the caller signed for,
+        // so it is read before the id it is built from is minted.
+        let region = crate::state::request_region(ctx.parts());
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateLaunchConfigurationTemplateErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the service store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // The emulator's own bound on this store: without it a caller that can reach the
+        // port could loop this call until the host is out of memory. The refusal is the
+        // modelled `ServiceQuotaExceededException` (402), so a client sees a DRS error
+        // rather than a dead emulator.
+        if store.launch_configuration_templates.len()
+            >= crate::state::launch_configuration_templates::QUOTA
+        {
+            return Err(
+                CreateLaunchConfigurationTemplateErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "Cannot create more than {} launch configuration templates",
+                            crate::state::launch_configuration_templates::QUOTA
+                        )),
+                        code: None,
+                        resource_id: None,
+                        resource_type: Some(
+                            crate::state::launch_configuration_templates::RESOURCE_TYPE.to_string(),
+                        ),
+                        service_code: Some(crate::state::SERVICE_CODE.to_string()),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The id is minted first because the ARN is derived from it, and the ARN carries
+        // the Region the caller signed for.
+        let id = store.next_id(crate::state::launch_configuration_templates::ID_PREFIX);
+        let record = crate::state::launch_configuration_templates::LaunchConfigurationTemplateRecord {
+            arn: crate::state::launch_configuration_templates::arn(&region, &id),
+            id: id.clone(),
+            // A template carries a tag set whether or not the request named one, so a
+            // create that named none stores an empty set — and that is what the 201
+            // reports, and what the tagging route then adds to.
+            tags: input.tags.unwrap_or_default(),
+            launch_disposition: input.launch_disposition,
+            target_instance_type_right_sizing_method: input
+                .target_instance_type_right_sizing_method,
+            copy_private_ip: input.copy_private_ip,
+            copy_tags: input.copy_tags,
+            licensing: input.licensing,
+            export_bucket_arn: input.export_bucket_arn,
+            post_launch_enabled: input.post_launch_enabled,
+            launch_into_source_instance: input.launch_into_source_instance,
+            recovery_mode: input.recovery_mode,
+        };
+
+        // Insert, then report the record as it now stands IN the store, so a 201 can only
+        // describe what was persisted — never the request echoed past a failed write. The
+        // id was just minted, so the entry is always vacant; `or_insert` is how one step
+        // both writes the record and hands back the stored one.
+        let stored = store
+            .launch_configuration_templates
+            .entry(id)
+            .or_insert(record)
+            .to_wire();
+
+        Ok(CreateLaunchConfigurationTemplateOutput {
+            launch_configuration_template: Some(stored),
+        })
     }
 }

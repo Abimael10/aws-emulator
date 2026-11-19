@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 pub mod ec2_subnets;
+pub mod launch_configuration_templates;
 pub mod recovery_plans;
 pub mod tags;
 
@@ -37,6 +38,14 @@ pub struct ComAmazonawsDrsElasticdisasterrecoveryserviceState {
     /// is `@paginated`, and the ids this service mints ascend with creation (see
     /// [`Self::next_id`]), so the map's key order IS creation order.
     pub recovery_plans: BTreeMap<String, recovery_plans::RecoveryPlanRecord>,
+    /// Launch Configuration Templates, keyed by `launchConfigurationTemplateID`.
+    ///
+    /// A [`BTreeMap`] for the same reason as the templates above:
+    /// `DescribeLaunchConfigurationTemplates` is `@paginated`, and the ids this service
+    /// mints ascend with creation (see [`Self::next_id`]), so the map's key order IS
+    /// creation order.
+    pub launch_configuration_templates:
+        BTreeMap<String, launch_configuration_templates::LaunchConfigurationTemplateRecord>,
     /// Source servers, keyed by `sourceServerID`. Registered by the replication
     /// agent, which this emulator does not model yet, so the map is empty — but
     /// `DescribeSourceServers` reads it rather than returning a canned empty list.

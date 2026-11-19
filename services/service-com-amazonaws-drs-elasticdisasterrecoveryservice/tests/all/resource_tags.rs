@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for the DRS tagging route's read, `ListTagsForResource`
-//! (`GET /tags/{resourceArn}`).
+//! End-to-end HTTP tests for the DRS tagging route — `ListTagsForResource`
+//! (`GET /tags/{resourceArn}`), `TagResource` (`POST`) and `UntagResource` (`DELETE`).
 //!
 //! Every test drives the service the way the router does — one buffered
 //! `http::Request` per call through [`MultiServiceRouter::dispatch`] — so what is
@@ -20,11 +20,17 @@
 //!    resource type.
 //! 2. It is a READ: the same ARN reports the same tag set however often it is asked, and
 //!    the resource's own reader keeps reporting that set too.
-//! 3. An ARN this service holds no resource for is 404 `ResourceNotFoundException`,
-//!    reporting the ARN the request named and this service's name for the kind of
-//!    resource that ARN addresses. The ways an ARN can name nothing span the rows: an id
-//!    nothing minted, a stored resource's id under another Region or account, a kind of
-//!    this service's that holds nothing, and another service's resource.
+//! 3. An ARN this service holds no resource for is refused by EVERY operation of the
+//!    route alike, with HTTP 404, the error code `NotFoundException` and the message
+//!    `Resource was not found`, and nothing it addresses is written. The ways an ARN can
+//!    name nothing span the rows: an id nothing minted, a stored resource's id under
+//!    another Region or account, a kind of this service's that holds nothing, and
+//!    another service's resource.
+//! 4. A write MERGES: `TagResource` sets the keys it names, overwrites a key the resource
+//!    already carries and leaves every other key where it is, so two calls naming
+//!    disjoint keys leave both sets on the resource; `UntagResource` removes the keys it
+//!    names and nothing else. Both are observable through the read AND through the
+//!    resource's own reader, because a resource has ONE tag set.
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_drs_elasticdisasterrecoveryservice::state::{self, SourceServerRecord};
@@ -40,17 +46,23 @@ const REGION: &str = "eu-west-1";
 /// The account id every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
-/// The code the model declares for a resource this operation found nothing for
-/// (`smithy_query(query="operation",operation="ListTagsForResource")` lists
-/// `ResourceNotFoundException`, HTTP 404).
-const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
+/// The code and the whole message EVERY operation of the tagging route answers an ARN it
+/// resolved to no resource with. The route is served ahead of any one resource's
+/// operations — it takes no resource type, and one path serves every kind — so it states
+/// a resource it could not resolve as its own error class, not as the
+/// `ResourceNotFoundException` the id-keyed operations of a resource raise.
+const NOT_FOUND_CODE: &str = "NotFoundException";
+const NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
-/// This service's names for the kinds of resource an ARN can address, written out here
-/// as the literals a client reads rather than taken from the implementation's constants,
-/// so a name that drifts fails this suite.
-const RECOVERY_PLAN_TYPE: &str = "Recovery Plan";
-const TEMPLATE_TYPE: &str = "Replication Configuration Template";
-const SOURCE_SERVER_TYPE: &str = "Source Server";
+/// The code the model declares for a request this service refuses on one of its fields
+/// (`smithy_query(query="operation",operation="TagResource")` lists
+/// `ValidationException`, HTTP 400).
+const VALIDATION_CODE: &str = "ValidationException";
+
+/// How many tags one resource carries at most: "Each resource can have a maximum of 50
+/// tags" (`TagResource`'s own documentation,
+/// `smithy_query(query="doc",shape="TagResource")`).
+const TAGS_PER_RESOURCE_LIMIT: usize = 50;
 
 /// An ARN as a client percent-encodes a non-greedy `@httpLabel`: `resourceArn` is bound
 /// to one path segment, so the colons and slashes inside it are escaped.
@@ -120,6 +132,61 @@ async fn list_tags(router: &MultiServiceRouter, region: &str, resource_arn: &str
     .await
 }
 
+/// `POST /tags/{resourceArn}` with a `tags` body — `TagResource` as the model binds it.
+async fn tag_resource(
+    router: &MultiServiceRouter,
+    region: &str,
+    resource_arn: &str,
+    tags: &Value,
+) -> Answer {
+    let body = json!({"tags": tags.clone()});
+    call_path(
+        router,
+        region,
+        "POST",
+        &format!("/tags/{}", encoded_label(resource_arn)),
+        &serde_json::to_vec(&body).expect("the request body serializes"),
+    )
+    .await
+}
+
+/// `DELETE /tags/{resourceArn}?tagKeys=…` — `UntagResource` as the model binds it:
+/// `tagKeys` is an `@httpQuery` list, so a client repeats the parameter per key.
+async fn untag_resource(
+    router: &MultiServiceRouter,
+    region: &str,
+    resource_arn: &str,
+    tag_keys: &[&str],
+) -> Answer {
+    let query = tag_keys
+        .iter()
+        .map(|key| format!("tagKeys={}", query_value(key)))
+        .collect::<Vec<_>>()
+        .join("&");
+    call_path(
+        router,
+        region,
+        "DELETE",
+        &format!("/tags/{}?{query}", encoded_label(resource_arn)),
+        &[],
+    )
+    .await
+}
+
+/// A query-string value as a client sends one. Every `tagKeys` value this suite sends is
+/// drawn from the RFC 3986 unreserved set, so none needs percent-encoding; a row that
+/// adds one which does is caught here rather than silently addressing another parameter,
+/// and such a row encodes it with the `percent-encoding` crate rather than by hand.
+fn query_value(key: &str) -> &str {
+    assert!(
+        key.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')),
+        "the tag key {key:?} is not unreserved, so it must be percent-encoded before it is \
+         sent as a query value"
+    );
+    key
+}
+
 /// The `tags` member of an answer, for an assertion that names the case.
 fn reported_tags(answer: &Answer) -> Option<&Value> {
     answer.member("tags")
@@ -169,6 +236,27 @@ async fn template_with_tags(router: &MultiServiceRouter, tags: &Value) -> String
     );
     answer
         .member("arn")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected the created template's ARN, got {answer:?}"))
+        .to_string()
+}
+
+/// Create a launch configuration template carrying `tags`, and answer its ARN.
+async fn launch_template_with_tags(router: &MultiServiceRouter, tags: &Value) -> String {
+    let answer = call_in(
+        router,
+        REGION,
+        "CreateLaunchConfigurationTemplate",
+        &json!({"tags": tags.clone()}),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 201,
+        "creating a launch configuration template with {tags}: expected 201, got {answer:?}"
+    );
+    answer
+        .member("launchConfigurationTemplate")
+        .and_then(|template| template.get("arn"))
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("expected the created template's ARN, got {answer:?}"))
         .to_string()
@@ -264,6 +352,9 @@ async fn every_kind_of_resource_reports_its_own_tag_set_through_the_one_route() 
     let template_tags = json!({"kind": "replication-configuration-template"});
     let template = template_with_tags(&router, &template_tags).await;
 
+    let launch_template_tags = json!({"kind": "launch-configuration-template"});
+    let launch_template = launch_template_with_tags(&router, &launch_template_tags).await;
+
     // A source server is registered by the replication agent, which this emulator does
     // not model, so the one way to hold one is to write the store directly — the same
     // seam `describe_source_servers_applies_every_modelled_filter` uses.
@@ -289,6 +380,11 @@ async fn every_kind_of_resource_reports_its_own_tag_set_through_the_one_route() 
     for (case, arn, expected) in [
         ("a recovery plan", &plan, &plan_tags),
         ("a replication configuration template", &template, &template_tags),
+        (
+            "a launch configuration template",
+            &launch_template,
+            &launch_template_tags,
+        ),
         ("a source server", &server, &server_tags),
     ] {
         let read = list_tags(&router, REGION, arn).await;
@@ -308,13 +404,11 @@ async fn every_kind_of_resource_reports_its_own_tag_set_through_the_one_route() 
 // Rule 3 — an ARN this service holds no resource for
 // ---------------------------------------------------------------------------
 
-/// An ARN this service holds no resource for is 404 `ResourceNotFoundException` naming
-/// the ARN the request asked for, and nothing it addresses changes. The rows are ARNs
-/// absent for different reasons: ids nothing minted, a STORED resource's id under
-/// another Region or another account, a resource kind of this service that holds
-/// nothing, and another service's resource — each reported with this service's name for
-/// the kind the ARN addresses, or with none when the ARN addresses no kind of this
-/// service.
+/// An ARN this service holds no resource for is refused by every operation of the route
+/// alike — 404 `NotFoundException` with the message `Resource was not found` — and
+/// nothing it addresses changes. The rows are ARNs absent for different reasons: ids
+/// nothing minted, a STORED resource's id under another Region or another account, a
+/// resource kind of this service that holds nothing, and another service's resource.
 #[tokio::test]
 async fn an_arn_this_service_holds_no_resource_for_is_not_found() {
     let (router, _engine) = drs_with_engine();
@@ -329,85 +423,86 @@ async fn an_arn_this_service_holds_no_resource_for_is_not_found() {
     // Every ARN below satisfies the modelled `ARN` (length 20..2048, pattern
     // `^arn:.{16,2044}$`), so each reaches the handler rather than the boundary
     // validator.
-    let absent: Vec<(&str, String, Option<&str>)> = vec![
+    let absent: Vec<(&str, String)> = vec![
         (
             "a recovery plan id nothing minted",
             format!("arn:aws:drs:{REGION}:{ACCOUNT}:recovery-plan/plan-00000000000000000"),
-            Some(RECOVERY_PLAN_TYPE),
         ),
         (
             "a stored plan's id under another Region",
             format!("arn:aws:drs:eu-central-1:{ACCOUNT}:recovery-plan/{plan_id}"),
-            Some(RECOVERY_PLAN_TYPE),
         ),
         (
             "a stored plan's id under another account",
             format!("arn:aws:drs:{REGION}:123456789012:recovery-plan/{plan_id}"),
-            Some(RECOVERY_PLAN_TYPE),
         ),
         (
-            "a template id nothing minted",
+            "a replication configuration template id nothing minted",
             format!(
                 "arn:aws:drs:{REGION}:{ACCOUNT}:replication-configuration-template/\
                  rct-00000000000000000"
             ),
-            Some(TEMPLATE_TYPE),
+        ),
+        (
+            "a launch configuration template id nothing minted",
+            format!(
+                "arn:aws:drs:{REGION}:{ACCOUNT}:launch-configuration-template/\
+                 lct-00000000000000000"
+            ),
         ),
         (
             "a source server nothing registered",
             format!("arn:aws:drs:{REGION}:{ACCOUNT}:source-server/s-00000000000000009"),
-            Some(SOURCE_SERVER_TYPE),
         ),
         (
             "a resource kind of this service that holds nothing",
             format!("arn:aws:drs:{REGION}:{ACCOUNT}:job/drsjob-00000000000000000"),
-            None,
         ),
         (
             "a recovery instance, another kind this service holds nothing of",
             format!("arn:aws:drs:{REGION}:{ACCOUNT}:recovery-instance/i-0123456789abcdef0"),
-            None,
         ),
         (
             "another service's resource",
             format!("arn:aws:ec2:{REGION}:{ACCOUNT}:subnet/subnet-0123456789abcdef0"),
-            None,
         ),
     ];
 
-    for (case, arn, resource_type) in &absent {
-        let answer = list_tags(&router, REGION, arn).await;
-        assert_eq!(
-            answer.status, 404,
-            "case {case:?}: expected 404 for {arn}, got {answer:?}"
-        );
-        assert_eq!(
-            answer.error_code.as_deref(),
-            Some(NOT_FOUND_CODE),
-            "case {case:?}: expected {NOT_FOUND_CODE}, got {answer:?}"
-        );
-        assert_eq!(
-            text(&answer, "resourceId"),
-            *arn,
-            "case {case:?}: resourceId must be the ARN the request named, got {answer:?}"
-        );
-        assert_eq!(
-            answer.member("resourceType").and_then(Value::as_str),
-            *resource_type,
-            "case {case:?}: expected resourceType {resource_type:?}, got {answer:?}"
-        );
-        assert_eq!(
-            text(&answer, "message"),
-            format!(
-                "{} with Arn: '{arn}' was not found",
-                resource_type.unwrap_or("Resource")
+    for (case, arn) in &absent {
+        // The read, the write and the removal of the one route answer the same way: the
+        // ARN resolves to no resource, and that is all the route knows about it.
+        let answers = [
+            ("ListTagsForResource", list_tags(&router, REGION, arn).await),
+            (
+                "TagResource",
+                tag_resource(&router, REGION, arn, &json!({"env": "prod"})).await,
             ),
-            "case {case:?}: wrong message in {answer:?}"
-        );
-        assert!(
-            reported_tags(&answer).is_none(),
-            "case {case:?}: a refusal must report no tags, got {answer:?}"
-        );
+            (
+                "UntagResource",
+                untag_resource(&router, REGION, arn, &["env"]).await,
+            ),
+        ];
+        for (operation, answer) in &answers {
+            let case = format!("{operation} on {case}");
+            assert_eq!(
+                answer.status, 404,
+                "case {case:?}: expected 404 for {arn}, got {answer:?}"
+            );
+            assert_eq!(
+                answer.error_code.as_deref(),
+                Some(NOT_FOUND_CODE),
+                "case {case:?}: expected {NOT_FOUND_CODE}, got {answer:?}"
+            );
+            assert_eq!(
+                text(answer, "message"),
+                NOT_FOUND_MESSAGE,
+                "case {case:?}: wrong message in {answer:?}"
+            );
+            assert!(
+                reported_tags(answer).is_none(),
+                "case {case:?}: a refusal must report no tags, got {answer:?}"
+            );
+        }
     }
 
     // None of those refusals touched anything: the resource that IS held still reports
@@ -418,4 +513,337 @@ async fn an_arn_this_service_holds_no_resource_for_is_not_found() {
         (200, Some(&tags)),
         "the stored plan's tags must survive every refusal, got {read:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 4 — the writes of the route merge into, and remove from, the one set
+// ---------------------------------------------------------------------------
+
+/// A write sets the keys it names and leaves every other key where it is, so the set the
+/// resource carries afterwards is the one it carried with the written keys overlaid. The
+/// rows differ along what the rule generalises over: writing onto an empty set, adding
+/// keys disjoint from the stored ones, overwriting a stored key, overwriting it with an
+/// empty value, writing a key and a value at the greatest modelled length, writing the
+/// same set twice, and writing nothing at all.
+#[tokio::test]
+async fn a_write_overlays_the_keys_it_names_on_the_set_the_resource_carries() {
+    let longest_key = "k".repeat(256);
+    let rows: Vec<(&str, Value, Value, Value)> = vec![
+        (
+            "onto a resource created with no tags",
+            json!({}),
+            json!({"env": "prod"}),
+            json!({"env": "prod"}),
+        ),
+        (
+            "keys disjoint from the stored ones",
+            json!({"env": "prod"}),
+            json!({"team": "dr", "tier": "1"}),
+            json!({"env": "prod", "team": "dr", "tier": "1"}),
+        ),
+        (
+            "a stored key overwritten",
+            json!({"env": "staging", "team": "dr"}),
+            json!({"env": "prod"}),
+            json!({"env": "prod", "team": "dr"}),
+        ),
+        (
+            "a stored key overwritten with an empty value",
+            json!({"env": "prod"}),
+            json!({"env": ""}),
+            json!({"env": ""}),
+        ),
+        (
+            "a key and a value at the greatest modelled length",
+            json!({"env": "prod"}),
+            one_tag(&longest_key, &"v".repeat(256)),
+            {
+                let mut expected = json!({"env": "prod"});
+                expected[&longest_key] = Value::String("v".repeat(256));
+                expected
+            },
+        ),
+        (
+            "the empty key",
+            json!({"env": "prod"}),
+            one_tag("", "unkeyed"),
+            {
+                let mut expected = json!({"env": "prod"});
+                expected[""] = Value::String("unkeyed".to_string());
+                expected
+            },
+        ),
+        (
+            "no key at all",
+            json!({"env": "prod"}),
+            json!({}),
+            json!({"env": "prod"}),
+        ),
+    ];
+
+    let (router, _engine) = drs_with_engine();
+    for (case, created_with, written, expected) in &rows {
+        let arn = plan_with_tags(&router, REGION, Some(created_with)).await;
+
+        let answer = tag_resource(&router, REGION, &arn, written).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected the write to be served, got {answer:?}"
+        );
+
+        let read = list_tags(&router, REGION, &arn).await;
+        assert_eq!(
+            reported_tags(&read),
+            Some(expected),
+            "case {case:?}: expected {expected}, got {read:?}"
+        );
+
+        // A resource has ONE tag set: what the route wrote is what the resource's own
+        // reader reports.
+        let plan = call_in(
+            &router,
+            REGION,
+            "GetRecoveryPlan",
+            &json!({"recoveryPlanArn": arn}),
+        )
+        .await;
+        assert_eq!(
+            plan.member("recoveryPlan").and_then(|plan| plan.get("tags")),
+            Some(expected),
+            "case {case:?}: the resource must carry {expected}, got {plan:?}"
+        );
+
+        // `TagResource` is modelled `@idempotent`: writing the same set again leaves the
+        // resource carrying the same tags.
+        let again = tag_resource(&router, REGION, &arn, written).await;
+        assert_eq!(
+            again.status, 200,
+            "case {case:?}: expected the repeated write to be served, got {again:?}"
+        );
+        let read = list_tags(&router, REGION, &arn).await;
+        assert_eq!(
+            reported_tags(&read),
+            Some(expected),
+            "case {case:?}: a repeated write must leave {expected}, got {read:?}"
+        );
+    }
+}
+
+/// Writes naming disjoint keys MERGE: each call adds its own keys without dropping the
+/// keys another call added, so after a series of such writes the resource carries the
+/// union of them. The rows span how many writers there are and how many keys each one
+/// names.
+#[tokio::test]
+async fn writes_naming_disjoint_keys_merge() {
+    let (router, _engine) = drs_with_engine();
+    for (case, writes) in [
+        ("two writers, one key each", vec![json!({"a": "1"}), json!({"b": "2"})]),
+        (
+            "three writers, several keys each",
+            vec![
+                json!({"a": "1", "b": "2"}),
+                json!({"c": "3", "d": "4"}),
+                json!({"e": "5"}),
+            ],
+        ),
+    ] {
+        let arn = plan_with_tags(&router, REGION, None).await;
+        let mut expected = Map::new();
+        for write in &writes {
+            let answer = tag_resource(&router, REGION, &arn, write).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected the write {write} to be served, got {answer:?}"
+            );
+            for (key, value) in write.as_object().expect("a JSON object of tags") {
+                expected.insert(key.clone(), value.clone());
+            }
+        }
+        let read = list_tags(&router, REGION, &arn).await;
+        assert_eq!(
+            reported_tags(&read),
+            Some(&Value::Object(expected.clone())),
+            "case {case:?}: expected the union of every write, got {read:?}"
+        );
+    }
+}
+
+/// A removal takes out the keys it names and nothing else, and a key the resource does
+/// not carry removes nothing — so repeating a removal answers the same way. The rows
+/// differ along how many of the stored keys are named, and whether a named key is stored
+/// at all.
+#[tokio::test]
+async fn a_removal_takes_out_only_the_keys_it_names() {
+    let stored = json!({"env": "prod", "team": "dr", "tier": "1"});
+    let rows: Vec<(&str, Vec<&str>, Value)> = vec![
+        (
+            "one of the stored keys",
+            vec!["team"],
+            json!({"env": "prod", "tier": "1"}),
+        ),
+        (
+            "several of the stored keys",
+            vec!["env", "tier"],
+            json!({"team": "dr"}),
+        ),
+        ("every stored key", vec!["env", "team", "tier"], json!({})),
+        ("a key the resource does not carry", vec!["absent"], stored.clone()),
+        (
+            "a stored key and one the resource does not carry",
+            vec!["env", "absent"],
+            json!({"team": "dr", "tier": "1"}),
+        ),
+    ];
+
+    let (router, _engine) = drs_with_engine();
+    for (case, keys, expected) in &rows {
+        let arn = plan_with_tags(&router, REGION, Some(&stored)).await;
+
+        for attempt in ["the removal", "the repeated removal"] {
+            let answer = untag_resource(&router, REGION, &arn, keys).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected {attempt} to be served, got {answer:?}"
+            );
+            let read = list_tags(&router, REGION, &arn).await;
+            assert_eq!(
+                reported_tags(&read),
+                Some(expected),
+                "case {case:?}: after {attempt}, expected {expected}, got {read:?}"
+            );
+        }
+    }
+}
+
+/// ONE route, every kind of resource: a write addresses the resource its ARN names, and
+/// the tags it sets and removes are the ones that resource's own reader reports — the
+/// route takes no resource type, so the kind can only come from the ARN.
+#[tokio::test]
+async fn a_write_reaches_every_kind_of_resource_through_the_one_route() {
+    let (router, engine) = drs_with_engine();
+
+    let plan = plan_with_tags(&router, REGION, Some(&json!({"kind": "recovery-plan"}))).await;
+    let template = template_with_tags(&router, &json!({"kind": "template"})).await;
+    let launch_template = launch_template_with_tags(&router, &json!({"kind": "launch"})).await;
+
+    // A source server is registered by the replication agent, which this emulator does
+    // not model, so the one way to hold one is to write the store directly.
+    let server_id = "s-00000000000000002";
+    let server = engine::emulator_arn("drs", REGION, &format!("source-server/{server_id}"));
+    {
+        let store = state::service_state(&*engine).expect("the DRS store");
+        let mut store = store.lock();
+        store.source_servers.insert(
+            server_id.to_string(),
+            SourceServerRecord {
+                source_server_id: server_id.to_string(),
+                arn: server.clone(),
+                tags: [("kind".to_string(), "source-server".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..SourceServerRecord::default()
+            },
+        );
+    }
+
+    for (case, arn, kind) in [
+        ("a recovery plan", &plan, "recovery-plan"),
+        ("a replication configuration template", &template, "template"),
+        ("a launch configuration template", &launch_template, "launch"),
+        ("a source server", &server, "source-server"),
+    ] {
+        let answer = tag_resource(&router, REGION, arn, &json!({"added": "yes"})).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected the write to be served, got {answer:?}"
+        );
+        let read = list_tags(&router, REGION, arn).await;
+        assert_eq!(
+            reported_tags(&read),
+            Some(&json!({"kind": kind, "added": "yes"})),
+            "case {case:?}: expected the written tag beside the created one, got {read:?}"
+        );
+
+        let answer = untag_resource(&router, REGION, arn, &["kind"]).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected the removal to be served, got {answer:?}"
+        );
+        let read = list_tags(&router, REGION, arn).await;
+        assert_eq!(
+            reported_tags(&read),
+            Some(&json!({"added": "yes"})),
+            "case {case:?}: expected only the written tag to remain, got {read:?}"
+        );
+    }
+}
+
+/// A resource carries at most the documented maximum of tags: the write that would take
+/// it past that is refused with the modelled `ValidationException` and the set is left
+/// exactly as it was, while a write that only overwrites keys the resource already
+/// carries is served at the limit.
+#[tokio::test]
+async fn a_write_past_the_documented_tag_maximum_is_refused() {
+    let (router, _engine) = drs_with_engine();
+    let arn = plan_with_tags(&router, REGION, None).await;
+
+    // Fill the set to the limit in one write, then read back what the resource carries.
+    let mut at_limit = Map::new();
+    for index in 0..TAGS_PER_RESOURCE_LIMIT {
+        at_limit.insert(format!("key-{index}"), Value::String(index.to_string()));
+    }
+    let at_limit = Value::Object(at_limit);
+    let answer = tag_resource(&router, REGION, &arn, &at_limit).await;
+    assert_eq!(
+        answer.status, 200,
+        "filling the set to the limit: expected the write to be served, got {answer:?}"
+    );
+
+    // A write that only overwrites stored keys adds nothing, so it is served at the
+    // limit; one that names a key the resource does not carry is refused.
+    for (case, written, expect_served) in [
+        ("overwriting a stored key", json!({"key-0": "overwritten"}), true),
+        ("one key past the limit", json!({"one-too-many": "x"}), false),
+        (
+            "several keys past the limit",
+            json!({"a": "1", "b": "2", "c": "3"}),
+            false,
+        ),
+    ] {
+        let before = list_tags(&router, REGION, &arn).await;
+        let before = reported_tags(&before).cloned();
+        let answer = tag_resource(&router, REGION, &arn, &written).await;
+        let read = list_tags(&router, REGION, &arn).await;
+        if expect_served {
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected the write to be served, got {answer:?}"
+            );
+            assert_eq!(
+                reported_tags(&read).and_then(|tags| tags.get("key-0")),
+                Some(&Value::String("overwritten".to_string())),
+                "case {case:?}: expected the overwrite to be stored, got {read:?}"
+            );
+        } else {
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: expected 400, got {answer:?}"
+            );
+            assert_eq!(
+                answer.error_code.as_deref(),
+                Some(VALIDATION_CODE),
+                "case {case:?}: expected {VALIDATION_CODE}, got {answer:?}"
+            );
+            assert_eq!(
+                text(&answer, "message"),
+                format!("Each resource can have a maximum of {TAGS_PER_RESOURCE_LIMIT} tags"),
+                "case {case:?}: wrong message in {answer:?}"
+            );
+            assert_eq!(
+                reported_tags(&read).cloned(),
+                before,
+                "case {case:?}: a refused write must leave the set as it was, got {read:?}"
+            );
+        }
+    }
 }

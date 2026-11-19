@@ -9,7 +9,7 @@
 //! The route (`/tags/{resourceArn}`) addresses a resource by its ARN alone, so which
 //! resource that is — and whether this service holds it at all — is resolved where every
 //! tagging operation resolves it (`crate::state::tags`). An ARN this service holds no
-//! resource for is the modelled `ResourceNotFoundException` (404), built there too.
+//! resource for is that route's own 404 `NotFoundException`, built there too.
 //!
 //! ## Shape of an operation
 //!
@@ -162,10 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         let Some(tags) = store.resource_tags(&input.resource_arn) else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                crate::state::tags::not_found(&input.resource_arn),
-            )
-            .into());
+            return Err(crate::state::tags::not_found());
         };
 
         // Every resource of this service carries a tag set — empty for one created with
