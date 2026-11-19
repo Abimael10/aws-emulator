@@ -60,6 +60,13 @@
 //! diagnostic for it under the constraint-violation class. [`request_layer`] is what
 //! answers such a request instead — the protocol's serialization error, naming the class
 //! of value sent and the type it could not be read into.
+//!
+//! The claim and the routing-error seams carry one more address for the same reason a
+//! domain's does: an APPLICATION this service creates publishes the URL a client follows to
+//! reach its user interface (`GetApplicationResponse$endpoint`), and this emulator publishes
+//! that URL on its OWN endpoint with the application named in the path, so a client of the
+//! emulator can reach it. [`application_ui`] is the half that claims and serves it, out of
+//! the stored application.
 
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, Refused, Service,
@@ -70,6 +77,10 @@ pub mod domain_rest;
 pub(crate) mod request_layer;
 pub(crate) mod required_query_contract;
 pub(crate) mod validation;
+
+/// The route that answers at the endpoint an OpenSearch UI application reports, which this
+/// emulator publishes on its own endpoint.
+pub mod application_ui;
 
 /// What the SERVICE, rather than the caller, puts in a domain's configuration: the
 /// storage performance members it refuses, the option blocks it defaults for a request
@@ -327,6 +338,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // shared store, rather than to a host or a path shape alone, so one request
             // keeps one claimant.
             || domain_rest::claims_parts(&*self.engine, parts)
+            // And the endpoint an APPLICATION of this service reports (`endpoint`, "the
+            // endpoint URL of the OpenSearch application"), which this emulator publishes
+            // on its own front door with the application named in the path
+            // ([`application_ui`]). Such a fetch is opened by whatever browser, probe or
+            // test holds that URL: anonymously, with no credential scope and no target
+            // naming this service — only the path this service itself minted, under a plane
+            // segment that is this service's alone. It is therefore claimed whatever host
+            // the client addressed, so the interface is reachable at the address the
+            // application advertised.
+            || application_ui::claimed(parts)
     }
 
     fn override_operation(
@@ -408,6 +429,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // (rest -> 501) by returning `None`.
         if domain_rest::claims_request(&*self.engine, req) {
             return Some(domain_rest::serve(&*self.engine, req, None));
+        }
+        // The same for a fetch of the endpoint an application reports: it is answered here
+        // because the router consults this seam before it authenticates anything, which is
+        // how AWS serves its own interface host — unauthenticated, and as a web page rather
+        // than a modelled API call.
+        if let Some(served) = application_ui::answer(&*self.engine, req) {
+            return Some(served);
         }
         // One class of request lands here that this service DOES answer: one whose
         // method and path address an operation of this API but which omits a member that

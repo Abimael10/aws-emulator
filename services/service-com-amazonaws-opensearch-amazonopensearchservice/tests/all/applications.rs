@@ -31,8 +31,13 @@
 //!   `ResourceNotFoundException`;
 //! * an application's tags are the set the create named, reported and changed through
 //!   the same tagging paths a domain's are, and a create naming more than the
-//!   documented number of tags is refused and creates nothing.
+//!   documented number of tags is refused and creates nothing;
+//! * the URL an application publishes for a caller to FOLLOW is built over the endpoint
+//!   this emulator is reached at, with the application's own id in the path, and this
+//!   emulator answers there out of the stored application — asserted over the forms a
+//!   caller can address this emulator by and over ids no application is held under.
 
+use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::APPLICATION_STATUS_VALUES;
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
@@ -40,15 +45,38 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
     APPLICATION_STATUS_CREATING, TAG_QUOTA,
 };
 
+use super::application_deletion::delete_application;
 use super::application_updates::read_list;
 use super::domain_lifecycle::{
-    error_code, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS, SETTLE_WAIT,
+    error_code, poll_until, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS,
+    SETTLE_WAIT,
 };
 use super::resource_tags::{add_tags, list_tags, reported_tags};
 
-/// The Region every request of this suite is signed for, so the ARN and the endpoint
-/// a create reports are built for it.
+/// The Region every request of this suite is signed for, so the ARN a create reports is
+/// built for it.
 const REGION: &str = "us-east-1";
+
+/// The path a published application endpoint carries, ahead of the application's own id:
+/// the reserved namespace segment every data plane of this emulator is addressed under
+/// (`service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`) and the segment that
+/// names this service's application plane (`state::APPLICATION_UI_PLANE`).
+///
+/// Written out here rather than read back off the implementation, so a case states the
+/// address a client is handed.
+const ENDPOINT_PATH_PREFIX: &str = "/_aws/opensearch-application";
+
+/// The `host[:port]` an emulator served on NO port at all publishes its addresses on: the
+/// base `smithy_server_runtime` reports for an unserved emulator, without its scheme.
+///
+/// This suite drives the router in process, so no port is open and this is the authority
+/// every address it publishes carries. It is a host reserved so that nothing resolves it —
+/// never one of AWS's.
+fn unserved_authority() -> String {
+    smithy_server_runtime::UNSERVED_URL_BASE
+        .trim_start_matches("https://")
+        .to_string()
+}
 
 /// A customer-managed key ARN satisfying `KmsKeyArn`'s own pattern.
 const KMS_KEY: &str = "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab";
@@ -348,9 +376,16 @@ async fn a_created_application_round_trips_through_get() {
             "case {case}: nothing has changed the application since it was created, got {:?}",
             read.body
         );
+        // The URL the application is reached on: this emulator's own endpoint with the
+        // application named in the path, never a host of AWS's — asserted over the hosts a
+        // caller can reach this emulator at by
+        // [`a_published_application_endpoint_is_served_by_this_emulator`] below.
         assert_eq!(
             read.body["endpoint"],
-            json!(format!("https://{id}.{REGION}.opensearch.amazonaws.com")),
+            json!(format!(
+                "https://{}{ENDPOINT_PATH_PREFIX}/{id}",
+                unserved_authority()
+            )),
             "case {case}: the read reports the URL the application is reached on, got {:?}",
             read.body
         );
@@ -795,6 +830,265 @@ async fn a_create_naming_more_tags_than_a_resource_may_carry_is_refused() {
             retry.status, 200,
             "case {count} tags: the refused create left the name free, got {} with {:?}",
             retry.status, retry.body
+        );
+    }
+}
+
+/// One caller the endpoint rule is asserted over: the host it addressed this emulator at,
+/// and the name it created its application under.
+struct EndpointRow {
+    case: &'static str,
+    /// The `Host` the create and the read carry — the endpoint this caller reached.
+    host: &'static str,
+    /// The authority the published URL has to carry for that caller, or `None` where the
+    /// caller addressed a host of AWS's: there is no own endpoint in the request to report,
+    /// so the address this process is served at stands instead.
+    authority: Option<&'static str>,
+    name: &'static str,
+}
+
+/// The table [`a_published_application_endpoint_is_served_by_this_emulator`] drives.
+///
+/// The rows differ along what the rule generalises over: the FORM of the endpoint the
+/// caller reached this emulator at — a loopback IPv4 address, a loopback name, a bracketed
+/// IPv6 literal — and one caller that resolves AWS's own hosts, which addresses this
+/// service's published control-plane host instead.
+fn endpoint_rows() -> Vec<EndpointRow> {
+    vec![
+        EndpointRow {
+            case: "a client on the emulator's own loopback address",
+            host: "127.0.0.1:9297",
+            authority: Some("127.0.0.1:9297"),
+            name: "endpoint-ui-one",
+        },
+        EndpointRow {
+            case: "a client on a loopback name",
+            host: "localhost:9297",
+            authority: Some("localhost:9297"),
+            name: "endpoint-ui-two",
+        },
+        EndpointRow {
+            case: "a client on the emulator's IPv6 loopback literal",
+            host: "[::1]:9297",
+            authority: Some("[::1]:9297"),
+            name: "endpoint-ui-three",
+        },
+        EndpointRow {
+            case: "a client that resolves AWS's own hosts",
+            host: "es.us-east-1.amazonaws.com",
+            authority: None,
+            name: "endpoint-ui-four",
+        },
+    ]
+}
+
+/// One request to this service addressed at `host`, so a case can read a resource from the
+/// endpoint a client of this emulator reaches it at as well as from the service's AWS host.
+async fn call_at(emulator: &Emulator, host: &str, method: &str, uri: &str, body: Option<Value>) -> Answer {
+    let payload = body.map(|value| value.to_string()).unwrap_or_default();
+    let request = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", host)
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260101/{REGION}/es/\
+                 aws4_request, SignedHeaders=host, Signature=0"
+            ),
+        )
+        .header("content-type", "application/json")
+        .body(Bytes::from(payload))
+        .expect("the test request is well formed");
+    emulator.dispatch(request).await
+}
+
+/// The authority and the request path of `url`, split the way a client that FOLLOWS the URL
+/// splits it: whatever stands before the first `/` of the address is the host it dials and
+/// signs, and the rest is the path it sends.
+fn dialled(url: &str) -> (String, String) {
+    let address = url
+        .strip_prefix("https://")
+        .expect("a published endpoint is an absolute https URL");
+    match address.find('/') {
+        Some(end) => (address[..end].to_string(), address[end..].to_string()),
+        None => (address.to_string(), "/".to_string()),
+    }
+}
+
+/// A fetch of `url` exactly as a client follows it: an anonymous `GET` — no AWS credential at
+/// all, the way a client that was handed an address dials it — of the path the URL carries, at
+/// the host it names.
+async fn followed(emulator: &Emulator, url: &str) -> Answer {
+    let (authority, path) = dialled(url);
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", authority)
+        .body(Bytes::new())
+        .expect("the test request is well formed");
+    emulator.dispatch(request).await
+}
+
+/// The `content-type` an answer carries, which is what a client reads its body as.
+fn media_type(answer: &Answer) -> String {
+    answer
+        .headers
+        .get("content-type")
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// RULE: a URL an operation reports for a caller to FOLLOW is built over the endpoint this
+/// emulator is reached at — the one the request arrived on, else the port this process is
+/// served at — with the resource's own id in the path, and this emulator SERVES it out of
+/// the stored resource. It is never a host of AWS's, which resolves nowhere here.
+///
+/// Asserted over the forms a caller can address this emulator by, and by USING the address:
+/// what it answers states the stored application, and the same address for an id this account
+/// holds no application under answers that there is no such application.
+#[tokio::test]
+async fn a_published_application_endpoint_is_served_by_this_emulator() {
+    let emulator = Emulator::new();
+    let unserved = unserved_authority();
+
+    for row in endpoint_rows() {
+        let case = row.case;
+        let created = call_at(
+            &emulator,
+            row.host,
+            "POST",
+            &format!("{PREFIX}/opensearch/application"),
+            Some(json!({
+                "name": row.name,
+                "dataSources": [{
+                    "dataSourceArn": format!("arn:aws:es:{REGION}:123456789012:domain/logs"),
+                    "dataSourceDescription": "the logs domain",
+                }],
+            })),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: expected 200 from CreateApplication, got {} with {:?}",
+            created.status, created.body
+        );
+        let id = string_member(&created.body, "id", case);
+
+        let read = call_at(
+            &emulator,
+            row.host,
+            "GET",
+            &format!("{PREFIX}/opensearch/application/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            read.status, 200,
+            "case {case}: expected 200 from GetApplication, got {} with {:?}",
+            read.status, read.body
+        );
+        let published = string_member(&read.body, "endpoint", case);
+
+        // The address is this emulator's own, with the application named in the path.
+        let authority = row.authority.unwrap_or(&unserved);
+        assert_eq!(
+            published,
+            format!("https://{authority}{ENDPOINT_PATH_PREFIX}/{id}"),
+            "case {case}: expected the endpoint on the address this emulator answers at, got \
+             {published:?}"
+        );
+        // And never a host of AWS's: a client handed one leaves the emulator altogether.
+        assert!(
+            !published.contains("amazonaws.com"),
+            "case {case}: expected no AWS host in the endpoint, got {published:?}"
+        );
+
+        // Following it reaches THIS application: what it answers states the record the
+        // control plane reports, out of the one store both read.
+        let followed = followed(&emulator, &published).await;
+        assert_eq!(
+            followed.status, 200,
+            "case {case}: expected 200 from following {published:?}, got {} with {:?}",
+            followed.status, followed.body
+        );
+        assert_eq!(
+            media_type(&followed),
+            "application/json",
+            "case {case}: expected the answer to be served as JSON, got {:?}",
+            media_type(&followed)
+        );
+        for member in ["id", "name", "status"] {
+            assert_eq!(
+                followed.body[member], read.body[member],
+                "case {case}: expected {member:?} at {published:?} to be the one the control \
+                 plane reports, got {:?}",
+                followed.body
+            );
+        }
+        assert_eq!(
+            followed.body["dataSources"], read.body["dataSources"],
+            "case {case}: expected the data sources at {published:?} to be the ones the control \
+             plane reports, got {:?}",
+            followed.body
+        );
+
+        // The address is the APPLICATION's, so it is minted once and every read reports the
+        // same one — a caller that stored what one reader told it keeps an address that works.
+        let again = call_at(
+            &emulator,
+            "es.us-east-1.amazonaws.com",
+            "GET",
+            &format!("{PREFIX}/opensearch/application/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            string_member(&again.body, "endpoint", case),
+            published,
+            "case {case}: two reads of one application report the same endpoint, got {:?}",
+            again.body
+        );
+    }
+
+    // An address of that shape naming an application this account does not hold answers that
+    // there is none, rather than an answer about an application nothing created: ids differing
+    // in length and alphabet, and one whose application was taken away.
+    let created = create_application(&emulator, json!({ "name": "endpoint-ui-gone" })).await;
+    let gone = string_member(&created.body, "id", "an application taken away");
+    let deleted = delete_application(&emulator, &gone).await;
+    assert_eq!(
+        deleted.status, 200,
+        "case an application taken away: expected 200 from DeleteApplication, got {} with {:?}",
+        deleted.status, deleted.body
+    );
+    // The removal is what the clock owes that application, so the case waits for the
+    // CONDITION — the account no longer holding it — rather than for a stretch of time.
+    let gone_url = format!("https://{unserved}{ENDPOINT_PATH_PREFIX}/{gone}");
+    poll_until("an application taken away", || async {
+        followed(&emulator, &gone_url).await.status == 404
+    })
+    .await;
+    for (case, id) in [
+        ("an id nothing was ever created under", "abc"),
+        ("a 20-character id of the width this service mints", "ab3xk9qp17vn42zd0c8m"),
+        ("an application taken away", gone.as_str()),
+    ] {
+        let url = format!("https://{unserved}{ENDPOINT_PATH_PREFIX}/{id}");
+        let answered = followed(&emulator, &url).await;
+        assert_eq!(
+            answered.status, 404,
+            "case {case}: expected 404 from following {url:?}, got {} with {:?}",
+            answered.status, answered.body
+        );
+        // The same sentence the control plane states about an id naming no application of
+        // this account, so both halves of the service say one thing about it.
+        assert_eq!(
+            answered.body["message"],
+            json!(APPLICATION_DOES_NOT_EXIST),
+            "case {case}: expected the answer to state that there is no such application, got \
+             {:?}",
+            answered.body
         );
     }
 }

@@ -155,11 +155,11 @@ pub(super) const TOKEN_LEN: u32 = 12;
 ///
 /// `Id` is `^[a-z0-9]{3,30}$`, a bound far wider than the ONE width the service mints
 /// inside it, so the modelled pattern does not settle this. What does is the identity's
-/// own shape: the id IS the host label the application's endpoint is reached on
-/// (`https://<id>.<region>.opensearch.amazonaws.com`), which is the form this account's
+/// own shape: the id is the host label AWS's own endpoint for an application carries
+/// (`<id>.<region>.opensearch.amazonaws.com`), which is the form this account's
 /// OpenSearch collections and their endpoints take too — 20 lowercase alphanumeric
-/// characters. A client, a provider or a test that checks the form of an id (or of an
-/// endpoint built from one) against AWS's own takes this width and no other.
+/// characters. A client, a provider or a test that checks the form of an id against AWS's
+/// own takes this width and no other.
 pub(super) const APPLICATION_ID_LEN: u32 = 20;
 
 /// The widest token [`drawn_token`] renders: `36^24` is the last power of 36 a `u128`

@@ -165,6 +165,10 @@ mod store;
 /// The capabilities an OpenSearch UI application has registered, and their lifecycle.
 mod capabilities;
 
+/// The ADDRESS an OpenSearch UI application publishes for its own user interface, and the
+/// page a fetch of that address renders out of the stored application.
+pub mod application_ui;
+
 /// A principal's access to one domain through an interface VPC endpoint, and the
 /// service-managed endpoints themselves.
 mod vpc_endpoints;
@@ -207,6 +211,7 @@ mod projections;
 mod refusals;
 
 pub use analyzers::*;
+pub use application_ui::*;
 pub use capabilities::*;
 pub use domains::*;
 pub use indexes::*;
@@ -1291,7 +1296,9 @@ pub struct Application {
     /// The application's `ARN`, built by [`application_arn`] from the id the store
     /// minted.
     pub arn: String,
-    /// "The endpoint URL of an OpenSearch application" ([`application_endpoint`]).
+    /// "The endpoint URL of an OpenSearch application" — the URL a client follows to
+    /// reach this application's user interface, built over the endpoint this emulator is
+    /// reached at ([`application_endpoint`]).
     pub endpoint: String,
     /// Where the application is in its lifecycle: one of `ApplicationStatus`'s
     /// values.
@@ -1563,16 +1570,6 @@ pub fn application_arn(id: &str, region: &str) -> String {
         region,
         &format!("application/{id}"),
     )
-}
-
-/// The URL an OpenSearch UI application is reached on: the application's own id, the
-/// Region it was created in, then the user-interface host of this service.
-///
-/// The model types the member as a plain string, so its SHAPE is the service's to
-/// pick: it is derived from the id rather than the name, so two applications never
-/// share an endpoint and renaming one cannot move it.
-pub fn application_endpoint(id: &str, region: &str) -> String {
-    format!("https://{id}.{region}.opensearch.amazonaws.com")
 }
 
 /// The `ConflictException` payload for a create whose `name` is already an

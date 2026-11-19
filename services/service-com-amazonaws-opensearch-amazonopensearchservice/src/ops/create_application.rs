@@ -278,7 +278,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = store.mint_application_id();
         let application = Application {
             arn: application_arn(&id, &region),
-            endpoint: application_endpoint(&id, &region),
+            // The URL a client follows to reach this application's user interface, built
+            // over the endpoint THIS emulator is reached at rather than over a host of
+            // AWS's: a client handed an address it cannot resolve reaches no user
+            // interface at all (`crate::state::application_ui`).
+            endpoint: application_endpoint(ctx.parts(), ctx.endpoint().as_str(), &id),
             id,
             name: input.name,
             // The application is not up the instant the call returns: it is being
