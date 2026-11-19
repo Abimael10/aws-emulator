@@ -73,6 +73,16 @@ redis-protocol = { version = "6.0.0", default-features = false, features = ["std
 # and `logs:GetLogEvents` answer from
 # (`src/state/cache_data_plane/slow_log.rs`), the way the EC2 store above is read.
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# `src/service/authorization.rs` resolves WHO a request speaks for from the same place
+# `sts:GetCallerIdentity` answers from, and reads the identity-based policies, the
+# permissions boundary and the session policies in force on that principal through STS's
+# own view of the IAM store on the same engine.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The `application/x-www-form-urlencoded` parameter list an awsQuery request's body is,
+# read by the crate that decodes that media type rather than by a split of the bytes: the
+# authorization gate reads the identifier its request addresses a resource by out of it
+# (`src/service/authorization.rs`).
+form_urlencoded = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -105,6 +115,13 @@ aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio",
 # this workspace already builds.
 rustls = { workspace = true }
 tokio-rustls = "0.26"
+# IAM, mounted beside this one in the authorization suite: the role, its inline policy and
+# its permissions boundary are that service's own records, which is where the gate reads the
+# documents in force on the caller from.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# ... and STS beside it: the assumed-role session a request signs with is that service's own
+# record, which is where the gate resolves the principal an access key id speaks for.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [lints]
 workspace = true

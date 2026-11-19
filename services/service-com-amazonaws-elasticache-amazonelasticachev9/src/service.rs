@@ -74,9 +74,20 @@
 //! * [`absent_parameter`] — the code and the sentence a request that omits a parameter the
 //!   model requires is refused with, which belongs to no handler at all: the framework
 //!   refuses it before one runs.
+//!
+//! # The gate ahead of every operation
+//!
+//! Whether IAM lets the caller perform the action it named is a fact of the CREDENTIAL the
+//! request presented and of the policies in force at the instant of the call, not of the input
+//! any one operation reads — so it is decided once, ahead of every operation, by
+//! [`authorization`], and a request the documents in force do not allow is refused
+//! `AccessDenied` before a handler reaches the store. It is asked at the same wrapper the
+//! envelope element is added by ([`query_error_envelope::RequestIdEnvelopeOperation`]), so the
+//! refusal travels in this service's own envelope like every other failure.
 
 pub mod absent_parameter;
 pub mod access_string_categories;
+pub mod authorization;
 pub mod cache_parameter_group_not_found;
 pub mod identifier_length_rules;
 pub mod query_error_envelope;

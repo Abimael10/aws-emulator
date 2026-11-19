@@ -1621,6 +1621,18 @@ pub fn parameter_group_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("parametergroup:{name}"))
 }
 
+/// The ARN of a cache security group:
+/// `arn:aws:elasticache:<region>:<account>:securitygroup:<name>`.
+///
+/// The EC2-Classic resource kind this emulator mints no record of
+/// ([`RESOURCE_TYPE_SEGMENTS`]), named here in the one form its ARN takes because the
+/// authorization gate ahead of every operation judges a request against the ARN of the
+/// resource it addresses, whether or not this store holds that resource
+/// (`crate::service::authorization`).
+pub fn security_group_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("securitygroup:{name}"))
+}
+
 /// The ARN of a snapshot: `arn:aws:elasticache:<region>:<account>:snapshot:<name>`.
 pub fn snapshot_arn(region: &str, snapshot_name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("snapshot:{snapshot_name}"))

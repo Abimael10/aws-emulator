@@ -214,14 +214,23 @@ fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dy
 /// [`ErasedOperation::run`]. So the framework still owns the whole
 /// deserialize → validate → handle → serialize sequence (and every status, code and
 /// message it answers with), and this wrapper owns one element of the envelope — plus the
-/// one piece of work that belongs to NO single operation: a cache cluster's event is
-/// published to the Amazon SNS topic its notification configuration names, and an event is
-/// recorded by the lifecycle calls AND by every call that materialises a change the clock
-/// made due, so the delivery is made here rather than repeated in each of them. It runs
-/// after the response has been rendered, so it cannot change what this call answers.
+/// two pieces of work that belong to NO single operation:
+///
+/// * the AUTHORIZATION gate ahead of every operation
+///   ([`crate::service::authorization::refusal_response`]): whether the caller may perform the
+///   action at all is a fact of the credential the request presented and of the policies in
+///   force at the instant of the call, so it is decided here, before the operation reaches the
+///   store, and the refusal is finished with the same envelope element every other error
+///   carries;
+/// * a cache cluster's event is published to the Amazon SNS topic its notification
+///   configuration names, and an event is recorded by the lifecycle calls AND by every call
+///   that materialises a change the clock made due, so the delivery is made here rather than
+///   repeated in each of them. It runs after the response has been rendered, so it cannot
+///   change what this call answers.
 pub struct RequestIdEnvelopeOperation<Eng: Send + Sync + 'static> {
     /// The shared engine this service's store lives in — the one the notifications are
-    /// taken from. Held rather than reached through `svc`, which is engine-erased.
+    /// taken from, and the one the IAM and STS records the gate decides on live in. Held
+    /// rather than reached through `svc`, which is engine-erased.
     engine: std::sync::Arc<Eng>,
 }
 
@@ -240,15 +249,28 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for RequestIdEnvelopeOperation<
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            let answered = match modeled_operation(svc, req) {
-                Some(op) => with_request_id(op.run(svc, req, ctx).await),
-                // Unreachable through `Service::override_operation`, which claims a
-                // request only when the routing table holds its key; answered as the
-                // framework answers an unroutable request rather than guessed at. The
-                // envelope element is NOT added here: that answer comes from
-                // [`ElastiCacheDefinition::routing_error_response`], which already adds
-                // it, so there is exactly one writer on this path.
-                None => svc.definition().routing_error_response(req),
+            // The authorization gate, ahead of the operation: a request the policies in force
+            // on the caller do not allow is refused before any handler reaches the store, and
+            // the refusal is finished with this service's envelope element like every other
+            // error (see the type docs).
+            let refused = crate::service::authorization::refusal_response(
+                &*self.engine,
+                svc,
+                req,
+                ctx,
+            );
+            let answered = match refused {
+                Some(response) => with_request_id(response),
+                None => match modeled_operation(svc, req) {
+                    Some(op) => with_request_id(op.run(svc, req, ctx).await),
+                    // Unreachable through `Service::override_operation`, which claims a
+                    // request only when the routing table holds its key; answered as the
+                    // framework answers an unroutable request rather than guessed at. The
+                    // envelope element is NOT added here: that answer comes from
+                    // [`ElastiCacheDefinition::routing_error_response`], which already adds
+                    // it, so there is exactly one writer on this path.
+                    None => svc.definition().routing_error_response(req),
+                },
             };
             crate::state::deliver_cluster_notifications(&self.engine, ctx).await;
             answered

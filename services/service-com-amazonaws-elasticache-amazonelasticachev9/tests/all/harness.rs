@@ -23,6 +23,11 @@ use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 /// itself.
 pub const REGION: &str = "us-east-1";
 
+/// The access key id every suite signs with unless it is exercising WHO a request
+/// speaks for: a key neither STS nor IAM holds a record for, which is the position
+/// AWS account root credentials are in.
+pub const ACCOUNT_KEY_ID: &str = "AKIDEXAMPLE";
+
 /// The API version an `awsQuery` client sends beside `Action`, from the model's
 /// service version (`smithy_query(query="service_info")`: `version 2015-02-02`).
 pub const API_VERSION: &str = "2015-02-02";
@@ -298,6 +303,39 @@ impl Emulator {
         router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
             Arc::clone(&engine),
         ));
+        let callback = EmbeddedEmulator::from_router(router.clone());
+        Self {
+            router,
+            engine,
+            callback,
+        }
+    }
+
+    /// The same emulator with IAM and STS mounted BESIDE this service on the one
+    /// shared engine, the way the assembled emulator mounts them.
+    ///
+    /// That is the only way a suite about AUTHORIZATION reaches the records the
+    /// decision is taken from: the role and its policies are IAM's own records,
+    /// and the session an access key id speaks for is STS's, which is where the
+    /// gate ahead of every operation resolves both.
+    pub fn with_identity() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
+        router.register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        router.register_service(
+            service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
         let callback = EmbeddedEmulator::from_router(router.clone());
         Self {
             router,
@@ -659,9 +697,24 @@ impl Emulator {
             .state::<state::ComAmazonawsElasticacheAmazonelasticachev9State>()
     }
 
-    /// Send one `awsQuery` call: `Action`, `Version` and the given form pairs.
+    /// Send one `awsQuery` call: `Action`, `Version` and the given form pairs,
+    /// signed with [`ACCOUNT_KEY_ID`].
     pub async fn call_in(
         &self,
+        region: &str,
+        action: &str,
+        params: &[(String, String)],
+    ) -> Reply {
+        self.call_signed_by(ACCOUNT_KEY_ID, region, action, params)
+            .await
+    }
+
+    /// The same call signed with `access_key_id` — what names the principal the
+    /// request speaks for, and so what the authorization gate ahead of every
+    /// operation decides the call on.
+    pub async fn call_signed_by(
+        &self,
+        access_key_id: &str,
         region: &str,
         action: &str,
         params: &[(String, String)],
@@ -674,8 +727,8 @@ impl Emulator {
             body.push_str(&form_encode(value));
         }
         let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/elasticache/aws4_request, \
-             SignedHeaders=host, Signature=deadbeef"
+            "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/elasticache/\
+             aws4_request, SignedHeaders=host, Signature=deadbeef"
         );
         let request = http::Request::builder()
             .method("POST")
