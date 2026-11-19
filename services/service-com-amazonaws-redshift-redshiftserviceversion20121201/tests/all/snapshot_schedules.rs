@@ -32,6 +32,7 @@ use std::time::{Duration, SystemTime};
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
 use crate::cluster_lifecycle::{all_text, Answer, Emulator};
+use crate::modify_snapshot_schedule::modify_params;
 
 /// One row of the create table: everything a `CreateSnapshotSchedule` request
 /// carries, plus how often the schedule it states fires.
@@ -1368,6 +1369,203 @@ async fn a_definition_under_the_minimum_interval_is_refused_with_nothing_stored(
             "Schedule interval {one_under} is less than minimum interval of {floor_minutes} minutes"
         )),
     );
+}
+
+/// The unit spellings a `rate(value unit)` definition may state its interval in,
+/// each with how long one of it lasts in seconds.
+///
+/// Source: `smithy_query(query="doc", shape="CreateSnapshotScheduleMessage",
+/// member="ScheduleDefinitions")` — "schedule expressions, for example
+/// \"cron(30 12 *)\" or \"rate(12 hours)\"": the published rate syntax pairs a
+/// value with a unit, written singular or plural.
+const RATE_UNIT_SPELLINGS: &[(&str, u64)] = &[
+    ("minute", 60),
+    ("minutes", 60),
+    ("hour", 60 * 60),
+    ("hours", 60 * 60),
+    ("day", 24 * 60 * 60),
+    ("days", 24 * 60 * 60),
+];
+
+/// The values the grid below pairs with every unit spelling: the value that
+/// reaches the bound in each unit, the ones either side of it, and values far
+/// over and far under it.
+const RATE_VALUES: &[u64] = &[1, 2, 5, 23, 59, 60, 61, 1440];
+
+/// How a definition is SPELLED decides nothing: the expression type and the unit
+/// are read case-insensitively and the fields are read whatever whitespace
+/// separates them, so two spellings of one interval are decided the same way.
+///
+/// Each row is one spelling, paired with the interval it states in seconds.
+const RATE_SPELLINGS: &[(&str, &str, u64)] = &[
+    ("the unit in upper case", "rate(5 MINUTES)", 5 * 60),
+    ("the expression type in upper case", "RATE(5 minutes)", 5 * 60),
+    ("both fields in mixed case", "Rate(5 Minutes)", 5 * 60),
+    ("doubled space between the fields", "rate(5  minutes)", 5 * 60),
+    ("space inside the brackets", "rate( 5 minutes )", 5 * 60),
+    ("the bound itself in upper case", "RATE(1 HOUR)", 60 * 60),
+    ("the bound itself spaced out", "rate( 60  minutes )", 60 * 60),
+];
+
+/// The floor a snapshot schedule's definitions are held to is decided by the
+/// interval a definition STATES, not by the unit it is written in nor by how it
+/// is spelled: every pairing of a value with a unit is served exactly when the
+/// interval it states reaches [`state::MIN_SCHEDULE_INTERVAL`], and refused with
+/// the modelled `InvalidSchedule` otherwise, naming the definition the request
+/// carried.
+///
+/// The inputs are the whole grid of [`RATE_VALUES`] against
+/// [`RATE_UNIT_SPELLINGS`] rather than rows someone picked, then the spellings of
+/// [`RATE_SPELLINGS`], each driven through the create path and the change path —
+/// the two paths that ACCEPT a definition — so neither reads a definition the
+/// other would refuse.
+#[tokio::test]
+async fn the_minimum_interval_is_decided_by_the_stated_interval_not_the_spelling() {
+    let emulator = Emulator::new();
+    // The bound is read off the service's own constant, so each row follows the
+    // rule rather than a number spelled here.
+    let floor_seconds = state::MIN_SCHEDULE_INTERVAL.as_secs();
+    let floor_minutes = floor_seconds / 60;
+    let refusal = |definition: &str| {
+        format!(
+            "Schedule interval {definition} is less than minimum interval of {floor_minutes} \
+             minutes"
+        )
+    };
+
+    for (unit, unit_seconds) in RATE_UNIT_SPELLINGS.iter().copied() {
+        for value in RATE_VALUES.iter().copied() {
+            let definition = format!("rate({value} {unit})");
+            let identifier = format!("interval-grid-{unit}-{value}");
+            let served = value * unit_seconds >= floor_seconds;
+            let answer = call_with(
+                &emulator,
+                "CreateSnapshotSchedule",
+                &create_params(
+                    Some(&identifier),
+                    &[definition.as_str()],
+                    None,
+                    &[],
+                    None,
+                    None,
+                ),
+            )
+            .await;
+            if served {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {definition}: it states {} seconds, which reaches the \
+                     {floor_seconds}-second bound, so expected status 200, got {} with body {}",
+                    value * unit_seconds,
+                    answer.status,
+                    answer.body
+                );
+                assert_eq!(
+                    stored_definitions(&emulator, &identifier).as_deref(),
+                    Some(&[definition.clone()][..]),
+                    "case {definition}: expected the definition stored as sent, got {:?}",
+                    stored_definitions(&emulator, &identifier)
+                );
+            } else {
+                assert_refused(&definition, &answer, 400, "InvalidSchedule");
+                assert_text(&definition, &answer, "Message", Some(&refusal(&definition)));
+                assert!(
+                    stored_definitions(&emulator, &identifier).is_none(),
+                    "case {definition}: a refused create stores nothing, got {:?}",
+                    stored_definitions(&emulator, &identifier)
+                );
+            }
+        }
+    }
+
+    // The change path reads a definition under the same rule, so the schedule a
+    // refused change names keeps the definitions it had.
+    let held = ["rate(12 hours)".to_string()];
+    let changed = "interval-spelling-change";
+    let seeded = call_with(
+        &emulator,
+        "CreateSnapshotSchedule",
+        &create_params(Some(changed), &["rate(12 hours)"], None, &[], None, None),
+    )
+    .await;
+    assert_eq!(
+        seeded.status, 200,
+        "case seeding the changed schedule: expected status 200, got {} with body {}",
+        seeded.status, seeded.body
+    );
+
+    for (index, (case, definition, stated_seconds)) in RATE_SPELLINGS.iter().copied().enumerate() {
+        // What the bound says about a row follows from the interval that row
+        // STATES, so the comparison is the rule rather than a verdict written
+        // beside the spelling.
+        let served = stated_seconds >= floor_seconds;
+        let identifier = format!("interval-spelling-{index}");
+        let created = call_with(
+            &emulator,
+            "CreateSnapshotSchedule",
+            &create_params(Some(&identifier), &[definition], None, &[], None, None),
+        )
+        .await;
+        let change = call_with(
+            &emulator,
+            "ModifySnapshotSchedule",
+            &modify_params(changed, &[definition]),
+        )
+        .await;
+        if served {
+            assert_eq!(
+                created.status, 200,
+                "case {case}: {definition} states {stated_seconds} seconds, so expected the \
+                 create served with 200, got {} with body {}",
+                created.status, created.body
+            );
+            assert_eq!(
+                stored_definitions(&emulator, &identifier).as_deref(),
+                Some(&[definition.to_string()][..]),
+                "case {case}: expected the definition stored as sent, got {:?}",
+                stored_definitions(&emulator, &identifier)
+            );
+            assert_eq!(
+                change.status, 200,
+                "case {case}: expected the change served with 200, got {} with body {}",
+                change.status, change.body
+            );
+            assert_eq!(
+                stored_definitions(&emulator, changed).as_deref(),
+                Some(&[definition.to_string()][..]),
+                "case {case}: expected the change stored, got {:?}",
+                stored_definitions(&emulator, changed)
+            );
+            // The rows that follow read this schedule as the seeded one again.
+            let put_back = call_with(
+                &emulator,
+                "ModifySnapshotSchedule",
+                &modify_params(changed, &["rate(12 hours)"]),
+            )
+            .await;
+            assert_eq!(
+                put_back.status, 200,
+                "case {case}: expected the schedule put back, got {} with body {}",
+                put_back.status, put_back.body
+            );
+        } else {
+            assert_refused(case, &created, 400, "InvalidSchedule");
+            assert_text(case, &created, "Message", Some(&refusal(definition)));
+            assert!(
+                stored_definitions(&emulator, &identifier).is_none(),
+                "case {case}: a refused create stores nothing, got {:?}",
+                stored_definitions(&emulator, &identifier)
+            );
+            assert_refused(case, &change, 400, "InvalidSchedule");
+            assert_text(case, &change, "Message", Some(&refusal(definition)));
+            assert_eq!(
+                stored_definitions(&emulator, changed).as_deref(),
+                Some(&held[..]),
+                "case {case}: expected the schedule to keep {held:?}, got {:?}",
+                stored_definitions(&emulator, changed)
+            );
+        }
+    }
 }
 
 /// A delete REMOVES the schedule from the store, which is what makes the

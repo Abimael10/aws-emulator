@@ -134,7 +134,14 @@ fn definition_params<S: AsRef<str>>(definitions: &[S]) -> Vec<(String, String)> 
 }
 
 /// The form parameters of a `ModifySnapshotSchedule` request.
-fn modify_params<S: AsRef<str>>(identifier: &str, definitions: &[S]) -> Vec<(String, String)> {
+///
+/// `pub(crate)` because the change path is driven from the snapshot-schedule
+/// suite too (see [`crate::snapshot_schedules`]), so one encoding of
+/// `ScheduleDefinitions` serves both rather than a copy per suite.
+pub(crate) fn modify_params<S: AsRef<str>>(
+    identifier: &str,
+    definitions: &[S],
+) -> Vec<(String, String)> {
     let mut params = vec![("ScheduleIdentifier".to_string(), identifier.to_string())];
     params.extend(definition_params(definitions));
     params
