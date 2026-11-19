@@ -54,7 +54,7 @@ fn build_router() -> MultiServiceRouter {
 
 /// The `Arn` STS reports for the credential this suite signs with, over STS's own
 /// awsQuery wire.
-async fn caller_identity_arn(router: &MultiServiceRouter) -> String {
+pub(crate) async fn caller_identity_arn(router: &MultiServiceRouter) -> String {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -74,7 +74,11 @@ async fn caller_identity_arn(router: &MultiServiceRouter) -> String {
 }
 
 /// Send one Billing awsJson1_0 call and return its status and decoded body.
-async fn billing(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn billing(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")

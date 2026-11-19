@@ -22,8 +22,8 @@ use crate::ops::types::{
 };
 
 use super::{
-    amount, apply_rate, caller_identity_arn, epoch_secs, prorate, rate_decimal, timestamp,
-    ComAmazonawsBillingAwsbillingState, SupportEligibleSpend, BILLING_SERVICE_CODE,
+    amount, apply_rate, caller_account_id, caller_identity_arn, epoch_secs, prorate, rate_decimal,
+    timestamp, ComAmazonawsBillingAwsbillingState, SupportEligibleSpend, BILLING_SERVICE_CODE,
     MINOR_UNITS_PER_UNIT,
 };
 
@@ -668,6 +668,34 @@ pub fn enterprise_support_access_denied<Eng: Send + Sync + 'static>(
             caller_identity_arn(engine, ctx)
         ),
     }
+}
+
+/// The refusal every read of the Enterprise Support profile answers a caller
+/// that is not the payer account of the consolidated billing family with, or
+/// `None` when the caller IS that account.
+///
+/// The decision needs one fact out of this service's store — which account pays
+/// for the family — so it is taken under a guard that is released again before
+/// anything else happens, and the refusal is composed with NO lock of this
+/// service held: building it resolves the caller's identity
+/// ([`caller_identity_arn`]), which reaches another service's store, and that
+/// must never happen inside this service's critical section. Every read of the
+/// profile decides its boundary through this one helper, so all three decide it
+/// the way the ARN-addressed handlers decide theirs before they lock.
+pub fn enterprise_support_read_refusal<Eng: Send + Sync + 'static>(
+    state: &::engine::ServiceState<ComAmazonawsBillingAwsbillingState>,
+    operation: &str,
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> Option<AccessDeniedException> {
+    let caller_is_payer = {
+        let store = state.lock();
+        store.is_billing_family_management_account(caller_account_id())
+    };
+    if caller_is_payer {
+        return None;
+    }
+    Some(enterprise_support_access_denied(operation, engine, ctx))
 }
 
 impl ComAmazonawsBillingAwsbillingState {

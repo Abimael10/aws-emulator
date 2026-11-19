@@ -249,22 +249,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // payer account whose Support profile this contract is about.
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| unavailable("the Enterprise Support contract store"))?;
-        // A reporting operation: the guard is only read through, so two callers
-        // reading the same month see the same answer.
-        let state = state.lock();
 
         // The contract covers the consolidated billing family, and its data is
         // the account that pays for that family's to read, so a caller that
         // pays for nobody is refused rather than answered with another
-        // profile's contract.
-        if !state.is_billing_family_management_account(crate::state::caller_account_id()) {
+        // profile's contract. The boundary is decided — and the refusal
+        // composed — BEFORE the store is locked for the report below, because
+        // resolving the caller's identity for that refusal reaches another
+        // service's store, which this way never happens while this service's
+        // own lock is held.
+        if let Some(denied) = crate::state::enterprise_support_read_refusal(
+            &state,
+            Self::NAME,
+            &*self.engine,
+            ctx,
+        ) {
             return Err(
-                GetEnterpriseSupportContractDetailsErrorModeled::AccessDeniedException(
-                    crate::state::enterprise_support_access_denied(Self::NAME, &*self.engine, ctx),
-                )
-                .into(),
+                GetEnterpriseSupportContractDetailsErrorModeled::AccessDeniedException(denied)
+                    .into(),
             );
         }
+
+        // A reporting operation: the guard is only read through, so two callers
+        // reading the same month see the same answer.
+        let state = state.lock();
 
         let requested = parse_month(&input.billing_month)
             .ok_or_else(|| invalid_field("billingMonth", "must name a calendar month"))?;

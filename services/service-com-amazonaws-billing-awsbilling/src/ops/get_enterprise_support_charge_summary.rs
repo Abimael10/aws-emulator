@@ -235,29 +235,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // payer account whose Support profile that answer is about.
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| unavailable("the Support charge store"))?;
-        // A reporting operation: the guard is only read through, so two callers
-        // reading the same month see the same answer.
-        let state = state.lock();
 
         // `payerAccountId` is "the payer account ID that is authorized to view
         // Enterprise Support data for all accounts in its Support profile": the
         // profile's data belongs to the account that pays for the family, so a
         // caller that pays for nobody is refused rather than answered with
-        // another profile's charges.
-        let payer_account_id = state.billing_family_management_account_id.clone();
-        let caller_account_id = crate::state::caller_account_id();
-        if payer_account_id != caller_account_id {
+        // another profile's charges. The boundary is decided — and the refusal
+        // composed — BEFORE the store is locked for the report below, because
+        // resolving the caller's identity for that refusal reaches another
+        // service's store, which this way never happens while this service's
+        // own lock is held.
+        if let Some(denied) = crate::state::enterprise_support_read_refusal(
+            &state,
+            Self::NAME,
+            &*self.engine,
+            ctx,
+        ) {
             return Err(
-                GetEnterpriseSupportChargeSummaryErrorModeled::AccessDeniedException(
-                    crate::state::enterprise_support_access_denied(
-                        Self::NAME,
-                        &*self.engine,
-                        ctx,
-                    ),
-                )
-                .into(),
+                GetEnterpriseSupportChargeSummaryErrorModeled::AccessDeniedException(denied).into(),
             );
         }
+
+        // A reporting operation: the guard is only read through, so two callers
+        // reading the same month see the same answer.
+        let state = state.lock();
+        let payer_account_id = state.billing_family_management_account_id.clone();
+        // The caller, which the refusal above has established IS that payer
+        // account: the identity whose own share of the profile's charge this
+        // answer reports.
+        let caller_account_id = crate::state::caller_account_id();
 
         let requested = parse_month(&input.billing_month)
             .ok_or_else(|| invalid_field("billingMonth", "must name a calendar month"))?;
