@@ -1151,7 +1151,7 @@ pub const RELATIONAL_DATABASE_PARAMETER_PAGE_SIZE: usize = 50;
 /// The runtime parameters the database engine `engine` offers: the catalog of
 /// the engine the database's blueprint names.
 ///
-/// The engine is matched the way [`relational_database_port`] matches it — on
+/// The engine is matched the way [`is_postgres_engine`] matches it — on
 /// the engine FAMILY — so a blueprint of any PostgreSQL major version resolves
 /// to the PostgreSQL set and everything else to the MySQL one, which is the
 /// engine the modelled `RelationalDatabaseEngine` enum names.

@@ -137,9 +137,8 @@ pub fn unpublished_tls_policy_message(member: &str, name: &str) -> String {
 /// load balancer", so it must never be a name that sends the next client OUT of
 /// the emulator. This emulator owns no DNS zone, so the name keeps the ELB SHAPE
 /// (`<load balancer name>-<id>.<region>`) under a suffix that belongs to the
-/// emulator and cannot resolve off-machine, exactly as a managed database's
-/// master endpoint does ([`RELATIONAL_DATABASE_ENDPOINT_SUFFIX`]): `.local` is
-/// reserved for link-local multicast name resolution (RFC 6762 §3).
+/// emulator and cannot resolve off-machine: `.local` is reserved for link-local
+/// multicast name resolution (RFC 6762 §3).
 ///
 /// This emulator terminates no HTTP traffic on it: a load balancer's DATA plane
 /// is not served. Everything the control plane owns — the record, its state,

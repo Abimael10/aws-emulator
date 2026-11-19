@@ -16547,6 +16547,7 @@ dependencies = [
 name = "service-com-amazonaws-lightsail-lightsail-20161128"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -16568,13 +16569,16 @@ dependencies = [
  "pkcs8 0.10.2",
  "quick-xml",
  "rcgen",
+ "rustls",
  "serde_json",
  "service-com-amazonaws-s3-amazons3",
+ "service-common",
  "sha1 0.10.7",
  "sha2 0.10.9",
  "spki 0.7.3",
  "ssh-key",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 
@@ -22129,6 +22133,7 @@ dependencies = [
  "chrono",
  "cron",
  "flate2",
+ "getrandom 0.3.4",
  "hex",
  "http",
  "ipnet",
@@ -22142,11 +22147,13 @@ dependencies = [
  "rcgen",
  "regex",
  "ring",
+ "rusqlite",
  "rustls",
  "rustls-pemfile",
  "serde",
  "serde_json",
  "serde_json_path",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "tokio",
  "tracing",

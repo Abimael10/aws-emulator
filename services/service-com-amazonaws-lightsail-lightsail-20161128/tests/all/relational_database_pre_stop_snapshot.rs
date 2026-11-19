@@ -236,10 +236,10 @@ async fn a_pre_stop_snapshot_restores_a_database_while_its_source_stays_stopped(
             "case {case}: expected the restored database to announce an endpoint, got {restored:?}"
         );
         assert_ne!(
-            restored["masterEndpoint"]["address"], serving["masterEndpoint"]["address"],
+            restored["masterEndpoint"], serving["masterEndpoint"],
             "case {case}: expected the restored database to announce an endpoint of its own, got \
              {:?} for both",
-            restored["masterEndpoint"]["address"]
+            restored["masterEndpoint"]
         );
 
         // The restore acted on the copy, so the database the copy was taken of is

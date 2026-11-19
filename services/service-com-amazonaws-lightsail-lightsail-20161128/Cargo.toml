@@ -58,11 +58,23 @@ sha1 = "0.10"
 # The base64 body of an OpenSSH public key line, and the encoding OpenSSH
 # publishes a key fingerprint in.
 base64 = "0.22"
+# The managed relational database's DATA plane: the endpoint a MySQL or
+# PostgreSQL client connects to is served by the ONE shared statement of a
+# SQL-wire data plane (`service_common::sql_wire_planes`), which owns the wires
+# and the confined in-process SQL engine; this crate adds the Lightsail half —
+# which wire a blueprint's engine speaks, and the stored database a login is
+# admitted against. `service_common` also carries the readings this service
+# already shares with its siblings (the address a data plane publishes, and the
+# register that makes it dialable by an in-process client).
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`: `automod` declares a
+# module per `tests/all/<suite>.rs`, so a new suite is a new file and nothing else.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # The granted temporary key material is read back with the SAME OpenSSH key crate
@@ -79,11 +91,18 @@ md-5 = "0.10"
 # fingerprints are checked against.
 base64 = "0.22"
 sha1 = "0.10"
-# `time` for the tests that wait on a clock-owed instance transition.
-tokio = { workspace = true, features = ["time"] }
+# `time` for the tests that wait on a clock-owed instance transition, and the
+# socket and stream traits the database endpoint suite dials the published
+# endpoint and speaks the engine's wire over.
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
 # An XML reader for the `ListObjectsV2` body the bucket object data plane answers
 # with, so a listing is read as a client reads it rather than by slicing the body.
 quick-xml = "0.41"
+# The MySQL and PostgreSQL client halves the database endpoint suite speaks:
+# `rustls`/`tokio-rustls` run the client side of the in-band TLS upgrade the
+# core's own upgrader answers.
+tokio-rustls = "0.26"
+rustls = { workspace = true }
 
 [lints]
 workspace = true

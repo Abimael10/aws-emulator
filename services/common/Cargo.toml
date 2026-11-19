@@ -130,7 +130,36 @@ uuid = { version = "1", features = ["v4"] }
 # `in_band_tls`: the async read/write traits a data-plane connection is read through
 # (`io-util`'s `AsyncReadExt` for the one sniffed byte, and the `AsyncRead`/`AsyncWrite`
 # the replaying stream implements), for a plane whose encryption is negotiated in band.
-tokio = { workspace = true, features = ["io-util"] }
+# `sql_wire_planes`: the same traits each wire reads and writes its own protocol through,
+# the blocking pool every statement of a SQL-wire session runs on (`rt`, from the
+# workspace's own feature set), and the clock its own cases wait on.
+tokio = { workspace = true, features = ["io-util", "time"] }
+# `sql_wire_planes`: the SQL engine a database endpoint's statements run against, in memory
+# and per resource — the `bundled` SQLite already in this workspace, at the version and
+# feature set the Amazon RDS engine endpoint builds (`vendor/emulator-telemetry` and the
+# Athena, Redshift Data and RDS Data services build the same one). `column_decltype`
+# carries the declared type of a column, which is what each wire maps to its own type code;
+# `limits` installs the per-connection bounds on a statement, a value and a row;
+# `functions` registers the server functions a statement may call (`version()`,
+# `database()`); `hooks` carries the default-deny authorizer that confines a client's SQL to
+# its own database and the progress handler that bounds one statement's run. An in-process
+# library over data: it opens no listener (the core owns the socket), writes no host file
+# (every database is opened in memory, with its temp store in memory too) and spawns
+# nothing.
+rusqlite = { version = "0.41", features = [
+    "bundled",
+    "column_decltype",
+    "functions",
+    "hooks",
+    "limits",
+] }
+# `sql_wire_planes`: `sha1` is the digest the MySQL `mysql_native_password` handshake is
+# defined in terms of, and the only form a native-password login can be verified against.
+sha1 = "0.10"
+# ... and `getrandom` draws the per-connection nonce that handshake challenges a client
+# with from the operating system's own entropy, so the proof the client answers with cannot
+# be replayed.
+getrandom = "0.3"
 # `iam_authorization`: the reading of an IP address or a range in CIDR notation that the
 # IAM `IpAddress`/`NotIpAddress` condition operators compare an address against, taken from
 # the maintained crate rather than by splitting the notation by hand.

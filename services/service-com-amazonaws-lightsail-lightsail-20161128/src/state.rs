@@ -312,6 +312,16 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// every database operation takes. A `BTreeMap` so `GetRelationalDatabases`
     /// walks a stable, total order and a page token can name the next database.
     pub relational_databases: BTreeMap<String, StoredRelationalDatabase>,
+    /// The open DATA plane of each managed relational database, keyed by the
+    /// same name the record is: the listener its engine is served on, and the
+    /// engine itself.
+    ///
+    /// Beside the records rather than on them, because a stored record is
+    /// CLONED by the reads that report it and a listener is not a value that can
+    /// be copied: the plane is the live resource, held here for as long as the
+    /// database is, and dropped with it — which is what closes the port
+    /// ([`relational_database_plane`]).
+    pub relational_database_planes: BTreeMap<String, RelationalDatabasePlane>,
     /// Every managed relational database snapshot, keyed by its snapshot name —
     /// the identifier every database snapshot operation takes. A `BTreeMap` so
     /// `GetRelationalDatabaseSnapshots` walks a stable, total order and a page
@@ -1597,10 +1607,25 @@ impl ComAmazonawsLightsailLightsail20161128State {
         self.relational_databases.get(name)
     }
 
-    /// Store a newly created managed relational database.
-    pub fn insert_relational_database(&mut self, database: StoredRelationalDatabase) {
+    /// Store a newly created managed relational database, together with the
+    /// data plane opened for it: the listener the plane holds is what keeps its
+    /// published endpoint answering, so it is admitted in the same step the
+    /// record is and no read can see a database whose endpoint nothing serves.
+    pub fn insert_relational_database(
+        &mut self,
+        database: StoredRelationalDatabase,
+        plane: RelationalDatabasePlane,
+    ) {
+        self.relational_database_planes
+            .insert(database.name.clone(), plane);
         self.relational_databases
             .insert(database.name.clone(), database);
+    }
+
+    /// The open data plane of the managed relational database `name`, for a
+    /// caller that reads what its engine holds.
+    pub fn relational_database_plane(&self, name: &str) -> Option<&RelationalDatabasePlane> {
+        self.relational_database_planes.get(name)
     }
 
     /// The managed relational database `name` names, for an operation the spec
@@ -1633,6 +1658,10 @@ impl ComAmazonawsLightsailLightsail20161128State {
         name: &str,
     ) -> Option<RemovedRelationalDatabase> {
         let database = self.relational_databases.remove(name)?;
+        // The plane goes with the record: dropping it closes the port the
+        // database published and severs every session on it, which is what
+        // deleting a database does to the clients connected to it.
+        self.relational_database_planes.remove(name);
         let released_references =
             self.release_alarms_monitoring(RESOURCE_TYPE_RELATIONAL_DATABASE, name);
         Some(RemovedRelationalDatabase {
@@ -2324,16 +2353,6 @@ impl ComAmazonawsLightsailLightsail20161128State {
             b"container-service-domain",
             DOMAIN_TOKEN_LEN,
             DOMAIN_TOKEN_ALPHABET,
-        )
-    }
-
-    /// The DNS label of one managed relational database's master endpoint: see
-    /// [`RELATIONAL_DATABASE_HOST_LABEL_LEN`].
-    pub fn mint_endpoint_host_label(&mut self) -> String {
-        self.mint_token(
-            b"relational-database-endpoint",
-            RELATIONAL_DATABASE_HOST_LABEL_LEN,
-            RELATIONAL_DATABASE_HOST_LABEL_ALPHABET,
         )
     }
 
@@ -4423,9 +4442,23 @@ pub fn with_state<Eng: Send + Sync + 'static, R>(
     body: impl FnOnce(&mut ComAmazonawsLightsailLightsail20161128State) -> R,
 ) -> Option<R> {
     let state = service_state(engine)?;
+    Some(with_held_state(&state, body))
+}
+
+/// Run `body` against the store a caller ALREADY holds the handle to, with
+/// every clock-owed transition already applied.
+///
+/// The same read [`with_state`] gives a handler, for a holder that was handed
+/// the handle rather than the engine: a data plane's session, which has no
+/// request context of its own and still must not observe a database that should
+/// already have settled.
+pub fn with_held_state<R>(
+    state: &::engine::ServiceState<ComAmazonawsLightsailLightsail20161128State>,
+    body: impl FnOnce(&mut ComAmazonawsLightsailLightsail20161128State) -> R,
+) -> R {
     let mut guard = state.lock();
     guard.advance_clock(now_ms());
-    Some(body(&mut guard))
+    body(&mut guard)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -4527,6 +4560,11 @@ pub use key_pairs::*;
 /// The managed relational databases and their snapshots.
 mod relational_databases;
 pub use relational_databases::*;
+
+/// The DATA plane of a managed relational database: the endpoint its engine is
+/// served at.
+mod relational_database_plane;
+pub use relational_database_plane::*;
 
 /// The append-only operation log every mutating call writes.
 mod operation_log;

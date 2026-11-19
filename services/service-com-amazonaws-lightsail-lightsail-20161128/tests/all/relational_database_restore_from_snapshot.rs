@@ -40,19 +40,11 @@ const ACCOUNT: &str = "000000000000";
 /// (`crate::state::DEFAULT_REGION`).
 const DEFAULT_REGION: &str = "us-east-1";
 
-/// The suffix every announced master endpoint carries
-/// (`crate::state::RELATIONAL_DATABASE_ENDPOINT_SUFFIX`).
-const ENDPOINT_SUFFIX: &str = "rds.lightsail.local";
-
-/// The port a database of `engine` must listen on: the engine's own default
-/// (MySQL 3306, PostgreSQL 5432).
-fn want_port(engine: &str) -> i64 {
-    if engine.contains("postgres") {
-        5432
-    } else {
-        3306
-    }
-}
+/// The address every announced master endpoint must carry: the host this
+/// emulator is REACHED on, since the core binds its listeners on the
+/// operator-chosen interface, loopback by default, which is what this suite
+/// runs under.
+const LOOPBACK: &str = "127.0.0.1";
 
 /// The three-letter day tokens a weekly maintenance window names
 /// (`crate::state::MAINTENANCE_WINDOW_DAYS`).
@@ -627,29 +619,40 @@ async fn a_restored_database_is_read_back_exactly() {
         }
 
         // The endpoint a client connects to is announced once the restored
-        // database is serving, on the engine's own port, and it is the restored
-        // database's own address.
-        let engine = database["engine"].as_str().unwrap_or_default().to_string();
-        assert_eq!(
-            database["masterEndpoint"]["port"].as_i64(),
-            Some(want_port(&engine)),
-            "case {case}: expected the {engine} default port, got {database:?}"
+        // database is serving: an address inside this emulator, a port its own
+        // engine is listening on there, and an endpoint of its OWN — a restore
+        // is a database of its own and serves no other database's engine.
+        let port = database["masterEndpoint"]["port"].as_i64().unwrap_or_else(|| {
+            panic!("case {case}: expected a master endpoint port, got {database:?}")
+        });
+        assert!(
+            (1..=65535).contains(&port),
+            "case {case}: expected the port the database is listening on, got {port}"
         );
         let address = database["masterEndpoint"]["address"]
             .as_str()
             .unwrap_or_else(|| {
                 panic!("case {case}: expected a master endpoint address, got {database:?}")
             });
-        assert!(
-            address.ends_with(&format!(".{reported_region}.{ENDPOINT_SUFFIX}"))
-                && address.starts_with("ls-"),
-            "case {case}: expected the endpoint of a Lightsail-managed instance in \
-             {reported_region} under {ENDPOINT_SUFFIX}, got {address}"
+        assert_eq!(
+            address, LOOPBACK,
+            "case {case}: expected an address this emulator answers on, got {address}"
         );
         assert_ne!(
-            database["masterEndpoint"]["address"], source["masterEndpoint"]["address"],
+            database["masterEndpoint"], source["masterEndpoint"],
             "case {case}: two databases never share a master endpoint, got {database:?} against \
              {source:?}"
+        );
+        // And it is an endpoint that ANSWERS: the restored database's own engine
+        // is served there, so the announcement is checked by dialling it — the
+        // loopback address the assertion above pinned.
+        let port = u16::try_from(port)
+            .unwrap_or_else(|_| panic!("case {case}: expected a port a client can dial, got {port}"));
+        let dialled = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+        assert!(
+            dialled.is_ok(),
+            "case {case}: expected the announced endpoint {address}:{port} to accept a \
+             connection, got {dialled:?}"
         );
 
         // Nothing was modified about the database or the snapshot the restore
@@ -758,7 +761,7 @@ async fn two_restores_of_one_snapshot_are_independent_databases() {
         );
     }
     assert_ne!(
-        restored[0]["masterEndpoint"]["address"], restored[1]["masterEndpoint"]["address"],
+        restored[0]["masterEndpoint"], restored[1]["masterEndpoint"],
         "case two restores of one snapshot: two databases never share a master endpoint, got {:?} \
          and {:?}",
         restored[0], restored[1]

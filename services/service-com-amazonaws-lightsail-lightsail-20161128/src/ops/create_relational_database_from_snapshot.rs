@@ -265,7 +265,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let publicly_accessible = input.publicly_accessible.unwrap_or(false);
         let now = crate::state::now_ms();
 
-        crate::state::with_state(&*self.engine, |store| {
+        // Everything the restored database inherits is resolved against the
+        // store FIRST and the record is built here; the database's own endpoint
+        // is opened afterwards, with no store guard held, and the record is
+        // admitted to the store with that endpoint on it. So nothing binds a
+        // listener for a restore that was going to be refused, and no read ever
+        // sees a restored database whose endpoint nothing serves.
+        let prepared = crate::state::with_state(&*self.engine, |store| {
             // A database name addresses one database, so restoring onto one this
             // account already holds is refused rather than silently replacing a
             // record that holds data.
@@ -419,7 +425,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let location = crate::state::StoredLocation::zonal(&availability_zone, &region);
 
             let id = store.mint_uuid();
-            let host_label = store.mint_endpoint_host_label();
             // The restored database is reached with the master user password the
             // snapshot captured, as a version created by this restore — the
             // instant `GetRelationalDatabaseMasterUserPassword` reports for the
@@ -441,7 +446,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
                 crate::state::RELATIONAL_DATABASE_STATE_AVAILABLE,
             );
-            store.insert_relational_database(crate::state::StoredRelationalDatabase {
+            Ok(crate::state::StoredRelationalDatabase {
                 name: name.clone(),
                 // The restored database is a resource of its own: its ARN,
                 // support code, creation time and endpoint are newly minted
@@ -469,11 +474,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // with it on, however it was created.
                 backup_retention_enabled: true,
                 secondary_availability_zone,
-                endpoint_address: crate::state::relational_database_endpoint_address(
-                    &id,
-                    &host_label,
-                    &region,
-                ),
+                // Filled in from the endpoint opened for this database below,
+                // which is the address its engine is served at.
+                endpoint_address: String::new(),
+                endpoint_port: 0,
                 // The certificate authority a new database's server
                 // certificate is issued under, until an
                 // `UpdateRelationalDatabase` call associates another one with
@@ -496,7 +500,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // finished being provisioned.
                 events: Vec::new(),
                 next_event_sequence: 0,
-            });
+            })
+        })
+        .ok_or_else(unavailable)??;
+
+        // The restored database's own ENGINE ENDPOINT: an address inside this
+        // emulator, where the blueprint's engine is served, which is what it
+        // publishes as its `masterEndpoint` once it reports `available`.
+        let plane = crate::state::open_relational_database_plane(
+            &*self.engine,
+            &name,
+            prepared.blueprint.engine,
+        )
+        .await
+        .map_err(data_plane_unavailable)?;
+        let mut record = prepared;
+        record.endpoint_address = plane.endpoint().address.clone();
+        record.endpoint_port = plane.endpoint().port;
+        let location = record.location.clone();
+        let due_at_ms = record.due.map(|due| due.at_ms);
+
+        crate::state::with_state(&*self.engine, |store| {
+            // Another request may have created this name while this one was
+            // binding, so the conflict is answered again here rather than
+            // overwriting a stored database.
+            if store.relational_database(&name).is_some() {
+                return Err(invalid(format!(
+                    "a relational database named '{name}' already exists"
+                )));
+            }
+            store.insert_relational_database(record, plane);
             // `operations` is a list because other Lightsail creates act on
             // several resources at once; `CreateRelationalDatabaseFromSnapshot`
             // creates exactly one database, so it answers exactly one entry,
@@ -508,7 +541,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
                 &name,
                 &location,
-                Some(due.at_ms),
+                due_at_ms,
             );
             Ok(CreateRelationalDatabaseFromSnapshotOutput {
                 operations: Some(vec![operation.view()]),
@@ -657,4 +690,16 @@ fn fault(message: &str) -> CreateRelationalDatabaseFromSnapshotError {
 /// modelled server fault, never a fresh engine.
 fn unavailable() -> CreateRelationalDatabaseFromSnapshotError {
     fault("the Lightsail relational database store is unavailable")
+}
+
+/// The restored database's data plane could not be opened: no listener, so no
+/// endpoint for its engine to be served at.
+///
+/// A modelled server fault rather than a success: a database whose
+/// `masterEndpoint` nothing answers on would report itself available and send
+/// every client that connects to it nowhere.
+fn data_plane_unavailable(error: String) -> CreateRelationalDatabaseFromSnapshotError {
+    fault(&format!(
+        "the database was not restored because its endpoint could not be opened: {error}"
+    ))
 }

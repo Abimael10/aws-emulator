@@ -53,23 +53,13 @@ const MAINTENANCE_WINDOW_DAYS: &[&str] = &["Mon", "Tue", "Wed", "Thu", "Fri", "S
 /// Minutes in a day: the clock a daily backup window is measured on.
 const MINUTES_PER_DAY: i64 = 24 * 60;
 
-/// The DNS suffix a master endpoint address must carry: a suffix this emulator
-/// owns, under `.local`, which RFC 6762 §3 reserves for link-local name
-/// resolution — so the announced address can never reach a host off this
-/// machine, where AWS's own `rds.amazonaws.com` name would.
-const ENDPOINT_SUFFIX: &str = "rds.lightsail.local";
-
-/// The port a database of `engine` must listen on: the engine's own default
-/// (MySQL 3306, PostgreSQL 5432), the ports RDS documents as the default for each
-/// engine under `CreateDBInstance$Port`. Lightsail exposes no port parameter, so
-/// a database always listens on its engine's default.
-fn want_port(engine: &str) -> i64 {
-    if engine.contains("postgres") {
-        5432
-    } else {
-        3306
-    }
-}
+/// The address every announced master endpoint must carry: the host this
+/// emulator is REACHED on, because `RelationalDatabaseEndpoint$address` is "the
+/// DNS address of the database" and a client that follows the contract (create,
+/// wait for `available`, connect) has to arrive at the database's engine. The
+/// core binds its listeners on the operator-chosen interface, loopback by
+/// default, which is what this suite runs under.
+const LOOPBACK: &str = "127.0.0.1";
 
 /// An engine identifier of exactly `chars` characters: a letter first, then
 /// letters, as both `masterDatabaseName` and `masterUsername` require.
@@ -600,24 +590,21 @@ async fn a_created_database_is_read_back_exactly() {
         }
 
         // The endpoint a client connects to is announced once the database is
-        // serving, on the engine's own port.
-        let engine = database["engine"].as_str().unwrap_or_default().to_string();
-        assert_eq!(
-            database["masterEndpoint"]["port"].as_i64(),
-            Some(want_port(&engine)),
-            "case {case}: expected the {engine} default port, got {database:?}"
+        // serving: an address inside this emulator, and the port its engine is
+        // listening on there.
+        let port = database["masterEndpoint"]["port"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("case {case}: expected a master endpoint port, got {database:?}"));
+        assert!(
+            (1..=65535).contains(&port),
+            "case {case}: expected the port the database is listening on, got {port}"
         );
         let address = database["masterEndpoint"]["address"]
             .as_str()
             .unwrap_or_else(|| panic!("case {case}: expected a master endpoint address, got {database:?}"));
-        assert!(
-            address.ends_with(&format!(".{reported_region}.{ENDPOINT_SUFFIX}")),
-            "case {case}: expected the endpoint in {reported_region} under {ENDPOINT_SUFFIX}, got \
-             {address}"
-        );
-        assert!(
-            address.starts_with("ls-"),
-            "case {case}: expected the endpoint of the Lightsail-managed instance, got {address}"
+        assert_eq!(
+            address, LOOPBACK,
+            "case {case}: expected an address this emulator answers on, got {address}"
         );
         // The announced address must never send the next client out of the
         // emulator: no AWS (or Lightsail) hostname, ever.
@@ -625,6 +612,18 @@ async fn a_created_database_is_read_back_exactly() {
             !address.contains("amazonaws.com") && !address.contains("amazonlightsail.com"),
             "case {case}: the announced address must not name a host off this emulator, got \
              {address}"
+        );
+        // And it is an endpoint that ANSWERS: the address and port a client
+        // reads out of the control plane are the ones it connects to, so the
+        // announcement is checked by dialling it — the loopback address the
+        // assertion above pinned, on this emulator's own machine.
+        let port = u16::try_from(port)
+            .unwrap_or_else(|_| panic!("case {case}: expected a port a client can dial, got {port}"));
+        let dialled = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+        assert!(
+            dialled.is_ok(),
+            "case {case}: expected the announced endpoint {address}:{port} to accept a \
+             connection, got {dialled:?}"
         );
 
         // The windows: named verbatim, or defaulted to a well-formed window of

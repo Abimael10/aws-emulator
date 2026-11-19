@@ -66,62 +66,11 @@ pub fn relational_database_ca_certificate_identifiers() -> String {
 /// member of its own `PendingModifiedValues` the same way.
 pub const MASKED_MASTER_USER_PASSWORD: &str = "****";
 
-/// The DNS suffix a Lightsail managed database's master endpoint carries.
-///
-/// A Lightsail managed database IS an Amazon RDS DB instance — which is why
-/// every member of the modelled `RelationalDatabase` is an RDS one — and AWS
-/// publishes its `masterEndpoint.address` under its own
-/// `rds.amazonaws.com` zone. That HOSTNAME is environment-specific and no
-/// caller may assume it, while the PROMISE the member makes is not:
-/// `RelationalDatabaseEndpoint$address` is "the DNS address of the database",
-/// so it must never be an address that sends the next client OUT of the
-/// emulator — the rule this crate already states for `Bucket$url` and a
-/// container service's public address. This emulator owns no DNS zone, so the
-/// address keeps the RDS SHAPE (`<db instance identifier>.<host label>.<region>`)
-/// under a suffix that belongs to the emulator and cannot resolve off-machine,
-/// exactly as a container service's private domain name does
-/// (`PRIVATE_DOMAIN_SUFFIX`, `<service name>.service.local`): `.local` is
-/// reserved for link-local multicast name resolution (RFC 6762 §3), so a name
-/// under it can never address a host off this machine. The labels are
-/// the database's own, so two databases never share an address.
-///
-/// This emulator serves no MySQL or PostgreSQL wire protocol on it, because the
-/// core's native listener (`engine.listeners().tcp`) is TLS-from-the-first-byte
-/// and neither engine's protocol begins with a TLS handshake: a MySQL server
-/// sends its Initial Handshake Packet in the clear and only then upgrades, on
-/// the client's SSL-request packet, and PostgreSQL negotiates the same way
-/// through its SSLRequest message — so the core's `rustls` acceptor fails the
-/// handshake of every real database driver before the connection ever reaches a
-/// handler (`vendor/server/src/listeners.rs`: "TLS-only ... a plaintext/HTTP
-/// preface also fails the handshake here and never reaches the handler"), and a
-/// service may not bind a socket of its own. Serving a database data plane
-/// needs a core seam that hands over a connection WITHOUT terminating TLS first
-/// (so the protocol server can do the in-band upgrade itself); until the core
-/// offers one, no address this service could announce would answer the MySQL or
-/// PostgreSQL protocol. Everything the control plane owns — resolving the
-/// database, its state, its hardware, its credentials and its windows — is real.
-pub(super) const RELATIONAL_DATABASE_ENDPOINT_SUFFIX: &str = "rds.lightsail.local";
-
-/// The prefix of the RDS DB instance identifier Lightsail gives a managed
-/// database: Lightsail names the underlying instance after itself rather than
-/// after the Lightsail resource, which is why a master endpoint begins `ls-`
-/// instead of with the database's own name.
-pub(super) const RELATIONAL_DATABASE_INSTANCE_ID_PREFIX: &str = "ls-";
-
-/// How many characters the minted host label of a master endpoint carries: the
-/// 12-character DNS label RDS puts between the instance identifier and the
-/// region.
-pub(super) const RELATIONAL_DATABASE_HOST_LABEL_LEN: usize = 12;
-
-/// The alphabet that host label is drawn from. A DNS label is
-/// case-insensitive and RDS renders this one in lowercase.
-pub(super) const RELATIONAL_DATABASE_HOST_LABEL_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-
 /// Whether `engine` is the PostgreSQL engine FAMILY.
 ///
-/// The ONE engine classification every per-engine helper here shares (the port,
-/// the parameter catalog, the log streams and the master-credential limits), so
-/// they cannot drift apart.
+/// The engine classification every per-engine helper here shares (the
+/// parameter catalog, the log streams, the wire protocol the data plane serves
+/// and the master-credential limits), so they cannot drift apart.
 ///
 /// It answers true when any SEPARATOR-DELIMITED token of the value is
 /// `postgres` or `postgresql`, case-insensitively — which covers the catalog's
@@ -136,20 +85,6 @@ pub fn is_postgres_engine(engine: &str) -> bool {
         .any(|token| {
             token.eq_ignore_ascii_case("postgres") || token.eq_ignore_ascii_case("postgresql")
         })
-}
-
-/// The port a database of `engine` listens on: the engine's own default
-/// (MySQL `3306`, PostgreSQL `5432`), the ports RDS documents as the default for
-/// each engine under `CreateDBInstance$Port`.
-///
-/// Lightsail exposes no port parameter at all, so a database always listens on
-/// its engine's default.
-pub fn relational_database_port(engine: &str) -> i32 {
-    if is_postgres_engine(engine) {
-        5432
-    } else {
-        3306
-    }
 }
 
 /// The log streams a MySQL managed database publishes, in the order
@@ -216,16 +151,6 @@ pub fn relational_database_arn(region: &str, id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{RELATIONAL_DATABASE_ARN_RESOURCE_PREFIX}{id}"),
-    )
-}
-
-/// The master endpoint address of a database whose underlying DB instance was
-/// minted as `id`, whose host label is `host_label`, in `region`. See
-/// [`RELATIONAL_DATABASE_ENDPOINT_SUFFIX`].
-pub fn relational_database_endpoint_address(id: &str, host_label: &str, region: &str) -> String {
-    format!(
-        "{RELATIONAL_DATABASE_INSTANCE_ID_PREFIX}{}.{host_label}.{region}.{RELATIONAL_DATABASE_ENDPOINT_SUFFIX}",
-        id.replace('-', "")
     )
 }
 
@@ -970,9 +895,24 @@ pub struct StoredRelationalDatabase {
     /// secondary database is used for failover support of a high availability
     /// database."
     pub secondary_availability_zone: Option<String>,
-    /// The master endpoint address, assigned at creation so every later read
-    /// reports the same one. See [`RELATIONAL_DATABASE_ENDPOINT_SUFFIX`].
+    /// The master endpoint this database's engine is SERVED at, assigned when
+    /// the data plane was opened for it so every later read reports the same
+    /// one.
+    ///
+    /// `RelationalDatabaseEndpoint$address` is "the DNS address of the
+    /// database" and `$port` is "the port that the database is listening on",
+    /// so the pair has to be an address a client can resolve and reach, where
+    /// this database's engine answers. AWS publishes a name in its own
+    /// `rds.amazonaws.com` zone; this emulator publishes the host and the port
+    /// of the listener the core opened for this database
+    /// ([`RelationalDatabasePlane`]), which is an address inside the emulator
+    /// and where this database's MySQL or PostgreSQL wire is served. An address
+    /// outside the emulator would send every client that follows the contract —
+    /// create, wait for `available`, connect — to a host nothing answers on.
     pub endpoint_address: String,
+    /// The port of that endpoint: the one the core assigned the listener, which
+    /// is the port this database is listening on.
+    pub endpoint_port: i32,
     /// The certificate authority this database's server certificate is issued
     /// under, as `caCertificateIdentifier` reports it: the service's default
     /// ([`RELATIONAL_DATABASE_CA_CERTIFICATE_IDENTIFIER`]) until an
@@ -1479,7 +1419,7 @@ impl StoredRelationalDatabase {
             // reported for every state other than `creating`.
             master_endpoint: (self.state != RELATIONAL_DATABASE_STATE_CREATING).then(|| {
                 crate::ops::types::RelationalDatabaseEndpoint {
-                    port: Some(relational_database_port(self.blueprint.engine)),
+                    port: Some(self.endpoint_port),
                     address: Some(self.endpoint_address.clone()),
                 }
             }),
@@ -1536,10 +1476,13 @@ impl StoredRelationalDatabase {
     /// never disagree.
     ///
     /// A QUERY log (`general/`, `slowquery/`) holds a line per statement a
-    /// CLIENT ran, and this emulator serves no database protocol, so no
-    /// statement has ever reached an engine here and every one of those streams
-    /// is empty — the same reason a container service's log reports no line
-    /// (`crate::ops::get_container_log`).
+    /// CLIENT ran. The statements a client sends to this database's endpoint
+    /// are run by its engine ([`RelationalDatabasePlane`]), and that endpoint
+    /// keeps no per-statement log of them — the engine's own query logging is
+    /// what `general_log` and `slow_query_log` turn on, and this emulator
+    /// publishes those parameters without implementing the logging behind them
+    /// — so every one of those streams is empty rather than carrying lines
+    /// nothing wrote.
     ///
     /// Ordered by sequence, which is the order the service logged them in: a
     /// file is read in the order it was WRITTEN, while the event log's own

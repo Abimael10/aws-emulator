@@ -330,10 +330,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let publicly_accessible = input.publicly_accessible.unwrap_or(false);
         let now = crate::state::now_ms();
 
-        crate::state::with_state(&*self.engine, |store| {
+        // Every refusal above is the request's own. The two that depend on the
+        // STORE are answered here, BEFORE the database's data plane is opened,
+        // so nothing binds a listener for a create that was going to fail.
+        let refusal = crate::state::with_state(&*self.engine, |store| {
             // A database name addresses one database, so creating one this
             // account already holds is refused rather than silently replacing a
             // record that holds data.
+            if store.relational_database(&name).is_some() {
+                return Some(format!(
+                    "a relational database named '{name}' already exists"
+                ));
+            }
+            if store.relational_databases.len() >= crate::state::MAX_RELATIONAL_DATABASES {
+                return Some(format!(
+                    "creating a relational database would take this account past the {} this \
+                     emulator holds",
+                    crate::state::MAX_RELATIONAL_DATABASES
+                ));
+            }
+            None
+        })
+        .ok_or_else(unavailable)?;
+        if let Some(refusal) = refusal {
+            return Err(invalid(refusal));
+        }
+
+        // The database's own ENGINE ENDPOINT, opened with no store guard held:
+        // binding is asynchronous and the core owns the socket, the bind
+        // interface and the port. What it reports back is the address and port
+        // this database publishes as its `masterEndpoint` — an address inside
+        // this emulator, where the blueprint's engine is served. The database
+        // still reports `creating` until the clock makes `available` due, and a
+        // session opened before then is refused by the engine exactly as it is
+        // against a database that is still coming up.
+        let plane = crate::state::open_relational_database_plane(
+            &*self.engine,
+            &name,
+            blueprint.engine,
+        )
+        .await
+        .map_err(data_plane_unavailable)?;
+        let endpoint = plane.endpoint().clone();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // Another request may have created this name while this one was
+            // binding, so the conflict is answered again here rather than
+            // overwriting a stored database — and the listener this create
+            // opened is dropped with the plane it was going to be stored on.
             if store.relational_database(&name).is_some() {
                 return Err(invalid(format!(
                     "a relational database named '{name}' already exists"
@@ -348,7 +392,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let id = store.mint_uuid();
-            let host_label = store.mint_endpoint_host_label();
             // The master user password this database is reached with, which
             // `GetRelationalDatabaseMasterUserPassword` is what answers with.
             // A managed database always HAS one — it is the credential its
@@ -371,58 +414,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
                 crate::state::RELATIONAL_DATABASE_STATE_AVAILABLE,
             );
-            store.insert_relational_database(crate::state::StoredRelationalDatabase {
-                name: name.clone(),
-                arn: crate::state::relational_database_arn(&region, &id),
-                support_code: crate::state::support_code(&id),
-                created_at_ms: now,
-                location: location.clone(),
-                tags,
-                // The catalog entries resolved above, so the engine, the version
-                // and the hardware every read reports are the published ones
-                // rather than whatever the request spelled.
-                blueprint,
-                bundle,
-                master_database_name: input.master_database_name.clone(),
-                master_username: input.master_username.clone(),
-                master_user_password,
-                // Nothing has replaced the password this database was created
-                // with, so it has no PREVIOUS version yet.
-                previous_master_user_password: None,
-                preferred_backup_window,
-                preferred_maintenance_window,
-                publicly_accessible,
-                // `UpdateRelationalDatabase$disableBackupRetention` exists to
-                // turn automated backup retention OFF, so a database is created
-                // with it on.
-                backup_retention_enabled: true,
-                secondary_availability_zone,
-                endpoint_address: crate::state::relational_database_endpoint_address(
-                    &id,
-                    &host_label,
-                    &region,
-                ),
-                // The certificate authority a new database's server
-                // certificate is issued under, until an
-                // `UpdateRelationalDatabase` call associates another one with
-                // it.
-                ca_certificate_identifier: crate::state::RELATIONAL_DATABASE_CA_CERTIFICATE_IDENTIFIER
-                    .to_string(),
-                state: crate::state::RELATIONAL_DATABASE_STATE_CREATING,
-                due: Some(due),
-                // A new database runs the engine's own defaults: nothing has
-                // modified a parameter of it yet, which is why it reports
-                // `in-sync` until `UpdateRelationalDatabaseParameters` sets one.
-                parameter_overrides: Default::default(),
-                // Nothing has asked this database to change yet, so nothing is
-                // waiting for its maintenance window.
-                pending_modification: None,
-                // Nothing has happened to this database yet: the first entry of
-                // its event log is the one the clock writes when the database
-                // has finished being provisioned.
-                events: Vec::new(),
-                next_event_sequence: 0,
-            });
+            store.insert_relational_database(
+                crate::state::StoredRelationalDatabase {
+                    name: name.clone(),
+                    arn: crate::state::relational_database_arn(&region, &id),
+                    support_code: crate::state::support_code(&id),
+                    created_at_ms: now,
+                    location: location.clone(),
+                    tags,
+                    // The catalog entries resolved above, so the engine, the
+                    // version and the hardware every read reports are the
+                    // published ones rather than whatever the request spelled.
+                    blueprint,
+                    bundle,
+                    master_database_name: input.master_database_name.clone(),
+                    master_username: input.master_username.clone(),
+                    master_user_password,
+                    // Nothing has replaced the password this database was
+                    // created with, so it has no PREVIOUS version yet.
+                    previous_master_user_password: None,
+                    preferred_backup_window,
+                    preferred_maintenance_window,
+                    publicly_accessible,
+                    // `UpdateRelationalDatabase$disableBackupRetention` exists
+                    // to turn automated backup retention OFF, so a database is
+                    // created with it on.
+                    backup_retention_enabled: true,
+                    secondary_availability_zone,
+                    // The endpoint the database's own engine is served at,
+                    // reported from the state it announces `available`.
+                    endpoint_address: endpoint.address.clone(),
+                    endpoint_port: endpoint.port,
+                    // The certificate authority a new database's server
+                    // certificate is issued under, until an
+                    // `UpdateRelationalDatabase` call associates another one
+                    // with it.
+                    ca_certificate_identifier:
+                        crate::state::RELATIONAL_DATABASE_CA_CERTIFICATE_IDENTIFIER.to_string(),
+                    state: crate::state::RELATIONAL_DATABASE_STATE_CREATING,
+                    due: Some(due),
+                    // A new database runs the engine's own defaults: nothing
+                    // has modified a parameter of it yet, which is why it
+                    // reports `in-sync` until
+                    // `UpdateRelationalDatabaseParameters` sets one.
+                    parameter_overrides: Default::default(),
+                    // Nothing has asked this database to change yet, so nothing
+                    // is waiting for its maintenance window.
+                    pending_modification: None,
+                    // Nothing has happened to this database yet: the first
+                    // entry of its event log is the one the clock writes when
+                    // the database has finished being provisioned.
+                    events: Vec::new(),
+                    next_event_sequence: 0,
+                },
+                plane,
+            );
             // `operations` is a list because other Lightsail creates act on
             // several resources at once; `CreateRelationalDatabase` creates
             // exactly one database, so it answers exactly one entry, left
@@ -518,6 +564,22 @@ fn invalid(message: String) -> CreateRelationalDatabaseError {
 fn unavailable() -> CreateRelationalDatabaseError {
     CreateRelationalDatabaseErrorModeled::ServiceException(ServiceException {
         message: Some("the Lightsail relational database store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The database's data plane could not be opened: no listener, so no endpoint
+/// for the engine to be served at.
+///
+/// A modelled server fault rather than a success: a database whose
+/// `masterEndpoint` nothing answers on would report itself available and send
+/// every client that connects to it nowhere.
+fn data_plane_unavailable(error: String) -> CreateRelationalDatabaseError {
+    CreateRelationalDatabaseErrorModeled::ServiceException(ServiceException {
+        message: Some(format!(
+            "the database was not created because its endpoint could not be opened: {error}"
+        )),
         ..Default::default()
     })
     .into()
