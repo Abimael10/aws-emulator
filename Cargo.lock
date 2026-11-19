@@ -6494,16 +6494,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "memory-stats"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c73f5c649995a115e1a0220b35e4df0a1294500477f97a91d0660fb5abeb574a"
-dependencies = [
- "libc",
- "windows-sys 0.52.0",
-]
-
-[[package]]
 name = "micromath"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16176,7 +16166,6 @@ dependencies = [
  "ipnet",
  "libc",
  "md-5 0.10.6",
- "memory-stats",
  "nix",
  "percent-encoding",
  "rand 0.9.5",

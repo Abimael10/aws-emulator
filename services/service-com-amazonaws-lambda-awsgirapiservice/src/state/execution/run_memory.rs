@@ -68,11 +68,6 @@ impl Held {
         self.measured.store(true, Ordering::SeqCst);
     }
 
-    /// Whether the run's own start has been marked ([`Self::measure_from_here`]).
-    pub(super) fn measured(&self) -> bool {
-        self.measured.load(Ordering::SeqCst)
-    }
-
     /// Read what the run holds beyond its baseline, keep it if it is the greatest reading so
     /// far, and report it.
     ///

@@ -72,22 +72,23 @@
 //!   may take beside it ([`Clock::within`]), which [`Bounds::step`] and the watch below read
 //!   from this host's own clock — so the host a run of caller-supplied code runs on is
 //!   bounded whichever clock that run's deadline is read against.
-//! * MEMORY is sampled from outside the guest — this thread's faulted pages and the
-//!   process's resident size — because the interpreter exposes no allocation seam; a sample
-//!   past the run's own ceiling ends the run, and so does one showing the run has grown the
-//!   whole process past the process ceiling. Both are measured from what was held once the
-//!   interpreter was standing and before a line of the run's own code had been read
+//! * MEMORY is sampled from outside the guest — the faulted pages of the run's OWN thread,
+//!   because the interpreter exposes no allocation seam — and a sample past the run's own
+//!   ceiling ends the run. It is measured from what that thread held once the interpreter was
+//!   standing and before a line of the run's own code had been read
 //!   ([`Bounds::measure_memory_from_here`]), and the HOST takes that baseline: nothing the
-//!   guest can call re-takes it, so the ceiling cannot be lifted by asking.
-//! * A long NATIVE call emits no trace event, so neither the deadline nor a memory sample can
-//!   land inside one. That is what the host's own watch ([`watch_run`]) is for: ONE thread of
-//!   this process reads the same clock and the same process reading for every live run and
-//!   LATCHES the stop, which the next event the interpreter delivers then raises — so one
-//!   native allocation that takes the process past its ceiling ends that run without waiting
-//!   for the guest to produce an event. Beside it, the caller's own host wait and
-//!   abandoned-run accounting ([`super::run_invocation`]) make sure the CALLER is always
-//!   answered inside its ceiling, and a run still going after its budget was spent is given
-//!   up on.
+//!   guest can call re-takes it, so the ceiling cannot be lifted by asking. The reading is
+//!   this one run's and no other's: memory another run, another environment or the rest of
+//!   this emulator holds is never charged to it. What the runs in flight hold BETWEEN them is
+//!   bounded where they are admitted ([`super::MAX_CONCURRENT_RUN_MEMORY_MB`]), and what the
+//!   environments standing idle hold is bounded by the pool that keeps them
+//!   ([`super::warm_pool`]).
+//! * A long NATIVE call emits no trace event, so the deadline cannot land inside one. That is
+//!   what the host's own watch ([`watch_run`]) is for: ONE thread of this process reads the
+//!   same clock for every live run and LATCHES the stop, which the next event the interpreter
+//!   delivers then raises. Beside it, the caller's own host wait and abandoned-run accounting
+//!   ([`super::run_invocation`]) make sure the CALLER is always answered inside its ceiling,
+//!   and a run still going after its budget was spent is given up on.
 //! * RECURSION is clamped on the interpreter before any guest code runs, and
 //!   `sys.setrecursionlimit` is removed so the guest cannot raise it.
 //! * The LOG and the RESPONSE are each capped, so a small request cannot make an
@@ -230,23 +231,6 @@ const ALLOWED_NATIVE_MODULES: &[&str] = &[
 /// The modules this emulator SUPPLIES in place of ones it does not register: the host
 /// functions the runtime source calls.
 const SUPPLIED_MODULES: &[&str] = &[HOST_MODULE, "posix"];
-
-/// How many trace events pass between two readings of the whole PROCESS's resident size.
-/// That reading is a request to the operating system, so it is taken often enough to catch
-/// a process-wide growth inside one bounded stretch of work and seldom enough not to
-/// dominate the run; the RUN's own memory is sampled at every event ([`Bounds::step`]).
-const STEPS_BETWEEN_PROCESS_SAMPLES: u64 = 2_048;
-
-/// The resident size this WHOLE process may reach while a handler is running, whatever any
-/// one run has added.
-///
-/// A ceiling on the PROCESS, not on one run: the run's own ceiling is its `MemorySize`, which
-/// is what a run is answerable for. What this adds is that no number of concurrent runs can
-/// take the emulator past it — so a run is stopped for it when the run has GROWN the process
-/// past it ([`Bounds::past_process_ceiling`]), and not for a process that was already there
-/// when the run began: memory a run did not allocate is not a bound that run breached, and
-/// stopping it would answer the wrong caller while freeing nothing.
-const PROCESS_RESIDENT_CEILING_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// One invocation to run: the package, the handler, and everything the runtime reports to
 /// it.
@@ -2200,8 +2184,6 @@ pub struct Bounds {
     deadline_epoch_ms: ::std::sync::atomic::AtomicI64,
     /// How many traced events are left.
     steps: AtomicU64,
-    /// How many have been spent, for the memory-sample interval.
-    spent: AtomicU64,
     /// How much memory the run may add to this process.
     memory_bytes: u64,
     /// How large the handler's response may be.
@@ -2212,9 +2194,6 @@ pub struct Bounds {
     /// ([`Self::max_memory_bytes`]). Only the host marks that instant, so no guest can raise
     /// the baseline it is judged against.
     held: Held,
-    /// What this PROCESS held resident at that same instant, which is what the process
-    /// ceiling measures this run's own growth against. Taken there too, for the same reason.
-    resident_at_start: AtomicU64,
     /// Which bound was breached, once one was. Latched: the answer to a run that spent its
     /// budget is that stop, whatever the guest does afterwards.
     stopped: Mutex<Option<Stop>>,
@@ -2261,11 +2240,9 @@ impl Bounds {
             clock,
             deadline_epoch_ms: ::std::sync::atomic::AtomicI64::new(0),
             steps: AtomicU64::new(budget.steps),
-            spent: AtomicU64::new(0),
             memory_bytes: budget.memory_bytes,
             response_bytes: budget.response_bytes,
             held: Held::new(),
-            resident_at_start: AtomicU64::new(resident_bytes()),
             stopped: Mutex::new(None),
             breached: AtomicBool::new(false),
             spending: AtomicBool::new(false),
@@ -2275,9 +2252,8 @@ impl Bounds {
         }
     }
 
-    /// Measure this run's memory from HERE: the thread's faulted pages and the process's
-    /// resident size as they are now, which is what both ceilings judge the run's own growth
-    /// against.
+    /// Measure this run's memory from HERE: the faulted pages of this run's own thread as they
+    /// are now, which is what its ceiling judges the run's own growth against.
     ///
     /// Called by the HOST only ([`drive`]), once the interpreter is standing and before a
     /// line of the run's own code has been read, so what it measures is the memory the run
@@ -2285,10 +2261,6 @@ impl Bounds {
     /// not on the module the guest can reach: a run that could re-take its own baseline
     /// could hold the ceiling's worth of memory again after every call.
     fn measure_memory_from_here(&self) {
-        self.resident_at_start
-            .store(resident_bytes(), Ordering::Relaxed);
-        // Last, so the host's own watch ([`Self::watch`]) never judges a run against a
-        // baseline that is still the one taken when these bounds were built.
         self.held.measure_from_here();
     }
 
@@ -2316,28 +2288,24 @@ impl Bounds {
         epoch_ms
     }
 
-    /// Sample the run's DEADLINE and the PROCESS's memory from OUTSIDE it, and latch the stop
-    /// when either is spent.
+    /// Sample the run's DEADLINE from OUTSIDE it, and latch the stop when it is spent.
     ///
     /// Called by the host's own watch thread ([`watch_run`]) rather than by the interpreter,
     /// so what a run is stopped on is the host's own reading and not the guest's traced events:
     /// a long NATIVE call emits none, and this is what notices a run that has stopped producing
-    /// them — whether it is sitting past its deadline or has taken the process past its ceiling
-    /// in ONE allocation. The stop is latched here and raised at the next event the interpreter
-    /// does deliver, which is the only place an interpreter can be interrupted; the caller's own
-    /// wait and abandoned-run accounting ([`super::run_invocation`]) answer the caller
-    /// whatever the run goes on doing.
+    /// them while it sits past its deadline. The stop is latched here and raised at the next
+    /// event the interpreter does deliver, which is the only place an interpreter can be
+    /// interrupted; the caller's own wait and abandoned-run accounting
+    /// ([`super::run_invocation`]) answer the caller whatever the run goes on doing.
     ///
-    /// The run's OWN ceiling stays with the hook ([`Self::step`]): it is this THREAD's faulted
-    /// pages, which only the run's own thread can read. The process's resident size is a
-    /// reading any thread can take, so from the instant the run's own code can allocate it is
-    /// taken here as well — a bound sampled only between traced events is one a single native
-    /// allocation would step over, and the module-level code of the deployment package, which
-    /// runs in the INIT phase, allocates as freely as the handler does. That instant is when
-    /// the baselines were taken ([`Self::measure_memory_from_here`]), which the host does
-    /// before it reads a line of the run's own code: before it, while this emulator is
-    /// building the interpreter the run will happen in, the memory in flight is the host's own
-    /// doing and stopping a run for it would answer a caller that allocated none of it.
+    /// MEMORY is not judged here, and cannot be: what a run holds is the faulted pages of its
+    /// OWN thread, a reading only that thread can take ([`Self::past_run_ceiling`], read at
+    /// every traced event). The reading a thread of the HOST can take is the whole process's
+    /// resident size, which is every run's, every standing environment's and the rest of this
+    /// emulator's together — it says nothing about what any one run allocated, so nothing here
+    /// is decided on it. What the runs in flight may hold BETWEEN them is bounded where they
+    /// are admitted ([`super::MAX_CONCURRENT_RUN_MEMORY_MB`]), and what the environments
+    /// standing idle may hold is bounded by the pool that keeps them ([`super::warm_pool`]).
     ///
     /// The deadline judged is the one of the PHASE the run is in: a run still initializing
     /// its execution environment is judged against the span that initialization is allowed
@@ -2360,10 +2328,6 @@ impl Bounds {
             || self.past_the_init_limit()
         {
             self.breach(Stop::Deadline);
-            return;
-        }
-        if self.held.measured() && self.past_process_ceiling() {
-            self.breach(Stop::Memory);
         }
     }
 
@@ -2501,15 +2465,10 @@ impl Bounds {
             return Some(self.breach(Stop::Deadline));
         }
         // The run's OWN memory is sampled at EVERY traced event, so there is no sampling
-        // interval for an allocating guest to outrun: the thread's faulted pages are a
-        // counter this process already keeps. The whole process's resident size is read
-        // from the operating system, which is the dearer of the two, so that one is read
-        // every [`STEPS_BETWEEN_PROCESS_SAMPLES`] events.
-        let spent = self.spent.fetch_add(1, Ordering::Relaxed);
+        // interval for an allocating guest to outrun: the faulted pages of this run's own
+        // thread are a counter this process already keeps, and they are the only reading that
+        // belongs to this one run.
         if self.past_run_ceiling() {
-            return Some(self.breach(Stop::Memory));
-        }
-        if spent.is_multiple_of(STEPS_BETWEEN_PROCESS_SAMPLES) && self.past_process_ceiling() {
             return Some(self.breach(Stop::Memory));
         }
         None
@@ -2528,28 +2487,6 @@ impl Bounds {
     /// Called on the run's own thread, where the reading is this run's.
     fn max_memory_bytes(&self) -> u64 {
         self.held.max_bytes()
-    }
-
-    /// Whether THIS RUN has grown the whole process past [`PROCESS_RESIDENT_CEILING_BYTES`].
-    ///
-    /// Both halves are needed, and each says something the other does not: the process is past
-    /// the ceiling, AND this run is what took it there — it holds more than it held when its
-    /// own code was about to be read ([`Self::measure_memory_from_here`]), by more than the
-    /// run's own ceiling allows it to add. A process
-    /// already past the ceiling when the run began is not this run's doing: stopping the run
-    /// for it would answer a caller that allocated none of it and would free none of it
-    /// either, while the run's own growth is bounded by the ceiling above whatever the rest of
-    /// the process holds.
-    ///
-    /// Read by the hook and by the host's own watch ([`Self::watch`]), so a run that takes the
-    /// process past the ceiling inside one native call is stopped without waiting for the
-    /// guest to deliver another traced event.
-    fn past_process_ceiling(&self) -> bool {
-        let held = resident_bytes();
-        if held <= PROCESS_RESIDENT_CEILING_BYTES {
-            return false;
-        }
-        held.saturating_sub(self.resident_at_start.load(Ordering::Relaxed)) > self.memory_bytes
     }
 
     /// Latch `stop` as the run's answer and report it.
@@ -2582,14 +2519,6 @@ fn nanoseconds(span: Duration) -> u64 {
     u64::try_from(span.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// How many bytes this PROCESS holds resident, as the host reports it.
-fn resident_bytes() -> u64 {
-    match ::memory_stats::memory_stats() {
-        Some(stats) => u64::try_from(stats.physical_mem).unwrap_or(0),
-        None => 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2598,9 +2527,9 @@ mod tests {
     /// runs.
     ///
     /// Its memory ceiling is out of reach ([`CEILING_OUT_OF_REACH`]), because a row that is
-    /// not about the ceiling must not be answered by it: the ceiling is read from the whole
-    /// PROCESS as well as from the run, and this binary's own growth belongs to no row. A row
-    /// about the ceiling gives itself one it can reach.
+    /// not about the ceiling must not be answered by it: a row's own handler faults pages of
+    /// its thread simply by importing what it needs. A row about the ceiling gives itself one
+    /// it can reach.
     fn budget() -> Budget {
         Budget {
             wall_clock: Duration::from_secs(5),
@@ -2636,13 +2565,11 @@ mod tests {
     /// function may have (`smithy_query(query="shape", shape="MemorySize")`:
     /// `@range(min: 128, max: 32768)`), in bytes.
     ///
-    /// The ceiling is read from the whole PROCESS as well as from the run
-    /// ([`Bounds::past_process_ceiling`]): a run that allocated nothing of its own is stopped
-    /// for memory once this process has grown past its ceiling by more than the run's own
-    /// ceiling allows it to add — and in a test binary running many suites at once, that
-    /// growth is other suites' and no row's own. A row that names another bound is therefore
-    /// given the largest ceiling a function may have, which neither half of the memory bound
-    /// can reach, so the bound the row names is the only one that can answer it.
+    /// The ceiling is read from the run's OWN thread ([`Bounds::past_run_ceiling`]), which the
+    /// run's own work faults pages of whatever the row is about — importing a module, building
+    /// the value it returns. A row that names another bound is therefore given the largest
+    /// ceiling a function may have, which that work cannot reach, so the bound the row names is
+    /// the only one that can answer it.
     const CEILING_OUT_OF_REACH: u64 = 32_768 * 1024 * 1024;
 
     /// Run `source` as the module `lambda_function` of a one-file package, on a thread with
@@ -3699,6 +3626,63 @@ mod tests {
             assert!(
                 !actual.iter().any(|name| name == absent),
                 "case {absent}: a host-reaching module is registered, got {actual:?}"
+            );
+        }
+    }
+
+    /// A run is stopped for memory on its OWN reading and on no other: a run that allocated
+    /// nothing is answered by its handler however much memory the rest of this process holds.
+    ///
+    /// The rows are the two readings a run can be in: one whose own work stays inside the
+    /// ceiling its function configures, and one whose own work passes it. Neither consults
+    /// anything but the faulted pages of the run's own thread, which is why a run of one
+    /// function is never ended by what another run, a standing environment or this emulator
+    /// itself is holding.
+    #[test]
+    fn a_run_is_stopped_for_memory_only_on_its_own_reading() {
+        // (case, the ceiling the run's function configures, how many MB the handler holds,
+        //  whether the run is stopped for memory)
+        let cases: &[(&str, u64, usize, bool)] = &[
+            (
+                "a handler that holds nothing, under a ceiling it cannot reach",
+                CEILING_OUT_OF_REACH,
+                0,
+                false,
+            ),
+            (
+                "a handler that holds a little, under a ceiling it cannot reach",
+                CEILING_OUT_OF_REACH,
+                4,
+                false,
+            ),
+            (
+                "a handler that holds more than its function is configured for",
+                8 * 1024 * 1024,
+                64,
+                true,
+            ),
+        ];
+        for (case, ceiling, megabytes, expected) in cases {
+            let source = format!(
+                "def lambda_handler(event, context):\n    \
+                     held = [bytearray(1024 * 1024) for _ in range({megabytes})]\n    \
+                     return {{'held': len(held)}}\n"
+            );
+            let finished = ran_with(
+                &source,
+                "lambda_function.lambda_handler",
+                None,
+                &BTreeMap::new(),
+                Budget {
+                    memory_bytes: *ceiling,
+                    ..budget()
+                },
+            );
+            let stopped = matches!(finished.completion, Completion::Stopped(Stop::Memory));
+            assert_eq!(
+                stopped, *expected,
+                "case {case}: expected the run to be stopped for memory: {expected}, got {:?}",
+                finished.completion
             );
         }
     }

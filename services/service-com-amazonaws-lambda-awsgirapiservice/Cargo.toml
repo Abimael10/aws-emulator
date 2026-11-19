@@ -221,11 +221,10 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 #   They are PINNED exactly: `rustpython-codegen` 0.6 is built against the 0.16.5 AST,
 #   and 0.16.10 renamed fields it uses, so an unpinned resolution picks a newer 0.16.x
 #   and fails to compile.
-# * `nix` (`resource` only) and `memory-stats` read this process's own resource usage —
-#   the run thread's faulted pages and the process resident size — which is how a run is
-#   bounded in memory: RustPython exposes no allocator seam, so the bound is sampled from
-#   outside the guest. `nix` is the only one of these that compiles no C; `memory-stats`
-#   reads `/proc/self/statm` on Linux.
+# * `nix` (`resource` only) reads this process's own resource usage — the run thread's
+#   faulted pages — which is how a run is bounded in memory: RustPython exposes no
+#   allocator seam, so the bound is sampled from outside the guest, and a per-THREAD
+#   reading is the only one that belongs to one run. It compiles no C.
 #
 # Native and unsafe surface accepted here: the RustPython tree uses `unsafe` for its
 # object model and its frozen-module tables, and its `malachite`/`num` arithmetic
@@ -260,7 +259,6 @@ rustpython-ruff_python_trivia = "=0.16.5"
 rustpython-ruff_source_file = "=0.16.5"
 rustpython-ruff_text_size = "=0.16.5"
 nix = { version = "0.31", default-features = false, features = ["resource"] }
-memory-stats = "1"
 # The TRAFFIC SPLIT an alias with a `RoutingConfig` performs: one uniform draw per
 # invocation decides which of the two versions that invocation runs on
 # (`state::alias_routing`).
