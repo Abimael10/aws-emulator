@@ -11,17 +11,20 @@
 //!
 //! The rule under test, read off the Smithy model rather than off any one recorded request
 //! (`smithy_query(query="operation",operation="DeleteApiKeyCredentialProvider,\
-//! GetApiKeyCredentialProvider")`): a delete of a resource this account holds RETIRES it, so
-//! the resource stops resolving. `DeleteApiKeyCredentialProvider` answers 204 carrying no
-//! member and the provider carries no status, so the removal is immediate: every later read of
-//! that `name` is the modelled `ResourceNotFoundException` (HTTP 404) whose message names the
-//! name the request carried, the name is free for a new provider, and the delete retires the
-//! ONE provider it names — the account's other providers, and the Secrets Manager secret
-//! behind each provider's key, are left exactly as they were.
+//! GetApiKeyCredentialProvider")`): the delete is satisfied by the provider's ABSENCE. The
+//! model declares it idempotent with an empty 204 success, so for ANY name the request
+//! carries it answers 204 with no member and leaves this account holding no provider under
+//! that name — whether one was there or not, and however often the call is repeated. The
+//! provider carries no status, so the removal is immediate: every later read of that `name` is
+//! the modelled `ResourceNotFoundException` (HTTP 404) whose message names the name the
+//! request carried, and the name is free for a new provider. The delete reaches only the ONE
+//! provider it names — the account's other providers, and the Secrets Manager secret behind
+//! each provider's key, are left exactly as they were.
 //!
-//! The rows differ along what the rule generalises over: where the key lives
-//! (`MANAGED`, named and implied, and `EXTERNAL`), the shape and length of the provider's
-//! name, the size of the key, and whether the request carried tags.
+//! The rows differ along what the rule generalises over: whether the account holds a provider
+//! under the name at all, where the key lives (`MANAGED`, named and implied, and `EXTERNAL`),
+//! the shape and length of the provider's name, the size of the key, and whether the request
+//! carried tags.
 
 use std::sync::Arc;
 
@@ -203,11 +206,27 @@ impl Answer {
     }
 }
 
-/// The sentence this service refuses with when this account holds no provider under the
+/// The sentence the READ route refuses with when this account holds no provider under the
 /// name the request addressed. The fixed text is the service's; the only variable part is
 /// the name the request carried.
 fn not_found_message(name: &str) -> String {
     format!("ApiKeyCredentialProvider not found for {name}")
+}
+
+/// Assert one answer is the delete's empty 204 success: the modelled output shape has no
+/// members, so the body carries none.
+fn assert_empty_success(case: &str, answer: &Answer) {
+    let carries_no_member = match &answer.body {
+        Value::Null => true,
+        Value::Object(members) => members.is_empty(),
+        _ => false,
+    };
+    assert!(
+        answer.status == 204 && carries_no_member,
+        "case {case:?}: the delete answers 204 carrying no member, got {} ({})",
+        answer.status,
+        answer.body
+    );
 }
 
 /// Where a row's provider keeps its API key.
@@ -306,7 +325,7 @@ impl Row {
 
 /// A deleted provider stops resolving at once: the delete answers 204 carrying no member,
 /// every later read of that name is the modelled 404, a repeat of the delete is that same
-/// 404, and the name is free for a new provider.
+/// empty 204 success, and the name is free for a new provider.
 #[tokio::test]
 async fn a_deleted_api_key_credential_provider_stops_resolving() {
     for row in rows() {
@@ -326,18 +345,7 @@ async fn a_deleted_api_key_credential_provider_stops_resolving() {
         );
 
         let deleted = emulator.delete_provider(&row.name).await;
-        let carries_no_member = match &deleted.body {
-            Value::Null => true,
-            Value::Object(members) => members.is_empty(),
-            _ => false,
-        };
-        assert!(
-            deleted.status == 204 && carries_no_member,
-            "case {:?}: the delete answers 204 carrying no member, got {} ({})",
-            row.case,
-            deleted.status,
-            deleted.body
-        );
+        assert_empty_success(row.case, &deleted);
 
         let gone = emulator.get_provider(&row.name).await;
         assert_eq!(
@@ -364,18 +372,21 @@ async fn a_deleted_api_key_credential_provider_stops_resolving() {
             still_gone.body
         );
 
+        // The delete is satisfied by absence, so repeating it on the retired name is the
+        // same empty success rather than a refusal.
         let repeated = emulator.delete_provider(&row.name).await;
+        assert_empty_success(row.case, &repeated);
+        let still_gone_after_repeat = emulator.get_provider(&row.name).await;
         assert_eq!(
-            (repeated.status, repeated.error_code(), repeated.message()),
             (
-                404,
-                "ResourceNotFoundException".to_string(),
-                not_found_message(&row.name)
+                still_gone_after_repeat.status,
+                still_gone_after_repeat.message()
             ),
-            "case {:?}: a delete of a retired provider is the modelled 404, got {} ({})",
+            (404, not_found_message(&row.name)),
+            "case {:?}: a repeated delete does not resurrect the provider, got {} ({})",
             row.case,
-            repeated.status,
-            repeated.body
+            still_gone_after_repeat.status,
+            still_gone_after_repeat.body
         );
 
         // "The name must be unique within your account" held the name while the provider
@@ -509,10 +520,11 @@ async fn deleting_a_provider_leaves_the_other_providers_and_their_secrets_alone(
     );
 }
 
-/// A delete naming a provider this account does not hold is refused the modelled 404, names
-/// the name it carried, and deletes nothing.
+/// A delete naming a provider this account does not hold is the delete's own empty 204
+/// success — repeatable, and deleting nothing. The name it could not resolve is refused only
+/// on the READ route.
 #[tokio::test]
-async fn a_provider_delete_that_resolves_nothing_is_refused_and_deletes_nothing() {
+async fn a_provider_delete_that_resolves_nothing_succeeds_and_deletes_nothing() {
     let emulator = Emulator::new();
     let created = emulator
         .create_provider(&json!({"name": "bystander-key", "apiKey": "sk-bystander-0005"}))
@@ -524,10 +536,10 @@ async fn a_provider_delete_that_resolves_nothing_is_refused_and_deletes_nothing(
     );
 
     // Every name below satisfies `CredentialProviderName` (`^[a-zA-Z0-9\-_]+$`, 1..128), so
-    // the refusal is the handler's lookup and not the boundary constraint walk: the
-    // shortest name the pattern admits, one carrying both characters its pattern allows
-    // beside letters and digits, one at the top of the length range, and one that differs
-    // from the stored provider's name only in case.
+    // what the row exercises is the handler's own lookup and not the boundary constraint
+    // walk: the shortest name the pattern admits, one carrying both characters its pattern
+    // allows beside letters and digits, one at the top of the length range, and one that
+    // differs from the stored provider's name only in case.
     let unknown = [
         "x".to_string(),
         "no_such-provider".to_string(),
@@ -535,24 +547,33 @@ async fn a_provider_delete_that_resolves_nothing_is_refused_and_deletes_nothing(
         "Bystander-Key".to_string(),
     ];
     for name in unknown {
-        let refused = emulator.delete_provider(&name).await;
+        // Twice: the delete is satisfied by the provider's absence, so it answers the same
+        // empty success however often it is repeated on a name nothing resolves.
+        for attempt in 1..=2 {
+            let answered = emulator.delete_provider(&name).await;
+            assert_empty_success(&format!("{name:?}, attempt {attempt}"), &answered);
+        }
+        // The name the delete accepted still resolves nothing on the READ route, which is
+        // where the modelled refusal lives.
+        let read = emulator.get_provider(&name).await;
         assert_eq!(
-            (refused.status, refused.error_code(), refused.message()),
+            (read.status, read.error_code(), read.message()),
             (
                 404,
                 "ResourceNotFoundException".to_string(),
                 not_found_message(&name)
             ),
-            "case {name:?}: the refusal names the provider the request carried, got {} ({})",
-            refused.status,
-            refused.body
+            "case {name:?}: the read names the provider the request carried, got {} ({})",
+            read.status,
+            read.body
         );
     }
 
     let intact = emulator.get_provider("bystander-key").await;
     assert_eq!(
         intact.status, 200,
-        "a refused delete leaves the account's provider readable, got {} ({})",
+        "a delete of a name nothing resolves leaves the account's provider readable, got {} \
+         ({})",
         intact.status, intact.body
     );
     let secret = emulator
@@ -560,7 +581,8 @@ async fn a_provider_delete_that_resolves_nothing_is_refused_and_deletes_nothing(
         .await;
     assert_eq!(
         secret.status, 200,
-        "a refused delete leaves the secret behind the provider alone, got {} ({})",
+        "a delete of a name nothing resolves leaves the secret behind the provider alone, \
+         got {} ({})",
         secret.status, secret.body
     );
 }

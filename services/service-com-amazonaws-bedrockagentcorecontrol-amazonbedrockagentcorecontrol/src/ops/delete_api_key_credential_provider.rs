@@ -148,11 +148,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // The name is the identifier every provider route addresses a provider
-        // by, so the removal is keyed by it; a name this account holds no provider
-        // under is the modelled 404, in the sentence this plane words a missing
-        // provider with. The delete answers 204 carrying no member and the model
-        // gives the provider no status to report, so the record goes NOW rather
-        // than after a span: the very next read resolves nothing.
+        // by, so the removal is keyed by it. The delete is satisfied by the
+        // provider's ABSENCE: the model declares it idempotent with an empty 204
+        // success, so what the caller asked for — this account holding no
+        // provider under that name — already holds when the lookup misses, and
+        // the call answers that same empty success rather than a refusal. The
+        // modelled 404 stays on the routes that have to RESOLVE the provider to
+        // answer at all (the read and the update). Only the named provider goes:
+        // the account's other providers are untouched.
+        //
+        // The model gives the provider no status to report, so the record goes
+        // NOW rather than after a span: the very next read resolves nothing.
         //
         // The Secrets Manager secret the key lives in is NOT deleted here. For an
         // `EXTERNAL` provider it is the CALLER's own secret, which this service
@@ -163,14 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is always the one its own create stored, and no stale key can be read
         // through a provider.
         let mut store = state.lock();
-        store
-            .api_key_credential_providers
-            .remove(&input.name)
-            .ok_or_else(|| {
-                DeleteApiKeyCredentialProviderErrorModeled::ResourceNotFoundException(
-                    crate::state::api_key_credential_provider_not_found(&input.name),
-                )
-            })?;
+        store.api_key_credential_providers.remove(&input.name);
 
         Ok(DeleteApiKeyCredentialProviderOutput {})
     }

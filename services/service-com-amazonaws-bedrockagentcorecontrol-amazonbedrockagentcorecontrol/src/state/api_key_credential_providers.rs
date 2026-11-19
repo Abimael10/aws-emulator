@@ -57,15 +57,19 @@ pub const API_KEY_CREDENTIAL_PROVIDER_ARN_TYPE: &str = "apikeycredentialprovider
 /// service could not resolve for a provider.
 pub const RESOURCE_SECRET: &str = "secret";
 
-/// How the READ and the DELETE route word the 404 for an API key credential
-/// provider this account does not hold: the resource type and the name the
-/// request addressed it by ("ApiKeyCredentialProvider not found for <name>").
+/// How the READ route words the 404 for an API key credential provider this
+/// account does not hold: the resource type and the name the request addressed
+/// it by ("ApiKeyCredentialProvider not found for <name>").
+///
+/// The DELETE route answers no 404 for a merely absent name — its empty 204
+/// success is satisfied by the provider's absence — so this sentence belongs to
+/// the routes that have to resolve the provider to answer at all.
 ///
 /// The credential-provider routes do NOT take the shared
 /// [`super::resource_not_found`] sentence — they name the resource type and echo
 /// the `name` the caller asked for, which is the identifier those routes address
-/// a provider by. Shared by the routes that word it this way, so one missing
-/// provider cannot be reported in two sentences by two of them; the UPDATE
+/// a provider by. Kept here rather than in one `ops/` file so a route that words
+/// it this way cannot drift from another; the UPDATE
 /// route words it differently
 /// ([`api_key_credential_provider_not_found_on_update`]).
 pub fn api_key_credential_provider_not_found(name: &str) -> ResourceNotFoundException {
