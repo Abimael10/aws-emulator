@@ -872,9 +872,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Each named table has to have ROOM for that one route, and must not already route
-        // its destination: "the route identified by <x> already exists" and the per-table
-        // route quota are the table's own bounds, asked before anything is written — so an
-        // endpoint is never stored reporting a table it does not actually route to.
+        // its destination: a table that already routes the service's prefix list and the
+        // per-table route quota are the table's own bounds, asked before anything is written
+        // — so an endpoint is never stored reporting a table it does not actually route to,
+        // and a request naming an occupied table BESIDE a clean one leaves the clean one
+        // untouched. The refusal names the occupied TABLE as well as the destination
+        // ([`crate::state::vpc_endpoint_route_already_exists`]), which is the only way a
+        // caller that named several tables learns which of them is the one in the way.
         //
         // Asked AFTER the replay above, because both questions are about what this store
         // already holds rather than about the request: the route the FIRST of two identical
@@ -884,7 +888,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(prefix_list_id) = endpoint_prefix_list.as_deref() {
             for route_table_id in &requested_route_tables {
                 if store.route_table_holds_destination(route_table_id, prefix_list_id) {
-                    return Err(state::route_already_exists(prefix_list_id));
+                    return Err(state::vpc_endpoint_route_already_exists(
+                        route_table_id,
+                        prefix_list_id,
+                    ));
                 }
                 if store.route_count(route_table_id) >= state::MAX_ROUTES_PER_ROUTE_TABLE {
                     return Err(state::route_limit_exceeded());

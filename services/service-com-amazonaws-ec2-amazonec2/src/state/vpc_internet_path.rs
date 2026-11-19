@@ -158,6 +158,34 @@ pub fn route_already_exists<E>(destination: &str) -> Scaffolded<E> {
     )
 }
 
+/// Refuse associating a GATEWAY VPC endpoint with a route table that already routes the
+/// endpoint service's prefix list: HTTP 400 [`super::ROUTE_ALREADY_EXISTS`], the same code a
+/// duplicate route carries, worded the way the VPC-endpoint operations word it.
+///
+/// A gateway endpoint's association adds one route per table, destined for the service's
+/// managed prefix list ("the route … uses the prefix list for the service as the
+/// destination", Amazon Web Services PrivateLink User Guide, "Gateway endpoints"), so the
+/// conflict is about a NAMED table rather than about the destination alone: the sentence
+/// names the table the request asked for and the destination member — the
+/// `destination-prefix-list-id` the route is keyed by, the spelling
+/// [`invalid_route_not_found`] reports a prefix-list route by — so a caller that named
+/// several tables learns WHICH one is occupied. [`route_already_exists`] is the
+/// destination-only sentence the route operations themselves answer, where the table is
+/// the subject of the call and so already known to the caller.
+pub fn vpc_endpoint_route_already_exists<E>(
+    route_table_id: &str,
+    prefix_list_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        super::ROUTE_ALREADY_EXISTS,
+        400,
+        format!(
+            "route table {route_table_id} already has a route with \
+             destination-prefix-list-id {prefix_list_id}"
+        ),
+    )
+}
+
 /// Refuse a route the table has no room for: HTTP 400 [`super::ROUTE_LIMIT_EXCEEDED`], in
 /// the sentence this crate words every quota refusal with, reporting the bound it would have
 /// crossed ([`MAX_ROUTES_PER_ROUTE_TABLE`]).

@@ -752,10 +752,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             // Each named table has to have ROOM for that one route and must not already route
             // its destination, asked here — before anything is written — so an endpoint is
-            // never left reporting a table it does not actually route to.
+            // never left reporting a table it does not actually route to. The refusal names
+            // the occupied TABLE beside the destination, through the one sentence the
+            // VPC-endpoint operations word this conflict with
+            // ([`crate::state::vpc_endpoint_route_already_exists`]).
             for route_table_id in &add_route_tables {
                 if store.route_table_holds_destination(route_table_id, prefix_list_id) {
-                    return Err(state::route_already_exists(prefix_list_id));
+                    return Err(state::vpc_endpoint_route_already_exists(
+                        route_table_id,
+                        prefix_list_id,
+                    ));
                 }
                 if store.route_count(route_table_id) >= state::MAX_ROUTES_PER_ROUTE_TABLE {
                     return Err(state::route_limit_exceeded());

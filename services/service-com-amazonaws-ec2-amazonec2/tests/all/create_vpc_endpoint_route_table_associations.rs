@@ -574,7 +574,8 @@ async fn a_route_table_set_that_cannot_be_served_is_refused_with_the_code_for_it
             status: 400,
             code: ec2::state::ROUTE_ALREADY_EXISTS.to_string(),
             message: Some(format!(
-                "The route identified by {prefix_list_id} already exists."
+                "route table {first_table} already has a route with \
+                 destination-prefix-list-id {prefix_list_id}"
             )),
             names: "",
         },
