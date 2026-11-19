@@ -1531,6 +1531,13 @@ pub(super) const PREVIOUS_GENERATION_FAMILIES: [&str; 16] = [
     "r3", "t1",
 ];
 
+/// The PREVIOUS generation families AWS offers IPv6 addresses on: "IPv6 is supported on all
+/// current generation instance types" and on these three alone, which is a shorter list than
+/// the previous generation families offered Amazon EBS encryption ([`FIRST_EBS_ENCRYPTION_GENERATION`]
+/// reads that one) — so a previous generation family of the same age as one of these, M3
+/// among them, has no IPv6 address to report while its volumes can still be encrypted.
+pub(super) const IPV6_PREVIOUS_GENERATION_FAMILIES: [&str; 3] = ["c3", "i2", "r3"];
+
 /// The families that run on the Nitro System from BEFORE their fifth generation, as the
 /// EC2 User Guide's list of "instances built on the Nitro System" names them. The
 /// Graviton families, the EC2 Macs and the burstable families from T3 on are answered by
@@ -1684,9 +1691,10 @@ pub(super) const LOCAL_STORAGE_FAMILIES: [&str; 23] = [
 
 /// The families whose instance store is magnetic rather than solid state — the dense
 /// HDD storage families and the oldest general purpose and compute families (same
-/// page). Every other instance store is `ssd`.
-pub(super) const HDD_STORAGE_FAMILIES: [&str; 9] =
-    ["c1", "d2", "d3", "d3en", "h1", "hs1", "m1", "m2", "m3"];
+/// page). Every other instance store is `ssd`, which the M3 family's published devices
+/// are: it is the generation that moved the general purpose store onto solid state.
+pub(super) const HDD_STORAGE_FAMILIES: [&str; 8] =
+    ["c1", "d2", "d3", "d3en", "h1", "hs1", "m1", "m2"];
 
 /// The vCPUs and memory (GiB) of each EC2 Mac host, whose only size is `metal` so the
 /// size ladder gives neither: the configurations published in "Amazon EC2 Mac
@@ -2863,14 +2871,17 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
     // The published facts of this type, where the catalog holds its row.
     let facts = published_instance_type_facts(instance_type);
 
-    // Amazon EBS encryption, and IPv6, reach every current generation instance type and
-    // the previous generation ones from the generation that introduced them on; the
-    // oldest families predate both.
+    // Amazon EBS encryption reaches every current generation instance type and the previous
+    // generation ones from the generation that introduced it on; the oldest families predate
+    // it. IPv6 reaches FEWER of them — AWS names the previous generation families offered each,
+    // and the two lists differ ([`IPV6_PREVIOUS_GENERATION_FAMILIES`]) — so the two are read
+    // apart rather than from one flag.
     let modern = record.current_generation
         || name
             .generation
             .is_some_and(|generation| generation >= FIRST_EBS_ENCRYPTION_GENERATION);
-    let ipv6_supported = modern;
+    let ipv6_supported = record.current_generation
+        || IPV6_PREVIOUS_GENERATION_FAMILIES.contains(&name.family);
     let efa_interfaces = facts
         .and_then(|facts| facts.efa_interfaces)
         .unwrap_or_else(|| efa_interfaces(&name, sixteenths));

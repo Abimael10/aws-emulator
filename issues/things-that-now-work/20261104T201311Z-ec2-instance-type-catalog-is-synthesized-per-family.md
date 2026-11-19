@@ -839,6 +839,8 @@ Issue-Commit: 26511efcb51aa0c8f5bf3ace614d1ff380fd4a98
 
 > _Note: this issue was identified against the code base at commit `26511efcb51aa0c8f5bf3ace614d1ff380fd4a98`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Causes 2 (gr6), 3 (m3), 4 (r5a) and 5 (t3a) are FIXED and their replay keys pass, and so is most of cause 1 (c8a): its EBS performance, attachment limit and limit type, bandwidth weightings, connection-tracking timeout, ENA Express support, secondary-network members, processor frequency and vCPU/core/thread arrangement are now served from the per-type published rows in `services/service-com-amazonaws-ec2-amazonec2/src/state/instance_ids_and_instance_types/instance_type_catalog/`. What is NOT fixed is four groups of c8a members — `networkInfo.maximumNetworkInterfaces`, `networkInfo.ipv4AddressesPerInterface`/`ipv6AddressesPerInterface`, `networkInfo.networkPerformance`, `vCpuInfo.validCores` above the `8xlarge`, and `ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps`/`baselineThroughputInMBps` on `c8a.48xlarge` — which stay on the size-ladder derivation because no published figure for them was available. They are re-filed, with what this fix established about each, as `issues/things-that-do-not-work/20261104T201311Z-ec2-c8a-network-ladder-and-valid-cores-remain-open.md`, which carries their replay keys so they are not recorded as working._
+
 ## Operation
 DescribeInstanceTypes
 

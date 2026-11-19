@@ -27,6 +27,10 @@ use crate::ops::types::{
     InferenceDeviceMemoryInfo,
 };
 
+mod amd_epyc_rows;
+mod gpu_rows;
+mod previous_generation_rows;
+
 /// The EBS-optimized performance AWS publishes for one instance type: the two bandwidth and
 /// the two IOPS figures of its row in "Amazon EBS optimized instance types".
 ///
@@ -4608,14 +4612,26 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .nitro_tpm(false),
 ];
 
+/// Every published row the catalog holds, whichever table it sits in.
+///
+/// The rows of the families above, then the rows each child module holds for the families it
+/// groups — the AMD EPYC families, the accelerated ones and the previous generation ones. A
+/// row is reached by its instance type alone, so which table it is written in is nothing but
+/// where the figures of one group of families are kept together.
+fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts> {
+    PUBLISHED_INSTANCE_TYPE_FACTS
+        .iter()
+        .chain(amd_epyc_rows::AMD_EPYC_INSTANCE_TYPE_FACTS)
+        .chain(gpu_rows::GPU_INSTANCE_TYPE_FACTS)
+        .chain(previous_generation_rows::PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS)
+}
+
 /// The published facts of `instance_type`, or `None` where the catalog holds no row for it
 /// and every member is the derivation's.
 pub fn published_instance_type_facts(
     instance_type: &str,
 ) -> Option<&'static PublishedInstanceTypeFacts> {
-    PUBLISHED_INSTANCE_TYPE_FACTS
-        .iter()
-        .find(|facts| facts.instance_type == instance_type)
+    published_rows().find(|facts| facts.instance_type == instance_type)
 }
 
 /// Every instance type the table above holds a row for.
@@ -4624,9 +4640,7 @@ pub fn published_instance_type_facts(
 /// names no type of the catalog would be a row nothing ever reads; this is what lets a test
 /// hold every key to being one.
 pub fn published_instance_types() -> impl Iterator<Item = &'static str> {
-    PUBLISHED_INSTANCE_TYPE_FACTS
-        .iter()
-        .map(|facts| facts.instance_type)
+    published_rows().map(|facts| facts.instance_type)
 }
 
 /// The local instance store of one instance type: the devices `facts` publishes for it, or
