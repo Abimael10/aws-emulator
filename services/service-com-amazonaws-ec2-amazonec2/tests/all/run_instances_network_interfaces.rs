@@ -562,10 +562,15 @@ async fn the_interfaces_a_launch_names_are_created_and_reported() {
             case: "three interfaces listed in reverse device-index order",
             count: 1,
             fields: {
-                let mut fields = interface(
+                // Three interfaces need a type whose published interface limit admits three:
+                // the limit is a fact of the instance type
+                // (`NetworkInfo$MaximumNetworkInterfaces`), and the launch's own default type
+                // holds two.
+                let mut fields = vec![param("InstanceType", "m5.large")];
+                fields.extend(interface(
                     1,
                     &[("DeviceIndex", "2"), ("SubnetId", &network.subnet_a)],
-                );
+                ));
                 fields.extend(interface(
                     2,
                     &[("DeviceIndex", "1"), ("SubnetId", &network.subnet_b)],

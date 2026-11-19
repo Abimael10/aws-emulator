@@ -416,6 +416,84 @@ pub fn error_message(xml: &str) -> String {
     unescaped(&element(xml, "Message").unwrap_or_default())
 }
 
+/// The body `DescribeInstanceTypes` answers for exactly one instance type, as that call's
+/// own 200, signed for `region`.
+///
+/// The ONE hop for a suite that reads what the catalog publishes about a type, beside the
+/// readers below, so every such suite asks for a type the same way.
+pub async fn described_instance_type(
+    case: &str,
+    router: &MultiServiceRouter,
+    region: &str,
+    instance_type: &str,
+) -> String {
+    let (status, body) = call(
+        router,
+        region,
+        "DescribeInstanceTypes",
+        &indexed("InstanceType", &[instance_type]),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 for {instance_type}, got {status} with body {body}"
+    );
+    body
+}
+
+/// The text of the member at `path` inside the one reported instance type of `body`, or
+/// `None` when the type reports no such member.
+///
+/// `path` names the members to walk through, outermost first (`["ebsInfo",
+/// "ebsOptimizedInfo", "baselineIops"]`), and the walk starts at the element that carries an
+/// `<instanceType>` of its own — the reported type. Reading the TREE rather than the text is
+/// what keeps a member inside the structure it belongs to: an `EbsInfo$EbsCards` entry
+/// carries a `baselineBandwidthInMbps` of its own beside the instance's.
+pub fn reported_instance_type_member(case: &str, body: &str, path: &[&str]) -> Option<String> {
+    let parsed = super::wire::document(case, body);
+    let item = reported_instance_type(case, &parsed, body);
+    let (member, enclosing) = path
+        .split_last()
+        .unwrap_or_else(|| panic!("case {case:?}: a member path cannot be empty"));
+    let mut node = item;
+    for name in enclosing {
+        node = super::wire::child(node, name)?;
+    }
+    super::wire::child_text(node, member)
+}
+
+/// The entries of the list member at `path` of the one reported instance type, in the order
+/// the type reported them.
+pub fn reported_instance_type_list(case: &str, body: &str, path: &[&str]) -> Vec<String> {
+    let parsed = super::wire::document(case, body);
+    let item = reported_instance_type(case, &parsed, body);
+    let mut node = item;
+    for name in path {
+        node = super::wire::child(node, name)
+            .unwrap_or_else(|| panic!("case {case:?}: no <{name}> in {body}"));
+    }
+    node.children()
+        .filter(roxmltree::Node::is_element)
+        .map(|entry| entry.text().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// The one reported instance type of a parsed body: the element that carries an
+/// `<instanceType>` of its own, so a member is never read out of a shape that merely shares
+/// its name.
+fn reported_instance_type<'a, 'i>(
+    case: &str,
+    parsed: &'a roxmltree::Document<'i>,
+    body: &str,
+) -> roxmltree::Node<'a, 'i> {
+    parsed
+        .descendants()
+        .find(|node| {
+            node.is_element() && super::wire::child(*node, "instanceType").is_some()
+        })
+        .unwrap_or_else(|| panic!("case {case:?}: no reported instance type in {body}"))
+}
+
 /// The `ResourceId.N` and `Tag.N.*` form fields of a tagging request (`CreateTags` and
 /// `DeleteTags`), as ec2Query flattens the `Resources` and `Tags` lists into indexed keys.
 ///

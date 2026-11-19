@@ -1641,6 +1641,10 @@ pub(super) const NITRO_ATTACHMENT_LIMIT: i32 = 28;
 /// own rather than one shared with its interfaces (same page).
 pub(super) const XEN_EBS_VOLUME_LIMIT: i32 = 27;
 
+/// The IPv6 addresses one network interface of a type that does not support IPv6 can have:
+/// none at all, which `NetworkInfo$Ipv6AddressesPerInterface` reports as the figure it is.
+pub(super) const NO_IPV6_ADDRESSES_PER_INTERFACE: i32 = 0;
+
 /// The default connection tracking idle timeouts, in seconds, that a Nitro instance
 /// type reports — the values the EC2 User Guide publishes under "Connection tracking
 /// timeouts": 432,000 s for an established TCP connection, 30 s for UDP and 180 s for
@@ -1657,11 +1661,11 @@ pub(super) const I386_INSTANCE_TYPES: [&str; 4] = ["c1.medium", "m1.medium", "m1
 
 /// The previous generation families whose AMIs are paravirtual and never HVM (EC2 User
 /// Guide, "Linux AMI virtualization types").
-pub(super) const PARAVIRTUAL_ONLY_FAMILIES: [&str; 4] = ["c1", "m1", "m2", "t1"];
+pub(super) const PARAVIRTUAL_ONLY_FAMILIES: [&str; 2] = ["c1", "t1"];
 
 /// The previous generation families that run both paravirtual and HVM AMIs (same page).
-pub(super) const PARAVIRTUAL_AND_HVM_FAMILIES: [&str; 10] = [
-    "c3", "cc1", "cc2", "cg1", "cr1", "g2", "hi1", "hs1", "i2", "m3",
+pub(super) const PARAVIRTUAL_AND_HVM_FAMILIES: [&str; 12] = [
+    "c3", "cc1", "cc2", "cg1", "cr1", "g2", "hi1", "hs1", "i2", "m1", "m2", "m3",
 ];
 
 /// The family letters whose instance storage IS the family: the storage optimized
@@ -2306,7 +2310,12 @@ pub fn instance_type_record(instance_type: &str) -> Option<InstanceTypeRecord> {
     let memory_mib = facts
         .and_then(|facts| facts.memory_mib)
         .unwrap_or(derived_memory_mib);
-    let default_threads_per_core = default_threads_per_core(&name, &architecture, default_vcpus);
+    // The threads each core runs: the published figure where the catalog holds the type's row
+    // — a type whose hardware runs, or ships with, one thread per core publishes its vCPUs as
+    // that many cores — else the one its processor's architecture gives.
+    let default_threads_per_core = facts
+        .and_then(|facts| facts.threads_per_core)
+        .unwrap_or_else(|| default_threads_per_core(&name, &architecture, default_vcpus));
     let derived_storage = instance_storage_facts(&name, sixteenths);
     let instance_storage = published_instance_storage(facts, &name, derived_storage);
     let (derived_interfaces, derived_ipv4) = network_limits(sixteenths);
@@ -2418,8 +2427,8 @@ pub(super) fn supported_root_device_types(name: &InstanceTypeName<'_>) -> Vec<St
 }
 
 /// The virtualization types the instance type supports: HVM everywhere, paravirtual on
-/// the previous generation families that predate it — four of which run paravirtual
-/// AMIs only.
+/// the previous generation families that predate it — among which the two oldest
+/// ([`PARAVIRTUAL_ONLY_FAMILIES`]) run paravirtual AMIs only.
 pub(super) fn supported_virtualization_types(name: &InstanceTypeName<'_>) -> Vec<String> {
     if PARAVIRTUAL_ONLY_FAMILIES.contains(&name.family) {
         return vec!["paravirtual".to_string()];
@@ -2918,7 +2927,11 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
         instance_type: Some(record.instance_type.clone()),
         current_generation: Some(record.current_generation),
         free_tier_eligible: Some(FREE_TIER_INSTANCE_TYPES.contains(&instance_type)),
-        supported_usage_classes: Some(supported_usage_classes(&name)),
+        supported_usage_classes: Some(
+            facts
+                .and_then(|facts| facts.usage_classes)
+                .map_or_else(|| supported_usage_classes(&name), strings),
+        ),
         supported_root_device_types: Some(
             facts
                 .and_then(|facts| facts.root_device_types)
@@ -2962,8 +2975,20 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
             .map(InstanceStorageFacts::to_instance_storage_info),
         ebs_info: Some(EbsInfo {
             ebs_optimized_support: Some(ebs_optimized.to_string()),
+            // "Indicates whether Amazon EBS encryption is supported"
+            // (`EbsInfo$EncryptionSupport`): the published answer where the catalog holds the
+            // type's row, else the support its generation gives — the oldest families predate
+            // it.
             encryption_support: Some(
-                if modern { "supported" } else { "unsupported" }.to_string(),
+                if facts
+                    .and_then(|facts| facts.ebs_encryption_supported)
+                    .unwrap_or(modern)
+                {
+                    "supported"
+                } else {
+                    "unsupported"
+                }
+                .to_string(),
             ),
             // "Describes the optimized EBS performance for the instance type"
             // (`EbsInfo$EbsOptimizedInfo`): reported for every type that HAS an
@@ -3035,8 +3060,16 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
                 published_performance,
             )),
             ipv4_addresses_per_interface: Some(record.ipv4_addresses_per_interface),
-            ipv6_addresses_per_interface: ipv6_supported
-                .then_some(record.ipv4_addresses_per_interface),
+            // "The maximum number of IPv6 addresses per network interface"
+            // (`NetworkInfo$Ipv6AddressesPerInterface`), reported for every instance type: an
+            // interface of a type that supports IPv6 takes as many of them as it takes private
+            // IPv4 addresses, and one of a type that does not takes NONE — which is a figure,
+            // not an absence.
+            ipv6_addresses_per_interface: Some(if ipv6_supported {
+                record.ipv4_addresses_per_interface
+            } else {
+                NO_IPV6_ADDRESSES_PER_INTERFACE
+            }),
             ipv6_supported: Some(ipv6_supported),
             ena_support: Some(
                 facts

@@ -263,6 +263,11 @@ pub struct PublishedInstanceTypeFacts {
     /// The vCPUs it runs with, where AWS's figure for the type is its own rather than the one
     /// its step of the size ladder carries.
     pub default_vcpus: Option<i32>,
+    /// The threads each of its cores runs (`VCpuInfo$DefaultThreadsPerCore`), where AWS's
+    /// figure for the type is its own rather than the one its processor's architecture gives:
+    /// a type whose hardware runs — or is shipped with — one thread per core publishes its
+    /// vCPUs as that many CORES.
+    pub threads_per_core: Option<i32>,
     /// The step the published core counts of the type go up in (`VCpuInfo$ValidCores`): a
     /// type whose cores sit on more than one processor socket takes them one per socket, so
     /// its counts are multiples of the sockets rather than every count up to its default.
@@ -347,6 +352,13 @@ pub struct PublishedInstanceTypeFacts {
     /// connection by default (`DefaultConnectionTrackingConfiguration$DefaultTcpEstablishedTimeout`),
     /// where the type's own default is not the one every earlier type reports.
     pub default_tcp_established_timeout: Option<i32>,
+    /// Whether Amazon EBS encryption is supported (`EbsInfo$EncryptionSupport`), where the
+    /// published answer for the type is not the one its generation gives.
+    pub ebs_encryption_supported: Option<bool>,
+    /// The usage classes the type is offered in (`InstanceTypeInfo$SupportedUsageClasses`),
+    /// where AWS's list for it is its own rather than the one its family gives — one value of
+    /// the modelled `UsageClassType` per entry.
+    pub usage_classes: Option<&'static [&'static str]>,
     /// Whether the type has an EBS-optimized mode — one value of the modelled
     /// `EbsOptimizedSupport` — where the published "EBS optimized" column of its row is not
     /// what its hardware generation gives. A type published as `unsupported` has no
@@ -382,6 +394,9 @@ impl PublishedInstanceTypeFacts {
             current_generation: None,
             memory_mib: None,
             default_vcpus: None,
+            threads_per_core: None,
+            ebs_encryption_supported: None,
+            usage_classes: None,
             valid_core_step: None,
             valid_core_minimum: None,
             ebs_performance: None,
@@ -440,6 +455,25 @@ impl PublishedInstanceTypeFacts {
     /// its step of the size ladder carries.
     const fn vcpus(mut self, vcpus: i32) -> Self {
         self.default_vcpus = Some(vcpus);
+        self
+    }
+
+    /// The threads each of the type's cores runs, where AWS's figure for it is its own rather
+    /// than the one its architecture gives.
+    const fn threads_per_core(mut self, threads: i32) -> Self {
+        self.threads_per_core = Some(threads);
+        self
+    }
+
+    /// Whether Amazon EBS encryption is supported, as the published answer for the type says.
+    const fn ebs_encryption(mut self, supported: bool) -> Self {
+        self.ebs_encryption_supported = Some(supported);
+        self
+    }
+
+    /// The usage classes the type is offered in, where AWS's published list for it is its own.
+    const fn usage_classes(mut self, classes: &'static [&'static str]) -> Self {
+        self.usage_classes = Some(classes);
         self
     }
 
@@ -804,6 +838,15 @@ const CONFIGURABLE_BANDWIDTH_WEIGHTINGS: &[&str] = &["default", "ebs-1", "vpc-1"
 /// The `PlacementGroupStrategy` values a type offered EVERY placement group strategy
 /// publishes, in the order AWS lists them.
 const EVERY_PLACEMENT_STRATEGY: &[&str] = &["cluster", "partition", "spread"];
+
+/// The `PlacementGroupStrategy` values a type that is NOT offered a cluster placement group
+/// publishes: a cluster group packs its members onto one rack of hardware, which a type whose
+/// share of a host is not a fixed allocation is not offered, while a partition and a spread
+/// group place any instance.
+const PARTITION_AND_SPREAD_STRATEGIES: &[&str] = &["partition", "spread"];
+
+/// The `UsageClassType` values a type offered on NO Spot capacity publishes: On-Demand alone.
+const ON_DEMAND_USAGE_CLASS: &[&str] = &["on-demand"];
 
 /// The `RootDeviceType` values a type whose AMIs may be backed by either an EBS volume or its
 /// local instance store publishes.
@@ -4331,6 +4374,238 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .ena_srd(true)
         .boot_modes(&["legacy-bios"])
         .host_features(false, false),
+    // C7i-flex — the C7i hardware offered with a FLEXIBLE share of it: the same 4th generation
+    // Intel Xeon Scalable (Sapphire Rapids) processor at a sustained 3.2 GHz, publishing nested
+    // virtualization as a processor feature the way its C7i sibling does, and the same
+    // `dedicated` kind of EBS attachment limit — 32 volumes up to the `12xlarge`, then 48. What
+    // the `flex` changes is what the size is GUARANTEED. Its published EBS baseline is a flat
+    // 625 Mbps per `xlarge` of size — half of what the C7i ladder gives the same size from the
+    // `xlarge` up, and half of the 625 the line itself carries at `large` rather than half of
+    // the 650 C7i publishes for that one irregular row, so the smallest size sustains a figure
+    // that is not a whole number of Mbps — while the maximum it bursts to is the C7i row's own.
+    // The IOPS beside each baseline is the figure the published table carries at THAT bandwidth
+    // whatever size holds it: 2,500 at 312.5 Mbps, 3,600 at 625, then 6,000, 12,000, 20,000,
+    // 30,000 and 40,000. Its network is a burst ceiling rather than a dedicated share at every
+    // size, so each row reads "Up to". Because the share is not a fixed allocation, the family is
+    // offered neither a Dedicated Host nor a cluster placement group, and the Nitro features its
+    // generation otherwise carries — Nitro Enclaves, ENA Express, a configurable number of ENA
+    // queues and interface attachments from a secondary network, of which no private address at
+    // all is available — are not offered on it either.
+    PublishedInstanceTypeFacts::of("c7i-flex.large")
+        .ebs_in_half_mbps(625, 2_500, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .dedicated_hosts(false)
+        .nitro_enclaves(false)
+        .placement_strategies(PARTITION_AND_SPREAD_STRATEGIES)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("c7i-flex.xlarge")
+        .ebs(625, 3_600, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .dedicated_hosts(false)
+        .nitro_enclaves(false)
+        .placement_strategies(PARTITION_AND_SPREAD_STRATEGIES)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("c7i-flex.2xlarge")
+        .ebs(1_250, 6_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .dedicated_hosts(false)
+        .nitro_enclaves(false)
+        .placement_strategies(PARTITION_AND_SPREAD_STRATEGIES)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("c7i-flex.4xlarge")
+        .ebs(2_500, 12_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .dedicated_hosts(false)
+        .nitro_enclaves(false)
+        .placement_strategies(PARTITION_AND_SPREAD_STRATEGIES)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("c7i-flex.8xlarge")
+        .ebs(5_000, 20_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .dedicated_hosts(false)
+        .nitro_enclaves(false)
+        .placement_strategies(PARTITION_AND_SPREAD_STRATEGIES)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("c7i-flex.12xlarge")
+        .ebs(7_500, 30_000, 15_000, 60_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 18.75 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .dedicated_hosts(false)
+        .nitro_enclaves(false)
+        .placement_strategies(PARTITION_AND_SPREAD_STRATEGIES)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("c7i-flex.16xlarge")
+        .ebs(10_000, 40_000, 20_000, 80_000)
+        .dedicated_ebs_attachments(48)
+        .network("Up to 25 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .dedicated_hosts(false)
+        .nitro_enclaves(false)
+        .placement_strategies(PARTITION_AND_SPREAD_STRATEGIES)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    // M1 — the general purpose family of AWS's FIRST generation, on AWS's "Previous generation
+    // instances" page, running paravirtual and HVM AMIs on the Xen hypervisor with a magnetic
+    // local instance store. Nothing about its ladder follows the modern ratios: its published
+    // memory is 1.7, 3.7, 7.5 and 15 GiB, its instance store is one 160 GB device at the
+    // smallest size, one of 410 GB at the next and then 420 GB devices two and four at a time,
+    // and its hardware runs ONE thread per core, so a size's vCPUs are that many cores. Its
+    // smallest two sizes take two network interfaces rather than the three their step of the
+    // published "IP addresses per network interface per instance type" table gives. Amazon EBS
+    // encryption IS supported on the family, while Traffic Mirroring — which copies a session's
+    // packets under the guest, on the Nitro System this generation predates — is not, and its
+    // EBS volumes share one attachment total of 39 with its other devices. Only its two largest
+    // sizes have an EBS-optimized mode at all, at the 500 and 1,000 Mbps their rows of "Amazon
+    // EBS optimized instance types" publish (a pre-Nitro type does not burst above its figure).
+    PublishedInstanceTypeFacts::of("m1.small")
+        .memory_mib(1_740)
+        .threads_per_core(1)
+        .instance_store(1, 160)
+        .network("Low")
+        .interfaces(2)
+        .shared_ebs_attachments(39)
+        .ebs_encryption(true)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("m1.medium")
+        .memory_mib(3_788)
+        .threads_per_core(1)
+        .instance_store(1, 410)
+        .network("Moderate")
+        .interfaces(2)
+        .shared_ebs_attachments(39)
+        .ebs_encryption(true)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("m1.large")
+        .memory_mib(7_680)
+        .threads_per_core(1)
+        .instance_store(2, 420)
+        .network("Moderate")
+        .shared_ebs_attachments(39)
+        .ebs_encryption(true)
+        .ebs_optimized("supported")
+        .ebs(500, 4_000, 500, 4_000)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("m1.xlarge")
+        .memory_mib(15_360)
+        .threads_per_core(1)
+        .instance_store(4, 420)
+        .network("High")
+        .shared_ebs_attachments(39)
+        .ebs_encryption(true)
+        .ebs_optimized("supported")
+        .ebs(1_000, 8_000, 1_000, 8_000)
+        .traffic_mirroring(false),
+    // M2 — the memory optimized family of the SECOND generation, on the same previous
+    // generation page and the same Xen hardware as M1 above: paravirtual and HVM AMIs, a
+    // magnetic instance store, one thread per core, Amazon EBS encryption supported, no Traffic
+    // Mirroring and the same shared attachment total of 39. Its published sizes are 2, 4 and 8
+    // vCPUs, and it carries one local device of 420 and 850 GB at the two smaller sizes, then
+    // two of 840 GB. Its
+    // `2xlarge` takes 30 private addresses per interface rather than the 15 its step of the
+    // published table gives, and the two larger sizes have an EBS-optimized mode at 500 and
+    // 1,000 Mbps while the smallest has none. Its published memory is 17.1, 34.2 and 68.4 GiB —
+    // a ratio no family letter carries.
+    PublishedInstanceTypeFacts::of("m2.xlarge")
+        .memory_mib(17_510)
+        .vcpus(2)
+        .threads_per_core(1)
+        .instance_store(1, 420)
+        .network("Moderate")
+        .shared_ebs_attachments(39)
+        .ebs_encryption(true)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("m2.2xlarge")
+        .memory_mib(35_020)
+        .vcpus(4)
+        .threads_per_core(1)
+        .instance_store(1, 850)
+        .network("Moderate")
+        .ipv4_per_interface(30)
+        .shared_ebs_attachments(39)
+        .ebs_encryption(true)
+        .ebs_optimized("supported")
+        .ebs(500, 4_000, 500, 4_000)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("m2.4xlarge")
+        .memory_mib(70_041)
+        .vcpus(8)
+        .threads_per_core(1)
+        .instance_store(2, 840)
+        .network("High")
+        .shared_ebs_attachments(39)
+        .ebs_encryption(true)
+        .ebs_optimized("supported")
+        .ebs(1_000, 8_000, 1_000, 8_000)
+        .traffic_mirroring(false),
+    // U-6tb1 — a High Memory instance: 6 TiB of memory on an eight-socket Intel Xeon Platinum
+    // (Skylake) server at a sustained 2.1 GHz, with no local instance store. Its name states the
+    // memory rather than a generation, and its two sizes are the SAME server with its second
+    // thread per core shipped on and off: 448 vCPUs on 224 cores, and 224 vCPUs on those same
+    // 224 cores. So both publish the server's own figures — a dedicated 38,000 Mbps and 160,000
+    // IOPS of EBS, 27 volumes attached out of the pool it shares with its interfaces, and 100
+    // Gigabit of network — and both take their cores all at once, so the one count each
+    // publishes is its default. The family is offered On-Demand capacity only, boots in the
+    // legacy BIOS mode alone, and is offered neither Nitro Enclaves nor a trusted platform
+    // module.
+    PublishedInstanceTypeFacts::of("u-6tb1.56xlarge")
+        .threads_per_core(1)
+        .cores_in_steps_of(224)
+        .ebs(38_000, 160_000, 38_000, 160_000)
+        .ebs_attachments(27)
+        .network("100 Gigabit")
+        .processor("Intel", 2.1)
+        .usage_classes(ON_DEMAND_USAGE_CLASS)
+        .boot_modes(LEGACY_BIOS_BOOT_MODE)
+        .nitro_enclaves(false)
+        .nitro_tpm(false),
+    PublishedInstanceTypeFacts::of("u-6tb1.112xlarge")
+        .cores_in_steps_of(224)
+        .ebs(38_000, 160_000, 38_000, 160_000)
+        .ebs_attachments(27)
+        .network("100 Gigabit")
+        .processor("Intel", 2.1)
+        .usage_classes(ON_DEMAND_USAGE_CLASS)
+        .boot_modes(LEGACY_BIOS_BOOT_MODE)
+        .nitro_enclaves(false)
+        .nitro_tpm(false),
 ];
 
 /// The published facts of `instance_type`, or `None` where the catalog holds no row for it
