@@ -15,11 +15,11 @@
 //! (`smithy_query(query="doc", shape="Transcript", member="TranscriptFileUri")`) — and a
 //! `DownloadUri` is the same kind of location ("use this URI to view or download the
 //! custom vocabulary", `smithy_query(query="operation", operation="GetVocabulary")`). A
-//! location in a bucket the REQUEST named is the caller's own address instead: they
-//! created that bucket and address it with their own credentials, so it is reported as
-//! given and nothing is signed for it. WHICH of the two a record holds follows from the
-//! stored request — whether the start named a bucket or an output location of its own —
-//! and not from the text of the address, which is why the caller-bucket table below holds
+//! location in a bucket the REQUEST named is the plain, UNSIGNED address of that object on
+//! the same endpoint instead: they created that bucket and address it with their own
+//! credentials, so nothing is signed for it. WHICH of the two a record holds follows from
+//! the stored request — whether the start named a bucket or an output location of its own
+//! — and not from the text of the address, which is why the caller-bucket table below holds
 //! rows whose bucket and key IMITATE this service's own store and are still reported as
 //! the caller's.
 //!
@@ -114,9 +114,9 @@ const SIGV4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SERVICE_MANAGED_VALIDITY_SECONDS: u64 = 15 * 60;
 
 /// The OBJECT a reported location names, as the object store addresses it: the
-/// `/BUCKET/KEY` path of a temporary address into this service's own store, and the
-/// `s3://BUCKET/KEY` of a location in the caller's own bucket, which is reported as that
-/// address itself.
+/// `/BUCKET/KEY` path the address carries, for both kinds of location this service reports
+/// — a temporary address into its own store and the unsigned address of an object in a
+/// bucket the request named.
 ///
 /// `pub(crate)`: every suite that pins WHERE this service reports a file reads the object
 /// out of the reported location through this one helper, because a service-managed
@@ -684,11 +684,12 @@ async fn service_managed_locations_again(router: &MultiServiceRouter, row: &Repo
     }
 }
 
-/// A location in a bucket the REQUEST named is the caller's own address, reported as
-/// given: nothing is signed for it, because the caller addresses its own bucket with its
-/// own credentials.
+/// A location in a bucket the REQUEST named is reported as the plain address of that
+/// object on the endpoint this emulator is reached on, with nothing signed for it:
+/// the caller addresses its own bucket with its own credentials, so this service puts no
+/// signature of its own on a bucket it does not own.
 #[tokio::test]
-async fn a_location_in_the_callers_own_bucket_is_reported_as_the_callers_address() {
+async fn a_location_in_the_callers_own_bucket_is_reported_unsigned_on_this_endpoint() {
     let router = emulator();
     given_staged_media(&router).await;
     given_object(&router, CALLER_BUCKET, "placeholder", b"created by the caller").await;
@@ -699,7 +700,8 @@ async fn a_location_in_the_callers_own_bucket_is_reported_as_the_callers_address
     // store: a bucket named like the path-style Amazon S3 host of a Region, with a key
     // under it spelling that Region's service-managed bucket and another record's object.
     // WHOSE bucket a job's output is in follows from the stored request, so those two are
-    // the caller's address like any other and nothing is signed for them.
+    // the caller's like any other and nothing is signed for them. Each row's last field is
+    // the `BUCKET/KEY` of the object the location names.
     let own_store_bucket = service_managed_bucket();
     let account = engine::emulator_account_id();
     let rows: Vec<(&str, &str, Value, &str, &str, String)> = vec![
@@ -714,7 +716,7 @@ async fn a_location_in_the_callers_own_bucket_is_reported_as_the_callers_address
             }),
             "GetTranscriptionJob",
             "TranscriptionJob",
-            format!("s3://{CALLER_BUCKET}/callers-bucket.json"),
+            format!("{CALLER_BUCKET}/callers-bucket.json"),
         ),
         (
             "a transcription job whose OutputKey names a folder",
@@ -728,7 +730,7 @@ async fn a_location_in_the_callers_own_bucket_is_reported_as_the_callers_address
             }),
             "GetTranscriptionJob",
             "TranscriptionJob",
-            format!("s3://{CALLER_BUCKET}/transcripts/callers-folder.json"),
+            format!("{CALLER_BUCKET}/transcripts/callers-folder.json"),
         ),
         (
             "a transcription job whose OutputKey names the output file",
@@ -742,7 +744,7 @@ async fn a_location_in_the_callers_own_bucket_is_reported_as_the_callers_address
             }),
             "GetTranscriptionJob",
             "TranscriptionJob",
-            format!("s3://{CALLER_BUCKET}/transcripts/chosen.json"),
+            format!("{CALLER_BUCKET}/transcripts/chosen.json"),
         ),
         (
             "a Call Analytics job whose start named an output location",
@@ -754,7 +756,7 @@ async fn a_location_in_the_callers_own_bucket_is_reported_as_the_callers_address
             }),
             "GetCallAnalyticsJob",
             "CallAnalyticsJob",
-            format!("s3://{CALLER_BUCKET}/calls/callers-call.json"),
+            format!("{CALLER_BUCKET}/calls/callers-call.json"),
         ),
         (
             "a transcription job whose bucket imitates the path-style Amazon S3 host and \
@@ -770,7 +772,7 @@ async fn a_location_in_the_callers_own_bucket_is_reported_as_the_callers_address
             "GetTranscriptionJob",
             "TranscriptionJob",
             format!(
-                "s3://s3.{REGION}.amazonaws.com/{own_store_bucket}/{account}/served-job.json"
+                "s3.{REGION}.amazonaws.com/{own_store_bucket}/{account}/served-job.json"
             ),
         ),
         (
@@ -786,7 +788,7 @@ async fn a_location_in_the_callers_own_bucket_is_reported_as_the_callers_address
             "GetCallAnalyticsJob",
             "CallAnalyticsJob",
             format!(
-                "s3://s3.{REGION}.amazonaws.com/{own_store_bucket}/{account}/served-call.json"
+                "s3.{REGION}.amazonaws.com/{own_store_bucket}/{account}/served-call.json"
             ),
         ),
     ];
@@ -818,13 +820,19 @@ async fn a_location_in_the_callers_own_bucket_is_reported_as_the_callers_address
         .await;
         let reported = reported(&job["Transcript"], "TranscriptFileUri", case);
         assert_eq!(
-            &reported, expected,
+            &reported,
+            &format!("{UNSERVED_URL_BASE}/{expected}"),
             "case {case:?}: a location in the caller's own bucket is reported as that \
-             address, got {reported:?}"
+             object's address on this emulator's own endpoint, got {reported:?}"
+        );
+        assert_eq!(
+            named_object(&reported),
+            format!("/{expected}"),
+            "case {case:?}: the address must name the caller's own object, got {reported:?}"
         );
         assert!(
             query_of(&reported).is_empty(),
-            "case {case:?}: nothing is signed for the caller's own address, got \
+            "case {case:?}: nothing is signed for a bucket the caller owns, got \
              {reported:?}"
         );
     }

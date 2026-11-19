@@ -466,10 +466,10 @@ async fn the_transcript_location_follows_the_documented_output_location_rule() {
     // `s3://BUCKET/my-output-folder/my-call-analytics-job.json`), a folder spelled
     // without its trailing slash, and the service-managed location a request that
     // names none gets. Each row is the OBJECT the reported location names
-    // (`object_path`): a location in the caller's own bucket is reported as that
-    // address, while a service-managed one is a temporary address into this emulator's
-    // own store, whose object is the path it carries (`crate::served_download_locations`
-    // pins what that address IS).
+    // (`object_path`), which is what the documented rule decides; both kinds of location
+    // are announced on the endpoint this emulator is reached on, so the object is the
+    // path the address carries (`crate::served_download_locations` pins what each address
+    // IS).
     let rows: Vec<(&str, Option<&str>, String)> = vec![
         (
             "no output location: the service-managed location",
@@ -479,22 +479,22 @@ async fn the_transcript_location_follows_the_documented_output_location_rule() {
         (
             "a bucket alone",
             Some("s3://example-output"),
-            "s3://example-output/output-bucket.json".to_string(),
+            "/example-output/output-bucket.json".to_string(),
         ),
         (
             "a folder with its trailing slash",
             Some("s3://example-output/analytics/"),
-            "s3://example-output/analytics/output-folder.json".to_string(),
+            "/example-output/analytics/output-folder.json".to_string(),
         ),
         (
             "a folder without a trailing slash",
             Some("s3://example-output/analytics"),
-            "s3://example-output/analytics/output-bare-folder.json".to_string(),
+            "/example-output/analytics/output-bare-folder.json".to_string(),
         ),
         (
             "a location naming the output file itself",
             Some("s3://example-output/analytics/chosen-name.json"),
-            "s3://example-output/analytics/chosen-name.json".to_string(),
+            "/example-output/analytics/chosen-name.json".to_string(),
         ),
     ];
     let names = [

@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::media_object_resolution::{call, emulator, given_staged_media, s3, BUCKET, STAGED_KEYS};
+use crate::transcription_jobs::callers_address;
 
 /// How long a poll of the family's reader waits between two calls, and how many calls
 /// it makes before giving up: together comfortably past the two spans of
@@ -580,7 +581,7 @@ async fn an_unfinished_job_has_written_nothing() {
     let locations = row.family.reported_locations(&job);
     assert_eq!(
         locations,
-        vec![format!("s3://{OUTPUT_BUCKET}/pending/out.json")],
+        vec![callers_address(OUTPUT_BUCKET, "pending/out.json")],
         "case {:?}: the finished job reports the location its request directed the \
          output to, got {locations:?}",
         row.case

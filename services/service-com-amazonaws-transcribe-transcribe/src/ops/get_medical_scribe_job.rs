@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // callback, one small document per distinct location the record reports, taken
         // once per job. Collected while the store is locked and written after the guard
         // is dropped, so no lock is held across the call into object storage.
-        let (outputs, job) = {
+        let (outputs, mut job) = {
             let mut store = state.lock();
             // The lookup materialises the transition the clock already owed this job, so
             // the status reported here is the one it had at `now`.
@@ -222,6 +222,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
             ));
         }
+
+        // Both locations this job reports are REPORTED as a caller can fetch them: this
+        // family's start REQUIRES `OutputBucketName`, so the transcript and the clinical
+        // document are in a bucket the request named and each address is that object's own
+        // on this emulator's endpoint, with nothing signed for a bucket this service does
+        // not own (`crate::state::report_medical_scribe_job_locations`).
+        crate::state::report_medical_scribe_job_locations(ctx, &mut job);
 
         Ok(GetMedicalScribeJobOutput {
             medical_scribe_job: Some(job),

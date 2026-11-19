@@ -1988,16 +1988,41 @@ impl JobOutputs for MedicalScribeJobRecord {
     }
 }
 
-/// A `SystemTime` as the `DateTime` the modelled timestamp members carry.
+/// A `SystemTime` as the `DateTime` the modelled timestamp members carry, at the
+/// resolution this service populates one at.
+///
+/// The members state that resolution themselves: "Timestamps are in the format
+/// `YYYY-MM-DD'T'HH:MM:SS.SSSSSS-UTC`. For example, `2022-05-04T12:32:58.761000-07:00`"
+/// (`smithy_query(query="doc", shape="TranscriptionJob", member="CreationTime")`, and the
+/// same sentence on every other timestamp member of the service) — the fractional part
+/// the service fills is MILLISECONDS, with the digits below them zero. So the instant a
+/// record holds, which the process clock reads at whatever resolution the host offers, is
+/// truncated to the millisecond before it is reported: a finer value is one no timestamp
+/// of this service ever carries, and a client that round-trips the member through a
+/// millisecond-resolution timestamp type would not read back what it was sent.
+///
+/// Truncated, never rounded: the instant reported is the millisecond the event had
+/// already reached, so a creation instant can never be reported as later than it was —
+/// which is what keeps the order of a record's own instants (creation, start, completion)
+/// the order the clock put them in.
+///
+/// Every family's projection goes through this one function
+/// ([`TranscriptionJobRecord::to_job`] and each other record's), so no member of this
+/// service reports a resolution another does not.
 pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     ::aws_smithy_types::DateTime::from_secs_and_nanos(
         i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
-        since_epoch.subsec_nanos(),
+        // `subsec_millis` is the whole milliseconds of the sub-second part, so scaling it
+        // back to nanoseconds drops exactly the digits below the millisecond.
+        since_epoch.subsec_millis() * NANOS_PER_MILLI,
     )
 }
+
+/// How many nanoseconds one millisecond is, for [`to_date_time`]'s truncation.
+const NANOS_PER_MILLI: u32 = 1_000_000;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

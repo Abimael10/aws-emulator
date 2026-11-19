@@ -216,15 +216,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        if let Some(region) = own_output_region.as_deref() {
-            crate::state::report_call_analytics_job_locations(ctx, region, &mut job);
-        }
+        crate::state::report_call_analytics_job_locations(
+            ctx,
+            own_output_region.as_deref(),
+            &mut job,
+        );
 
         Ok(GetCallAnalyticsJobOutput {
             // Each location this job reports is REPORTED as a caller can fetch it: a
             // service-managed one as the temporary pre-signed address of the document
-            // just stored there, and an output location the request named as the
-            // caller's own address (`crate::state::report_call_analytics_job_locations`).
+            // just stored there, and an output location the request named as the plain
+            // address of that object on this emulator's own endpoint
+            // (`crate::state::report_call_analytics_job_locations`).
             call_analytics_job: Some(job),
         })
     }

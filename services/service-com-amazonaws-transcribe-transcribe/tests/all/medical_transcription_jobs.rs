@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::transcription_jobs::Transcribe;
+use crate::transcription_jobs::{callers_address, Transcribe};
 
 /// Long enough for the `IN_PROGRESS -> COMPLETED` transition of a job started during
 /// the test to have fallen due: one span of `crate::state::JOB_TRANSITION_DELAY`
@@ -146,16 +146,22 @@ fn job_name(request: &Value) -> String {
 /// specified for your medical transcription job", an `OutputKey` naming a file is used
 /// as given, and an `OutputKey` naming a prefix holds a file named for the job (model
 /// doc for `StartMedicalTranscriptionJobRequest$OutputKey`). `OutputBucketName` is
-/// required for this family, so the transcript is always in the caller's bucket.
+/// required for this family, so the transcript is always in the caller's bucket — and
+/// it is announced, like every location this service hands a caller to fetch, on the
+/// endpoint this emulator is reached on
+/// (`crate::transcription_jobs::callers_address`).
 fn expected_transcript_uri(request: &Value) -> String {
     let bucket = request["OutputBucketName"]
         .as_str()
         .expect("every row names its output bucket");
     let name = job_name(request);
     match request.get("OutputKey").and_then(Value::as_str) {
-        None => format!("s3://{bucket}/{name}.json"),
-        Some(key) if key.ends_with(".json") => format!("s3://{bucket}/{key}"),
-        Some(key) => format!("s3://{bucket}/{prefix}/{name}.json", prefix = key.trim_end_matches('/')),
+        None => callers_address(bucket, &format!("{name}.json")),
+        Some(key) if key.ends_with(".json") => callers_address(bucket, key),
+        Some(key) => callers_address(
+            bucket,
+            &format!("{prefix}/{name}.json", prefix = key.trim_end_matches('/')),
+        ),
     }
 }
 

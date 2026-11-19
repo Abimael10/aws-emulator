@@ -12,9 +12,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{MultiServiceRouter, UNSERVED_URL_BASE};
 
 use crate::served_download_locations::named_object;
+
+/// The address a reported location in a bucket the REQUEST named takes: the object
+/// addressed path-style under the endpoint this emulator is reached on
+/// (`crate::state::callers_location`), which is [`UNSERVED_URL_BASE`] for an emulator no
+/// data port serves, as every suite in this crate stands one up.
+///
+/// `pub(crate)`: each suite that pins where such a location is reported reads the form
+/// through this one spelling, so no two of them can expect addresses of different shapes.
+/// `crate::reported_location_endpoints` is the suite that pins the ENDPOINT half of it,
+/// over the addresses a served emulator publishes.
+pub(crate) fn callers_address(bucket: &str, key: &str) -> String {
+    format!("{UNSERVED_URL_BASE}/{bucket}/{key}")
+}
 
 /// Long enough for every clock-owed transition of a job started during the test to
 /// have fallen due: a queued job's `QUEUED -> IN_PROGRESS -> COMPLETED` is two spans
@@ -752,18 +765,13 @@ async fn a_job_completes_once_its_processing_span_has_elapsed() {
         );
     }
 
-    // Nothing sleeps inside the service: the transition is due at an instant stored
-    // on the record, so the test simply waits past it.
-    std::thread::sleep(PAST_EVERY_TRANSITION);
-
     for (case, _) in cases {
-        let fetched = transcribe
-            .call(
-                "GetTranscriptionJob",
-                json!({"TranscriptionJobName": format!("lifecycle-{case}")}),
-            )
+        // Nothing sleeps inside the service: the transition is due at an instant stored
+        // on the record, so the test looks again until the job has settled rather than
+        // waiting out a span (`Transcribe::transcription_job_settled`).
+        let job = transcribe
+            .transcription_job_settled(&format!("lifecycle-{case}"), None)
             .await;
-        let job = fetched.ok(case)["TranscriptionJob"].clone();
         assert_eq!(
             job["TranscriptionJobStatus"],
             json!("COMPLETED"),
@@ -772,7 +780,7 @@ async fn a_job_completes_once_its_processing_span_has_elapsed() {
         );
         assert_eq!(
             job["Transcript"]["TranscriptFileUri"],
-            json!(format!("s3://example-output/lifecycle-{case}.json")),
+            json!(callers_address("example-output", &format!("lifecycle-{case}.json"))),
             "case {case:?}: a completed job carries its transcript URI, got {:?}",
             job["Transcript"]
         );
@@ -817,41 +825,44 @@ async fn the_output_location_follows_the_documented_output_key_rule() {
     // Rows 2-5 are the four examples in the model doc for
     // `StartTranscriptionJobRequest$OutputKey`; row 1 is its stated default ("the
     // same as the name you specified for your transcription job") and row 6 is the
-    // service-managed bucket of `Transcript$TranscriptFileUri`.
+    // service-managed bucket of `Transcript$TranscriptFileUri`. Each row's `uri` is the
+    // OBJECT the reported location names (`/BUCKET/KEY`), which is what the documented
+    // rule decides; WHERE that object is announced — the endpoint this emulator is
+    // reached on, in either bucket — is `crate::reported_location_endpoints`' subject.
     let cases = vec![
         OutputCase {
             name: "job-a",
             bucket: Some("doc-example-bucket"),
             key: None,
-            uri: "s3://doc-example-bucket/job-a.json".to_string(),
+            uri: "/doc-example-bucket/job-a.json".to_string(),
             location: "CUSTOMER_BUCKET",
         },
         OutputCase {
             name: "job-b",
             bucket: Some("doc-example-bucket"),
             key: Some("my-transcript.json"),
-            uri: "s3://doc-example-bucket/my-transcript.json".to_string(),
+            uri: "/doc-example-bucket/my-transcript.json".to_string(),
             location: "CUSTOMER_BUCKET",
         },
         OutputCase {
             name: "my-first-transcription",
             bucket: Some("doc-example-bucket"),
             key: Some("my-transcript"),
-            uri: "s3://doc-example-bucket/my-transcript/my-first-transcription.json".to_string(),
+            uri: "/doc-example-bucket/my-transcript/my-first-transcription.json".to_string(),
             location: "CUSTOMER_BUCKET",
         },
         OutputCase {
             name: "job-c",
             bucket: Some("doc-example-bucket"),
             key: Some("test-files/my-transcript.json"),
-            uri: "s3://doc-example-bucket/test-files/my-transcript.json".to_string(),
+            uri: "/doc-example-bucket/test-files/my-transcript.json".to_string(),
             location: "CUSTOMER_BUCKET",
         },
         OutputCase {
             name: "job-d",
             bucket: Some("doc-example-bucket"),
             key: Some("test-files/my-transcript"),
-            uri: "s3://doc-example-bucket/test-files/my-transcript/job-d.json".to_string(),
+            uri: "/doc-example-bucket/test-files/my-transcript/job-d.json".to_string(),
             location: "CUSTOMER_BUCKET",
         },
         OutputCase {

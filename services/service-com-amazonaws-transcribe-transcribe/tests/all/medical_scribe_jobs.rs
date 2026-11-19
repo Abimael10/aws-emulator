@@ -26,7 +26,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_transcribe_transcribe::state::DEFAULT_NOTE_TEMPLATE;
 
-use crate::transcription_jobs::Transcribe;
+use crate::transcription_jobs::{callers_address, Transcribe};
 
 /// Long enough for the `IN_PROGRESS -> COMPLETED` transition of a job started during
 /// the test to have fallen due: one span of `crate::state::JOB_TRANSITION_DELAY`
@@ -341,9 +341,6 @@ async fn a_medical_scribe_job_completes_once_its_processing_span_has_elapsed() {
             .ok(case);
     }
 
-    // One wait for every row, not one per row.
-    std::thread::sleep(PAST_THE_TRANSITION);
-
     for (case, request) in start_requests() {
         let name = job_name(&request);
         let bucket = request["OutputBucketName"]
@@ -351,8 +348,19 @@ async fn a_medical_scribe_job_completes_once_its_processing_span_has_elapsed() {
             .expect("every row names its output bucket")
             .to_string();
 
-        let fetched = get(&transcribe, &name).await;
-        let job = fetched.ok(case)["MedicalScribeJob"].clone();
+        // Nothing sleeps inside the service: the transition is due at an instant stored
+        // on the record, so each row looks again until its job has settled rather than
+        // waiting out a span (`Transcribe::job_settled`, the crate's poll-until helper).
+        let job = transcribe
+            .job_settled(
+                "GetMedicalScribeJob",
+                "MedicalScribeJobName",
+                "MedicalScribeJob",
+                "MedicalScribeJobStatus",
+                &name,
+                None,
+            )
+            .await;
         assert_eq!(
             job["MedicalScribeJobStatus"],
             json!("COMPLETED"),
@@ -365,13 +373,15 @@ async fn a_medical_scribe_job_completes_once_its_processing_span_has_elapsed() {
             "case {case:?}: a completed job reports a CompletionTime, got {:?}",
             job["CompletionTime"]
         );
-        // Both output URIs are in the bucket the request named, under a prefix named
-        // for the job (see `crate::state::medical_scribe_output_uri`).
+        // Both output URIs name the object in the bucket the request named, under a
+        // prefix named for the job (see `crate::state::medical_scribe_output_uri`),
+        // announced on the endpoint this emulator is reached on, as every location this
+        // service hands a caller to fetch is.
         assert_eq!(
             job["MedicalScribeOutput"],
             json!({
-                "TranscriptFileUri": format!("s3://{bucket}/{name}/transcript.json"),
-                "ClinicalDocumentUri": format!("s3://{bucket}/{name}/summary.json")
+                "TranscriptFileUri": callers_address(&bucket, &format!("{name}/transcript.json")),
+                "ClinicalDocumentUri": callers_address(&bucket, &format!("{name}/summary.json"))
             }),
             "case {case:?}: unexpected MedicalScribeOutput, got {:?}",
             job["MedicalScribeOutput"]

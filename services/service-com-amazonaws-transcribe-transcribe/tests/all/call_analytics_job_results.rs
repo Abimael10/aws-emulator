@@ -29,7 +29,7 @@ use service_com_amazonaws_transcribe_transcribe::state::{
 
 use crate::call_analytics_jobs::{get, job_name, list, names_of, PAST_THE_TRANSITION};
 use crate::served_download_locations::{named_object, reported_objects};
-use crate::transcription_jobs::Transcribe;
+use crate::transcription_jobs::{callers_address, Transcribe};
 
 /// Every value the model's `MediaFormat` enum carries, read from the generated
 /// constant rather than copied, so a change to the model reaches this table
@@ -463,12 +463,16 @@ async fn a_finished_job_reports_the_transcripts_its_redaction_settings_asked_for
         .iter()
         .find(|(job_case, _)| job_case == case)
         .unwrap_or_else(|| panic!("case {case:?}: the row must have a finished job"));
+    // The locations are the caller's own objects, announced on the endpoint this
+    // emulator is reached on (`crate::transcription_jobs::callers_address`), because a
+    // client follows the value it is handed.
+    let bucket = "example-output";
     assert_eq!(
         job["Transcript"],
         json!({
-            "TranscriptFileUri": "s3://example-output/analytics/chosen-name.json",
+            "TranscriptFileUri": callers_address(bucket, "analytics/chosen-name.json"),
             "RedactedTranscriptFileUri":
-                "s3://example-output/analytics/redacted-chosen-name.json"
+                callers_address(bucket, "analytics/redacted-chosen-name.json")
         }),
         "case {case:?}: unexpected transcript locations, got {:?}",
         job["Transcript"]

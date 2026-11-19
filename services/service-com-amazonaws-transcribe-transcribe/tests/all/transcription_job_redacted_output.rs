@@ -26,7 +26,7 @@ use service_com_amazonaws_transcribe_transcribe::ops::types::REDACTION_OUTPUT_VA
 use service_com_amazonaws_transcribe_transcribe::state::DEFAULT_REGION;
 
 use crate::served_download_locations::{named_object, reported_objects};
-use crate::transcription_jobs::Transcribe;
+use crate::transcription_jobs::{callers_address, Transcribe};
 
 /// Long enough for every clock-owed transition of a job started during the test to
 /// have fallen due: a deferred job's `QUEUED -> IN_PROGRESS -> COMPLETED` is two spans
@@ -297,8 +297,9 @@ async fn the_redacted_transcript_sits_beside_the_unredacted_one_in_the_requested
                 }
             }),
             json!({
-                "TranscriptFileUri": "s3://example-output/both-bucket.json",
-                "RedactedTranscriptFileUri": "s3://example-output/redacted-both-bucket.json"
+                "TranscriptFileUri": callers_address("example-output", "both-bucket.json"),
+                "RedactedTranscriptFileUri":
+                    callers_address("example-output", "redacted-both-bucket.json")
             }),
         ),
         (
@@ -316,9 +317,10 @@ async fn the_redacted_transcript_sits_beside_the_unredacted_one_in_the_requested
                 }
             }),
             json!({
-                "TranscriptFileUri": "s3://example-output/transcripts/both-folder.json",
+                "TranscriptFileUri":
+                    callers_address("example-output", "transcripts/both-folder.json"),
                 "RedactedTranscriptFileUri":
-                    "s3://example-output/transcripts/redacted-both-folder.json"
+                    callers_address("example-output", "transcripts/redacted-both-folder.json")
             }),
         ),
         (
@@ -335,9 +337,10 @@ async fn the_redacted_transcript_sits_beside_the_unredacted_one_in_the_requested
                 }
             }),
             json!({
-                "TranscriptFileUri": "s3://example-output/transcripts/chosen-name.json",
+                "TranscriptFileUri":
+                    callers_address("example-output", "transcripts/chosen-name.json"),
                 "RedactedTranscriptFileUri":
-                    "s3://example-output/transcripts/redacted-chosen-name.json"
+                    callers_address("example-output", "transcripts/redacted-chosen-name.json")
             }),
         ),
         (

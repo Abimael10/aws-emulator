@@ -48,10 +48,12 @@
 //! `SubtitlesOutput.SubtitleFileUris`, in this emulator's own object store over the
 //! in-process callback, so the canonical workflow — start a job, poll it until it is
 //! finished, then fetch the location it reports — completes (see
-//! [`store_job_outputs`]). WHAT a caller is handed for a location in the service-managed
-//! store is the temporary pre-signed address of that very object, because a client
-//! follows it with no credential of its own (see
-//! [`report_transcription_job_locations`]). What that
+//! [`store_job_outputs`]). WHAT a caller is handed is an address on the endpoint THIS
+//! EMULATOR is reached on, whichever bucket the file is in: the temporary pre-signed
+//! address of that very object for a location in the service-managed store, because a
+//! client follows it with no credential of its own, and the plain unsigned address of the
+//! object for a location in a bucket the REQUEST named, which the caller addresses with
+//! its own credentials (see [`report_transcription_job_locations`]). What that
 //! document holds is the envelope the service itself
 //! owns (the job, the account, the status) with an EMPTY transcript and no caption,
 //! because no engine read the audio: a transcription that produced no words, never
