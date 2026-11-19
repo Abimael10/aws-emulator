@@ -272,7 +272,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     .iter()
                     .filter(|attachment| attachment.is_elastic_network_interface())
                     .filter(|attachment| attachment.allocated.is_none())
-                    .filter(|attachment| attachment.status != ATTACHMENT_STATUS_DELETED)
+                    // An attachment the clock is RELEASING stands for an interface that is
+                    // on its way out ([`INTERFACE_DETACH_LIFECYCLE`]), so nothing is owed
+                    // one for it.
+                    .filter(|attachment| {
+                        attachment.status != ATTACHMENT_STATUS_DELETED
+                            && !attachment.is_detaching()
+                    })
                     .filter_map(move |attachment| {
                         Some(PendingInterface {
                             task_arn: task.task_arn.clone(),

@@ -174,6 +174,48 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     task.finish_work(due);
                 }
             }
+            // The elastic network interface Amazon ECS created for the task is torn down WITH
+            // the task, and Amazon ECS takes those steps BEFORE the task is stopped: the
+            // release is a progression of the attachment's own
+            // ([`INTERFACE_DETACH_LIFECYCLE`]), one step per span, each owed from the instant
+            // the task began stopping whether or not anybody called to look
+            // ([`AttachmentRecord::begin_release`]) — so a client watching a task stop
+            // sees each step, and one reading a task that HAS stopped finds the interface it
+            // held already gone. Driven off what the task holds rather than off the call that
+            // stopped it, so every stop reaches it: the one the clock materialises below, the
+            // one a call asked for and the one an agent reported
+            // (`SubmitTaskStateChange`) alike.
+            if task.desired_status == STATUS_STOPPED || task.last_status == STATUS_STOPPED {
+                let began_at = task
+                    .stopping_at
+                    .or(task.stopped_at)
+                    .and_then(|at| SystemTime::try_from(at).ok())
+                    .unwrap_or(now);
+                let mut released = false;
+                for attachment in &mut task.attachments {
+                    released |= attachment.begin_release(began_at);
+                }
+                // And the stop itself waits for that release, the way a task's `PENDING`
+                // waits for the attach ([`TaskRecord::interfaces_attached`]): the task is
+                // `STOPPED` at the instant the last of its interfaces is gone, when that
+                // falls later than the stop the clock already owed. Read off the schedule
+                // before any step of it is materialised, so a pass that arrives late stops
+                // the task at the instant the release finished rather than at the earlier one
+                // the stop was owed at.
+                if task.last_status != STATUS_STOPPED {
+                    if let (Some(due), Some(released_at)) =
+                        (task.stopped_due_at, task.interfaces_release_due_at())
+                    {
+                        task.stopped_due_at = Some(due.max(released_at));
+                    }
+                }
+                for attachment in &mut task.attachments {
+                    released |= attachment.advance_release(now);
+                }
+                if released {
+                    task.version += 1;
+                }
+            }
             if let Some(due) = task.stopped_due_at {
                 if due <= now {
                     task.stopped_due_at = None;
@@ -185,12 +227,6 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     task.execution_stopped_at = Some(DateTime::from(due));
                     for container in &mut task.containers {
                         container.advance_to(STATUS_STOPPED);
-                    }
-                    // The elastic network interface Amazon ECS created for the task is torn
-                    // down with the task, so what the attachment stands for is gone
-                    // ([`AttachmentRecord::delete_allocated_interface`]).
-                    for attachment in &mut task.attachments {
-                        attachment.delete_allocated_interface();
                     }
                     task.version += 1;
                 }

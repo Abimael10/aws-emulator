@@ -53,8 +53,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long a poll keeps trying before it gives up: the whole start of an `awsvpc` task
 /// ([`AWSVPC_START`]) plus the two further spans a launch failure takes (the fetch is
 /// attempted where the start would have been, and the stop falls due one span after
-/// that), with margin for a loaded test machine.
-const POLL_BUDGET: Duration = AWSVPC_START.saturating_add(Duration::from_secs(3));
+/// that) plus the release of the interface the task was allocated, which its stop waits for
+/// (one `state::INTERFACE_RELEASE_STEP_SPAN` per step of
+/// `state::INTERFACE_DETACH_LIFECYCLE`), with margin for a loaded test machine.
+const POLL_BUDGET: Duration = AWSVPC_START
+    .saturating_add(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::INTERFACE_RELEASE_STEP_SPAN
+            .saturating_mul(3),
+    )
+    .saturating_add(Duration::from_secs(3));
 
 /// An image in a PUBLIC container registry: its registry is no AWS service, so it is
 /// reachable only over the internet.

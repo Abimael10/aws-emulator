@@ -59,11 +59,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// How long a poll keeps trying before it gives up: the whole start of an `awsvpc` task
 /// ([`AWSVPC_START`]), the work a standalone task is placed to do
-/// (`state::CONTAINER_WORK_SPAN`) and the stop that follows it, with margin for a loaded
-/// test machine.
+/// (`state::CONTAINER_WORK_SPAN`) and the stop that follows it, which also waits for the
+/// release of the interface such a task was allocated (one
+/// `state::INTERFACE_RELEASE_STEP_SPAN` per step of `state::INTERFACE_DETACH_LIFECYCLE`),
+/// with margin for a loaded test machine.
 const POLL_BUDGET: Duration = AWSVPC_START
     .saturating_add(
         service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::CONTAINER_WORK_SPAN,
+    )
+    .saturating_add(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::INTERFACE_RELEASE_STEP_SPAN
+            .saturating_mul(3),
     )
     .saturating_add(Duration::from_secs(5));
 

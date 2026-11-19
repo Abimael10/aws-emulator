@@ -82,13 +82,21 @@ const POLL_BUDGET: Duration =
 /// How long a poll of a SERVICE's task keeps trying: the whole start of an `awsvpc` task
 /// ([`AWSVPC_START`], which covers the interface steps Amazon ECS takes and the start owed
 /// after them) plus the further spans a failed launch takes — the fetch is decided where the
-/// start would have been, and `STOPPED` falls due one span after that — with margin for a
-/// loaded test machine. Built by `Duration` arithmetic, so no figure here is a cast.
-const SERVICE_POLL_BUDGET: Duration = AWSVPC_START.saturating_add(
-    service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::TRANSITION_SPAN
-        .saturating_mul(4)
-        .saturating_add(Duration::from_secs(4)),
-);
+/// start would have been, and `STOPPED` falls due one span after that, once the release of
+/// the interface the task was allocated has finished (one
+/// `state::INTERFACE_RELEASE_STEP_SPAN` per step of `state::INTERFACE_DETACH_LIFECYCLE`) —
+/// with margin for a loaded test machine. Built by `Duration` arithmetic, so no figure here
+/// is a cast.
+const SERVICE_POLL_BUDGET: Duration = AWSVPC_START
+    .saturating_add(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::INTERFACE_RELEASE_STEP_SPAN
+            .saturating_mul(3),
+    )
+    .saturating_add(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::TRANSITION_SPAN
+            .saturating_mul(4)
+            .saturating_add(Duration::from_secs(4)),
+    );
 
 /// `Task$lastStatus` of a task that has stopped.
 const STOPPED: &str = "STOPPED";

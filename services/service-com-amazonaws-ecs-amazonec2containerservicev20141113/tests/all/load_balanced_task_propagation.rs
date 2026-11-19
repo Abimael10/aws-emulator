@@ -73,9 +73,16 @@ const TASK_LIFECYCLE: [&str; 5] = [
 /// How often a poll re-reads a surface it is waiting on.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// How long a poll keeps trying before it gives up: the whole start of an `awsvpc` task and
-/// several further transitions, with margin for a loaded test machine.
-const POLL_BUDGET: Duration = AWSVPC_START.saturating_add(Duration::from_secs(6));
+/// How long a poll keeps trying before it gives up: the whole start of an `awsvpc` task,
+/// several further transitions and the release of the interface such a task was allocated,
+/// which its stop waits for (one `state::INTERFACE_RELEASE_STEP_SPAN` per step of
+/// `state::INTERFACE_DETACH_LIFECYCLE`), with margin for a loaded test machine.
+const POLL_BUDGET: Duration = AWSVPC_START
+    .saturating_add(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::INTERFACE_RELEASE_STEP_SPAN
+            .saturating_mul(3),
+    )
+    .saturating_add(Duration::from_secs(6));
 
 /// An emulator carrying ECS, Elastic Load Balancing v2, EventBridge and SQS over ONE shared
 /// engine, the way the production router mounts them.

@@ -25,11 +25,23 @@
 //!   interface in place connects the task at that instant. The state a report may name is
 //!   `ATTACHED` alone — Amazon ECS takes the interface as far as `ATTACHING` itself — and a
 //!   report naming any other state is refused and leaves the progression to the clock.
+//! * The interface belongs to the task, so Amazon ECS tears it down WITH the task, and takes
+//!   those steps BEFORE the task is stopped ("Amazon ECS has to perform additional steps
+//!   before the task is stopped", the ECS task lifecycle): one read after another sees the
+//!   attachment of a task on its way out leave `ATTACHED` and pass `DETACHING`, `DETACHED`
+//!   and `DELETED` while the task reports `DEACTIVATING`, and the task reaches `STOPPED` at
+//!   the instant the release finishes — so each status of the release is one a client that
+//!   waits for the interface to be gone can really observe, and a client reading a task that
+//!   HAS stopped finds the interface it held already released. The interface that was in
+//!   place keeps every detail it reported throughout. An interface Amazon ECS had never
+//!   attached has nothing to be detached from, so it reports the terminal status with no
+//!   detach in between and none of the details of an interface.
 //!
 //! The rows differ along which launch path placed the task (`RunTask`, `StartTask`, a
 //! service's own scheduler), along the network mode (every value of the model's
-//! `NetworkMode` enum), and along the status the report names (the one it accepts, and every
-//! other value `Attachment$status` lists).
+//! `NetworkMode` enum), along the status the report names (the one it accepts, and every
+//! other value `Attachment$status` lists), and along how the task STOPPED (a `StopTask` of
+//! the caller's, and the end of the work a standalone task was placed to do).
 //!
 //! Nothing here reaches into the state struct: every value asserted is read back through
 //! `DescribeTasks`, so a response that is not computed from persisted state cannot pass.
@@ -69,6 +81,38 @@ const PAST_THE_FIRST_ATTACH_STEP: Duration =
 /// The statuses the interface of a task that is coming up passes through, in order — three
 /// of the values `Attachment$status` lists.
 const ATTACH_STATUSES: [&str; 3] = ["PRECREATED", "ATTACHING", "ATTACHED"];
+
+/// The statuses the interface of a task that is STOPPING passes through, in order — four of
+/// the values the same member lists, beginning where the attach left it.
+const RELEASE_STATUSES: [&str; 4] = ["ATTACHED", "DETACHING", "DETACHED", "DELETED"];
+
+/// The terminal status of an attachment whose resource is gone, the last of those.
+const DELETED: &str = "DELETED";
+
+/// The `Attachment$details` keys an interface that is in place reports — `Attachment$details`
+/// "for elastic network interfaces ... includes the network interface ID, the MAC address,
+/// the subnet ID, and the private IPv4 address".
+const INTERFACE_DETAILS: [&str; 4] = [
+    "subnetId",
+    "networkInterfaceId",
+    "macAddress",
+    "privateIPv4Address",
+];
+
+/// How long a poll keeps trying for the RELEASE of a stopping task's interface: the whole
+/// start of an `awsvpc` task ([`AWSVPC_START`]), the work a task placed on its own does
+/// (`state::CONTAINER_WORK_SPAN`), then one `state::INTERFACE_RELEASE_STEP_SPAN` per step of
+/// `state::INTERFACE_DETACH_LIFECYCLE`, which is what the task's own stop waits for — with
+/// generous margin, so a loaded machine cannot fail a row the emulator would satisfy.
+const RELEASE_BUDGET: Duration = AWSVPC_START
+    .saturating_add(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::CONTAINER_WORK_SPAN,
+    )
+    .saturating_add(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::INTERFACE_RELEASE_STEP_SPAN
+            .saturating_mul(3),
+    )
+    .saturating_add(Duration::from_secs(30));
 
 /// The `lastStatus` values a task that is coming up passes through, in order.
 const TASK_STATUSES: [&str; 3] = ["PROVISIONING", "PENDING", "RUNNING"];
@@ -643,4 +687,234 @@ async fn a_task_that_is_not_placed_yet_is_given_no_interface_and_is_on_no_networ
         "case {case:?}: expected the attach to begin with the placement and pass through \
          every documented status, observed {attach_seen:?}"
     );
+}
+
+/// The identity the attachment of an `awsvpc` task reports once its interface is in place:
+/// every detail [`INTERFACE_DETAILS`] names, in that order.
+fn identity_of(attachment: &Value, case: &str) -> Vec<String> {
+    INTERFACE_DETAILS
+        .iter()
+        .map(|name| {
+            detail(attachment, name).unwrap_or_else(|| {
+                panic!("case {case:?}: an interface in place reports {name}, got {attachment}")
+            })
+        })
+        .collect()
+}
+
+/// Read one task until its interface is in place and it is RUNNING, and answer the identity
+/// that interface reports.
+async fn running_interface(
+    router: &MultiServiceRouter,
+    task_arn: &str,
+    case: &str,
+) -> Vec<String> {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let task = describe(router, task_arn, case).await;
+        let attachment = only_attachment(&task, case);
+        if string(&task, "lastStatus", case) == "RUNNING" {
+            assert_eq!(
+                attachment["status"].as_str(),
+                Some(RELEASE_STATUSES[0]),
+                "case {case:?}: a running task's interface is in place, got {attachment}"
+            );
+            return identity_of(&attachment, case);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the clock to attach the interface and run the task, got \
+             {task}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[tokio::test]
+async fn a_stopped_awsvpc_tasks_interface_is_released_one_documented_step_at_a_time() {
+    // The rows differ along how the task was asked to stop — the two ways a task placed on
+    // its own ends — because the release follows from the task stopping, not from what
+    // stopped it.
+    let rows: [(&str, bool); 2] = [
+        ("a task the caller stopped", true),
+        ("a task whose own work finished", false),
+    ];
+
+    for (index, (case, stopped_by_the_caller)) in rows.into_iter().enumerate() {
+        // A fresh engine per row, so one row's tasks cannot leak into another.
+        let router = service();
+        cluster_with_capacity(&router, CLUSTER, case).await;
+        let family = format!("ifacerelease{index}");
+        register(&router, &family, "awsvpc", case).await;
+        let task_arn = launch(&router, Launch::RunTask, &family, case).await;
+        let identity = running_interface(&router, &task_arn, case).await;
+
+        if stopped_by_the_caller {
+            ok(
+                &router,
+                "StopTask",
+                json!({
+                    "cluster": CLUSTER,
+                    "task": task_arn.clone(),
+                    "reason": "the client is finished with it",
+                }),
+                case,
+            )
+            .await;
+        }
+
+        // The release, read one step at a time: every status it is documented to pass
+        // through, in order and with nothing skipped.
+        let mut seen: Vec<String> = Vec::new();
+        let deadline = Instant::now() + RELEASE_BUDGET;
+        loop {
+            let task = describe(&router, &task_arn, case).await;
+            let attachment = only_attachment(&task, case);
+            let status = string(&attachment, "status", case);
+            observe(&mut seen, &status);
+
+            // The interface that was in place keeps the identity it reported for the whole
+            // release: it is what a client reading the stopped task resolves the interface
+            // it HELD by.
+            assert_eq!(
+                INTERFACE_DETAILS
+                    .iter()
+                    .map(|name| detail(&attachment, name))
+                    .collect::<Vec<Option<String>>>(),
+                identity.iter().cloned().map(Some).collect::<Vec<_>>(),
+                "case {case:?}: expected the released interface to keep the details it \
+                 reported, got {attachment}"
+            );
+
+            // And the release is part of the STOP: an attachment that has left `ATTACHED` is
+            // one of a task Amazon ECS is still stopping, and the task is `STOPPED` only once
+            // the interface it held is gone.
+            let last_status = string(&task, "lastStatus", case);
+            let desired_status = string(&task, "desiredStatus", case);
+            if status == RELEASE_STATUSES[1] || status == RELEASE_STATUSES[2] {
+                assert_eq!(
+                    (last_status.as_str(), desired_status.as_str()),
+                    ("DEACTIVATING", "STOPPED"),
+                    "case {case:?}: expected the interface to be released while the task is \
+                     still being stopped, got {task}"
+                );
+            }
+            if status == DELETED {
+                assert_eq!(
+                    last_status, "STOPPED",
+                    "case {case:?}: expected the task stopped once its interface was gone, \
+                     got {task}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: expected the stopping task's interface to be released; \
+                 observed {seen:?}, last {attachment}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        // The statuses observed are the documented ones, in the documented order, and the
+        // release was OBSERVABLE off `ATTACHED` before the interface was gone. A poll
+        // SAMPLES the record, and on a loaded machine a whole span can pass between two
+        // samples, so what is asserted is the order of what was seen and that a status
+        // between the two ends was seen at all — not that every window was sampled. The jump
+        // this rule exists to rule out, straight from `ATTACHED` to `DELETED`, satisfies
+        // neither.
+        let documented: Vec<Option<usize>> = seen
+            .iter()
+            .map(|status| {
+                RELEASE_STATUSES
+                    .iter()
+                    .position(|documented| *documented == status.as_str())
+            })
+            .collect();
+        assert!(
+            documented.iter().all(Option::is_some),
+            "case {case:?}: expected every status of the release to be one \
+             `Attachment$status` documents, observed {seen:?}"
+        );
+        let documented: Vec<usize> = documented.into_iter().flatten().collect();
+        assert!(
+            documented.windows(2).all(|pair| pair[0] < pair[1]),
+            "case {case:?}: expected the release to run in the documented order, observed \
+             {seen:?}"
+        );
+        assert_eq!(
+            (seen.first().map(String::as_str), seen.last().map(String::as_str)),
+            (Some(RELEASE_STATUSES[0]), Some(DELETED)),
+            "case {case:?}: expected the release to begin at the attached interface and end \
+             with it gone, observed {seen:?}"
+        );
+        assert!(
+            seen.len() >= 3,
+            "case {case:?}: expected the interface to be observably off {:?} before it was \
+             {DELETED}, observed {seen:?}",
+            RELEASE_STATUSES[0]
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_interface_the_task_stopped_before_attaching_is_reported_simply_gone() {
+    // An interface Amazon ECS had not attached to anything has nothing to be detached FROM,
+    // so there is no detach in its release — and it reports none of the three details that
+    // belong to the interface itself, exactly as it reported none while it was being
+    // attached. The subnet the launch supplied is reported throughout, because the launch
+    // supplied it.
+    let case = "a task stopped while its interface was still being created";
+    let router = service();
+    cluster_with_capacity(&router, CLUSTER, case).await;
+    register(&router, "earlystopiface", "awsvpc", case).await;
+    let task_arn = launch(&router, Launch::RunTask, "earlystopiface", case).await;
+
+    let created = only_attachment(&describe(&router, &task_arn, case).await, case);
+    assert_eq!(
+        created["status"].as_str(),
+        Some(ATTACH_STATUSES[0]),
+        "case {case:?}: Amazon ECS has only just created the interface, got {created}"
+    );
+    ok(
+        &router,
+        "StopTask",
+        json!({ "cluster": CLUSTER, "task": task_arn.clone(), "reason": "never mind" }),
+        case,
+    )
+    .await;
+
+    let mut seen: Vec<String> = Vec::new();
+    let deadline = Instant::now() + RELEASE_BUDGET;
+    let gone = loop {
+        let task = describe(&router, &task_arn, case).await;
+        let attachment = only_attachment(&task, case);
+        let status = string(&attachment, "status", case);
+        observe(&mut seen, &status);
+        if status == DELETED {
+            break attachment;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the interface of the stopped task to be reported gone; \
+             observed {seen:?}, last {attachment}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    };
+    assert!(
+        !seen
+            .iter()
+            .any(|status| status == RELEASE_STATUSES[1] || status == RELEASE_STATUSES[2]),
+        "case {case:?}: an interface that was never attached has nothing to detach, observed \
+         {seen:?}"
+    );
+    assert!(
+        detail(&gone, INTERFACE_DETAILS[0]).is_some_and(|value| !value.is_empty()),
+        "case {case:?}: the attachment keeps the subnet the launch supplied, got {gone}"
+    );
+    for name in INTERFACE_DETAILS.iter().skip(1) {
+        assert!(
+            detail(&gone, name).is_none(),
+            "case {case:?}: expected no {name} for an interface that was never in place, got \
+             {gone}"
+        );
+    }
 }

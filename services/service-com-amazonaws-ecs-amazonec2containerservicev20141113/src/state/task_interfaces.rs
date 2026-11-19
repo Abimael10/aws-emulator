@@ -21,6 +21,13 @@
 //! ([`INTERFACE_ATTACH_LIFECYCLE`]), and the task it belongs to does not reach `PENDING`
 //! before it is in place ([`placement_schedule`]) — which is also the instant the task is
 //! `CONNECTED` ([`TaskRecord::report_connected`]).
+//!
+//! The interface belongs to the task, so it is RELEASED with it: Amazon ECS detaches and
+//! deletes it as part of STOPPING the task, so the clock takes the attachment down the other
+//! documented progression ([`INTERFACE_DETACH_LIFECYCLE`]) one step at a time while the task
+//! is on its way out, the task's own `STOPPED` falls due at the instant that release finishes
+//! ([`TaskRecord::interfaces_release_due_at`]), and the Amazon VPC record is torn down with
+//! it ([`super::awsvpc_interfaces`]).
 
 use super::*;
 
@@ -42,14 +49,46 @@ pub const ATTACHMENT_STATUS_DELETED: &str = "DELETED";
 
 /// The statuses Amazon ECS takes an interface it is attaching THROUGH, in the order it
 /// takes them: created for the task that is provisioning, being attached to it, and in
-/// place. They are three of the values `Attachment$status` lists, and nothing here moves
-/// an attachment to one of the others — a detach or a failure is not something this
+/// place. They are three of the values `Attachment$status` lists; the ones a RELEASE passes
+/// through are [`INTERFACE_DETACH_LIFECYCLE`], and a failure is not something this
 /// emulator's clock owes anybody.
 pub const INTERFACE_ATTACH_LIFECYCLE: [&str; 3] = [
     ATTACHMENT_STATUS_PRECREATED,
     ATTACHMENT_STATUS_ATTACHING,
     ATTACHMENT_STATUS_ATTACHED,
 ];
+
+/// `Attachment$status` of an attachment Amazon ECS is in the middle of detaching from the
+/// task it created it for, from the same list of statuses.
+pub const ATTACHMENT_STATUS_DETACHING: &str = "DETACHING";
+
+/// `Attachment$status` of an attachment whose resource is no longer attached to the task
+/// but has not been torn down yet, from the same list of statuses.
+pub const ATTACHMENT_STATUS_DETACHED: &str = "DETACHED";
+
+/// The statuses Amazon ECS takes an interface it is RELEASING through, in the order it
+/// takes them: in place, being detached from the task, detached, and torn down. They are
+/// four of the values `Attachment$status` lists, and they begin where
+/// [`INTERFACE_ATTACH_LIFECYCLE`] ends — the release of a resource is a progression of its
+/// own, so a client watching a task stop observes each step of it rather than one jump.
+pub const INTERFACE_DETACH_LIFECYCLE: [&str; 4] = [
+    ATTACHMENT_STATUS_ATTACHED,
+    ATTACHMENT_STATUS_DETACHING,
+    ATTACHMENT_STATUS_DETACHED,
+    ATTACHMENT_STATUS_DELETED,
+];
+
+/// How long Amazon ECS takes over ONE step of [`INTERFACE_DETACH_LIFECYCLE`].
+///
+/// EMULATOR-CHOSEN, as [`INTERFACE_STEP_SPAN`] is, and one task transition
+/// ([`TRANSITION_SPAN`]) rather than that longer span, for two reasons: releasing the
+/// interface is part of the task's own STOP — Amazon ECS takes these steps before the task is
+/// stopped, which is what a task on its way out is waiting for — so a step of the release is
+/// a step of that stop and the stop as a whole is the sum of them; and no agent has a release
+/// status to acknowledge, which is what makes an ATTACH step the longer one: the only status a
+/// report may name is `ATTACHED` ([`AGENT_REPORT_ATTACHMENT_STATUSES`]), so nothing is waiting
+/// to observe a `DETACHING` and report on it.
+pub const INTERFACE_RELEASE_STEP_SPAN: Duration = TRANSITION_SPAN;
 
 /// How long Amazon ECS takes over ONE step of [`INTERFACE_ATTACH_LIFECYCLE`].
 ///
@@ -232,17 +271,19 @@ impl AttachmentRecord {
         self.attachment_type == ATTACHMENT_TYPE_ELASTIC_NETWORK_INTERFACE
     }
 
-    /// Report the interface Amazon ECS allocated for this attachment as GONE, which is what
-    /// the task it was created for reaching `STOPPED` means has happened.
+    /// Report the interface Amazon ECS allocated for this attachment as GONE, without
+    /// passing through the release progression — what a task that stopped before Amazon ECS
+    /// had ATTACHED the interface leaves behind.
     ///
     /// The interface an `awsvpc` task is allocated belongs to that task — Amazon ECS creates
     /// it while the task provisions and tears it down when the task stops — so a stopped
     /// task's attachment stands for a resource that no longer exists, and
     /// [`ATTACHMENT_STATUS_DELETED`] is what the member's own list of statuses words that
-    /// with. An interface that WAS in place keeps the details it reported: they are what a
-    /// client reading a stopped task resolves the interface it HELD by. One the task stopped
-    /// before Amazon ECS had attached it reports none of them, for the reason it reported
-    /// none while it was being attached ([`Self::report_allocated_interface`]).
+    /// with. An interface that was never in place has nothing to be detached FROM, which is
+    /// why this is the whole of its release: one that WAS in place is released a documented
+    /// step at a time instead ([`Self::begin_release`]). It reports none of the three
+    /// details that belong to the interface, for the reason it reported none while it was
+    /// being attached ([`Self::report_allocated_interface`]).
     ///
     /// Answers whether anything changed, which is what makes the task's `version` counter
     /// move ("Every time a task experiences a change ... the version counter is
@@ -254,6 +295,115 @@ impl AttachmentRecord {
         self.status = ATTACHMENT_STATUS_DELETED.to_string();
         self.next_status_due_at = None;
         true
+    }
+
+    /// Begin releasing the interface Amazon ECS allocated for this attachment, for a task
+    /// that began stopping at `stop_began_at`: schedule the first step of the release, or
+    /// report an interface that was never in place as simply gone.
+    ///
+    /// Amazon ECS tears the interface of a stopping task down, and that teardown is a
+    /// PROGRESSION of the attachment's own ([`INTERFACE_DETACH_LIFECYCLE`]): the interface
+    /// that was in place is detached from the task and then deleted, so a client watching the
+    /// task stop sees the attachment leave [`ATTACHMENT_STATUS_ATTACHED`] and reach
+    /// [`ATTACHMENT_STATUS_DELETED`] instead of seeing one status stand for both. Each step
+    /// takes [`INTERFACE_RELEASE_STEP_SPAN`] and is owed from the instant the task began
+    /// stopping, whether or not anybody calls to look ([`Self::advance_release`]), so the
+    /// statuses in between are ones a caller can really observe — and the task is not STOPPED
+    /// before the last of them ([`TaskRecord::interfaces_release_due_at`]), so a client
+    /// reading a stopped task finds the interface it held already gone. The interface that WAS
+    /// in place keeps the details it reported throughout: they are what a client reading a
+    /// stopped task resolves the interface it HELD by.
+    ///
+    /// An attachment Amazon ECS had not attached yet has nothing to detach from, so it is
+    /// simply gone ([`Self::delete_allocated_interface`]) and holds the stop open for
+    /// nothing. The Amazon VPC record of a deleted interface is torn down by the pass that
+    /// owns it
+    /// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::interfaces_awaiting_release`]).
+    ///
+    /// The schedule is computed from the STORED instant the stop began, so it is the same
+    /// whenever a pass gets to it, and re-stating it is what makes this safe to call on every
+    /// pass. Answers whether anything a caller reads changed, which is what makes the task's
+    /// `version` counter move ("Every time a task experiences a change ... the version
+    /// counter is incremented").
+    pub fn begin_release(&mut self, stop_began_at: SystemTime) -> bool {
+        if !self.is_elastic_network_interface() || self.status == ATTACHMENT_STATUS_DELETED {
+            return false;
+        }
+        if !self.is_attached() && !self.is_detaching() {
+            return self.delete_allocated_interface();
+        }
+        // The first step is owed one span from the instant the stop began, so the attachment
+        // an in-place interface stands for is still ATTACHED to a caller reading straight
+        // after the stop was asked for. An attachment the release has already moved — or one
+        // an agent's own report left at a release status — is re-armed only when nothing is
+        // owed on it, so a progression under way keeps the schedule it is on and one that
+        // lost its due instant is picked up again rather than stalling.
+        if self.is_attached() || self.next_status_due_at.is_none() {
+            self.next_status_due_at = Some(stop_began_at + INTERFACE_RELEASE_STEP_SPAN);
+        }
+        false
+    }
+
+    /// Whether the clock is in the middle of releasing this attachment's resource: it has
+    /// left [`ATTACHMENT_STATUS_ATTACHED`] but has not reached
+    /// [`ATTACHMENT_STATUS_DELETED`].
+    pub fn is_detaching(&self) -> bool {
+        self.status == ATTACHMENT_STATUS_DETACHING || self.status == ATTACHMENT_STATUS_DETACHED
+    }
+
+    /// The instant this attachment is expected to report [`ATTACHMENT_STATUS_DELETED`] at,
+    /// from where its release has got to, and `None` once nothing more is owed — what the
+    /// stop of the task holding it waits for ([`TaskRecord::interfaces_release_due_at`]).
+    ///
+    /// Only an elastic network interface has a release of its own here, so nothing else a task
+    /// carries holds its stop open ([`super::managed_ebs_volumes`]).
+    pub fn release_due_at(&self) -> Option<SystemTime> {
+        if !self.is_elastic_network_interface() {
+            return None;
+        }
+        let due = self.next_status_due_at?;
+        let reached = INTERFACE_DETACH_LIFECYCLE
+            .iter()
+            .position(|status| *status == self.status)?;
+        // The next step falls due at `due`, and every step after it one span further on.
+        let steps_left = INTERFACE_DETACH_LIFECYCLE.len() - 1 - reached;
+        let after_next = steps_left.checked_sub(1)?;
+        Some(due + INTERFACE_RELEASE_STEP_SPAN * after_next as u32)
+    }
+
+    /// The status [`INTERFACE_DETACH_LIFECYCLE`] takes this attachment to next, or `None`
+    /// when the clock owes it nothing more: the resource is gone, or the attachment is at a
+    /// status that progression does not pass through at all.
+    fn next_release_status(&self) -> Option<&'static str> {
+        let reached = INTERFACE_DETACH_LIFECYCLE
+            .iter()
+            .position(|status| *status == self.status)?;
+        INTERFACE_DETACH_LIFECYCLE.get(reached + 1).copied()
+    }
+
+    /// Materialise every step of this attachment's release that the clock has already made
+    /// due as of `now`, and answer whether any of them moved the status — the progression
+    /// [`Self::begin_release`] put on the record, and nothing else: an attachment of another
+    /// kind, or one still being attached, is left where it is.
+    pub fn advance_release(&mut self, now: SystemTime) -> bool {
+        if !self.is_elastic_network_interface() {
+            return false;
+        }
+        let mut changed = false;
+        while let Some(due) = self.next_status_due_at.filter(|due| *due <= now) {
+            match self.next_release_status() {
+                Some(next) => {
+                    self.status = next.to_string();
+                    changed = true;
+                    self.next_status_due_at = self
+                        .next_release_status()
+                        .map(|_| due + INTERFACE_RELEASE_STEP_SPAN);
+                }
+                // Nothing further is owed: the release is over.
+                None => self.next_status_due_at = None,
+            }
+        }
+        changed
     }
 
     /// Whether the resource this attachment stands for is in place.
@@ -371,5 +521,22 @@ impl AttachmentRecord {
             // interface does not hold would be reporting a reachable address that is not.
             ipv6_address: None,
         })
+    }
+}
+
+impl TaskRecord {
+    /// The instant the release of the interfaces this task holds is expected to finish, and
+    /// `None` once none of them is owed another step.
+    ///
+    /// What the task's own `STOPPED` waits for: Amazon ECS detaches and deletes the interface
+    /// an `awsvpc` task was allocated as part of stopping that task
+    /// ([`AttachmentRecord::begin_release`]), so a task that still holds one has that step
+    /// outstanding and is not stopped yet — the mirror of the attach, which a task's
+    /// `PENDING` waits for ([`Self::interfaces_attached`]).
+    pub fn interfaces_release_due_at(&self) -> Option<SystemTime> {
+        self.attachments
+            .iter()
+            .filter_map(AttachmentRecord::release_due_at)
+            .max()
     }
 }
