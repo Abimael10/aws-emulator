@@ -77,13 +77,14 @@ fn alias_arn(function: &str, alias: &str) -> String {
     )
 }
 
-/// Create a role that trusts CodeDeploy and embed `document` in it as an inline
-/// policy, answering the role's ARN.
+/// Embed `document` in the role named `name` as its inline deployment policy,
+/// through IAM's own `PutRolePolicy` — so what CodeDeploy evaluates is the very
+/// document IAM stored.
 ///
-/// The inline policy goes in through IAM's own `PutRolePolicy`, so what CodeDeploy
-/// evaluates is the very document IAM stored.
-async fn given_role_with_policy(emulator: &Emulator, name: &str, document: &str) -> String {
-    let role = given_role(emulator, name, &trust_policy(SERVICE_PRINCIPAL)).await;
+/// A put of a policy name the role already carries REPLACES that document, which is
+/// how a client revokes or restores a grant on a role its deployment groups are
+/// already running as.
+async fn put_role_policy(emulator: &Emulator, name: &str, document: &str) {
     let (status, body) = emulator
         .iam_query(
             "PutRolePolicy",
@@ -98,12 +99,30 @@ async fn given_role_with_policy(emulator: &Emulator, name: &str, document: &str)
         status, 200,
         "setup {name:?}: PutRolePolicy must succeed, got {status} with {body}"
     );
+}
+
+/// Create a role that trusts CodeDeploy and embed `document` in it as an inline
+/// policy, answering the role's ARN.
+async fn given_role_with_policy(emulator: &Emulator, name: &str, document: &str) -> String {
+    let role = given_role(emulator, name, &trust_policy(SERVICE_PRINCIPAL)).await;
+    put_role_policy(emulator, name, document).await;
     role
 }
 
-/// Create a function with two published versions and an alias on version 1,
-/// answering the alias name.
+/// Create a function with two published versions and an alias on version 1.
 async fn given_function_with_alias(emulator: &Emulator, function: &str, alias: &str) {
+    given_function_with_versions(emulator, function, alias, 2).await;
+}
+
+/// Create a function with `versions` published versions and an alias on version 1,
+/// so a suite that deploys to it more than once has a further version to shift to
+/// each time.
+async fn given_function_with_versions(
+    emulator: &Emulator,
+    function: &str,
+    alias: &str,
+    versions: u32,
+) {
     emulator
         .lambda_ok(
             function,
@@ -119,7 +138,7 @@ async fn given_function_with_alias(emulator: &Emulator, function: &str, alias: &
             201,
         )
         .await;
-    for version in 1..=2 {
+    for version in 1..=versions {
         emulator
             .lambda_ok(
                 function,
@@ -190,6 +209,12 @@ async fn given_group(
 
 /// The AppSpec of a Lambda deployment shifting `alias` from version 1 to 2.
 fn app_spec_revision(function: &str, alias: &str) -> Value {
+    app_spec_shift(function, alias, "1", "2")
+}
+
+/// The AppSpec of a Lambda deployment shifting `alias` from version `from` to
+/// version `to`.
+fn app_spec_shift(function: &str, alias: &str, from: &str, to: &str) -> Value {
     let content = json!({
         "version": 0.0,
         "Resources": [{
@@ -198,8 +223,8 @@ fn app_spec_revision(function: &str, alias: &str) -> Value {
                 "Properties": {
                     "Name": function,
                     "Alias": alias,
-                    "CurrentVersion": "1",
-                    "TargetVersion": "2",
+                    "CurrentVersion": from,
+                    "TargetVersion": to,
                 },
             },
         }],
@@ -540,6 +565,163 @@ async fn a_role_this_emulator_knows_nothing_about_refuses_nothing() {
             (Some("Succeeded"), Some("2")),
             "case {case:?}: expected the deployment to succeed and the alias to move, got \
              {info:?} and {read:?}"
+        );
+    }
+}
+
+/// RULE: the verdict is read off the documents in force on the deployment group's
+/// service role AT THE INSTANT the deployment runs, so revoking a grant the
+/// deployment needs refuses every deployment created after the rewrite — with
+/// `Failed`, `IAM_ROLE_PERMISSIONS` and the fixed sentence naming the role and the
+/// service that call reaches — and restoring the grant lets the identical
+/// deployment through, each time leaving the alias exactly where that outcome says.
+///
+/// Rows differ along which of the deployment's calls the rewrite revokes and what
+/// the group says about alarms: the alarm poll with `ignorePollAlarmFailure` false,
+/// the same poll with it true (the member is about alarm state that could not be
+/// RETRIEVED, so it excuses no revocation), and the alias update on a group polling
+/// no alarm at all.
+#[tokio::test]
+async fn a_revoked_grant_refuses_later_deployments_and_a_restored_one_lets_them_through() {
+    let emulator = Emulator::with_lambda_cloudwatch_and_iam();
+    let alias = "live";
+    let alarm = "revoked-grant-alarm";
+    given_alarm(&emulator, alarm).await;
+
+    let allows_lambda = json!({"Effect": "Allow", "Action": "lambda:*", "Resource": "*"});
+    let allows_poll =
+        json!({"Effect": "Allow", "Action": "cloudwatch:DescribeAlarms", "Resource": "*"});
+    let denies_poll = json!({
+        "Effect": "Deny",
+        "Action": ["cloudwatch:DescribeAlarms", "cloudwatch:DescribeAlarmHistory"],
+        "Resource": "*",
+    });
+    let denies_alias =
+        json!({"Effect": "Deny", "Action": "lambda:UpdateAlias", "Resource": "*"});
+    // Every row starts from this document, which grants every call its deployment
+    // makes; the rewrite adds the row's own Deny to it and changes nothing else.
+    let granted = policy_of(&[allows_lambda.clone(), allows_poll.clone()]);
+
+    // (case, the alarm configuration's `ignorePollAlarmFailure` when the group
+    // carries one at all, the statement the rewrite adds, the AWS service the
+    // refusal must name)
+    let cases: &[(&str, Option<bool>, Value, &str)] = &[
+        (
+            "the alarm poll revoked, with ignorePollAlarmFailure false",
+            Some(false),
+            denies_poll.clone(),
+            "AmazonCloudWatch",
+        ),
+        (
+            "the alarm poll revoked, with ignorePollAlarmFailure true",
+            Some(true),
+            denies_poll,
+            "AmazonCloudWatch",
+        ),
+        (
+            "the alias update revoked, on a group polling no alarm",
+            None,
+            denies_alias,
+            "AWSLambda",
+        ),
+    ];
+
+    for (index, (case, ignore_poll_alarm_failure, denial, service)) in cases.iter().enumerate() {
+        let function = format!("revoked-fn-{index}");
+        let application = format!("revoked-app-{index}");
+        // Three versions: one shift while the grant stands, one while it is
+        // revoked, and the identical shift once more when it is restored.
+        given_function_with_versions(&emulator, &function, alias, 3).await;
+        let role_name = format!("revoked-role-{index}");
+        let role = given_role_with_policy(&emulator, &role_name, &granted).await;
+        let extras = match ignore_poll_alarm_failure {
+            Some(ignore) => json!({
+                "alarmConfiguration": {
+                    "enabled": true,
+                    "ignorePollAlarmFailure": ignore,
+                    "alarms": [{"name": alarm}],
+                },
+            }),
+            None => json!({}),
+        };
+        let group = given_group(&emulator, &application, &role, &extras).await;
+
+        // The positive control: with every call granted, the deployment succeeds
+        // and the alias moves.
+        let first = deploy(
+            &emulator,
+            &application,
+            &group,
+            app_spec_shift(&function, alias, "1", "2"),
+        )
+        .await;
+        let info = terminal_deployment(&emulator, &first, case).await;
+        let read = alias_of(&emulator, &function, alias).await;
+        assert_eq!(
+            (info["status"].as_str(), read["FunctionVersion"].as_str()),
+            (Some("Succeeded"), Some("2")),
+            "case {case:?} with every call granted: expected the deployment to succeed and the \
+             alias to move to version 2, got {info:?} and {read:?}"
+        );
+
+        // The one thing that changes: the role's policy now denies the row's call.
+        let revoked = policy_of(&[allows_lambda.clone(), allows_poll.clone(), denial.clone()]);
+        put_role_policy(&emulator, &role_name, &revoked).await;
+
+        let refused = deploy(
+            &emulator,
+            &application,
+            &group,
+            app_spec_shift(&function, alias, "2", "3"),
+        )
+        .await;
+        let info = terminal_deployment(&emulator, &refused, case).await;
+        let read = alias_of(&emulator, &function, alias).await;
+        assert_eq!(
+            (
+                info["status"].as_str(),
+                info["errorInformation"]["code"].as_str(),
+                info["errorInformation"]["message"].as_str(),
+            ),
+            (
+                Some("Failed"),
+                Some(IAM_ROLE_PERMISSIONS),
+                Some(iam_role_permissions_message(&role, service).as_str()),
+            ),
+            "case {case:?} once revoked: expected a Failed deployment naming the role and \
+             {service}, got {info:?}"
+        );
+        // The refused deployment had no effect: the alias is still on the version
+        // the control left it on, with no weighted routing.
+        assert_eq!(
+            (
+                read["FunctionVersion"].as_str(),
+                read["RoutingConfig"]["AdditionalVersionWeights"]
+                    .as_object()
+                    .map(serde_json::Map::len)
+                    .unwrap_or_default(),
+            ),
+            (Some("2"), 0),
+            "case {case:?} once revoked: expected the alias left on version 2 with no weights, \
+             got {read:?}"
+        );
+
+        // Restored, the identical deployment goes through.
+        put_role_policy(&emulator, &role_name, &granted).await;
+        let restored = deploy(
+            &emulator,
+            &application,
+            &group,
+            app_spec_shift(&function, alias, "2", "3"),
+        )
+        .await;
+        let info = terminal_deployment(&emulator, &restored, case).await;
+        let read = alias_of(&emulator, &function, alias).await;
+        assert_eq!(
+            (info["status"].as_str(), read["FunctionVersion"].as_str()),
+            (Some("Succeeded"), Some("3")),
+            "case {case:?} once restored: expected the identical deployment to succeed and the \
+             alias to move to version 3, got {info:?} and {read:?}"
         );
     }
 }
