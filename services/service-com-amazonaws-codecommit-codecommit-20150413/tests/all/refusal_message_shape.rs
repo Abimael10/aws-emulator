@@ -10,10 +10,12 @@
 //!    `ParentCommitIdRequiredException`, `NoChangeException`,
 //!    `SameFileContentException`, `BlobIdDoesNotExistException`), and a TEMPLATE
 //!    whose single slot is a named request value where it does — the resolved
-//!    commit specifier for `CommitDoesNotExistException` raised on a member the
-//!    model types `CommitName`, and the object name for the same code raised on
-//!    one it types `CommitId` — whichever operation raises the code and whatever
-//!    else the request said.
+//!    commit specifier for `CommitDoesNotExistException` raised where a
+//!    `CommitName` member was resolved, and the object name for the same code
+//!    raised where a `CommitId` member was looked up — and the template is the
+//!    one the raising operation answers that code with: the single-commit content
+//!    reads state the lookup's own miss, while a comparison or a merge adds the
+//!    sentence about a reference that may merely be unpushed.
 //! 2. Whether the body carries a `message` at all is part of the response shape,
 //!    decided per operation: the branch READ (`GetBranch`) answers
 //!    `BranchDoesNotExistException` with no message text, while the write paths
@@ -86,6 +88,13 @@ fn commit_specifier_not_found(specifier: &str) -> String {
         "AWS CodeCommit could not find the commit specifier {specifier}. Either the specifier \
          does not exist, or the commit has not yet been pushed to the remote repository."
     )
+}
+
+/// `CommitDoesNotExistException`'s text where a single-commit CONTENT read found
+/// no commit to read the path out of: the lookup's own miss, naming the specifier
+/// the read resolved against and nothing else.
+fn commit_not_found(specifier: &str) -> String {
+    format!("Could not find commit {specifier}")
 }
 
 /// `CommitDoesNotExistException`'s text for a member the model types `CommitId` —
@@ -632,11 +641,12 @@ async fn the_branch_read_refusal_carries_no_message() {
     }
 }
 
-/// Rule 1, `CommitDoesNotExistException` — the code is worded by the KIND of
-/// member that named nothing: a specifier member (`CommitName`) takes the
-/// specifier template, whose one slot is the specifier the read was resolved
-/// against (`HEAD` for a request that names none), and a raw object id member
-/// (`CommitId`) takes the object-missing template.
+/// Rule 1, `CommitDoesNotExistException` — the code is worded by what the
+/// operation was resolving: a single-commit content read takes the lookup's short
+/// miss, whose one slot is the specifier the read was resolved against (`HEAD` for
+/// a request that names none), a comparison or merge of two specifiers takes the
+/// specifier template, and a raw object id member (`CommitId`), looked up rather
+/// than resolved, takes the object-missing template.
 #[tokio::test]
 async fn commit_does_not_exist_message_names_the_resolved_specifier() {
     let router = emulator();
@@ -717,7 +727,7 @@ async fn commit_does_not_exist_message_names_the_resolved_specifier() {
                     "case ({operation}, {repository}, {label}): expected code \
                      CommitDoesNotExistException, got {code:?}"
                 );
-                let expected = commit_specifier_not_found(named);
+                let expected = commit_not_found(named);
                 assert_eq!(
                     message, expected,
                     "case ({operation}, {repository}, {label}): expected message {expected:?}, \
@@ -727,10 +737,10 @@ async fn commit_does_not_exist_message_names_the_resolved_specifier() {
         }
     }
 
-    // The operations that name the commit by another member carry the template for
-    // the KIND of member they name it with: a specifier member keeps the specifier
-    // template, while `CreateBranch`'s `commitId` — typed `CommitId`, a raw object
-    // name — takes the object-missing one.
+    // The operations that resolve something else carry their own template: a
+    // comparison or a merge of two specifiers keeps the specifier template, while
+    // `CreateBranch`'s `commitId` — typed `CommitId`, a raw object name looked up
+    // rather than resolved — takes the object-missing one.
     let others: Vec<(&str, Value, String)> = vec![
         (
             "GetDifferences",

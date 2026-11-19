@@ -15,8 +15,11 @@
 //!   thing that tells a caller which side was refused.
 //! * A member the model types `CommitName` is a commit SPECIFIER — a branch, a
 //!   tag, `HEAD`, or a full commit id — so one that resolves to nothing is refused
-//!   as `CommitDoesNotExistException` naming the specifier, plus the sentence that
-//!   says the reference may exist and simply not be pushed yet.
+//!   as `CommitDoesNotExistException` naming the specifier, in the template the
+//!   RAISING operation words that code with: a single-commit content read states
+//!   the lookup's own miss and stops there, while a comparison or a merge of two
+//!   specifiers adds the sentence that says the reference may exist and simply not
+//!   be pushed yet.
 //! * A member the model types `CommitId` is a raw object name looked up rather
 //!   than resolved, so the same code is worded as the git object lookup's own
 //!   miss, naming that id.
@@ -81,6 +84,12 @@ fn commit_specifier_not_found(specifier: &str) -> String {
         "AWS CodeCommit could not find the commit specifier {specifier}. Either the specifier \
          does not exist, or the commit has not yet been pushed to the remote repository."
     )
+}
+
+/// `CommitDoesNotExistException`'s text where a single-commit CONTENT read found
+/// no commit to read the path out of.
+fn commit_not_found(specifier: &str) -> String {
+    format!("Could not find commit {specifier}")
 }
 
 /// `CommitDoesNotExistException`'s text for a raw commit object name the
@@ -301,8 +310,10 @@ fn rejected_specifiers() -> Vec<(&'static str, &'static str)> {
 }
 
 /// `CommitDoesNotExistException` raised on a member the model types `CommitName`
-/// names the SPECIFIER, and says the reference may simply not be pushed yet —
-/// whichever operation resolved it and whatever form the specifier took.
+/// names the SPECIFIER — whichever operation resolved it and whatever form the
+/// specifier took — in the template that operation words the code with: the
+/// single-commit content reads state the miss alone, and the comparison and merge
+/// operations say the reference may simply not be pushed yet.
 #[tokio::test]
 async fn a_commit_specifier_that_resolves_to_nothing_names_the_specifier() {
     let router = emulator();
@@ -311,7 +322,7 @@ async fn a_commit_specifier_that_resolves_to_nothing_names_the_specifier() {
     seeded(&router, repository, branch, "README.md", b"# demo\n").await;
 
     for (label, specifier) in rejected_specifiers() {
-        let requests: Vec<(&str, Value)> = vec![
+        let requests: Vec<(&str, Value, String)> = vec![
             (
                 "GetFile",
                 json!({
@@ -319,6 +330,7 @@ async fn a_commit_specifier_that_resolves_to_nothing_names_the_specifier() {
                     "filePath": "README.md",
                     "commitSpecifier": specifier,
                 }),
+                commit_not_found(specifier),
             ),
             (
                 "GetFolder",
@@ -327,6 +339,7 @@ async fn a_commit_specifier_that_resolves_to_nothing_names_the_specifier() {
                     "folderPath": "/",
                     "commitSpecifier": specifier,
                 }),
+                commit_not_found(specifier),
             ),
             (
                 "ListFileCommitHistory",
@@ -335,6 +348,7 @@ async fn a_commit_specifier_that_resolves_to_nothing_names_the_specifier() {
                     "filePath": "README.md",
                     "commitSpecifier": specifier,
                 }),
+                commit_not_found(specifier),
             ),
             (
                 "GetDifferences",
@@ -342,6 +356,7 @@ async fn a_commit_specifier_that_resolves_to_nothing_names_the_specifier() {
                     "repositoryName": repository,
                     "afterCommitSpecifier": specifier,
                 }),
+                commit_specifier_not_found(specifier),
             ),
             (
                 "GetMergeOptions",
@@ -350,6 +365,7 @@ async fn a_commit_specifier_that_resolves_to_nothing_names_the_specifier() {
                     "sourceCommitSpecifier": specifier,
                     "destinationCommitSpecifier": branch,
                 }),
+                commit_specifier_not_found(specifier),
             ),
             (
                 "GetMergeOptions",
@@ -358,9 +374,10 @@ async fn a_commit_specifier_that_resolves_to_nothing_names_the_specifier() {
                     "sourceCommitSpecifier": branch,
                     "destinationCommitSpecifier": specifier,
                 }),
+                commit_specifier_not_found(specifier),
             ),
         ];
-        for (operation, body) in requests {
+        for (operation, body, expected) in requests {
             let (code, message) =
                 error_with_message(&router, operation, &body, CLIENT_ERROR_STATUS).await;
             assert_eq!(
@@ -368,7 +385,6 @@ async fn a_commit_specifier_that_resolves_to_nothing_names_the_specifier() {
                 "case ({operation}, {label}, {specifier:?}): expected code \
                  CommitDoesNotExistException, got {code:?}"
             );
-            let expected = commit_specifier_not_found(specifier);
             assert_eq!(
                 message, expected,
                 "case ({operation}, {label}, {specifier:?}): expected message {expected:?}, got \
@@ -410,7 +426,7 @@ async fn an_absent_commit_specifier_is_refused_naming_head() {
             json!({ "repositoryName": repository, "filePath": "README.md" }),
         ),
     ];
-    let expected = commit_specifier_not_found("HEAD");
+    let expected = commit_not_found("HEAD");
     for (operation, body) in requests {
         let (code, message) =
             error_with_message(&router, operation, &body, CLIENT_ERROR_STATUS).await;
@@ -422,6 +438,188 @@ async fn an_absent_commit_specifier_is_refused_naming_head() {
             message, expected,
             "case {operation}: expected message {expected:?}, got {message:?}"
         );
+    }
+}
+
+/// The request body for a content read, with `commitSpecifier` present only when
+/// the row names one — an absent member is what resolves to
+/// `HEAD`, so the two cases must be sent as different bodies.
+fn with_commit_specifier(mut body: Value, specifier: Option<&str>) -> Value {
+    if let (Some(specifier), Some(object)) = (specifier, body.as_object_mut()) {
+        object.insert("commitSpecifier".to_string(), json!(specifier));
+    }
+    body
+}
+
+/// Every single-commit CONTENT read of `repository`, over the paths such a read
+/// addresses — the repository root, a nested folder, a file at the root, a nested
+/// file with a non-ASCII segment — each carrying `specifier` when the row names
+/// one. The path is returned beside the request so an assertion can state that the
+/// refusal names neither it nor the repository.
+fn content_reads(repository: &str, specifier: Option<&str>) -> Vec<(&'static str, String, Value)> {
+    vec![
+        (
+            "GetFolder",
+            "/".to_string(),
+            with_commit_specifier(
+                json!({ "repositoryName": repository, "folderPath": "/" }),
+                specifier,
+            ),
+        ),
+        (
+            "GetFolder",
+            "docs".to_string(),
+            with_commit_specifier(
+                json!({ "repositoryName": repository, "folderPath": "docs" }),
+                specifier,
+            ),
+        ),
+        (
+            "GetFile",
+            "README.md".to_string(),
+            with_commit_specifier(
+                json!({ "repositoryName": repository, "filePath": "README.md" }),
+                specifier,
+            ),
+        ),
+        (
+            "GetFile",
+            "docs/guía.md".to_string(),
+            with_commit_specifier(
+                json!({ "repositoryName": repository, "filePath": "docs/guía.md" }),
+                specifier,
+            ),
+        ),
+        (
+            "ListFileCommitHistory",
+            "docs/guía.md".to_string(),
+            with_commit_specifier(
+                json!({ "repositoryName": repository, "filePath": "docs/guía.md" }),
+                specifier,
+            ),
+        ),
+    ]
+}
+
+/// A single-commit content read that finds no commit to read states the lookup's
+/// own miss and stops there, and a comparison or merge of two specifiers answers
+/// the same code with its own, longer wording — so the two templates COEXIST, each
+/// worded by the operation that raises it.
+///
+/// The rows vary what the rule generalises over: which content read is asked
+/// (`GetFile`, `GetFolder`, `ListFileCommitHistory`), the path it addresses (root,
+/// a folder, a file, a nested non-ASCII file), the form of the specifier that
+/// resolves to nothing (absent so `HEAD`, `HEAD` itself, a branch name, a fully
+/// qualified reference, a tag reference, a full object id) — the forms `CommitName`
+/// documents — and whether the repository has a history at all.
+#[tokio::test]
+async fn a_content_read_words_the_commit_miss_as_its_own_lookup() {
+    let router = emulator();
+
+    // A repository with no commit, and so no default branch: every specifier form
+    // names nothing here, including the `HEAD` an absent member resolves to.
+    let empty = "content-read-empty";
+    ok(&router, "CreateRepository", &json!({ "repositoryName": empty })).await;
+
+    // A repository WITH a history, so a row asked of it is refused for naming no
+    // commit rather than for the repository holding none.
+    let history = "content-read-history";
+    seeded(&router, history, "main", "docs/guía.md", b"# demo\n").await;
+
+    // Rows: (what the specifier is, what the request sends, what the refusal must
+    // name, whether the repository WITH a history also resolves it to nothing).
+    // The two HEAD-default rows are asked of the empty repository only, because a
+    // repository with a default branch resolves them to a commit.
+    let specifiers: Vec<(&str, Option<&str>, &str, bool)> = vec![
+        ("no specifier at all", None, "HEAD", false),
+        ("HEAD itself", Some("HEAD"), "HEAD", false),
+        ("a branch name", Some("ghost-branch"), "ghost-branch", true),
+        (
+            "a fully qualified reference",
+            Some("refs/heads/ghost-branch"),
+            "refs/heads/ghost-branch",
+            true,
+        ),
+        ("a tag-shaped reference", Some("refs/tags/v9"), "refs/tags/v9", true),
+        ("a full object id", Some(ABSENT_OBJECT_ID), ABSENT_OBJECT_ID, true),
+    ];
+
+    for (label, sent, named, also_history) in specifiers {
+        let mut repositories: Vec<&str> = vec![empty];
+        if also_history {
+            repositories.push(history);
+        }
+        for repository in repositories {
+            for (operation, path, body) in content_reads(repository, sent) {
+                let (code, message) =
+                    error_with_message(&router, operation, &body, CLIENT_ERROR_STATUS).await;
+                assert_eq!(
+                    code, "CommitDoesNotExistException",
+                    "case ({operation}, {repository}, {label}, {path}): expected code \
+                     CommitDoesNotExistException, got {code:?}"
+                );
+                let expected = commit_not_found(named);
+                assert_eq!(
+                    message, expected,
+                    "case ({operation}, {repository}, {label}, {path}): expected message \
+                     {expected:?}, got {message:?}"
+                );
+                assert!(
+                    !message.contains(repository),
+                    "case ({operation}, {repository}, {label}, {path}): the message must not \
+                     name the repository, got {message:?}"
+                );
+                // The root is named by the separator every qualified reference
+                // also carries, so only a path with a segment of its own can be
+                // looked for in the text.
+                assert!(
+                    path == "/" || !message.contains(&path),
+                    "case ({operation}, {repository}, {label}, {path}): the message must not \
+                     name the path, got {message:?}"
+                );
+            }
+        }
+
+        // The comparison and merge operations resolve the SAME specifier and keep
+        // their own, two-sentence text for the same code: one read's wording never
+        // replaces the other's. They are asked only for a specifier the repository
+        // with a history resolves to nothing, since these members carry no HEAD
+        // default to fall back on.
+        if !also_history {
+            continue;
+        }
+        let Some(specifier) = sent else { continue };
+        let comparisons: Vec<(&str, Value)> = vec![
+            (
+                "GetDifferences",
+                json!({
+                    "repositoryName": history,
+                    "afterCommitSpecifier": specifier,
+                }),
+            ),
+            (
+                "GetMergeOptions",
+                json!({
+                    "repositoryName": history,
+                    "sourceCommitSpecifier": specifier,
+                    "destinationCommitSpecifier": "main",
+                }),
+            ),
+        ];
+        for (operation, body) in comparisons {
+            let (code, message) =
+                error_with_message(&router, operation, &body, CLIENT_ERROR_STATUS).await;
+            assert_eq!(
+                code, "CommitDoesNotExistException",
+                "case ({operation}, {label}): expected code CommitDoesNotExistException, got \
+                 {code:?}"
+            );
+            let expected = commit_specifier_not_found(named);
+            assert_eq!(
+                message, expected,
+                "case ({operation}, {label}): expected message {expected:?}, got {message:?}"
+            );
+        }
     }
 }
 

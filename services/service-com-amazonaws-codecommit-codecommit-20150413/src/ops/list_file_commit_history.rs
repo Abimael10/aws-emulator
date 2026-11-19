@@ -267,7 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `commitSpecifier` names a commit or a branch; absent, it is `HEAD`,
         // which resolves to the repository's default branch. A specifier that
         // names neither — including `HEAD` in a repository with no default branch
-        // — is `CommitDoesNotExistException`, which is what that error documents.
+        // — is `CommitDoesNotExistException`, which is what that error documents,
+        // worded as this single-commit read's own miss
+        // (`crate::state::commit_not_found_message`).
         let specifier = input
             .commit_specifier
             .clone()
@@ -275,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let head = repository.resolve_commit(&specifier).ok_or_else(|| {
             ListFileCommitHistoryErrorModeled::CommitDoesNotExistException(
                 CommitDoesNotExistException {
-                    message: Some(crate::state::commit_does_not_exist_message(&specifier)),
+                    message: Some(crate::state::commit_not_found_message(&specifier)),
                 },
             )
         })?;

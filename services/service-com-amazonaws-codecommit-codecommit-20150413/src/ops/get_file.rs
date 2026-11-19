@@ -228,14 +228,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `commitSpecifier` names a commit or a branch; absent, it is `HEAD`,
-        // which resolves to the repository's default branch.
+        // which resolves to the repository's default branch. A content read words
+        // the miss as the tree lookup's own
+        // (`crate::state::commit_not_found_message`), the commit sibling of the
+        // path miss below.
         let specifier = input
             .commit_specifier
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_COMMIT_SPECIFIER.to_string());
         let commit = repository.resolve_commit(&specifier).ok_or_else(|| {
             GetFileErrorModeled::CommitDoesNotExistException(CommitDoesNotExistException {
-                message: Some(crate::state::commit_does_not_exist_message(&specifier)),
+                message: Some(crate::state::commit_not_found_message(&specifier)),
             })
         })?;
 

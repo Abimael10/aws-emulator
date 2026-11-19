@@ -834,24 +834,44 @@ pub const BRANCH_NAME_IS_TAG_NAME_MESSAGE: &str =
 /// default branch) and a refusal names `HEAD` rather than an empty string.
 pub const DEFAULT_COMMIT_SPECIFIER: &str = "HEAD";
 
-/// `CommitDoesNotExistException`'s message for a request that named a commit
-/// SPECIFIER — a branch name, a tag, `HEAD` or a full commit id, the forms
-/// `CommitName` documents — which resolved to no commit.
+/// `CommitDoesNotExistException`'s message where a COMPARISON or a MERGE resolved
+/// a commit SPECIFIER — a branch name, a tag, `HEAD` or a full commit id, the
+/// forms `CommitName` documents — to no commit.
 ///
 /// The template's single slot is that specifier, so the message names the
 /// reference that resolved to nothing (`HEAD` for a request that named none) and
-/// NOT the repository. The second sentence is the actionable half of the text: a
-/// specifier that names nothing here is as often a reference the caller holds
-/// only locally as one that does not exist at all.
+/// NOT the repository. The second sentence is the actionable half of the text for
+/// those operations: a side of a diff or a merge that names nothing here is as
+/// often a reference the caller holds only locally as one that does not exist at
+/// all.
 ///
-/// A member the model types as a raw object id (`CommitId`) rather than as a
-/// specifier is NOT resolved this way, and is worded by
-/// [`commit_object_missing_message`] instead.
+/// The single-commit CONTENT reads word the same code with the shorter
+/// [`commit_not_found_message`], and a member the model types as a raw object id
+/// (`CommitId`) rather than as a specifier is NOT resolved at all, so it is worded
+/// by [`commit_object_missing_message`]: one code, three templates, each picked by
+/// what the operation was doing when it failed to find the commit.
 pub fn commit_does_not_exist_message(specifier: &str) -> String {
     format!(
         "AWS CodeCommit could not find the commit specifier {specifier}. Either the specifier \
          does not exist, or the commit has not yet been pushed to the remote repository."
     )
+}
+
+/// `CommitDoesNotExistException`'s message where a single-commit CONTENT read —
+/// one that resolves ONE specifier and then looks a path up in that commit's tree
+/// — found no commit to read.
+///
+/// These reads answer the git lookup's own short sentence: the fixed words
+/// `Could not find commit ` and then the specifier the read resolved against, the
+/// request's `commitSpecifier` when it names one and [`DEFAULT_COMMIT_SPECIFIER`]
+/// when it names none. Nothing else of the request reaches the text — not the
+/// repository, not the path, not a commit id. It is the commit sibling of
+/// [`file_does_not_exist_message`], the same lookup's miss on the path: a content
+/// read states which thing it could not find and stops there, where a comparison
+/// or a merge adds the second sentence
+/// ([`commit_does_not_exist_message`]).
+pub fn commit_not_found_message(specifier: &str) -> String {
+    format!("Could not find commit {specifier}")
 }
 
 /// `CommitDoesNotExistException`'s message for a request that named a raw commit
