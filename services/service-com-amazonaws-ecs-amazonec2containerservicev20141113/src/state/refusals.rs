@@ -605,46 +605,6 @@ pub fn namespace_key(reference: &str) -> &str {
     reference.rsplit('/').next().unwrap_or(reference)
 }
 
-/// The DNS suffix the Region-scoped hosts of this service live under.
-pub(super) const ENDPOINT_DNS_SUFFIX: &str = "amazonaws.com";
-
-/// One Region-scoped host of this service, as `<host>.<region>.<suffix>` served over
-/// HTTPS: the form every endpoint this service hands an agent takes.
-pub(super) fn regional_endpoint_url(host: &str, region: &str) -> String {
-    format!("https://{host}.{region}.{ENDPOINT_DNS_SUFFIX}/")
-}
-
-/// The host of the agent-communication service, whose endpoint the agent polls for the
-/// work assigned to its container instance — this service's endpoint prefix, `-a-`, and
-/// the shard the account's instances are served from.
-pub(super) const AGENT_POLL_HOST: &str = "ecs-a-1";
-
-/// The host of the agent-telemetry service, whose endpoint the agent reports its
-/// containers' metrics to — the same prefix with `-t-` for telemetry.
-pub(super) const AGENT_TELEMETRY_HOST: &str = "ecs-t-1";
-
-/// The host of the Service Connect configuration service, whose endpoint the agent polls
-/// for "Service Connect configuration" (`DiscoverPollEndpoint$serviceConnectEndpoint`).
-pub(super) const AGENT_SERVICE_CONNECT_HOST: &str = "ecs-sc";
-
-/// "The endpoint for the Amazon ECS agent to poll", in the Region the request was signed
-/// for.
-pub fn agent_poll_endpoint(region: &str) -> String {
-    regional_endpoint_url(AGENT_POLL_HOST, region)
-}
-
-/// "The telemetry endpoint for the Amazon ECS agent", in the Region the request was signed
-/// for.
-pub fn agent_telemetry_endpoint(region: &str) -> String {
-    regional_endpoint_url(AGENT_TELEMETRY_HOST, region)
-}
-
-/// "The endpoint for the Amazon ECS agent to poll for Service Connect configuration", in
-/// the Region the request was signed for.
-pub fn agent_service_connect_endpoint(region: &str) -> String {
-    regional_endpoint_url(AGENT_SERVICE_CONNECT_HOST, region)
-}
-
 /// The cluster NAME a `cluster` request member refers to: the short name as given, or
 /// the last segment of a cluster ARN. Every `cluster` member's doc: "The short name or
 /// full Amazon Resource Name (ARN) of the cluster".

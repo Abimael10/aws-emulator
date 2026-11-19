@@ -17,9 +17,10 @@
 //!   accept needs an agent version this service has RECORDED: an instance registered
 //!   through the API has none, however the registration spelled its own `versionInfo`
 //!   ([`crate::container_agent_version_source`]), so the call is refused.
-//! * `DiscoverPollEndpoint` answers the agent with the endpoints of the REGION the request
-//!   was signed for, once the cluster and (when the request names one) the container
-//!   instance it is called for resolve to records this store holds.
+//! * `DiscoverPollEndpoint` answers the agent with the three endpoints it dials afterwards,
+//!   each on the address THIS emulator is reached at rather than on a host of the real
+//!   service, once the cluster and (when the request names one) the container instance it is
+//!   called for resolve to records this store holds.
 //! * `SubmitContainerStateChange` is a report the agent RETRIES, so what is stored is the
 //!   furthest stage the container has been reported at: a report of a stage it has already
 //!   passed is acknowledged and changes nothing.
@@ -180,29 +181,34 @@ fn instance_id_of(instance_arn: &str) -> String {
 }
 
 #[tokio::test]
-async fn discover_poll_endpoint_answers_the_region_endpoints_for_a_registered_instance() {
-    let router = fixture().await;
+async fn discover_poll_endpoint_announces_this_emulators_own_address_for_a_registered_instance() {
+    let mut router = fixture().await;
     let instance_arn = register_agent(&router, CLUSTER, "i-0dpe0dpe0dpe0dpe0", None, "fixture")
         .await;
     let instance_id = instance_id_of(&instance_arn);
     let elsewhere =
         register_agent(&router, OTHER_CLUSTER, "i-0e1e2e3e4e5e6e7e8", None, "fixture").await;
 
-    // The endpoints are hosts of this service in the Region the request was signed for.
-    let expected = [
-        ("endpoint", format!("https://ecs-a-1.{SIGNED_REGION}.amazonaws.com/")),
+    // The three members an agent discovers are addresses it DIALS afterwards, so each is the
+    // base URL this emulator is reached at — whatever that base is. The rows below move that
+    // base along its forms (the unserved base, an IPv4 address with a port, an IPv6 literal
+    // with a port, a host name), which is what the rule generalises over: nothing of the
+    // announced value comes from the Region the request was signed for, from the resources it
+    // named, or from any host written into this service.
+    let members = ["endpoint", "telemetryEndpoint", "serviceConnectEndpoint"];
+    let bases = [
         (
-            "telemetryEndpoint",
-            format!("https://ecs-t-1.{SIGNED_REGION}.amazonaws.com/"),
+            "the unserved base",
+            smithy_server_runtime::UNSERVED_URL_BASE.to_string(),
         ),
-        (
-            "serviceConnectEndpoint",
-            format!("https://ecs-sc.{SIGNED_REGION}.amazonaws.com/"),
-        ),
+        ("an address with a port", "https://127.0.0.1:9297".to_string()),
+        ("an IPv6 literal with a port", "https://[::1]:8443".to_string()),
+        ("a host name", "https://ecs.emulator.test".to_string()),
     ];
 
-    // The rows span the ways an agent may ask: naming its instance by id, by full ARN, and
-    // naming no instance at all; with the cluster by name, by ARN, and left to the default.
+    // The request rows span the ways an agent may ask: naming its instance by id, by full
+    // ARN, and naming no instance at all; with the cluster by name, by ARN, and left to the
+    // default; and in a second cluster, whose agent is told the same one address.
     let accepted = [
         (
             "the instance by id",
@@ -220,15 +226,49 @@ async fn discover_poll_endpoint_answers_the_region_endpoints_for_a_registered_in
             }),
         ),
         ("no instance named", json!({ "cluster": CLUSTER })),
+        (
+            "an instance of another cluster",
+            json!({
+                "cluster": OTHER_CLUSTER,
+                "containerInstance": instance_id_of(&elsewhere),
+            }),
+        ),
     ];
-    for (case, request) in accepted {
-        let body = ok(&router, "DiscoverPollEndpoint", request, case).await;
-        for (member, value) in &expected {
-            assert_eq!(
-                string(&body, member, case),
-                *value,
-                "case {case:?}: expected {member} to be the Region's own endpoint, got {body}"
-            );
+
+    for (served, base) in &bases {
+        router.set_url_base(
+            smithy_server_runtime::EndpointUrl::parse(base)
+                .unwrap_or_else(|| panic!("case {served:?}: {base} is an endpoint base")),
+        );
+        let expected = format!("{base}/");
+        for (asked, request) in &accepted {
+            let case = format!("{asked} while served at {served}");
+            let case = case.as_str();
+            let body = ok(&router, "DiscoverPollEndpoint", request.clone(), case).await;
+            for member in &members {
+                let answered = string(&body, member, case);
+                assert_eq!(
+                    answered, expected,
+                    "case {case:?}: expected {member} to be this emulator's own address \
+                     {expected:?}, got {answered:?}"
+                );
+                // The invariant each row is really about: the host announced is the one this
+                // emulator answers on, and never a host AWS publishes its own endpoints at.
+                let authority = service_common::data_plane_addressing::url_authority(&answered)
+                    .trim_end_matches('/')
+                    .to_string();
+                assert_eq!(
+                    authority,
+                    service_common::data_plane_addressing::url_authority(base),
+                    "case {case:?}: expected {member} on this emulator's own authority, got \
+                     {answered:?}"
+                );
+                assert!(
+                    !service_common::data_plane_addressing::addresses_an_aws_endpoint(&authority),
+                    "case {case:?}: expected {member} not to name an AWS endpoint host, got \
+                     {answered:?}"
+                );
+            }
         }
     }
 

@@ -2,8 +2,9 @@
 
 //! @op DiscoverPollEndpoint
 //! Answers the Amazon ECS agent with the endpoints it polls: the agent-communication
-//! endpoint, the telemetry endpoint and the Service Connect configuration endpoint, each
-//! the host of this service in the Region the request was signed for. The call RESOLVES
+//! endpoint, the telemetry endpoint and the Service Connect configuration endpoint, each an
+//! address THIS emulator is reached at ([`crate::state::agent_poll_endpoint`] and the two
+//! beside it), since each is an address the agent dials afterwards. The call RESOLVES
 //! the cluster and, when the request names one, the container instance it is called for,
 //! so an agent that names a cluster or an instance this store does not hold is refused
 //! rather than handed endpoints.
@@ -249,13 +250,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The endpoints are the Region's own: each is a host of this service under the
-        // Region the request was signed for, so an agent registered through a Region's
-        // endpoint is pointed back at that same Region's.
+        // Each endpoint is an address the AGENT then dials, so each is this emulator's own: the
+        // base URL a later request addresses (`ctx.endpoint()`), which is the one address this
+        // process answers Amazon ECS on. An agent that discovered its endpoints through this
+        // deployment is pointed back at this deployment.
+        let here = ctx.endpoint();
+        let here = here.as_str();
         Ok(DiscoverPollEndpointOutput {
-            endpoint: Some(crate::state::agent_poll_endpoint(&region)),
-            telemetry_endpoint: Some(crate::state::agent_telemetry_endpoint(&region)),
-            service_connect_endpoint: Some(crate::state::agent_service_connect_endpoint(&region)),
+            endpoint: Some(crate::state::agent_poll_endpoint(here)),
+            telemetry_endpoint: Some(crate::state::agent_telemetry_endpoint(here)),
+            service_connect_endpoint: Some(crate::state::agent_service_connect_endpoint(here)),
         })
     }
 }

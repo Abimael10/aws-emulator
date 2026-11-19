@@ -245,6 +245,11 @@ pub use resource_scoping::*;
 mod agent_plane;
 pub use agent_plane::*;
 
+/// The endpoints `DiscoverPollEndpoint` announces to the container agent, each on the
+/// address this emulator is reached at.
+mod agent_endpoints;
+pub use agent_endpoints::*;
+
 pub use request_arn::{
     foreign_arn_segment, is_cluster_arn, names_another_account, names_another_region,
     request_arn_resource_violation, request_arn_violation, ForeignArnSegment,
