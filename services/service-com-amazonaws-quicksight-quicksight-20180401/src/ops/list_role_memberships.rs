@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRoleMemberships
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRoleMemberships`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRoleMemberships::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the groups one role of a namespace holds, a page at a time: a report on the
+//! role memberships the store holds, which writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +161,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRoleMemberships` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRoleMembershipsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRoleMemberships"))
+        // A report on stored state: nothing here writes to the store, and every part of
+        // the address it reads comes from the request's path labels.
+        let _ = ctx;
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRoleMembershipsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+
+        // Whether the account holds role memberships at all is a fact about the ACCOUNT,
+        // settled before any address inside it is resolved: a role is held by a group the
+        // account manages itself, so an account whose authentication method gives it no
+        // QuickSight identity store of its own holds no role memberships to report. What
+        // the refusal states is that store, because that is what forbids the call.
+        if !store.manages_quicksight_users(&input.aws_account_id) {
+            return Err(ListRoleMembershipsErrorModeled::AccessDeniedException(
+                crate::state::access_denied(
+                    crate::state::role_membership_not_authorized_message(
+                        &store.identity_store(&input.aws_account_id),
+                        &input.aws_account_id,
+                        &input.namespace,
+                        &input.role,
+                    ),
+                    &request_id,
+                ),
+            )
+            .into());
+        }
+
+        // A role is a role OF a namespace, so a namespace the account does not hold holds
+        // no role whose members could be reported.
+        if !store.namespace_exists(
+            &input.aws_account_id,
+            &input.namespace,
+            std::time::SystemTime::now(),
+        ) {
+            return Err(ListRoleMembershipsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Namespace {} not found in account {}.",
+                        input.namespace, input.aws_account_id
+                    )),
+                    resource_type: Some(
+                        crate::state::EXCEPTION_RESOURCE_TYPE_NAMESPACE.to_string(),
+                    ),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // A token this service did not issue names no position, so it is refused rather
+        // than read as "from the beginning".
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(ListRoleMembershipsErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: Some("The NextToken value isn't valid.".to_string()),
+                            request_id: Some(request_id),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        let members =
+            store.role_members_in(&input.aws_account_id, &input.namespace, &input.role);
+        let (page, next_token) = crate::state::page_of(
+            &members,
+            |member_name| member_name.as_str(),
+            resume_after.as_deref(),
+            input.max_results,
+        );
+
+        Ok(ListRoleMembershipsOutput {
+            // The modelled list is of names: a role's member IS a group, reported by the
+            // name it is known by in its namespace.
+            members_list: Some(page.into_iter().cloned().collect()),
+            next_token,
+            request_id: Some(request_id),
+            // `Status` is this response's `@httpResponseCode` member, so it IS the call's
+            // HTTP status.
+            status: 200,
+        })
     }
 }

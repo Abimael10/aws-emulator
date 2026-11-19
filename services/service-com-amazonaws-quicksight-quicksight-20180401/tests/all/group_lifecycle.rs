@@ -18,7 +18,9 @@
 //!
 //! The membership cases at the end of this suite are about a group's MEMBERS — the
 //! users it holds — which are reached through the group they belong to, so they are
-//! driven here beside the group they hang on.
+//! driven here beside the group they hang on. The role-membership cases after them are
+//! the other way round: a ROLE's members are groups, so they too are driven beside the
+//! group they name.
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::{json, Value};
@@ -1210,5 +1212,637 @@ async fn a_new_membership_past_the_allowance_is_refused_and_a_held_one_still_ans
         held_memberships(&harness),
         qs_state::MAX_GROUP_MEMBERS,
         "the store must hold exactly the allowance's worth of memberships"
+    );
+}
+
+// --- A role's members -------------------------------------------------------------
+//
+// The rule under test: a role membership joins one of the service's roles to a GROUP of
+// the same namespace and is identified by `(AwsAccountId, Namespace, Role, MemberName)`;
+// `CreateRoleMembership` persists it, `ListRoleMemberships` reports the groups one role
+// holds by name — in name order, a page at a time — and `DeleteRoleMembership` takes one
+// out again. A role is held by a group the account manages itself, so an account whose
+// authentication method gives it no QuickSight identity store of its own is denied its
+// roles altogether. The rows vary what the rule generalises over (the role, the number
+// and form of the group names, the page size, the namespace and the account) rather than
+// re-running one recorded call.
+
+/// A third 12-digit account id, for the row whose account takes its identities from a
+/// directory.
+const DIRECTORY_ACCOUNT: &str = "123456789012";
+
+/// Every member of the model's `Role` enum: the roles a group can be added to, and the
+/// only values the `Role` label admits.
+/// Source: smithy_query(query="shape", shape="Role").
+const ROLES: [&str; 6] = [
+    "ADMIN",
+    "ADMIN_PRO",
+    "AUTHOR",
+    "AUTHOR_PRO",
+    "READER",
+    "READER_PRO",
+];
+
+/// The address of one role's membership list:
+/// `.../namespaces/{Namespace}/roles/{Role}/members`.
+/// Source: smithy_query(query="operation", operation="ListRoleMemberships").
+fn role_members_path(account: &str, namespace: &str, role: &str) -> String {
+    format!("/accounts/{account}/namespaces/{namespace}/roles/{role}/members")
+}
+
+/// The address of one role membership: that list with the group's name under it.
+/// `MemberName` targets `GroupName`, so the label is percent-encoded over the same bytes
+/// a group's own name is ([`group_label`]).
+/// Source: smithy_query(query="operation",
+/// operation="CreateRoleMembership,DeleteRoleMembership").
+fn role_member_path(account: &str, namespace: &str, role: &str, member_name: &str) -> String {
+    format!(
+        "{}/{}",
+        role_members_path(account, namespace, role),
+        group_label(member_name)
+    )
+}
+
+/// `ListRoleMemberships`: `GET` on a role's membership list, with `query` carrying the
+/// pagination parameters the model binds to the query string (`max-results`,
+/// `next-token`).
+async fn list_role_members(
+    harness: &Harness,
+    account: &str,
+    namespace: &str,
+    role: &str,
+    query: &str,
+) -> (u16, Value) {
+    harness
+        .call(
+            "GET",
+            &format!("{}{query}", role_members_path(account, namespace, role)),
+            None,
+        )
+        .await
+}
+
+/// `CreateRoleMembership`: `POST` on the membership's own address.
+async fn add_role_member(
+    harness: &Harness,
+    account: &str,
+    namespace: &str,
+    role: &str,
+    member_name: &str,
+) -> (u16, Value) {
+    harness
+        .call(
+            "POST",
+            &role_member_path(account, namespace, role, member_name),
+            None,
+        )
+        .await
+}
+
+/// `DeleteRoleMembership`: `DELETE` on that same address.
+async fn remove_role_member(
+    harness: &Harness,
+    account: &str,
+    namespace: &str,
+    role: &str,
+    member_name: &str,
+) -> (u16, Value) {
+    harness
+        .call(
+            "DELETE",
+            &role_member_path(account, namespace, role, member_name),
+            None,
+        )
+        .await
+}
+
+/// Sign `account` up for QuickSight with `subscription`, the sign-up body that chooses
+/// where the account's identities come from.
+/// Source: smithy_query(query="operation", operation="CreateAccountSubscription").
+async fn sign_up(harness: &Harness, case: &str, account: &str, subscription: Value) {
+    let (status, body) = harness
+        .call("POST", &format!("/account/{account}"), Some(subscription))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the sign-up this case needs failed: {status} with {body}"
+    );
+}
+
+/// How many role memberships the store holds.
+fn held_role_memberships(harness: &Harness) -> usize {
+    let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
+    let store = state.lock();
+    store.role_memberships.len()
+}
+
+/// The group names one `ListRoleMemberships` response reported, in the order it reported
+/// them.
+fn reported_members(case: &str, body: &Value) -> Vec<String> {
+    body["MembersList"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: no MembersList in {body}"))
+        .iter()
+        .map(|name| name.as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// What a role-membership call on an account that holds no QuickSight identity store of
+/// its own reports: the store that account HAS — which is what forbids the call — and
+/// then the identity path's locator for the address the call named, which follows the
+/// sentence directly.
+fn role_denial_message(identity_store: &str, account: &str, namespace: &str, role: &str) -> String {
+    format!(
+        "Operation is not supported for {identity_store} identity store.AWS account id: \
+         {account}, Namespace: {namespace}, Role: {role}. "
+    )
+}
+
+/// What a role-membership delete reports for a group the role does not hold: the locator
+/// alone, because nothing is known to have existed at that address.
+fn role_membership_locator(
+    account: &str,
+    namespace: &str,
+    role: &str,
+    member_name: &str,
+) -> String {
+    format!(
+        "AWS account id: {account}, Namespace: {namespace}, Role: {role}, \
+         memberName: {member_name}. "
+    )
+}
+
+#[tokio::test]
+async fn a_role_reports_exactly_the_groups_added_to_it() {
+    let harness = Harness::new();
+    sign_up_for_quicksight_identities(&harness, ACCOUNT).await;
+    sign_up_for_quicksight_identities(&harness, OTHER_ACCOUNT).await;
+    create_settled_custom_namespace(&harness, ACCOUNT).await;
+
+    // Rows: one per member of the model's `Role` catalog, differing in how many groups
+    // the role holds (none, one, several), the form and length of those group names, the
+    // namespace the role belongs to and the account it is in.
+    let rows: [(&str, &str, &str, &str, &[&str]); 6] = [
+        ("one-group", ACCOUNT, DEFAULT_NAMESPACE, "ADMIN", &["Admins"]),
+        (
+            "three-groups",
+            ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "AUTHOR",
+            &["Analysts", "Report Authors", "Zürich Authoren"],
+        ),
+        ("no-group", ACCOUNT, DEFAULT_NAMESPACE, "READER", &[]),
+        (
+            "custom-namespace",
+            ACCOUNT,
+            CUSTOM_NAMESPACE,
+            "ADMIN_PRO",
+            &["Admins"],
+        ),
+        (
+            "other-account",
+            OTHER_ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "AUTHOR_PRO",
+            &["Admins"],
+        ),
+        (
+            "digits-in-the-names",
+            ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "READER_PRO",
+            &["team-42", "team-7"],
+        ),
+    ];
+
+    // Every group a row names has to exist where the row puts it: a role takes an
+    // EXISTING group of its own namespace.
+    let mut created: Vec<(&str, &str, &str)> = Vec::new();
+    for (case, account, namespace, _, members) in rows {
+        for member in members {
+            if created.contains(&(account, namespace, member)) {
+                continue;
+            }
+            given_group(&harness, case, account, namespace, member).await;
+            created.push((account, namespace, member));
+        }
+    }
+
+    let mut added = 0usize;
+    for (case, account, namespace, role, members) in rows {
+        for member in members {
+            let (status, body) = add_role_member(&harness, account, namespace, role, member).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: adding {member:?} to {role} expected 200, got {status} \
+                 with {body}"
+            );
+            assert!(
+                body["RequestId"].is_string(),
+                "case {case:?}: the add must report a RequestId: {body}"
+            );
+            added += 1;
+        }
+    }
+
+    for (case, account, namespace, role, members) in rows {
+        let (status, body) = list_role_members(&harness, account, namespace, role, "").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: listing {role} expected 200, got {status} with {body}"
+        );
+        let mut expected: Vec<String> = members.iter().map(|name| name.to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            reported_members(case, &body),
+            expected,
+            "case {case:?}: {role} must report exactly the groups added to it, in name \
+             order: {body}"
+        );
+        assert_eq!(
+            body["NextToken"],
+            Value::Null,
+            "case {case:?}: a complete page needs no NextToken: {body}"
+        );
+        assert!(
+            body["RequestId"].is_string(),
+            "case {case:?}: the listing must report a RequestId: {body}"
+        );
+    }
+
+    // A membership is held under ONE role of ONE namespace: every other role of the
+    // custom namespace reports nothing, though a group of the same name holds a role in
+    // the account's default namespace.
+    for role in ROLES {
+        let (status, body) = list_role_members(&harness, ACCOUNT, CUSTOM_NAMESPACE, role, "").await;
+        assert_eq!(
+            status, 200,
+            "case {role:?}: listing the custom namespace's role expected 200, got \
+             {status} with {body}"
+        );
+        let expected: Vec<String> = if role == "ADMIN_PRO" {
+            vec!["Admins".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            reported_members(role, &body),
+            expected,
+            "case {role:?}: a membership must be reported by its own role only: {body}"
+        );
+    }
+
+    assert_eq!(
+        held_role_memberships(&harness),
+        added,
+        "the store must hold exactly the memberships the adds created"
+    );
+}
+
+#[tokio::test]
+async fn role_membership_pages_walk_every_member_exactly_once() {
+    let harness = Harness::new();
+    sign_up_for_quicksight_identities(&harness, ACCOUNT).await;
+
+    // Seven groups in one role, so a page size smaller than the list leaves a remainder.
+    let members: Vec<String> = (0..7).map(|n| format!("page-group-{n:02}")).collect();
+    for member in &members {
+        given_group(&harness, "paging", ACCOUNT, DEFAULT_NAMESPACE, member).await;
+        let (status, body) =
+            add_role_member(&harness, ACCOUNT, DEFAULT_NAMESPACE, "READER", member).await;
+        assert_eq!(
+            status, 200,
+            "fixture {member:?}: the add expected 200, got {status} with {body}"
+        );
+    }
+
+    // Rows: the unpaginated request, both published bounds of `MaxResults` (1..100) and
+    // sizes in between. Each must walk the seven members exactly once.
+    // Source: smithy_query(query="operation", operation="ListRoleMemberships").
+    for max_results in [None, Some(1), Some(2), Some(3), Some(7), Some(100)] {
+        let case = format!("max-results={max_results:?}");
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let query = match (&token, max_results) {
+                (Some(token), Some(max)) => format!("?max-results={max}&next-token={token}"),
+                (Some(token), None) => format!("?next-token={token}"),
+                (None, Some(max)) => format!("?max-results={max}"),
+                (None, None) => String::new(),
+            };
+            let (status, body) =
+                list_role_members(&harness, ACCOUNT, DEFAULT_NAMESPACE, "READER", &query).await;
+            assert_eq!(
+                status, 200,
+                "case {case}: listing expected 200, got {status} with {body}"
+            );
+            let page = reported_members(&case, &body);
+            if let Some(max) = max_results {
+                assert!(
+                    page.len() <= usize::try_from(max).unwrap_or_default(),
+                    "case {case}: a page held {} members, more than MaxResults: {body}",
+                    page.len()
+                );
+            }
+            seen.extend(page);
+            pages += 1;
+            assert!(
+                pages <= members.len() + 1,
+                "case {case}: pagination did not terminate after {pages} pages"
+            );
+            match body["NextToken"].as_str() {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen, members,
+            "case {case}: paging must yield every member exactly once, in name order"
+        );
+    }
+
+    // A token this service did not issue names no position, so it is refused rather than
+    // read as "from the beginning": an opaque-looking token, one with this service's
+    // prefix but a body that is not hex, and an empty one.
+    for token in ["not-a-token", "qs1-zzzz", "qs1-abc", ""] {
+        let (status, body) = list_role_members(
+            &harness,
+            ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "READER",
+            &format!("?next-token={token}"),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {token:?}: an unreadable NextToken expected 400, got {status} with \
+             {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("InvalidNextTokenException"),
+            "case {token:?}: expected InvalidNextTokenException, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_role_is_reached_only_in_an_account_that_holds_a_quicksight_identity_store() {
+    let harness = Harness::new();
+    // Rows: the ways an account ends up with no QuickSight identity store of its own —
+    // it never signed up, so it authenticates Amazon Web Services identities alone (the
+    // service default); it signed up choosing exactly that; or it signed up against a
+    // directory, which is where its identities then come from. The store the refusal
+    // names is the one the row's account has rather than a constant.
+    // Source: smithy_query(query="shape", shape="AuthenticationMethodOption").
+    let rows = [
+        ("never-signed-up", ACCOUNT, "IAM_ONLY", Value::Null),
+        (
+            "signed-up-without-one",
+            OTHER_ACCOUNT,
+            "IAM_ONLY",
+            json!({
+                "AccountName": format!("roles-{OTHER_ACCOUNT}"),
+                "AuthenticationMethod": "IAM_ONLY",
+                "NotificationEmail": "ops@example.com",
+                "Edition": "ENTERPRISE",
+            }),
+        ),
+        (
+            "signed-up-against-a-directory",
+            DIRECTORY_ACCOUNT,
+            "ACTIVE_DIRECTORY",
+            json!({
+                "AccountName": format!("roles-{DIRECTORY_ACCOUNT}"),
+                "AuthenticationMethod": "ACTIVE_DIRECTORY",
+                "NotificationEmail": "ops@example.com",
+                "Edition": "ENTERPRISE",
+                "ActiveDirectoryName": "corp.example.com",
+                "Realm": "CORP.EXAMPLE.COM",
+                "AdminGroup": ["Domain Admins"],
+            }),
+        ),
+    ];
+    for (case, account, identity_store, subscription) in rows {
+        if !subscription.is_null() {
+            sign_up(&harness, case, account, subscription).await;
+        }
+        // The group itself CAN be created there, so what the refusals below are about is
+        // the role rather than a group the namespace is missing.
+        given_group(&harness, case, account, DEFAULT_NAMESPACE, "Admins").await;
+        for role in ROLES {
+            let calls = [
+                (
+                    "list",
+                    list_role_members(&harness, account, DEFAULT_NAMESPACE, role, "").await,
+                ),
+                (
+                    "create",
+                    add_role_member(&harness, account, DEFAULT_NAMESPACE, role, "Admins").await,
+                ),
+                (
+                    "delete",
+                    remove_role_member(&harness, account, DEFAULT_NAMESPACE, role, "Admins").await,
+                ),
+            ];
+            for (call, (status, body)) in calls {
+                assert_eq!(
+                    status, 401,
+                    "case {case:?} {call} {role}: an account with no QuickSight identity \
+                     store must be denied its roles, got {status} with {body}"
+                );
+                assert_eq!(
+                    body["__type"],
+                    json!("AccessDeniedException"),
+                    "case {case:?} {call} {role}: expected AccessDeniedException, got \
+                     {body}"
+                );
+                assert_eq!(
+                    body["Message"],
+                    json!(role_denial_message(
+                        identity_store,
+                        account,
+                        DEFAULT_NAMESPACE,
+                        role
+                    )),
+                    "case {case:?} {call} {role}: the refusal must name the identity \
+                     store the account has: {body}"
+                );
+                assert!(
+                    body["RequestId"].is_string(),
+                    "case {case:?} {call} {role}: the refusal must report a RequestId: \
+                     {body}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        held_role_memberships(&harness),
+        0,
+        "a denied call must persist nothing"
+    );
+}
+
+#[tokio::test]
+async fn removing_a_group_from_a_role_takes_it_out_of_the_listing() {
+    let harness = Harness::new();
+    sign_up_for_quicksight_identities(&harness, ACCOUNT).await;
+    create_settled_custom_namespace(&harness, ACCOUNT).await;
+
+    let doomed = "Doomed Admins";
+    let kept = "Kept Admins";
+    for member in [doomed, kept] {
+        given_group(&harness, "removal", ACCOUNT, DEFAULT_NAMESPACE, member).await;
+        let (status, body) =
+            add_role_member(&harness, ACCOUNT, DEFAULT_NAMESPACE, "ADMIN", member).await;
+        assert_eq!(
+            status, 200,
+            "fixture {member:?}: the add expected 200, got {status} with {body}"
+        );
+    }
+
+    let (status, body) = remove_role_member(&harness, ACCOUNT, DEFAULT_NAMESPACE, "ADMIN", doomed)
+        .await;
+    assert_eq!(
+        status, 200,
+        "removing a group the role holds expected 200, got {status} with {body}"
+    );
+    assert!(
+        body["RequestId"].is_string(),
+        "the removal must report a RequestId: {body}"
+    );
+
+    let (status, body) = list_role_members(&harness, ACCOUNT, DEFAULT_NAMESPACE, "ADMIN", "").await;
+    assert_eq!(
+        status, 200,
+        "the listing after the removal expected 200, got {status} with {body}"
+    );
+    assert_eq!(
+        reported_members("after-removal", &body),
+        vec![kept.to_string()],
+        "the removed group must be out of the listing and the other one still in it: \
+         {body}"
+    );
+    assert_eq!(
+        held_role_memberships(&harness),
+        1,
+        "the removal must take exactly the membership it named"
+    );
+
+    // Removing it again finds no membership at that address, and says so with the
+    // locator for the address the call named.
+    let (status, body) = remove_role_member(&harness, ACCOUNT, DEFAULT_NAMESPACE, "ADMIN", doomed)
+        .await;
+    assert_eq!(
+        status, 404,
+        "a membership the role does not hold expected 404, got {status} with {body}"
+    );
+    assert_eq!(
+        body["__type"],
+        json!("ResourceNotFoundException"),
+        "a membership the role does not hold is not found: {body}"
+    );
+    assert_eq!(
+        body["ResourceType"],
+        json!("GROUP"),
+        "a role's members are groups: {body}"
+    );
+    assert_eq!(
+        body["Message"],
+        json!(role_membership_locator(
+            ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "ADMIN",
+            doomed
+        )),
+        "the refusal must report the address the call named: {body}"
+    );
+
+    // A role takes an EXISTING group of its namespace: a name no group there is known by
+    // names no member. The group the row names exists in ANOTHER namespace of the same
+    // account, so what is missing is the group in this one.
+    given_group(&harness, "elsewhere", ACCOUNT, CUSTOM_NAMESPACE, "Sales").await;
+    let (status, body) =
+        add_role_member(&harness, ACCOUNT, DEFAULT_NAMESPACE, "AUTHOR", "Sales").await;
+    assert_eq!(
+        status, 404,
+        "a role takes an existing group, got {status} with {body}"
+    );
+    assert_eq!(
+        body["ResourceType"],
+        json!("GROUP"),
+        "the refusal is about the group the call named: {body}"
+    );
+    assert_eq!(
+        body["Message"],
+        json!(group_miss_message(ACCOUNT, DEFAULT_NAMESPACE, "Sales")),
+        "the refusal must name the group the namespace does not hold: {body}"
+    );
+
+    // A role is a role OF a namespace, so every call on one the account does not hold
+    // reports that namespace.
+    let missing = "no-such-namespace";
+    let calls = [
+        (
+            "list",
+            list_role_members(&harness, ACCOUNT, missing, "ADMIN", "").await,
+        ),
+        (
+            "create",
+            add_role_member(&harness, ACCOUNT, missing, "ADMIN", kept).await,
+        ),
+        (
+            "delete",
+            remove_role_member(&harness, ACCOUNT, missing, "ADMIN", kept).await,
+        ),
+    ];
+    for (call, (status, body)) in calls {
+        assert_eq!(
+            status, 404,
+            "case {call}: a namespace the account does not hold expected 404, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            body["ResourceType"],
+            json!("NAMESPACE"),
+            "case {call}: the refusal is about a namespace: {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(format!(
+                "Namespace {missing} not found in account {ACCOUNT}."
+            )),
+            "case {call}: the refusal must name the namespace: {body}"
+        );
+    }
+
+    // And a membership goes with the group it names: the groups of a namespace go when
+    // that namespace is deleted, so the roles they held go with them.
+    let (status, body) =
+        add_role_member(&harness, ACCOUNT, CUSTOM_NAMESPACE, "AUTHOR", "Sales").await;
+    assert_eq!(
+        status, 200,
+        "the membership of the doomed namespace expected 200, got {status} with {body}"
+    );
+    let (status, body) = delete_namespace(&harness, ACCOUNT, CUSTOM_NAMESPACE).await;
+    assert_eq!(
+        status, 200,
+        "deleting the namespace expected 200, got {status} with {body}"
+    );
+    assert_eq!(
+        held_role_memberships(&harness),
+        1,
+        "the memberships of a deleted namespace go with it, and only those"
+    );
+    let (status, body) = list_role_members(&harness, ACCOUNT, DEFAULT_NAMESPACE, "ADMIN", "").await;
+    assert_eq!(
+        status, 200,
+        "the untouched namespace's role must still answer, got {status} with {body}"
+    );
+    assert_eq!(
+        reported_members("survivor", &body),
+        vec![kept.to_string()],
+        "the membership of another namespace must survive the deletion: {body}"
     );
 }

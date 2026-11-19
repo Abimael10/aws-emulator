@@ -18,6 +18,7 @@ mod group_members;
 /// struct, so it exports no name of its own and needs no re-export.
 mod identity_store;
 mod refusals;
+mod role_memberships;
 mod user_deletions;
 mod users;
 
@@ -26,6 +27,7 @@ pub use connection_test::*;
 pub use external_login::*;
 pub use group_members::*;
 pub use refusals::*;
+pub use role_memberships::*;
 pub use user_deletions::*;
 pub use users::*;
 
@@ -102,6 +104,14 @@ pub struct ComAmazonawsQuicksightQuicksight20180401State {
     /// the member's name under it; the member it names is a user of the same namespace.
     /// [`MAX_GROUP_MEMBERS_PER_GROUP`] and [`MAX_GROUP_MEMBERS`] are checked against it.
     pub group_members: HashMap<(String, String, String, String), GroupMemberRecord>,
+    /// Role memberships by `(AwsAccountId, Namespace, Role, MemberName)`.
+    ///
+    /// A role membership joins one group of a namespace to one of the service's roles,
+    /// so its key is that role's own address with the group's name under it. The key is
+    /// the whole record — see
+    /// [`ComAmazonawsQuicksightQuicksight20180401State::role_members_in`] — because a
+    /// role membership is no more than the fact that the group holds the role.
+    pub role_memberships: HashSet<(String, String, String, String)>,
     /// Users by `(AwsAccountId, Namespace, UserName)`.
     ///
     /// A user belongs to one namespace and its name identifies it inside that
@@ -592,9 +602,12 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
     /// deleting a namespace deletes the users and groups associated with it, so they go
     /// with the namespace rather than outliving it.
     ///
-    /// A group's memberships are held inside the group, so they go with it.
+    /// A group's memberships are held inside the group, so they go with it — and so do
+    /// the roles the groups of the namespace held, which name groups that no longer
+    /// exist.
     pub fn remove_groups_in(&mut self, aws_account_id: &str, namespace: &str) -> usize {
         self.remove_group_members_in(aws_account_id, namespace);
+        self.remove_role_memberships_in(aws_account_id, namespace);
         let before = self.groups.len();
         self.groups.retain(|(account, group_namespace, _), _| {
             account != aws_account_id || group_namespace != namespace

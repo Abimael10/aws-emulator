@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRoleMembership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRoleMembership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRoleMembership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds one group of a namespace to one of the service's roles, which is what a later
+//! read of that role reports as its member.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +155,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRoleMembership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRoleMembershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRoleMembership"))
+        // Every part of this membership comes from the request's path labels and from
+        // stored state, so nothing here is read off the request's metadata.
+        let _ = ctx;
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRoleMembershipErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // Whether the account holds role memberships at all is a fact about the ACCOUNT,
+        // settled before any address inside it is resolved: a role is held by a group the
+        // account manages itself, so an account whose authentication method gives it no
+        // QuickSight identity store of its own has no role for a group to be added to.
+        // What the refusal states is that store, because that is what forbids the call.
+        if !store.manages_quicksight_users(&input.aws_account_id) {
+            return Err(CreateRoleMembershipErrorModeled::AccessDeniedException(
+                crate::state::access_denied(
+                    crate::state::role_membership_not_authorized_message(
+                        &store.identity_store(&input.aws_account_id),
+                        &input.aws_account_id,
+                        &input.namespace,
+                        &input.role,
+                    ),
+                    &request_id,
+                ),
+            )
+            .into());
+        }
+
+        // A role is a role OF a namespace, and the group it takes lives in that same
+        // namespace: one the account does not hold holds neither of them.
+        if !store.namespace_exists(
+            &input.aws_account_id,
+            &input.namespace,
+            std::time::SystemTime::now(),
+        ) {
+            return Err(CreateRoleMembershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Namespace {} not found in account {}.",
+                        input.namespace, input.aws_account_id
+                    )),
+                    resource_type: Some(
+                        crate::state::EXCEPTION_RESOURCE_TYPE_NAMESPACE.to_string(),
+                    ),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // The member is an EXISTING group of that namespace: a name no group of the
+        // namespace is known by names no member.
+        if store
+            .group(&input.aws_account_id, &input.namespace, &input.member_name)
+            .is_none()
+        {
+            return Err(CreateRoleMembershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::group_not_found_message(
+                        &input.aws_account_id,
+                        &input.namespace,
+                        &input.member_name,
+                    )),
+                    resource_type: Some(crate::state::EXCEPTION_RESOURCE_TYPE_GROUP.to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        let key = crate::state::role_membership_key(
+            &input.aws_account_id,
+            &input.namespace,
+            &input.role,
+            &input.member_name,
+        );
+        // A membership the role already holds takes no further room, so only a new one is
+        // counted against the allowance below.
+        if !store.role_memberships.contains(&key)
+            && store.role_memberships.len() >= crate::state::MAX_ROLE_MEMBERSHIPS
+        {
+            return Err(CreateRoleMembershipErrorModeled::ResourceUnavailableException(
+                ResourceUnavailableException {
+                    message: Some(format!(
+                        "This QuickSight emulator holds the maximum of {} role memberships.",
+                        crate::state::MAX_ROLE_MEMBERSHIPS
+                    )),
+                    resource_type: Some(crate::state::EXCEPTION_RESOURCE_TYPE_GROUP.to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+        // Adding a group the role already holds leaves the role exactly as it was, so the
+        // call answers for the membership that now stands either way.
+        store.role_memberships.insert(key);
+
+        Ok(CreateRoleMembershipOutput {
+            request_id: Some(request_id),
+            // `Status` is this response's `@httpResponseCode` member, so it IS the call's
+            // HTTP status.
+            status: 200,
+        })
     }
 }

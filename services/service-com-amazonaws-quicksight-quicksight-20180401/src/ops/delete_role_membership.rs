@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRoleMembership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRoleMembership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRoleMembership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one group from one of the service's roles, so a later read of that role no
+//! longer reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +155,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRoleMembership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRoleMembershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRoleMembership"))
+        // The membership this call removes is addressed by the request's path labels
+        // alone, so nothing here is read off the request's metadata.
+        let _ = ctx;
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteRoleMembershipErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // Whether the account holds role memberships at all is a fact about the ACCOUNT,
+        // settled before any address inside it is resolved: a role is held by a group the
+        // account manages itself, so an account whose authentication method gives it no
+        // QuickSight identity store of its own holds no membership to remove. What the
+        // refusal states is that store, because that is what forbids the call.
+        if !store.manages_quicksight_users(&input.aws_account_id) {
+            return Err(DeleteRoleMembershipErrorModeled::AccessDeniedException(
+                crate::state::access_denied(
+                    crate::state::role_membership_not_authorized_message(
+                        &store.identity_store(&input.aws_account_id),
+                        &input.aws_account_id,
+                        &input.namespace,
+                        &input.role,
+                    ),
+                    &request_id,
+                ),
+            )
+            .into());
+        }
+
+        // A role is a role OF a namespace, so a namespace the account does not hold holds
+        // no role to remove a group from.
+        if !store.namespace_exists(
+            &input.aws_account_id,
+            &input.namespace,
+            std::time::SystemTime::now(),
+        ) {
+            return Err(DeleteRoleMembershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Namespace {} not found in account {}.",
+                        input.namespace, input.aws_account_id
+                    )),
+                    resource_type: Some(
+                        crate::state::EXCEPTION_RESOURCE_TYPE_NAMESPACE.to_string(),
+                    ),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // A membership the role does not hold is not there to be removed, and the member
+        // it would have named is a group, so the refusal is about that group.
+        let key = crate::state::role_membership_key(
+            &input.aws_account_id,
+            &input.namespace,
+            &input.role,
+            &input.member_name,
+        );
+        if !store.role_memberships.remove(&key) {
+            return Err(DeleteRoleMembershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::role_membership_not_found_message(
+                        &input.aws_account_id,
+                        &input.namespace,
+                        &input.role,
+                        &input.member_name,
+                    )),
+                    resource_type: Some(crate::state::EXCEPTION_RESOURCE_TYPE_GROUP.to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteRoleMembershipOutput {
+            request_id: Some(request_id),
+            // `Status` is this response's `@httpResponseCode` member, so it IS the call's
+            // HTTP status.
+            status: 200,
+        })
     }
 }

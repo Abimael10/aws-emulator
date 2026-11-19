@@ -196,6 +196,52 @@ pub fn group_membership_not_found_message(
     )
 }
 
+/// The miss a role-membership delete reports for a group the role does not hold: the
+/// identity path's locator alone, with no sentence before it.
+///
+/// A role membership is held under the role it belongs to with the group's name under it,
+/// and nothing is known to have existed at that address, so — as for a group's members
+/// ([`group_membership_not_found_message`]) — the only thing the service can report is the
+/// address the call asked about: the account, the namespace, the role and the member it
+/// named.
+pub fn role_membership_not_found_message(
+    aws_account_id: &str,
+    namespace: &str,
+    role: &str,
+    member_name: &str,
+) -> String {
+    identity_scope_fields(
+        aws_account_id,
+        &[
+            ("Namespace", namespace),
+            ("Role", role),
+            ("memberName", member_name),
+        ],
+    )
+}
+
+/// The refusal a role-membership call on an account that holds no QuickSight identity
+/// store of its own reports.
+///
+/// A role is held by a group the account manages itself, so what forbids the call is not
+/// the caller's permissions but the identity store the ACCOUNT has — the one its
+/// authentication method gave it — and that is what the sentence states: the operation is
+/// not supported for an account whose identity store is that one. The store is read from
+/// the account's own subscription rather than fixed here, so the sentence names the store
+/// the refused account actually has, and the identity path's labelled fields then report
+/// the account, the namespace the call addressed and the role inside it.
+pub fn role_membership_not_authorized_message(
+    identity_store: &str,
+    aws_account_id: &str,
+    namespace: &str,
+    role: &str,
+) -> String {
+    format!(
+        "Operation is not supported for {identity_store} identity store.{}",
+        identity_scope_fields(aws_account_id, &[("Namespace", namespace), ("Role", role)])
+    )
+}
+
 /// The conflict `CreateNamespace` reports for a `Namespace` the account already holds.
 ///
 /// What forbids the create is the status the namespace holding that name is in, so the

@@ -30,4 +30,14 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
             .as_deref()
             == Some(AUTHENTICATION_METHOD_IAM_AND_QUICKSIGHT)
     }
+
+    /// The identity store `aws_account_id`'s QuickSight account has, which is the
+    /// authentication method its subscription chose ([`Self::manages_quicksight_users`]
+    /// reads the same member): the one a refusal states when what forbids a call is the
+    /// store the account has rather than the caller's permissions.
+    pub fn identity_store(&self, aws_account_id: &str) -> String {
+        self.account_info(aws_account_id)
+            .authentication_type
+            .unwrap_or_else(|| DEFAULT_AUTHENTICATION_METHOD.to_string())
+    }
 }
