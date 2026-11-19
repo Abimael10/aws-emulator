@@ -74,6 +74,12 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The bounded generator the traffic-policy not-found suite draws its `(Id, Version)`
+# pairs from: the refusal's sentence has no variable part, which is an invariant over
+# the pair a request names rather than a property of any one pair. A maintained RNG,
+# seeded from a constant in the test so a drawn pair that fails reproduces. Only the
+# seeded generator is used, so the operating system's entropy source is left out.
+rand = { version = "0.9", default-features = false, features = ["std", "std_rng"] }
 # Amazon S3 is mounted beside Route 53 in the repointed-endpoint suite: a health checker's
 # probe can only observe an endpoint this emulator SERVES, and a bucket serving a static
 # website is one — without it there is no endpoint for a probe to be answered 2xx from, so

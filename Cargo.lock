@@ -19344,6 +19344,7 @@ dependencies = [
  "hex",
  "http",
  "quick-xml",
+ "rand 0.9.5",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",

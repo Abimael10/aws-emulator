@@ -31,10 +31,19 @@
 //! belongs to these two refusals rather than to the operations or to the
 //! service's error envelope.
 //!
+//! That the sentence has no variable part at all is an INVARIANT over the pair a
+//! request names rather than a property of any one pair, so it is also asserted
+//! over drawn `(Id, Version)` pairs: whatever a request asked about, the refusal
+//! states the one sentence and none of what it asked about.
+//!
 //! The harness (`router`, `call`, `Reply`) and the request builders come from the
 //! suites that own these operations, so these tests drive the service through the
 //! same router a socket-served request goes through.
 
+use std::collections::BTreeSet;
+
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::hosted_zone_records::{create_zone_ok, router, Reply};
@@ -127,6 +136,12 @@ enum PolicyOperation {
 }
 
 impl PolicyOperation {
+    /// Whether this operation words the refusal's sentence, as against reporting
+    /// the refusal's identity alone.
+    fn states_the_sentence(self) -> bool {
+        self != Self::DeleteTrafficPolicy
+    }
+
     /// Whether the request names a `TrafficPolicyVersion` at all.
     fn addresses_version(self) -> bool {
         !matches!(
@@ -139,10 +154,10 @@ impl PolicyOperation {
     /// hold: the DELETE reports the refusal's identity alone, every other operation states
     /// the one sentence.
     fn assert_refused(self, reply: &Reply, case: &str) {
-        if self == Self::DeleteTrafficPolicy {
-            assert_identity_only(reply, case, NO_SUCH_POLICY);
-        } else {
+        if self.states_the_sentence() {
             assert_no_such_traffic_policy(reply, case);
+        } else {
+            assert_identity_only(reply, case, NO_SUCH_POLICY);
         }
     }
 
@@ -439,4 +454,112 @@ async fn another_refusal_of_the_same_operations_still_states_its_message() {
             reply.body
         );
     }
+}
+
+/// The seed the `(Id, Version)` pairs below are drawn from.
+///
+/// Fixed, and named in every case label, so a drawn pair that fails is reproduced
+/// by re-running this suite rather than guessed at. Nothing of the draw leaves
+/// the process.
+const PAIR_SEED: u64 = 0x1f4b_3c7a_2d61_90e5;
+
+/// How many pairs are drawn: a bounded count, so the suite stays as quick as the
+/// tables beside it.
+const PAIRS_DRAWN: usize = 12;
+
+/// Draw an id of the form `TrafficPolicyId` admits — `len 1..36`
+/// (smithy_query(query="shape",shape="TrafficPolicyId")) — from 8 characters up.
+///
+/// The length floor is what makes the "carries nothing the request named" check
+/// below meaningful: the sentence's longest run without a space is six
+/// characters, so a drawn id can only turn up inside the message if the service
+/// put it there. The one-character end of the range is a row of the table above.
+fn drawn_policy_id(rng: &mut StdRng) -> String {
+    const CHARACTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-";
+    let length = rng.random_range(8..=36usize);
+    (0..length)
+        .map(|_| char::from(CHARACTERS[rng.random_range(0..CHARACTERS.len())]))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_refusal_states_one_sentence_whatever_pair_the_request_named() {
+    let router = router();
+    let zone = create_zone_ok(&router, "example.com", "ref-policy-drawn-pairs").await;
+    // A policy the account DOES hold, so each draw asks about a version of a real
+    // policy as well as about an id that names no policy at all.
+    let held = policy_id(&router, "drawn-pairs-held").await;
+    // The published maximum of `TrafficPolicyVersion`, read off the same constant
+    // the table above sends, so the draws range over the whole modelled range.
+    let version_max: i32 = VERSION_MAX
+        .parse()
+        .expect("the published version bound is a number");
+
+    let mut rng = StdRng::seed_from_u64(PAIR_SEED);
+    // Every sentence these refusals stated. The rule is that the text has no
+    // variable part at all, so however many pairs were asked about, there must be
+    // exactly ONE sentence among them.
+    let mut sentences: BTreeSet<String> = BTreeSet::new();
+
+    for draw in 0..PAIRS_DRAWN {
+        let unknown_id = drawn_policy_id(&mut rng);
+        assert_ne!(
+            unknown_id, held,
+            "draw {draw}: the drawn id must name no policy, got the held one {held:?}"
+        );
+        let version = rng.random_range(1..=version_max).to_string();
+        // A version the held policy does not hold: it holds its first one only.
+        let unheld_version = rng.random_range(2..=version_max).to_string();
+
+        for operation in POLICY_OPERATIONS
+            .iter()
+            .filter(|operation| operation.states_the_sentence())
+        {
+            // One half of the pair: an id nothing minted, at a drawn version.
+            let case = format!(
+                "{operation:?} on the drawn id {unknown_id:?} at version {version:?} \
+                 (seed {PAIR_SEED:#x}, draw {draw})"
+            );
+            let reply = operation.send(&router, &zone, &unknown_id, &version).await;
+            assert_no_such_traffic_policy(&reply, &case);
+            let message = message_of(&reply, &case);
+            assert!(
+                !message.contains(&unknown_id) && !message.contains(version.as_str()),
+                "case {case:?}: the sentence must carry nothing the request named, \
+                 got {message:?}"
+            );
+            sentences.insert(message);
+
+            // The other half: the policy the account holds, at a version it does
+            // not. Only the operations that name a version can ask this.
+            if !operation.addresses_version() {
+                continue;
+            }
+            let case = format!(
+                "{operation:?} on the held policy at version {unheld_version:?} \
+                 (seed {PAIR_SEED:#x}, draw {draw})"
+            );
+            let reply = operation.send(&router, &zone, &held, &unheld_version).await;
+            assert_no_such_traffic_policy(&reply, &case);
+            let message = message_of(&reply, &case);
+            assert!(
+                !message.contains(&held) && !message.contains(unheld_version.as_str()),
+                "case {case:?}: the sentence must carry nothing the request named, \
+                 got {message:?}"
+            );
+            sentences.insert(message);
+        }
+    }
+
+    assert_eq!(
+        sentences.len(),
+        1,
+        "the refusal has no variable part, so every drawn pair must be refused with \
+         the same sentence (seed {PAIR_SEED:#x}), got {sentences:?}"
+    );
+    assert!(
+        sentences.contains(NO_SUCH_POLICY_MESSAGE),
+        "the one sentence must be {NO_SUCH_POLICY_MESSAGE:?} (seed {PAIR_SEED:#x}), \
+         got {sentences:?}"
+    );
 }
