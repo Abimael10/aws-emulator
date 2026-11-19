@@ -25,8 +25,9 @@
 //! 5. a resource-based policy is attached to "a table or stream" (the
 //!    `PutResourcePolicy` doc): a stream holds a policy of its own, independent of its
 //!    table's, every statement names actions of the resource it is attached to, an Allow
-//!    may not name a public principal, and the document is stored as the request stated
-//!    it, with the `Version` it is read under stated where it stated none.
+//!    may not grant unbounded access to a public principal, and the document is stored as
+//!    the request stated it, with the `Version` it is read under stated where it stated
+//!    none.
 //!
 //! Every test drives the operations over the wire (`POST /` with
 //! `X-Amz-Target: DynamoDB_20120810.<OperationName>`) through the same
@@ -656,8 +657,8 @@ async fn a_stream_holds_a_policy_of_its_own_and_every_statement_names_the_resour
                 "Statement": [{"Effect": "Deny", "Principal": {"AWS": "*"},
                                "Action": "dynamodb:GetItem", "Resource": &stream_arn}],
             }).to_string()}),
-            "One or more parameter values were invalid: Invalid policy document: Policy has an \
-             action that is not supported for the resource: dynamodb:GetItem"
+            "One or more parameter values were invalid: Invalid policy document: The following \
+             action names are invalid: \"dynamodb:GetItem\""
                 .to_string(),
         ),
         (
@@ -667,19 +668,19 @@ async fn a_stream_holds_a_policy_of_its_own_and_every_statement_names_the_resour
                 "Statement": [{"Effect": "Deny", "Principal": {"AWS": "*"},
                                "Action": "s3:GetObject", "Resource": &table_arn}],
             }).to_string()}),
-            "One or more parameter values were invalid: Invalid policy document: Policy has an \
-             action that is not supported for the resource: s3:GetObject"
+            "One or more parameter values were invalid: Invalid policy document: Action field \
+             includes AWS services that are inconsistent with specified vendor"
                 .to_string(),
         ),
         (
-            "an Allow naming a public principal",
+            "an Allow naming a public principal with no condition to bound it",
             json!({"ResourceArn": &table_arn, "Policy": json!({
                 "Version": "2012-10-17",
                 "Statement": [{"Effect": "Allow", "Principal": "*",
                                "Action": "dynamodb:GetItem", "Resource": &table_arn}],
             }).to_string()}),
-            "One or more parameter values were invalid: Invalid policy document: Policy \
-             statement must not grant access to a public principal"
+            "Resource-based policy grants unbounded access in one or more elements. Please \
+             revise the policy to ensure least-privilege form of access"
                 .to_string(),
         ),
         (

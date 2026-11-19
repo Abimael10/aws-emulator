@@ -261,14 +261,11 @@ fn rows() -> Vec<Row> {
 }
 
 /// The refusal AWS words for a principal that is no identity of this account: the
-/// invalid-policy-document clause, over the value the document named and the type it named it
-/// under.
-fn invalid_principal(named: &str) -> String {
-    format!(
-        "One or more parameter values were invalid: Invalid policy document: Invalid principal \
-         in policy: \"AWS\":\"{named}\""
-    )
-}
+/// parameter-value clause over the sentence that a principal of the document could not be
+/// resolved. It is FIXED text in its entirety — AWS names neither the offending value nor the
+/// type it was named under, so every refused row below expects the same sentence.
+const INVALID_PRINCIPAL: &str =
+    "One or more parameter values were invalid: Invalid principal in policy document.";
 
 /// RULE: see the module docs — `PutResourcePolicy` admits a document only when every principal
 /// it names is one the account can resolve, and the refusal names the first value that is not.
@@ -303,8 +300,8 @@ async fn put_resource_policy_admits_only_principals_the_account_can_resolve() {
                 );
                 assert_eq!(
                     message(&body),
-                    invalid_principal(&named),
-                    "case {:?}: expected AWS's invalid-principal sentence, got {:?}",
+                    INVALID_PRINCIPAL,
+                    "case {:?}: expected AWS's invalid-principal sentence for {named}, got {:?}",
                     row.case,
                     message(&body)
                 );
@@ -390,8 +387,8 @@ async fn create_table_admits_the_same_principals_as_the_attach() {
         );
         assert_eq!(
             message(&body),
-            invalid_principal(&named),
-            "case {:?}: expected AWS's invalid-principal sentence, got {:?}",
+            INVALID_PRINCIPAL,
+            "case {:?}: expected AWS's invalid-principal sentence for {named}, got {:?}",
             row.case,
             message(&body)
         );

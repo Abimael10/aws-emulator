@@ -813,10 +813,10 @@ async fn a_resource_arn_that_is_not_an_arn_is_refused_by_that_rule() {
                 (code.as_str(), stated.as_str()),
                 (
                     "ValidationException",
-                    "One or more parameter values were invalid: Invalid policy document: Policy \
-                     has an action that is not supported for the resource: dynamodb:GetItem"
+                    "One or more parameter values were invalid: Invalid policy document: The \
+                     following action names are invalid: \"dynamodb:GetItem\""
                 ),
-                "case a stream sub-resource ARN ({operation}): expected the unsupported-action \
+                "case a stream sub-resource ARN ({operation}): expected the invalid-action-name \
                  refusal, got {code} with {stated:?}"
             );
         } else if operation.ends_with("ResourcePolicy") {

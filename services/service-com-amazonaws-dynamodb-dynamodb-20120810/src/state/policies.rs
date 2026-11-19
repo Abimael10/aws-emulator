@@ -23,7 +23,13 @@ pub enum PolicyFault {
     Invalid(String),
 }
 
-/// The clause every refusal of a policy DOCUMENT is stated behind: AWS words a document
+/// The clause a refusal of one MEMBER's value is stated behind, whichever member and
+/// whatever is wrong with it ("One or more parameter values were invalid: Maximum policy
+/// size of 20480 bytes exceeded").
+pub(super) const INVALID_PARAMETER_VALUES_CLAUSE: &str =
+    "One or more parameter values were invalid";
+
+/// The clause most refusals of a policy DOCUMENT are stated behind: AWS words such a
 /// defect as an invalid parameter value naming the document, and then says what is wrong
 /// with it ("One or more parameter values were invalid: Invalid policy document: This
 /// policy contains invalid Json" for a document that is not JSON at all).
@@ -46,13 +52,45 @@ pub(super) fn invalid_policy_document(detail: &str) -> PolicyFault {
 }
 
 /// How a document naming a principal that is no identity of this account is refused: the
-/// document clause above, over the sentence the policy language's own validation words that
-/// defect in — the offending value, under the principal type it was named with, is the only
-/// thing substituted.
-pub(super) fn invalid_principal_in_policy(named: &str) -> PolicyFault {
-    invalid_policy_document(&format!(
-        "Invalid principal in policy: \"{IDENTITY_PRINCIPAL_TYPE}\":\"{named}\""
+/// parameter-value clause over AWS's own sentence for that defect, which is FIXED in its
+/// entirety — it states that a principal of the document could not be resolved and names
+/// none of the document's values, so WHICH principal failed is not part of the message.
+pub(super) fn invalid_principal_in_policy() -> PolicyFault {
+    PolicyFault::Invalid(format!(
+        "{INVALID_PARAMETER_VALUES_CLAUSE}: Invalid principal in policy document."
     ))
+}
+
+/// How a document naming an action of ANOTHER service's vendor is refused: AWS's FIXED
+/// sentence for that defect, under the document clause. It reports the vendor disagreement
+/// itself and interpolates no action: which value disagrees is a fact of the document the
+/// caller sent.
+pub(super) fn inconsistent_action_vendor() -> PolicyFault {
+    invalid_policy_document(
+        "Action field includes AWS services that are inconsistent with specified vendor",
+    )
+}
+
+/// How a document naming an action its vendor has but the resource does not is refused:
+/// AWS's sentence for an action NAME that is not one of the resource's, over the names from
+/// the request that are not, each quoted, in the order the document lists them.
+pub(super) fn invalid_action_names(named: &[String]) -> PolicyFault {
+    let listed: Vec<String> = named.iter().map(|value| format!("\"{value}\"")).collect();
+    invalid_policy_document(&format!(
+        "The following action names are invalid: {}",
+        listed.join(", ")
+    ))
+}
+
+/// How a document that would grant the resource to everyone is refused: AWS's FIXED
+/// sentence for unbounded access, which is a class of its own and is NOT stated behind the
+/// parameter-value clause the document defects above are.
+pub(super) fn unbounded_access() -> PolicyFault {
+    PolicyFault::Invalid(
+        "Resource-based policy grants unbounded access in one or more elements. Please revise \
+         the policy to ensure least-privilege form of access"
+            .to_string(),
+    )
 }
 
 /// The service every action of a DynamoDB resource-based policy belongs to: a policy
@@ -164,8 +202,8 @@ impl AttachedPolicy {
         // identity of this account that the account does not hold names nobody and the
         // document is refused rather than stored as a grant to no one
         // ([`unresolvable_principal`]).
-        if let Some(unresolvable) = unresolvable_principal(&document, identities) {
-            return Err(invalid_principal_in_policy(&unresolvable));
+        if unresolvable_principal(&document, identities).is_some() {
+            return Err(invalid_principal_in_policy());
         }
         // WHAT this policy holds each identity principal by: "AWS transforms the ARN to the
         // underlying unique principal ID when you save the policy", so the resolution
@@ -516,11 +554,13 @@ const STREAM_POLICY_ACTIONS: [&str; 4] = [
 /// Hold every action of a STREAM's policy to the actions a stream has.
 ///
 /// A policy attached to a stream decides requests to that stream, so a TABLE action in
-/// it names a permission the stream could never grant or refuse — the same rule that
-/// refuses another service's action in either policy ([`foreign_service_action`]), one
-/// resource further in. A wildcard (`*`, `dynamodb:Get*`) is left alone: it selects
-/// whatever actions the resource has.
+/// it names no action of the resource the document is attached to — an invalid action
+/// NAME, which is a different defect from an action of another vendor
+/// ([`inconsistent_action_vendor`]) and is refused in its own words, over every name the
+/// document lists that the resource does not have ([`invalid_action_names`]). A wildcard
+/// (`*`, `dynamodb:Get*`) is left alone: it selects whatever actions the resource has.
 pub fn check_stream_policy_actions(policy: &AttachedPolicy) -> Result<(), PolicyFault> {
+    let mut invalid: Vec<String> = Vec::new();
     for statement in &policy.statements {
         for value in &statement.action.values {
             let named = value
@@ -530,14 +570,15 @@ pub fn check_stream_policy_actions(policy: &AttachedPolicy) -> Result<(), Policy
             if named.contains('*') {
                 continue;
             }
-            if !STREAM_POLICY_ACTIONS.contains(&named.as_str()) {
-                return Err(invalid_policy_document(&format!(
-                    "Policy has an action that is not supported for the resource: {value}"
-                )));
+            if !STREAM_POLICY_ACTIONS.contains(&named.as_str()) && !invalid.contains(value) {
+                invalid.push(value.clone());
             }
         }
     }
-    Ok(())
+    if invalid.is_empty() {
+        return Ok(());
+    }
+    Err(invalid_action_names(&invalid))
 }
 
 /// The fixed opening of every `PolicyNotFoundException` message, whichever
@@ -585,7 +626,7 @@ pub fn policy_revision_mismatch_message(
 /// nothing of the document or the resource it was offered for.
 pub fn policy_too_large_message() -> String {
     format!(
-        "One or more parameter values were invalid: Maximum policy size of \
+        "{INVALID_PARAMETER_VALUES_CLAUSE}: Maximum policy size of \
          {MAX_RESOURCE_POLICY_BYTES} bytes exceeded"
     )
 }
@@ -749,23 +790,21 @@ impl PolicyStatement {
         )?;
         // A policy attached to a DynamoDB resource decides DynamoDB requests, so an
         // action of another service could never be decided by it: the document names a
-        // permission this resource cannot grant or refuse, and is refused rather than
-        // stored and never honoured.
+        // vendor other than the one the resource belongs to, which is what AWS's own
+        // sentence for the defect states ([`inconsistent_action_vendor`]).
         for value in &action.values {
-            if let Some(foreign) = foreign_service_action(value) {
-                return Err(invalid_policy_document(&format!(
-                    "Policy has an action that is not supported for the resource: {foreign}"
-                )));
+            if foreign_service_action(value).is_some() {
+                return Err(inconsistent_action_vendor());
             }
         }
         // "Resource-based policies ... require a Principal", and a PUBLIC one — `*`,
-        // which names every identity there is — would grant the resource to anyone, so
-        // an Allow may not carry it. A DENY of everyone takes nothing away from anyone
-        // in particular and stands.
-        if !deny && principal.is_public() {
-            return Err(invalid_policy_document(
-                "Policy statement must not grant access to a public principal",
-            ));
+        // which names every identity there is — grants the resource to everyone, so an
+        // Allow carrying it with no `Condition` to bound it grants unbounded access and
+        // is refused ([`unbounded_access`]). A statement whose grant is gated on a
+        // condition is bounded by it, and a DENY of everyone takes nothing away from
+        // anyone in particular, so both stand.
+        if !deny && principal.is_public() && !conditioned {
+            return Err(unbounded_access());
         }
         // A resource-based policy is attached to ONE resource, so a statement that
         // names no Resource applies to the resource it is attached to.

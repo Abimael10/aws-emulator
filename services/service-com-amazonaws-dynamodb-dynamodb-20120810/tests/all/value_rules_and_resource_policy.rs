@@ -641,9 +641,9 @@ async fn a_resource_policy_decides_whether_the_data_plane_serves_the_request() {
         PolicyCase {
             case: "an Allow of the same action",
             statement: json!({
-                // An Allow may not name a PUBLIC principal, so this row grants to the
-                // account that is going to make the read instead: what is under test is
-                // that an Allow denies nothing.
+                // An unconditioned Allow may not grant a PUBLIC principal, so this row
+                // grants to the account that is going to make the read instead: what is
+                // under test is that an Allow denies nothing.
                 "Effect": "Allow",
                 "Principal": {"AWS": format!("arn:aws:iam::{ACCOUNT_ID}:root")},
                 "Action": "dynamodb:GetItem",
