@@ -334,8 +334,17 @@ pub const BATCH_REQUIREMENT_ERROR_NOT_PROCESSED: &str = "NotProcessed";
 /// Stated here once so every batch security requirement operation that meets the
 /// condition answers the same sentence. The only variable part is the requirement name,
 /// which the entry itself names.
+///
+/// RECORDED, not modelled: `BatchSecurityRequirementError$message` is "The error
+/// message", an unconstrained string. The sentence first states the rule the entry
+/// broke — a requirement name is unique WITHIN one pack, so the same name stays legal
+/// in another pack — and then names the name the pack already holds. The fixed text is
+/// the service's; the only variable part is that name, taken verbatim from the request.
 pub fn security_requirement_exists_message(name: &str) -> String {
-    format!("Security requirement already exists for name: {name}")
+    format!(
+        "Security requirement name must be unique within a pack. \
+         Security requirement with name: {name} already exists"
+    )
 }
 
 /// The sentence one batch entry carries when the pack holds no security requirement of

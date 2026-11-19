@@ -742,3 +742,194 @@ async fn whole_request_refusals() {
         );
     }
 }
+
+/// The WHOLE sentence a per-entry error states for a name the pack does not hold.
+///
+/// `BatchSecurityRequirementError$message` is "The error message", an unconstrained
+/// String (`smithy_query(query="shape", shape="BatchSecurityRequirementError")`), so the
+/// wording is the service's and is written out here independently of the helper the
+/// handlers report it from. Everything but the name is FIXED text; the name is the
+/// request's, verbatim.
+fn item_not_found_message(name: &str) -> String {
+    format!("Security requirement with name: {name} was not found")
+}
+
+/// The WHOLE sentence a per-entry error states for a name the pack already holds: the
+/// rule the entry broke — a name is unique WITHIN one pack — and then that name.
+/// Written out here for the same reason as [`item_not_found_message`].
+fn item_already_exists_message(name: &str) -> String {
+    format!(
+        "Security requirement name must be unique within a pack. \
+         Security requirement with name: {name} already exists"
+    )
+}
+
+/// The names the per-entry error vocabulary is asserted over. The rule turns on nothing
+/// about the name, so the rows differ along its FORM and LENGTH — ASCII, punctuation and
+/// digits, non-ASCII, surrounding whitespace, one character, long — and none of them is
+/// the name the recorded run used.
+fn item_error_name_rows() -> Vec<(&'static str, String)> {
+    vec![
+        ("a plain ascii name", "absent-requirement".to_string()),
+        (
+            "punctuation and digits",
+            "requirement.with/odd-chars_0123".to_string(),
+        ),
+        ("a non-ascii name", "exigence-chiffrement-🔐".to_string()),
+        (
+            "surrounding whitespace",
+            "  padded requirement  ".to_string(),
+        ),
+        ("one character", "q".to_string()),
+        ("a long name", "n".repeat(512)),
+    ]
+}
+
+/// The one per-entry error of `payload`, with its three `@required` members asserted
+/// against `code` and `message`.
+fn expect_one_item_error(payload: &Value, name: &str, code: &str, message: &str, case: &str) {
+    let failed = errors(payload, case);
+    assert_eq!(
+        failed.len(),
+        1,
+        "case {case:?}: expected exactly one per-entry error, got {failed:?}"
+    );
+    let error = &failed[0];
+    assert_eq!(
+        member(error, "securityRequirementName").as_deref(),
+        Some(name),
+        "case {case:?}: the error names the wrong requirement: {error}"
+    );
+    assert_eq!(
+        member(error, "code").as_deref(),
+        Some(code),
+        "case {case:?}: expected code {code:?}, got {:?}",
+        member(error, "code")
+    );
+    assert_eq!(
+        member(error, "message").as_deref(),
+        Some(message),
+        "case {case:?}: expected message {message:?}, got {:?}",
+        member(error, "message")
+    );
+}
+
+/// A name the pack does not hold is reported, by every batch operation that resolves a
+/// name, with the SERVICE's item-error vocabulary: the item code `ResourceNotFound` —
+/// which is not the name of the call-level `ResourceNotFoundException` shape — and the
+/// service's own sentence naming the requested name.
+#[tokio::test]
+async fn a_missing_name_carries_the_services_item_error_vocabulary() {
+    let router = emulator();
+
+    // The item code is a WIRE value, so it is pinned here as the literal a client
+    // branches on, not only as the constant the handlers read.
+    assert_eq!(
+        BATCH_REQUIREMENT_ERROR_NOT_FOUND, "ResourceNotFound",
+        "case \"a missing name's code\": got {BATCH_REQUIREMENT_ERROR_NOT_FOUND:?}"
+    );
+
+    for (case, name) in item_error_name_rows() {
+        let pack_id = create_pack(&router, &format!("pack for {case}"), case).await;
+        let expected = item_not_found_message(&name);
+
+        // The READ: a name the pack does not hold is one per-entry error, HTTP 200.
+        let read = batch_get(&router, &pack_id, &[name.as_str()], case).await;
+        expect_one_item_error(
+            &read,
+            &name,
+            BATCH_REQUIREMENT_ERROR_NOT_FOUND,
+            &expected,
+            case,
+        );
+
+        // The UPDATE and the DELETE resolve a name the same way, so they state the same
+        // sentence for a name the pack does not hold. Both are HTTP 200 with the outcome
+        // per entry (`smithy_query(query="operation",
+        // operation="BatchUpdateSecurityRequirements,BatchDeleteSecurityRequirements")`).
+        let bodies: Vec<(&str, Value)> = vec![
+            (
+                "BatchUpdateSecurityRequirements",
+                json!({
+                    "packId": &pack_id,
+                    "securityRequirements": [{"name": &name, "description": "a new description"}]
+                }),
+            ),
+            (
+                "BatchDeleteSecurityRequirements",
+                json!({"packId": &pack_id, "securityRequirementNames": [&name]}),
+            ),
+        ];
+        for (operation, body) in bodies {
+            let answer = expect_status(&router, operation, &body, 200, case).await;
+            expect_one_item_error(
+                &answer,
+                &name,
+                BATCH_REQUIREMENT_ERROR_NOT_FOUND,
+                &expected,
+                case,
+            );
+        }
+    }
+}
+
+/// A name the pack ALREADY holds is reported, per entry, with the sentence that states
+/// the rule it broke: the name is unique within a PACK. So the same name is created
+/// without complaint in another pack, which is the scope the sentence claims.
+#[tokio::test]
+async fn a_held_name_carries_the_uniqueness_sentence() {
+    let router = emulator();
+
+    // The item code is a WIRE value, so it is pinned here as the literal a client
+    // branches on, not only as the constant the handler reads.
+    assert_eq!(
+        BATCH_REQUIREMENT_ERROR_CONFLICT, "ConflictException",
+        "case \"a held name's code\": got {BATCH_REQUIREMENT_ERROR_CONFLICT:?}"
+    );
+
+    for (case, name) in item_error_name_rows() {
+        let pack_id = create_pack(&router, &format!("held in a pack for {case}"), case).await;
+        let entry = json!({
+            "name": &name,
+            "description": "the stored description",
+            "domain": "the stored domain",
+            "evaluation": "the stored evaluation"
+        });
+
+        let first =
+            batch_create(&router, &pack_id, std::slice::from_ref(&entry), case).await;
+        assert!(
+            errors(&first, case).is_empty(),
+            "case {case:?}: the first create did not store cleanly: {first}"
+        );
+
+        let second =
+            batch_create(&router, &pack_id, std::slice::from_ref(&entry), case).await;
+        assert!(
+            results(&second, case).is_empty(),
+            "case {case:?}: the refused entry was reported as created: {second}"
+        );
+        expect_one_item_error(
+            &second,
+            &name,
+            BATCH_REQUIREMENT_ERROR_CONFLICT,
+            &item_already_exists_message(&name),
+            case,
+        );
+
+        // Uniqueness is WITHIN a pack, so the very same name is a clean create in
+        // another one.
+        let other_pack = create_pack(&router, &format!("another pack for {case}"), case).await;
+        let elsewhere = batch_create(&router, &other_pack, std::slice::from_ref(&entry), case).await;
+        assert!(
+            errors(&elsewhere, case).is_empty(),
+            "case {case:?}: the name was refused in another pack: {elsewhere}"
+        );
+        assert_eq!(
+            results(&elsewhere, case).len(),
+            1,
+            "case {case:?}: expected one record in the other pack, got {:?}",
+            results(&elsewhere, case)
+        );
+    }
+}
