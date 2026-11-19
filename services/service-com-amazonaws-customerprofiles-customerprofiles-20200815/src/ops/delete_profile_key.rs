@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteProfileKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteProfileKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteProfileKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes key values from one of a profile's searchable keys: every value the request
+//! names is disassociated from the profile and un-indexed, so `SearchProfiles` no longer
+//! finds the profile through it, and the delete is acknowledged with the output
+//! `Message`. A domain or profile the store does not hold, and a value the profile does
+//! not carry under that key, are `ResourceNotFoundException` (404) and write nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +147,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteProfileKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteProfileKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteProfileKey"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The key belongs to one of one domain's profiles, so both are resolved before
+        // anything is written and an unknown one is not found.
+        let domain = store
+            .domains
+            .get_mut(&input.domain_name)
+            .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+        if !domain.profiles.contains_key(&input.profile_id) {
+            return Err(not_found(crate::state::profile_not_found(
+                &input.profile_id,
+            )));
+        }
+
+        // "Removes a searchable key from a customer profile": every named value is
+        // disassociated from the key and un-indexed with it, so the profile is no longer
+        // found through it. A value the profile does not carry under that key is no key
+        // of that profile, so the request is refused and every value it named stays as
+        // it was.
+        if !domain.remove_profile_key(&input.profile_id, &input.key_name, &input.values) {
+            return Err(not_found(KEY_NOT_FOUND.to_string()));
+        }
+        // A profile's keys are part of the profile, so disassociating one is a write of
+        // that profile: it was last updated now.
+        if let Some(stored) = domain.profiles.get_mut(&input.profile_id) {
+            stored.last_updated_at = now;
+        }
+        // One more action in this profile's history: a key value was disassociated from
+        // it.
+        domain.record_profile_action(
+            &input.profile_id,
+            crate::state::ProfileAction::on_profile(crate::state::ACTION_DELETED_PROFILE_KEY),
+            now,
+        );
+
+        Ok(DeleteProfileKeyOutput {
+            message: Some(DELETE_ACKNOWLEDGEMENT.to_string()),
+        })
     }
+}
+
+/// `DeleteProfileKeyResponse$Message` — documented only as "a message that indicates the
+/// delete request is done". It is the fixed acknowledgement this service answers a
+/// completed delete with, the same one its other deletes answer: the whole value is fixed
+/// text, interpolating nothing from the request or the store.
+const DELETE_ACKNOWLEDGEMENT: &str = "OK";
+
+/// How the service words a delete of a key value the named profile does not carry under
+/// the named key. The sentence is FIXED text for this error class — it interpolates
+/// nothing from the request, so neither the domain, the profile, the key name nor the
+/// value appears in it.
+const KEY_NOT_FOUND: &str = "Failed to delete profile key due to key not found";
+
+/// A domain, a profile, or a key value of that profile the request names is not stored.
+fn not_found(message: String) -> DeleteProfileKeyError {
+    DeleteProfileKeyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> DeleteProfileKeyError {
+    DeleteProfileKeyErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
 }

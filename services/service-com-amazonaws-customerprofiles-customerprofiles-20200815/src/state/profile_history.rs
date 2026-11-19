@@ -44,6 +44,9 @@ pub const ACTION_UPDATED: &str = "UPDATED";
 /// `ActionType` of the record associating a key value with a profile writes.
 pub const ACTION_ADDED_PROFILE_KEY: &str = "ADDED_PROFILE_KEY";
 
+/// `ActionType` of the record disassociating a key value from a profile writes.
+pub const ACTION_DELETED_PROFILE_KEY: &str = "DELETED_PROFILE_KEY";
+
 /// `ActionType` of the record ingesting a profile object writes.
 pub const ACTION_INGESTED: &str = "INGESTED";
 

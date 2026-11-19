@@ -63,8 +63,9 @@ pub use segment_definitions::{
 
 pub use profile_history::{
     new_history_record_id, ProfileAction, StoredProfileHistoryRecord, ACTION_ADDED_PROFILE_KEY,
-    ACTION_CREATED, ACTION_DELETED_BY_CUSTOMER, ACTION_DELETED_BY_MERGE, ACTION_EXPIRED,
-    ACTION_INGESTED, ACTION_MERGED, ACTION_UPDATED, MAX_PROFILE_HISTORY_RECORDS,
+    ACTION_CREATED, ACTION_DELETED_BY_CUSTOMER, ACTION_DELETED_BY_MERGE,
+    ACTION_DELETED_PROFILE_KEY, ACTION_EXPIRED, ACTION_INGESTED, ACTION_MERGED, ACTION_UPDATED,
+    MAX_PROFILE_HISTORY_RECORDS,
     STANDARD_PROFILE_OBJECT_TYPE,
 };
 
@@ -1091,6 +1092,71 @@ impl Domain {
             self.index_key(profile_id, key_name.to_string(), value);
         }
         Ok(())
+    }
+
+    /// Disassociate every value in `values` from `profile_id` under `key_name`,
+    /// un-indexing each pair so a search no longer finds the profile through it.
+    ///
+    /// A key value is removable exactly when the profile CARRIES it under that key — the
+    /// associations [`Domain::add_profile_key`] holds — compared in the key's canonical
+    /// form ([`indexed_key_value`]), which is the form the pair is stored and indexed in.
+    /// A value the profile does not carry under that key names no association to remove,
+    /// so the whole request is refused and NOTHING is written: a removal that was asked
+    /// for together with one that cannot be made does not happen either. A predefined key
+    /// a profile's own attributes populate is not one of these associations — that value
+    /// is the profile's data, and it stays indexed for as long as the profile carries it.
+    ///
+    /// `false` is "no such key value on that profile", which is what the refusal is
+    /// worded from.
+    pub fn remove_profile_key(
+        &mut self,
+        profile_id: &str,
+        key_name: &str,
+        values: &[String],
+    ) -> bool {
+        let canonical: Vec<String> = values
+            .iter()
+            .map(|value| indexed_key_value(key_name, value))
+            .collect();
+        // Nothing named is nothing to remove, so there is no key value this request
+        // deleted and it is refused like any other key value the profile does not carry.
+        if canonical.is_empty() {
+            return false;
+        }
+        let carried = self
+            .profile_keys
+            .get(profile_id)
+            .and_then(|keys| keys.get(key_name));
+        if !carried.is_some_and(|held| canonical.iter().all(|value| held.contains(value))) {
+            return false;
+        }
+
+        for value in &canonical {
+            if let Some(keys) = self.profile_keys.get_mut(profile_id) {
+                if keys.get_mut(key_name).is_some_and(|held| {
+                    held.remove(value);
+                    held.is_empty()
+                }) {
+                    keys.remove(key_name);
+                }
+                if keys.is_empty() {
+                    self.profile_keys.remove(profile_id);
+                }
+            }
+            self.unindex_key(profile_id, key_name, value);
+            // The same pair can also be one the profile's own attributes populate. That
+            // one is the profile's data rather than an association, so it survives: the
+            // index entry is restored when the profile still derives the pair.
+            let derived = self.profiles.get(profile_id).is_some_and(|stored| {
+                standard_search_keys(&stored.profile)
+                    .iter()
+                    .any(|(name, derived)| name == key_name && derived == value)
+            });
+            if derived {
+                self.index_key(profile_id, key_name.to_string(), value.clone());
+            }
+        }
+        true
     }
 
     /// The (key name, value) pairs this domain has `profile` indexed under: the predefined
