@@ -1955,8 +1955,10 @@ fn resolve_indexes(
 /// index declared WITH the table: the table's capacity mode is the on-demand one
 /// ([`crate::state::check_vector_index_capacity_mode`]), a name no other index of the table
 /// already has, a `Projection` that holds together, a search-schema attribute the table has
-/// an `AttributeDefinition` for (its type is what the index partitions and filters by), and
-/// the per-table index count. One call carries ONE index action
+/// an `AttributeDefinition` for (its type is what the index partitions and filters by), the
+/// per-table index count ([`crate::state::check_vector_index_count`]) and the one dimension
+/// count every index over a vector attribute shares
+/// ([`crate::state::check_vector_dimensions_agree`]). One call carries ONE index action
 /// ([`vector_index_actions_over_limit`]), so the two loops below never both do work for the
 /// same request; the deletes are walked first all the same, which is the order the table
 /// would be left in if the limit ever let both through.
@@ -1995,12 +1997,6 @@ fn resolve_vector_indexes(
                 create.index_name
             )));
         }
-        if indexes.len() >= crate::state::MAX_VECTOR_INDEXES {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid VectorIndexUpdates: a table carries at most {} vector indexes",
-                crate::state::MAX_VECTOR_INDEXES
-            )));
-        }
         // What the declaration has to satisfy, and the index it stores, are `CreateTable`'s
         // to state: the two members describe the same resource, so a vector index added
         // here is held to exactly the rules one declared with the table is
@@ -2031,6 +2027,13 @@ fn resolve_vector_indexes(
             )?,
         );
     }
+    // The per-table vector-index quota and the one dimension count each vector attribute
+    // may have are the TABLE's rules, so both are asked of the list this update leaves the
+    // table carrying ([`crate::state::check_vector_index_count`],
+    // [`crate::state::check_vector_dimensions_agree`]): an index added here is held to
+    // exactly what one declared with the table is.
+    crate::state::check_vector_index_count(indexes.len())?;
+    crate::state::check_vector_dimensions_agree(&indexes)?;
     // A vector index exists only on an ON-DEMAND table, so the mode this very update
     // leaves the table in is what every index it will still CARRY has to hold on
     // ([`crate::state::check_vector_index_capacity_mode`]): an update that adds one to a

@@ -395,12 +395,13 @@ pub const MAX_INDEX_KEY_ELEMENTS: usize = MAX_INDEX_PARTITION_KEYS + MAX_INDEX_S
 
 /// The most vector indexes one table may carry.
 ///
-/// AWS documents no ceiling for `CreateTable$VectorIndexes`, so this one is this
-/// emulator's own: the global secondary index quota over again
-/// ([`MAX_GLOBAL_SECONDARY_INDEXES`]), since a vector index is another index on the same
-/// table. A request past it is refused rather than storing a list whose length is the
-/// request's to choose.
-pub const MAX_VECTOR_INDEXES: usize = MAX_GLOBAL_SECONDARY_INDEXES;
+/// AWS documents no ceiling for `CreateTable$VectorIndexes` in the model, so the ceiling
+/// is the SERVICE's per-table quota: AWS refuses a table that would carry more vector
+/// indexes than this and states the limit in force in the refusal itself
+/// ([`vector_index_count_limit_message`]). A table taken past it — declared with too many
+/// at once, or taken there one added index at a time — is refused rather than carrying a
+/// list whose length is the request's to choose ([`check_vector_index_count`]).
+pub const MAX_VECTOR_INDEXES: usize = 5;
 
 /// The most elements one vector index's `SearchSchema` may carry.
 ///
@@ -4753,3 +4754,11 @@ pub use addressing::*;
 /// every caller still names it `crate::state::…`.
 mod index_backfill;
 pub use index_backfill::*;
+
+/// How the VECTOR-INDEX declarations one request carries are refused — more of them than a
+/// table may carry, a search-schema element nothing declares, and two of them disagreeing
+/// about one vector attribute's dimensions — in its own file, because all three are facts
+/// about the declaration rather than about what the store holds. Re-exported below, so
+/// every caller still names them `crate::state::…`.
+mod vector_index_declarations;
+pub use vector_index_declarations::*;

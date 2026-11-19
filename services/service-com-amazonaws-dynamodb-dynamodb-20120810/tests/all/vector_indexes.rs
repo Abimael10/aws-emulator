@@ -241,9 +241,8 @@ async fn a_request_past_a_vector_index_bound_is_refused_before_it_is_walked() {
             "one vector index too many",
             indexes(MAX_VECTOR_INDEXES + 1),
             Some(format!(
-                "Invalid VectorIndexes: a table may carry at most {MAX_VECTOR_INDEXES} vector \
-                 indexes, got {}",
-                MAX_VECTOR_INDEXES + 1
+                "One or more parameter values were invalid: VectorIndex count exceeds the \
+                 per-table limit of {MAX_VECTOR_INDEXES}"
             )),
         ),
         (
@@ -357,27 +356,26 @@ async fn a_search_schema_attribute_the_request_declares_no_definition_for_is_ref
     // The converse of the usage rule, and the same rule an index key schema is held to: a
     // search schema partitions and filters by an attribute's VALUE, so that attribute
     // needs an `AttributeDefinitions` entry. Rows differ in the element type naming the
-    // undeclared attribute and in which position of the schema it sits in.
-    let cases: [(&str, Value, &str); 3] = [
+    // undeclared attribute and in which position of the schema it sits in; the sentence is
+    // the same fixed one in every row, since what is wrong is that ONE element of the
+    // schema has no definition.
+    let cases: [(&str, Value); 3] = [
         (
             "a HASH element on an undeclared attribute",
             json!([{"AttributeName": "tenant", "SearchSchemaElementType": "HASH"}]),
-            "tenant",
         ),
         (
             "an INLINE_FILTER element on an undeclared attribute",
             json!([{"AttributeName": "price", "SearchSchemaElementType": "INLINE_FILTER"}]),
-            "price",
         ),
         (
             "the second element of the schema undeclared",
             json!([{"AttributeName": "pk", "SearchSchemaElementType": "HASH"},
                    {"AttributeName": "tier", "SearchSchemaElementType": "INLINE_FILTER"}]),
-            "tier",
         ),
     ];
 
-    for (position, (case, search_schema, undeclared)) in cases.into_iter().enumerate() {
+    for (position, (case, search_schema)) in cases.into_iter().enumerate() {
         let table = format!("VectorUndeclared{position}");
         let (status, body) = call(
             &router,
@@ -400,13 +398,12 @@ async fn a_search_schema_attribute_the_request_declares_no_definition_for_is_ref
             (
                 400,
                 "ValidationException".to_string(),
-                format!(
-                    "Invalid SearchSchema for index idx.search: no AttributeDefinition was \
-                     provided for search schema attribute {undeclared}"
-                )
+                "One or more parameter values were invalid: One element in SearchSchema is not \
+                 defined in attribute definitions"
+                    .to_string()
             ),
-            "case {case}: the undeclared search schema attribute is refused by name, got \
-             {status} with {body}"
+            "case {case}: the undeclared search schema attribute is refused with the fixed \
+             sentence, got {status} with {body}"
         );
     }
 

@@ -859,14 +859,9 @@ impl<'d> DeclaredTable<'d> {
                 )));
             }
         }
-        let vector_indexes = self.vector_indexes.len();
-        if vector_indexes > crate::state::MAX_VECTOR_INDEXES {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid VectorIndexes: a table may carry at most {} vector indexes, got \
-                 {vector_indexes}",
-                crate::state::MAX_VECTOR_INDEXES
-            )));
-        }
+        // The per-table vector-index quota, which bounds this walk and is the table's own
+        // limit either way ([`crate::state::check_vector_index_count`]).
+        crate::state::check_vector_index_count(self.vector_indexes.len())?;
         for index in self.vector_indexes {
             clamped_search_schema(
                 &index.index_name,
@@ -1394,6 +1389,10 @@ pub(crate) fn validated_vector_indexes(
             .validated(&definitions, region, table, crate::state::IndexBackfill::WithTable, now)?,
         );
     }
+    // The dimensions are a property of the vectors the ATTRIBUTE holds, so every index
+    // over one has to agree about them ([`crate::state::check_vector_dimensions_agree`]);
+    // asked of the whole list, since a pair is what disagrees.
+    crate::state::check_vector_dimensions_agree(&indexes)?;
     Ok(indexes)
 }
 
@@ -1465,11 +1464,9 @@ impl DeclaredVectorIndex<'_> {
                 .iter()
                 .any(|definition| definition.attribute_name == name)
             {
-                return Err(crate::state::RequestError::Validation(format!(
-                    "Invalid SearchSchema for index {}: no AttributeDefinition was provided for \
-                     search schema attribute {name}",
-                    self.index_name
-                )));
+                return Err(crate::state::RequestError::Validation(
+                    crate::state::SEARCH_SCHEMA_ATTRIBUTE_UNDECLARED_MESSAGE.to_string(),
+                ));
             }
         }
         Ok(crate::state::VectorIndex {
