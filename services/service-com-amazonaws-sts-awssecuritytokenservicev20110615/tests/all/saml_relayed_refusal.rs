@@ -40,7 +40,12 @@ use super::saml_federation::{
     SESSION_NAME_PATTERN_MESSAGE, SESSION_NAME_REQUIRED_MESSAGE, SIGNATURE_INVALID_MESSAGE,
     STATUS_AUTHN_FAILED,
 };
-use super::sts_sessions::{element, emulator_account, member};
+use super::sts_sessions::{element, emulator_account, member, query, LONG_TERM_KEY};
+
+/// IAM's SigV4 signing name and awsQuery API version: the manifest this suite removes is
+/// removed through IAM's own operation, so the account really stops holding it.
+const IAM_SIGNING_NAME: &str = "iam";
+const IAM_API_VERSION: &str = "2010-05-08";
 
 /// The service the relayed reading was made to, as the relaying layer names it.
 pub(crate) const DISCOVERY_SERVICE: &str = "AWSOpenIdDiscoveryService";
@@ -88,6 +93,19 @@ pub(crate) fn relayed_request_id(
 /// The ARN IAM keys a SAML provider of this account by.
 fn provider_arn_of(name: &str) -> String {
     format!("arn:aws:iam::{}:saml-provider/{name}", emulator_account())
+}
+
+/// A 12-digit account id that is NOT the one this emulator vends for: every digit of its own
+/// advanced by one, so an ARN built from it names a provider of another account whichever
+/// account the emulator vends for.
+fn another_account() -> String {
+    emulator_account()
+        .chars()
+        .map(|digit| {
+            let advanced = (digit.to_digit(10).expect("an account id of digits") + 1) % 10;
+            char::from_digit(advanced, 10).expect("a digit")
+        })
+        .collect()
 }
 
 /// What a row expects of the refusal: the HTTP status, the `<Code>`, the fixed sentence of
@@ -422,5 +440,168 @@ async fn every_relayed_refusal_reports_its_own_request_id() {
                 }
             }
         }
+    }
+}
+
+/// The case label of the value that is a response of the registered provider's in every
+/// respect, which is the one the control row expects to be SERVED.
+const SIGNED_BY_THE_REGISTERED_PROVIDER: &str = "a response the registered provider signed";
+
+/// Looking the provider's manifest up is the FIRST step of the relayed reading, so a request
+/// naming an ARN the account holds no manifest for is refused by that step whatever else it
+/// carries: the sentence of the lookup class followed by the envelope naming that call and the
+/// lookup's own exception — never a reading of the presented value, which never happened.
+///
+/// The rows cross the forms an ARN takes that the account holds no manifest for (a name never
+/// registered, the registered name spelled differently, the same name in another account, a
+/// manifest the account removed) with values that, against the provider the account DOES hold,
+/// would each be refused by a LATER step — its encoding, its signature's presence, its
+/// signature's validity, its validity window — or served. The control rows present those very
+/// values against the registered provider and show that the lookup answers none of them, which
+/// is what makes the envelope's `Error Code` field say which step refused.
+#[tokio::test]
+async fn a_manifest_the_account_does_not_hold_is_refused_by_the_lookup() {
+    let (router, _engine) = emulator_with_iam();
+    let provider = IdentityProvider::mint("https://lookup.example.test/saml");
+    let provider_arn = create_saml_provider(&router, "lookup-idp", &provider).await;
+    // Registered and then removed: the account held this manifest and holds it no longer.
+    let removed = IdentityProvider::mint("https://removed.example.test/saml");
+    let removed_arn = create_saml_provider(&router, "removed-idp", &removed).await;
+    let (status, body) = query(
+        &router,
+        LONG_TERM_KEY,
+        IAM_SIGNING_NAME,
+        IAM_API_VERSION,
+        "DeleteSAMLProvider",
+        &[("SAMLProviderArn", removed_arn.clone())],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "removing a registered provider must be served, got {status} {body}"
+    );
+    let role_arn =
+        create_saml_role(&router, "lookup-role", &provider_arn, audience_condition()).await;
+    // A key no provider of this account publishes, which is what an unverifiable signature is.
+    let stranger = IdentityProvider::mint("https://stranger.example.test/saml");
+
+    let valid = || Response::valid(&provider, &role_arn, &provider_arn);
+
+    // One presented value per step that would decide it against the provider the account
+    // holds, so a lookup that read the value instead would answer these rows differently.
+    let presented: Vec<(&str, String)> = vec![
+        (
+            SIGNED_BY_THE_REGISTERED_PROVIDER,
+            saml_assertion(&provider, &valid()),
+        ),
+        ("a value that is not base64", "not base64".to_string()),
+        (
+            "a response carrying no signature",
+            saml_assertion(
+                &provider,
+                &Response {
+                    signed: false,
+                    ..valid()
+                },
+            ),
+        ),
+        (
+            "a response signed by a key no provider of the account publishes",
+            saml_assertion(
+                &stranger,
+                &Response::valid(&stranger, &role_arn, &provider_arn),
+            ),
+        ),
+        (
+            "a response whose validity window has passed",
+            saml_assertion(
+                &provider,
+                &Response {
+                    not_on_or_after_offset: Some(-60),
+                    conditions_not_on_or_after_offset: Some(600),
+                    ..valid()
+                },
+            ),
+        ),
+    ];
+
+    // One form an ARN the account holds no manifest for takes per row.
+    let absent: Vec<(&str, String)> = vec![
+        (
+            "a name the account never registered",
+            provider_arn_of("never-registered"),
+        ),
+        (
+            "the registered name spelled in another case",
+            provider_arn_of("Lookup-Idp"),
+        ),
+        (
+            "the registered name with a suffix",
+            provider_arn_of("lookup-idp-2"),
+        ),
+        (
+            "the registered name in another account",
+            format!(
+                "arn:aws:iam::{}:saml-provider/lookup-idp",
+                another_account()
+            ),
+        ),
+        ("a manifest the account removed", removed_arn.clone()),
+    ];
+
+    let mut ids: Vec<(String, String)> = Vec::new();
+    for (named, principal) in &absent {
+        for (shown, assertion) in &presented {
+            let case = format!("{named}, presenting {shown}");
+            let (status, body) = exchange(&router, &role_arn, principal, assertion).await;
+            let expected = Refusal {
+                status: 400,
+                code: "InvalidIdentityToken",
+                sentence: PROVIDER_NOT_FOUND_MESSAGE.to_string(),
+                relayed: Some(MANIFEST_NOT_FOUND_EXCEPTION),
+            };
+            let reported = assert_refusal(&case, status, &body, &expected);
+            let id = relayed_request_id(
+                &case,
+                &reported,
+                PROVIDER_NOT_FOUND_MESSAGE,
+                MANIFEST_NOT_FOUND_EXCEPTION,
+            );
+            ids.push((case, id));
+        }
+    }
+    // Every one of those refusals relayed a call of its own, so no two report one id.
+    for (position, (case, id)) in ids.iter().enumerate() {
+        for (other_case, other_id) in ids.iter().skip(position + 1) {
+            assert_ne!(
+                id, other_id,
+                "case {case:?} and case {other_case:?}: expected each relayed refusal its own \
+                 request id, got {id:?} twice"
+            );
+        }
+    }
+
+    // The control: the very same values against the provider the account DOES hold are served
+    // or refused by a later step, so the lookup's exception is never what they report.
+    for (shown, assertion) in &presented {
+        let case = format!("the registered provider, presenting {shown}");
+        let (status, body) = exchange(&router, &role_arn, &provider_arn, assertion).await;
+        if *shown == SIGNED_BY_THE_REGISTERED_PROVIDER {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the exchange to be served, got {status} {body}"
+            );
+            continue;
+        }
+        assert_ne!(
+            status, 200,
+            "case {case:?}: expected the exchange to be refused, got {body}"
+        );
+        let reported = member(&case, &body, "Message").replace("&amp;", "&");
+        assert!(
+            !reported.contains(MANIFEST_NOT_FOUND_EXCEPTION)
+                && !reported.starts_with(PROVIDER_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the step that read the value to answer, got {reported:?}"
+        );
     }
 }
