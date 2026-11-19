@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyActivityStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyActivityStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation writes the AUDIT POLICY STATE of the database activity stream
+//! of the stored DB instance its `ResourceArn` names — the
+//! `DBInstance$ActivityStreamPolicyStatus` that instance's own describe reports — and is the
+//! ONLY file to touch for this operation.
+//!
+//! The write itself is
+//! [`crate::state::ComAmazonawsRdsAmazonrdsv19State::set_activity_stream_audit_policy`], so
+//! the resolution of the ARN, the preconditions and the transition the clock settles are
+//! stated once, next to the record they are about ([`crate::state::ActivityStreamPolicy`]).
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyActivityStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +128,40 @@ impl From<ModifyActivityStreamErrorModeled> for ModifyActivityStreamError {
     }
 }
 
+/// This operation's answer to a refused modification, in its own error channel: the
+/// instance-side faults the model declares for it, plus the member refusal a `ResourceArn`
+/// that names no DB instance ARN at all is answered on.
+///
+/// The modelled `ResourceNotFoundFault` ("The specified resource ID was not found") is left
+/// unused, including for an instance whose activity stream has never been STARTED: the
+/// audit policy state this call writes is editable then — `AuditPolicyState` states "you can
+/// edit your audit policy only when the activity stream is unlocked or stopped", and a stream
+/// that was never started is stopped — so a stopped stream is served rather than reported
+/// absent. Every other value `ResourceArn` takes either names a DB instance, found or not,
+/// which is `DBInstanceNotFoundFault`, or is no usable DB instance ARN, which is the
+/// parameter's own refusal.
+fn refusal_of(refusal: crate::state::ActivityStreamRefusal) -> ModifyActivityStreamError {
+    match refusal {
+        crate::state::ActivityStreamRefusal::UnusableArn(message) => {
+            crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+        }
+        crate::state::ActivityStreamRefusal::NotFound(message) => {
+            ModifyActivityStreamErrorModeled::DBInstanceNotFoundFault(DBInstanceNotFoundFault {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::ActivityStreamRefusal::InvalidState(message) => {
+            ModifyActivityStreamErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+    }
+}
+
 /// The `ModifyActivityStream` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,17 +199,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyActivityStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyActivityStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyActivityStream"))
+        // request metadata.
+        let region =
+            crate::state::request_region(ctx).map_err(ModifyActivityStreamError::validation)?;
+        // The model leaves `ResourceArn` optional, but it is the only handle the request has
+        // on the DB instance whose policy is to change: a call that carries none, or carries
+        // it empty, names no instance at all and is refused for that member rather than
+        // acting on something it did not name.
+        let resource_arn = input.resource_arn.unwrap_or_default();
+        crate::state::check_not_empty("ResourceArn", &resource_arn)
+            .map_err(ModifyActivityStreamError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot resolve the instance at all; 501 is the honest answer, never a policy state
+        // nothing recorded.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due, so the modification is judged against
+        // the state the instance is really in.
+        store.settle_due_transitions(&region);
+
+        // "Changes the audit policy state of a database activity stream to either locked
+        // (default) or unlocked": the one write this operation performs.
+        let report = match store.set_activity_stream_audit_policy(
+            &region,
+            &resource_arn,
+            input.audit_policy_state.as_deref(),
+        ) {
+            Ok(report) => report,
+            Err(refusal) => return Err(refusal_of(refusal)),
+        };
+
+        Ok(ModifyActivityStreamOutput {
+            // "The status of the modification to the policy state of the database activity
+            // stream" and "the status of the modification to the database activity stream":
+            // the policy as this call left it, beside the stream's own status, which a change
+            // of the policy state does not move — "restarting the activity stream isn't
+            // required".
+            policy_status: Some(report.policy_status),
+            status: Some(report.status),
+            // The Kinesis data stream the activity stream is delivered to, the key its
+            // messages are encrypted under, its mode and whether it carries engine-native
+            // audit fields are the configuration of a STARTED stream, which is what
+            // `StartActivityStream` records — an operation of its own, still a stub. No
+            // instance this service holds has a started stream, so there is no such
+            // configuration to report and these members are absent rather than carrying a
+            // value nothing configured.
+            kinesis_stream_name: None,
+            kms_key_id: None,
+            mode: None,
+            engine_native_audit_fields_included: None,
+        })
     }
 }

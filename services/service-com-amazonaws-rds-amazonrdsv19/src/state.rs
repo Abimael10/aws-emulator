@@ -321,6 +321,10 @@ pub use maintenance_window::{stored_maintenance_window, window_is_open};
 // The Data API HTTP endpoint of a DB cluster: the one write `EnableHttpEndpoint` and
 // `DisableHttpEndpoint` share, and the preconditions both hold a request to.
 mod data_api_endpoint;
+// The audit policy state of a DB instance's database activity stream: the write
+// `ModifyActivityStream` performs, and the preconditions it holds a request to.
+mod activity_stream;
+pub use activity_stream::*;
 // The data a DB cluster holds through the Data API, which a snapshot of that cluster carries
 // and a restore of that snapshot installs: the hand-off to the service that owns those
 // databases.

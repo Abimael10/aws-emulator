@@ -953,6 +953,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // And its continuous backup holds no recovery point yet: the instance's data is
             // what it came up with until a session commits a change to it.
             recovery_points: Vec::new(),
+            // No activity stream was started for the new instance and nothing has set the
+            // audit policy state of one, so it carries none: `ModifyActivityStream` is what
+            // sets it.
+            activity_stream_policy: None,
         };
         record.engine_log.record(format!(
             "DB instance {} created with engine {}; status {}",

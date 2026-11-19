@@ -794,6 +794,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // credential (see [`crate::state::DbInstanceRecord::master_user_secret`]).
                 // Named explicitly so the source's is not swept in by the update below.
                 master_user_secret: None,
+                // And it carries no activity stream audit policy state of its own: a
+                // `ModifyActivityStream` sets that on the instance it names, and the
+                // source's is the SOURCE's. Named explicitly so the source's is not swept
+                // in by the update below.
+                activity_stream_policy: None,
                 // Everything else is the source's, and is never the request's: the engine
                 // and its version, the database the replica serves and the master credential
                 // a login is verified against are all the source's by definition — a replica
@@ -1436,6 +1441,9 @@ fn resolve_source_cluster(
         enabled_cloudwatch_logs_exports: Vec::new(),
         general_query_log: crate::state::InstanceLog::default(),
         recovery_points: Vec::new(),
+        // Nor the cluster's activity stream audit policy state: `ModifyActivityStream` sets
+        // that on the DB INSTANCE it names, so a replica created here has none.
+        activity_stream_policy: None,
     };
     let resolved = ResolvedSource::Cluster(cluster.identifier.clone());
     Ok((settings, resolved))

@@ -211,6 +211,11 @@ pub struct DbInstanceRecord {
     /// ran while `general_log` was on ([`data_plane::statement_log`]). EMPTY for an instance
     /// whose engine has written none, which has no such file at all.
     pub general_query_log: InstanceLog,
+    /// The audit policy state of this instance's database activity stream, for an instance
+    /// a `ModifyActivityStream` has set one on — what `ActivityStreamPolicyStatus` reports
+    /// ([`ActivityStreamPolicy`]). `None` for an instance whose policy nothing has modified,
+    /// which reports no policy status at all.
+    pub activity_stream_policy: Option<ActivityStreamPolicy>,
     /// The recovery points this instance's CONTINUOUS BACKUP holds, oldest first: the data it
     /// held at each instant a session committed a change, which is what
     /// `RestoreDBInstanceToPointInTime` restores an instant's data from
@@ -225,6 +230,12 @@ impl DbInstanceRecord {
     /// the store.
     pub(super) fn settle(&mut self, now: Instant) -> bool {
         self.settle_deferred_modification();
+        // A change of the activity stream's audit policy state settles on its own clock,
+        // whatever the instance's status is doing: the policy state is not the instance's
+        // status ([`ActivityStreamPolicy`]).
+        if let Some(policy) = self.activity_stream_policy.as_mut() {
+            policy.settle(now);
+        }
         let due = self
             .pending_status
             .as_ref()
@@ -462,6 +473,17 @@ impl DbInstanceRecord {
             .into_iter()
             .find(|(name, _)| *name == named)
             .map(|(_, log)| log)
+    }
+
+    /// `ActivityStreamStatus` for this instance's database activity stream: the `stopped`
+    /// member for an instance no activity stream was started for, which is every instance
+    /// this service holds ([`ACTIVITY_STREAM_STOPPED`]).
+    ///
+    /// One reader for the status, so the instance's own report
+    /// (`DBInstance$ActivityStreamStatus`) and what a call on the stream answers cannot
+    /// drift apart.
+    pub fn activity_stream_status(&self) -> &str {
+        ACTIVITY_STREAM_STOPPED
     }
 
     /// `arn:aws:rds:<region>:<account>:db:<identifier>`, from the stored region and
@@ -865,7 +887,14 @@ impl DbInstanceRecord {
             tag_list: Some(self.tags.clone()),
             customer_owned_ip_enabled: Some(self.customer_owned_ip_enabled),
             network_type: Some(self.network_type.clone()),
-            activity_stream_status: Some(ACTIVITY_STREAM_STOPPED.to_string()),
+            activity_stream_status: Some(self.activity_stream_status().to_string()),
+            // `ActivityStreamPolicyStatus`: the state of the audit policy of this instance's
+            // activity stream, for an instance a `ModifyActivityStream` has set one on, and
+            // absent for one whose policy nothing has modified.
+            activity_stream_policy_status: self
+                .activity_stream_policy
+                .as_ref()
+                .map(|policy| policy.status().to_string()),
             backup_target: Some(self.backup_target.clone()),
             dedicated_log_volume: Some(self.dedicated_log_volume),
             // Nothing this service does changes an instance's storage file system
