@@ -4,7 +4,7 @@
 //! operation answers once the `AppInstance` it addresses has been deleted — end to end
 //! over HTTP.
 //!
-//! Three RULEs are pinned here:
+//! Four RULEs are pinned here:
 //!
 //! * a create's `@idempotencyToken` replays only the request the token already made: the
 //!   same token with ANY different parameter is refused `ConflictException` (409) and
@@ -13,11 +13,19 @@
 //!   AWS's fixed already-exists sentence, whatever the resource's id looks like;
 //! * a request addressed to a deleted `AppInstance` — its own ARN, or the ARN of a
 //!   resource the delete cascaded away — is refused `ForbiddenException` (403), while an
-//!   ARN that never named a resource keeps the service's unknown-ARN refusal.
+//!   ARN that never named a resource keeps the service's unknown-ARN refusal;
+//! * a value outside a member's modelled `@pattern` is refused `ValidationException`
+//!   (400) whose requirement clause quotes the expression the service PUBLISHES: the
+//!   modelled trait without the `^`/`$` pair the model wraps a whole-value match in, and
+//!   the trait exactly as written where the model wraps it in no such pair — while the
+//!   check itself still runs the pattern as modelled.
 //!
 //! The tables span what those rules generalise over: which member a reused token differs
-//! in, the form of the id a duplicate create names, and which operation (and which kind
-//! of ARN under the instance) the request is addressed to. A fourth test pins the bound on
+//! in, the form of the id a duplicate create names, which operation (and which kind
+//! of ARN under the instance) the request is addressed to, and — for the pattern
+//! requirement — which member of which operation broke which modelled pattern, whether
+//! that pattern is anchored at all, whether the member's value is one the service
+//! discloses, and how many clauses one refusal carries. A further test pins the bound on
 //! the deletions the emulator remembers, and the order in which it forgets them.
 
 use serde_json::{json, Value};
@@ -764,5 +772,374 @@ async fn the_remembered_deletions_are_bounded_and_forget_the_oldest_first() {
         (status, answer["Code"].as_str()),
         (403, Some("Forbidden")),
         "case \"the newest deletion\": expected it to be remembered, got {status} {answer:?}"
+    );
+}
+
+// ============================================================================
+// How a value outside a modelled `@pattern` is refused.
+// ============================================================================
+
+/// The expressions a `@pattern` requirement of this service is quoted with: the modelled
+/// trait with the `^`/`$` pair the model wraps a whole-value match in removed, and the
+/// trait exactly as written where the model wraps it in no such pair.
+///
+/// Source: `smithy_query(query="shape",
+/// shape="ChimeArn,ClientRequestToken,LexBotAliasArn,LexIntentName,UserName")` on this
+/// crate's model. `ChimeArn` is modelled
+/// `^arn:[a-z0-9-\.]{1,63}:…:[^/].{0,1023}$`, so the published expression is its body —
+/// note the `^` INSIDE the `[^/]` class, which is a negation and not an anchor.
+const CHIME_ARN_PUBLISHED: &str =
+    r"arn:[a-z0-9-\.]{1,63}:[a-z0-9-\.]{0,63}:[a-z0-9-\.]{0,63}:[a-z0-9-\.]{0,63}:[^/].{0,1023}";
+
+/// `ClientRequestToken` is modelled `^[-_a-zA-Z0-9]*$`.
+const CLIENT_REQUEST_TOKEN_PUBLISHED: &str = r"[-_a-zA-Z0-9]*";
+
+/// `LexBotAliasArn` is modelled
+/// `^arn:aws:lex:[a-z]{2}-[a-z]+-\d{1}:\d{12}:bot-alias/[A-Z0-9]{10}/[A-Z0-9]{10}$`.
+const LEX_BOT_ALIAS_ARN_PUBLISHED: &str =
+    r"arn:aws:lex:[a-z]{2}-[a-z]+-\d{1}:\d{12}:bot-alias/[A-Z0-9]{10}/[A-Z0-9]{10}";
+
+/// `LexIntentName` is modelled `^([A-Za-z]_?)+$`.
+const LEX_INTENT_NAME_PUBLISHED: &str = r"([A-Za-z]_?)+";
+
+/// `UserName` is modelled `\S` — the model wraps it in NO anchor pair, so there is
+/// nothing to drop and the expression is quoted exactly as written.
+const USER_NAME_PUBLISHED: &str = r"\S";
+
+/// A bot-alias ARN that satisfies `LexBotAliasArn` as modelled.
+const WHOLE_LEX_BOT_ALIAS_ARN: &str =
+    "arn:aws:lex:us-west-2:123456789012:bot-alias/BOTIDAAAAA/ALIASAAAAA";
+
+/// The clause stating that `value`, submitted at `path`, is outside `published`.
+fn pattern_clause(value: &str, path: &str, published: &str) -> String {
+    format!(
+        "Value '{value}' at '{path}' failed to satisfy constraint: Member must satisfy \
+         regular expression pattern: {published}"
+    )
+}
+
+/// [`pattern_clause`] for a member whose submitted value the service does not disclose.
+fn withheld_pattern_clause(path: &str, published: &str) -> String {
+    format!(
+        "Value at '{path}' failed to satisfy constraint: Member must satisfy regular \
+         expression pattern: {published}"
+    )
+}
+
+/// The envelope one clause is stated in.
+fn one_validation_error(clause: &str) -> String {
+    format!("1 validation error detected: {clause}")
+}
+
+/// `POST /app-instance-bots`, with the Lex configuration a row carries.
+fn bot_request(app_instance_arn: &str, token: &str, lex: Value) -> Value {
+    json!({
+        "AppInstanceArn": app_instance_arn,
+        "Name": "pattern-bot",
+        "ClientRequestToken": token,
+        "Configuration": { "Lex": lex },
+    })
+}
+
+/// The Lex configuration of a bot create, with `LexBotAliasArn` as the row carries it.
+fn lex_with_alias(lex_bot_alias_arn: &str) -> Value {
+    json!({
+        "LexBotAliasArn": lex_bot_alias_arn,
+        "LocaleId": "en_US",
+        "RespondsTo": "STANDARD_MESSAGES",
+    })
+}
+
+/// Assert that the call was refused as the modelled constraint refusal carrying `message`.
+fn assert_validation_refusal(label: &str, status: u16, answer: &Value, message: &str) {
+    assert_eq!(
+        (status, answer["__type"].as_str(), answer["message"].as_str()),
+        (400, Some("ValidationException"), Some(message)),
+        "case {label:?}: expected the constraint refusal carrying {message:?}, got \
+         {status} {answer:?}"
+    );
+}
+
+/// RULE: a value outside a member's modelled `@pattern` is refused `ValidationException`
+/// (400) whose requirement clause quotes the expression the service PUBLISHES — the
+/// modelled trait with the `^`/`$` pair that spells "the whole value matches" removed,
+/// and the trait exactly as written where the model wraps it in no such pair — whichever
+/// member of whichever operation broke it.
+#[tokio::test]
+async fn a_pattern_requirement_quotes_the_expression_the_service_publishes() {
+    let emulator = Emulator::new();
+    let instance = emulator
+        .app_instance("pattern-rendering", "tok-pattern-rendering")
+        .await;
+
+    // Rows span the members and operations a `@pattern` is declared on in this model, the
+    // two anchorings the model uses (the wrapped pair, and none at all), two values
+    // outside one pattern, and a member whose value the service discloses against one it
+    // withholds.
+    let rows: Vec<(&str, &str, String, Value, String)> = vec![
+        (
+            "the Lex bot-alias ARN of a bot create",
+            "POST",
+            "/app-instance-bots".to_string(),
+            bot_request(
+                &instance,
+                "tok-pattern-alias",
+                lex_with_alias("not-a-valid-lex-bot-alias-arn"),
+            ),
+            one_validation_error(&pattern_clause(
+                "not-a-valid-lex-bot-alias-arn",
+                "configuration.lex.lexBotAliasArn",
+                LEX_BOT_ALIAS_ARN_PUBLISHED,
+            )),
+        ),
+        (
+            "another value outside the same bot-alias pattern",
+            "POST",
+            "/app-instance-bots".to_string(),
+            bot_request(
+                &instance,
+                "tok-pattern-alias-2",
+                lex_with_alias("arn:aws:lex:us-west-2:123456789012:bot-alias/botidaaaaa/aliasaaaaa"),
+            ),
+            one_validation_error(&pattern_clause(
+                "arn:aws:lex:us-west-2:123456789012:bot-alias/botidaaaaa/aliasaaaaa",
+                "configuration.lex.lexBotAliasArn",
+                LEX_BOT_ALIAS_ARN_PUBLISHED,
+            )),
+        ),
+        (
+            "the welcome intent of a bot create",
+            "POST",
+            "/app-instance-bots".to_string(),
+            {
+                let mut body = bot_request(
+                    &instance,
+                    "tok-pattern-intent",
+                    lex_with_alias(WHOLE_LEX_BOT_ALIAS_ARN),
+                );
+                body["Configuration"]["Lex"]["WelcomeIntent"] = json!("Welcome Intent 1");
+                body
+            },
+            one_validation_error(&pattern_clause(
+                "Welcome Intent 1",
+                "configuration.lex.welcomeIntent",
+                LEX_INTENT_NAME_PUBLISHED,
+            )),
+        ),
+        (
+            "the idempotency token of a bot create",
+            "POST",
+            "/app-instance-bots".to_string(),
+            bot_request(
+                &instance,
+                "tok pattern!",
+                lex_with_alias(WHOLE_LEX_BOT_ALIAS_ARN),
+            ),
+            one_validation_error(&pattern_clause(
+                "tok pattern!",
+                "clientRequestToken",
+                CLIENT_REQUEST_TOKEN_PUBLISHED,
+            )),
+        ),
+        (
+            "the parent ARN of a bot create",
+            "POST",
+            "/app-instance-bots".to_string(),
+            bot_request(
+                "not-an-arn",
+                "tok-pattern-parent",
+                lex_with_alias(WHOLE_LEX_BOT_ALIAS_ARN),
+            ),
+            one_validation_error(&pattern_clause(
+                "not-an-arn",
+                "appInstanceArn",
+                CHIME_ARN_PUBLISHED,
+            )),
+        ),
+        (
+            "the resource ARN of a tagging call",
+            "POST",
+            "/tags?operation=tag-resource".to_string(),
+            json!({
+                "ResourceARN": "not-an-arn",
+                "Tags": [{ "Key": "env", "Value": "prod" }],
+            }),
+            one_validation_error(&pattern_clause(
+                "not-an-arn",
+                "resourceARN",
+                CHIME_ARN_PUBLISHED,
+            )),
+        ),
+        (
+            "the unanchored name pattern of a user create",
+            "POST",
+            "/app-instance-users".to_string(),
+            json!({
+                "AppInstanceArn": instance,
+                "AppInstanceUserId": "pattern-user",
+                "Name": " ",
+                "ClientRequestToken": "tok-pattern-name",
+            }),
+            // `Name` targets `UserName`, which the model marks `@sensitive`: the clause
+            // names the member and the requirement and states no value.
+            one_validation_error(&withheld_pattern_clause("name", USER_NAME_PUBLISHED)),
+        ),
+    ];
+
+    for (label, method, path, body, expected) in rows {
+        let (status, answer) = emulator.call(method, &path, Some(body)).await;
+        assert_validation_refusal(label, status, &answer, &expected);
+    }
+
+    // The refused calls stored nothing: the instance holds no bot and no user.
+    let (status, listed) = emulator
+        .call(
+            "GET",
+            &format!("/app-instance-bots?app-instance-arn={}", uri_encode(&instance)),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status, listed["AppInstanceBots"].as_array().map_or(0, Vec::len)),
+        (200, 0),
+        "expected every pattern-refused create to store no AppInstanceBot, got {listed:?}"
+    );
+    let (status, listed) = emulator
+        .call(
+            "GET",
+            &format!("/app-instance-users?app-instance-arn={}", uri_encode(&instance)),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status, listed["AppInstanceUsers"].as_array().map_or(0, Vec::len)),
+        (200, 0),
+        "expected every pattern-refused create to store no AppInstanceUser, got {listed:?}"
+    );
+}
+
+/// RULE: dropping the anchor pair is a RENDERING of the requirement only — the check
+/// itself still runs the pattern as modelled, so a value that holds the published
+/// expression merely as a SUBSTRING is refused exactly like one that does not hold it at
+/// all, and only a whole-value match is accepted.
+#[tokio::test]
+async fn the_published_expression_is_a_rendering_and_not_the_check() {
+    let emulator = Emulator::new();
+    let instance = emulator
+        .app_instance("pattern-check", "tok-pattern-check")
+        .await;
+
+    // Rows differ in WHERE the value carries the published expression: wrapped on both
+    // sides, prefixed only, suffixed only, and not at all.
+    let refused = [
+        (
+            "the published expression with text on both sides",
+            format!("xx{WHOLE_LEX_BOT_ALIAS_ARN}yy"),
+        ),
+        (
+            "the published expression with a prefix",
+            format!("see {WHOLE_LEX_BOT_ALIAS_ARN}"),
+        ),
+        (
+            "the published expression with a suffix",
+            format!("{WHOLE_LEX_BOT_ALIAS_ARN}/extra"),
+        ),
+        (
+            "a value that does not hold the expression at all",
+            "lex-bot-alias-of-no-particular-shape".to_string(),
+        ),
+    ];
+    for (label, alias) in &refused {
+        let (status, answer) = emulator
+            .call(
+                "POST",
+                "/app-instance-bots",
+                Some(bot_request(&instance, "tok-pattern-find", lex_with_alias(alias))),
+            )
+            .await;
+        assert_validation_refusal(
+            label,
+            status,
+            &answer,
+            &one_validation_error(&pattern_clause(
+                alias,
+                "configuration.lex.lexBotAliasArn",
+                LEX_BOT_ALIAS_ARN_PUBLISHED,
+            )),
+        );
+    }
+
+    // The whole-value match is served, so the rendering changed no decision.
+    let (status, answer) = emulator
+        .call(
+            "POST",
+            "/app-instance-bots",
+            Some(bot_request(
+                &instance,
+                "tok-pattern-served",
+                lex_with_alias(WHOLE_LEX_BOT_ALIAS_ARN),
+            )),
+        )
+        .await;
+    assert_eq!(
+        status, 201,
+        "expected a whole-value match of the modelled pattern to be served, got \
+         {status} {answer:?}"
+    );
+}
+
+/// RULE: the published rendering is applied to EVERY clause of a refusal, so a request
+/// breaking two patterns at once states both expressions anchor-free under the plural
+/// envelope.
+#[tokio::test]
+async fn every_clause_of_a_refusal_carries_the_published_expression() {
+    let emulator = Emulator::new();
+    let instance = emulator
+        .app_instance("pattern-clauses", "tok-pattern-clauses")
+        .await;
+
+    let mut body = bot_request(
+        &instance,
+        "tok clauses!",
+        lex_with_alias("not-a-valid-lex-bot-alias-arn"),
+    );
+    body["Configuration"]["Lex"]["WelcomeIntent"] = json!("Welcome Intent 1");
+    let (status, answer) = emulator.call("POST", "/app-instance-bots", Some(body)).await;
+    assert_eq!(
+        (status, answer["__type"].as_str()),
+        (400, Some("ValidationException")),
+        "expected three broken patterns to be refused as a constraint refusal, got \
+         {status} {answer:?}"
+    );
+
+    let message = answer["message"].as_str().unwrap_or_default();
+    let rest = message
+        .strip_prefix("3 validation errors detected: ")
+        .unwrap_or_else(|| {
+            panic!("expected the plural envelope over three clauses, got {message:?}")
+        });
+    let mut stated: Vec<String> = rest.split("; ").map(str::to_string).collect();
+    stated.sort_unstable();
+    let mut expected = vec![
+        pattern_clause(
+            "tok clauses!",
+            "clientRequestToken",
+            CLIENT_REQUEST_TOKEN_PUBLISHED,
+        ),
+        pattern_clause(
+            "not-a-valid-lex-bot-alias-arn",
+            "configuration.lex.lexBotAliasArn",
+            LEX_BOT_ALIAS_ARN_PUBLISHED,
+        ),
+        pattern_clause(
+            "Welcome Intent 1",
+            "configuration.lex.welcomeIntent",
+            LEX_INTENT_NAME_PUBLISHED,
+        ),
+    ];
+    expected.sort_unstable();
+    assert_eq!(
+        stated, expected,
+        "expected every clause to quote its published expression, got {message:?}"
     );
 }

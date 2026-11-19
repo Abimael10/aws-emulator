@@ -135,17 +135,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // This service answers the `ValidationException` envelope the framework already
+        // renders — same 400, same code, same `N validation error(s) detected:` prefix,
+        // same member paths, same echoed value — with ONE rendering of its own: a
+        // `@pattern` requirement is quoted as the expression a value has to satisfy,
+        // WITHOUT the `^` / `$` the model wraps it in to turn Smithy's find into a
+        // whole-value match. That wrapping is how the model spells "the whole value
+        // matches", not part of the character grammar the service publishes, so a client
+        // that lifts the expression out of the message and re-validates locally gets the
+        // one the service advertises rather than a doubly anchored one. The CHECK is
+        // unchanged: it still runs the model's pattern as written, anchors included.
+        //
+        // The rendering is shared by every service on a JSON protocol (this one answers
+        // restJson1), so it is reached in `service-common` rather than spelled here, and
+        // it covers every `@pattern`-constrained member of every operation this service
+        // models — not the one `@pattern` a recording happened to break. A pattern the
+        // model does NOT wrap in that pair is quoted exactly as written.
+        ::service_common::validation_message::aws_validation_refusal(refusal)
     }
 
     fn override_routing_error(
