@@ -197,15 +197,21 @@ pub(super) async fn delivery_stream_removal(
     Ok(Removal::Gone)
 }
 
-/// The stream's configuration as Amazon Data Firehose reports it, for drift detection.
-/// A stream it no longer has (`ResourceNotFoundException`) was deleted.
-pub(super) async fn describe_delivery_stream(
+/// The `DeliveryStreamDescription` Amazon Data Firehose reports for the stream `name`, with
+/// every refusal of that read — including the `ResourceNotFoundException` for a stream it no
+/// longer has — answered as it came.
+///
+/// The one place this service's description is read, so a caller that needs the refusal
+/// ([`super::firehose_delivery_streams`], which addresses an update by the version and the
+/// destination id the description carries) and one that reads it as evidence of what the
+/// stream now looks like ([`describe_delivery_stream`]) make the same call.
+pub(super) async fn delivery_stream_description(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
-    physical_resource_id: &str,
-) -> Result<Option<Value>, Refusal> {
-    let request = serde_json::json!({ "DeliveryStreamName": physical_resource_id });
-    match call_json_rpc(
+    name: &str,
+) -> Result<Value, Refusal> {
+    let request = serde_json::json!({ "DeliveryStreamName": name });
+    let answer = call_json_rpc(
         ctx,
         FIREHOSE_SIGNING_NAME,
         region,
@@ -213,9 +219,19 @@ pub(super) async fn describe_delivery_stream(
         &format!("{FIREHOSE_TARGET_PREFIX}.DescribeDeliveryStream"),
         &request,
     )
-    .await
-    {
-        Ok(answer) => Ok(Some(reported_member(&answer, "DeliveryStreamDescription"))),
+    .await?;
+    Ok(reported_member(&answer, "DeliveryStreamDescription"))
+}
+
+/// The stream's configuration as Amazon Data Firehose reports it, for drift detection.
+/// A stream it no longer has (`ResourceNotFoundException`) was deleted.
+pub(super) async fn describe_delivery_stream(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    match delivery_stream_description(ctx, region, physical_resource_id).await {
+        Ok(description) => Ok(Some(description)),
         Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }

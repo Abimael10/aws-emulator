@@ -3526,6 +3526,15 @@ impl Provisioner {
             Self::NeptuneGraphGraph => update_neptune_graph(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // `UpdateDestination` "updates the specified destination of the specified
+            // Firehose stream", and "the target Firehose stream remains active while the
+            // configurations are updated" — so a declaration stating the stream's
+            // destination differently is applied to the stream the stack created, which
+            // keeps its name, its ARN and the source it reads, rather than replacing it
+            // ([`firehose_delivery_streams::update_delivery_stream`]).
+            Self::FirehoseDeliveryStream => {
+                update_delivery_stream(ctx, region, resource, declared).await
+            }
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -4445,6 +4454,12 @@ mod glue_table_optimizers;
 /// as using one.
 mod mediaconvert_certificates;
 mod data_and_storage;
+/// The in-place CHANGE of an `AWS::KinesisFirehose::DeliveryStream`, beside the create and
+/// delete arms [`data_and_storage`] holds for the same owning service: applying a changed
+/// destination declaration is one concern of its own, because Amazon Data Firehose addresses
+/// a destination by the version and the id IT keeps rather than by anything the template
+/// states.
+mod firehose_delivery_streams;
 mod iam_identities;
 mod application_services;
 mod platform_services;
@@ -4580,6 +4595,7 @@ use glue_table_optimizers::*;
 use mediaconvert_certificates::*;
 use iam_identities::*;
 use data_and_storage::*;
+use firehose_delivery_streams::*;
 use emr_resources::*;
 
 /// Amazon CloudWatch's wire identity, for the ROLLBACK TRIGGER monitoring beside this

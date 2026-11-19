@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -47,6 +47,12 @@ const ACCOUNT_ID: &str = "000000000000";
 /// (`STATUS_TRANSITION_DELAY`, 500 ms) and the stream's (`TRANSITION_DELAY`, 3 s), with
 /// margin for a loaded machine.
 const PAST_BOTH_SPANS: Duration = Duration::from_millis(3_900);
+
+/// How long a resource a stack deleted is given to be gone from its owning service, and how
+/// often that service is asked. A generous wall-clock deadline whose only job is that the
+/// wait TERMINATES: the spans those services choose take the time they take.
+const REMOVAL_DEADLINE: Duration = Duration::from_secs(60);
+const REMOVAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The emulator with the services this suite exercises, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them. Request authentication is off, as in every other
@@ -1200,29 +1206,32 @@ async fn an_update_creates_the_streams_it_declares_and_deletes_the_ones_it_drops
 }
 
 /// An update that asks for a DIFFERENT configuration of a resource that already exists is
-/// never reported as applied when nothing applied it: a type whose in-place update path
-/// this emulator has not written (a Firehose delivery stream here — the owning service's
-/// update API is not called for it) leaves the stack failed, naming the resource, and the
-/// resource keeps the configuration it has. A type that HAS one is applied in place and
-/// completes, which `cloudformation_provisions_sqs_queues.rs` holds to.
+/// never reported as applied when nothing applied it: a PROPERTY whose in-place update path
+/// this emulator has not written (a Firehose delivery stream's `Tags` here — Amazon Data
+/// Firehose changes those through `TagDeliveryStream`/`UntagDeliveryStream`, which no arm of
+/// the provisioner calls for this type) leaves the stack failed, naming the resource, and the
+/// resource keeps the configuration it has. A property that HAS one is applied in place and
+/// completes, which `cloudformation_provisions_sqs_queues.rs` holds to — and, for this type's
+/// destination configuration, `cloudformation_firehose_destination_prefix_update.rs`.
 #[tokio::test]
 async fn an_update_that_would_change_an_existing_resource_in_place_fails_the_stack() {
     let router = build_router();
-    let case = "an update that changes a kept stream's compression";
+    let case = "an update that changes a kept stream's tags";
     let stack_name = "in-place-stack";
     let stream_name = "in-place-stack-stream";
     given_delivery_role(&router, case, "in-place-role").await;
-    let template = |compression: &str| {
+    let template = |stage: &str| {
         json!({
             "Resources": {
                 "Stream": {
                     "Type": "AWS::KinesisFirehose::DeliveryStream",
                     "Properties": {
                         "DeliveryStreamName": stream_name,
+                        "Tags": [{ "Key": "stage", "Value": stage }],
                         "ExtendedS3DestinationConfiguration": {
                             "BucketARN": bucket_arn("in-place-bucket"),
                             "RoleARN": role_arn("in-place-role"),
-                            "CompressionFormat": compression
+                            "CompressionFormat": "GZIP"
                         }
                     }
                 }
@@ -1231,7 +1240,7 @@ async fn an_update_that_would_change_an_existing_resource_in_place_fails_the_sta
         .to_string()
     };
 
-    create_stack(&router, case, stack_name, &template("GZIP"), &[]).await;
+    create_stack(&router, case, stack_name, &template("created"), &[]).await;
     // The create completes once Firehose reports the stream it declared ready: a stack still
     // in progress cannot be updated.
     crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status(
@@ -1246,7 +1255,7 @@ async fn an_update_that_would_change_an_existing_resource_in_place_fails_the_sta
         "UpdateStack",
         &[
             ("StackName", stack_name),
-            ("TemplateBody", &template("Snappy")),
+            ("TemplateBody", &template("changed")),
         ],
     )
     .await;
@@ -1254,14 +1263,17 @@ async fn an_update_that_would_change_an_existing_resource_in_place_fails_the_sta
         status, 200,
         "case {case:?}: expected HTTP 200 from UpdateStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_BOTH_SPANS).await;
-
-    let body = describe_stack(&router, case, stack_name).await;
-    // The refused change fails the update, and a failed update is ROLLED BACK: rollback is at
-    // its default here, so the stack's terminal status is the rolled-back one.
+    // The wait is on the CONDITION — the stack's own terminal status — and not on a span: the
+    // refused change fails the update, and a failed update is ROLLED BACK (rollback is at its
+    // default here, so the stack's terminal status is the rolled-back one).
+    let (settled, body) = crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status(
+        &router,
+        stack_name,
+        "UPDATE_ROLLBACK_COMPLETE",
+    )
+    .await;
     assert_eq!(
-        xml_text(&body, "StackStatus").as_deref(),
-        Some("UPDATE_ROLLBACK_COMPLETE"),
+        settled, "UPDATE_ROLLBACK_COMPLETE",
         "case {case:?}: expected the update to fail and roll back rather than drop the \
          caller's change, got {body}"
     );
@@ -1303,24 +1315,55 @@ async fn an_update_that_would_change_an_existing_resource_in_place_fails_the_sta
         "case {case:?}: expected the stream to keep the compression it was created with, \
          got {destination}"
     );
+    // ...including the tags the refused change would have rewritten, read through Firehose's
+    // own tag report rather than off the stack's record of what it declared.
+    let (status, tagged) = firehose(
+        &router,
+        "ListTagsForDeliveryStream",
+        &json!({ "DeliveryStreamName": stream_name }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from ListTagsForDeliveryStream, got {status} with \
+         body {tagged}"
+    );
+    assert_eq!(
+        tagged["Tags"],
+        json!([{ "Key": "stage", "Value": "created" }]),
+        "case {case:?}: expected the stream to keep the tags it was created with, got {tagged}"
+    );
 
     let (status, body) = cloudformation(&router, "DeleteStack", &[("StackName", stack_name)]).await;
     assert_eq!(
         status, 200,
         "case {case:?}: expected HTTP 200 from DeleteStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_BOTH_SPANS).await;
-    let (status, gone) = firehose(
-        &router,
-        "DescribeDeliveryStream",
-        &json!({ "DeliveryStreamName": stream_name }),
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "case {case:?}: expected the stack's deletion to delete the stream it created, got \
-         {status} with body {gone}"
-    );
+    await_stream_gone(&router, case, stream_name).await;
+}
+
+/// Wait until Amazon Data Firehose no longer has the stream `name`, which is what a stack's
+/// deletion owes: the wait is on that CONDITION, looked at again until it holds or
+/// [`REMOVAL_DEADLINE`] passes, so how fast the host runs decides nothing.
+async fn await_stream_gone(router: &MultiServiceRouter, case: &str, name: &str) {
+    let giving_up_at = Instant::now() + REMOVAL_DEADLINE;
+    loop {
+        let (status, answered) = firehose(
+            router,
+            "DescribeDeliveryStream",
+            &json!({ "DeliveryStreamName": name }),
+        )
+        .await;
+        if status == 400 {
+            return;
+        }
+        assert!(
+            Instant::now() < giving_up_at,
+            "case {case:?}: expected the stack's deletion to delete the stream it created, got \
+             {status} with body {answered}"
+        );
+        tokio::time::sleep(REMOVAL_POLL_INTERVAL).await;
+    }
 }
 
 /// A resource the owning service cannot delete YET is reported as it is: the stack's
