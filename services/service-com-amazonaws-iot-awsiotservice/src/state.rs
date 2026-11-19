@@ -3371,7 +3371,8 @@ pub use v2_logging_levels::{
 // `crate::state::<name>`.
 pub mod audit_configuration;
 pub use audit_configuration::{
-    is_audit_check, AccountAuditConfiguration, AuditConfigurationRefusal, AUDIT_CHECK_NAMES,
+    check_custom_configuration, is_audit_check, AccountAuditConfiguration,
+    AuditConfigurationRefusal, CheckCustomConfiguration, AUDIT_CHECK_NAMES,
 };
 
 // What a DEVICE DEFENDER AUDIT does — which checks one may target, what each check

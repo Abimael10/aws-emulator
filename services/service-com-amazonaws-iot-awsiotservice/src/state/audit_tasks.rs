@@ -110,6 +110,12 @@ pub const DEFAULT_CERT_AGE_THRESHOLD_IN_DAYS: u64 = 365;
 /// One day, the unit both configured thresholds are expressed in.
 const ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The widest threshold an audit check is evaluated with, in days: ten thousand years,
+/// which is past every certificate lifetime and short enough that adding it to an instant
+/// stays in range. A configured `configValue` beyond it is evaluated at this ceiling, so a
+/// caller cannot make the evaluation compute with an unbounded span.
+const MAX_THRESHOLD_DAYS: u64 = 10_000 * 365;
+
 /// Why a writer refused to start an audit, mapped to the operation's modelled
 /// `InvalidRequestException` ("The request is not valid", HTTP 400) by the handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,32 +477,34 @@ fn run_check(
         // "Device certificate expiring": every device certificate this account holds, each
         // non-compliant once it expires within the configured window — or has expired.
         DEVICE_CERTIFICATE_EXPIRING_CHECK => {
-            let window = threshold(
-                store,
-                check_name,
-                CERT_EXPIRATION_THRESHOLD_IN_DAYS,
-                DEFAULT_CERT_EXPIRATION_THRESHOLD_IN_DAYS,
-            );
+            // The far end of the window, computed once. A window so wide that no instant
+            // lies past it reaches every certificate, which is what `None` means here —
+            // an instant is never advanced past the end of time.
+            let horizon = now.checked_add(threshold(store, check_name));
             let expiring = store
                 .certificates
                 .values()
-                .filter(|certificate| certificate.not_after <= now + window)
+                .filter(|certificate| {
+                    horizon.is_none_or(|horizon| certificate.not_after <= horizon)
+                })
                 .count();
             AuditCheckRun::of(store.certificates.len(), expiring)
         }
         // "Device certificate age": every device certificate this account holds, each
         // non-compliant once it is older than the configured age.
         DEVICE_CERTIFICATE_AGE_CHECK => {
-            let age = threshold(
-                store,
-                check_name,
-                CERT_AGE_THRESHOLD_IN_DAYS,
-                DEFAULT_CERT_AGE_THRESHOLD_IN_DAYS,
-            );
+            let age = threshold(store, check_name);
             let old = store
                 .certificates
                 .values()
-                .filter(|certificate| certificate.creation_date + age <= now)
+                // An age so great that the certificate reaches it past the end of time is
+                // an age it never reaches, so the certificate is compliant.
+                .filter(|certificate| {
+                    certificate
+                        .creation_date
+                        .checked_add(age)
+                        .is_some_and(|aged_at| aged_at <= now)
+                })
                 .count();
             AuditCheckRun::of(store.certificates.len(), old)
         }
@@ -581,26 +589,29 @@ fn named_values(member: Option<&::serde_json::Value>) -> Vec<String> {
     }
 }
 
-/// The threshold `config_name` configures for `check_name` on this account, as a duration.
+/// The threshold `check_name` is evaluated against on this account, as a duration.
 ///
-/// The value is the account's own ([`super::AccountAuditConfiguration`]): a check carries
-/// its `configuration` map of `configName` to `configValue`, and a check nobody has
-/// configured a threshold for uses the default the check documents. A value that is no
-/// positive whole number of days configures no threshold, so the default stands.
-fn threshold(
-    store: &ComAmazonawsIotAwsiotserviceState,
-    check_name: &str,
-    config_name: &str,
-    default_days: u64,
-) -> Duration {
+/// The `configName` the check is configured by and the default it falls back to are the
+/// account configuration's own catalog ([`super::check_custom_configuration`]), which is
+/// also what a reader of the configuration reports, so the threshold reported and the
+/// threshold evaluated are one value. A check that takes no custom configuration, or a
+/// stored value that is no positive whole number of days, configures no threshold, so the
+/// default stands and a check with neither is evaluated against nothing. A value past
+/// [`MAX_THRESHOLD_DAYS`] is evaluated at that ceiling, because the `configValue` is
+/// caller-supplied and the evaluation must stay in range whatever it says.
+fn threshold(store: &ComAmazonawsIotAwsiotserviceState, check_name: &str) -> Duration {
+    let Some(custom) = super::check_custom_configuration(check_name) else {
+        return Duration::ZERO;
+    };
     let days = store
         .audit_configuration
         .checks
         .get(check_name)
         .and_then(|configuration| configuration.configuration.as_ref())
-        .and_then(|configuration| configuration.get(config_name))
+        .and_then(|configuration| configuration.get(custom.config_name))
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|days| *days > 0)
-        .unwrap_or(default_days);
+        .unwrap_or(custom.default_days)
+        .min(MAX_THRESHOLD_DAYS);
     ONE_DAY.saturating_mul(u32::try_from(days).unwrap_or(u32::MAX))
 }

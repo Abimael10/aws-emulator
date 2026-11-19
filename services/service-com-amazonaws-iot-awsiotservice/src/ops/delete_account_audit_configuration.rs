@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAccountAuditConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAccountAuditConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAccountAuditConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Restores the account's DEFAULT Device Defender audit settings: the one record
+//! `UpdateAccountAuditConfiguration` writes and `DescribeAccountAuditConfiguration`
+//! reports ([`crate::state::AccountAuditConfiguration`]) is reset whole — no role, every
+//! audit check back to disabled and no notification target — so the read after this call
+//! reports the account as unconfigured and the next update is a first call again. A call
+//! that asks for it takes the account's scheduled audits with it.
+//!
+//! The reset covers the WHOLE record rather than the part one caller configured, because
+//! what the operation documents it deletes is "any configuration data you entered".
 //!
 //! ## Shape of an operation
 //!
@@ -103,6 +104,34 @@ impl From<DeleteAccountAuditConfigurationErrorModeled> for DeleteAccountAuditCon
     }
 }
 
+/// Record this state-changing call for attribution: the operation, the identity the
+/// request PRESENTED (the SigV4 access key id, a public identifier and never a secret),
+/// the request target, whether the call also asked for the account's scheduled audits, and
+/// how the call ended.
+///
+/// Restoring the defaults takes the account's whole audit configuration away, so without a
+/// record nothing says which call stopped its audits. Every request-derived field goes
+/// through [`crate::state::audit_field`], which bounds it and strips the control characters
+/// that would otherwise forge a second record; the subscriber supplies the timestamp.
+fn audit(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    delete_scheduled_audits: bool,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        target: "emulator::audit",
+        service = ctx.identity().signing_name(),
+        operation = "DeleteAccountAuditConfiguration",
+        access_key_id = %crate::state::audit_field(&::engine::extract_akid(&parts.headers)),
+        request_target =
+            %crate::state::audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        delete_scheduled_audits,
+        outcome,
+        "state-changing operation"
+    );
+}
+
 /// The `DeleteAccountAuditConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -139,18 +168,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAccountAuditConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAccountAuditConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAccountAuditConfiguration"))
+        // The engine is reachable from `&self` (constructor-injected) and the audit
+        // configuration is account-wide, so nothing in the request selects what is reset;
+        // `ctx` only carries the identity and target the audit record names.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAccountAuditConfigurationErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+
+        {
+            let mut store = state.lock();
+            // Restoring the defaults is the whole write: the role, every configured
+            // check and every notification target go, so nothing of the deleted
+            // configuration survives for the next reader.
+            store.audit_configuration.reset();
+            // `deleteScheduledAudits` takes the account's SCHEDULED AUDITS with it: "if
+            // true, all scheduled audits are deleted", so each record goes whole (its
+            // tags live on the record), and a delete that does not ask leaves them for
+            // `DescribeScheduledAudit` to report.
+            if input.delete_scheduled_audits {
+                store.scheduled_audits.clear();
+            }
+        }
+
+        // Restoring the default settings is defined on an account that configured none
+        // just as on one that did — the operation restores settings rather than
+        // destroying a named resource — so an unconfigured account is answered the same
+        // empty 200, and repeating the call changes nothing.
+        audit(ctx, input.delete_scheduled_audits, "restored-defaults");
+        Ok(DeleteAccountAuditConfigurationOutput {})
     }
 }

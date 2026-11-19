@@ -12,14 +12,20 @@
 //! every check disabled, no notification target enabled and no role — which is what makes
 //! the read a pure read: it never has to create the record it reports.
 //!
-//! The record holds only what a caller CONFIGURED. What a reader reports is the whole
-//! catalog of audit checks and of notification target types, each carrying the account's
-//! setting for it or the disabled default
-//! ([`AccountAuditConfiguration::check_configurations`],
-//! [`AccountAuditConfiguration::notification_target_configurations`]): the model documents
-//! the read as the way to "see the list of all checks, including those that are enabled"
+//! The record holds only what a caller CONFIGURED. What a reader reports of the AUDIT
+//! CHECKS is the whole catalog, each check carrying the account's setting for it or the
+//! disabled default and, while it is enabled, the custom configuration it would be
+//! evaluated against ([`AccountAuditConfiguration::check_configurations`]): the model
+//! documents the read as the way to "see the list of all checks, including those that are
+//! enabled"
 //! (`smithy_query(query="doc",shape="UpdateAccountAuditConfigurationRequest",member="auditCheckConfigurations")`),
 //! so a check nobody has configured is reported as disabled rather than left out.
+//!
+//! What it reports of the NOTIFICATION TARGETS is only what the account configured
+//! ([`AccountAuditConfiguration::notification_target_configurations`]), and nothing at all
+//! when it configured none: there is no catalog of targets to enumerate — a target exists
+//! because a caller wired one up — so a default-valued entry would be indistinguishable
+//! from a target that was configured and then disabled.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -58,6 +64,45 @@ pub const AUDIT_CHECK_NAMES: &[&str] = &[
 /// Is `check_name` one of the account's audit checks ([`AUDIT_CHECK_NAMES`])?
 pub fn is_audit_check(check_name: &str) -> bool {
     AUDIT_CHECK_NAMES.contains(&check_name)
+}
+
+/// The CUSTOM CONFIGURATION one audit check takes: the `configName` that configures it and
+/// the `configValue` Device Defender uses until an update sets another.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckCustomConfiguration {
+    /// The one `configName` this check is configured by
+    /// ([`crate::ops::types::CONFIG_NAME_VALUES`]).
+    pub config_name: &'static str,
+    /// The threshold in days the check is evaluated against while the account has
+    /// configured no `configValue` of its own.
+    pub default_days: u64,
+}
+
+impl CheckCustomConfiguration {
+    /// The default `configValue`, as the string a `CheckCustomConfiguration` map carries.
+    pub fn default_config_value(&self) -> String {
+        self.default_days.to_string()
+    }
+}
+
+/// The custom configuration `check_name` takes, if it takes one at all.
+///
+/// Only the two threshold checks do: each `configName` the model declares
+/// ([`crate::ops::types::CONFIG_NAME_VALUES`]) configures exactly one check, with the
+/// default the check's evaluation already uses ([`super::audit_tasks`]), so a reader and a
+/// running audit agree on the threshold in force.
+pub fn check_custom_configuration(check_name: &str) -> Option<CheckCustomConfiguration> {
+    match check_name {
+        super::audit_tasks::DEVICE_CERTIFICATE_EXPIRING_CHECK => Some(CheckCustomConfiguration {
+            config_name: super::audit_tasks::CERT_EXPIRATION_THRESHOLD_IN_DAYS,
+            default_days: super::audit_tasks::DEFAULT_CERT_EXPIRATION_THRESHOLD_IN_DAYS,
+        }),
+        super::audit_tasks::DEVICE_CERTIFICATE_AGE_CHECK => Some(CheckCustomConfiguration {
+            config_name: super::audit_tasks::CERT_AGE_THRESHOLD_IN_DAYS,
+            default_days: super::audit_tasks::DEFAULT_CERT_AGE_THRESHOLD_IN_DAYS,
+        }),
+        _ => None,
+    }
 }
 
 /// The account's audit configuration, as this service persists it.
@@ -116,9 +161,13 @@ pub enum AuditConfigurationRefusal {
     /// A key of `auditNotificationTargetConfigurations` that names no
     /// `AuditNotificationType` the model declares.
     UnknownNotificationType(String),
-    /// The account has no audit configuration yet and the request supplied no
-    /// `roleArn`.
-    RoleArnRequired,
+    /// The account has no audit configuration yet and the request omitted a
+    /// configuration argument the first call requires, named as the service documents
+    /// it (`RoleArn`, `AuditCheckConfigurations`).
+    MissingConfigurationArgument {
+        /// The documented name of the absent configuration argument.
+        argument: &'static str,
+    },
     /// The account has no audit configuration yet and the request enabled no check.
     EnabledCheckRequired,
 }
@@ -140,9 +189,12 @@ impl AuditConfigurationRefusal {
             Self::UnknownNotificationType(notification_type) => {
                 format!("Invalid audit notification type: {notification_type}")
             }
-            Self::RoleArnRequired => "On the first call to UpdateAccountAuditConfiguration, \
-                 roleArn is required"
-                .to_string(),
+            // One sentence for the whole class, with the absent argument as its only
+            // variable part: a caller that branches on the text of a missing-argument
+            // refusal reads the same sentence whichever argument it left out.
+            Self::MissingConfigurationArgument { argument } => {
+                format!("Missing required configuration argument: {argument}.")
+            }
             Self::EnabledCheckRequired => {
                 "On the first call to UpdateAccountAuditConfiguration, auditCheckConfigurations \
                  must specify at least one enabled check"
@@ -211,20 +263,38 @@ impl AccountAuditConfiguration {
             }
         }
         if !self.is_configured() {
+            // The first call must supply both arguments the model documents as required
+            // then; an ABSENT one is a missing configuration argument, named as the
+            // service documents it.
             if role_arn.is_none() {
-                return Err(AuditConfigurationRefusal::RoleArnRequired);
+                return Err(AuditConfigurationRefusal::MissingConfigurationArgument {
+                    argument: "RoleArn",
+                });
             }
-            let enables_a_check = checks
-                .as_ref()
-                .is_some_and(|checks| checks.values().any(|check| check.enabled));
-            if !enables_a_check {
+            let Some(checks) = checks.as_ref() else {
+                return Err(AuditConfigurationRefusal::MissingConfigurationArgument {
+                    argument: "AuditCheckConfigurations",
+                });
+            };
+            if !checks.values().any(|check| check.enabled) {
                 return Err(AuditConfigurationRefusal::EnabledCheckRequired);
             }
         }
         if let Some(role_arn) = role_arn {
             self.role_arn = Some(role_arn);
         }
-        for (check_name, configuration) in checks.unwrap_or_default() {
+        for (check_name, mut configuration) in checks.unwrap_or_default() {
+            // One check's members are merged the way the request's top-level members
+            // are: `configuration` is optional, so a request that does not carry it
+            // leaves the custom configuration the account already had rather than
+            // dropping it. (`enabled` carries a modelled default, so an absent flag is
+            // indistinguishable from `false` and always lands.)
+            if configuration.configuration.is_none() {
+                configuration.configuration = self
+                    .checks
+                    .get(&check_name)
+                    .and_then(|stored| stored.configuration.clone());
+            }
             self.checks.insert(check_name, configuration);
         }
         for (notification_type, target) in notification_targets.unwrap_or_default() {
@@ -234,8 +304,15 @@ impl AccountAuditConfiguration {
     }
 
     /// Every audit check, each carrying the account's setting for it or the disabled
-    /// default — what `DescribeAccountAuditConfiguration` reports as
-    /// `auditCheckConfigurations`.
+    /// default, and the custom configuration the check RUNS WITH — what
+    /// `DescribeAccountAuditConfiguration` reports as `auditCheckConfigurations`.
+    ///
+    /// A check that takes a custom configuration ([`check_custom_configuration`]) and is
+    /// ENABLED reports a `configValue` for every `configName` it takes: the one the
+    /// account configured, or the value Device Defender documents as that check's
+    /// default, which is the threshold the check would actually be evaluated against
+    /// ([`super::audit_tasks`]). A check that takes none, or that is not enabled, reports
+    /// only what an update explicitly stored for it.
     pub fn check_configurations(&self) -> HashMap<String, AuditCheckConfiguration> {
         AUDIT_CHECK_NAMES
             .iter()
@@ -243,29 +320,54 @@ impl AccountAuditConfiguration {
                 // A check nobody configured is reported disabled, which is the
                 // modelled default of both members (`enabled` is `@default(false)` and
                 // `configuration` is optional).
-                let configuration = self.checks.get(*check_name).cloned().unwrap_or_default();
+                let mut configuration =
+                    self.checks.get(*check_name).cloned().unwrap_or_default();
+                if configuration.enabled {
+                    if let Some(custom) = check_custom_configuration(check_name) {
+                        configuration
+                            .configuration
+                            .get_or_insert_with(HashMap::new)
+                            .entry(custom.config_name.to_string())
+                            .or_insert_with(|| custom.default_config_value());
+                    }
+                }
                 ((*check_name).to_string(), configuration)
             })
             .collect()
     }
 
-    /// Every notification target type the model declares
-    /// (`AUDIT_NOTIFICATION_TYPE_VALUES`), each carrying the account's target for it or
-    /// the disabled default — what `DescribeAccountAuditConfiguration` reports as
-    /// `auditNotificationTargetConfigurations`.
-    pub fn notification_target_configurations(&self) -> HashMap<String, AuditNotificationTarget> {
-        crate::ops::types::AUDIT_NOTIFICATION_TYPE_VALUES
-            .iter()
-            .map(|notification_type| {
-                // A target nobody configured is reported disabled, under the same
-                // modelled defaults as a check nobody configured.
-                let target = self
-                    .notification_targets
-                    .get(*notification_type)
-                    .cloned()
-                    .unwrap_or_default();
-                ((*notification_type).to_string(), target)
-            })
-            .collect()
+    /// The notification targets the account CONFIGURED, keyed by notification type — what
+    /// `DescribeAccountAuditConfiguration` reports as
+    /// `auditNotificationTargetConfigurations`, and `None` when the account configured
+    /// none, so the member is left out of the response entirely.
+    ///
+    /// Unlike the audit checks there is no catalog to fill in here: a notification target
+    /// exists because a caller wired one up, so reporting a default-valued entry for a
+    /// type nobody configured would claim a target that does not exist — and one with
+    /// neither `targetArn` nor `roleArn` at that.
+    pub fn notification_target_configurations(
+        &self,
+    ) -> Option<HashMap<String, AuditNotificationTarget>> {
+        if self.notification_targets.is_empty() {
+            return None;
+        }
+        Some(
+            self.notification_targets
+                .iter()
+                .map(|(notification_type, target)| (notification_type.clone(), target.clone()))
+                .collect(),
+        )
+    }
+
+    /// Restore the account's default audit settings: no role, no configured check and no
+    /// notification target — what `DeleteAccountAuditConfiguration` documents as "any
+    /// configuration data you entered is deleted and all audit checks are reset to
+    /// disabled".
+    ///
+    /// The WHOLE record is reset, not the part one caller happened to configure, so a
+    /// later read reports the account as unconfigured and a later update is a first call
+    /// again.
+    pub fn reset(&mut self) {
+        *self = Self::default();
     }
 }

@@ -3,10 +3,12 @@
 //! @op DescribeAccountAuditConfiguration
 //!
 //! Reports the account's Device Defender audit configuration: the role the audit runs
-//! under, every audit check with whether it is enabled, and every notification target
-//! type with where its notifications go. All three come from the one record
+//! under, every audit check with whether it is enabled, and the notification targets the
+//! account configured. All three come from the one record
 //! `UpdateAccountAuditConfiguration` writes ([`crate::state::AccountAuditConfiguration`]),
-//! so the reader hands back what the last writer stored.
+//! so the reader hands back what the last writer stored — and reports nothing the account
+//! has not configured: the notification-target member is absent while no target is wired
+//! up.
 //!
 //! A PURE READ: the record is cloned out from under the lock and nothing is written, so a
 //! later caller sees what this one saw. An account that has never configured auditing
@@ -161,12 +163,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let configuration = state.lock().audit_configuration.clone();
 
         Ok(DescribeAccountAuditConfigurationOutput {
-            audit_notification_target_configurations: Some(
-                configuration.notification_target_configurations(),
-            ),
+            // Only the notification targets the account configured, and the member left
+            // out entirely when it configured none: a target exists because a caller
+            // wired one up, so there is no catalog of types to default an entry from.
+            audit_notification_target_configurations: configuration
+                .notification_target_configurations(),
             audit_check_configurations: Some(configuration.check_configurations()),
             // `None` until an update supplies one: that is what an account which has
-            // never configured auditing reports.
+            // never configured auditing reports, and what one whose configuration was
+            // deleted reports again.
             role_arn: configuration.role_arn,
         })
     }

@@ -814,3 +814,78 @@ async fn describe_audit_task_refuses_an_id_no_audit_was_started_under() {
         );
     }
 }
+
+/// The `configValue` of a threshold check is caller-supplied, so the EVALUATION must stay
+/// in range whatever it says: however large, unparseable or out of a number's range the
+/// configured threshold, the audit still runs over the account's certificates, settles, and
+/// reports each targeted check — it never takes the emulator down with it.
+///
+/// The rows differ along what a configValue can be past a usable number of days: one far
+/// beyond any certificate lifetime, the largest a `u64` holds, one past that range, and
+/// nothing numeric at all.
+#[tokio::test]
+async fn an_outsized_configured_threshold_still_settles_the_audit() {
+    let rows: &[(&str, &str)] = &[
+        ("more days than any certificate lives", "100000000"),
+        ("the largest value a u64 holds", "18446744073709551615"),
+        ("a value past what a u64 holds", "99999999999999999999"),
+        ("a value no number parses from", "not-a-number"),
+    ];
+    // Each threshold check with the `configName` that configures it.
+    let configured: &[(&str, &str)] = &[
+        (
+            DEVICE_CERTIFICATE_EXPIRING_CHECK,
+            "CERT_EXPIRATION_THRESHOLD_IN_DAYS",
+        ),
+        (DEVICE_CERTIFICATE_AGE_CHECK, "CERT_AGE_THRESHOLD_IN_DAYS"),
+    ];
+
+    for &(case, config_value) in rows {
+        let emulator = Emulator::new();
+        emulator.create_certificate(case).await;
+
+        let mut checks = Map::new();
+        for &(check_name, config_name) in configured {
+            checks.insert(
+                check_name.to_string(),
+                json!({
+                    "enabled": true,
+                    "configuration": { config_name: config_value },
+                }),
+            );
+        }
+        let reply = emulator
+            .dispatch(
+                "PATCH",
+                "/audit/configuration",
+                Some(&json!({
+                    "roleArn": AUDIT_ROLE_ARN,
+                    "auditCheckConfigurations": Value::Object(checks),
+                })),
+            )
+            .await;
+        assert_eq!(
+            reply.status,
+            200,
+            "case {case}: expected the threshold to be accepted, got {} body {}",
+            reply.status,
+            reply.text()
+        );
+
+        let targets: Vec<String> = configured
+            .iter()
+            .map(|(check_name, _)| (*check_name).to_string())
+            .collect();
+        let task_id = emulator.started_audit(case, &targets).await;
+        let report = emulator.completed_audit(case, &task_id).await;
+        for &(check_name, _) in configured {
+            let details = check_details(case, &report, check_name);
+            assert_eq!(
+                details["totalResourcesCount"].as_i64(),
+                Some(1),
+                "case {case}: expected {check_name} to have evaluated the account's one \
+                 certificate, got {details}"
+            );
+        }
+    }
+}

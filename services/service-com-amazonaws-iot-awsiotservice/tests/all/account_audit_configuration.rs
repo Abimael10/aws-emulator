@@ -11,13 +11,18 @@
 //!
 //! * `DescribeAccountAuditConfiguration` reports the configuration this service HOLDS —
 //!   the role, the per-check settings and the notification targets the last
-//!   `UpdateAccountAuditConfiguration` persisted — over the WHOLE catalog of audit checks
-//!   and of notification target types, each check or target nobody configured reported
-//!   disabled, because the read is documented as the way to see "the list of all checks,
-//!   including those that are currently enabled"
+//!   `UpdateAccountAuditConfiguration` persisted — over the WHOLE catalog of audit checks,
+//!   each check nobody configured reported disabled, because the read is documented as the
+//!   way to see "the list of all checks, including those that are currently enabled"
 //!   (`smithy_query(query="doc",shape="UpdateAccountAuditConfigurationRequest",member="auditCheckConfigurations")`);
+//! * a response carries NO value the account did not configure: the notification-target
+//!   member reports exactly the targets an update wired up and is absent while there are
+//!   none;
 //! * an account that has never updated it still has a configuration: no role, every check
-//!   disabled, every notification target disabled;
+//!   disabled, no notification target;
+//! * `DeleteAccountAuditConfiguration` restores the defaults: after it the read reports no
+//!   role, every check disabled and no notification target, however many checks were
+//!   enabled, and the next update is a first call again;
 //! * the read is a read: repeating it, with no update between, reports the same
 //!   configuration and leaves the store alone;
 //! * a member the update SUPPLIES is merged key by key into the stored configuration and
@@ -37,7 +42,7 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_iot_awsiotservice::ops::types::{
     AUDIT_NOTIFICATION_TYPE_VALUES, CONFIG_NAME_VALUES,
 };
-use service_com_amazonaws_iot_awsiotservice::state::AUDIT_CHECK_NAMES;
+use service_com_amazonaws_iot_awsiotservice::state::{check_custom_configuration, AUDIT_CHECK_NAMES};
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -64,11 +69,15 @@ impl Emulator {
     }
 
     async fn dispatch(&self, method: &str, body: Option<&Value>) -> Reply {
+        self.dispatch_to(method, "/audit/configuration", body).await
+    }
+
+    async fn dispatch_to(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
         let host = format!("iot.{REGION}.amazonaws.com");
         let payload = body.map_or_else(Bytes::new, |value| Bytes::from(value.to_string()));
         let request = http::Request::builder()
             .method(method)
-            .uri(format!("https://{host}/audit/configuration"))
+            .uri(format!("https://{host}{path}"))
             .header("host", host)
             .header("content-type", "application/json")
             // The credential scope names the `iot` signing name the model's
@@ -91,6 +100,33 @@ impl Emulator {
 
     async fn update_account_audit_configuration(&self, body: &Value) -> Reply {
         self.dispatch("PATCH", Some(body)).await
+    }
+
+    /// `DELETE /audit/configuration`, with `deleteScheduledAudits` bound to the query
+    /// string the model declares for it when `delete_scheduled_audits` is supplied.
+    async fn delete_account_audit_configuration(
+        &self,
+        delete_scheduled_audits: Option<bool>,
+    ) -> Reply {
+        let query = delete_scheduled_audits
+            .map(|flag| format!("?deleteScheduledAudits={flag}"))
+            .unwrap_or_default();
+        self.dispatch_to("DELETE", &format!("/audit/configuration{query}"), None)
+            .await
+    }
+
+    /// Delete the configuration and require the call to succeed.
+    async fn delete(&self, case: &str, delete_scheduled_audits: Option<bool>) {
+        let reply = self
+            .delete_account_audit_configuration(delete_scheduled_audits)
+            .await;
+        assert_eq!(
+            reply.status,
+            200,
+            "case {case}: expected DeleteAccountAuditConfiguration to answer 200, got {} body {}",
+            reply.status,
+            reply.text()
+        );
     }
 
     /// The configuration a successful read reports, as JSON.
@@ -149,6 +185,14 @@ impl Reply {
             .unwrap_or_else(|| panic!("no __type in {}", self.text()))
             .to_string()
     }
+
+    /// The `message` member a modelled error response carries.
+    fn error_message(&self) -> String {
+        self.json()["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no message in {}", self.text()))
+            .to_string()
+    }
 }
 
 /// One audit check configuration, in the JSON form the model binds it to.
@@ -198,6 +242,33 @@ fn supplied_entry<'a>(supplied: &'a Value, member: &str, key: &str) -> Option<&'
     supplied.get(member).and_then(|map| map.get(key))
 }
 
+/// The `configuration` a read must report for `check_name`: the `configValue` the account
+/// configured, plus — while the check is ENABLED — the default the check documents for a
+/// `configName` it takes and the account did not set, which is the threshold the check
+/// would be evaluated against. The catalog of which check takes which `configName`, and of
+/// each default, is the emulator's own
+/// (`service_..::state::check_custom_configuration`), so a check the issue never cited is
+/// covered too.
+fn expected_check_configuration(
+    supplied: Option<&Value>,
+    check_name: &str,
+    enabled: bool,
+) -> Option<Value> {
+    let mut configuration = supplied
+        .and_then(|entry| entry.get("configuration"))
+        .and_then(Value::as_object)
+        .cloned();
+    if enabled {
+        if let Some(custom) = check_custom_configuration(check_name) {
+            configuration
+                .get_or_insert_with(Map::new)
+                .entry(custom.config_name.to_string())
+                .or_insert_with(|| Value::String(custom.default_config_value()));
+        }
+    }
+    configuration.map(Value::Object)
+}
+
 /// Assert that a read reports exactly `expected_role_arn` and the configurations
 /// `expected` (the accumulated effect of every update applied so far) over the whole
 /// catalog.
@@ -232,14 +303,28 @@ fn assert_reports(case: &str, report: &Value, expected_role_arn: Option<&str>, e
             expected_enabled,
             "case {case}: expected {check_name} enabled={expected_enabled}, got {entry}"
         );
-        let expected_configuration = expected_entry.and_then(|entry| entry.get("configuration"));
+        let expected_configuration =
+            expected_check_configuration(expected_entry, check_name, expected_enabled);
         assert_eq!(
             entry.get("configuration"),
-            expected_configuration,
+            expected_configuration.as_ref(),
             "case {case}: expected {check_name} configuration {expected_configuration:?}, \
              got {entry}"
         );
     }
+    // The notification targets are NOT a catalog: the response carries one entry per
+    // target an update wired up, and no member at all while the account wired up none.
+    let Some(expected_targets) = expected
+        .get("auditNotificationTargetConfigurations")
+        .and_then(Value::as_object)
+    else {
+        assert_eq!(
+            report.get("auditNotificationTargetConfigurations"),
+            None,
+            "case {case}: expected no auditNotificationTargetConfigurations member, got {report}"
+        );
+        return;
+    };
     let targets = report["auditNotificationTargetConfigurations"]
         .as_object()
         .unwrap_or_else(|| {
@@ -247,12 +332,18 @@ fn assert_reports(case: &str, report: &Value, expected_role_arn: Option<&str>, e
         });
     assert_eq!(
         targets.len(),
-        AUDIT_NOTIFICATION_TYPE_VALUES.len(),
-        "case {case}: expected one entry per modelled notification type, got {targets:?}"
+        expected_targets.len(),
+        "case {case}: expected one entry per configured notification target \
+         {expected_targets:?}, got {targets:?}"
     );
-    for notification_type in AUDIT_NOTIFICATION_TYPE_VALUES {
+    for notification_type in expected_targets.keys() {
+        assert!(
+            AUDIT_NOTIFICATION_TYPE_VALUES.contains(&notification_type.as_str()),
+            "case {case}: {notification_type} is no modelled notification type \
+             {AUDIT_NOTIFICATION_TYPE_VALUES:?}"
+        );
         let entry = targets
-            .get(*notification_type)
+            .get(notification_type)
             .unwrap_or_else(|| panic!("case {case}: {notification_type} missing from {report}"));
         let expected_entry =
             supplied_entry(expected, "auditNotificationTargetConfigurations", notification_type);
@@ -717,5 +808,571 @@ async fn a_role_arn_outside_the_modelled_length_is_refused() {
         );
         let after = emulator.reported(name).await;
         assert_reports(name, &after, None, &Value::Object(Map::new()));
+    }
+}
+
+/// The configuration an account has before it configures anything, and the one it is back
+/// to after the configuration is deleted: no role, every check disabled and no notification
+/// target.
+fn nothing_configured() -> Value {
+    Value::Object(Map::new())
+}
+
+/// A first update that omits a configuration argument the first call requires is refused
+/// naming THAT argument, one sentence for the whole class — and the rule is about the FIRST
+/// call only, so a later update may omit both.
+#[tokio::test]
+async fn a_missing_configuration_argument_is_named_in_the_refusal() {
+    // The arguments a first call requires, each in the spelling the service names it by:
+    // the input members of UpdateAccountAuditConfiguration documented as required then
+    // (`smithy_query(query="operation",operation="UpdateAccountAuditConfiguration")`).
+    let cases: &[(&str, Value, &str)] = &[
+        (
+            "no role",
+            json!({
+                "auditCheckConfigurations": check_map(&[("LOGGING_DISABLED_CHECK", check(true))]),
+            }),
+            "Missing required configuration argument: RoleArn.",
+        ),
+        (
+            "no role, with a custom configuration on the check",
+            json!({
+                "auditCheckConfigurations": check_map(&[(
+                    "DEVICE_CERTIFICATE_EXPIRING_CHECK",
+                    configured_check(true, "CERT_EXPIRATION_THRESHOLD_IN_DAYS", "45"),
+                )]),
+            }),
+            "Missing required configuration argument: RoleArn.",
+        ),
+        (
+            "no check configurations",
+            json!({ "roleArn": ROLE_ARN }),
+            "Missing required configuration argument: AuditCheckConfigurations.",
+        ),
+        (
+            "no check configurations, only a notification target",
+            json!({
+                "roleArn": SHORT_ROLE_ARN,
+                "auditNotificationTargetConfigurations": {
+                    "SNS": { "targetArn": "arn:aws:sns:ap-south-1:123456789012:findings", "enabled": true },
+                },
+            }),
+            "Missing required configuration argument: AuditCheckConfigurations.",
+        ),
+        (
+            "neither",
+            json!({}),
+            "Missing required configuration argument: RoleArn.",
+        ),
+    ];
+
+    for (name, request, expected_message) in cases {
+        let emulator = Emulator::new();
+        let reply = emulator.update_account_audit_configuration(request).await;
+        assert_eq!(
+            reply.status,
+            400,
+            "case {name}: expected 400, got {} body {}",
+            reply.status,
+            reply.text()
+        );
+        assert_eq!(
+            reply.error_code(),
+            "InvalidRequestException",
+            "case {name}: expected InvalidRequestException, got {}",
+            reply.text()
+        );
+        assert_eq!(
+            reply.error_message(),
+            *expected_message,
+            "case {name}: expected the message {expected_message:?}, got {:?}",
+            reply.error_message()
+        );
+        let after = emulator.reported(name).await;
+        assert_reports(name, &after, None, &nothing_configured());
+    }
+
+    // An account that HAS a configuration may omit both arguments: nothing is missing
+    // once the first call supplied them.
+    let emulator = Emulator::new();
+    let first = json!({
+        "roleArn": ROLE_ARN,
+        "auditCheckConfigurations": check_map(&[("LOGGING_DISABLED_CHECK", check(true))]),
+    });
+    emulator.apply("already configured", &first).await;
+    emulator
+        .apply(
+            "already configured, later update omitting both",
+            &json!({
+                "auditNotificationTargetConfigurations": {
+                    "SNS": { "targetArn": "arn:aws:sns:ap-south-1:123456789012:findings", "enabled": true },
+                },
+            }),
+        )
+        .await;
+}
+
+/// One configuration to delete, and the `deleteScheduledAudits` the delete carries.
+struct DeleteCase {
+    name: &'static str,
+    request: fn() -> Value,
+    /// `None` leaves the query parameter off the request entirely, so the modelled
+    /// default stands.
+    delete_scheduled_audits: Option<bool>,
+}
+
+/// Configurations spanning what the reset generalises over: how many checks were enabled,
+/// whether a check carried a custom configuration, whether a notification target was wired
+/// up, and whether the delete asks for scheduled audits to go too.
+const DELETE_CASES: &[DeleteCase] = &[
+    DeleteCase {
+        name: "one enabled check",
+        request: || {
+            json!({
+                "roleArn": ROLE_ARN,
+                "auditCheckConfigurations": check_map(&[("LOGGING_DISABLED_CHECK", check(true))]),
+            })
+        },
+        delete_scheduled_audits: None,
+    },
+    DeleteCase {
+        name: "two enabled checks",
+        request: || {
+            json!({
+                "roleArn": ROLE_ARN,
+                "auditCheckConfigurations": check_map(&[
+                    ("DEVICE_CERTIFICATE_EXPIRING_CHECK", check(true)),
+                    ("LOGGING_DISABLED_CHECK", check(true)),
+                ]),
+            })
+        },
+        delete_scheduled_audits: Some(false),
+    },
+    DeleteCase {
+        name: "every check in the catalog enabled",
+        request: || json!({ "roleArn": ROLE_ARN, "auditCheckConfigurations": every_check_enabled() }),
+        delete_scheduled_audits: Some(true),
+    },
+    DeleteCase {
+        name: "a custom configuration and a notification target",
+        request: || {
+            json!({
+                "roleArn": SHORT_ROLE_ARN,
+                "auditCheckConfigurations": check_map(&[
+                    (
+                        "DEVICE_CERTIFICATE_AGE_CHECK",
+                        configured_check(true, "CERT_AGE_THRESHOLD_IN_DAYS", "100"),
+                    ),
+                    ("CONFLICTING_CLIENT_IDS_CHECK", check(false)),
+                ]),
+                "auditNotificationTargetConfigurations": {
+                    "SNS": {
+                        "targetArn": "arn:aws:sns:ap-south-1:123456789012:audit-findings",
+                        "roleArn": ROLE_ARN,
+                        "enabled": true,
+                    },
+                },
+            })
+        },
+        delete_scheduled_audits: Some(true),
+    },
+];
+
+/// Deleting the account audit configuration restores the DEFAULTS: whatever was
+/// configured, the read after it reports no role, every audit check disabled with no custom
+/// configuration, and no notification target at all.
+#[tokio::test]
+async fn deleting_the_configuration_restores_the_defaults() {
+    for case in DELETE_CASES {
+        let emulator = Emulator::new();
+        let request = (case.request)();
+        emulator.apply(case.name, &request).await;
+        let configured = emulator.reported(case.name).await;
+        assert_reports(
+            case.name,
+            &configured,
+            request["roleArn"].as_str(),
+            &request,
+        );
+
+        emulator.delete(case.name, case.delete_scheduled_audits).await;
+
+        let after = emulator.reported(case.name).await;
+        assert_reports(case.name, &after, None, &nothing_configured());
+    }
+}
+
+/// The delete is defined on an account that configured nothing, and repeating it changes
+/// nothing: both answer 200 and leave the default configuration in place.
+#[tokio::test]
+async fn deleting_an_unconfigured_configuration_changes_nothing() {
+    let emulator = Emulator::new();
+    let before = emulator.reported("never configured").await;
+    for case in ["first delete", "repeated delete"] {
+        emulator.delete(case, None).await;
+        let after = emulator.reported(case).await;
+        assert_reports(case, &after, None, &nothing_configured());
+        assert_eq!(
+            before, after,
+            "case {case}: the delete changed the default configuration to {after}"
+        );
+    }
+
+    // And repeating it on an account that HAD a configuration is just as flat.
+    let emulator = Emulator::new();
+    emulator
+        .apply(
+            "configured then deleted twice",
+            &json!({
+                "roleArn": ROLE_ARN,
+                "auditCheckConfigurations": every_check_enabled(),
+            }),
+        )
+        .await;
+    for case in ["configured, first delete", "configured, repeated delete"] {
+        emulator.delete(case, None).await;
+        let after = emulator.reported(case).await;
+        assert_reports(case, &after, None, &nothing_configured());
+    }
+}
+
+/// After the delete the account is UNCONFIGURED, so the next update is a first call again:
+/// it must supply the arguments a first call requires, and once it does the read reports
+/// exactly what it configured.
+#[tokio::test]
+async fn after_the_delete_the_next_update_is_a_first_call() {
+    let emulator = Emulator::new();
+    emulator
+        .apply(
+            "configured",
+            &json!({
+                "roleArn": ROLE_ARN,
+                "auditCheckConfigurations": check_map(&[(
+                    "DEVICE_CERTIFICATE_EXPIRING_CHECK",
+                    configured_check(true, "CERT_EXPIRATION_THRESHOLD_IN_DAYS", "30"),
+                )]),
+            }),
+        )
+        .await;
+    emulator.delete("configured", None).await;
+
+    let reply = emulator
+        .update_account_audit_configuration(&json!({
+            "auditCheckConfigurations": check_map(&[("LOGGING_DISABLED_CHECK", check(true))]),
+        }))
+        .await;
+    assert_eq!(
+        reply.status,
+        400,
+        "case update after delete without a role: expected 400, got {} body {}",
+        reply.status,
+        reply.text()
+    );
+    assert_eq!(
+        reply.error_message(),
+        "Missing required configuration argument: RoleArn.",
+        "case update after delete without a role: got {:?}",
+        reply.error_message()
+    );
+
+    let reprovision = json!({
+        "roleArn": SHORT_ROLE_ARN,
+        "auditCheckConfigurations": check_map(&[("LOGGING_DISABLED_CHECK", check(true))]),
+    });
+    emulator.apply("reprovision", &reprovision).await;
+    let after = emulator.reported("reprovision").await;
+    assert_reports("reprovision", &after, Some(SHORT_ROLE_ARN), &reprovision);
+}
+
+/// An ENABLED audit check that takes a custom configuration reports the configuration it
+/// would be evaluated against: the `configValue` the account set, or the default Device
+/// Defender documents for that `configName`. A check that takes none reports no
+/// configuration at all.
+///
+/// Driven over the WHOLE catalog of audit checks, so the checks that take a configuration
+/// and the ones that do not are both covered by name rather than by the one the issue
+/// cited.
+#[tokio::test]
+async fn an_enabled_check_reports_the_configuration_in_force() {
+    for &check_name in AUDIT_CHECK_NAMES {
+        let emulator = Emulator::new();
+        emulator
+            .apply(
+                check_name,
+                &json!({
+                    "roleArn": ROLE_ARN,
+                    "auditCheckConfigurations": check_map(&[(check_name, check(true))]),
+                }),
+            )
+            .await;
+        let report = emulator.reported(check_name).await;
+        let reported = report["auditCheckConfigurations"][check_name]["configuration"].clone();
+        match documented_default(check_name) {
+            Some((config_name, default_config_value)) => {
+                let expected = json!({ config_name: default_config_value });
+                assert_eq!(
+                    reported, expected,
+                    "case {check_name} enabled with no configValue: expected the documented \
+                     default {expected}, got {reported}"
+                );
+            }
+            None => assert_eq!(
+                reported,
+                Value::Null,
+                "case {check_name} takes no custom configuration: expected none, got {reported}"
+            ),
+        }
+    }
+}
+
+/// The `configName` and default `configValue` AWS IoT Device Defender DOCUMENTS for each
+/// audit check that takes a custom configuration, written out here rather than read from
+/// the emulator so the assertion above is not the implementation checking itself: the audit
+/// checks reference of the Device Defender developer guide gives
+/// `CERT_EXPIRATION_THRESHOLD_IN_DAYS` 30 days for the expiring-certificate check and
+/// `CERT_AGE_THRESHOLD_IN_DAYS` 365 days for the certificate-age check, and no other check
+/// takes a configuration.
+fn documented_default(check_name: &str) -> Option<(&'static str, &'static str)> {
+    match check_name {
+        "DEVICE_CERTIFICATE_EXPIRING_CHECK" => Some(("CERT_EXPIRATION_THRESHOLD_IN_DAYS", "30")),
+        "DEVICE_CERTIFICATE_AGE_CHECK" => Some(("CERT_AGE_THRESHOLD_IN_DAYS", "365")),
+        _ => None,
+    }
+}
+
+/// The documented catalog above and the emulator's own must agree, check for check, over
+/// the whole catalog of audit checks — so a change to either that drifts from Device
+/// Defender's documentation fails here rather than silently in a projection.
+#[test]
+fn the_documented_defaults_are_the_catalog_the_emulator_holds() {
+    for &check_name in AUDIT_CHECK_NAMES {
+        let held = check_custom_configuration(check_name)
+            .map(|custom| (custom.config_name, custom.default_config_value()));
+        let documented = documented_default(check_name)
+            .map(|(config_name, value)| (config_name, value.to_string()));
+        assert_eq!(
+            held, documented,
+            "case {check_name}: the emulator holds {held:?} where Device Defender documents \
+             {documented:?}"
+        );
+    }
+}
+
+/// A `configValue` the account sets stands in for the default, and survives the check
+/// being disabled: the account's own write is never dropped.
+#[tokio::test]
+async fn a_configured_config_value_stands_in_for_the_default() {
+    for &check_name in AUDIT_CHECK_NAMES {
+        let Some(custom) = check_custom_configuration(check_name) else {
+            continue;
+        };
+        let config_name = custom.config_name;
+        // A value that is not the documented default, so the assertion cannot pass on the
+        // default's account.
+        let config_value = "7";
+        assert_ne!(
+            config_value,
+            custom.default_config_value(),
+            "case {check_name}: the row's configValue must differ from the default"
+        );
+
+        let emulator = Emulator::new();
+        emulator
+            .apply(
+                check_name,
+                &json!({
+                    "roleArn": ROLE_ARN,
+                    "auditCheckConfigurations": check_map(&[(
+                        check_name,
+                        configured_check(true, config_name, config_value),
+                    )]),
+                }),
+            )
+            .await;
+        let expected = json!({ config_name: config_value });
+        for case in ["enabled", "then disabled"] {
+            if case == "then disabled" {
+                emulator
+                    .apply(
+                        check_name,
+                        &json!({
+                            "auditCheckConfigurations": check_map(&[(check_name, check(false))]),
+                        }),
+                    )
+                    .await;
+            }
+            let report = emulator.reported(check_name).await;
+            let reported = report["auditCheckConfigurations"][check_name]["configuration"].clone();
+            assert_eq!(
+                reported, expected,
+                "case {check_name} {case}: expected the configured {expected}, got {reported}"
+            );
+        }
+    }
+}
+
+/// `deleteScheduledAudits` decides what happens to the account's SCHEDULED AUDITS: a
+/// delete that asks for them takes every one, and one that does not leaves every one
+/// readable — while the configuration itself is reset either way.
+///
+/// The rows differ along what the request says about the flag (absent, so the modelled
+/// default stands; false; true) and over schedules of different frequencies, so the rule is
+/// not read off one schedule's shape.
+#[tokio::test]
+async fn delete_scheduled_audits_decides_whether_the_schedules_go() {
+    // Each schedule's own body, as `CreateScheduledAudit` binds it: a frequency, the day
+    // that frequency needs, and the checks it targets.
+    let schedules: &[(&str, Value)] = &[
+        (
+            "daily-audit",
+            json!({
+                "frequency": "DAILY",
+                "targetCheckNames": ["LOGGING_DISABLED_CHECK"],
+            }),
+        ),
+        (
+            "weekly-audit",
+            json!({
+                "frequency": "WEEKLY",
+                "dayOfWeek": "SUN",
+                "targetCheckNames": ["LOGGING_DISABLED_CHECK", "DEVICE_CERTIFICATE_AGE_CHECK"],
+            }),
+        ),
+        (
+            "monthly-audit",
+            json!({
+                "frequency": "MONTHLY",
+                "dayOfMonth": "LAST",
+                "targetCheckNames": ["DEVICE_CERTIFICATE_EXPIRING_CHECK"],
+            }),
+        ),
+    ];
+    let cases: &[(&str, Option<bool>, bool)] = &[
+        ("the flag left off the request", None, true),
+        ("the flag set false", Some(false), true),
+        ("the flag set true", Some(true), false),
+    ];
+
+    for &(case, delete_scheduled_audits, expect_survival) in cases {
+        let emulator = Emulator::new();
+        // Every check enabled, which is what lets a schedule target the ones below.
+        emulator
+            .apply(
+                case,
+                &json!({
+                    "roleArn": ROLE_ARN,
+                    "auditCheckConfigurations": every_check_enabled(),
+                }),
+            )
+            .await;
+        for (name, body) in schedules {
+            let reply = emulator
+                .dispatch_to(
+                    "POST",
+                    &format!("/audit/scheduledaudits/{name}"),
+                    Some(body),
+                )
+                .await;
+            assert_eq!(
+                reply.status,
+                200,
+                "case {case}: expected CreateScheduledAudit {name} to answer 200, got {} body {}",
+                reply.status,
+                reply.text()
+            );
+        }
+
+        emulator.delete(case, delete_scheduled_audits).await;
+
+        // The configuration is reset whatever the flag said.
+        let after = emulator.reported(case).await;
+        assert_reports(case, &after, None, &nothing_configured());
+
+        for (name, _) in schedules {
+            let reply = emulator
+                .dispatch_to("GET", &format!("/audit/scheduledaudits/{name}"), None)
+                .await;
+            let expected_status = if expect_survival { 200 } else { 404 };
+            assert_eq!(
+                reply.status,
+                expected_status,
+                "case {case}: expected DescribeScheduledAudit {name} to answer \
+                 {expected_status}, got {} body {}",
+                reply.status,
+                reply.text()
+            );
+        }
+    }
+}
+
+/// A check's `configuration` is optional, so an update that does not carry it leaves the
+/// custom configuration the account already had — the same rule as a top-level member the
+/// request omits — while one that carries it replaces it.
+#[tokio::test]
+async fn an_update_that_omits_a_custom_configuration_leaves_it() {
+    // One row per modelled `configName`, so the rule is checked on the check each one
+    // configures (`service_..::ops::types::CONFIG_NAME_VALUES`).
+    let rows: &[(&str, &str, &str, &str)] = &[
+        (
+            "DEVICE_CERTIFICATE_EXPIRING_CHECK",
+            "CERT_EXPIRATION_THRESHOLD_IN_DAYS",
+            "30",
+            "14",
+        ),
+        (
+            "DEVICE_CERTIFICATE_AGE_CHECK",
+            "CERT_AGE_THRESHOLD_IN_DAYS",
+            "365",
+            "90",
+        ),
+    ];
+    assert_eq!(
+        rows.len(),
+        CONFIG_NAME_VALUES.len(),
+        "case coverage: expected one row per modelled configName {CONFIG_NAME_VALUES:?}, \
+         got {} rows",
+        rows.len()
+    );
+
+    for &(check_name, config_name, first_value, second_value) in rows {
+        let emulator = Emulator::new();
+        let mut expected = json!({
+            "roleArn": ROLE_ARN,
+            "auditCheckConfigurations": check_map(&[(
+                check_name,
+                configured_check(true, config_name, first_value),
+            )]),
+        });
+        emulator.apply(check_name, &expected.clone()).await;
+
+        // An update that re-sends the check WITHOUT a configuration leaves the stored
+        // one: the member it omits is not a member it cleared.
+        emulator
+            .apply(
+                check_name,
+                &json!({
+                    "auditCheckConfigurations": check_map(&[(check_name, check(true))]),
+                }),
+            )
+            .await;
+        let report = emulator.reported(check_name).await;
+        assert_reports(check_name, &report, Some(ROLE_ARN), &expected);
+
+        // An update that DOES carry one replaces it.
+        let replacement = json!({
+            "auditCheckConfigurations": check_map(&[(
+                check_name,
+                configured_check(true, config_name, second_value),
+            )]),
+        });
+        emulator.apply(check_name, &replacement).await;
+        merge_into(&mut expected, &replacement);
+        let report = emulator.reported(check_name).await;
+        assert_reports(check_name, &report, Some(ROLE_ARN), &expected);
+
+        // And the delete takes the custom configuration with it.
+        emulator.delete(check_name, None).await;
+        let after = emulator.reported(check_name).await;
+        assert_reports(check_name, &after, None, &nothing_configured());
     }
 }
