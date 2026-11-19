@@ -79,7 +79,7 @@ const ORIGIN_ENVELOPE_MEMBER: &str = "<RequestId>";
 
 /// CloudFront's code for a request that names no key at all, and the one for a key the
 /// behaviour's trusted key groups do not hold.
-const MISSING_KEY: &str = "MissingKey";
+pub(crate) const MISSING_KEY: &str = "MissingKey";
 const INVALID_KEY: &str = "InvalidKey";
 
 // ---------------------------------------------------------------------------
@@ -89,14 +89,18 @@ const INVALID_KEY: &str = "InvalidKey";
 /// CloudFront and Amazon S3 over ONE shared engine, as two planes: the SETUP plane, whose
 /// calls carry a credential scope without a computed signature, and the VIEWER plane, which
 /// authenticates — so what makes the origin fetch succeed is the signature the edge applies.
-struct Emulator {
-    setup: MultiServiceRouter,
-    viewers: MultiServiceRouter,
+///
+/// `pub(crate)`: a sibling suite that needs the same two planes over one engine
+/// ([`super::edge_signed_cookie_prefix_policy`]) stages through this one harness rather than
+/// growing a second copy of it.
+pub(crate) struct Emulator {
+    pub(crate) setup: MultiServiceRouter,
+    pub(crate) viewers: MultiServiceRouter,
     callback: EmbeddedEmulator,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let setup = mounted(&engine, false);
         let viewers = mounted(&engine, true);
@@ -116,7 +120,7 @@ impl Emulator {
 
     /// Create `bucket` and put `body` at `key` in it. The bucket carries no public access of
     /// any kind: what reaches the object is the policy each row writes, or nothing.
-    async fn staged_object(&self, case: &str, bucket: &str, key: &str, body: &str) {
+    pub(crate) async fn staged_object(&self, case: &str, bucket: &str, key: &str, body: &str) {
         self.s3()
             .create_bucket()
             .bucket(bucket)
@@ -140,7 +144,7 @@ impl Emulator {
     }
 
     /// Put `document` on `bucket` as its resource policy.
-    async fn staged_policy(&self, case: &str, bucket: &str, document: &str) {
+    pub(crate) async fn staged_policy(&self, case: &str, bucket: &str, document: &str) {
         self.s3()
             .put_bucket_policy()
             .bucket(bucket)
@@ -177,14 +181,14 @@ pub(crate) fn mounted(
 
 /// The host a bucket of this Region is addressed at virtual-hosted style, which is what an S3
 /// origin's `DomainName` carries.
-fn origin_domain(bucket: &str) -> String {
+pub(crate) fn origin_domain(bucket: &str) -> String {
     format!("{bucket}.s3.{REGION}.amazonaws.com")
 }
 
 /// A bucket policy granting the CloudFront service principal `s3:GetObject` on every object of
 /// `bucket`, scoped by `AWS:SourceArn` to the one distribution `arn` names — the document AWS
 /// publishes for an origin access control.
-fn grant(bucket: &str, arn: &str) -> String {
+pub(crate) fn grant(bucket: &str, arn: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\
          \"Sid\":\"AllowCloudFrontServicePrincipal\",\"Effect\":\"Allow\",\
@@ -200,7 +204,7 @@ fn grant(bucket: &str, arn: &str) -> String {
 
 /// `CreateOriginAccessControl` for an `s3` origin CloudFront signs every request to, answering
 /// the control's id.
-async fn create_origin_access_control(
+pub(crate) async fn create_origin_access_control(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -236,7 +240,7 @@ async fn create_origin_access_control(
 /// `CreateDistribution` over the S3 origin `bucket` fronted by the origin access control
 /// `control`, whose DEFAULT behaviour requires the key group `key_group`; answers the
 /// distribution's `(Id, DomainName, ARN)`.
-async fn create_distribution(
+pub(crate) async fn create_distribution(
     router: &MultiServiceRouter,
     case: &str,
     caller_reference: &str,
