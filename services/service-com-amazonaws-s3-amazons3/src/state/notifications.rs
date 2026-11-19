@@ -497,6 +497,9 @@ pub struct Pending {
     bucket: String,
     /// What to deliver, in the order the events and the configuration produced them.
     deliveries: Vec<Delivery>,
+    /// The TRACING header of the call these events came of, where it carried one — the
+    /// chain a delivery that is itself a call belongs to ([`Pending::on_the_chain_of`]).
+    chain: Option<String>,
 }
 
 impl Pending {
@@ -511,6 +514,55 @@ impl Pending {
     pub fn len(&self) -> usize {
         self.deliveries.len()
     }
+
+    /// Name the request CHAIN these deliveries belong to: the one the call that produced the
+    /// events belongs to, read off that request's own tracing header
+    /// ([`request_chain_header`]).
+    ///
+    /// A delivery Amazon S3 makes is a call Amazon S3 makes, so it is one hop further along
+    /// the chain of the call that produced the event rather than the start of a chain of its
+    /// own: "for X-Ray traces, all Amazon Web Services services use the X-Amzn-Trace-Id
+    /// header from the HTTP request", and that header is what every service of this emulator
+    /// reads the chain a request belongs to off. It is what lets the destination tell a
+    /// delivery that came round from one of its own calls apart from a new one — which is how
+    /// AWS Lambda's recursive-loop guardrail detects a function being invoked by an event its
+    /// own write produced and stops the loop.
+    #[must_use]
+    fn on_the_chain_of(mut self, parts: &::http::request::Parts) -> Self {
+        self.chain = request_chain_header(parts);
+        self
+    }
+}
+
+/// The header a request's X-Ray tracing context travels on, as X-Ray spells it: "for X-Ray
+/// traces, all Amazon Web Services services use the X-Amzn-Trace-Id header from the HTTP
+/// request" (`StartExecution$traceHeader`, the one place an AWS model states where that
+/// context is read from).
+const TRACE_HEADER: &str = "x-amzn-trace-id";
+
+/// The most characters of a tracing header a delivery carries on: X-Ray's own `TraceHeader`
+/// is modelled as 0..256 ASCII characters, so a longer value is not a tracing header any
+/// service of this emulator would report, and none is copied onto the deliveries of one
+/// request. It bounds what a caller's own header can make this process carry.
+const MAX_TRACE_HEADER_CHARS: usize = 256;
+
+/// The TRACING header the request `parts` carries, or `None` where it carries none — the
+/// chain the deliveries of that request's events belong to ([`Pending::on_the_chain_of`]).
+///
+/// Carried on only when the value IS a tracing header naming a chain, read through the one
+/// reading of that form this tree shares (`service_common::xray_trace`), and only inside the
+/// width that form is modelled at ([`MAX_TRACE_HEADER_CHARS`]): text that names no chain
+/// places this request on none, so the delivery carries no context rather than relaying
+/// whatever a header happened to hold.
+#[must_use]
+pub fn request_chain_header(parts: &::http::request::Parts) -> Option<String> {
+    parts
+        .headers
+        .get(TRACE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.chars().count() <= MAX_TRACE_HEADER_CHARS)
+        .filter(|value| ::service_common::xray_trace::trace_root(value).is_some())
+        .map(str::to_string)
 }
 
 /// The most deliveries one request's object events may owe.
@@ -624,6 +676,9 @@ pub fn pending(
     Pending {
         bucket: bucket.to_string(),
         deliveries,
+        // Named by the request these events came of once the store is released
+        // ([`Pending::on_the_chain_of`]), which is where the request itself is reached.
+        chain: None,
     }
 }
 
@@ -910,6 +965,10 @@ pub fn publish(ctx: &smithy_server_runtime::OperationContext<'_>, pending: Pendi
     // deliveries outlives the request that produced them.
     let callback = ctx.callback().clone();
     let deliveries = pending.len();
+    // The CHAIN these deliveries belong to, read off the request that produced the events
+    // while it is still here to be read: a delivery is a call Amazon S3 makes, and it is one
+    // hop of the chain the producing call belongs to ([`Pending::on_the_chain_of`]).
+    let pending = pending.on_the_chain_of(ctx.parts());
     runtime.spawn(async move {
         // Moved into the task, so the permit is held for exactly as long as the task
         // runs and is released however it ends.
@@ -1028,6 +1087,9 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
     // instant, so the answer cannot differ between them, and this bounds the reads by the
     // number of distinct destinations rather than by the number of events.
     let mut admitted: Vec<(&'static str, String, bool)> = Vec::new();
+    // The chain these deliveries are a hop of, which a delivery that is itself a call carries
+    // ([`Pending::on_the_chain_of`]).
+    let chain = pending.chain.clone();
     for delivery in pending.deliveries {
         if !delivery_admitted(&mut clients, callback, &pending.bucket, &delivery, &mut admitted)
             .await
@@ -1116,6 +1178,15 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
                 // that Lambda is still provisioning — "during this time, you can't invoke or
                 // modify the function" (`CreateFunction`) — cannot take the invocation yet, so
                 // that answer is one this delivery outlives rather than loses the event to.
+                //
+                // The invocation is one HOP of the chain the call that produced the event
+                // belongs to, so it carries that call's own tracing header
+                // ([`Pending::on_the_chain_of`]): the chain is what lets Lambda recognise a
+                // function being invoked by an event one of its own calls produced, which is
+                // what its recursive-loop guardrail counts — "Lambda can detect certain types
+                // of recursive loops shortly after they occur … it stops your function being
+                // invoked" (`PutFunctionRecursionConfig$RecursiveLoop`). A delivery that
+                // carried no chain would make every hop of such a loop look like the first.
                 let function = clients.lambda(callback, &region).clone();
                 let answer = attempted!(
                     attempts_until,
@@ -1126,6 +1197,27 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
                         .payload(::aws_sdk_lambda::primitives::Blob::new(
                             payload.clone().into_bytes()
                         ))
+                        .customize()
+                        .mutate_request({
+                            let chain = chain.clone();
+                            move |request| {
+                                if let Some(chain) = chain.clone() {
+                                    // `try_insert` rather than the panicking `insert`: the
+                                    // value is the producing request's own header text, so a
+                                    // byte the wire cannot carry in a header value costs this
+                                    // delivery its chain rather than the event.
+                                    if let Err(refused) =
+                                        request.headers_mut().try_insert(TRACE_HEADER, chain)
+                                    {
+                                        ::tracing::warn!(
+                                            error = %refused,
+                                            "the chain this object event came of cannot travel \
+                                             on the wire, so its delivery carries none"
+                                        );
+                                    }
+                                }
+                            }
+                        })
                         .send()
                         .await
                 );
@@ -2016,6 +2108,53 @@ impl Clients {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which tracing header a request places its events' deliveries on — one row per form the
+    /// value can take: each field of a chain X-Ray reads, a request that names none, text that
+    /// names no chain, and a value wider than the form is modelled at.
+    #[test]
+    fn a_requests_deliveries_are_placed_on_the_chain_its_header_names() {
+        let root = "1-5759e988-bd862e3fe1be46a994272793";
+        let sampled = format!("Root={root};Parent=53995c3f42cd8ad8;Sampled=1");
+        let undecided = format!("Root={root}");
+        let oversized = format!("Root={root};Note={}", "n".repeat(MAX_TRACE_HEADER_CHARS));
+        // (case, the header the request carried, the chain the deliveries carry)
+        let rows: &[(&str, Option<&str>, Option<&str>)] = &[
+            (
+                "a chain with a parent and a decision",
+                Some(sampled.as_str()),
+                Some(sampled.as_str()),
+            ),
+            (
+                "a chain with no decision",
+                Some(undecided.as_str()),
+                Some(undecided.as_str()),
+            ),
+            ("no header at all", None, None),
+            ("a root that is no trace id", Some("Root=not-a-trace-id"), None),
+            ("a field with no name", Some("=1"), None),
+            ("text naming no chain", Some("hello"), None),
+            ("the empty header", Some(""), None),
+            (
+                "a chain wider than the form is modelled at",
+                Some(oversized.as_str()),
+                None,
+            ),
+        ];
+        for (case, sent, expected) in rows {
+            let mut request = ::http::Request::builder().uri("https://s3.amazonaws.com/b/k");
+            if let Some(sent) = sent {
+                request = request.header(TRACE_HEADER, *sent);
+            }
+            let (parts, ()) = request.body(()).expect("a well-formed request").into_parts();
+            let answered = request_chain_header(&parts);
+            assert_eq!(
+                answered.as_deref(),
+                *expected,
+                "case {case:?}: expected the deliveries on {expected:?}, got {answered:?}"
+            );
+        }
+    }
 
     /// Which refusals a publication OUTLIVES, by the status the destination's own service
     /// answered with: one row per status the rule names as "not yet", one per neighbouring

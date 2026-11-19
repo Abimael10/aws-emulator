@@ -2166,6 +2166,7 @@ impl AwsAccess {
                     region,
                     operation,
                     body,
+                    self.trace_header.as_deref(),
                 )
                 .await
             }
@@ -2178,6 +2179,7 @@ impl AwsAccess {
                     self.identity.as_ref(),
                     operation,
                     body,
+                    self.trace_header.as_deref(),
                 )
                 .await
             }
@@ -2188,6 +2190,7 @@ impl AwsAccess {
                     region,
                     operation,
                     body,
+                    self.trace_header.as_deref(),
                 )
                 .await
             }
@@ -2198,6 +2201,7 @@ impl AwsAccess {
                     region,
                     operation,
                     body,
+                    self.trace_header.as_deref(),
                 )
                 .await
             }
@@ -2208,6 +2212,7 @@ impl AwsAccess {
                     region,
                     operation,
                     body,
+                    self.trace_header.as_deref(),
                 )
                 .await
             }
@@ -2218,6 +2223,7 @@ impl AwsAccess {
                     region,
                     operation,
                     body,
+                    self.trace_header.as_deref(),
                 )
                 .await
             }

@@ -106,6 +106,7 @@ pub async fn call(
     region: &str,
     operation: &str,
     body: &str,
+    chain: Option<&str>,
 ) -> Result<Answer, Refusal> {
     let input = Input::read(body)?;
     let observed = Observed::default();
@@ -115,6 +116,7 @@ pub async fn call(
         region,
         observed.clone(),
         input.text("Bucket")?.as_deref(),
+        chain,
     );
     match operation {
         "GetObject" => get_object(&client, &input, &observed).await,
@@ -171,6 +173,7 @@ fn client(
     region: &str,
     observed: Observed,
     bucket: Option<&str>,
+    chain: Option<&str>,
 ) -> Client {
     let config = ::aws_sdk_s3::Config::builder()
         .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
@@ -206,6 +209,14 @@ fn client(
             PROVIDER_NAME,
         )),
         None => config.credentials_provider(callback.aws_credentials_provider()),
+    };
+    // A call the handler makes is one HOP of the chain that reached the handler, so it carries
+    // that chain's tracing header where this invocation has one: the service that serves the
+    // call then places it in the same chain, which is what lets AWS Lambda's recursive-loop
+    // guardrail recognise a function being invoked by an event one of its own calls produced.
+    let config = match chain {
+        Some(chain) => config.interceptor(::service_common::xray_trace::ChainHop::carrying(chain)),
+        None => config,
     };
     Client::from_conf(config.build())
 }

@@ -88,10 +88,11 @@ pub async fn call(
     region: &str,
     operation: &str,
     body: &str,
+    chain: Option<&str>,
 ) -> Result<Answer, Refusal> {
     let input = Input::read(SERVICE, body)?;
     let observed = Observed::of(SERVICE);
-    let client = client(callback, identity, region, observed.clone());
+    let client = client(callback, identity, region, observed.clone(), chain);
     match operation {
         "Publish" => publish(&client, &input, &observed).await,
         "PublishBatch" => publish_batch(&client, &input, &observed).await,
@@ -132,11 +133,16 @@ pub async fn call(
 /// The transport is in-process, so everything a network client needs and this one cannot have —
 /// retries, timeouts, identity caching and stalled-stream protection, each of which needs a
 /// sleep implementation the callback transport is not given — is switched off.
+///
+/// Every request it makes carries the tracing header of the chain this invocation belongs to,
+/// where the invocation has one ([`::service_common::xray_trace::ChainHop`]): a call the
+/// handler makes is one HOP of the chain that reached the handler.
 fn client(
     callback: &EmbeddedEmulator,
     identity: Option<&CallerIdentity>,
     region: &str,
     observed: Observed,
+    chain: Option<&str>,
 ) -> Client {
     let config = ::aws_sdk_sns::Config::builder()
         .behavior_version(::aws_sdk_sns::config::BehaviorVersion::latest())
@@ -161,6 +167,11 @@ fn client(
             ))
         }
         None => config.credentials_provider(callback.aws_credentials_provider()),
+    };
+    // A call the handler makes is one HOP of the chain that reached the handler.
+    let config = match chain {
+        Some(chain) => config.interceptor(::service_common::xray_trace::ChainHop::carrying(chain)),
+        None => config,
     };
     Client::from_conf(config.build())
 }

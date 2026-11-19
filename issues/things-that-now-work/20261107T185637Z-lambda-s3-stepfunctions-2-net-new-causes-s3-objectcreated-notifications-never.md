@@ -43,3 +43,45 @@ Cause 2: expected an executionArn (or AccessDeniedException) from the handler; g
 ## Steps to Reproduce
 1) Cause 1: PutBucketNotificationConfiguration with a LambdaFunctionConfigurations entry (with and without a prefix FilterRule), AddPermission for s3.amazonaws.com with the bucket SourceArn, PutObject inside and outside the prefix, and poll for invocations and the record payload.
 2) Cause 2: Invoke a handler calling boto3.client('stepfunctions').start_execution and boto3.client('s3').put_object, with the grant present and absent.
+
+## What was fixed, and what is still open
+
+Both causes are served now. The notification dispatcher's Lambda destination delivers — the
+envelope, the key-name filter, the invoke grant and the handler's own calls to Step Functions and
+Amazon S3 are all exercised by the recorded units that pass — and the bundled SDK's reachable-service
+table carries `s3`, `stepfunctions` and `sfn`
+(`services/service-com-amazonaws-lambda-awsgirapiservice/src/state/execution/aws_api.rs`), so a
+handler builds a client for either and the two IAM negatives are falsifiable again.
+
+One defect of that dispatcher was found, fixed and pinned in this change: a delivery carried NO
+request chain, and neither did a handler's own call to Amazon S3 (or to CloudFront, Amazon SNS, the
+token service, Amazon RDS, CloudFormation), because only the AWS-JSON and `restJson1` dispatch path
+stamped the invocation's tracing header. Every hop of a Lambda-to-S3-to-Lambda loop therefore looked
+like the start of a new chain, so AWS Lambda's recursive-loop guardrail — which this emulator already
+implements — never saw one: a single `PutObject` into a bucket whose unfiltered configuration its own
+handler writes back into produced fifty invocations and counting, each holding a run slot, a permit
+of the one pool every bucket's deliveries share, and an interpreter, where AWS stops the chain at
+sixteen. A delivery is now a hop of the chain the call that produced the event belongs to, so such a
+loop is stopped at the published bound
+(`services/service-com-amazonaws-s3-amazons3/src/state/notifications.rs`,
+`services/common/src/xray_trace.rs`, pinned by
+`core/router/tests/all/s3_notification_delivery_is_a_hop_of_its_chain.rs`).
+
+STILL OPEN: two recorded checks of this fixture are NOT demonstrated passing —
+`.s3-notification-triggers-lambda-positive` and `.cfn-deploy-s3-notification-to-lambda-positive`,
+both of which poll `ListObjectsV2(Prefix='processed/')` for an object the invoked handler writes back
+into the bucket the event came from. Their replay reports "Check timed out after 60.0s", and their
+CURRENT replay keys are owned by the open issues
+20261118T064915Z-lambda-s3-stepfunctions-a-bucket-s-lambdafunctionconfigurations-notification.md and
+20261116T230421Z-lambda-s3-stepfunctions-a-cloudformation-deployed-s3-objectcreated.md. What was
+driven and PASSES in process and on the started binary while tracing them: that exact pipeline with
+the role scoped the way the recording scopes it (`s3:GetObject` on `<bucket>/*`, `s3:PutObject` on
+`<bucket>/processed/*`), at the function's default `Timeout` and at the smallest the model allows,
+with the client built inside the handler as well as at module scope, with the configuration filtered
+and unfiltered, with the handler's marker read back through `ListObjectsV2` spelled as botocore
+spells it (`prefix=processed%2F`, `encoding-type=url`) as well as with a bare slash, and with the
+loop the unfiltered form produces. None of those reproduces the recording's outcome, so what the
+recording does between its grant and its poll that this emulator answers differently is still not
+identified; whoever picks those two up next should start from the client's own wire rather than from
+the dispatcher.
+

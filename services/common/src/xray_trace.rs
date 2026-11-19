@@ -267,6 +267,71 @@ pub fn onward_tracing_header(
     }
 }
 
+/// The HTTP header a request's tracing context travels on, as X-Ray spells it: "for X-Ray
+/// traces, all Amazon Web Services services use the X-Amzn-Trace-Id header from the HTTP
+/// request" (`StartExecution$traceHeader`, the one place an AWS model states where a service
+/// reads that context from).
+pub const TRACE_HEADER: &str = "x-amzn-trace-id";
+
+/// Stamps ONE chain's tracing header on every request the client it is registered on makes.
+///
+/// A call a service makes on behalf of the call it is serving — a handler's own SDK call, a
+/// service's delivery of an event one of its calls produced — is a HOP of that call's chain
+/// rather than the start of a chain of its own, and the chain travels on
+/// [`TRACE_HEADER`]. Registered on an in-process client
+/// (`.interceptor(ChainHop::carrying(header))`), this is what puts it there for every request
+/// that client makes, so a caller that holds a client for a whole call does not have to
+/// remember the header per request.
+///
+/// The header is put on BEFORE the request is signed, which is where a service's own
+/// propagation puts it.
+#[derive(Clone, Debug)]
+pub struct ChainHop {
+    /// The header every request carries: the chain the served call belongs to, as that call
+    /// named it.
+    header: String,
+}
+
+impl ChainHop {
+    /// The hop that carries `header`, the tracing header of the chain the served call belongs
+    /// to.
+    #[must_use]
+    pub fn carrying(header: impl Into<String>) -> Self {
+        Self {
+            header: header.into(),
+        }
+    }
+}
+
+impl ::aws_smithy_runtime_api::client::interceptors::Intercept for ChainHop {
+    fn name(&self) -> &'static str {
+        "xray-chain-hop"
+    }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut ::aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterceptorContextMut<'_>,
+        _components: &::aws_smithy_runtime_api::client::runtime_components::RuntimeComponents,
+        _config: &mut ::aws_smithy_types::config_bag::ConfigBag,
+    ) -> Result<(), ::aws_smithy_runtime_api::box_error::BoxError> {
+        // `try_insert` rather than the panicking `insert`: the value is the served call's own
+        // header text, so a byte the wire cannot carry in a header value costs this call its
+        // chain rather than the call itself.
+        if let Err(refused) = context
+            .request_mut()
+            .headers_mut()
+            .try_insert(TRACE_HEADER, self.header.clone())
+        {
+            ::tracing::warn!(
+                error = %refused,
+                "the chain this call belongs to cannot travel on the wire, so the call carries \
+                 none"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
