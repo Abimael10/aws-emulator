@@ -43,18 +43,21 @@ const ENGINES: [&str; 7] = [
 ];
 
 /// One reported `<OrderableDBInstanceOption>`, as the members this suite asserts on.
+///
+/// `pub(crate)` so a sibling suite reads an option through this one projection rather than a
+/// second copy of it.
 #[derive(Debug, Clone)]
-struct OrderableOption {
-    engine: String,
-    engine_version: String,
-    db_instance_class: String,
-    license_model: String,
-    storage_type: String,
-    xml: String,
+pub(crate) struct OrderableOption {
+    pub(crate) engine: String,
+    pub(crate) engine_version: String,
+    pub(crate) db_instance_class: String,
+    pub(crate) license_model: String,
+    pub(crate) storage_type: String,
+    pub(crate) xml: String,
 }
 
 /// Every `<OrderableDBInstanceOption>` in a response body, in reported order.
-fn options(xml: &str) -> Vec<OrderableOption> {
+pub(crate) fn options(xml: &str) -> Vec<OrderableOption> {
     subtrees(xml, "OrderableDBInstanceOption")
         .into_iter()
         .map(|entry| OrderableOption {
@@ -69,7 +72,7 @@ fn options(xml: &str) -> Vec<OrderableOption> {
 }
 
 /// `DescribeOrderableDBInstanceOptions` with `params`, asserted to answer 200.
-async fn describe(
+pub(crate) async fn describe(
     router: &MultiServiceRouter,
     case: &str,
     params: &[(&str, String)],
@@ -80,7 +83,7 @@ async fn describe(
 
 /// Every option a request carrying `params` reports, paged to exhaustion so the
 /// assertions see the whole report rather than its first page.
-async fn all_options(
+pub(crate) async fn all_options(
     router: &MultiServiceRouter,
     case: &str,
     params: &[(&'static str, String)],
@@ -507,12 +510,15 @@ async fn max_records_is_bounded_and_the_marker_resumes_the_report() {
 /// General Purpose SSD (`gp2`, `gp3`) and Provisioned IOPS SSD (`io1`, `io2`) — plus
 /// Aurora, whose storage the cluster manages and which is therefore not ordered with the
 /// instance at all.
-struct StorageRule {
+///
+/// `pub(crate)` so a sibling suite reads these published bounds from this one table rather
+/// than a second copy of them.
+pub(crate) struct StorageRule {
     /// `StorageType`.
     storage_type: &'static str,
     /// `MinStorageSize`, in GiB, or `None` when storage is not ordered per instance and
     /// the option reports no bounds.
-    min_storage_size: Option<i32>,
+    pub(crate) min_storage_size: Option<i32>,
     /// `SupportsIops`, and `MaxIopsPerGib` — the published IOPS-to-GiB ratio ceiling —
     /// when the type takes provisioned IOPS.
     max_iops_per_gib: Option<f64>,
@@ -522,7 +528,7 @@ struct StorageRule {
 }
 
 /// The published storage types, one row each.
-const STORAGE_RULES: &[StorageRule] = &[
+pub(crate) const STORAGE_RULES: &[StorageRule] = &[
     StorageRule {
         storage_type: "gp2",
         min_storage_size: Some(20),
@@ -580,11 +586,27 @@ const STORAGE_RULES: &[StorageRule] = &[
 ];
 
 /// The rule for `storage_type`.
-fn storage_rule(storage_type: &str) -> &'static StorageRule {
+pub(crate) fn storage_rule(storage_type: &str) -> &'static StorageRule {
     STORAGE_RULES
         .iter()
         .find(|rule| rule.storage_type == storage_type)
         .unwrap_or_else(|| panic!("the report named a storage type RDS does not publish: {storage_type}"))
+}
+
+/// The largest `AllocatedStorage`, in GiB, `engine` accepts — which is what caps the
+/// `MaxStorageSize` of every storage type a DB instance of it is offered with.
+///
+/// Source: the per-engine storage maxima of the "Amazon RDS DB instance storage" tables —
+/// 65,536 GiB for the MySQL, MariaDB, PostgreSQL and Oracle engines, 16,384 for Microsoft SQL
+/// Server and 64,000 for Db2 — which is where the caps the `ROWS` table above carries per
+/// engine come from. `pub(crate)` so a sibling suite reads them from here rather than from a
+/// third copy.
+pub(crate) fn engine_max_allocated_storage(engine: &str) -> i32 {
+    match engine {
+        _ if engine.starts_with("sqlserver") => 16_384,
+        _ if engine.starts_with("db2") => 64_000,
+        _ => 65_536,
+    }
 }
 
 /// `<tag>` read as an integer, or `None` when the option carries none.

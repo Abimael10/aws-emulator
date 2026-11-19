@@ -3213,13 +3213,38 @@ fn upgrades_in_place(entry: &CatalogVersion, target: &CatalogVersion) -> bool {
 /// whose family it belongs to, so what follows that prefix is this release's minor version
 /// within the family: `44-rds.20250213` of MySQL `5.7.44-rds.20250213`, `4` of Aurora
 /// PostgreSQL `16.4`, `4385.2.v1` of SQL Server `15.00.4385.2.v1`. A version string that
-/// does NOT carry its major version as a prefix reports the whole string: there is no
-/// major part of it to take away.
+/// does NOT carry its major version as a prefix ([`release_is_in_line`]) reports the whole
+/// string: there is no major part of it to take away.
 fn minor_engine_version(engine_version: &str, major_engine_version: &str) -> String {
+    if !release_is_in_line(engine_version, major_engine_version) {
+        return engine_version.to_string();
+    }
     engine_version
-        .strip_prefix(&format!("{major_engine_version}."))
+        .get(major_engine_version.len() + 1..)
         .unwrap_or(engine_version)
         .to_string()
+}
+
+/// Whether the engine version `engine_version` is a release of the major version LINE
+/// `major_engine_version`.
+///
+/// A line is named by the leading components of its releases
+/// (`DBEngineVersion$MajorEngineVersion`, "the part of the version an upgrade within it is a
+/// minor upgrade of"), so a release of it is that line, a dot, and the rest of the release:
+/// `8.4.9` is of `8.4`, `15.00.4382.1.v1` of `15.00` and `8.0.mysql_aurora.3.08.0` of `8.0`,
+/// while `8.40.1` is of neither `8.4` nor `8`, and the line itself is no release of itself.
+///
+/// Stated once here, where the catalogue that publishes both halves lives: this is the
+/// relation [`minor_engine_version`] takes the major part off by, and the one
+/// `DescribeOrderableDBInstanceOptions` reads to answer whether a version a request names is
+/// a release of a line this catalogue publishes.
+pub(crate) fn release_is_in_line(engine_version: &str, major_engine_version: &str) -> bool {
+    engine_version
+        .get(..major_engine_version.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(major_engine_version))
+        && engine_version
+            .get(major_engine_version.len()..)
+            .is_some_and(|rest| rest.starts_with('.'))
 }
 
 /// Whether a version of `engine` reports the two replication-log capability members,

@@ -2,17 +2,26 @@
 
 //! @op DescribeOrderableDBInstanceOptions
 //! IMPLEMENTED: this operation reports the DB instance options a caller can order for an
-//! engine — the cross product of that engine's AVAILABLE versions (read from the engine
-//! catalogue `DescribeDBEngineVersions` owns, so the two reports cannot disagree), the DB
-//! instance classes this service offers for it, its license models and the STORAGE TYPES
-//! each class can be ordered with — narrowed by the request's `EngineVersion`,
-//! `DBInstanceClass`, `LicenseModel`, `Vpc` and `AvailabilityZoneGroup` filters and paged
-//! by `MaxRecords` / `Marker`. This is the ONLY file to touch for it.
+//! engine — the cross product of the engine VERSIONS it describes (every available version
+//! the engine catalogue `DescribeDBEngineVersions` owns publishes, or the one release the
+//! request's `EngineVersion` names, see `described_versions`), the DB instance classes this
+//! service offers for it, its license models and the STORAGE TYPES each class can be ordered
+//! with — narrowed by the request's `DBInstanceClass`, `LicenseModel`, `Vpc` and
+//! `AvailabilityZoneGroup` filters and paged by `MaxRecords` / `Marker`. This is the ONLY
+//! file to touch for it.
 //!
 //! An option is one (engine version, DB instance class, license model, storage type)
 //! combination: the storage members an option carries (`MinStorageSize`/`MaxStorageSize`,
 //! the provisioned IOPS bounds, the provisioned throughput bounds) are properties of its
 //! storage type, so a class orderable with several types has one option per type.
+//!
+//! The engine catalogue is a SAMPLE of the real service's live version list for the engines
+//! whose releases are the upstream engines' own, so a request that names a release the
+//! catalogue carries no row for is answered for the release LINE it belongs to rather than
+//! with an empty report, where that line's releases are written as plain release numbers; the
+//! engines of the sibling control planes this door serves, whose version list the service
+//! itself defines and this emulator carries whole, keep the empty report (see
+//! `described_versions`).
 //!
 //! An option is reference data, not caller state, with one request-derived member: an
 //! option's `AvailabilityZones` are the zones of the region the request is signed for,
@@ -101,7 +110,9 @@ use super::types::*;
 // The engine-catalogue predicates both reports read, so they cannot disagree about an
 // engine: whether its instances are CLUSTER members, and whether it belongs to another
 // control plane this one front door serves.
-use crate::ops::describe_db_engine_versions::{is_cluster_engine, serves_another_control_plane};
+use crate::ops::describe_db_engine_versions::{
+    is_cluster_engine, release_is_in_line, serves_another_control_plane,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -215,28 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut matching: Vec<(String, OrderableDBInstanceOption)> = Vec::new();
-        // An option is offered for an engine VERSION this service reports, so the two
-        // reports cannot disagree: `DescribeDBEngineVersions` owns the engine catalogue
-        // and this operation reads it.
-        for (_, version, _) in crate::ops::describe_db_engine_versions::catalogue() {
-            // Only a version that is still available can be ordered; a deprecated one is
-            // reported by `DescribeDBEngineVersions` under `IncludeAll` and ordered by
-            // nobody.
-            if version.status != crate::ops::describe_db_engine_versions::STATUS_AVAILABLE {
-                continue;
-            }
-            if !version.engine.eq_ignore_ascii_case(&input.engine) {
-                continue;
-            }
-            // "A filter to include only the available options for the specified engine
-            // version."
-            if input
-                .engine_version
-                .as_ref()
-                .is_some_and(|wanted| !version.engine_version.eq_ignore_ascii_case(wanted))
-            {
-                continue;
-            }
+        // The versions this report describes options for, which is where the request's
+        // `EngineVersion` filter is applied ([`described_versions`]).
+        for version in described_versions(&input.engine, input.engine_version.as_deref()) {
             for class in instance_classes(version.engine) {
                 // "A filter to include only the available options for the specified DB
                 // instance class."
@@ -276,7 +268,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 class.name,
                                 storage.name
                             ),
-                            to_wire(version, &class, license_model, storage, &region),
+                            to_wire(
+                                version.engine,
+                                &version.engine_version,
+                                version.profile,
+                                &class,
+                                license_model,
+                                storage,
+                                &region,
+                            ),
                         ));
                     }
                 }
@@ -293,6 +293,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             orderable_db_instance_options: Some(page.items),
         })
     }
+}
+
+/// One engine version this report describes options for: the `EngineVersion` an option of it
+/// reports, and the capabilities the engine publishes for the release line that version
+/// belongs to ([`described_versions`]).
+struct DescribedVersion {
+    /// `Engine`, in the spelling the engine catalogue publishes it.
+    engine: &'static str,
+    /// `EngineVersion`, as this report describes it.
+    engine_version: String,
+    /// What the version can do: the engine modes and capability flags
+    /// `DescribeDBEngineVersions` publishes for it.
+    profile: &'static crate::ops::describe_db_engine_versions::VersionProfile,
+}
+
+/// The engine versions this report describes options for, which is where `EngineVersion` —
+/// "a filter to include only the available options for the specified engine version" — is
+/// applied.
+///
+/// With no filter the versions are the ones `DescribeDBEngineVersions` reports as AVAILABLE
+/// for the engine, so the two reports cannot disagree: that operation owns the engine
+/// catalogue and this one reads it. A deprecated version is ordered by nobody, so it is
+/// described by nothing here.
+///
+/// With a filter, the version the request NAMED is what the report describes, and the
+/// catalogue answers which of three things that name is:
+///
+/// * a version the catalogue carries as available — that version, with its own profile;
+/// * a version the catalogue carries as deprecated, or a value that is no release of any line
+///   the engine publishes — no options at all: the first cannot be ordered and the second
+///   names no release of this engine. `EngineVersion` is an EXACT filter ("the available
+///   options for the specified engine version"), so a value naming only a line (`8.0`) is no
+///   version of it and selects nothing;
+/// * a version of a line the engine DOES publish that the catalogue carries no row for — that
+///   version, with the profile of the latest available release of its line, for an engine whose
+///   version list this emulator SAMPLES and a line whose releases are written as plain release
+///   numbers ([`is_a_plain_release_number`]). The engine-version catalogue is explicitly a
+///   sample of the real service's live list for the engines whose releases are the upstream
+///   engines' own (see `crate::state::check_engine_version_form`, which is why nothing else in
+///   this service refuses a version for being outside it), so a minor release inside a
+///   published line is not a version this report can deny: answering it with an empty list
+///   would tell a caller sizing an instance that no DB instance class at all is orderable for a
+///   release the engine really offers, which is what every pre-flight check reads this report
+///   for. A line's capabilities are a property of the line, so the release the catalogue
+///   publishes last for it — its latest — is the record the option reports from, rather than
+///   invented flags.
+///
+/// The engines of the two SIBLING control planes this front door also serves are the exception,
+/// and they take the empty report: their version list is one the SERVICE defines and this
+/// emulator carries whole — the shared catalogue both views of that door read
+/// (`::service_common::docdb_engine_catalog`) — so a release outside it is a release that engine
+/// cannot run, and describing one here would make this view of the door disagree with that
+/// engine's own view of it.
+///
+/// A value that is not an engine version at all (`crate::state::check_engine_version_form`)
+/// names no release of any line, so it describes nothing either.
+///
+/// This is what the ENGINE offers, which is a different question from what this emulator can
+/// PROVISION: a create resolves the version it must run an instance on against the catalogue
+/// rows themselves (`crate::ops::describe_db_engine_versions::resolve_version`, whose
+/// documented rule is that `8.0.99` is not `8.0`) and refuses a release it holds no row for,
+/// because it has to name a release this emulator can actually stand up. A report of what the
+/// engine offers cannot be held to that: it would otherwise deny, in AWS's name, every release
+/// of a published line that this sample happens not to carry.
+fn described_versions(engine: &str, requested: Option<&str>) -> Vec<DescribedVersion> {
+    let describe = |entry: &'static crate::ops::describe_db_engine_versions::CatalogVersion| {
+        DescribedVersion {
+            engine: entry.engine,
+            engine_version: entry.engine_version.to_string(),
+            profile: entry.profile,
+        }
+    };
+    let of_engine: Vec<&'static crate::ops::describe_db_engine_versions::CatalogVersion> =
+        crate::ops::describe_db_engine_versions::catalogue()
+            .map(|(_, entry, _)| entry)
+            .filter(|entry| entry.engine.eq_ignore_ascii_case(engine))
+            .collect();
+    let available = || {
+        of_engine.iter().copied().filter(|entry| {
+            entry.status == crate::ops::describe_db_engine_versions::STATUS_AVAILABLE
+        })
+    };
+
+    let Some(wanted) = requested else {
+        return available().map(describe).collect();
+    };
+    if let Some(exact) = available().find(|entry| entry.engine_version.eq_ignore_ascii_case(wanted))
+    {
+        return vec![describe(exact)];
+    }
+    // A version this catalogue carries and does not publish as available is a deprecated
+    // release, which no order can name.
+    if of_engine
+        .iter()
+        .any(|entry| entry.engine_version.eq_ignore_ascii_case(wanted))
+    {
+        return Vec::new();
+    }
+    // Naming only the major version is no version at all for this EXACT filter; a value that
+    // is not an engine version, one of a sibling control plane's engines, and one written as
+    // anything but a plain release number are no release of a published line either.
+    if crate::state::check_engine_version_form(wanted).is_err()
+        || serves_another_control_plane(engine)
+        || !is_a_plain_release_number(wanted)
+    {
+        return Vec::new();
+    }
+    // A release INSIDE a published line that this sampled catalogue carries no row for, where
+    // that line's own releases are written as plain release numbers too.
+    available()
+        .rfind(|entry| {
+            release_is_in_line(wanted, entry.major_engine_version)
+                && is_a_plain_release_number(entry.engine_version)
+        })
+        .map(|line| DescribedVersion {
+            engine: line.engine,
+            engine_version: wanted.to_string(),
+            profile: line.profile,
+        })
+        .into_iter()
+        .collect()
+}
+
+/// Whether `version` is written as a PLAIN release number: dot-separated numbers and nothing
+/// else.
+///
+/// It is what decides whether a version outside this sampled catalogue can be a release of a
+/// published line at all. A line whose releases carry a lettered qualifier publishes the FORM
+/// of its releases as surely as it publishes the releases themselves — Aurora MySQL writes the
+/// Aurora release into the string (`8.0.mysql_aurora.3.08.0`), Microsoft SQL Server its build
+/// and revision (`15.00.4382.1.v1`), and an Amazon RDS Extended Support build the day it was
+/// cut (`11.22-rds.20241121`) — so a bare number is no release of such a line, however well it
+/// matches the line's leading digits, and the report describes nothing for it. Where a line's
+/// releases ARE plain numbers (`8.4.3`, `13.16`), a number inside the line is a release the
+/// engine may well have and this sample simply does not carry.
+fn is_a_plain_release_number(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .split('.')
+            .all(|component| !component.is_empty() && component.bytes().all(|c| c.is_ascii_digit()))
 }
 
 /// The lowest and highest `MaxRecords` THIS operation documents: "Default: 100
@@ -1116,14 +1256,20 @@ fn availability_zones(region: &str) -> Vec<AvailabilityZone> {
 
 /// Project one (engine version, DB instance class, license model, storage type) onto the
 /// modelled `OrderableDBInstanceOption` wire shape.
+///
+/// The version is given as the three things an option reports about it — the engine, the
+/// `EngineVersion` and the capability `profile` of its release line — rather than as a
+/// catalogue row, because a release the catalogue samples no row for is described by its
+/// line's profile ([`described_versions`]).
 fn to_wire(
-    version: &crate::ops::describe_db_engine_versions::CatalogVersion,
+    engine: &str,
+    engine_version: &str,
+    profile: &crate::ops::describe_db_engine_versions::VersionProfile,
     class: &InstanceClass,
     license_model: &str,
     storage: &StorageProfile,
     region: &str,
 ) -> OrderableDBInstanceOption {
-    let engine = version.engine;
     // A storage type's published maximum, capped by what the ENGINE accepts.
     let storage_size = storage
         .size_range
@@ -1139,7 +1285,7 @@ fn to_wire(
         .then_some(::service_common::docdb_engine_catalog::OPTION_CAPABILITIES);
     OrderableDBInstanceOption {
         engine: Some(engine.to_string()),
-        engine_version: Some(version.engine_version.to_string()),
+        engine_version: Some(engine_version.to_string()),
         db_instance_class: Some(class.name.clone()),
         license_model: Some(license_model.to_string()),
         availability_zones: Some(availability_zones(region)),
@@ -1149,7 +1295,7 @@ fn to_wire(
         // read-replica answer is read from the engine catalogue so this report and
         // `DescribeDBEngineVersions` cannot disagree about the version.
         multi_az_capable: Some(multi_az_capable(engine)),
-        read_replica_capable: Some(version.profile.supports_read_replica),
+        read_replica_capable: Some(profile.supports_read_replica),
         vpc: Some(true),
         supports_storage_encryption: Some(true),
         // Everything below comes from the option's OWN storage type.
@@ -1195,15 +1341,14 @@ fn to_wire(
         // from the engine catalogue, so this report and `DescribeDBEngineVersions` cannot
         // disagree about the version an option is offered for.
         supported_engine_modes: Some(
-            version
-                .profile
+            profile
                 .engine_modes
                 .iter()
                 .map(|mode| (*mode).to_string())
                 .collect(),
         ),
         supports_global_databases: Some(docdb.map_or(
-            version.profile.supports_global_databases,
+            profile.supports_global_databases,
             |capabilities| capabilities.global_databases,
         )),
         // "Whether DB instances can be configured as a Multi-AZ DB cluster": an instance of a
@@ -1266,7 +1411,7 @@ fn to_wire(
         // disagree about an engine's endpoint.
         supports_http_endpoint: Some(docdb.map_or_else(
             || {
-                version.profile.engine_modes.iter().any(|mode| {
+                profile.engine_modes.iter().any(|mode| {
                     crate::state::cluster_has_toggleable_http_endpoint(engine, mode)
                 })
             },

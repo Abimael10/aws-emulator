@@ -38,6 +38,8 @@ Issue-Commit: 029c732db8092362c2d6a7aa89bcc4c3ae279d73
 
 > _Note: this issue was identified against the code base at commit `029c732db8092362c2d6a7aa89bcc4c3ae279d73`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Status: cause 1 is FIXED (`DescribeOrderableDBInstanceOptions` describes the release its `EngineVersion` filter names, so the report is the member-wrapped option list again), and causes 3 and 9 replay clean. Causes 2, 4, 5, 6, 7 and 8 are NOT closed and are re-filed, with their replay keys and what this fix established about each, as `issues/things-that-do-not-work/20261114T091417Z-rds-6-of-the-9-reference-catalog-causes-remain-open.md` — so they are not recorded as working. Read that report, not this one, for the open work._
+
 ## Operation
 DescribeOrderableDBInstanceOptions
 
