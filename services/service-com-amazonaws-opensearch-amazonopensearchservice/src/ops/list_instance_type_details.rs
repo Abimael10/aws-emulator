@@ -248,33 +248,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // A token names the entry of the selected listing the answer starts at, so an
-        // answer resumes from a PLACE in the listing rather than from an offset. It is
-        // only ever a value this operation handed out, so one that names no entry of the
-        // listing the request selected — this version and this filter — is a malformed
-        // request rather than an empty answer.
-        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
-            None => 0,
-            Some(token) => selected
-                .iter()
-                .position(|instance_type| *instance_type == token)
-                .ok_or_else(|| {
-                    ListInstanceTypeDetailsErrorModeled::ValidationException(
-                        crate::state::invalid_next_token(),
-                    )
-                })?,
-        };
-
-        // The rest of the catalog the request selected — this version, and the instance
-        // type a filter named. The recorded answers of this operation report that catalog
+        // The whole catalog the request selected — this version, and the instance type a
+        // filter named. The recorded answers of this operation report that catalog
         // complete and carry NO `NextToken`, including for a request that named a
-        // `MaxResults` smaller than it: the catalog is published complete in a single
-        // answer, so `MaxResults` does not bound what is reported, the answer runs to the
-        // end of the listing, and there is never a token to hand out — which is what
-        // tells a paginating client it has the whole set.
+        // `MaxResults` smaller than it and for one that carried a `NextToken`: the
+        // catalog is published complete in a single answer, exactly as the sibling
+        // catalog read `ListVersions` publishes its own, so neither paging member bounds
+        // what is reported nor resumes it, the answer runs from the head of the listing
+        // to its end, and there is never a token to hand out — which is what tells a
+        // paginating client it has the whole set. A `NextToken` is therefore inert rather
+        // than a value to resolve: this operation issues none, so one a request carries
+        // names no place in a listing that is never paged and cannot turn a read every
+        // modelled constraint admits into a refusal.
         let listed: Vec<InstanceTypeDetails> = selected
             .iter()
-            .skip(start)
             .map(|instance_type| {
                 crate::state::instance_type_details(
                     version,

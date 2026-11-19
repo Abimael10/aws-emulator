@@ -23,7 +23,12 @@
 //!   sizes including the one the service bounds an unbounded request by;
 //! * a token that names no place in the set being paged is refused with the status, the
 //!   modelled error and the wording AWS uses, naming nothing of the request — over a
-//!   table of tokens and of the three operations that model that error.
+//!   table of tokens and of the three operations that model that error;
+//! * a catalog the service PUBLISHES complete in one answer — the version catalog and the
+//!   instance-type catalog — reports its whole set however the paging members are set:
+//!   it hands out no token, so a `NextToken` a request carries neither resumes the set
+//!   nor refuses the read, over a table of tokens and page sizes on both operations,
+//!   while a page size outside the modelled range is still refused.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::RESERVED_INSTANCE_OFFERING_PAGE;
@@ -386,6 +391,151 @@ async fn a_set_larger_than_the_answer_names_where_to_resume_and_the_last_answer_
             "case {query}: nothing remains, so the answer carries no NextToken, got {:?}",
             answer.body
         );
+    }
+}
+
+/// A token drawn from a reported catalog entry: the entry itself where the catalog is a
+/// list of strings, and the entry's `InstanceType` where each entry is a structure.
+fn entry_token(entry: &Value, case: &str) -> String {
+    entry
+        .as_str()
+        .or_else(|| entry["InstanceType"].as_str())
+        .unwrap_or_else(|| panic!("case {case}: expected a catalog entry, got {entry:?}"))
+        .to_owned()
+}
+
+/// One published catalog read with `query` as its `@httpQuery` members: the set it
+/// reports, asserted served and complete.
+async fn published_catalog(
+    emulator: &Emulator,
+    path: &str,
+    query: &str,
+    member: &str,
+    case: &str,
+) -> Vec<Value> {
+    let uri = if query.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{query}")
+    };
+    let answer = emulator.call("GET", &uri, None).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}({query:?}): expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.body.get("NextToken"),
+        None,
+        "case {case}({query:?}): a catalog published complete carries no NextToken, got {:?}",
+        answer.body
+    );
+    answer.body[member]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case}({query:?}): expected a {member} array, got {:?}",
+                answer.body
+            )
+        })
+        .clone()
+}
+
+#[tokio::test]
+async fn a_catalog_published_complete_answers_the_whole_set_whatever_the_paging_members_ask() {
+    let emulator = Emulator::new();
+
+    // The reads of a catalog the SERVICE publishes rather than a caller creates, each
+    // with the member carrying the set it reports (source:
+    // `smithy_query(query="operation",operation="ListVersions,ListInstanceTypeDetails")`).
+    // Such a read reports its set complete in one answer and hands out no token, so
+    // neither paging member can bound it, resume it or refuse it — the rows span both
+    // operations and, for the instance-type catalog, releases of both engine lines, whose
+    // catalogs are of different lengths.
+    for (case, path, member) in [
+        (
+            "ListVersions",
+            format!("{PREFIX}/opensearch/versions"),
+            "Versions",
+        ),
+        (
+            "ListInstanceTypeDetails(OpenSearch_2.11)",
+            format!("{PREFIX}/opensearch/instanceTypeDetails/{PUBLISHED_VERSION}"),
+            "InstanceTypeDetails",
+        ),
+        (
+            "ListInstanceTypeDetails(Elasticsearch_7.10)",
+            format!("{PREFIX}/opensearch/instanceTypeDetails/Elasticsearch_7.10"),
+            "InstanceTypeDetails",
+        ),
+        (
+            "ListInstanceTypeDetails(Elasticsearch_1.5)",
+            format!("{PREFIX}/opensearch/instanceTypeDetails/Elasticsearch_1.5"),
+            "InstanceTypeDetails",
+        ),
+    ] {
+        let whole = published_catalog(&emulator, &path, "", member, case).await;
+        assert!(
+            whole.len() > 2,
+            "case {case}: expected a catalog larger than the page sizes under test, got {} \
+             entries",
+            whole.len()
+        );
+
+        // Tokens: entries of this very catalog (its second, its middle and its last), a
+        // value of the member's shape this service never mints, an identifier-shaped one,
+        // and one at the far end of what the member admits.
+        let mut tokens = vec![
+            entry_token(&whole[1], case),
+            entry_token(&whole[whole.len() / 2], case),
+            entry_token(&whole[whole.len() - 1], case),
+            "not-a-token".to_owned(),
+            "00000000-0000-0000-0000-000000000000".to_owned(),
+            "t".repeat(128),
+        ];
+        tokens.dedup();
+
+        let mut queries: Vec<String> = vec![
+            "maxResults=1".to_owned(),
+            "maxResults=2".to_owned(),
+            "maxResults=100".to_owned(),
+            "maxResults=0".to_owned(),
+        ];
+        for token in &tokens {
+            queries.push(format!("nextToken={token}"));
+            queries.push(format!("maxResults=1&nextToken={token}"));
+            queries.push(format!("maxResults=100&nextToken={token}"));
+        }
+
+        for query in queries {
+            let reported = published_catalog(&emulator, &path, &query, member, case).await;
+            assert_eq!(
+                reported, whole,
+                "case {case}({query:?}): expected the whole catalog from its head, got {} \
+                 entries headed by {:?}",
+                reported.len(),
+                reported.first()
+            );
+        }
+
+        // A page size outside the modelled range is still refused at either end: the
+        // paging members are inert, not unchecked.
+        for out_of_range in ["maxResults=101", "maxResults=1000", "maxResults=-1"] {
+            let answer = emulator
+                .call("GET", &format!("{path}?{out_of_range}"), None)
+                .await;
+            assert_eq!(
+                answer.status, 400,
+                "case {case}({out_of_range}): expected 400, got {} with {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ValidationException",
+                "case {case}({out_of_range}): expected the modelled validation refusal, got {:?}",
+                answer.body
+            );
+        }
     }
 }
 

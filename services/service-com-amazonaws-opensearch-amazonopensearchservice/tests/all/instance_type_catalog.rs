@@ -29,9 +29,9 @@
 //! * the release's catalog is reported COMPLETE in a single answer, with no `NextToken`
 //!   member at all, over a table of page sizes: `MaxResults` does not bound what is
 //!   reported and no token is ever handed out, while a `MaxResults` outside the modelled
-//!   range is still refused at either end; a token names a place in the listing, so an
-//!   answer resumed from one is the listing's suffix and a token naming no entry of the
-//!   listing is refused;
+//!   range is still refused at either end; because no token is ever issued, a `NextToken`
+//!   a request carries is inert — it neither resumes the listing nor turns the read into
+//!   a refusal, over a table of token values and of the filters they are sent beside;
 //! * `retrieveAZs` is what puts Availability Zones in the answer, and the zones are
 //!   those of the Region the listing is for — the signing Region, or the Region of the
 //!   domain the request names;
@@ -966,29 +966,26 @@ async fn instance_type_filter_reports_exactly_that_type() {
         );
     }
 
-    // A token names a place in the listing it was issued under, so one naming an entry
-    // the FILTERED listing does not hold is refused rather than served with the filter
-    // dropped.
+    // The filter decides what is reported, and a `NextToken` beside it decides nothing:
+    // this operation hands out no token, so one a request carries names no place in any
+    // listing and the filtered answer is the same one entry it is without it.
     let first = instance_types(&listing)[0].clone();
     let second = instance_types(&listing)[1].clone();
-    let crossed = list(
-        &emulator,
-        version,
-        &format!("instanceType={first}&nextToken={second}"),
-    )
-    .await;
-    assert_eq!(
-        crossed.status, 400,
-        "case token from another listing: expected HTTP 400, got {} {:?}",
-        crossed.status, crossed.body
-    );
-    assert_eq!(
-        error_code(&crossed),
-        "ValidationException",
-        "case token from another listing: expected the modelled validation refusal, got \
-         {:?}",
-        crossed.body
-    );
+    for token in [second.as_str(), "not-a-token"] {
+        let case = format!("instanceType={first} beside nextToken={token}");
+        let reported = whole_listing(
+            &emulator,
+            version,
+            &format!("instanceType={first}&nextToken={token}"),
+        )
+        .await;
+        assert_eq!(
+            instance_types(&reported),
+            vec![first.clone()],
+            "case {case}: expected the filtered listing, got {:?}",
+            instance_types(&reported)
+        );
+    }
 }
 
 #[tokio::test]
@@ -1022,40 +1019,38 @@ async fn the_whole_listing_is_reported_whatever_the_pagination_members_ask() {
             );
         }
 
-        // A token names a place in the listing, and the answer from there runs to its
-        // end: it reports the listing's suffix and still carries no token of its own.
+        // No token is ever handed out, so a `NextToken` a request carries names no place
+        // in the listing and resumes nothing: the answer is the same complete catalog,
+        // from its head, whatever the token's value and whatever page size it comes with.
+        // Rows: an entry of this very listing, an entry from the middle and the end of it,
+        // a value of the member's shape this service never mints, an identifier-shaped
+        // one, and one at the far end of what the member admits.
         let types = instance_types(&listing);
-        for at in [1_usize, types.len() / 2, types.len() - 1] {
-            let query = format!("nextToken={}", types[at]);
-            let case = format!("{version} resumed at {at}");
-            let reported = whole_listing(&emulator, version, &query).await;
-            assert_eq!(
-                reported,
-                listing[at..].to_vec(),
-                "case {case}: expected the listing's suffix, got {} entries",
-                reported.len()
-            );
-        }
-
-        // A token this operation never handed out names no place in the listing, which is
-        // a malformed request rather than an empty answer.
-        for invented in [
-            "nextToken=not-a-token",
-            "nextToken=m5.large.search.page2",
-            "maxResults=5&nextToken=00000000-0000-0000-0000-000000000000",
-        ] {
-            let answer = list(&emulator, version, invented).await;
-            assert_eq!(
-                answer.status, 400,
-                "case {version} {invented}: expected HTTP 400, got {} {:?}",
-                answer.status, answer.body
-            );
-            assert_eq!(
-                error_code(&answer),
-                "ValidationException",
-                "case {version} {invented}: expected the modelled validation refusal, got {:?}",
-                answer.body
-            );
+        let tokens: Vec<String> = vec![
+            types[1].clone(),
+            types[types.len() / 2].clone(),
+            types[types.len() - 1].clone(),
+            "m5.large.search.page2".to_owned(),
+            "00000000-0000-0000-0000-000000000000".to_owned(),
+            "not-a-token".to_owned(),
+            "t".repeat(128),
+        ];
+        for token in &tokens {
+            for query in [
+                format!("nextToken={token}"),
+                format!("maxResults=5&nextToken={token}"),
+                format!("maxResults=100&nextToken={token}&retrieveAZs=false"),
+            ] {
+                let case = format!("{version} query {query:?}");
+                let reported = whole_listing(&emulator, version, &query).await;
+                assert_eq!(
+                    reported, listing,
+                    "case {case}: expected the whole listing from its head, got {} entries \
+                     headed by {:?}",
+                    reported.len(),
+                    instance_types(&reported).first()
+                );
+            }
         }
     }
 
