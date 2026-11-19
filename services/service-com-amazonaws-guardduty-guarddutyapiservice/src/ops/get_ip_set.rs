@@ -178,11 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetIPSetOutput {
             name: ip_set.name.clone(),
             format: ip_set.format.clone(),
-            // "The URI of the file that contains the IPSet": the stored list object,
-            // announced at the endpoint this emulator is reached at so the advertised
-            // list can actually be fetched from it
+            // "The URI of the file that contains the IPSet": the URI the create or
+            // update supplied, reported back as it was stored
             // ([`crate::state::announced_list_location`]).
-            location: crate::state::announced_list_location(ctx, &ip_set.location),
+            location: crate::state::announced_list_location(&ip_set.location),
             status: ip_set.status.clone(),
             // Projected through the ONE tag-map rule every read of this service
             // shares ([`crate::state::reported_tags`]): the member is always

@@ -2,12 +2,13 @@
 
 //! End-to-end tests for WHICH records a CloudWatch Logs Insights aggregation groups.
 //!
-//! The rule under test: a `stats` command groups only the records its grouping keys are
-//! DEFINED on — a record carrying no value for one of them belongs to no group, so it
-//! contributes to no aggregate and forms no group of its own — while a record whose key is
-//! present and EMPTY text is grouped under that empty text. A `parse` binds its fields only on
-//! the records its pattern matches, so the records it did not match are exactly the records a
-//! later grouping by one of those fields leaves out.
+//! The rule under test: a `stats` command groups EVERY record of the scan — a record carrying
+//! no value for one of its grouping keys is grouped with the other records that carry none
+//! either, and the row that group reports OMITS the key it has no value for — while a record
+//! whose key is present and EMPTY text is grouped under that empty text, in a group of its own.
+//! A `parse` binds its fields only on the records its pattern matches, so the records it did
+//! not match are exactly the records a later grouping by one of those fields reports with no
+//! value for it.
 //!
 //! The table spans what the rule generalises over rather than one query, so any one query
 //! string an issue happens to mention is a single row:
@@ -16,14 +17,15 @@
 //!   `parse`, a field discovered in a JSON message, and a name no record carries at all;
 //! * how many of the scanned records carry it — all of them, some of them, none of them;
 //! * whether the value is absent or present and empty;
-//! * how many keys the `by` clause names, so a record missing ANY one of them is left out;
+//! * how many keys the `by` clause names, so a record missing ANY one of them reports no
+//!   member for that one and its value for the others;
 //! * which query language's vocabulary the pipeline is written in (Logs Insights QL and
 //!   OpenSearch PPL);
-//! * an aggregation naming NO grouping key, which leaves no record out.
+//! * an aggregation naming NO grouping key, which folds every record into one group.
 //!
 //! The last case closes the loop the way a client does: the same lines read through a
-//! positional metric filter, whose extracted values must agree with the rows the aggregation
-//! answers.
+//! positional metric filter, whose extracted values must agree with the KEYED rows the
+//! aggregation answers.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -176,16 +178,19 @@ const CWLI: &str = "CWLI";
 /// The OpenSearch PPL language name, the second pipeline vocabulary the same rule holds in.
 const PPL: &str = "PPL";
 
-/// RULE: an aggregation groups only the records its grouping keys are defined on.
+/// RULE: an aggregation groups every record, and the records carrying no value for a key form
+/// one group whose row omits that key.
 #[tokio::test]
-async fn a_record_with_no_value_for_a_grouping_key_joins_no_group() {
+async fn a_record_with_no_value_for_a_grouping_key_forms_the_keyless_group() {
     let logs = Logs::new();
     let window = group_with_events(&logs).await;
 
     let cases: Vec<Case> = vec![
         (
             // The issue's own shape: a named capture binds `user` only on the lines the
-            // pattern matches, so the five records it did not match form no group.
+            // pattern matches, so the five records it did not match form ONE group of their
+            // own, reported with no `user` member at all. A sort orders a row carrying no
+            // value for its key after every row that carries one.
             "a named capture group, grouped by the captured field",
             CWLI,
             r"parse @message /^XFER (?<user>\S+) (?<nbytes>\d+)$/ | stats sum(nbytes) as total, count(*) as n by user | sort user asc"
@@ -193,6 +198,7 @@ async fn a_record_with_no_value_for_a_grouping_key_joins_no_group() {
             vec![
                 vec![("user", "alice"), ("total", "42"), ("n", "2")],
                 vec![("user", "bob"), ("total", "5"), ("n", "1")],
+                vec![("total", "0"), ("n", "5")],
             ],
         ),
         (
@@ -204,38 +210,47 @@ async fn a_record_with_no_value_for_a_grouping_key_joins_no_group() {
             vec![
                 vec![("user", "alice"), ("total", "42"), ("n", "2")],
                 vec![("user", "bob"), ("total", "5"), ("n", "1")],
+                vec![("total", "0"), ("n", "5")],
             ],
         ),
         (
             // A field discovered in a JSON message: present, present and EMPTY, and absent.
             // The record whose `svc` is empty text keeps a group of its own, keyed by that
-            // empty text; the records carrying no `svc` at all form none.
+            // empty text; the six records carrying no `svc` at all form the keyless group.
             "a discovered field, present on one record, empty on another and absent on the rest",
             CWLI,
             "stats count(*) as n by svc | sort svc asc".to_string(),
             vec![
                 vec![("svc", ""), ("n", "1")],
                 vec![("svc", "api"), ("n", "1")],
+                vec![("n", "6")],
             ],
         ),
         (
-            // Two grouping keys no single record carries both of: a record missing EITHER one
-            // joins no group, so the aggregation answers nothing.
+            // Two grouping keys no single record carries both of: each group reports the keys
+            // it HAS a value for, so a record missing one is grouped by the other alone and
+            // the records missing both form one group reporting neither.
             "two grouping keys, no record carrying both",
             CWLI,
             r"parse @message /^XFER (?<user>\S+) (?<nbytes>\d+)$/ | stats count(*) as n by user, svc"
                 .to_string(),
-            vec![],
+            vec![
+                vec![("n", "3")],
+                vec![("svc", ""), ("n", "1")],
+                vec![("svc", "api"), ("n", "1")],
+                vec![("user", "alice"), ("n", "2")],
+                vec![("user", "bob"), ("n", "1")],
+            ],
         ),
         (
             "a grouping key no record carries at all",
             CWLI,
             "stats count(*) as n by absentField".to_string(),
-            vec![],
+            vec![vec![("n", "8")]],
         ),
         (
-            // An aggregation naming NO grouping key leaves no record out: every scanned record
-            // is folded into the one group, whatever fields it carries.
+            // An aggregation naming NO grouping key folds every scanned record into the one
+            // group, whatever fields it carries.
             "an aggregation naming no grouping key",
             CWLI,
             "stats count(*) as n".to_string(),
@@ -243,11 +258,12 @@ async fn a_record_with_no_value_for_a_grouping_key_joins_no_group() {
         ),
         (
             // The span grouping is the same rule over an instant: a record whose timestamp
-            // field is absent has no instant to be grouped by, so it joins no span.
+            // field is absent has no instant to be grouped by, so it joins the keyless group
+            // and the row reports no span.
             "a span taken over a field no record carries",
             CWLI,
             "stats count(*) as n by bin(absentTime, 1m)".to_string(),
-            vec![],
+            vec![vec![("n", "8")]],
         ),
         (
             // The sibling clustering command follows the same rule: a record carrying no text
@@ -277,6 +293,7 @@ async fn a_record_with_no_value_for_a_grouping_key_joins_no_group() {
             vec![
                 vec![("svc", ""), ("n", "1")],
                 vec![("svc", "api"), ("n", "1")],
+                vec![("n", "6")],
             ],
         ),
     ];
@@ -303,9 +320,9 @@ async fn a_record_with_no_value_for_a_grouping_key_joins_no_group() {
     }
 }
 
-/// RULE: the records a `parse` did not match contribute to no group, so an aggregation over a
-/// captured field agrees with a positional metric filter reading the same lines — the records
-/// one instrument extracts values from are the records the other groups.
+/// RULE: the records a `parse` did not match form the keyless group, so the KEYED rows of an
+/// aggregation over a captured field agree with a positional metric filter reading the same
+/// lines — the records one instrument extracts values from are the records the other keys.
 #[tokio::test]
 async fn an_aggregation_over_a_captured_field_agrees_with_a_metric_filter() {
     let logs = Logs::new();
@@ -355,10 +372,13 @@ async fn an_aggregation_over_a_captured_field_agrees_with_a_metric_filter() {
     .await;
     let by_insights: BTreeMap<String, (f64, usize)> = produced
         .iter()
+        // The KEYED rows are the ones the filter's matches are comparable with: the row the
+        // records the pattern did not match form carries no `user` to key it by.
+        .filter(|row| row.contains_key("user"))
         .map(|row| {
             let user = row
                 .get("user")
-                .unwrap_or_else(|| panic!("case {case:?}: every row carries user, got {row:?}"))
+                .unwrap_or_else(|| panic!("case {case:?}: every keyed row carries user, got {row:?}"))
                 .clone();
             let total: f64 = row
                 .get("total")

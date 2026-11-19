@@ -657,10 +657,11 @@ fn rename(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Execu
 /// total by level, bin(5m)`). The result's columns are the grouped fields and then the
 /// aggregates, each named by its `as` clause or by the text that computes it.
 ///
-/// The aggregation is over the records the grouping keys are DEFINED on: a record carrying no
-/// value for one of them — a field it does not hold, a `parse` capture whose pattern did not
-/// match it, an expression that computes nothing on it — joins no group, so it contributes to
-/// no aggregate and forms no group of its own.
+/// The aggregation is over EVERY record of the scan: a record carrying no value for one of
+/// the grouping keys — a field it does not hold, a `parse` capture whose pattern did not match
+/// it, an expression that computes nothing on it — is grouped with the other records that
+/// carry none either, and the row that group reports OMITS the key it has no value for rather
+/// than reporting empty text for it.
 fn stats(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), ExecutionFailure> {
     let (aggregate_text, group_text) = split_on_keyword(arguments, BY);
     let mut aggregates: Vec<(String, Aggregate)> = Vec::new();
@@ -708,7 +709,7 @@ fn stats(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Execut
     // fixed amount of state, so a group costs the same whatever it holds, and the groups
     // themselves are bounded ([`MAX_GROUPS`]). Kept in the order of the group's key values,
     // so one store answers one query the same way every time.
-    let mut groups: BTreeMap<Vec<String>, Vec<expression::Accumulator>> = BTreeMap::new();
+    let mut groups: BTreeMap<Vec<Option<String>>, Vec<expression::Accumulator>> = BTreeMap::new();
     // One record costs the record itself plus the key each grouping computes on it, which is
     // what the budget is charged for it.
     let per_record = u64::try_from(groupings.len())
@@ -718,18 +719,16 @@ fn stats(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Execut
         if !budget.charge(per_record) {
             break;
         }
-        // A record carrying NO value for one of the grouping keys belongs to NO group: the
-        // aggregation is over the records the key is defined on ([`Grouping::key`]), so such a
-        // record contributes to no aggregate rather than to a group keyed by nothing. A record
-        // whose key is present and EMPTY text is grouped under that empty text, which is a
-        // value the record carries.
-        let Some(key) = groupings
+        // A record carrying NO value for one of the grouping keys is grouped under the ABSENCE
+        // of that value ([`Grouping::key`] answers `None` for it): every record of the scan
+        // contributes to an aggregate, and the records that carry no value for a key form one
+        // group of their own — the row of which omits that key below. A record whose key is
+        // present and EMPTY text is grouped under that empty text, which is a value the record
+        // carries, and so is a group of its own.
+        let key: Vec<Option<String>> = groupings
             .iter()
             .map(|(_, grouping)| grouping.key(record, budget))
-            .collect::<Option<Vec<String>>>()
-        else {
-            continue;
-        };
+            .collect();
         if !groups.contains_key(&key) && groups.len() >= MAX_GROUPS {
             return Err(ExecutionFailure::new(format!(
                 "a stats command groups the records into at most {MAX_GROUPS} groups"
@@ -756,10 +755,13 @@ fn stats(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Execut
         .map(|(key, collected)| {
             let mut record = Record::default();
             for ((name, _), value) in groupings.iter().zip(key) {
-                // Every group has a value for every key it is grouped by — a record carrying
-                // none for one of them joined no group at all — so the row reports each of
-                // them, whatever text it holds.
-                store(&mut record, name, value, budget);
+                // A group reports every key it HAS a value for, whatever text that is. The
+                // group of the records that carry no value for a key reports no member for
+                // it: there is no value of that key to report, and empty text would be
+                // another group's.
+                if let Some(value) = value {
+                    store(&mut record, name, value, budget);
+                }
             }
             for ((name, aggregate), accumulator) in aggregates.iter().zip(collected.iter()) {
                 store(
@@ -1320,9 +1322,9 @@ impl Grouping {
     }
 
     /// This key's value for one record, or `None` when the record carries no value to be
-    /// grouped by: such a record belongs to no group of the aggregation, so it contributes to
-    /// no aggregate — while a record whose value is present and EMPTY text is grouped under
-    /// that empty text.
+    /// grouped by: such a record is grouped with the others that carry none for this key, and
+    /// the group they form reports no member for it — while a record whose value is present and
+    /// EMPTY text is grouped under that empty text.
     fn key(&self, record: &Record, budget: &Budget) -> Option<String> {
         match self {
             Self::Value(expression) => match expression::evaluate(expression, record, budget) {

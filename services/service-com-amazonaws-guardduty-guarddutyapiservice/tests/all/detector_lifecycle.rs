@@ -117,52 +117,16 @@ async fn call_signed(
 /// names another ([`call_at`]).
 const DEFAULT_HOST: &str = "guardduty.us-east-1.amazonaws.com";
 
-/// The `Location` an uploaded-list read-back ANNOUNCES for a list created at `stored`,
-/// for a read made through this harness's own endpoint.
+/// The `Location` an uploaded-list read-back REPORTS for a list created at `stored`.
 ///
-/// A read-back does not echo the URL the create carried: it announces the stored list
-/// OBJECT at the address this emulator is reached at, path-style
-/// (`<endpoint>/<bucket>/<key>`), so the advertised list is fetchable from the emulator
-/// instead of naming a host it does not serve. The harness addresses a published
-/// GuardDuty endpoint ([`DEFAULT_HOST`]), which is a caller that resolves AWS's own
-/// hostnames, so the address announced to it is the one this process is served at —
-/// and an in-process emulator is served on no port, which is the base
-/// [`smithy_server_runtime::UNSERVED_URL_BASE`] names.
-///
-/// A stored location whose announced form would not fit the modelled `Location` of
-/// `len 1..300` is announced unchanged, since a URL cut to length addresses nothing.
-/// The `uploaded_list_location_endpoint` suite is where the whole rule is asserted over
-/// a table of spellings and endpoints; this is how every other suite spells the value
-/// it expects back.
+/// The URI the create or the update supplied, character for character: a `Location`
+/// addresses an object of another service's storage, which GuardDuty only records, so
+/// nothing re-addresses it and a read-back answers with the value the caller submitted
+/// whatever endpoint the read arrives at. The `uploaded_list_location_endpoint` suite is
+/// where that rule is asserted over a table of spellings and endpoints; this is how
+/// every other suite spells the value it expects back.
 pub(crate) fn announced_location(stored: &str) -> String {
-    let announced = format!(
-        "{}/{}",
-        smithy_server_runtime::UNSERVED_URL_BASE,
-        s3_object_of(stored)
-    );
-    match announced.chars().count() <= 300 {
-        true => announced,
-        false => stored.to_string(),
-    }
-}
-
-/// The `bucket/key` an S3 URL addresses: the authority and path of an `s3://` URL, the
-/// leading host label plus the path of a virtual-hosted-style object URL, and the path
-/// of a path-style one.
-fn s3_object_of(location: &str) -> String {
-    if let Some(object) = location.strip_prefix("s3://") {
-        return object.to_string();
-    }
-    let after_scheme = location
-        .split_once("://")
-        .map_or(location, |(_scheme, rest)| rest);
-    let (authority, path) = after_scheme
-        .split_once('/')
-        .unwrap_or((after_scheme, Default::default()));
-    match authority.split_once(".s3") {
-        Some((bucket, _endpoint)) => format!("{bucket}/{path}"),
-        None => path.to_string(),
-    }
+    stored.to_string()
 }
 
 /// [`call_in`], answering with the response body's RAW bytes as the service

@@ -7,14 +7,14 @@
 //! `Qualifier` "specif[ies] a version or alias to invoke a published version of the
 //! function", and an invocation naming none runs the unpublished version — so the
 //! `ResourceNotFoundException` for a request that resolves to nothing names the ARN the
-//! invocation ADDRESSED, spelled the way this service spells a function at a version:
-//! `Function not found: arn:aws:lambda:<region>:<account>:function:<name>[:<qualifier>]`,
-//! with the qualifier carried only when the request named one.** The
+//! invocation ADDRESSED, always QUALIFIED by the version it resolved:
+//! `Function not found: arn:aws:lambda:<region>:<account>:function:<name>:<qualifier>`, where
+//! the qualifier is the one the request named and `$LATEST` for a request that named none — the
+//! version such an invocation would have run and reported as its `ExecutedVersion`.** The
 //! fixed text is `Function not found: `; the variable part is built from the request — the
 //! function the name addresses, the Region the name named when it carried one, and the
-//! qualifier it resolved, whether that qualifier was named in the name or in the `Qualifier`
-//! parameter; a request that named neither is answered about the unqualified identifier it
-//! sent.
+//! qualifier it resolved, whether that qualifier was named in the name, in the `Qualifier`
+//! parameter or nowhere at all.
 //!
 //! The rows differ along what the rule generalises over: the documented `FunctionName` form
 //! the request addresses the function by (the bare name, the full ARN, the partial ARN, the
@@ -228,8 +228,8 @@ struct NotFoundRow {
     /// The `Qualifier` query parameter the request carries, if any.
     qualifier: Option<&'static str>,
     /// The qualifier the refused ARN must carry — the one the request named, in the name or
-    /// in the `Qualifier` parameter — absent for a request that named none, which is
-    /// answered about the unqualified identifier it sent.
+    /// in the `Qualifier` parameter — absent for a request that named none, which addressed
+    /// the unpublished version and is answered about that version's own label.
     resolved_qualifier: Option<&'static str>,
     /// Whether the reference names a Region this endpoint does not serve, which is settled
     /// BEFORE a version is: those rows resolve no resource to name and are refused on the
@@ -370,8 +370,8 @@ fn not_found_rows() -> Vec<NotFoundRow> {
     ]
 }
 
-/// RULE: `Invoke`'s `ResourceNotFoundException` names the ARN the invocation addressed,
-/// carrying a qualifier only when the request named one.
+/// RULE: `Invoke`'s `ResourceNotFoundException` names the ARN the invocation addressed, always
+/// qualified by the version it resolved.
 #[tokio::test]
 async fn the_invoke_refusal_names_the_qualified_arn_the_invocation_resolved() {
     let engine = Arc::new(engine::InMemoryEngine::new());
@@ -394,10 +394,10 @@ async fn the_invoke_refusal_names_the_qualified_arn_the_invocation_resolved() {
                 "arn:aws:lambda:{}:{ACCOUNT}:function:{}",
                 row.addressed_region, row.function
             );
-            match row.resolved_qualifier {
-                Some(qualifier) => format!("Function not found: {arn}:{qualifier}"),
-                None => format!("Function not found: {arn}"),
-            }
+            // A request that named no qualifier resolved the unpublished version, so that is
+            // the version the resource it addressed is qualified by.
+            let qualifier = row.resolved_qualifier.unwrap_or(LATEST);
+            format!("Function not found: {arn}:{qualifier}")
         };
         // The resolution happens before the invocation type is acted on, so every type is
         // refused the same way — including the asynchronous one, which never queues an

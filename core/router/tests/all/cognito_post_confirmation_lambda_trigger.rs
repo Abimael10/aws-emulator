@@ -45,6 +45,10 @@ const ZIP_FILE: &str = "UEsDBAoAAAAAAAAAAAA=";
 /// The local name of Cognito's Smithy shape, which is the `X-Amz-Target` prefix.
 const COGNITO_TARGET_PREFIX: &str = "AWSCognitoIdentityProviderService";
 
+/// The version an invocation that names no qualifier addresses, which Lambda's own
+/// `ResourceNotFoundException` qualifies the resource it could not find by.
+const LATEST: &str = "$LATEST";
+
 /// A password satisfying a default pool's password policy.
 const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
@@ -365,11 +369,14 @@ async fn a_confirmation_invokes_the_pools_post_confirmation_function() {
             // The refusal states the trigger and the error Lambda itself reported for the
             // function the pool named — both taken from the request's own pool and from
             // what Lambda answered. An INVOCATION's not-found refusal names the ARN the
-            // request addressed, and the trigger names no qualifier, so the unqualified ARN
-            // is what it names.
+            // request addressed AT the version it resolved, and the trigger names no
+            // qualifier, so the unpublished version's own label is what it carries.
             assert_eq!(
                 message(&answer),
-                format!("PostConfirmation failed with error Function not found: {configured}."),
+                format!(
+                    "PostConfirmation failed with error Function not found: \
+                     {configured}:{LATEST}."
+                ),
                 "case {case:?}: expected the trigger failure to name the function Lambda could \
                  not find, got {answer}"
             );
@@ -424,7 +431,7 @@ async fn every_confirming_operation_invokes_the_trigger() {
     );
     assert_eq!(
         message(&answer),
-        format!("PostConfirmation failed with error Function not found: {absent}."),
+        format!("PostConfirmation failed with error Function not found: {absent}:{LATEST}."),
         "case \"ConfirmSignUp with an absent trigger function\": expected the failure to name \
          the function, got {answer}"
     );
@@ -479,7 +486,7 @@ async fn every_confirming_operation_invokes_the_trigger() {
     );
     assert_eq!(
         message(&answer),
-        format!("PostConfirmation failed with error Function not found: {absent}."),
+        format!("PostConfirmation failed with error Function not found: {absent}:{LATEST}."),
         "case \"ConfirmForgotPassword with an absent trigger function\": expected the failure to \
          name the function, got {answer}"
     );

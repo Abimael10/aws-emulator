@@ -4297,11 +4297,14 @@ pub fn resolve_durable_execution<'a>(
 /// the resource they address is the same one: a refusal naming no single resolved ARN is
 /// what a client comparing it against the ARN it invoked cannot match.
 ///
-/// The ARN is spelled the way this service spells a function AT a version everywhere else
-/// ([`qualified_arn`]): the unqualified ARN for the unpublished version, and the
-/// `:<qualifier>`-suffixed one for a published version or an alias. So a request that named
-/// no qualifier is answered about the identifier it sent, with no qualifier appended that
-/// the caller never asked about.
+/// The ARN always CARRIES that qualifier, the unpublished version's label included: an
+/// invocation resolves a version to run whether or not the request named one, so the resource
+/// it addressed is `<function arn>:<version>` — `:$LATEST` for a request that named no
+/// qualifier, exactly as the invocation that resolved would have reported
+/// [`VERSION_LATEST`] as its `ExecutedVersion`. This is the ARN an invoking operation's
+/// refusal names, and it is not how a LOOKUP of a function spells the resource it could not
+/// find ([`qualified_arn`], which leaves the unpublished version unqualified): a lookup
+/// addresses the function, an invocation addresses the version it would have run.
 ///
 /// `None` is a `FunctionName` this operation resolves NO version for, so there is no
 /// resolved ARN to name and the refusal is the resolution's own: a value that names no
@@ -4339,9 +4342,9 @@ pub fn addressed_arn_of(
         .as_deref()
         .or(qualifier)
         .unwrap_or(VERSION_LATEST);
-    Some(qualified_arn(
-        &function_arn(region, &reference.name),
-        addressed,
+    Some(format!(
+        "{}:{addressed}",
+        function_arn(region, &reference.name)
     ))
 }
 

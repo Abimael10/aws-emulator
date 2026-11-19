@@ -1254,7 +1254,8 @@ const AGGREGATE_GROUP: &str = "/insights/results-aggregates";
 
 /// The events those cases aggregate, as `(offset from the base instant, message)` pairs:
 /// three events of one service, two of another, and one that names NO service — which is what
-/// makes a record the grouping key is unset on a case of its own: it joins no group.
+/// makes a record the grouping key is unset on a case of its own: it forms the group the
+/// aggregation reports with no key member.
 const AGGREGATE_EVENTS: [(i64, &str); 6] = [
     (1_000, r#"{"svc":"api","ms":10,"user":"u1"}"#),
     (2_000, r#"{"svc":"api","ms":20,"user":"u2"}"#),
@@ -1320,9 +1321,10 @@ async fn every_documented_stats_aggregate_is_computed_over_the_group() {
     .await;
     let produced = rows(&answer);
 
-    // One row per group, and the event naming no service forms none: a record carrying no
-    // value for the grouping key joins no group of the aggregation.
-    let expected: [(&str, Vec<(&str, &str)>); 2] = [
+    // One row per group, and the event naming no service forms the group reported with no
+    // `svc` member — ordered after every row that carries one, as a sort places a row whose
+    // key it cannot read.
+    let expected: [(&str, Vec<(&str, &str)>); 3] = [
         (
             "the three events of api",
             vec![
@@ -1349,6 +1351,18 @@ async fn every_documented_stats_aggregate_is_computed_over_the_group() {
                 ("p50", "100"),
             ],
         ),
+        (
+            "the one event naming no service",
+            vec![
+                ("n", "1"),
+                ("total", "5"),
+                ("mean", "5"),
+                ("fastest", "5"),
+                ("slowest", "5"),
+                ("users", "1"),
+                ("p50", "5"),
+            ],
+        ),
     ];
     assert_eq!(
         produced.len(),
@@ -1368,12 +1382,12 @@ async fn every_documented_stats_aggregate_is_computed_over_the_group() {
     }
 }
 
-/// RULE: an aggregation groups only the records its grouping key is DEFINED on — a record
-/// carrying no value for the key joins no group and contributes to no aggregate — while a
+/// RULE: an aggregation groups EVERY record — a record carrying no value for the grouping key
+/// forms the group whose row omits that key, and its values are aggregated there — while a
 /// record whose key is present and EMPTY text keeps a group of its own, so "the field is
 /// missing" is told apart from "the field is present and empty".
 #[tokio::test]
-async fn a_record_with_no_value_for_the_grouping_key_joins_no_group() {
+async fn a_record_with_no_value_for_the_grouping_key_forms_the_keyless_group() {
     let logs = Logs::new();
     const GROUP_KEYS: &str = "/insights/results-group-keys";
     // One event carrying a value, one carrying EMPTY text under the same field, and one
@@ -1399,32 +1413,41 @@ async fn a_record_with_no_value_for_the_grouping_key_joins_no_group() {
     let produced = rows(&answer);
     assert_eq!(
         produced.len(),
-        2,
-        "case {case:?}: the event carrying no svc forms no group, so only the value and the \
-         empty text do, got {produced:?}"
+        3,
+        "case {case:?}: the value, the empty text and the absent field each form a group, got \
+         {produced:?}"
     );
 
-    // No row stands for the records the key is unset on: neither one missing the `svc` member
-    // nor one whose aggregates cover the event that carries no `svc`.
+    // ONE row stands for the records the key is unset on, and it carries no `svc` member at
+    // all: the group of the records that have no value for the key.
     let keyless: Vec<&BTreeMap<String, String>> = produced
         .iter()
         .filter(|row| !row.contains_key("svc"))
         .collect();
-    assert!(
-        keyless.is_empty(),
-        "case {case:?}: no group holds the records with no value for the key, got {produced:?}"
+    assert_eq!(
+        keyless.len(),
+        1,
+        "case {case:?}: the records with no value for the key form one group reporting no svc, \
+         got {produced:?}"
+    );
+    assert_eq!(
+        value(keyless[0], "total"),
+        "3",
+        "case {case:?}: that group aggregates the event carrying no svc, got {:?}",
+        keyless[0]
     );
     let summed: f64 = produced
         .iter()
         .map(|row| value(row, "total").parse::<f64>().unwrap_or(0.0))
         .sum();
     assert_eq!(
-        summed, 3.0,
-        "case {case:?}: only the two grouped events are aggregated (1 + 2), got {produced:?}"
+        summed, 6.0,
+        "case {case:?}: every event is aggregated in some group (1 + 2 + 3), got {produced:?}"
     );
 
     // The record carrying EMPTY text under the field is a group of its own, keyed by that
-    // empty text — which is why the keyless group may not report one.
+    // empty text — which is what tells it apart from the group of the records that carry no
+    // value for the key at all.
     let empty: Vec<&BTreeMap<String, String>> = produced
         .iter()
         .filter(|row| row.get("svc").is_some_and(String::is_empty))
@@ -1521,9 +1544,14 @@ async fn the_spread_of_a_groups_values_is_computed_over_the_group() {
     let produced = rows(&answer);
 
     // Hand-computed from [`AGGREGATE_EVENTS`]: api holds 10, 20 and 30 around a mean of 20,
-    // and db holds 100 and 300 around a mean of 200. The event naming no service forms no
-    // group, so there is no third spread to report.
-    let expected: [(&str, f64); 2] = [("api", (200.0f64 / 3.0).sqrt()), ("db", 100.0)];
+    // and db holds 100 and 300 around a mean of 200. The event naming no service forms the
+    // group reported with no `svc` member — one value, so its spread is zero — ordered after
+    // the rows a sort can read its key on.
+    let expected: [(&str, f64); 3] = [
+        ("api", (200.0f64 / 3.0).sqrt()),
+        ("db", 100.0),
+        ("the events naming no service", 0.0),
+    ];
     assert_eq!(
         produced.len(),
         expected.len(),

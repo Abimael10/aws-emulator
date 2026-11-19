@@ -216,12 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetTrustedEntitySetOutput {
             name: set.name.clone(),
             format: set.format.clone(),
-            // "The URI of the file that contains the trusted entity set": the stored
-            // list object, announced at the endpoint this emulator is reached at so
-            // the advertised list can actually be fetched from it — the one
+            // "The URI of the file that contains the trusted entity set": the URI the
+            // create or update supplied, reported back as it was stored — the one
             // projection every uploaded-list read-back shares
             // ([`crate::state::announced_list_location`]).
-            location: crate::state::announced_list_location(ctx, &set.location),
+            location: crate::state::announced_list_location(&set.location),
             expected_bucket_owner: set.expected_bucket_owner.clone(),
             status: set.status.clone(),
             // Projected through the ONE tag-map rule every read of this service

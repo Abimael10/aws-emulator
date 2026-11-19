@@ -2,21 +2,22 @@
 
 //! The GRANULARITY a stored datapoint is read at, end to end over the wire.
 //!
-//! ONE rule, asserted over a table: **a read answers a series only at a period the series is
-//! STORED at or coarser — "Setting this to 1 specifies this metric as a high-resolution metric,
-//! so that CloudWatch stores the metric with sub-minute resolution down to one second. Setting
-//! this to 60 specifies this metric as regular resolution, which CloudWatch stores at 1-minute
-//! resolution."
+//! ONE rule, asserted over a table: **a read answers a series at the granularity the series is
+//! STORED at, never at a finer one — "Setting this to 1 specifies this metric as a
+//! high-resolution metric, so that CloudWatch stores the metric with sub-minute resolution down
+//! to one second. Setting this to 60 specifies this metric as regular resolution, which
+//! CloudWatch stores at 1-minute resolution."
 //! (`smithy_query(query="doc",shape="MetricDatum",member="StorageResolution")`) — so a
-//! regular-resolution series holds no sub-minute detail at all and a sub-minute-period read over
-//! it answers with NO datapoint, while the same read over its high-resolution twin
-//! (`StorageResolution` 1) answers with the sub-minute buckets it asked for. At a period of a
-//! minute or more the two cannot differ: a high-resolution series is folded up into the window
-//! the read asked for, and a regular-resolution one is read at the minute it is stored in.**
+//! sub-minute-period read over a regular-resolution series is answered with that series bucketed
+//! by the MINUTE it is stored in (every instant it reports is a whole minute, however short the
+//! period asked for), while the same read over its high-resolution twin (`StorageResolution` 1)
+//! answers with the sub-minute buckets it asked for. At a period of a minute or more the two
+//! cannot differ: a high-resolution series is folded up into the window the read asked for, and a
+//! regular-resolution one is read at the minute it is stored in.**
 //!
-//! A read cannot report detail finer than the resolution the data is stored at, and it is not
-//! served a coarser datapoint in place of one: the storage granularity is part of what a read
-//! selects by. `StorageResolution` is optional and "if you omit this, the default of 60 is
+//! A read cannot report detail finer than the resolution the data is stored at, but it is not
+//! refused and not answered with nothing either: the datapoint is served at the start of the span
+//! it IS stored in. `StorageResolution` is optional and "if you omit this, the default of 60 is
 //! used", so an omitted member reads exactly like 60.
 //!
 //! The rows differ along what the rule generalises over: the resolution the series was published
@@ -69,15 +70,21 @@ struct Row {
     buckets: &'static [(f64, f64)],
 }
 
+/// The `(offset from the base, SampleCount)` buckets a read over a REGULAR-resolution series
+/// answers with, whatever sub-minute period it asks for: the two observations of the first minute
+/// fold into that minute, and the third into the next one, because the series holds no finer
+/// detail than the minute it is stored at.
+const BY_THE_MINUTE: &[(f64, f64)] = &[(0.0, 2.0), (60.0, 1.0)];
+
 /// The table: one row per shape the rule generalises over.
 const ROWS: &[Row] = &[
     Row {
-        // The recorded case: a regular-resolution series read at a sub-minute period answers
-        // with NOTHING — the series was never stored at that granularity.
+        // The recorded case: a regular-resolution series read at a sub-minute period is accepted
+        // and answered with the series bucketed by the minute it is stored in.
         case: "regular resolution read at ten seconds",
         storage_resolution: Some(60),
         period: 10,
-        buckets: &[],
+        buckets: BY_THE_MINUTE,
     },
     Row {
         // The same series published at high resolution: the sub-minute detail is stored, so the
@@ -93,13 +100,13 @@ const ROWS: &[Row] = &[
         case: "an omitted StorageResolution read at ten seconds",
         storage_resolution: None,
         period: 10,
-        buckets: &[],
+        buckets: BY_THE_MINUTE,
     },
     Row {
         case: "regular resolution read at one second",
         storage_resolution: Some(60),
         period: 1,
-        buckets: &[],
+        buckets: BY_THE_MINUTE,
     },
     Row {
         case: "high resolution read at one second",
@@ -111,13 +118,13 @@ const ROWS: &[Row] = &[
         case: "regular resolution read at five seconds",
         storage_resolution: Some(60),
         period: 5,
-        buckets: &[],
+        buckets: BY_THE_MINUTE,
     },
     Row {
         case: "regular resolution read at twenty seconds",
         storage_resolution: Some(60),
         period: 20,
-        buckets: &[],
+        buckets: BY_THE_MINUTE,
     },
     Row {
         case: "high resolution read at twenty seconds",
@@ -132,7 +139,7 @@ const ROWS: &[Row] = &[
         case: "regular resolution read at thirty seconds",
         storage_resolution: Some(60),
         period: 30,
-        buckets: &[],
+        buckets: BY_THE_MINUTE,
     },
     Row {
         // At a one-minute period the two resolutions cannot differ: the window IS the minute the
@@ -339,9 +346,10 @@ async fn a_range_inside_one_minute_holds_a_datapoint_published_inside_it_at_eith
     // either resolution: a range opening forty seconds into a minute holds an observation
     // published fifty seconds into it — the second it is stored in for a high-resolution
     // series, and the minute it is stored in for a regular-resolution one. What the resolution
-    // decides is the PERIOD such a read may ask for: the sub-minute period reads the second the
-    // observation was published at where that detail is stored, and answers nothing where it is
-    // not, while the minute the series IS stored at still holds the observation.
+    // decides is where the datapoint is REPORTED: the sub-minute period reads the second the
+    // observation was published at where that detail is stored, and the whole minute the series
+    // is stored at where it is not — an instant that may precede the range's own start, that
+    // minute having no other instant to be reported at.
     let router = build_router();
     let base = base_time();
 
@@ -350,7 +358,13 @@ async fn a_range_inside_one_minute_holds_a_datapoint_published_inside_it_at_eith
     //  or `None` for a read the series has no datapoint for)
     for (case, resolution, period, from, reported_at) in [
         ("high resolution read at ten seconds", 1, 10, 40.0, Some(50.0)),
-        ("regular resolution read at ten seconds", 60, 10, 40.0, None),
+        (
+            "regular resolution read at ten seconds",
+            60,
+            10,
+            40.0,
+            Some(0.0),
+        ),
         (
             "regular resolution read at the minute it is stored at",
             60,
@@ -414,11 +428,12 @@ async fn a_range_inside_one_minute_holds_a_datapoint_published_inside_it_at_eith
 
 #[tokio::test]
 async fn an_alarm_grades_a_regular_resolution_series_by_the_minute() {
-    // The alarm evaluation reads the same series the readers above do, so it selects by the same
-    // granularity: an alarm with a sub-minute period grades the observations of one minute only
-    // where the series is stored at that resolution, and sees no datapoint at all otherwise —
-    // "Be sure to specify 10 or 30 only for metrics that are stored by a PutMetricData call with
-    // a StorageResolution of 1" (`MetricAlarm$Period`).
+    // The alarm evaluation reads the same series the readers above do, so it buckets by the same
+    // granularity: an alarm with a sub-minute period over a series stored at regular resolution
+    // grades the observations of one minute as ONE window, and only a series stored at that
+    // resolution has a window per sub-minute bucket — "Be sure to specify 10 or 30 only for
+    // metrics that are stored by a PutMetricData call with a StorageResolution of 1"
+    // (`MetricAlarm$Period`).
     let router = build_router();
     // The previous whole minute: both observations below are stamped inside it and in the past,
     // so each falls in a ten-second bucket of its own and both fall in one minute, whatever

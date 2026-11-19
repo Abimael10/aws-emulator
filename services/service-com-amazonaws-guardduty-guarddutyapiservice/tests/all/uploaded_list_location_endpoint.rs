@@ -21,10 +21,10 @@
 //!    nothing. The rule is the uploaded-list FAMILY's, so the rows span all four
 //!    families — the IPSet, the threat list and the two entity sets — on the create
 //!    that stores a location.
-//! 2. A read-back ANNOUNCES the stored list object at the endpoint this emulator is
-//!    reached at: the same bucket and key the create named, addressed path-style
-//!    beneath the host the read arrived on, so the advertised list is fetchable from
-//!    the emulator rather than from a host it does not serve.
+//! 2. A read-back reports the `Location` the create or the update SUBMITTED, character
+//!    for character — it addresses an object of another service's storage, which
+//!    GuardDuty only records — whatever endpoint the read itself arrives at, so the
+//!    value a caller round-trips is its own.
 //! 3. A change to a list whose own delete has already been accepted collides with
 //!    work in flight rather than naming an absent resource, so `UpdateIPSet` and
 //!    `UpdateThreatIntelSet` refuse it under the `InternalServerErrorException` class
@@ -111,15 +111,13 @@ fn families() -> Vec<Family> {
     ]
 }
 
-/// One `Location` case: the location a create carries, whether the service may store it
-/// and — when it may — the `bucket/key` object that location addresses, which is what a
-/// read-back must announce beneath the emulator's own endpoint. Every row is sent to
+/// One `Location` case: the location a create carries and whether the service may store
+/// it — and, when it may, a read-back reports that same value back. Every row is sent to
 /// each of [`endpoints`].
 struct LocationCase {
     why: &'static str,
     location: String,
     accepted: bool,
-    object: &'static str,
 }
 
 /// The locations, spanning what the rule generalises over: the SPELLING of the S3
@@ -139,73 +137,61 @@ fn location_cases() -> Vec<LocationCase> {
             why: "an s3:// URL",
             location: "s3://my-bucket/lists/trusted.txt".to_string(),
             accepted: true,
-            object: "my-bucket/lists/trusted.txt",
         },
         LocationCase {
             why: "a path-style public S3 endpoint",
             location: "https://s3.eu-west-1.amazonaws.com/my-bucket/lists/trusted.txt".to_string(),
             accepted: true,
-            object: "my-bucket/lists/trusted.txt",
         },
         LocationCase {
             why: "a virtual-hosted-style public S3 endpoint",
             location: "https://my-bucket.s3.us-west-2.amazonaws.com/lists/trusted.txt".to_string(),
             accepted: true,
-            object: "my-bucket/lists/trusted.txt",
         },
         LocationCase {
             why: "an object URL on a loopback endpoint with a port",
             location: format!("https://{LOOPBACK_ENDPOINT}/my-bucket/lists/trusted.txt"),
             accepted: true,
-            object: "my-bucket/lists/trusted.txt",
         },
         LocationCase {
             why: "an object URL on a named endpoint with a port",
             location: format!("https://{NAMED_ENDPOINT}/my-bucket/trusted.txt"),
             accepted: true,
-            object: "my-bucket/trusted.txt",
         },
         LocationCase {
             why: "an object URL on that endpoint with a deep key",
             location: format!("https://{NAMED_ENDPOINT}/my-bucket/lists/2026/03/trusted.txt"),
             accepted: true,
-            object: "my-bucket/lists/2026/03/trusted.txt",
         },
         LocationCase {
             why: "an object URL on an endpoint naming no port",
             location: "https://gd-endpoint.internal/my-bucket/trusted.txt".to_string(),
             accepted: true,
-            object: "my-bucket/trusted.txt",
         },
         LocationCase {
             why: "an object URL over http rather than https",
             location: format!("http://{LOOPBACK_ENDPOINT}/my-bucket/trusted.txt"),
             accepted: true,
-            object: "my-bucket/trusted.txt",
         },
         LocationCase {
             why: "an object URL on an unrelated host",
             location: "https://files.example-corp.com/my-bucket/trusted.txt".to_string(),
             accepted: true,
-            object: "my-bucket/trusted.txt",
         },
         LocationCase {
             why: "an object URL naming only a bucket",
             location: format!("https://{LOOPBACK_ENDPOINT}/my-bucket"),
             accepted: false,
-            object: "",
         },
         LocationCase {
             why: "an object URL with an empty key",
             location: format!("https://{LOOPBACK_ENDPOINT}/my-bucket/"),
             accepted: false,
-            object: "",
         },
         LocationCase {
             why: "a value that is no URL at all",
             location: "this is not a valid s3 uri or arn".to_string(),
             accepted: false,
-            object: "",
         },
     ]
 }
@@ -273,29 +259,6 @@ async fn read(router: &Router, detector_id: &str, family: &Family, id: &str) -> 
     body
 }
 
-/// The base a read-back announces the stored list object beneath, for a read that
-/// arrived at `endpoint`.
-///
-/// A client configured with one local endpoint URL resolves nothing else, so it is
-/// handed back the very address it is already talking to; a caller that resolves AWS's
-/// own hostnames — which every published GuardDuty endpoint is — is handed the address
-/// this process is served at, which for an emulator served on no port at all is the
-/// base the runtime reports for one
-/// ([`smithy_server_runtime::UNSERVED_URL_BASE`]).
-fn announced_base(endpoint: &str) -> String {
-    match endpoint == PUBLIC_ENDPOINT {
-        true => smithy_server_runtime::UNSERVED_URL_BASE.to_string(),
-        false => format!("https://{endpoint}"),
-    }
-}
-
-/// The `Location` a read arriving at `endpoint` must announce for the stored object
-/// `object` (`bucket/key`): that object, addressed path-style beneath the address the
-/// emulator is reached at.
-fn announced_location(endpoint: &str, object: &str) -> String {
-    format!("{}/{object}", announced_base(endpoint))
-}
-
 // ---------------------------------------------------------------------------
 // Rule 1: a Location addresses an object at an S3 endpoint, whichever one.
 // ---------------------------------------------------------------------------
@@ -336,21 +299,19 @@ async fn a_location_is_accepted_exactly_when_it_addresses_an_object_at_any_s3_en
                         .as_str()
                         .unwrap_or_else(|| panic!("case {case:?}: expected an id, got {body:?}"))
                         .to_string();
-                    // The SAME object, announced at the address the read arrived at:
-                    // the bucket and key the create named, path-style beneath this
-                    // emulator's own endpoint, whichever of them the caller submitted
-                    // its location on. Asserted at every endpoint a read can arrive
-                    // at, so the announced host follows the READ and not the create.
+                    // The SAME value the create submitted, read back at every endpoint
+                    // a read can arrive at: the URI is the caller's own record of an
+                    // object in another service, so neither the endpoint it names nor
+                    // the one the read landed on changes it.
                     for read_endpoint in endpoints() {
                         let stored =
                             read_at(&router, read_endpoint, &detector_id, &family, &id).await;
                         let reported = stored["location"].as_str().unwrap_or_default();
-                        let expected = announced_location(read_endpoint, row.object);
                         assert_eq!(
-                            reported, expected,
-                            "case {case:?}: a read at {read_endpoint} must announce the \
-                             stored object at the emulator's own endpoint, expected \
-                             {expected:?}, got {reported:?}"
+                            reported, row.location,
+                            "case {case:?}: a read at {read_endpoint} must report the \
+                             submitted location, expected {:?}, got {reported:?}",
+                            row.location
                         );
                     }
                 } else {
@@ -447,7 +408,7 @@ async fn an_update_reads_a_location_by_its_own_syntax_whatever_endpoint_it_arriv
             let kept = read(&router, &detector_id, &family, &id).await;
             assert_eq!(
                 kept["location"].as_str(),
-                Some(announced_location(PUBLIC_ENDPOINT, "my-bucket/lists/stored.txt").as_str()),
+                Some(stored_location),
                 "case {case:?}: a refused update must keep the stored location, got {kept:?}"
             );
 
@@ -469,10 +430,8 @@ async fn an_update_reads_a_location_by_its_own_syntax_whatever_endpoint_it_arriv
             let after = read(&router, &detector_id, &family, &id).await;
             assert_eq!(
                 after["location"].as_str(),
-                Some(
-                    announced_location(PUBLIC_ENDPOINT, "other-bucket/lists/new.txt").as_str()
-                ),
-                "case {case:?}: expected the updated object announced back, got {after:?}"
+                Some(object_url.as_str()),
+                "case {case:?}: expected the updated location read back, got {after:?}"
             );
         }
     }

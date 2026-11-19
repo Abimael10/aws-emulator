@@ -838,7 +838,7 @@ async fn every_code_issuing_stage_invokes_the_pools_custom_sender() {
         );
         assert_eq!(
             message(&answer),
-            format!("CustomEmailSender failed with error Function not found: {absent}."),
+            format!("CustomEmailSender failed with error Function not found: {absent}:$LATEST."),
             "case {case:?}: expected the failure to name the trigger and what Lambda answered, \
              got {answer}"
         );

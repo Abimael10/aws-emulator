@@ -923,7 +923,7 @@ async fn a_failing_pre_sign_up_function_registers_nobody() {
             &absent_client,
             vec![],
             "UnexpectedLambdaException",
-            format!("PreSignUp failed with error Function not found: {absent}."),
+            format!("PreSignUp failed with error Function not found: {absent}:$LATEST."),
         ),
     ];
 
