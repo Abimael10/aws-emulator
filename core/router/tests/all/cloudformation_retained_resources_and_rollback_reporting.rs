@@ -29,6 +29,14 @@
 //! ask, and AWS Systems Manager is what still holds (or no longer holds) the parameter — so
 //! the suite lives here rather than in either crate.
 //!
+//! The create the retention rows ROLL BACK is failed by a resource AWS Systems Manager
+//! REFUSES — a `Value` its own declared `AllowedPattern` does not admit — declared behind the
+//! resource whose `DeletionPolicy` the row is about. The walk therefore reaches the refusal
+//! once it has created the resource the rollback has to decide about, and the failure falls
+//! when the owning service answers rather than when a span runs out: what each row reads back
+//! is decided by the policies and by nothing about how fast the host ran. The `Timeout` that
+//! runs out below is rule 2's own subject, and only those rows declare one.
+//!
 //! The rows span what each rule generalises over: every value `DeletionPolicy` takes
 //! (absent, `Delete`, `Retain`, `RetainExceptOnCreate`) against both teardowns (the stack's
 //! deletion and a rolled-back create), how many resources one failure leaves unfinished (one,
@@ -270,6 +278,52 @@ fn parameter_resource(name: &str, policy: Option<&str>) -> Value {
     declaration
 }
 
+/// The `AllowedPattern` the declaration every retention row's create FAILS at carries —
+/// "a regular expression used to validate the parameter value"
+/// (`AWS::SSM::Parameter$AllowedPattern`, which `PutParameter` takes under the same name).
+const DIGITS_ONLY: &str = "^[0-9]+$";
+
+/// ...and the `Value` that declaration asks for, which [`DIGITS_ONLY`] does not admit: AWS
+/// Systems Manager refuses such a put, so the resource's creation fails the moment the walk
+/// reaches it rather than when any clock runs out.
+const NOT_DIGITS: &str = "not a number";
+
+/// The logical id of the resource whose `DeletionPolicy` a retention row is about, which is
+/// the one the rollback has to decide what to do with.
+const HELD: &str = "Held";
+
+/// The logical id of the resource AWS Systems Manager refuses, which is what FAILS the create
+/// the retention rows roll back.
+const REFUSED: &str = "Refused";
+
+/// The template one retention row deploys to have it ROLLED BACK: the parameter whose
+/// `DeletionPolicy` the row is about, and behind it one whose creation that service refuses.
+///
+/// The refused declaration `DependsOn` the held one, so the ORDER is the template's: "when you
+/// add a `DependsOn` attribute to a resource, that resource is created only after the creation
+/// of the resource specified in the attribute". The create has therefore made the resource the
+/// rollback decides about before it reaches the refusal, whatever the host's speed — and the
+/// refusal is an answer from the owning service rather than a span expiring, so nothing about
+/// the row's outcome is on the clock.
+fn rolled_back_template(parameter: &str, policy: Option<&str>, refused: &str) -> String {
+    let mut resources = serde_json::Map::new();
+    resources.insert(HELD.to_string(), parameter_resource(parameter, policy));
+    resources.insert(
+        REFUSED.to_string(),
+        json!({
+            "Type": "AWS::SSM::Parameter",
+            "DependsOn": HELD,
+            "Properties": {
+                "Name": refused,
+                "Type": "String",
+                "AllowedPattern": DIGITS_ONLY,
+                "Value": NOT_DIGITS,
+            },
+        }),
+    );
+    json!({ "Resources": Value::Object(resources) }).to_string()
+}
+
 /// The status a resource's LAST event reports, which is what became of it.
 fn last_status_of(events: &[WireEvent], logical_id: &str) -> Option<String> {
     events
@@ -336,10 +390,9 @@ async fn a_retaining_deletion_policy_keeps_its_resource_when_the_stack_is_delete
         let case = row.case;
         let stack_name = format!("retain-on-delete-{index}");
         let parameter = format!("/retain-on-delete-{index}/kept");
-        let template = json!({
-            "Resources": { "Held": parameter_resource(&parameter, row.policy) },
-        })
-        .to_string();
+        let mut resources = serde_json::Map::new();
+        resources.insert(HELD.to_string(), parameter_resource(&parameter, row.policy));
+        let template = json!({ "Resources": Value::Object(resources) }).to_string();
 
         let (status, created) = cloudformation(
             &router,
@@ -376,7 +429,7 @@ async fn a_retaining_deletion_policy_keeps_its_resource_when_the_stack_is_delete
 
         let events = events_of(&router, case, &stack_id).await;
         let (expected_status, survives) = row.on_delete;
-        let last = last_status_of(&events, "Held");
+        let last = last_status_of(&events, HELD);
         assert_eq!(
             last.as_deref(),
             Some(expected_status),
@@ -392,6 +445,14 @@ async fn a_retaining_deletion_policy_keeps_its_resource_when_the_stack_is_delete
     }
 }
 
+/// RULE 1 on the one teardown `RetainExceptOnCreate` reads differently from every other: the
+/// ROLLBACK of the create that made the resource.
+///
+/// The create is failed by the resource declared BEHIND the held one, whose creation AWS
+/// Systems Manager refuses — so the walk has created the resource the rollback decides about
+/// before the failure, and that failure is the owning service's answer rather than a span
+/// running out. Nothing here waits for a span to pass: the one wait is for the stack to report
+/// a terminal status, looked at again until it does ([`settled_stack_status`]).
 #[tokio::test]
 async fn a_rolled_back_create_keeps_only_what_its_resources_policies_retain() {
     let router = build_router();
@@ -399,24 +460,10 @@ async fn a_rolled_back_create_keeps_only_what_its_resources_policies_retain() {
         let case = row.case;
         let stack_name = format!("retain-on-rollback-{index}");
         let parameter = format!("/retain-on-rollback-{index}/made");
-        // The parameter is created BEFORE the gate that fails the create, so the rollback has
-        // a resource of this create's own to decide about.
-        let template = json!({
-            "Resources": {
-                "Held": parameter_resource(&parameter, row.policy),
-                "Handle": { "Type": "AWS::CloudFormation::WaitConditionHandle" },
-                "Gate": {
-                    "Type": "AWS::CloudFormation::WaitCondition",
-                    "DependsOn": "Held",
-                    "Properties": {
-                        "Handle": { "Ref": "Handle" },
-                        "Timeout": EXPIRING_TIMEOUT,
-                        "Count": "1",
-                    },
-                },
-            },
-        })
-        .to_string();
+        let refused = format!("/retain-on-rollback-{index}/refused");
+        // The held parameter is created BEFORE the declaration that fails the create, so the
+        // rollback has a resource of this create's own to decide about.
+        let template = rolled_back_template(&parameter, row.policy, &refused);
 
         let (status, created) = cloudformation(
             &router,
@@ -431,12 +478,41 @@ async fn a_rolled_back_create_keeps_only_what_its_resources_policies_retain() {
         let reached = settled_stack_status(&router, case, &stack_name).await;
         assert_eq!(
             reached, "ROLLBACK_COMPLETE",
-            "case {case:?}: expected the create whose wait ran out to roll back, got {reached:?}"
+            "case {case:?}: expected the create whose resource was refused to roll back, got \
+             {reached:?}"
         );
 
         let events = events_of(&router, case, &stack_name).await;
+        // The create failed WHERE the row meant it to: on the declaration the owning service
+        // refused, whose own event quotes that refusal — so what follows is read off the
+        // rollback of a create that reached the resource it was meant to fail at.
+        let refusal = events
+            .iter()
+            .find(|event| event.logical_id == REFUSED && event.status == "CREATE_FAILED")
+            .and_then(|event| event.status_reason.clone());
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains(DIGITS_ONLY)),
+            "case {case:?}: expected {REFUSED} to report a CREATE_FAILED naming the pattern \
+             {DIGITS_ONLY} it could not satisfy, got {refusal:?} in {events:?}"
+        );
+        let position_of = |logical_id: &str, status: &str| {
+            events
+                .iter()
+                .position(|event| event.logical_id == logical_id && event.status == status)
+        };
+        let made = position_of(HELD, "CREATE_COMPLETE");
+        let failed = position_of(REFUSED, "CREATE_FAILED");
+        assert!(
+            made.zip(failed).is_some_and(|(made, failed)| made < failed),
+            "case {case:?}: expected {HELD} to be CREATE_COMPLETE before {REFUSED} failed, so \
+             the rollback had a resource of this create's own to decide about, got {made:?} and \
+             {failed:?} in {events:?}"
+        );
+
         let (expected_status, survives) = row.on_rolled_back_create;
-        let last = last_status_of(&events, "Held");
+        let last = last_status_of(&events, HELD);
         assert_eq!(
             last.as_deref(),
             Some(expected_status),
