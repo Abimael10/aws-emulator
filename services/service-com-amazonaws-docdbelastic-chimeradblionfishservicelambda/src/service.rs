@@ -52,6 +52,8 @@
 //!   failure alike — announces as the JSON media type the REQUEST named for its own
 //!   payload, defaulting to this service's native AWS JSON 1.1 media type when the
 //!   request carried no payload, where the renderers always announce the generic
+//!   `application/json`; the ARN-addressed tagging surface (`/tags/{resourceArn}`) is the
+//!   one surface that does not negotiate and announces every payload as the generic
 //!   `application/json` ([`json_media_type`]).
 //!
 //! Each lives in its own module, and both are applied at the two layers every response of

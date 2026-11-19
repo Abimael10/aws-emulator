@@ -8,6 +8,14 @@
 //! and so named none — the same media type for a success and for a refusal of one
 //! request, whatever the operation and whatever the status.
 //!
+//! The ARN-ADDRESSED TAGGING SURFACE is the one surface that does not negotiate: every
+//! response of the three operations bound to `/tags/{resourceArn}` — `TagResource`,
+//! `UntagResource` and `ListTagsForResource`, the only operations of this service bound
+//! under `/tags` (`smithy_query(query="digest")`) — announces its JSON payload as the
+//! generic `application/json`, whatever media type the request named and whatever the
+//! status. The last suite below is that rule; the tables above it stay scoped to this
+//! service's own resource operations.
+//!
 //! The rule generalises over the media type the request names, over the operation, over
 //! the status class and over the layer that rendered the response, so the tables below
 //! span: requests naming no media type, the generic JSON one, a parameterised one, an
@@ -35,9 +43,11 @@ const ACCOUNT: &str = "000000000000";
 const DEFAULT_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
 
 /// The media type a request carrying a JSON payload names for it, and so the one its
-/// answer is announced with.
+/// answer is announced with — and the one the ARN-addressed tagging surface announces
+/// every payload with, whatever the request named.
 ///
-/// Recorded AWS behavior for a request that names it (a create, an update).
+/// Recorded AWS behavior for a request that names it (a create, an update), and for every
+/// response of the tagging surface.
 const GENERIC_JSON: &str = "application/json";
 
 /// A SigV4 `Authorization` header for this service in [`REGION`].
@@ -256,13 +266,6 @@ async fn a_request_naming_no_media_type_is_answered_in_this_services_own() {
             case: "DeleteClusterSnapshot of an absent snapshot (404)",
             method: "DELETE",
             path: format!("/cluster-snapshot/{}", label(&absent_snapshot)),
-            body: None,
-            status: 404,
-        },
-        Answer {
-            case: "ListTagsForResource of an absent resource (404)",
-            method: "GET",
-            path: format!("/tags/{}", label(&absent_cluster)),
             body: None,
             status: 404,
         },
@@ -504,5 +507,131 @@ async fn the_announced_media_type_does_not_change_the_payload() {
         updated["cluster"]["shardCount"].as_i64(),
         Some(2),
         "case \"an update\": the payload must be the changed cluster, got {updated}"
+    );
+}
+
+/// One operation of the ARN-addressed tagging surface, as it addresses an ARN on the wire.
+///
+/// `tags` travels in the BODY of `TagResource` and `tagKeys` as repeated `@httpQuery`
+/// parameters of `UntagResource`, so each row carries its own path and body builder
+/// (`smithy_query(query="operation",
+/// operation="TagResource,UntagResource,ListTagsForResource")`).
+struct TagCall {
+    operation: &'static str,
+    method: &'static str,
+    path: fn(&str) -> String,
+    body: fn() -> Option<Value>,
+}
+
+/// All three operations bound to `/tags/{resourceArn}`, which are the whole tagging
+/// surface of this service (`smithy_query(query="digest")`).
+fn tag_calls() -> Vec<TagCall> {
+    vec![
+        TagCall {
+            operation: "TagResource",
+            method: "POST",
+            path: |arn| format!("/tags/{}", label(arn)),
+            body: || Some(json!({"tags": {"Project": "lionfish"}})),
+        },
+        TagCall {
+            operation: "UntagResource",
+            method: "DELETE",
+            path: |arn| format!("/tags/{}?tagKeys=Project", label(arn)),
+            body: || None,
+        },
+        TagCall {
+            operation: "ListTagsForResource",
+            method: "GET",
+            path: |arn| format!("/tags/{}", label(arn)),
+            body: || None,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn the_tagging_surface_announces_the_generic_json_media_type() {
+    // The rows span all three tagging operations, the media types a request can name for
+    // its own payload (including naming none and naming one that is not JSON), and both
+    // status classes: a success against an ARN this emulator holds, and the 404 against
+    // one it holds nothing under. The recorded case — one tag read of an ARN no resource
+    // carries — is one row of it.
+    let router = emulator();
+    let held = create_cluster(&router, "generically-announced").await;
+    let unheld = format!(
+        "arn:aws:docdb-elastic:{REGION}:{ACCOUNT}:cluster/00000000-0000-0000-0000-000000000000"
+    );
+
+    let named: Vec<(&str, Option<&str>)> = vec![
+        ("naming no media type", None),
+        ("naming the generic JSON media type", Some(GENERIC_JSON)),
+        ("naming this service's own", Some(DEFAULT_MEDIA_TYPE)),
+        ("naming another AWS JSON version", Some("application/x-amz-json-1.0")),
+        ("naming a media type that is not JSON", Some("application/xml")),
+    ];
+
+    let mut announced = BTreeSet::new();
+    for (named_case, request_media_type) in named {
+        for tag_call in tag_calls() {
+            for (addressed, arn, expected_status) in [
+                ("an ARN this emulator holds", held.as_str(), 200),
+                ("an ARN no resource carries", unheld.as_str(), 404),
+            ] {
+                let case = format!("{} {named_case} / {addressed}", tag_call.operation);
+                let (status, media_type, body) = call(
+                    &router,
+                    tag_call.method,
+                    &(tag_call.path)(arn),
+                    (tag_call.body)(),
+                    request_media_type,
+                )
+                .await;
+                assert_eq!(
+                    status, expected_status,
+                    "case {case:?}: expected HTTP {expected_status}, got {status} with {body}"
+                );
+                // Every answer of this surface carries a JSON payload to announce: the
+                // tag read answers its `tags` map, a refusal its error envelope, and a
+                // tag write — whose output models no members at all — still answers the
+                // empty JSON object. So each row is asserted to carry one, rather than
+                // the row being let off whenever the implementation answered none.
+                assert!(
+                    !body.is_null(),
+                    "case {case:?}: expected a JSON payload to announce, got an empty body"
+                );
+                assert_eq!(
+                    media_type.as_deref(),
+                    Some(GENERIC_JSON),
+                    "case {case:?}: expected {GENERIC_JSON:?}, got {media_type:?}"
+                );
+                announced.insert(media_type.unwrap_or_default());
+            }
+        }
+    }
+
+    assert_eq!(
+        announced,
+        [GENERIC_JSON.to_string()].into_iter().collect(),
+        "case \"the whole tagging surface\": one media type must serve every payload it \
+         answers, got {announced:?}"
+    );
+
+    // A refusal the FRAMEWORK raises on that route before any handler runs — `tags` is
+    // @required on TagResource — is announced the same way.
+    let (status, media_type, body) = call(
+        &router,
+        "POST",
+        &format!("/tags/{}", label(&unheld)),
+        Some(json!({})),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case \"an omitted required member\": expected HTTP 400, got {status} with {body}"
+    );
+    assert_eq!(
+        media_type.as_deref(),
+        Some(GENERIC_JSON),
+        "case \"an omitted required member\": expected {GENERIC_JSON:?}, got {media_type:?}"
     );
 }

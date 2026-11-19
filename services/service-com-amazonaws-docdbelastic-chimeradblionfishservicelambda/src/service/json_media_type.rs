@@ -23,6 +23,28 @@
 //! announced alike — so a client that reads `content-type` back sees the JSON dialect it
 //! asked for, and one that asked for nothing sees this service's own.
 //!
+//! ## The ARN-addressed tagging surface answers in the generic JSON media type
+//!
+//! One SURFACE of this service does not negotiate: the three operations that address a
+//! resource generically, by the ARN of any class this service owns, announce every payload
+//! they answer with as the generic `application/json`, whatever the request named.
+//!
+//! ```text
+//! GET /tags/{resourceArn}
+//! (no content-type: no request payload)
+//!
+//! HTTP/1.1 404 Not Found
+//! content-type: application/json
+//! ```
+//!
+//! That surface is model-derived rather than enumerated here: `TagResource`,
+//! `UntagResource` and `ListTagsForResource` are the only operations of this service bound
+//! under `/tags`, and they are also the only ones modelled with their own
+//! `…Request`/`…Response` shapes rather than this service's `…Input`/`…Output` pair
+//! (`smithy_query(query="digest")`), so the route is what tells the two surfaces apart —
+//! not a list of operation names that a renamed or added tagging operation would leave
+//! stale.
+//!
 //! Nothing else about a response changes: the status, the body and every other header
 //! stay as the renderer wrote them, and the payload itself keeps every byte — only the
 //! media type the response announces that payload with is restated.
@@ -40,6 +62,28 @@ const CONTENT_TYPE: &str = "content-type";
 
 /// The media type this service announces a JSON payload with when the request named none.
 pub const JSON_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
+
+/// The generic JSON media type: what the ARN-addressed tagging surface announces every
+/// payload with, and what a request carrying a JSON payload usually names.
+pub const GENERIC_JSON_MEDIA_TYPE: &str = "application/json";
+
+/// The path the ARN-addressed tagging operations are bound under, with the `/` that
+/// separates it from the `@httpLabel` carrying the ARN: all three of them are
+/// `/tags/{resourceArn}` and nothing else of this service is bound under `/tags`
+/// (`smithy_query(query="digest")`).
+const TAGGING_PATH_PREFIX: &str = "/tags/";
+
+/// Whether `req` addresses the ARN-addressed tagging surface — the route all three tagging
+/// operations share, read off the request rather than off the operation that serves it, so
+/// a response no operation produced (a refusal raised before dispatch) is announced the
+/// same way as one an operation answered.
+///
+/// The literal segment is compared exactly, as the framework's REST router compares the
+/// literal segments of a modelled URI: a path the router does not resolve to a tagging
+/// operation is not this surface, so the two cannot disagree about one request.
+fn addresses_tagging_surface(req: &RtRequest) -> bool {
+    ::service_common::request_path(req.uri()).starts_with(TAGGING_PATH_PREFIX)
+}
 
 /// The media type `named` states, without the parameters that follow it (a `charset`,
 /// say) and case-folded, since a media type is case-insensitive.
@@ -60,10 +104,14 @@ fn is_json(media_type: &str) -> bool {
     media_type == "application/json" || media_type.starts_with("application/x-amz-json")
 }
 
-/// The media type a response to `req` announces its JSON payload with: the JSON media
-/// type `req` named for its own payload, or [`JSON_MEDIA_TYPE`] when it named none (or
-/// named one that is not JSON, which no payload of this wire is).
+/// The media type a response to `req` announces its JSON payload with: the generic
+/// [`GENERIC_JSON_MEDIA_TYPE`] for the ARN-addressed tagging surface, and otherwise the
+/// JSON media type `req` named for its own payload, or [`JSON_MEDIA_TYPE`] when it named
+/// none (or named one that is not JSON, which no payload of this wire is).
 pub fn announced_media_type(req: &RtRequest) -> String {
+    if addresses_tagging_surface(req) {
+        return GENERIC_JSON_MEDIA_TYPE.to_string();
+    }
     req.headers()
         .get(CONTENT_TYPE)
         .map(media_type_of)
@@ -110,6 +158,13 @@ mod tests {
         req
     }
 
+    /// The same request, addressed at `uri`.
+    fn addressed(uri: &str, content_type: Option<&str>) -> RtRequest {
+        let mut req = request(content_type);
+        req.set_uri(uri).expect("a valid request URI");
+        req
+    }
+
     /// One response, built from a status and the media type its renderer announced.
     fn response(status: u16, content_type: Option<&str>) -> RtResponse {
         let mut resp = RtResponse::new(
@@ -121,6 +176,15 @@ mod tests {
         }
         resp
     }
+
+    /// A route of this service's OWN operations, which negotiate the media type
+    /// (`smithy_query(query="digest")`: `ListClusters` is `GET /clusters`).
+    const RESOURCE_ROUTE: &str = "/clusters";
+
+    /// The route all three ARN-addressed tagging operations share, with the ARN
+    /// percent-encoded into its `@httpLabel` the way an SDK sends it.
+    const TAGGING_ROUTE: &str =
+        "/tags/arn%3Aaws%3Adocdb-elastic%3Aeu-west-2%3A000000000000%3Acluster%2Fabc";
 
     /// The media type to announce follows the request: the JSON dialect it named for its
     /// own payload, and this service's own when it named none or named no JSON at all.
@@ -143,10 +207,61 @@ mod tests {
             ("this service's own", Some(JSON_MEDIA_TYPE), JSON_MEDIA_TYPE),
             ("a media type that is not JSON", Some("application/xml"), JSON_MEDIA_TYPE),
         ] {
-            let actual = announced_media_type(&request(named));
+            let actual = announced_media_type(&addressed(RESOURCE_ROUTE, named));
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// The ARN-addressed tagging surface does not negotiate: whatever the request named,
+    /// and whether it named anything at all, its answer is announced in the generic JSON
+    /// media type. The rows span the media types a request can name and both forms the
+    /// request URI arrives in (origin and absolute).
+    #[test]
+    fn the_tagging_surface_is_announced_in_the_generic_json_media_type() {
+        let absolute = format!("https://docdb-elastic.eu-west-2.amazonaws.com{TAGGING_ROUTE}");
+        for (case, uri, named) in [
+            ("no payload", TAGGING_ROUTE, None),
+            ("the generic JSON media type", TAGGING_ROUTE, Some("application/json")),
+            ("this service's own", TAGGING_ROUTE, Some(JSON_MEDIA_TYPE)),
+            (
+                "another AWS JSON version",
+                TAGGING_ROUTE,
+                Some("application/x-amz-json-1.0"),
+            ),
+            ("a media type that is not JSON", TAGGING_ROUTE, Some("application/xml")),
+            ("a query string beside the label", "/tags/abc?tagKeys=Project", None),
+            ("an absolute request URI", absolute.as_str(), None),
+        ] {
+            let actual = announced_media_type(&addressed(uri, named));
+            assert_eq!(
+                actual, GENERIC_JSON_MEDIA_TYPE,
+                "case {case:?}: expected {GENERIC_JSON_MEDIA_TYPE:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// The scope of that one: a route outside the tagging surface keeps negotiating, so
+    /// the surface is told apart by the route the model binds and not by a prefix match
+    /// that catches the rest of the service.
+    #[test]
+    fn a_route_outside_the_tagging_surface_still_negotiates() {
+        for (case, uri) in [
+            ("a listing", RESOURCE_ROUTE),
+            ("a cluster's own route", "/cluster/abc"),
+            ("a snapshot listing", "/cluster-snapshots"),
+            ("the root", "/"),
+            // `/tags` alone binds no operation of this service: only `/tags/{resourceArn}`
+            // does, so the prefix includes the separator.
+            ("the tagging path with no label", "/tags"),
+            ("a route that merely starts with the same letters", "/tagsets/abc"),
+        ] {
+            let actual = announced_media_type(&addressed(uri, None));
+            assert_eq!(
+                actual, JSON_MEDIA_TYPE,
+                "case {case:?}: expected {JSON_MEDIA_TYPE:?}, got {actual:?}"
             );
         }
     }
