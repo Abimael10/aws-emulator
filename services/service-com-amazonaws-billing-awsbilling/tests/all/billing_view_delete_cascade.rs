@@ -4,24 +4,37 @@
 //! wire.
 //!
 //! One rule: a deleted billing view is referenced nowhere in the store
-//! afterwards — not by its own record, and not by the source-view set of any
-//! view that drew from it. So no read reports an association that names a view
-//! the store no longer holds (the state `AssociateSourceViews` refuses to
-//! write), every other source a view held stays where it was, and the per-view
-//! source slot the deleted view occupied is free for another association.
+//! afterwards — not by its own record, not by any record the store keys by that
+//! view's ARN, and not by the source-view set of any view that drew from it. So
+//! no read reports an association that names a view the store no longer holds
+//! (the state `AssociateSourceViews` refuses to write), every other source a
+//! view held stays where it was, the per-view source slot the deleted view
+//! occupied is free for another association, and a create/delete cycle hands
+//! back every bounded slot it took — an ARN is minted once and never again, so
+//! a record left under a deleted one could never be observed or freed.
 //!
 //! The rows span what the rule generalises over: how many source views the
 //! drawing view holds (1 through 10, the `BillingViewSourceViewsList` `@length`
 //! maximum), where in that stored order the deleted view sits (only, first,
-//! middle, last), and how many views draw from the deleted one.
+//! middle, last), how many views draw from the deleted one, and — for the
+//! per-view records the store keys by an ARN, the billing-view segment timeline
+//! — how many segments that timeline holds, how they are bounded, which
+//! `BillingDomain` each carries and whether one is hidden.
 //!
 //! The harness (`call`, `error_code`, …) is the one `billing_views.rs` owns and
 //! the view creation is `source_view_disassociation.rs`'s.
 
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use serde_json::{json, Value};
+use service_com_amazonaws_billing_awsbilling::state::{
+    BillingViewSegment, BILLING_DOMAIN_BILLABLE, BILLING_DOMAIN_PRO_FORMA,
+};
+use service_com_amazonaws_billing_awsbilling::ComAmazonawsBillingAwsbillingState;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::billing_views::{call, emulator_with_engine, error_code, PRIMARY_ARN};
+use crate::billing_views::{call, emulator_with_engine, error_code, ABSENT_ARN, PRIMARY_ARN};
 use crate::source_view_disassociation::create_view;
 
 /// One row: a view created holding `held` real source views, `derived` views
@@ -372,5 +385,426 @@ async fn only_the_sets_that_named_the_deleted_view_are_rewritten() {
         Some(1),
         "case {case:?}: the refused delete left the association in place, got {:?}",
         source_view["derivedViewCount"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The per-view records the store keys BY a billing view's ARN: its segment
+// timeline, the one `ListBillingViewSegments` reports.
+// ---------------------------------------------------------------------------
+
+/// Instants the timelines below are built from: four UTC month boundaries, far
+/// enough in the past that the clock cannot move them.
+const JANUARY: i64 = 1_735_689_600; // 2025-01-01T00:00:00Z
+const FEBRUARY: i64 = 1_738_368_000; // 2025-02-01T00:00:00Z
+const MARCH: i64 = 1_740_787_200; // 2025-03-01T00:00:00Z
+const APRIL: i64 = 1_743_465_600; // 2025-04-01T00:00:00Z
+
+/// A day, the step the longest timeline below moves its segments by.
+const DAY: i64 = 86_400;
+
+/// One segment of a timeline a row records: its own bounds in epoch seconds
+/// (`None` for an unbounded side), the `BillingDomain` that applied over it, and
+/// whether it is hidden from the caller.
+type Segment = (Option<i64>, Option<i64>, &'static str, bool);
+
+/// One row of the timeline table: the shape of the deleted view's timeline, and
+/// whether another view draws from it (so the delete needs `force`).
+struct TimelineRow {
+    case: &'static str,
+    segments: Vec<Segment>,
+    derived: bool,
+}
+
+/// The timeline shapes a delete must reclaim, spanning what the rule
+/// generalises over: how many segments the view's timeline holds (none at all
+/// through ten), whether a segment is bounded on neither, one or both sides,
+/// each published `BillingDomain` value
+/// (`smithy_query(query="shape",shape="BillingDomain")` = BILLABLE, PRO_FORMA),
+/// whether a segment is hidden from the caller, and whether the delete needed
+/// `force` to go through at all.
+fn timeline_rows() -> Vec<TimelineRow> {
+    vec![
+        TimelineRow {
+            case: "a view whose timeline was never recorded",
+            segments: vec![],
+            derived: false,
+        },
+        TimelineRow {
+            case: "one segment in effect, bounded on neither side",
+            segments: vec![(None, None, BILLING_DOMAIN_BILLABLE, false)],
+            derived: false,
+        },
+        TimelineRow {
+            case: "two segments meeting at a change",
+            segments: vec![
+                (None, Some(FEBRUARY), BILLING_DOMAIN_BILLABLE, false),
+                (Some(FEBRUARY), None, BILLING_DOMAIN_PRO_FORMA, false),
+            ],
+            derived: false,
+        },
+        TimelineRow {
+            case: "three bounded segments, the middle one hidden, a view drawing from it",
+            segments: vec![
+                (
+                    Some(JANUARY),
+                    Some(FEBRUARY),
+                    BILLING_DOMAIN_BILLABLE,
+                    false,
+                ),
+                (Some(FEBRUARY), Some(MARCH), BILLING_DOMAIN_BILLABLE, true),
+                (Some(MARCH), Some(APRIL), BILLING_DOMAIN_PRO_FORMA, false),
+            ],
+            derived: true,
+        },
+        TimelineRow {
+            case: "a timeline whose only segment is hidden",
+            segments: vec![(Some(JANUARY), None, BILLING_DOMAIN_PRO_FORMA, true)],
+            derived: true,
+        },
+        TimelineRow {
+            case: "ten consecutive daily segments",
+            segments: (0..10)
+                .map(|nth| {
+                    (
+                        Some(JANUARY + nth * DAY),
+                        Some(JANUARY + (nth + 1) * DAY),
+                        BILLING_DOMAIN_BILLABLE,
+                        false,
+                    )
+                })
+                .collect(),
+            derived: false,
+        },
+    ]
+}
+
+/// The timeline of a view no delete below names — what the reclamation must
+/// leave exactly where it is.
+fn bystander_timeline() -> Vec<Segment> {
+    vec![
+        (Some(JANUARY), Some(MARCH), BILLING_DOMAIN_BILLABLE, false),
+        (Some(MARCH), None, BILLING_DOMAIN_PRO_FORMA, false),
+    ]
+}
+
+/// Epoch seconds as the instant the store holds.
+fn instant(secs: i64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).expect("a post-epoch instant"))
+}
+
+/// Record `segments` as the timeline of the billing view `arn`.
+///
+/// A segment is "a time range during which the billing domain and account
+/// relationships for a billing view remained unchanged", and no modelled
+/// operation moves an account into an organization or a billing group, so a
+/// timeline is written straight into the shared engine's store — the way the
+/// `ListBillingViewSegments` suite writes the one it reads back.
+fn record_timeline(
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &str,
+    arn: &str,
+    segments: &[Segment],
+) {
+    let state = engine.state::<ComAmazonawsBillingAwsbillingState>();
+    let mut state = state.lock();
+    for (begin, end, domain, hidden) in segments {
+        assert!(
+            state.record_billing_view_segment(BillingViewSegment {
+                begin_date_inclusive: begin.map(instant),
+                end_date_exclusive: end.map(instant),
+                hidden: *hidden,
+                ..BillingViewSegment::in_effect(arn, domain)
+            }),
+            "case {case:?}: the recorded segment {begin:?}..{end:?} must fit in the store"
+        );
+    }
+}
+
+/// Every segment the store holds, as the key it is stored under beside the
+/// billing view its record names.
+fn stored_segments(engine: &Arc<engine::InMemoryEngine>) -> Vec<(String, String)> {
+    let state = engine.state::<ComAmazonawsBillingAwsbillingState>();
+    let state = state.lock();
+    state
+        .billing_view_segments
+        .iter()
+        .map(|(key, segment)| (key.clone(), segment.billing_view_arn.clone()))
+        .collect()
+}
+
+/// Every stored segment that names a billing view the store no longer holds —
+/// the records the rule says cannot exist.
+fn segments_naming_no_stored_view(engine: &Arc<engine::InMemoryEngine>) -> Vec<(String, String)> {
+    let state = engine.state::<ComAmazonawsBillingAwsbillingState>();
+    let state = state.lock();
+    state
+        .billing_view_segments
+        .iter()
+        .filter(|(_, segment)| !state.billing_views.contains_key(&segment.billing_view_arn))
+        .map(|(key, segment)| (key.clone(), segment.billing_view_arn.clone()))
+        .collect()
+}
+
+/// How many segments the store holds for the billing view `arn`.
+fn segment_count(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> usize {
+    stored_segments(engine)
+        .iter()
+        .filter(|(_, named)| named == arn)
+        .count()
+}
+
+#[tokio::test]
+async fn a_delete_reclaims_the_deleted_views_whole_segment_timeline() {
+    let (router, engine) = emulator_with_engine();
+
+    for (index, row) in timeline_rows().iter().enumerate() {
+        let case = row.case;
+        let target = create_view(
+            &router,
+            &engine,
+            case,
+            &format!("seg-{index}"),
+            &[PRIMARY_ARN.to_string()],
+        )
+        .await;
+        // A view no delete names, with a timeline of its own, so what the
+        // reclamation must leave alone is more than the account's PRIMARY view.
+        let bystander = create_view(
+            &router,
+            &engine,
+            case,
+            &format!("seg-{index}-bystander"),
+            &[PRIMARY_ARN.to_string()],
+        )
+        .await;
+        record_timeline(&engine, case, &bystander, &bystander_timeline());
+        if row.derived {
+            create_view(
+                &router,
+                &engine,
+                case,
+                &format!("seg-{index}-drawing"),
+                std::slice::from_ref(&target),
+            )
+            .await;
+        }
+
+        // The store as it stands before this view has a timeline at all: what
+        // the delete must hand back.
+        let before = stored_segments(&engine);
+        record_timeline(&engine, case, &target, &row.segments);
+        let recorded = stored_segments(&engine);
+        assert_eq!(
+            recorded.len(),
+            before.len() + row.segments.len(),
+            "case {case:?}: the timeline must be recorded before the delete, got {recorded:?}"
+        );
+
+        let (status, deleted) = call(
+            &router,
+            "DeleteBillingView",
+            &json!({ "arn": target, "force": row.derived }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the delete to answer 200, got {status} {deleted:?}"
+        );
+
+        let after = stored_segments(&engine);
+        assert_eq!(
+            after, before,
+            "case {case:?}: the delete reclaims exactly the deleted view's timeline, got {after:?}"
+        );
+        assert_eq!(
+            segment_count(&engine, &target),
+            0,
+            "case {case:?}: no segment may name the deleted view {target}, got {after:?}"
+        );
+        assert_eq!(
+            segment_count(&engine, &bystander),
+            bystander_timeline().len(),
+            "case {case:?}: the timeline of a view the delete did not name is untouched, \
+             got {after:?}"
+        );
+        let orphaned = segments_naming_no_stored_view(&engine);
+        assert!(
+            orphaned.is_empty(),
+            "case {case:?}: no stored segment may name a view the store no longer holds, \
+             got {orphaned:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_delete_reclaims_only_the_timeline_of_the_arn_it_names() {
+    let (router, engine) = emulator_with_engine();
+
+    // Ten views, so the minted resource ids run `custom-1` through `custom-10`
+    // and one view's ARN is a strict prefix of another's: what a delete
+    // reclaims is the timeline of the ARN the request names, not of every ARN
+    // that merely starts with it.
+    let case = "an ARN another view's ARN extends";
+    let mut created = Vec::new();
+    for nth in 0..10 {
+        created.push(
+            create_view(
+                &router,
+                &engine,
+                case,
+                &format!("prefix-{nth}"),
+                &[PRIMARY_ARN.to_string()],
+            )
+            .await,
+        );
+    }
+    for arn in &created {
+        record_timeline(&engine, case, arn, &bystander_timeline());
+    }
+
+    let target = created[0].clone();
+    let extending: Vec<String> = created
+        .iter()
+        .filter(|arn| **arn != target && arn.starts_with(target.as_str()))
+        .cloned()
+        .collect();
+    assert!(
+        !extending.is_empty(),
+        "case {case:?}: expected a minted ARN extending {target}, got {created:?}"
+    );
+
+    let (status, deleted) = call(&router, "DeleteBillingView", &json!({ "arn": target })).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the delete to answer 200, got {status} {deleted:?}"
+    );
+
+    assert_eq!(
+        segment_count(&engine, &target),
+        0,
+        "case {case:?}: the named view's timeline is reclaimed, got {:?}",
+        stored_segments(&engine)
+    );
+    for arn in created.iter().skip(1) {
+        assert_eq!(
+            segment_count(&engine, arn),
+            bystander_timeline().len(),
+            "case {case:?}: {arn} keeps its own timeline, got {:?}",
+            stored_segments(&engine)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_create_record_delete_cycle_frees_the_segment_budget_it_took() {
+    let (router, engine) = emulator_with_engine();
+    // A billing-view ARN is minted once and never again, so a segment left
+    // under a deleted view's ARN would hold its place in the bounded store for
+    // good: the resident count after a cycle is what it was before it.
+    let case = "a create/record/delete cycle";
+    let baseline = stored_segments(&engine).len();
+
+    for cycle in 0..8 {
+        let arn = create_view(
+            &router,
+            &engine,
+            case,
+            &format!("cycle-{cycle}"),
+            &[PRIMARY_ARN.to_string()],
+        )
+        .await;
+        record_timeline(&engine, case, &arn, &timeline_rows()[5].segments);
+        let (status, deleted) = call(&router, "DeleteBillingView", &json!({ "arn": arn })).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?} {cycle}: expected the delete to answer 200, got {status} {deleted:?}"
+        );
+        assert_eq!(
+            stored_segments(&engine).len(),
+            baseline,
+            "case {case:?} {cycle}: the cycle must hand back every segment slot it took, got {:?}",
+            stored_segments(&engine)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_delete_reclaims_no_timeline() {
+    let (router, engine) = emulator_with_engine();
+    let case = "a refused delete";
+    let source = create_view(
+        &router,
+        &engine,
+        case,
+        "refused-source",
+        &[PRIMARY_ARN.to_string()],
+    )
+    .await;
+    create_view(
+        &router,
+        &engine,
+        case,
+        "refused-drawing",
+        std::slice::from_ref(&source),
+    )
+    .await;
+    record_timeline(&engine, case, &source, &bystander_timeline());
+    let before = stored_segments(&engine);
+
+    // Every refusal this operation models for an ARN: a view another view draws
+    // from without `force` (409), the account's PRIMARY view and an ARN no view
+    // is stored under (400).
+    let rows: Vec<(&str, Value, u16, &str)> = vec![
+        (
+            "a view another view draws from, without force",
+            json!({ "arn": source }),
+            409,
+            "ConflictException",
+        ),
+        (
+            "the account's PRIMARY view",
+            json!({ "arn": PRIMARY_ARN }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "an arn no view is stored under",
+            json!({ "arn": ABSENT_ARN }),
+            400,
+            "ValidationException",
+        ),
+    ];
+    for (row, request, want_status, want_code) in rows {
+        let (status, refused) = call(&router, "DeleteBillingView", &request).await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (want_status, want_code),
+            "case {row:?}: expected {want_status} {want_code}, got {status} {refused:?}"
+        );
+        let after = stored_segments(&engine);
+        assert_eq!(
+            after, before,
+            "case {row:?}: a refused delete reclaims nothing, got {after:?}"
+        );
+    }
+
+    // And the PRIMARY view's own timeline still reads back over the wire, which
+    // is the one timeline an API caller can observe.
+    let (status, listed) = call(
+        &router,
+        "ListBillingViewSegments",
+        &json!({ "arn": PRIMARY_ARN }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the segment read to answer 200, got {status} {listed:?}"
+    );
+    assert!(
+        listed["items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "case {case:?}: the PRIMARY view still reports its own segments, got {listed:?}"
     );
 }

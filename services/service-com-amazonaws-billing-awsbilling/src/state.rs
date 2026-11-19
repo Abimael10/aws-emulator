@@ -689,7 +689,8 @@ pub struct ComAmazonawsBillingAwsbillingState {
     /// [`BillingViewSegment::key`] — the view's ARN, then the instant the
     /// segment began — so one view's segments are a contiguous range walked
     /// oldest first and `ListBillingViewSegments`' page boundaries are stable.
-    /// Bounded by [`BillingViewSegment::MAX_RESIDENT`].
+    /// Bounded by [`BillingViewSegment::MAX_RESIDENT`]: a view's whole range is
+    /// reclaimed by [`Self::forget_view`] when that view is deleted.
     ///
     /// Seeded with the one open-ended segment of the account's default PRIMARY
     /// view: its relationships have not changed, so its whole history is one
@@ -916,15 +917,19 @@ impl ComAmazonawsBillingAwsbillingState {
     }
 
     /// Drop the view at `arn` and every reference the store holds to it: its own
-    /// record, every idempotency token that named it, and its place in every
-    /// other view's source-view set.
+    /// record, every idempotency token that named it, its whole segment timeline
+    /// — the records [`BillingViewSegment::key`] keys by that very ARN — and its
+    /// place in every other view's source-view set.
     ///
-    /// Those three are all a billing view is referenced by, so afterwards no
+    /// Those four are all a billing view is referenced by, so afterwards no
     /// stored record names a view this store no longer holds: a create/delete
-    /// loop reclaims every token it allocated instead of leaving entries behind
-    /// that no API can observe or free, and no read can report an association
-    /// that points at nothing — the state `AssociateSourceViews` refuses to
-    /// write.
+    /// loop reclaims every token and every segment slot it allocated instead of
+    /// leaving entries behind that no API can observe or free (an ARN is never
+    /// minted twice, so a record left under a deleted one would hold its place
+    /// against [`MAX_IDEMPOTENCY_TOKENS`] or
+    /// [`BillingViewSegment::MAX_RESIDENT`] for good), and no read can report an
+    /// association that points at nothing — the state `AssociateSourceViews`
+    /// refuses to write.
     ///
     /// A view that drew from `arn` loses that one source and keeps the rest in
     /// the order it held them. Its source set is part of its definition, so the
@@ -936,6 +941,17 @@ impl ComAmazonawsBillingAwsbillingState {
     pub fn forget_view(&mut self, arn: &str, at: SystemTime) -> Option<BillingView> {
         let removed = self.billing_views.remove(arn);
         self.idempotency_tokens.retain(|_, stored| stored != arn);
+        // The deleted view's timeline is a contiguous key range of the segment
+        // store, the one [`Self::billing_view_segments_of`] walks, so the whole
+        // of it goes with the view: a segment record names the view it belongs
+        // to, and this store no longer holds that view.
+        let timeline: Vec<String> = self
+            .billing_view_segments_of(arn)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in timeline {
+            self.billing_view_segments.remove(&key);
+        }
         for view in self.billing_views.values_mut() {
             if !view.source_views.iter().any(|source| source == arn) {
                 continue;
