@@ -56,10 +56,15 @@ const CERTIFICATE_AUTHORITY_TYPE: &str = "acm-pca:CertificateAuthority";
 /// to a share of a certificate authority that names no permission of its own.
 const DEFAULT_CA_PERMISSION: &str = "AWSRAMDefaultPermissionCertificateAuthority";
 
-/// The action a share of a certificate authority exists to grant: every published permission
-/// of the family allows it, and it is what a service brokering certificates from the shared CA
-/// performs.
+/// The action a share of a certificate authority exists to grant: every published issuance
+/// permission of the family allows it, and it is what a service brokering certificates from
+/// the shared CA performs.
 const ISSUE_CERTIFICATE_ACTION: &str = "acm-pca:IssueCertificate";
+
+/// The permission the family publishes for REVOKING a certificate of the shared CA rather
+/// than issuing one, and the action it allows in the issuance's place.
+const REVOKE_CA_PERMISSION: &str = "AWSRAMRevokeCertificateCertificateAuthority";
+const REVOKE_CERTIFICATE_ACTION: &str = "acm-pca:RevokeCertificate";
 
 /// An Amazon Web Services service principal, which is what a share with a service that brokers
 /// certificates from the CA names as its principal.
@@ -391,12 +396,18 @@ async fn every_published_certificate_authority_permission_reads_back() {
             PERMISSION_TYPE_AWS_MANAGED,
             "case {name:?}: expected AWS_MANAGED, got {permission:?}"
         );
-        // A share of a certificate authority exists to let the receiving principal have
-        // certificates issued from it, so every permission of the family allows that action.
+        // A share of a certificate authority exists to let the receiving principal act on
+        // the certificates of that CA: every issuance permission of the family allows the
+        // issuance, and the one published for revocation allows the revocation.
         let document = field(name, &permission, "permission");
+        let granted = if name == REVOKE_CA_PERMISSION {
+            REVOKE_CERTIFICATE_ACTION
+        } else {
+            ISSUE_CERTIFICATE_ACTION
+        };
         assert!(
-            document.contains(ISSUE_CERTIFICATE_ACTION),
-            "case {name:?}: expected {ISSUE_CERTIFICATE_ACTION:?} among the actions, got \
+            document.contains(granted),
+            "case {name:?}: expected {granted:?} among the actions, got \
              {document:?}"
         );
     }
@@ -429,6 +440,79 @@ async fn the_permission_library_filters_on_every_spelling_of_the_type() {
             permission_arns(&case, &listed),
             expected,
             "case {case:?}: expected the permissions published for that type, got {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_library_publishes_exactly_the_permissions_aws_publishes_for_the_type() {
+    let router = emulator();
+
+    // What the catalog's MEMBERSHIP must be, named here rather than read off the catalog:
+    // a permission the library publishes is enumerated and resolves, and a name it
+    // publishes no permission under is neither. Source: the managed permissions the RAM
+    // permission library publishes for `acm-pca:CertificateAuthority` — the type's default
+    // permission, the two blank end-entity issuance permissions, one subordinate-CA
+    // issuance permission per published certificate template (the path lengths zero
+    // through three), and the revocation permission — which is what a `ListPermissions`
+    // scoped to that type enumerates in any account.
+    let mut published: Vec<String> = [
+        "AWSRAMBlankEndEntityCertificateAPICSRPassthroughIssuanceCertificateAuthority",
+        "AWSRAMBlankEndEntityCertificateAPIPassthroughIssuanceCertificateAuthority",
+        "AWSRAMDefaultPermissionCertificateAuthority",
+        "AWSRAMRevokeCertificateCertificateAuthority",
+        "AWSRAMSubordinateCACertificatePathLen0IssuanceCertificateAuthority",
+        "AWSRAMSubordinateCACertificatePathLen1IssuanceCertificateAuthority",
+        "AWSRAMSubordinateCACertificatePathLen2IssuanceCertificateAuthority",
+        "AWSRAMSubordinateCACertificatePathLen3IssuanceCertificateAuthority",
+    ]
+    .into_iter()
+    .map(aws_managed_permission_arn)
+    .collect();
+    published.sort();
+
+    let case = "the permissions published for a private certificate authority";
+    let (status, listed) = list_permissions(
+        &router,
+        &json!({"resourceType": CERTIFICATE_AUTHORITY_TYPE}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with {listed:?}"
+    );
+    assert_eq!(
+        permission_arns(case, &listed),
+        published,
+        "case {case:?}: the library must publish exactly those permissions for the type, got \
+         {listed:?}"
+    );
+
+    // Names that look like members of the family and are not permissions: a path length
+    // beyond the published templates, a template the library publishes no permission for,
+    // and the family's name shouted. A name the library does not publish is enumerated
+    // nowhere and resolves to nothing, so a client cannot attach an ARN that does not
+    // exist.
+    for name in [
+        "AWSRAMSubordinateCACertificatePathLen9IssuanceCertificateAuthority",
+        "AWSRAMRootCACertificateIssuanceCertificateAuthority",
+        "awsramdefaultpermissioncertificateauthority",
+    ] {
+        let arn = aws_managed_permission_arn(name);
+        assert!(
+            !permission_arns(case, &listed).contains(&arn),
+            "case {name:?}: a permission the library does not publish must not be enumerated, \
+             got {listed:?}"
+        );
+        let (status, refused) = get_permission(&router, &json!({"permissionArn": arn})).await;
+        assert_eq!(
+            status, 400,
+            "case {name:?}: expected HTTP 400, got {status} with {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "UnknownResourceException",
+            "case {name:?}: expected UnknownResourceException, got {refused:?}"
         );
     }
 }

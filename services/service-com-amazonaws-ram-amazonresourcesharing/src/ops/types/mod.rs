@@ -41,6 +41,7 @@ pub mod list_resource_share_permissions_types;
 pub mod list_resource_types_types;
 pub mod list_resources_types;
 pub mod list_source_associations_types;
+pub mod permission_summary_wire;
 pub mod promote_permission_created_from_policy_types;
 pub mod promote_resource_share_created_from_policy_types;
 pub mod reject_resource_share_invitation_types;
@@ -106,6 +107,8 @@ pub use list_resource_types_types::*;
 pub use list_resources_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_source_associations_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use permission_summary_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use promote_permission_created_from_policy_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

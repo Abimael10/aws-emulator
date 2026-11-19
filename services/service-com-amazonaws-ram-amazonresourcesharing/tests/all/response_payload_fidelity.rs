@@ -3,7 +3,7 @@
 //! End-to-end HTTP tests for the SHAPE of what this service's success bodies carry,
 //! and for where the `external` flag of an association comes from.
 //!
-//! The two rules under test, each asserted over a table rather than one case:
+//! The three rules under test, each asserted over a table rather than one case:
 //!
 //! * **A tag MUTATION reports its entries as self-describing documents; a tag reported
 //!   as part of a resource's state does not.** `TagResource$tagsCreated` and
@@ -13,6 +13,13 @@
 //!   exactly `key` and `value`, so the discriminator is not a modelled member);
 //!   `ResourceShare$tags` carries the pair alone. Strip the discriminator and one
 //!   stored pair is the same object in both places.
+//! * **Every managed-permission summary a response carries reports the
+//!   service-linked-share restriction.** A summary of a managed permission carries, beside
+//!   the twelve members `smithy_query(query="shape",shape="ResourceSharePermissionSummary")`
+//!   declares, a boolean saying whether that permission may govern only a service-linked
+//!   resource share; it is read off the stored permission, so every operation that projects
+//!   a summary reports it and its value follows the permission's state rather than the
+//!   operation that reported it.
 //! * **`external` is derived from the entity and the share's owning account, and the
 //!   teardown report carries false.** `ResourceShareAssociation$external` "indicates
 //!   whether the principal belongs to the same organization in Organizations as the
@@ -33,6 +40,10 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_ram_amazonresourcesharing::state::{
+    aws_managed_permission_arn, AWS_MANAGED_PERMISSIONS,
+};
+use smithy_server_runtime::MultiServiceRouter;
 
 // Every suite in this crate calls the service the one way: through `tests/all/harness.rs`.
 use super::harness::*;
@@ -743,6 +754,337 @@ async fn external_is_a_property_of_the_entity_and_the_owner_alone() {
             !on_disassociate,
             "case {case:?}: DisassociateResourceShare expected external false, \
              got {on_disassociate} for {entity}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Every managed-permission summary reports the service-linked-share restriction
+// ---------------------------------------------------------------------------
+
+/// The member a summary of a managed permission carries beside the twelve
+/// `ResourceSharePermissionSummary` declares: whether that permission may govern only a
+/// resource share an Amazon Web Services service created on the account's behalf.
+const RESTRICTION_MEMBER: &str = "restrictToServiceLinkedShares";
+
+/// The resource type the share below shares, and the type whose default managed
+/// permission the second test writes the restriction onto.
+const SUBNET_RESOURCE_TYPE: &str = "ec2:Subnet";
+
+async fn create_permission(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/createpermission", Some(body)).await
+}
+
+async fn list_permissions(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/listpermissions", Some(body)).await
+}
+
+async fn list_permission_versions(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/listpermissionversions", Some(body)).await
+}
+
+async fn list_share_permissions(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/listresourcesharepermissions", Some(body)).await
+}
+
+/// The summaries a response carries: the `permissions` list of a read, or the single
+/// `permission` a create reported.
+fn summaries_of(case: &str, body: &Value) -> Vec<Value> {
+    if let Some(list) = body.get("permissions").and_then(Value::as_array) {
+        return list.clone();
+    }
+    body.get("permission")
+        .cloned()
+        .map(|permission| vec![permission])
+        .unwrap_or_else(|| panic!("case {case:?}: response carried no permission, got {body:?}"))
+}
+
+/// The ARN of a reported summary.
+fn arn_of_summary(case: &str, summary: &Value) -> String {
+    summary
+        .get("arn")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: a summary carried no arn, got {summary:?}"))
+        .to_string()
+}
+
+/// The restriction one reported summary carries. A summary that carries no such member,
+/// or carries something that is not a boolean, fails the case: AWS sends a boolean on
+/// every element.
+fn restriction_of(case: &str, summary: &Value) -> bool {
+    let reported = summary.get(RESTRICTION_MEMBER).unwrap_or_else(|| {
+        panic!("case {case:?}: expected a {RESTRICTION_MEMBER} member, got {summary:?}")
+    });
+    reported.as_bool().unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: {RESTRICTION_MEMBER} must be a boolean, got {reported:?} in \
+             {summary:?}"
+        )
+    })
+}
+
+/// Every reported summary's `(arn, restriction)` pair, asserting each one carries the
+/// member at all.
+fn restrictions_of(case: &str, body: &Value) -> Vec<(String, bool)> {
+    let summaries = summaries_of(case, body);
+    assert!(
+        !summaries.is_empty(),
+        "case {case:?}: expected at least one reported permission, got {body:?}"
+    );
+    summaries
+        .iter()
+        .map(|summary| {
+            (
+                arn_of_summary(case, summary),
+                restriction_of(case, summary),
+            )
+        })
+        .collect()
+}
+
+/// A call that must answer 200, with the body it answered.
+fn ok(case: &str, (status, body): (u16, Value)) -> Value {
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with {body:?}"
+    );
+    body
+}
+
+#[tokio::test]
+async fn every_operation_that_reports_a_permission_summary_reports_the_restriction() {
+    let router = emulator();
+
+    // A customer managed permission beside the catalog, so the rows span both
+    // populations the store holds rather than only the one the recording read.
+    let minted = ok(
+        "CreatePermission",
+        create_permission(
+            &router,
+            &json!({
+                "name": "RestrictionProbe",
+                "resourceType": "codebuild:Project",
+                "policyTemplate": r#"{"Effect":"ALLOW","Action":["codebuild:BatchGetProjects"]}"#,
+            }),
+        )
+        .await,
+    );
+    let minted_arn = arn_of_summary("CreatePermission", &summaries_of("CreatePermission", &minted)[0]);
+
+    // A share of a resource whose type the catalog publishes a default permission for,
+    // so the share-scoped read has an attachment to project.
+    let share = create_ok(
+        &router,
+        "a share to read the attached permission of",
+        &json!({"name": "restriction-probe-share", "resourceArns": [LOCAL_RESOURCE]}),
+    )
+    .await;
+    let share_arn = arn_of("a share to read the attached permission of", &share);
+
+    // The rows: every operation that projects a summary, over both populations — the
+    // whole AWS managed catalog unfiltered, one catalog entry's versions, a created
+    // permission and its versions, and the share-scoped read of an attachment.
+    let catalog_arn = aws_managed_permission_arn(AWS_MANAGED_PERMISSIONS[0].name);
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "CreatePermission reports the permission it minted",
+            minted.clone(),
+        ),
+        (
+            "ListPermissions over the whole store",
+            ok(
+                "ListPermissions over the whole store",
+                list_permissions(&router, &json!({})).await,
+            ),
+        ),
+        (
+            "ListPermissions filtered to the AWS managed catalog",
+            ok(
+                "ListPermissions filtered to the AWS managed catalog",
+                list_permissions(&router, &json!({"permissionType": "AWS_MANAGED"})).await,
+            ),
+        ),
+        (
+            "ListPermissions filtered to one resource type",
+            ok(
+                "ListPermissions filtered to one resource type",
+                list_permissions(&router, &json!({"resourceType": SUBNET_RESOURCE_TYPE})).await,
+            ),
+        ),
+        (
+            "ListPermissionVersions of a catalog entry",
+            ok(
+                "ListPermissionVersions of a catalog entry",
+                list_permission_versions(&router, &json!({"permissionArn": catalog_arn})).await,
+            ),
+        ),
+        (
+            "ListPermissionVersions of a created permission",
+            ok(
+                "ListPermissionVersions of a created permission",
+                list_permission_versions(&router, &json!({"permissionArn": minted_arn.clone()}))
+                    .await,
+            ),
+        ),
+        (
+            "ListResourceSharePermissions of a share",
+            ok(
+                "ListResourceSharePermissions of a share",
+                list_share_permissions(&router, &json!({"resourceShareArn": share_arn})).await,
+            ),
+        ),
+    ];
+
+    for (case, body) in rows {
+        for (arn, restricted) in restrictions_of(case, &body) {
+            // Nothing this store holds is published for service-linked shares only, so
+            // every one of them reports the member as false — and reports it, which is
+            // what a client that branches on it reads.
+            assert!(
+                !restricted,
+                "case {case:?}: {arn} is attachable to any share, so {RESTRICTION_MEMBER} \
+                 must be false, got {restricted}"
+            );
+        }
+    }
+
+    // The unfiltered read covers every catalog entry, not only the first: each one
+    // carries the member.
+    let listed = ok(
+        "ListPermissions covers the catalog",
+        list_permissions(&router, &json!({})).await,
+    );
+    let reported: Vec<String> = restrictions_of("ListPermissions covers the catalog", &listed)
+        .into_iter()
+        .map(|(arn, _)| arn)
+        .collect();
+    for entry in AWS_MANAGED_PERMISSIONS {
+        let arn = aws_managed_permission_arn(entry.name);
+        assert!(
+            reported.contains(&arn),
+            "case {:?}: the unfiltered read must report this catalog entry, got {reported:?}",
+            entry.name
+        );
+    }
+    assert!(
+        reported.contains(&minted_arn),
+        "case \"ListPermissions covers the catalog\": the created permission must be reported \
+         too, got {reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_reported_restriction_follows_the_stored_permission() {
+    let (router, engine) = emulator_with_engine();
+
+    let minted = ok(
+        "mint a permission to restrict",
+        create_permission(
+            &router,
+            &json!({
+                "name": "RestrictedProbe",
+                "resourceType": "codebuild:Project",
+                "policyTemplate": r#"{"Effect":"ALLOW","Action":["codebuild:BatchGetProjects"]}"#,
+            }),
+        )
+        .await,
+    );
+    let minted_arn = arn_of_summary(
+        "mint a permission to restrict",
+        &summaries_of("mint a permission to restrict", &minted)[0],
+    );
+
+    // The default managed permission of the type the share below shares, so the
+    // share-scoped read projects a RESTRICTED permission too.
+    let subnet_default = AWS_MANAGED_PERMISSIONS
+        .iter()
+        .find(|entry| entry.resource_type == SUBNET_RESOURCE_TYPE && entry.is_resource_type_default)
+        .expect("the catalog publishes a default permission for the type the share shares");
+    let subnet_default_arn = aws_managed_permission_arn(subnet_default.name);
+
+    // The restriction is a property of the stored permission, so writing it onto two
+    // records — one of each population — is what a read must then report.
+    let restricted = [minted_arn.clone(), subnet_default_arn.clone()];
+    {
+        let state = store(&engine);
+        let mut locked = state.lock();
+        for arn in &restricted {
+            let permission = locked
+                .permissions
+                .get_mut(arn)
+                .unwrap_or_else(|| panic!("the store holds the permission {arn}"));
+            permission.restrict_to_service_linked_shares = true;
+        }
+    }
+
+    let share = create_ok(
+        &router,
+        "a share governed by a restricted permission",
+        &json!({"name": "restricted-probe-share", "resourceArns": [LOCAL_RESOURCE]}),
+    )
+    .await;
+    let share_arn = arn_of("a share governed by a restricted permission", &share);
+
+    // Each read reports true for exactly the two permissions carrying the restriction
+    // and false for every other, so the value follows the state and not the caller.
+    let reads: Vec<(&str, Value)> = vec![
+        (
+            "ListPermissions after the restriction was written",
+            ok(
+                "ListPermissions after the restriction was written",
+                list_permissions(&router, &json!({})).await,
+            ),
+        ),
+        (
+            "ListPermissionVersions of the restricted catalog entry",
+            ok(
+                "ListPermissionVersions of the restricted catalog entry",
+                list_permission_versions(
+                    &router,
+                    &json!({"permissionArn": subnet_default_arn.clone()}),
+                )
+                .await,
+            ),
+        ),
+        (
+            "ListPermissionVersions of the restricted created permission",
+            ok(
+                "ListPermissionVersions of the restricted created permission",
+                list_permission_versions(&router, &json!({"permissionArn": minted_arn.clone()}))
+                    .await,
+            ),
+        ),
+        (
+            "ListResourceSharePermissions of the share it governs",
+            ok(
+                "ListResourceSharePermissions of the share it governs",
+                list_share_permissions(&router, &json!({"resourceShareArn": share_arn.clone()}))
+                    .await,
+            ),
+        ),
+    ];
+    for (case, body) in &reads {
+        for (arn, reported) in restrictions_of(case, body) {
+            let expected = restricted.contains(&arn);
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected {RESTRICTION_MEMBER} {expected} for {arn}, got {reported}"
+            );
+        }
+    }
+
+    // And reading it does not move it: a second read of the same permission reports the
+    // same restriction.
+    let again = ok(
+        "a repeated read",
+        list_permissions(&router, &json!({"resourceType": SUBNET_RESOURCE_TYPE})).await,
+    );
+    for (arn, reported) in restrictions_of("a repeated read", &again) {
+        let expected = restricted.contains(&arn);
+        assert_eq!(
+            reported, expected,
+            "case \"a repeated read\": expected {RESTRICTION_MEMBER} {expected} for {arn}, \
+             got {reported}"
         );
     }
 }

@@ -136,7 +136,12 @@ pub struct Tag {
     pub value: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ram#ResourceSharePermissionSummary")]
+/// `com.amazonaws.ram#ResourceSharePermissionSummary`.
+///
+/// Its schema, serializer and deserializer are stated in
+/// [`super::permission_summary_wire`] rather than emitted by
+/// `#[smithy_macros::smithy(shape = ...)]`, because RAM reports one member beside the
+/// twelve the on-disk model declares; see that module's docs.
 #[derive(Debug, Clone, Default)]
 pub struct ResourceSharePermissionSummary {
     pub arn: Option<String>,
@@ -151,6 +156,12 @@ pub struct ResourceSharePermissionSummary {
     pub permission_type: Option<String>,
     pub feature_set: Option<String>,
     pub tags: Option<Vec<Tag>>,
+    /// Whether the managed permission this summary describes may govern only a
+    /// service-linked resource share. Read off the stored permission
+    /// ([`crate::state::PermissionRecord::restrict_to_service_linked_shares`]); the
+    /// member is reported by the service beyond this service's on-disk model, which is
+    /// why the shape's wire form is hand-written.
+    pub restrict_to_service_linked_shares: Option<bool>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ram#InvalidPolicyException")]

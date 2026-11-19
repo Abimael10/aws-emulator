@@ -361,6 +361,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // permissions Amazon Web Services manages, so a customer managed one
             // this call mints is not its resource type's default.
             is_resource_type_default: false,
+            // A permission a caller created is one for that caller's own shares, so
+            // it is not confined to the shares a service creates on the account's
+            // behalf.
+            restrict_to_service_linked_shares: false,
             versions: [(
                 first_version,
                 crate::state::PermissionVersionRecord {

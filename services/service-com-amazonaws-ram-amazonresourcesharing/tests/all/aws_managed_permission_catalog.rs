@@ -97,8 +97,9 @@ fn assert_detail(case: &str, permission: &Value, index: usize, version_asked_for
     );
     assert_eq!(
         field(case, permission, "version"),
-        FIRST_PERMISSION_VERSION.to_string(),
-        "case {case:?}: expected the version the catalog ships, got {permission:?}"
+        entry.version.to_string(),
+        "case {case:?}: expected the version the catalog publishes the permission at, got \
+         {permission:?}"
     );
     assert!(
         flag(case, permission, "defaultVersion"),
@@ -168,10 +169,10 @@ async fn every_aws_managed_permission_in_the_catalog_reads_back() {
         );
         assert_detail(entry.name, &permission_of(entry.name, &read), index, None);
 
-        // Asking for the version the catalog ships reports the same detail.
+        // Asking for the version the catalog publishes reports the same detail.
         let (status, by_version) = get_permission(
             &router,
-            &json!({"permissionArn": arn, "permissionVersion": FIRST_PERMISSION_VERSION}),
+            &json!({"permissionArn": arn, "permissionVersion": entry.version}),
         )
         .await;
         assert_eq!(
@@ -184,7 +185,7 @@ async fn every_aws_managed_permission_in_the_catalog_reads_back() {
             entry.name,
             &permission_of(entry.name, &by_version),
             index,
-            Some(FIRST_PERMISSION_VERSION),
+            Some(entry.version),
         );
         assert_eq!(
             read, by_version,
@@ -261,6 +262,110 @@ async fn the_catalog_holds_an_entry_that_is_not_its_resource_types_default() {
             !flag(name, &permission_of(name, &read), "isResourceTypeDefault"),
             "case {name:?}: this entry is not its resource type's default, got {read:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn the_published_version_of_a_revised_permission_is_the_one_the_library_publishes() {
+    // The published numbers themselves, named here rather than read off the catalog, so a
+    // renumbering of a table entry fails a case. Source: the version the RAM permission
+    // library publishes each of these permissions at, which is what an unfiltered
+    // ListPermissions reports for it; the rows are the permissions the library has revised
+    // since first publication, beside one it has not.
+    let published: &[(&str, &str)] = &[
+        ("AWSRAMDefaultPermissionAppMesh", "3"),
+        ("AWSRAMDefaultPermissionCapacityReservation", "2"),
+        ("AWSRAMDefaultPermissionTransitGateway", "3"),
+        ("AWSRAMPermissionGlueDatabaseReadWrite", "3"),
+        ("AWSRAMDefaultPermissionCertificateAuthority", "1"),
+        ("AWSRAMDefaultPermissionSubnet", "1"),
+    ];
+
+    let router = emulator();
+    for (name, version) in published {
+        let (status, read) = get_permission(
+            &router,
+            &json!({"permissionArn": aws_managed_permission_arn(name)}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected HTTP 200, got {status} with {read:?}"
+        );
+        let permission = permission_of(name, &read);
+        assert_eq!(
+            field(name, &permission, "version"),
+            *version,
+            "case {name:?}: expected the version the library publishes, got {permission:?}"
+        );
+        assert!(
+            flag(name, &permission, "defaultVersion"),
+            "case {name:?}: the published version is the default one, got {permission:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_permission_the_library_has_revised_is_published_at_that_revision() {
+    // The version is per entry, not one number for the catalog: a permission the library
+    // has revised since it was first published is published at the revision, and that is
+    // the version every read of it reports and the only version it carries. The rows span
+    // both states — an entry still at its first version and each entry published at a
+    // later one — so the catalog is driven over what the rule generalises over.
+    let revised: Vec<&_> = AWS_MANAGED_PERMISSIONS
+        .iter()
+        .filter(|entry| entry.version != FIRST_PERMISSION_VERSION)
+        .collect();
+    assert!(
+        !revised.is_empty(),
+        "the catalog must carry a permission the library has revised, so the published \
+         version is exercised beyond the first one"
+    );
+
+    let router = emulator();
+    for entry in AWS_MANAGED_PERMISSIONS {
+        let case = entry.name;
+        let arn = aws_managed_permission_arn(entry.name);
+        let (status, read) = get_permission(&router, &json!({"permissionArn": arn.clone()})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {read:?}"
+        );
+        let permission = permission_of(case, &read);
+        assert_eq!(
+            field(case, &permission, "version"),
+            entry.version.to_string(),
+            "case {case:?}: a read that names no version reports the published one, got \
+             {permission:?}"
+        );
+        assert!(
+            flag(case, &permission, "defaultVersion"),
+            "case {case:?}: the published version is the default one, got {permission:?}"
+        );
+        assert!(
+            entry.version >= FIRST_PERMISSION_VERSION,
+            "case {case:?}: a published version is numbered from {FIRST_PERMISSION_VERSION} \
+             upward, got {}",
+            entry.version
+        );
+
+        // A version the library does not publish is not a version the permission carries,
+        // whichever side of the published one it is on.
+        for absent in [FIRST_PERMISSION_VERSION - 1, entry.version + 1]
+            .into_iter()
+            .chain((entry.version != FIRST_PERMISSION_VERSION).then_some(FIRST_PERMISSION_VERSION))
+        {
+            let (status, refused) = get_permission(
+                &router,
+                &json!({"permissionArn": arn.clone(), "permissionVersion": absent}),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: version {absent} is not published, so the read is refused, \
+                 got {status} with {refused:?}"
+            );
+        }
     }
 }
 

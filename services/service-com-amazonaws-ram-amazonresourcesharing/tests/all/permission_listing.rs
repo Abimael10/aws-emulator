@@ -212,8 +212,9 @@ async fn every_permission_the_store_holds_is_listed_once_at_its_default_version(
         );
         assert_eq!(
             field(case, &permission, "version"),
-            FIRST_PERMISSION_VERSION.to_string(),
-            "case {:?}: expected the version the catalog ships, got {permission:?}",
+            entry.version.to_string(),
+            "case {:?}: expected the version the catalog publishes the permission at, got \
+             {permission:?}",
             entry.name
         );
         assert!(
@@ -790,14 +791,15 @@ async fn a_page_of_versions_runs_to_max_results_and_its_token_resumes_after_it()
 async fn the_versions_of_an_aws_managed_permission_are_the_one_it_publishes() {
     let router = emulator();
     // The catalog is read the same way a created permission is, from every Region: an
-    // AWS managed permission is published at one version, which is its default.
-    for entry in AWS_MANAGED_PERMISSIONS.iter().take(3) {
+    // AWS managed permission is published at one version, which is its default — whether
+    // that is the first version or the revision the library has since published.
+    for entry in AWS_MANAGED_PERMISSIONS {
         let case = entry.name;
         let arn = aws_managed_permission_arn(entry.name);
         let reported = list_versions_ok(&router, case, &json!({"permissionArn": arn.clone()})).await;
         assert_eq!(
             versions_of(case, &reported),
-            vec![FIRST_PERMISSION_VERSION.to_string()],
+            vec![entry.version.to_string()],
             "case {case:?}: expected the one published version, got {reported:?}"
         );
         let permission = permissions_of(case, &reported)

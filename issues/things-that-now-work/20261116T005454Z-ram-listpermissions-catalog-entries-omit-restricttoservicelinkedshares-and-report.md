@@ -18,6 +18,39 @@ Issue-Commit: f672b96071627a2f926b4576526626783c2d131c
 
 # ram ListPermissions catalog entries omit restrictToServiceLinkedShares and report stale versions, and most AWS_MANAGED permission ARNs are absent
 
+## Resolution
+
+Every key this issue carries is addressed — four are fixed and three are declined with their reason
+below:
+
+- `restrictToServiceLinkedShares` is now reported on every `ResourceSharePermissionSummary` this
+  service serves (ListPermissions, ListPermissionVersions, ListResourceSharePermissions and
+  CreatePermission share the one projection), read off the stored permission
+  (`PermissionRecord::restrict_to_service_linked_shares`); the shape's wire form is hand-written in
+  `src/ops/types/permission_summary_wire.rs` because the on-disk model declares no such member.
+- Each catalog entry now carries the version the permission library publishes it at
+  (`AwsManagedPermission::version`) instead of one number for the whole catalog.
+- The private-CA family gained the revocation permission
+  (`AWSRAMRevokeCertificateCertificateAuthority`), which the library publishes for
+  `acm-pca:CertificateAuthority` and the catalog did not carry.
+
+DECLINED, with reason: the three whole-object keys for
+`AWSRAMSubordinateCACertificatePathLen1/2/3IssuanceCertificateAuthority`. The permission library
+publishes one subordinate-CA issuance permission per published certificate template (path lengths
+zero through three) and the catalog serves all four, so what the emulator reports for those ARNs is
+what AWS publishes; the recorded page of this read stops at the path-length-zero sibling and carries
+none of the three, which is a property of that page rather than of the response. Removing them would
+make a published, attachable permission ARN unresolvable, so they stay.
+
+STILL OPEN, under another issue: the membership-completeness part of this report — the ~127 further
+published AWS_MANAGED ARNs the catalog does not carry (AWSRAMDefaultPermissionAPIGatewayDeveloperPortalProduct,
+...AgentRegistryReadOnly, the NetworkFirewall*/EventBridgeEventBusV2*/LFEnabledGlue*/SageMaker*
+families and the rest). Those divergences are the key set of
+`20261115T141853Z-ram-listpermissions-serves-an-incomplete-aws-managed-permission.md`, which lists
+every one of them by name; this issue carries none of them. They are left to that issue rather than
+guessed: no source readable from this checkout gives those permissions' resource types and policy
+actions.
+
 > _Note: this issue was identified against the code base at commit `f672b96071627a2f926b4576526626783c2d131c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

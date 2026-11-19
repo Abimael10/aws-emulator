@@ -24,6 +24,19 @@
 //! resource type's default. The model enumerates none of them, so the catalog is
 //! written out here, exactly as the resource-type catalog in [`super::RESOURCE_TYPES`]
 //! is; every entry's resource type is one of that catalog's.
+//!
+//! MEMBERSHIP is part of that data. `ListPermissions` is the only enumeration API for
+//! managed permissions, so the catalog carries an entry per permission the library
+//! publishes — a resource type whose owning service maintains a family of certificate
+//! templates gets one entry per published permission of that family, the revocation
+//! permission beside the issuance ones — and a name no permission is published under
+//! resolves nowhere, so an ARN a caller discovers here can be attached.
+//!
+//! So is each entry's published VERSION ([`AwsManagedPermission::version`]). The library
+//! revises a managed permission in place and publishes the revision as the permission's
+//! version, so an entry carries the version the library publishes it at rather than one
+//! number for the whole catalog: that is the version every read of it reports and the
+//! default version a share attaches.
 
 use std::collections::BTreeMap;
 
@@ -59,21 +72,36 @@ pub struct AwsManagedPermission {
     /// resource type" (`ResourceSharePermissionDetail$isResourceTypeDefault`) — the
     /// one RAM attaches when a share names no permission for the type.
     pub is_resource_type_default: bool,
+    /// Whether Amazon Web Services publishes this permission for service-linked
+    /// resource shares only — a share a service created on the account's behalf — so a
+    /// caller cannot attach it to a share of their own. A published property of each
+    /// permission, reported beside the modelled members of every summary it appears in.
+    pub restrict_to_service_linked_shares: bool,
+    /// The version Amazon Web Services publishes this permission at, which is therefore
+    /// its default version: a permission the library has revised since it was first
+    /// published is published at the revision, and a read of it reports that number
+    /// (`ResourceSharePermissionSummary$version`). Counting from
+    /// [`FIRST_PERMISSION_VERSION`], the version every permission starts at.
+    pub version: i32,
 }
+
+/// Whether a permission the catalog publishes for any resource share, which is what
+/// every entry below is, is confined to service-linked shares: it is not.
+const ATTACHABLE_TO_ANY_SHARE: bool = false;
 
 /// The resource type a private certificate authority's ARN names, spelled as
 /// [`super::RESOURCE_TYPES`] publishes it. Named once because the permissions Amazon Web
 /// Services publishes for it are a family rather than a single entry.
 const CERTIFICATE_AUTHORITY_RESOURCE_TYPE: &str = "acm-pca:CertificateAuthority";
 
-/// The actions every managed permission for a private certificate authority allows: the
-/// reads a receiving account makes about the shared CA, plus the issuance the share exists
-/// to grant.
+/// The actions every managed permission for ISSUING a certificate of a private
+/// certificate authority allows: the reads a receiving account makes about the shared CA,
+/// plus the issuance the share exists to grant.
 ///
-/// The permissions of that family differ from one another in the certificate TEMPLATE a
-/// condition on the issuance admits — which is the `Condition` element of each published
-/// policy, not its `Action` element — so every entry of the family allows the same actions.
-/// A catalog record carries a permission's effect and its actions
+/// The issuance permissions of that family differ from one another in the certificate
+/// TEMPLATE a condition on the issuance admits — which is the `Condition` element of each
+/// published policy, not its `Action` element — so every issuance entry of the family
+/// allows the same actions. A catalog record carries a permission's effect and its actions
 /// (`ResourceSharePermissionDetail$permission`, "The permission's effect and actions in JSON
 /// format"), so the template condition is not a field of one.
 const CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS: &[&str] = &[
@@ -83,6 +111,18 @@ const CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS: &[&str] = &[
     "acm-pca:IssueCertificate",
     "acm-pca:ListPermissions",
     "acm-pca:ListTags",
+];
+
+/// The actions the managed permission for REVOKING a certificate of a shared private
+/// certificate authority allows: the same reads the issuance permissions of the family
+/// allow, with the revocation the permission exists to grant in place of the issuance.
+const CERTIFICATE_AUTHORITY_REVOCATION_ACTIONS: &[&str] = &[
+    "acm-pca:DescribeCertificateAuthority",
+    "acm-pca:GetCertificate",
+    "acm-pca:GetCertificateAuthorityCertificate",
+    "acm-pca:ListPermissions",
+    "acm-pca:ListTags",
+    "acm-pca:RevokeCertificate",
 ];
 
 /// The AWS managed permissions this service serves, one entry per published
@@ -131,12 +171,18 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         false,
     ),
     entry(
+        "AWSRAMRevokeCertificateCertificateAuthority",
+        CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
+        CERTIFICATE_AUTHORITY_REVOCATION_ACTIONS,
+        false,
+    ),
+    entry(
         "APIGatewayPrivateDomainNameManagementPolicyDefaultPermission",
         "apigateway:Domainnames",
         &["apigateway:CreateAccessAssociation"],
         true,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMDefaultPermissionAppMesh",
         "appmesh:Mesh",
         &[
@@ -146,6 +192,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "appmesh:ListVirtualNodes",
         ],
         true,
+        3,
     ),
     entry(
         "AWSRAMDefaultPermissionCodeBuildProject",
@@ -167,11 +214,12 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         ],
         true,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMDefaultPermissionCapacityReservation",
         "ec2:CapacityReservation",
         &["ec2:DescribeCapacityReservations", "ec2:RunInstances"],
         true,
+        2,
     ),
     entry(
         "AWSRAMDefaultPermissionDedicatedHost",
@@ -209,7 +257,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         ],
         true,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMDefaultPermissionTransitGateway",
         "ec2:TransitGateway",
         &[
@@ -219,6 +267,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "ec2:DescribeTransitGateways",
         ],
         true,
+        3,
     ),
     entry(
         "AWSRAMDefaultPermissionGlueDatabase",
@@ -231,7 +280,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         ],
         true,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionGlueDatabaseReadWrite",
         "glue:Database",
         &[
@@ -242,6 +291,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "glue:UpdateTable",
         ],
         false,
+        3,
     ),
     entry(
         "AWSRAMDefaultPermissionGlueTable",
@@ -344,17 +394,44 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
 ];
 
 /// One catalog entry, so [`AWS_MANAGED_PERMISSIONS`] reads as the table it is.
+///
+/// Every entry the catalog publishes is one a caller may attach to a share of their own
+/// ([`ATTACHABLE_TO_ANY_SHARE`]); the restriction is a per-permission property of the
+/// record ([`super::PermissionRecord::restrict_to_service_linked_shares`]) rather than
+/// of the catalog, so a permission that carries it reports it without the table having
+/// to.
 const fn entry(
     name: &'static str,
     resource_type: &'static str,
     actions: &'static [&'static str],
     is_resource_type_default: bool,
 ) -> AwsManagedPermission {
+    entry_at_version(
+        name,
+        resource_type,
+        actions,
+        is_resource_type_default,
+        FIRST_PERMISSION_VERSION,
+    )
+}
+
+/// One catalog entry whose permission the library has REVISED since it was first
+/// published, so the version it publishes — and the one every read of it reports — is
+/// `version` rather than the first.
+const fn entry_at_version(
+    name: &'static str,
+    resource_type: &'static str,
+    actions: &'static [&'static str],
+    is_resource_type_default: bool,
+    version: i32,
+) -> AwsManagedPermission {
     AwsManagedPermission {
         name,
         resource_type,
         actions,
         is_resource_type_default,
+        restrict_to_service_linked_shares: ATTACHABLE_TO_ANY_SHARE,
+        version,
     }
 }
 
@@ -390,13 +467,13 @@ impl AwsManagedPermission {
 
     /// This entry as the record the store holds, created at `now`.
     ///
-    /// Amazon Web Services publishes each of these permissions at one version, which
-    /// is therefore its default version, and that version is `ATTACHABLE`: it "can be
-    /// associated with resource shares" (`ResourceSharePermissionDetail$status`),
-    /// which is the whole point of the catalog. A permission nobody can modify carries
-    /// no tags.
+    /// Amazon Web Services publishes each of these permissions at one version
+    /// ([`AwsManagedPermission::version`]), which is therefore its default version, and
+    /// that version is `ATTACHABLE`: it "can be associated with resource shares"
+    /// (`ResourceSharePermissionDetail$status`), which is the whole point of the catalog.
+    /// A permission nobody can modify carries no tags.
     fn record(&self, now: i64) -> PermissionRecord {
-        let version = FIRST_PERMISSION_VERSION;
+        let version = self.version;
         PermissionRecord {
             arn: self.arn(),
             name: self.name.to_string(),
@@ -408,6 +485,7 @@ impl AwsManagedPermission {
             last_updated_time: now,
             default_version: version,
             is_resource_type_default: self.is_resource_type_default,
+            restrict_to_service_linked_shares: self.restrict_to_service_linked_shares,
             versions: [(
                 version,
                 PermissionVersionRecord {

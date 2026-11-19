@@ -820,6 +820,13 @@ pub struct PermissionRecord {
     /// of this resource type" (`ResourceSharePermissionSummary$isResourceTypeDefault`),
     /// which is a property of the permission rather than of one of its versions.
     pub is_resource_type_default: bool,
+    /// Whether this permission may govern only a service-linked resource share — a
+    /// share an Amazon Web Services service created on the account's behalf — rather
+    /// than any share a caller creates. A property of the permission, published with it
+    /// for an AWS managed one ([`AwsManagedPermission::restrict_to_service_linked_shares`])
+    /// and false for one a caller created for their own shares, and reported on every
+    /// summary this record is projected into.
+    pub restrict_to_service_linked_shares: bool,
     /// Every version written for this permission, keyed by version number: the key
     /// order is total and stable, so a paginated read over versions has a page order.
     pub versions: BTreeMap<i32, PermissionVersionRecord>,
@@ -859,6 +866,10 @@ impl PermissionRecord {
             // A permission carrying no tags reports `[]`, so a caller can tell "no
             // tags" from "tags not reported".
             tags: Some(tag_list(&self.tags)),
+            // Reported on every summary, from this record's own flag: a caller reads
+            // whether the permission is confined to service-linked shares without
+            // having to fetch the permission itself.
+            restrict_to_service_linked_shares: Some(self.restrict_to_service_linked_shares),
         }
     }
 
