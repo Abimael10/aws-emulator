@@ -401,6 +401,29 @@ impl ClusterRecord {
         })
     }
 
+    /// The compute node group `identifier` names that this cluster is still going to hold
+    /// — [`Self::compute_node_group`] without one whose delete the service has already
+    /// accepted ([`ComputeNodeGroupRecord::is_being_deleted`]).
+    ///
+    /// This is the lookup a request that would PERSIST a reference to a group has to ask:
+    /// a group that is `DELETING`, or `DELETED` for the one request before its record is
+    /// forgotten, is removal this service already owes, so a reference stored to it would
+    /// dangle for the rest of the referring resource's life with no later call able to
+    /// repair it. A group name is unique among ALL of a cluster's stored groups, deleting
+    /// ones included (`CreateComputeNodeGroup`'s conflict), so this never hides an
+    /// available group behind one on its way out.
+    ///
+    /// Reporting a group the caller ADDRESSED is the other question, and keeps using
+    /// [`Self::compute_node_group`]: `GetComputeNodeGroup` answers `DELETING`/`DELETED`
+    /// for a group on its way out rather than claiming it was never there.
+    pub fn available_compute_node_group(
+        &self,
+        identifier: &str,
+    ) -> Option<&ComputeNodeGroupRecord> {
+        self.compute_node_group(identifier)
+            .filter(|group| !group.is_being_deleted())
+    }
+
     /// The queue `identifier` names — its generated id or its name.
     pub fn queue(&self, identifier: &str) -> Option<&QueueRecord> {
         self.queues

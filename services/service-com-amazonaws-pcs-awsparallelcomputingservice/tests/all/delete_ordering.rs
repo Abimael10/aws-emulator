@@ -16,6 +16,11 @@
 //! carries one status, the service's [`CLIENT_ERROR_STATUS`], and names its class in the
 //! body.
 //!
+//! That ordering is TWO-sided: a create that would persist a reference to a resource whose
+//! delete has already been accepted is refused the way one naming a resource the cluster
+//! never held is, so no stored record can be left naming a resource the service is not
+//! going to hold.
+//!
 //! The suites are tables. Their rows differ along what the rule generalises over: the form
 //! of the identifier each call addresses a resource by (its generated id or its name, the
 //! two forms the `*Identifier` patterns allow), the form a queue names a compute node group
@@ -564,6 +569,209 @@ async fn a_delete_of_a_resource_nothing_holds_is_not_found() {
             "case {case}: expected {operation} to name the identifier it could not \
              resolve, got {refused}"
         );
+    }
+}
+
+/// The sentence PCS answers a request naming a compute node group it cannot find with
+/// (`crate::state::not_found`'s own fixed sentence for the kind).
+const GROUP_NOT_FOUND: &str = "AWS PCS couldn't find the compute node group you specified.";
+
+/// RULE: a create stores a reference to another resource only when that resource is one the
+/// service is still going to hold, so a `computeNodeGroupConfigurations` entry naming a
+/// compute node group whose delete has already been accepted is refused exactly as one
+/// naming a group the cluster never held is — `ResourceNotFoundException` for the compute
+/// node group, and nothing persisted.
+///
+/// The group a row names has had its delete accepted by the previous request, so the settle
+/// pass at the top of the create reports it `DELETED` and the request after that forgets its
+/// record: were the create served, the stored queue would name a group the cluster does not
+/// hold, for the rest of the queue's life and with no later call able to repair it.
+#[tokio::test]
+async fn a_queue_cannot_reference_a_compute_node_group_whose_delete_was_accepted() {
+    // Each row: how the create addresses its cluster, how a configuration names a group,
+    // how many configurations the request carries, and where in that list the group on its
+    // way out sits — every other entry names an ACTIVE group of the same cluster.
+    let rows: &[(&str, Address, Address, usize, usize)] = &[
+        (
+            "cluster by id, group by id, the only configuration",
+            Address::Id,
+            Address::Id,
+            1,
+            0,
+        ),
+        (
+            "cluster by name, group by name, the only configuration",
+            Address::Name,
+            Address::Name,
+            1,
+            0,
+        ),
+        (
+            "cluster by id, group by name, last of two configurations",
+            Address::Id,
+            Address::Name,
+            2,
+            1,
+        ),
+        (
+            "cluster by name, group by id, first of three configurations",
+            Address::Name,
+            Address::Id,
+            3,
+            0,
+        ),
+    ];
+
+    for (case, cluster_address, reference, configurations, position) in rows {
+        let router = emulator();
+        let cluster = active_cluster(&router, case, "dangling-cluster").await;
+        let doomed = active_group(&router, case, &cluster.id, "nodes").await;
+        let mut spares = Vec::new();
+        for index in 1..*configurations {
+            spares.push(active_group(&router, case, &cluster.id, &format!("spare-{index}")).await);
+        }
+
+        // No queue assigns jobs to it, so the group's delete is accepted and the service
+        // owes its removal from here on. `DeleteComputeNodeGroup` answers an empty body;
+        // the group it left `DELETING` is what the next request's settle pass reports
+        // `DELETED` before the record is forgotten.
+        let delete_group = json!({
+            "clusterIdentifier": cluster.id.clone(),
+            "computeNodeGroupIdentifier": doomed.id.clone(),
+        });
+        let (status, deleted) = call(&router, "DeleteComputeNodeGroup", &delete_group).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected the group's delete to be accepted, got {status} with \
+             {deleted}"
+        );
+
+        let mut named: Vec<String> = spares
+            .iter()
+            .map(|spare| spare.as_addressed(*reference).to_string())
+            .collect();
+        named.insert(*position, doomed.as_addressed(*reference).to_string());
+        let create_queue = json!({
+            "clusterIdentifier": cluster.as_addressed(*cluster_address),
+            "queueName": "work",
+            "computeNodeGroupConfigurations": named
+                .iter()
+                .map(|named| json!({"computeNodeGroupId": named}))
+                .collect::<Vec<Value>>(),
+        });
+        let (status, refused) = call(&router, "CreateQueue", &create_queue).await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+            "case {case}: expected CreateQueue {create_queue} to be refused for the group \
+             on its way out, got {status} with {refused}"
+        );
+        assert_eq!(
+            refused["message"].as_str(),
+            Some(GROUP_NOT_FOUND),
+            "case {case}: expected the service's own sentence for a compute node group it \
+             cannot find, got {refused}"
+        );
+        assert_eq!(
+            (
+                refused["resourceId"].as_str(),
+                refused["resourceType"].as_str()
+            ),
+            (
+                Some(doomed.as_addressed(*reference)),
+                Some("Compute Node Group ID")
+            ),
+            "case {case}: expected the refusal to name the configuration's identifier, got \
+             {refused}"
+        );
+
+        // An identifier the cluster NEVER held earns the same refusal, which is what makes
+        // "a group whose removal is owed" and "no such group" one answer.
+        let unknown = json!({
+            "clusterIdentifier": cluster.as_addressed(*cluster_address),
+            "queueName": "work",
+            "computeNodeGroupConfigurations": [{"computeNodeGroupId": "no-such-group"}],
+        });
+        let (status, unknown_refusal) = call(&router, "CreateQueue", &unknown).await;
+        assert_eq!(
+            (
+                status,
+                error_code(&unknown_refusal).as_str(),
+                unknown_refusal["message"].as_str(),
+                unknown_refusal["resourceType"].as_str()
+            ),
+            (
+                CLIENT_ERROR_STATUS,
+                "ResourceNotFoundException",
+                Some(GROUP_NOT_FOUND),
+                Some("Compute Node Group ID")
+            ),
+            "case {case}: expected a configuration naming an unheld group to be refused the \
+             same way, got {status} with {unknown_refusal}"
+        );
+
+        // Nothing was persisted, so no stored queue can name the group once its record is
+        // forgotten.
+        let in_cluster = json!({"clusterIdentifier": cluster.id.clone()});
+        let (status, listed) = call(&router, "ListQueues", &in_cluster).await;
+        assert_eq!(
+            (status, listed["queues"].as_array().map(Vec::len)),
+            (200, Some(0)),
+            "case {case}: expected the refused creates to have stored no queue, got {status} \
+             with {listed}"
+        );
+
+        // The group's removal has come due meanwhile: the reference the refused create would
+        // have stored would now resolve to nothing.
+        let (status, gone) = call(&router, "GetComputeNodeGroup", &delete_group).await;
+        assert_eq!(
+            (status, error_code(&gone).as_str()),
+            (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+            "case {case}: expected the group to be gone once its removal came due, got \
+             {status} with {gone}"
+        );
+
+        // The same create against the cluster's ACTIVE groups alone is served and reads
+        // back, so the refusal is keyed on the accepted delete rather than on naming a
+        // group at all.
+        if !spares.is_empty() {
+            let still_held: Vec<&str> = spares
+                .iter()
+                .map(|spare| spare.as_addressed(*reference))
+                .collect();
+            let queue = active_queue(
+                &router,
+                case,
+                cluster.as_addressed(*cluster_address),
+                "work",
+                &still_held,
+            )
+            .await;
+            let (status, read) = call(
+                &router,
+                "GetQueue",
+                &json!({
+                    "clusterIdentifier": cluster.id.clone(),
+                    "queueIdentifier": queue.id.clone(),
+                }),
+            )
+            .await;
+            let stored: Vec<&str> = read["queue"]["computeNodeGroupConfigurations"]
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry["computeNodeGroupId"].as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                (status, stored),
+                (200, still_held),
+                "case {case}: expected the stored queue to name the groups the create \
+                 carried, got {status} with {read}"
+            );
+        }
     }
 }
 

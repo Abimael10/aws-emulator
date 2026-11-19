@@ -353,13 +353,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A queue assigns jobs to compute node groups of its own cluster, so a
-        // configuration naming one the cluster does not hold cannot be stored.
+        // configuration naming one the cluster does not hold — or one whose delete this
+        // service has already accepted, and therefore is not going to hold — cannot be
+        // stored: such a reference would dangle as soon as the record is forgotten, and no
+        // later call could repair it.
         let configurations = input.compute_node_group_configurations.unwrap_or_default();
         for configuration in &configurations {
             let Some(named) = configuration.compute_node_group_id.as_deref() else {
                 continue;
             };
-            if cluster.compute_node_group(named).is_none() {
+            if cluster.available_compute_node_group(named).is_none() {
                 return Err(CreateQueueErrorModeled::ResourceNotFoundException(
                     crate::state::not_found(crate::state::COMPUTE_NODE_GROUP, named),
                 )
