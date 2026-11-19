@@ -87,6 +87,10 @@ pub const OTA_JOB_DOCUMENT_ROOT: &str = "afr_ota";
 ///   `s3Location` names ([`ota_file_download_url`]) and the code-signing material the
 ///   request supplied for it ([`insert_ota_file_code_signing`]).
 ///
+/// The download location is an address a DEVICE then fetches, so it is minted against
+/// the endpoint this emulator is reached on ([`ota_file_download_url`]) — `ctx` is what
+/// carries that endpoint and the signing key.
+///
 /// A file's `attributes` and the update's `additionalParameters` are documented as NOT
 /// sent to devices as part of the job document, so neither appears. No `filesize` is
 /// stated either: nothing here holds the object a file names, so its size is not known
@@ -96,6 +100,7 @@ pub const OTA_JOB_DOCUMENT_ROOT: &str = "afr_ota";
 /// hold it ([`MAX_JOB_DOCUMENT_BYTES`]), so a request whose files would deploy a job
 /// whose document no reader can report is refused rather than recorded.
 pub fn ota_update_job_document(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     protocols: Option<&[String]>,
     presigned_url_config: Option<&AwsJobPresignedUrlConfig>,
@@ -128,7 +133,7 @@ pub fn ota_update_job_document(
             entry.insert("fileType".to_string(), ::serde_json::json!(file_type));
         }
         if let Some(url) = s3_location
-            .and_then(|location| ota_file_download_url(region, location, expires_in_sec))
+            .and_then(|location| ota_file_download_url(ctx, region, location, expires_in_sec))
         {
             entry.insert("update_data_url".to_string(), ::serde_json::json!(url));
         }
@@ -154,34 +159,90 @@ pub fn ota_update_job_document(
     Ok(document)
 }
 
-/// The HTTPS location of the S3 object a requested file names.
+/// The lifetime a pre-signed download URL is minted with when the request asked for
+/// none: 1800 seconds.
 ///
-/// "The location of the updated firmware in S3" is a bucket, a key and optionally an
-/// object version, so the URL is that object's own, in the virtual-hosted form an S3
-/// object URL takes, with the version when the location pins one and the lifetime the
-/// request asked for pre-signed URLs (`AwsJobPresignedUrlConfig$expiresInSec`, "How
-/// long (in seconds) pre-signed URLs are valid") when it asked for one. Nothing here
-/// signs the URL, so no signature is stated.
+/// `AwsJobPresignedUrlConfig$expiresInSec` states it — "How long (in seconds) pre-signed
+/// URLs are valid. Valid values are 60 - 3600, the default value is 1800 seconds" — so it
+/// is the service's documented default rather than a span chosen here.
+pub const DEFAULT_PRESIGNED_URL_EXPIRY_SEC: u64 = 1800;
+
+/// The shortest lifetime that member documents for a pre-signed URL ("Valid values are
+/// 60 - 3600").
+pub const MIN_PRESIGNED_URL_EXPIRY_SEC: u64 = 60;
+
+/// The longest lifetime that member documents for a pre-signed URL ("Valid values are
+/// 60 - 3600").
+pub const MAX_PRESIGNED_URL_EXPIRY_SEC: u64 = 3600;
+
+/// How long the pre-signed download URLs of one update stay valid: the lifetime the
+/// request asked for, held inside the range the member documents, and the documented
+/// default for a request that asked for none.
+///
+/// `ExpiresInSeconds` carries no modelled range, so a value outside the documented one
+/// reaches here; it is held at the nearer published bound rather than minting a URL that
+/// has already expired or outlives what the member promises.
+fn presigned_url_lifetime(expires_in_sec: Option<i64>) -> Duration {
+    let seconds = expires_in_sec
+        .map(|value| u64::try_from(value).unwrap_or(MIN_PRESIGNED_URL_EXPIRY_SEC))
+        .unwrap_or(DEFAULT_PRESIGNED_URL_EXPIRY_SEC)
+        .clamp(MIN_PRESIGNED_URL_EXPIRY_SEC, MAX_PRESIGNED_URL_EXPIRY_SEC);
+    Duration::from_secs(seconds)
+}
+
+/// The location a DEVICE downloads the S3 object a requested file names from: that
+/// object's own address on the Amazon S3 THIS EMULATOR serves, pre-signed.
+///
+/// `update_data_url` is not a label an agent reads — it is the address it then FETCHES,
+/// and the member that governs it is about pre-signing: "How long (in seconds) pre-signed
+/// URLs are valid" (`AwsJobPresignedUrlConfig$expiresInSec`). So the value has to be a URL
+/// a client of this emulator can follow, which the host AWS serves its own buckets at is
+/// not — a device sent there leaves the emulator and downloads nothing — and it has to
+/// carry a signature this emulator verifies, which a hand-written `X-Amz-Expires` is not.
+/// Both come from the framework's URL signer: it signs for the base URL this emulator is
+/// reached on, and the object's bucket and key travel in the PATH, the way a path-style
+/// Amazon S3 URL carries them. The lifetime is [`presigned_url_lifetime`] and the Region
+/// signed for is the one the update was created in, so the link's credential scope names
+/// the same Region as the update's own ARN.
+///
+/// "The S3 bucket version" is carried as the `versionId` query Amazon S3 reads a pinned
+/// version from, and only when the location pins one.
 ///
 /// `None` for a location missing its bucket or its key: that is no location a device
 /// could fetch from, so the entry states none rather than a URL with a hole in it.
 fn ota_file_download_url(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     location: &S3Location,
     expires_in_sec: Option<i64>,
 ) -> Option<String> {
     let bucket = location.bucket.as_deref()?;
     let key = location.key.as_deref()?;
-    let mut url = format!("https://{bucket}.s3.{region}.amazonaws.com/{key}");
-    let mut separator = '?';
+    let path = format!("/{bucket}/{key}");
+    let mut request = ::smithy_server_runtime::SignedUrlRequest::new(
+        ::smithy_server_runtime::http::Method::GET,
+        super::thing_registration_reports::S3_SIGNING_NAME,
+        &path,
+    )
+    .region(region);
     if let Some(version) = location.version.as_deref() {
-        url.push_str(&format!("{separator}versionId={version}"));
-        separator = '&';
+        request = request.query("versionId", version);
     }
-    if let Some(seconds) = expires_in_sec {
-        url.push_str(&format!("{separator}X-Amz-Expires={seconds}"));
-    }
-    Some(url)
+    Some(
+        match ctx
+            .url_signer()
+            .sign(request, presigned_url_lifetime(expires_in_sec))
+        {
+            Ok(signed) => signed.as_str().to_string(),
+            // The lifetime is held inside the signer's own range and the Region is
+            // narrowed before it gets here, so this is unreachable in practice; the
+            // object is still served at that address, so the address is what the entry
+            // states rather than no location at all. The endpoint is `scheme://host[:port]`
+            // with no path of its own, and a trailing separator is dropped so the object's
+            // path is the only one the URL carries.
+            Err(_) => format!("{}{path}", ctx.endpoint().as_str().trim_end_matches('/')),
+        },
+    )
 }
 
 /// Write the code-signing material a requested file carries into its document entry.

@@ -356,6 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // built here, before any lock is taken, and a request whose files would not fit
         // one `JobDocument` is refused instead of deploying a job no reader can report.
         let job_document = crate::state::ota_update_job_document(
+            ctx,
             &region,
             ota_update.protocols.as_deref(),
             ota_update.aws_job_presigned_url_config.as_ref(),

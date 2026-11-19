@@ -35,12 +35,15 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_iot_awsiotservice::state::ota_updates::{
+    DEFAULT_PRESIGNED_URL_EXPIRY_SEC, MAX_PRESIGNED_URL_EXPIRY_SEC, MIN_PRESIGNED_URL_EXPIRY_SEC,
+};
 use service_com_amazonaws_iot_awsiotservice::state::{
     MAX_JOB_DOCUMENT_BYTES, OTA_JOB_DOCUMENT_ROOT, OTA_UPDATE_JOB_ID_PREFIX,
 };
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use service_common::iot_job_executions::JobExecutionStore;
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EndpointUrl, MultiServiceRouter};
 
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
@@ -52,6 +55,12 @@ const REGION: &str = "us-east-1";
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/ota-update-role";
 /// The bucket the firmware images of these cases live in.
 const BUCKET: &str = "firmware-images";
+
+/// One address this emulator is served at, as the core publishes it from its data port.
+/// The port is the operating system's in a real run; what matters here is that a download
+/// location the generated document states is an address on THIS endpoint, which a device
+/// can then fetch.
+const SERVED_AT: &str = "https://127.0.0.1:41287";
 
 /// A SigV4 `Authorization` header whose credential scope names the `iot` signing name:
 /// the scope is how the router picks the claiming service, and how the service picks
@@ -84,9 +93,11 @@ impl Reply {
     }
 }
 
-/// The emulator under test: ONE shared engine with the IoT service mounted on it. The
-/// engine handle is kept so a case can read the SHARED job-execution store the control
-/// plane writes the device-facing copy of the document into.
+/// The emulator under test: ONE shared engine with the IoT service and the Amazon S3 the
+/// firmware images live in mounted on it — the shape `core/router/src/lib.rs` mounts them
+/// in — served at [`SERVED_AT`]. The engine handle is kept so a case can read the SHARED
+/// job-execution store the control plane writes the device-facing copy of the document
+/// into.
 struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
@@ -97,7 +108,13 @@ impl Emulator {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
+        router.set_url_base(
+            EndpointUrl::parse(SERVED_AT).expect("the served base is a usable endpoint"),
+        );
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
         Self { router, engine }
     }
 
@@ -180,6 +197,108 @@ impl Emulator {
             .find(|record| record.job_id == job_id)
             .and_then(|record| record.job_document.clone())
     }
+
+    /// One Amazon S3 request through the same router, signed for the `s3` scope so the
+    /// Amazon S3 mounted beside the IoT service claims it.
+    async fn s3(&self, method: &str, path: &str, body: Vec<u8>) -> (u16, Vec<u8>) {
+        let request = http::Request::builder()
+            .method(method)
+            .uri(format!("https://s3.{REGION}.amazonaws.com{path}"))
+            .header("host", format!("s3.{REGION}.amazonaws.com"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDTESTIOT/20260101/{REGION}/s3/aws4_request, \
+                     SignedHeaders=host, Signature=0000"
+                ),
+            )
+            .body(bytes::Bytes::from(body))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        (status, response.into_body().to_vec())
+    }
+
+    /// `PUT /<bucket>` — `CreateBucket` — so a staged firmware image has a bucket to live
+    /// in.
+    async fn given_bucket(&self) {
+        let (status, body) = self.s3("PUT", &format!("/{BUCKET}"), Vec::new()).await;
+        assert_eq!(
+            status,
+            200,
+            "the firmware bucket must be creatable, got {status} with {:?}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// `PUT /<bucket>/<key>` — `PutObject` — staging `image` as the firmware a file names.
+    async fn given_image(&self, key: &str, image: &[u8]) {
+        let (status, body) = self.s3("PUT", &object_path(key), image.to_vec()).await;
+        assert_eq!(
+            status,
+            200,
+            "the firmware image {key} must be stageable, got {status} with {:?}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// A GET of a download location the document handed a device, answered with its status
+    /// and the bytes it served.
+    ///
+    /// The location is an absolute URL, so what is fetched is the ADDRESS it names: its
+    /// path and query go back through the very router that minted it — which is what makes
+    /// it a location a device can follow — and the credential scope the pre-signed query
+    /// carries is what names the service that answers it. No `Authorization` header is
+    /// sent: a pre-signed URL carries its own credentials.
+    async fn fetch(&self, location: &str) -> (u16, Vec<u8>) {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(location)
+            .header("host", url_host(location))
+            .body(bytes::Bytes::new())
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        (status, response.into_body().to_vec())
+    }
+}
+
+/// The `host[:port]` of an absolute URL — the `Host` header a client following it sends.
+fn url_host(url: &str) -> String {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The path of an absolute URL, without its query: the resource the URL addresses.
+fn url_path(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let from_path = after_scheme
+        .find('/')
+        .map_or("/", |start| &after_scheme[start..]);
+    from_path.split(['?', '#']).next().unwrap_or("/")
+}
+
+/// The request path an object of [`BUCKET`] is addressed by: the bucket and the key, with
+/// the key's own `/` separators kept and every other character outside RFC 3986's
+/// unreserved set percent-encoded.
+///
+/// Hand-written for the same reason the sibling suites' encoders are: it is a few lines of
+/// test-only encoding, not worth a dependency entry in the workspace lock file.
+fn object_path(key: &str) -> String {
+    let encoded: String = key
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                char::from(byte).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect();
+    format!("/{BUCKET}/{encoded}")
 }
 
 /// The thing ARN a target entry names a device by.
@@ -504,12 +623,40 @@ async fn an_ota_update_deploys_a_job_document_generated_from_the_request() {
                              {bucket}/{key}, got {entry:?}"
                         )
                     });
+                    // The location is an address a device DIALS, so it names the object
+                    // on the endpoint THIS emulator is reached on — the bucket and key in
+                    // the path, the way a path-style Amazon S3 URL carries them — and no
+                    // host AWS serves its own buckets at.
                     assert!(
-                        url.starts_with(&format!(
-                            "https://{bucket}.s3.{REGION}.amazonaws.com/{key}"
-                        )),
-                        "case {where_:?}: expected the S3 object's own URL, got {url:?}"
+                        url.starts_with(&format!("{SERVED_AT}/{bucket}/{key}?")),
+                        "case {where_:?}: expected the object's address on this emulator \
+                         ({SERVED_AT}/{bucket}/{key}), got {url:?}"
                     );
+                    assert!(
+                        !url.contains("amazonaws.com"),
+                        "case {where_:?}: a download location must name no AWS host, got \
+                         {url:?}"
+                    );
+                    // And it is PRE-SIGNED, which is what `awsJobPresignedUrlConfig` is
+                    // about: a signature, the credential scope of the update's own
+                    // Region, and the lifetime asked for — the member's documented
+                    // default when none was.
+                    let expires = case
+                        .expires_in_sec
+                        .and_then(|seconds| u64::try_from(seconds).ok())
+                        .unwrap_or(DEFAULT_PRESIGNED_URL_EXPIRY_SEC);
+                    for expected in [
+                        "X-Amz-Algorithm=AWS4-HMAC-SHA256".to_string(),
+                        "X-Amz-Signature=".to_string(),
+                        format!("%2F{REGION}%2Fs3%2Faws4_request"),
+                        format!("X-Amz-Expires={expires}"),
+                    ] {
+                        assert!(
+                            url.contains(&expected),
+                            "case {where_:?}: expected the pre-signed location to carry \
+                             {expected:?}, got {url:?}"
+                        );
+                    }
                     let version = requested
                         .pointer("/fileLocation/s3Location/version")
                         .and_then(Value::as_str);
@@ -518,15 +665,6 @@ async fn an_ota_update_deploys_a_job_document_generated_from_the_request() {
                         version.is_some(),
                         "case {where_:?}: the object version is stated only when the \
                          request pinned one, got {url:?}"
-                    );
-                    assert_eq!(
-                        url.contains(&format!(
-                            "X-Amz-Expires={}",
-                            case.expires_in_sec.unwrap_or_default()
-                        )),
-                        case.expires_in_sec.is_some(),
-                        "case {where_:?}: the lifetime is stated only when the request \
-                         asked for one, got {url:?}"
                     );
                 }
                 _ => assert!(
@@ -574,6 +712,216 @@ async fn an_ota_update_deploys_a_job_document_generated_from_the_request() {
                 emulator.execution_document(thing_name, &job_id)
             );
         }
+    }
+}
+
+/// One row of the download-location table.
+struct DownloadCase {
+    case: &'static str,
+    ota_update_id: &'static str,
+    /// The device the update targets.
+    thing: &'static str,
+    /// The `s3Location.key` the staged firmware image lives at.
+    key: &'static str,
+    /// The image staged at that key — the bytes a device following the location must get
+    /// back.
+    image: &'static [u8],
+    /// `awsJobPresignedUrlConfig.expiresInSec`, when the row asks for one.
+    expires_in_sec: Option<i64>,
+    /// How long the published location must then stay valid, written out here rather
+    /// than recomputed from the row: the member documents "Valid values are 60 - 3600,
+    /// the default value is 1800 seconds", so a request naming none is 1800 and one
+    /// naming a value outside those bounds is held at the nearer bound.
+    expected_expires_sec: u64,
+}
+
+/// RULE: the download location a generated OTA job document states for a file is an
+/// address THIS emulator answers on — the file's Amazon S3 object, pre-signed against the
+/// endpoint the emulator is reached at — so a device that follows it as published is
+/// served the very bytes staged at that bucket and key.
+///
+/// The rows span what the rule generalises over: where the object sits in the bucket (at
+/// its root, under a prefix, under a key carrying characters a URL must encode), how long
+/// the request asked the location to stay valid (the documented bounds, a value on either
+/// side of them, a value no lifetime at all, and the default for a request that asked for
+/// nothing), and what the image is (text and bytes no text encoding survives, so the
+/// equality is over the bytes).
+#[tokio::test]
+async fn the_download_location_a_job_document_states_serves_the_staged_image() {
+    let emulator = Emulator::new();
+    emulator.given_bucket().await;
+
+    let cases: &[DownloadCase] = &[
+        DownloadCase {
+            case: "an object at the bucket's root, no lifetime asked for",
+            ota_update_id: "ota-fetch-root",
+            thing: "fetch-sensor-a",
+            key: "firmware.bin",
+            image: b"the firmware image at the bucket root",
+            expires_in_sec: None,
+            expected_expires_sec: DEFAULT_PRESIGNED_URL_EXPIRY_SEC,
+        },
+        DownloadCase {
+            case: "an object under a prefix, at the shortest documented lifetime",
+            ota_update_id: "ota-fetch-prefixed",
+            thing: "fetch-sensor-b",
+            key: "firmware/2.0.0/image.bin",
+            image: b"the firmware image under a prefix",
+            expires_in_sec: Some(60),
+            expected_expires_sec: 60,
+        },
+        DownloadCase {
+            case: "a key carrying characters a URL must encode, at the longest documented \
+                   lifetime",
+            ota_update_id: "ota-fetch-encoded",
+            thing: "fetch-sensor-c",
+            key: "firmware/release 2.0+rc1/image.bin",
+            image: b"the firmware image behind an encoded key",
+            expires_in_sec: Some(3600),
+            expected_expires_sec: 3600,
+        },
+        DownloadCase {
+            case: "an image of bytes no text encoding survives",
+            ota_update_id: "ota-fetch-binary",
+            thing: "fetch-sensor-d",
+            key: "firmware/binary.bin",
+            image: &[0x00, 0xff, 0x10, 0x80, 0x7f, 0x00, 0xfe],
+            expires_in_sec: Some(1800),
+            expected_expires_sec: 1800,
+        },
+        DownloadCase {
+            case: "a lifetime under the published minimum is held at the minimum",
+            ota_update_id: "ota-fetch-under",
+            thing: "fetch-sensor-e",
+            key: "firmware/under.bin",
+            image: b"the firmware image of a too-short lifetime",
+            expires_in_sec: Some(1),
+            expected_expires_sec: MIN_PRESIGNED_URL_EXPIRY_SEC,
+        },
+        DownloadCase {
+            case: "a lifetime that is no lifetime at all is held at the minimum",
+            ota_update_id: "ota-fetch-negative",
+            thing: "fetch-sensor-f",
+            key: "firmware/negative.bin",
+            image: b"the firmware image of a negative lifetime",
+            expires_in_sec: Some(-1),
+            expected_expires_sec: MIN_PRESIGNED_URL_EXPIRY_SEC,
+        },
+        DownloadCase {
+            case: "a lifetime over the published maximum is held at the maximum",
+            ota_update_id: "ota-fetch-over",
+            thing: "fetch-sensor-g",
+            key: "firmware/over.bin",
+            image: b"the firmware image of a too-long lifetime",
+            expires_in_sec: Some(86_400),
+            expected_expires_sec: MAX_PRESIGNED_URL_EXPIRY_SEC,
+        },
+    ];
+
+    for case in cases {
+        emulator.given_image(case.key, case.image).await;
+        assert_eq!(
+            emulator.create_thing(case.thing).await.status,
+            200,
+            "case {:?}: the target device must be registrable",
+            case.case
+        );
+
+        let mut request = json!({
+            "targets": [thing_arn(case.thing)],
+            "files": [s3_file("firmware.bin", case.key)],
+            "protocols": ["HTTP"],
+            "roleArn": ROLE_ARN,
+        });
+        if let Some(seconds) = case.expires_in_sec {
+            request["awsJobPresignedUrlConfig"] = json!({"expiresInSec": seconds});
+        }
+        let created = emulator.create_ota_update(case.ota_update_id, &request).await;
+        assert_eq!(
+            created.status, 200,
+            "case {:?}: expected 200 from the create, got {} {:?}",
+            case.case, created.status, created.body
+        );
+
+        let job_id = job_id_of(case.ota_update_id);
+        let document = emulator
+            .job_document(&job_id)
+            .await
+            .text("document")
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: expected the deployed job to report a document",
+                    case.case
+                )
+            });
+        let update = afr_ota(case.case, &document);
+        let location = update
+            .pointer("/files/0/update_data_url")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: expected a download location, got {update:?}",
+                    case.case
+                )
+            })
+            .to_string();
+
+        // Published for a device to DIAL, so it is an address of this emulator.
+        assert_eq!(
+            url_host(&location),
+            url_host(SERVED_AT),
+            "case {:?}: expected the location to name this emulator's own host, got \
+             {location:?}",
+            case.case
+        );
+
+        // And it stays valid for the lifetime the member documents for this row.
+        let expires = format!("X-Amz-Expires={}", case.expected_expires_sec);
+        assert!(
+            location.contains(&expires),
+            "case {:?}: expected the location to carry {expires:?}, got {location:?}",
+            case.case
+        );
+
+        // Followed as published, it serves the object staged at that bucket and key.
+        let (status, served) = emulator.fetch(&location).await;
+        assert_eq!(
+            status,
+            200,
+            "case {:?}: expected the published location {location:?} to serve the image, \
+             got {status} with {:?}",
+            case.case,
+            String::from_utf8_lossy(&served)
+        );
+        assert_eq!(
+            served.as_slice(),
+            case.image,
+            "case {:?}: expected the staged image back from the published location, got \
+             {served:?}",
+            case.case
+        );
+
+        // The same object read with `GetObject`, no location involved, answers the same
+        // bytes: the location addresses a real object of the emulator's own Amazon S3,
+        // under the bucket the request named.
+        let object_path = url_path(&location);
+        assert!(
+            object_path.starts_with(&format!("/{BUCKET}/")),
+            "case {:?}: expected the location to address an object of {BUCKET}, got \
+             {object_path:?}",
+            case.case
+        );
+        let (status, directly) = emulator.s3("GET", object_path, Vec::new()).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected the staged object to be readable directly, got {status}",
+            case.case
+        );
+        assert_eq!(
+            directly, served,
+            "case {:?}: expected the location and Amazon S3 to serve the same bytes",
+            case.case
+        );
     }
 }
 

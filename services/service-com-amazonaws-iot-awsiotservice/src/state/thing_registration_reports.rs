@@ -296,9 +296,14 @@ fn report_link(
     }
 }
 
-/// The signing name of the service that SERVES a report object: a link is an Amazon S3 object
-/// URL, so it is presigned for Amazon S3 and the emulator's own Amazon S3 answers it.
-const S3_SIGNING_NAME: &str = "s3";
+/// The signing name of the service that SERVES an Amazon S3 object of this account: a link
+/// to one is an Amazon S3 object URL, so it is presigned for Amazon S3 and the emulator's own
+/// Amazon S3 answers it.
+///
+/// Read by every link this service mints over an object — a task's report objects here, and
+/// the firmware image an OTA job document sends a device to
+/// (`crate::state::ota_updates`) — so what is signed for and what answers cannot drift.
+pub(crate) const S3_SIGNING_NAME: &str = "s3";
 
 /// The one Region whose buckets are created with no location constraint at all.
 const US_EAST_1: &str = "us-east-1";
