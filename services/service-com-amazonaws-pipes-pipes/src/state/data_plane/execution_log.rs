@@ -26,6 +26,13 @@
 //! that record is what the execution beginning IS; a stage that failed the execution is named
 //! by its failure record ([`Execution::verdict`]) whichever stage it was.
 //!
+//! A stage whose INVOCATION the service it calls REFUSED writes one record more, at
+//! [`Level::Error`] ([`Execution::invocation_failed`]): the refusal belongs to the called
+//! service, so that record names which service refused the pipe's call, with what HTTP status
+//! and under which class of error, the resource the call named, the identifier of that answer
+//! and what it said ([`invocation_error`]) — the only signal a client has that its enrichment
+//! or its target is failing, and the reason `ERROR` is a level an operator alarms on.
+//!
 //! WHICH destination is written to is the one surface of the three
 //! `PipeLogConfigurationParameters` carries that this emulator serves: the CloudWatch Logs
 //! group `CloudwatchLogsLogDestination.LogGroupArn` names ([`Destination`]). A pipe
@@ -49,6 +56,7 @@
 
 use ::serde_json::{json, Value};
 
+use super::called_service::Refusal;
 use super::{Batch, FailedAttempt, LiveRecord, RunningPipe, Stage};
 use crate::ops::types::PipeLogConfiguration;
 
@@ -97,6 +105,22 @@ const STAGE_FIELD: &str = "stage";
 /// What a record about a FAILURE says went wrong.
 const ERROR_FIELD: &str = "error";
 
+/// The members the [`ERROR_FIELD`] of a record about a REFUSED INVOCATION carries: which
+/// service refused, with what HTTP status and under which class, the resource the refused
+/// call named, the identifier of that answer, and what it said.
+///
+/// They are the facts of the call the stage made ([`super::called_service`]), so a client
+/// reading the record is told which service failed its pipe rather than only that one did.
+const AWS_SERVICE_FIELD: &str = "awsService";
+/// See [`AWS_SERVICE_FIELD`].
+const HTTP_STATUS_CODE_FIELD: &str = "httpStatusCode";
+/// See [`AWS_SERVICE_FIELD`].
+const EXCEPTION_TYPE_FIELD: &str = "exceptionType";
+/// See [`AWS_SERVICE_FIELD`].
+const REQUEST_ID_FIELD: &str = "requestId";
+/// See [`AWS_SERVICE_FIELD`].
+const MESSAGE_FIELD: &str = "message";
+
 /// The kinds of record an execution writes.
 const EXECUTION_STARTED: &str = "ExecutionStarted";
 /// See [`EXECUTION_STARTED`].
@@ -109,6 +133,22 @@ const EXECUTION_STAGE_STARTED: &str = "ExecutionStageStarted";
 const EXECUTION_STAGE_SUCCEEDED: &str = "ExecutionStageSucceeded";
 /// See [`EXECUTION_STARTED`].
 const EXECUTION_STAGE_FAILED: &str = "ExecutionStageFailed";
+
+/// The kind of record the INVOCATION a stage made being refused is reported by, one per
+/// stage that makes one: the enrichment's and the target's
+/// ([`Execution::invocation_failed`]).
+const ENRICHMENT_INVOCATION_FAILED: &str = "EnrichmentInvocationFailed";
+/// See [`ENRICHMENT_INVOCATION_FAILED`].
+const TARGET_INVOCATION_FAILED: &str = "TargetInvocationFailed";
+
+/// How a record about a refused invocation OPENS its message, per stage: the stage whose
+/// invocation failed, then the service that refused it ([`invocation_message`]).
+const ENRICHMENT_INVOCATION_OPENING: &str = "Enrichment invocation failed";
+/// See [`ENRICHMENT_INVOCATION_OPENING`].
+const TARGET_INVOCATION_OPENING: &str = "Target invocation failed";
+
+/// What joins that opening to the service that refused and the sentence it worded.
+const WITH_ERROR_FROM: &str = "with error from";
 
 /// The most records ONE execution writes.
 ///
@@ -363,6 +403,33 @@ impl<'a> Execution<'a> {
         );
     }
 
+    /// The INVOCATION `stage` made was REFUSED by the service it was made to: the record
+    /// that names which service refused it and what it said.
+    ///
+    /// One record per refused invocation, carrying what that stage was handed — so a client
+    /// alarming on the pipe's `ERROR` records is told which service failed its pipe, with
+    /// what status and over which record, and never only that something failed. A stage the
+    /// pipe could not even make its call for (a role that may not make it, a payload that
+    /// could not be built) has no answer from any service to report and leaves this record
+    /// out; its failure is the execution's own ([`Execution::verdict`]) as before.
+    pub(super) fn invocation_failed(
+        &mut self,
+        stage: Stage,
+        payload: &[Value],
+        refusal: &Refusal,
+    ) {
+        let Some((message_type, opening)) = invocation_failure(stage) else {
+            return;
+        };
+        self.record(
+            Level::Error,
+            message_type,
+            None,
+            Some(payload),
+            Some(invocation_error(opening, refusal)),
+        );
+    }
+
     /// What the pass the execution's stages came to is: its verdict record, and the record of
     /// the stage that failed it when one did.
     ///
@@ -395,9 +462,15 @@ impl<'a> Execution<'a> {
             EXECUTION_STAGE_FAILED,
             Some(stage),
             None,
-            Some(detail),
+            Some(json!(detail)),
         );
-        self.record(Level::Error, EXECUTION_FAILED, None, None, Some(detail));
+        self.record(
+            Level::Error,
+            EXECUTION_FAILED,
+            None,
+            None,
+            Some(json!(detail)),
+        );
     }
 
     /// Hold one record of this execution, if the pipe's configured level admits a record of
@@ -412,7 +485,7 @@ impl<'a> Execution<'a> {
         message_type: &str,
         stage: Option<Stage>,
         payload: Option<&[Value]>,
-        error: Option<&str>,
+        error: Option<Value>,
     ) {
         if !self.run.logging.admits_record(level) || self.records.len() >= MAX_RECORDS_PER_EXECUTION
         {
@@ -432,7 +505,7 @@ impl<'a> Execution<'a> {
             record[STAGE_FIELD] = json!(stage.reported_stage());
         }
         if let Some(detail) = error {
-            record[ERROR_FIELD] = json!(detail);
+            record[ERROR_FIELD] = detail;
         }
         if let Some(payload) = payload.filter(|_| self.run.logging.execution_data) {
             if let Some(data) = logged_payload(payload) {
@@ -499,6 +572,54 @@ impl<'a> Execution<'a> {
             );
         }
     }
+}
+
+/// How a refused invocation of `stage` is reported: the kind of record it is, and how that
+/// record's message opens.
+///
+/// `None` for a stage that makes no invocation of its own — the source POLL is the execution
+/// beginning rather than a call the pipe hands a batch to, so a poll that failed is the
+/// execution's own failure and nothing narrower.
+fn invocation_failure(stage: Stage) -> Option<(&'static str, &'static str)> {
+    match stage {
+        Stage::Source => None,
+        Stage::Enrichment => Some((
+            ENRICHMENT_INVOCATION_FAILED,
+            ENRICHMENT_INVOCATION_OPENING,
+        )),
+        Stage::Target => Some((TARGET_INVOCATION_FAILED, TARGET_INVOCATION_OPENING)),
+    }
+}
+
+/// The [`ERROR_FIELD`] of a record about a refused invocation: the facts of the call the
+/// stage made, and the one sentence they come to.
+///
+/// The sentence is the stage's own `opening`, the service that refused, that service's own
+/// words for the refusal, and the clause naming the call it came from — the workspace's one
+/// rendering of a relayed call ([`::service_common::relayed_refusal`]), so the request id
+/// the sentence states and the one the field beside it carries are the one identifier of the
+/// one answer.
+fn invocation_error(opening: &str, refusal: &Refusal) -> Value {
+    let message = format!(
+        "{opening} {WITH_ERROR_FROM} {}: {}{}",
+        refusal.service_named(),
+        refusal.reason(),
+        ::service_common::relayed_refusal::relay_envelope_of(
+            ::service_common::relayed_refusal::RelayedCall::once(
+                refusal.service_sdk(),
+                refusal.status(),
+            ),
+            refusal.request_id(),
+        )
+    );
+    json!({
+        AWS_SERVICE_FIELD: refusal.namespace(),
+        HTTP_STATUS_CODE_FIELD: refusal.status(),
+        EXCEPTION_TYPE_FIELD: refusal.exception_type(),
+        RESOURCE_ARN_FIELD: refusal.resource(),
+        REQUEST_ID_FIELD: refusal.request_id(),
+        MESSAGE_FIELD: message,
+    })
 }
 
 /// The log stream one pipe's records go into, inside the group its configuration names.

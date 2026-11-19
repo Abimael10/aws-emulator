@@ -327,6 +327,7 @@ mod tests {
                     CallFailure {
                         detail: "the enrichment answered an Unhandled error".to_string(),
                         function_error: Some("Unhandled".to_string()),
+                        refusal: None,
                     },
                 ),
             ),

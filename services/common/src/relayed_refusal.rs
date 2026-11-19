@@ -74,17 +74,28 @@ impl<'a> RelayedCall<'a> {
 /// The envelope a relayed refusal is reported inside, including the space that separates it
 /// from the reason it follows — so a caller that carries a downstream reason through
 /// APPENDS this to it.
+///
+/// The request id belongs to the relayed CALL, so one is minted here per call. A caller that
+/// already HOLDS the answer's own identifier — because it read it off that answer, and
+/// reports it beside this message — states it through [`relay_envelope_of`] instead, so the
+/// id in the message and the id in the field are the one identifier of the one call.
 #[must_use]
 pub fn relay_envelope(call: RelayedCall<'_>) -> String {
+    relay_envelope_of(call, &new_request_id())
+}
+
+/// [`relay_envelope`] for a caller that holds the relayed answer's own request id
+/// ([`answered_request_id`]) rather than minting one for it.
+#[must_use]
+pub fn relay_envelope_of(call: RelayedCall<'_>, request_id: &str) -> String {
     let RelayedCall {
         service,
         status,
         attempts,
     } = call;
     format!(
-        " (Service: {service}, Status Code: {status}, Request ID: {}) \
-         (SDK Attempt Count: {attempts})",
-        new_request_id()
+        " (Service: {service}, Status Code: {status}, Request ID: {request_id}) \
+         (SDK Attempt Count: {attempts})"
     )
 }
 
@@ -191,7 +202,8 @@ pub fn caught_exception_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        caught_exception_message, relay_envelope, relayed_refusal_message, CaughtCall, RelayedCall,
+        caught_exception_message, relay_envelope, relay_envelope_of, relayed_refusal_message,
+        CaughtCall, RelayedCall,
     };
     use crate::query_error_envelope::is_request_id;
 
@@ -248,6 +260,28 @@ mod tests {
             "case \"a call made once\": expected one attempt, got {}",
             call.attempts
         );
+    }
+
+    /// A caller that HOLDS the answered id states that one, so the id in a message and the
+    /// id in the field beside it are the one identifier of the one call.
+    #[test]
+    fn an_answered_request_id_is_the_one_the_envelope_states() {
+        // (case, the service, the status, the identifier the answer carried)
+        let rows = [
+            ("a step functions refusal", "Sfn", 400u16, "a1b2c3d4-0000-4000-8000-000000000000"),
+            ("a queue refusal", "Sqs", 403, "9f8e7d6c-1111-4111-8111-111111111111"),
+        ];
+        for (case, service, status, request_id) in rows {
+            let envelope = relay_envelope_of(RelayedCall::once(service, status), request_id);
+            let expected = format!(
+                " (Service: {service}, Status Code: {status}, Request ID: {request_id}) \
+                 (SDK Attempt Count: 1)"
+            );
+            assert_eq!(
+                envelope, expected,
+                "case {case:?}: expected {expected:?}, got {envelope:?}"
+            );
+        }
     }
 
     /// The other rendering states the opening, the caught class, the called service's own

@@ -152,6 +152,7 @@ use ::serde_json::{json, Value};
 use super::{pipe_state, ComAmazonawsPipesPipesState, PipeRecord};
 use crate::ops::types::{PipeSourceParameters, PipeTargetParameters};
 
+mod called_service;
 mod dead_letter;
 mod event_bus;
 mod execution_log;
@@ -1315,7 +1316,15 @@ async fn run_stages(
                     log.stage_succeeded(Stage::Enrichment, Some(&events));
                     events
                 }
-                Err(failure) => return Err(FailedAttempt::from_call(Stage::Enrichment, failure)),
+                Err(failure) => {
+                    // The service the enrichment was called on refused it, which is the
+                    // one signal a client has that its enrichment is failing: the record
+                    // naming that refusal is written before the execution's own verdict.
+                    if let Some(refusal) = &failure.refusal {
+                        log.invocation_failed(Stage::Enrichment, &handed, refusal);
+                    }
+                    return Err(FailedAttempt::from_call(Stage::Enrichment, failure));
+                }
             }
         }
     };
@@ -1348,9 +1357,24 @@ async fn run_stages(
         log.stage_started(Stage::Target, &events);
     }
     let report =
-        match deliver_batch(callback, clients, &decided.target, &payloads, &identifiers).await {
+        match deliver_batch(
+            callback,
+            clients,
+            &decided.target,
+            &decided.target_arn,
+            &payloads,
+            &identifiers,
+        )
+        .await {
             Ok(report) => report,
-            Err(failure) => return Err(FailedAttempt::from_call(Stage::Target, failure)),
+            Err(failure) => {
+                // As for the enrichment above: a delivery the target service refused is
+                // reported as that service's refusal, naming which service failed the pipe.
+                if let Some(refusal) = &failure.refusal {
+                    log.invocation_failed(Stage::Target, &events, refusal);
+                }
+                return Err(FailedAttempt::from_call(Stage::Target, failure));
+            }
         };
     // A report that cannot be read as a report of the records of THIS batch — an identifier
     // the batch does not hold among them, or every record of it — leaves nothing of it
@@ -2760,6 +2784,15 @@ struct CallFailure {
     /// (`InvocationResponse$FunctionError`) — `None` for a call that failed without the
     /// resource naming an error of its own.
     function_error: Option<String>,
+    /// What the called service ANSWERED, for a call it refused with words of its own: which
+    /// service refused, with what status, under which request id and what it said
+    /// ([`called_service`]). `None` for a failure no service answered — one the pipe could
+    /// not even make the call for, and one the transport refused. It is what the record of a
+    /// refused invocation is written from ([`execution_log::Execution::invocation_failed`]).
+    ///
+    /// Held BEHIND A POINTER: a failure is the unusual answer of every call a stage makes,
+    /// so what one says about itself is not carried in the width of every `Ok` beside it.
+    refusal: Option<Box<called_service::Refusal>>,
 }
 
 impl From<String> for CallFailure {
@@ -2767,6 +2800,7 @@ impl From<String> for CallFailure {
         Self {
             detail,
             function_error: None,
+            refusal: None,
         }
     }
 }
@@ -2794,9 +2828,14 @@ async fn invoke_enrichment(
                 .send()
                 .await
                 .map_err(|error| {
-                    format!(
-                        "the enrichment {arn} could not be invoked ({})",
-                        ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                    called_service::call_failure(
+                        format!(
+                            "the enrichment {arn} could not be invoked ({})",
+                            ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                        ),
+                        called_service::LAMBDA,
+                        arn,
+                        &error,
                     )
                 })?;
             // "If present, indicates that an error occurred during function execution"
@@ -2806,6 +2845,7 @@ async fn invoke_enrichment(
                 return Err(CallFailure {
                     detail: format!("the enrichment {arn} answered a {failure} error"),
                     function_error: Some(failure.to_string()),
+                    refusal: None,
                 });
             }
             let returned = answer
@@ -2823,15 +2863,21 @@ async fn invoke_enrichment(
                 .send()
                 .await
                 .map_err(|error| {
-                    format!(
-                        "the enrichment {arn} could not be run ({})",
-                        ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                    called_service::call_failure(
+                        format!(
+                            "the enrichment {arn} could not be run ({})",
+                            ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                        ),
+                        called_service::STATES,
+                        arn,
+                        &error,
                     )
                 })?;
             if answer.status != ::aws_sdk_sfn::types::SyncExecutionStatus::Succeeded {
                 return Err(CallFailure {
                     detail: format!("the enrichment {arn} ended {}", answer.status.as_str()),
                     function_error: Some(answer.status.as_str().to_string()),
+                    refusal: None,
                 });
             }
             let returned = answer.output.unwrap_or_default();
@@ -2857,6 +2903,7 @@ fn enrichment_events(returned: &[u8], arn: &str) -> Result<Vec<Value>, CallFailu
     let value: Value = ::serde_json::from_slice(trimmed).map_err(|error| CallFailure {
         detail: format!("the enrichment {arn} answered a body that is not JSON ({error})"),
         function_error: None,
+        refusal: None,
     })?;
     Ok(match value {
         Value::Null => Vec::new(),
@@ -2889,10 +2936,16 @@ fn enrichment_events(returned: &[u8], arn: &str) -> Result<Vec<Value>, CallFailu
 /// delivery says nothing about the records, so its batch counts as wholly processed — an
 /// Amazon SQS `SendMessage` answers nothing about the event it took, and an asynchronous
 /// invocation has only been accepted at the point it answers.
+///
+/// `target_arn` is the ARN the pipe NAMES the target by: the resource a refusal of the
+/// delivery is attributed to ([`called_service`]), whichever form the call itself addresses
+/// that resource in — a queue is addressed by its url, and a client reading the record of a
+/// failed delivery is told the ARN it configured.
 async fn deliver_batch(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
     target: &Target,
+    target_arn: &str,
     payloads: &[Delivery<'_>],
     records: &[String],
 ) -> Result<::service_common::batch_item_failures::BatchReport, CallFailure> {
@@ -2930,9 +2983,14 @@ async fn deliver_batch(
                     request = request.message_deduplication_id(deduplication);
                 }
                 request.send().await.map_err(|error| {
-                    format!(
-                        "the target queue {url} did not take the event ({})",
-                        ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                    called_service::call_failure(
+                        format!(
+                            "the target queue {url} did not take the event ({})",
+                            ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                        ),
+                        called_service::SQS,
+                        target_arn,
+                        &error,
                     )
                 })?;
             }
@@ -2973,9 +3031,14 @@ async fn deliver_batch(
                 .send()
                 .await
                 .map_err(|error| {
-                    format!(
-                        "the target {arn} could not be invoked ({})",
-                        ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                    called_service::call_failure(
+                        format!(
+                            "the target {arn} could not be invoked ({})",
+                            ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                        ),
+                        called_service::LAMBDA,
+                        arn,
+                        &error,
                     )
                 })?;
             // "If present, indicates that an error occurred during function execution"
@@ -2987,6 +3050,7 @@ async fn deliver_batch(
                 return Err(CallFailure {
                     detail: format!("the target {arn} answered a {failure} error"),
                     function_error: Some(failure.to_string()),
+                    refusal: None,
                 });
             }
             if !*synchronous {

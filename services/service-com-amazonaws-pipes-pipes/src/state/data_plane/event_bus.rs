@@ -151,10 +151,15 @@ pub(super) async fn publish(
             request = request.entries(entry(bus, payload.as_ref(), event.as_ref())?);
         }
         let answered = request.send().await.map_err(|error| {
-            format!(
-                "the target event bus {} did not take the events ({})",
-                bus.arn,
-                ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+            super::called_service::call_failure(
+                format!(
+                    "the target event bus {} did not take the events ({})",
+                    bus.arn,
+                    ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                ),
+                super::called_service::EVENTS,
+                bus.arn(),
+                &error,
             )
         })?;
         // "The number of failed entries" (`PutEventsResponse$FailedEntryCount`): an entry

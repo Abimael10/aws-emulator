@@ -120,9 +120,14 @@ pub(super) async fn start(
             .send()
             .await
             .map_err(|error| {
-                format!(
-                    "the target {arn} could not be started ({})",
-                    ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                super::called_service::call_failure(
+                    format!(
+                        "the target {arn} could not be started ({})",
+                        ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                    ),
+                    super::called_service::STATES,
+                    arn,
+                    &error,
                 )
             })?;
         // "Invoke asynchronously": Step Functions has only accepted the input at the point
@@ -138,9 +143,14 @@ pub(super) async fn start(
         .send()
         .await
         .map_err(|error| {
-            format!(
-                "the target {arn} could not be run ({})",
-                ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+            super::called_service::call_failure(
+                format!(
+                    "the target {arn} could not be run ({})",
+                    ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                ),
+                super::called_service::STATES,
+                arn,
+                &error,
             )
         })?;
     // A run that did not SUCCEED took nothing: nothing of the batch is deleted from the
@@ -149,6 +159,7 @@ pub(super) async fn start(
         return Err(CallFailure {
             detail: format!("the target {arn} ended {}", answer.status.as_str()),
             function_error: Some(answer.status.as_str().to_string()),
+            refusal: None,
         });
     }
     // What the run RETURNED, read as its report of the records of the batch it did not

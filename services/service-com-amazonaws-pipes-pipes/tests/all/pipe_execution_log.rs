@@ -35,6 +35,12 @@
 //! and every assertion that something stays ABSENT is looked at repeatedly across its span:
 //! nothing below is asserted about elapsed time, so a row reports what the pipe did and
 //! never how fast the host it ran on happened to be.
+//!
+//! The second table ([`the_refusal_is_reported_for`]) is about the `ERROR` level over a stage
+//! whose INVOCATION the service it called REFUSED, with Step Functions mounted beside the
+//! rest: the refusal belongs to that service, so the record names which service refused the
+//! pipe's call, with what status, under which class and request id, over which resource and
+//! in whose words.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -56,6 +62,14 @@ use crate::pipe_metrics::given_role_stating;
 /// other one is slow at everything.
 const BUDGET: Duration = Duration::from_secs(60);
 
+/// How long a wait in the refused-invocation table is given before the row is a failure.
+///
+/// More generous than [`BUDGET`]: a row there drives a pipe through a stage that calls
+/// another service of this emulator, so its work spans two services' own passes, and this
+/// suite runs beside every other one in the workspace. Every wait below looks again until
+/// its condition holds, so a row whose work the pipe did spends none of this.
+const REFUSAL_BUDGET: Duration = Duration::from_secs(150);
+
 /// The record kinds a pipe writes, named as the records themselves name them.
 const EXECUTION_STARTED: &str = "ExecutionStarted";
 const EXECUTION_SUCCEEDED: &str = "ExecutionSucceeded";
@@ -63,10 +77,16 @@ const EXECUTION_FAILED: &str = "ExecutionFailed";
 const EXECUTION_STAGE_STARTED: &str = "ExecutionStageStarted";
 const EXECUTION_STAGE_SUCCEEDED: &str = "ExecutionStageSucceeded";
 const EXECUTION_STAGE_FAILED: &str = "ExecutionStageFailed";
+/// The kinds that report the INVOCATION a stage made being refused by the service it was
+/// made to, one per stage that makes one.
+const ENRICHMENT_INVOCATION_FAILED: &str = "EnrichmentInvocationFailed";
+const TARGET_INVOCATION_FAILED: &str = "TargetInvocationFailed";
 
 /// Pipes, plus every service this rule is observed through, on ONE engine — the shape
 /// `core/router/src/lib.rs` mounts them in: the source and target queues, the IAM role the
-/// stages act as, and the CloudWatch Logs group the records are read back from.
+/// stages act as, the CloudWatch Logs group the records are read back from, and the Step
+/// Functions state machine the rows about a REFUSED INVOCATION name as a pipe's enrichment
+/// or target.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -86,6 +106,9 @@ fn emulator() -> MultiServiceRouter {
         service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(Arc::clone(
             &engine,
         )),
+    );
+    router.register_service(
+        service_com_amazonaws_sfn_awsstepfunctions::EmulatedService::new(Arc::clone(&engine)),
     );
     router
 }
@@ -776,6 +799,404 @@ async fn a_role_granted_another_groups_streams_writes_nothing_and_still_delivers
         may_deliver: true,
         expect: &[],
         forbid: &[EXECUTION_STARTED, EXECUTION_SUCCEEDED],
+    })
+    .await;
+}
+
+/// A workflow that hands its input straight back, so an enrichment run of it answers the
+/// events it was handed. It is the smallest definition that runs at all.
+const ECHO_DEFINITION: &str = r#"{"StartAt":"Echo","States":{"Echo":{"Type":"Pass","End":true}}}"#;
+
+/// The workflow types a state machine below is created as, as Step Functions' own
+/// `StateMachineType` spells them.
+const STANDARD: &str = "STANDARD";
+/// See [`STANDARD`].
+const EXPRESS: &str = "EXPRESS";
+
+/// One Step Functions call (`awsJson1_0`, `AWSStepFunctions.<Operation>`).
+async fn states(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+    rpc(router, "states", "AWSStepFunctions", operation, body).await
+}
+
+/// A state machine called `name` of the workflow type `sm_type`; answers the ARN a pipe
+/// names it by.
+async fn given_state_machine(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    sm_type: &str,
+) -> String {
+    let (status, created) = states(
+        router,
+        "CreateStateMachine",
+        &json!({
+            "name": name,
+            "definition": ECHO_DEFINITION,
+            "roleArn": format!("arn:aws:iam::{}:role/{name}-workflow", engine::emulator_account_id()),
+            "type": sm_type,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateStateMachine answered {status} {created}"
+    );
+    created["stateMachineArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no stateMachineArn in {created}"))
+        .to_string()
+}
+
+/// Which stage of the pipe names the state machine, and so whose invocation the called
+/// service refuses.
+#[derive(Clone, Copy, Debug)]
+enum Stage {
+    /// The pipe's `Enrichment`, with a queue as its target.
+    Enrichment,
+    /// The pipe's `Target`, started synchronously (`REQUEST_RESPONSE`).
+    Target,
+}
+
+/// What the state machine that stage names IS.
+#[derive(Clone, Copy, Debug)]
+enum Machine {
+    /// A `STANDARD` workflow: the type `StartSyncExecution` is "not available for", so Step
+    /// Functions refuses the synchronous start of it.
+    Standard,
+    /// An `EXPRESS` workflow: the type that serves the synchronous start, so nothing refuses
+    /// the call.
+    Express,
+    /// A well-formed state machine ARN of this account that nothing created — another
+    /// refusal of the same service, worded about the resource.
+    Absent,
+}
+
+/// One row of the refused-invocation table: which stage calls Step Functions, what it names,
+/// and what the group then holds about it.
+struct Refused {
+    /// Also the pipe's, the queues', the group's and the state machine's name, so every row
+    /// is independent.
+    case: &'static str,
+    stage: Stage,
+    machine: Machine,
+    /// The record the refusal is reported by, or `None` for a call nothing refused.
+    message_type: Option<&'static str>,
+    /// How that record's message opens, before the service that refused.
+    opening: &'static str,
+    /// The sentence the called service itself worded, where it is that service's own fixed
+    /// text for the error class; `None` where the sentence quotes the resource, and the row
+    /// asserts the structure around it instead of Step Functions' own wording.
+    reason: Option<&'static str>,
+}
+
+/// The first record of `group` whose message carries `marker` — read the way the client in
+/// the report reads it, with `FilterLogEvents` through a pattern for that marker — once one
+/// is there.
+async fn record_carrying(
+    router: &MultiServiceRouter,
+    case: &str,
+    group: &str,
+    marker: &str,
+) -> Value {
+    let pattern = format!("\"{marker}\"");
+    let deadline = Instant::now() + REFUSAL_BUDGET;
+    loop {
+        let held = records_in(router, group, Some(&pattern)).await;
+        if let Some(first) = held.first() {
+            return first.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected a record carrying {marker:?} in {group}, got none"
+        );
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// Watch `group` for the whole of `watch`, failing the row at the first look that finds a
+/// record reporting a refused invocation.
+async fn no_invocation_failure_in(router: &MultiServiceRouter, case: &str, group: &str) {
+    let deadline = Instant::now() + QUIET;
+    loop {
+        let kinds: BTreeSet<String> = records_in(router, group, None)
+            .await
+            .iter()
+            .filter_map(|record| record["messageType"].as_str().map(ToString::to_string))
+            .collect();
+        for forbidden in [ENRICHMENT_INVOCATION_FAILED, TARGET_INVOCATION_FAILED] {
+            assert!(
+                !kinds.contains(forbidden),
+                "case {case:?}: expected no {forbidden} record for a call nothing refused, \
+                 got {kinds:?}"
+            );
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// RULE: when the service a pipe's enrichment or target stage CALLS refuses that call, the
+/// pipe writes one `ERROR`-level record for the stage whose invocation failed —
+/// `EnrichmentInvocationFailed` or `TargetInvocationFailed` — whose `error` attributes the
+/// refusal to the service that answered it: `awsService` the namespace that service signs
+/// under, `httpStatusCode` the status it answered, `exceptionType` that status's class,
+/// `resourceArn` the resource the call named, `requestId` the identifier of that answer, and
+/// `message` the stage's own opening, the service that refused, that service's own sentence
+/// and the clause naming the call. A call nothing refused leaves no such record.
+///
+/// The rows differ along what the rule generalises over: which stage made the call, what the
+/// resource it named is, and which refusal of the called service that produces.
+async fn the_refusal_is_reported_for(row: Refused) {
+    let router = emulator();
+    let (source_url, source_arn) = given_queue(&router, &format!("{}-source", row.case)).await;
+    let (target_url, target_arn) = given_queue(&router, &format!("{}-target", row.case)).await;
+    let group = format!("/aws/vendedlogs/pipes/{}", row.case);
+    let group_arn = given_log_group(&router, &group).await;
+    let machine = format!("{}-machine", row.case);
+    let machine_arn = match row.machine {
+        Machine::Standard => given_state_machine(&router, row.case, &machine, STANDARD).await,
+        Machine::Express => given_state_machine(&router, row.case, &machine, EXPRESS).await,
+        // The one form of an ARN that names a state machine of this account: nothing
+        // created it, which is the other refusal this service answers the start with.
+        Machine::Absent => format!(
+            "arn:aws:states:{REGION}:{}:stateMachine:{machine}",
+            engine::emulator_account_id()
+        ),
+    };
+    // The role every stage acts as: it may take the source's records, deliver to the queue,
+    // start the workflow either way round, and write the pipe's own log.
+    let role_arn = given_role_stating(
+        &router,
+        &format!("{}-role", row.case),
+        SERVICE_PRINCIPAL,
+        json!([
+            {
+                "Effect": "Allow",
+                "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+                "Resource": source_arn,
+            },
+            { "Effect": "Allow", "Action": "sqs:SendMessage", "Resource": target_arn },
+            {
+                "Effect": "Allow",
+                "Action": ["states:StartSyncExecution", "states:StartExecution"],
+                "Resource": machine_arn,
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                "Resource": format!("{group_arn}:log-stream:*"),
+            },
+        ]),
+    )
+    .await;
+    let mut body = json!({
+        "Source": source_arn,
+        "RoleArn": role_arn,
+        "SourceParameters": { "SqsQueueParameters": { "BatchSize": 1 } },
+        "LogConfiguration": {
+            "CloudwatchLogsLogDestination": { "LogGroupArn": group_arn },
+            "Level": "ERROR",
+            "IncludeExecutionData": ["ALL"],
+        },
+        "DesiredState": "RUNNING",
+    });
+    match row.stage {
+        Stage::Enrichment => {
+            body["Target"] = json!(target_arn);
+            body["Enrichment"] = json!(machine_arn);
+        }
+        Stage::Target => {
+            body["Target"] = json!(machine_arn);
+            body["TargetParameters"] = json!({
+                "StepFunctionStateMachineParameters": { "InvocationType": "REQUEST_RESPONSE" },
+            });
+        }
+    }
+    let created = call(
+        &router,
+        "POST",
+        &format!("/v1/pipes/{}", row.case),
+        Some(body),
+        REGION,
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case {:?}: CreatePipe answered {} {}",
+        row.case, created.status, created.body
+    );
+    let pipe_arn = created.string("Arn");
+
+    // The record the execution is about, carrying a marker no other row sends.
+    let marker = format!("{}-marker", row.case);
+    send(&router, &source_url, std::slice::from_ref(&marker)).await;
+
+    let Some(message_type) = row.message_type else {
+        // The control: the workflow type serves the synchronous start, so the enrichment
+        // answers the events and the record reaches the target — and nothing reports a
+        // refused invocation.
+        let delivered = collect_at_least(&router, &target_url, 1, REFUSAL_BUDGET).await;
+        assert!(
+            delivered.iter().any(|body| body.contains(&marker)),
+            "case {:?}: expected the target to hold the record the enrichment answered, got \
+             {delivered:?}",
+            row.case
+        );
+        no_invocation_failure_in(&router, row.case, &group).await;
+        return;
+    };
+
+    let case = row.case;
+    let record = record_carrying(&router, case, &group, &marker).await;
+    assert_eq!(
+        record["messageType"],
+        json!(message_type),
+        "case {case:?}: expected the record carrying the sent record to be a \
+         {message_type}, got {record}"
+    );
+    assert_eq!(
+        record["logLevel"],
+        json!("ERROR"),
+        "case {case:?}: expected a failure to be reported at ERROR, got {record}"
+    );
+    assert_eq!(
+        record["resourceArn"],
+        json!(pipe_arn),
+        "case {case:?}: expected the record to name the executing pipe, got {record}"
+    );
+    assert!(
+        !record["executionId"].as_str().unwrap_or_default().is_empty(),
+        "case {case:?}: expected the record to belong to an execution, got {record}"
+    );
+    assert!(
+        record["payload"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&marker),
+        "case {case:?}: expected the record the stage was handed in the record's payload, \
+         got {record}"
+    );
+
+    let error = &record["error"];
+    assert_eq!(
+        error["awsService"],
+        json!("states"),
+        "case {case:?}: expected the refusal attributed to Step Functions, got {error}"
+    );
+    assert_eq!(
+        error["httpStatusCode"],
+        json!(400),
+        "case {case:?}: expected the status Step Functions answered, got {error}"
+    );
+    assert_eq!(
+        error["exceptionType"],
+        json!("BadRequest"),
+        "case {case:?}: expected the class of a 400 answer, got {error}"
+    );
+    assert_eq!(
+        error["resourceArn"],
+        json!(machine_arn),
+        "case {case:?}: expected the resource the refused call named, got {error}"
+    );
+    let request_id = error["requestId"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !request_id.is_empty(),
+        "case {case:?}: expected the identifier of the answer that refused, got {error}"
+    );
+    let message = error["message"].as_str().unwrap_or_default();
+    let head = format!("{} with error from States: ", row.opening);
+    let tail = format!(
+        " (Service: Sfn, Status Code: 400, Request ID: {request_id}) (SDK Attempt Count: 1)"
+    );
+    assert!(
+        message.starts_with(&head),
+        "case {case:?}: expected the message to open {head:?}, got {message:?}"
+    );
+    assert!(
+        message.ends_with(&tail),
+        "case {case:?}: expected the message to name the call it came from as {tail:?}, got \
+         {message:?}"
+    );
+    let reason = message
+        .strip_prefix(&head)
+        .and_then(|rest| rest.strip_suffix(&tail))
+        .unwrap_or_default();
+    match row.reason {
+        Some(expected) => assert_eq!(
+            reason, expected,
+            "case {case:?}: expected the called service's own sentence {expected:?}, got \
+             {reason:?}"
+        ),
+        None => assert!(
+            !reason.is_empty() && reason.contains(&machine_arn),
+            "case {case:?}: expected the called service's own sentence about \
+             {machine_arn:?}, got {reason:?}"
+        ),
+    }
+}
+
+/// What Step Functions answers the SYNCHRONOUS start of a `STANDARD` workflow with — the
+/// refusal a pipe enriching through such a state machine fails every record on. Its text is
+/// the service's own for the class and carries no value of the request.
+const TYPE_NOT_SUPPORTED: &str = "This operation is not supported by this type of state machine";
+
+/// The row the report is about: a `STANDARD` state machine as the pipe's `Enrichment`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_standard_state_machine_as_enrichment_is_reported_as_a_refused_invocation() {
+    the_refusal_is_reported_for(Refused {
+        case: "a-standard-enrichment",
+        stage: Stage::Enrichment,
+        machine: Machine::Standard,
+        message_type: Some(ENRICHMENT_INVOCATION_FAILED),
+        opening: "Enrichment invocation failed",
+        reason: Some(TYPE_NOT_SUPPORTED),
+    })
+    .await;
+}
+
+/// The same refusal of the same service at the OTHER stage that calls it: a `STANDARD` state
+/// machine as the pipe's `Target`, started synchronously.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_standard_state_machine_as_target_is_reported_as_a_refused_invocation() {
+    the_refusal_is_reported_for(Refused {
+        case: "a-standard-target",
+        stage: Stage::Target,
+        machine: Machine::Standard,
+        message_type: Some(TARGET_INVOCATION_FAILED),
+        opening: "Target invocation failed",
+        reason: Some(TYPE_NOT_SUPPORTED),
+    })
+    .await;
+}
+
+/// ANOTHER refusal of the same service, worded about the resource: an enrichment ARN that
+/// names a state machine nothing created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enrichment_the_called_service_does_not_hold_is_reported_as_it_answered() {
+    the_refusal_is_reported_for(Refused {
+        case: "an-absent-enrichment",
+        stage: Stage::Enrichment,
+        machine: Machine::Absent,
+        message_type: Some(ENRICHMENT_INVOCATION_FAILED),
+        opening: "Enrichment invocation failed",
+        reason: None,
+    })
+    .await;
+}
+
+/// The control: the identical wiring against an `EXPRESS` twin, which serves the synchronous
+/// start — the records reach the target and no record reports a refused invocation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_express_enrichment_is_refused_by_nothing_and_reports_no_failure() {
+    the_refusal_is_reported_for(Refused {
+        case: "an-express-enrichment",
+        stage: Stage::Enrichment,
+        machine: Machine::Express,
+        message_type: None,
+        opening: "",
+        reason: None,
     })
     .await;
 }
