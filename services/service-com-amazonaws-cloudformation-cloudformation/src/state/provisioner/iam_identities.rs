@@ -71,6 +71,18 @@ pub(super) async fn create_role(
         .set_path(resource.properties.get("Path").and_then(scalar_text))
         .set_description(resource.properties.get("Description").and_then(scalar_text))
         .set_max_session_duration(whole_number(resource.properties.get("MaxSessionDuration")))
+        // `PermissionsBoundary` is spelled the same on the resource type and on `CreateRole`
+        // — "the ARN of the managed policy that is used to set the permissions boundary" —
+        // and it is the CEILING on everything the role's own policies grant, so a role the
+        // stack reports created with one is a role IAM holds that boundary for: a declaration
+        // whose boundary never reached IAM would describe a role whose permissions are wider
+        // than the template asked for.
+        .set_permissions_boundary(
+            resource
+                .properties
+                .get("PermissionsBoundary")
+                .and_then(scalar_text),
+        )
         .set_tags((!role_tags.is_empty()).then_some(role_tags))
         .send()
         .await;
@@ -140,20 +152,24 @@ pub(super) async fn create_role(
 /// `Tags` is one of them, applied in [`retag_role`] rather than in [`update_role`] —
 /// where every tag a role is to carry is reconciled at once.
 ///
-/// Three properties are deliberately NOT here, so a deployment that changes one is reported
+/// `PermissionsBoundary` is among them because IAM publishes the pair of calls that moves one
+/// on an existing role — `PutRolePermissionsBoundary` ("adds or updates the policy that is
+/// specified as the IAM role's permissions boundary") and `DeleteRolePermissionsBoundary` —
+/// and neither touches the role's identity.
+///
+/// Two properties are deliberately NOT here, so a deployment that changes one is reported
 /// as not applied rather than as a success that dropped it:
 ///
 /// * `RoleName`, which this emulator replaces the role over rather than updating: the name
 ///   IS the resource's physical id, so a changed one is a different resource to
 ///   [`super::provisioning::is_same_resource`] and never reaches [`update_role`] at all;
-/// * `Path`, which decides the role's ARN and which no IAM call moves on an existing role;
-/// * `PermissionsBoundary`, which [`create_role`] does not apply either, so claiming to
-///   apply a change to it would record a configuration nothing put in force.
+/// * `Path`, which decides the role's ARN and which no IAM call moves on an existing role.
 pub(super) const ROLE_IN_PLACE_PROPERTIES: &[&str] = &[
     "AssumeRolePolicyDocument",
     "Description",
     "ManagedPolicyArns",
     "MaxSessionDuration",
+    "PermissionsBoundary",
     "Policies",
     "Tags",
 ];
@@ -333,6 +349,30 @@ pub(super) async fn update_role(
                 .send()
                 .await
                 .map_err(|error| iam_refusal_of(&error))?;
+        }
+    }
+
+    // The CEILING the declaration puts on the role: "adds or updates the policy that is
+    // specified as the IAM role's permissions boundary" for a boundary this deployment
+    // states, and the call that removes one for a boundary it no longer states, so a role
+    // stops being capped exactly when its declaration stops capping it.
+    if is_changed("PermissionsBoundary") {
+        match declared.get("PermissionsBoundary").and_then(scalar_text) {
+            Some(boundary) => client
+                .put_role_permissions_boundary()
+                .role_name(role_name)
+                .permissions_boundary(boundary)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|error| iam_refusal_of(&error))?,
+            None => client
+                .delete_role_permissions_boundary()
+                .role_name(role_name)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|error| iam_refusal_of(&error))?,
         }
     }
 
@@ -574,8 +614,11 @@ async fn held_role_policies(
 ///
 /// A role IAM no longer holds (`NoSuchEntity`) was deleted. The members compared are the
 /// ones the resource type and `GetRole` spell identically and the create sends — `Path`,
-/// `Description` and `MaxSessionDuration` — so a role whose description or session length
-/// was changed outside the stack is MODIFIED.
+/// `Description`, `MaxSessionDuration` and `PermissionsBoundary` — so a role whose
+/// description, session length or ceiling was changed outside the stack is MODIFIED. The
+/// boundary is compared in the form the DECLARATION states it, the ARN of the managed policy
+/// that caps the role, which `GetRole` reports under
+/// `PermissionsBoundary.PermissionsBoundaryArn`.
 pub(super) async fn describe_role(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -607,6 +650,15 @@ pub(super) async fn describe_role(
         }
         if let Some(duration) = role.max_session_duration() {
             actual.insert("MaxSessionDuration".to_string(), Value::from(duration));
+        }
+        if let Some(arn) = role
+            .permissions_boundary()
+            .and_then(::aws_sdk_iam::types::AttachedPermissionsBoundary::permissions_boundary_arn)
+        {
+            actual.insert(
+                "PermissionsBoundary".to_string(),
+                Value::String(arn.to_string()),
+            );
         }
     }
     Ok(Some(Value::Object(actual)))

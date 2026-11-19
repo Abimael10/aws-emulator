@@ -4,10 +4,12 @@
 //! bucket's own configuration subresources, and the operations that act on the objects it
 //! holds as a SET.
 //!
-//! A handler that administers storage rather than storing through it calls these: it reads
-//! and replaces the notification container that decides where a bucket's object events are
-//! published, reads and replaces the bucket's tag set, lists the versions a bucket holds and
-//! removes a set of them in one call. Every one of them is bound exactly as the object calls
+//! A handler that administers storage rather than storing through it calls these: it probes
+//! whether a bucket is there and usable at all, lists the account's buckets, reads and
+//! replaces the notification container that decides where a bucket's object events are
+//! published, reads and replaces the bucket's tag set, lists the versions a bucket
+//! holds and removes a set of them in one call. Every one of them is bound exactly as the
+//! object calls
 //! beside it are ([`super`]): the request is built, signed and parsed by the S3 client this
 //! crate holds, over the in-process callback, so the answer is the emulated S3 service's
 //! own — that operation's output members for a success, and S3's own code, message and
@@ -29,7 +31,101 @@ use ::aws_sdk_s3::types::{
 use ::aws_sdk_s3::Client;
 
 use super::super::aws_api::{Answer, Refusal};
-use super::{insert_number, insert_text, insert_timestamp, refused, Input, Observed};
+use super::{
+    insert_flag, insert_number, insert_text, insert_timestamp, refused,
+    refused_without_a_document, Input, Observed,
+};
+
+/// `HeadBucket`: whether the bucket is there and whether this identity may use it.
+///
+/// "You can use this operation to determine if a bucket exists and if you have permission to
+/// access it. The action returns a 200 OK HTTP status code if the bucket exists and you have
+/// permission to access it" (`HeadBucket`'s own documentation) — the probe a handler makes
+/// before it stores anything, which is why it is bound beside the HEAD of one object.
+///
+/// Its answer carries NO BODY either way — "if the bucket doesn't exist or you don't have
+/// permission to access it, the HEAD request returns a generic 400 Bad Request, 403
+/// Forbidden, or 404 Not Found HTTP status code. A message body isn't included, so you can't
+/// determine the exception beyond these HTTP response codes" — so a refusal is reported the
+/// way an SDK reports one with nothing to read: the STATUS as the code, with that status's
+/// own reason as the message ([`super::refused_without_a_document`]), exactly as the HEAD of
+/// an object is.
+pub(super) async fn head_bucket(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&["Bucket", "ExpectedBucketOwner"])?;
+    let sent = client
+        .head_bucket()
+        .bucket(input.required_text("Bucket")?)
+        .set_expected_bucket_owner(input.text("ExpectedBucketOwner")?)
+        .send()
+        .await;
+    let read = match sent {
+        Ok(read) => read,
+        Err(error) => return refused_without_a_document(&error, observed),
+    };
+    let mut document = Map::new();
+    insert_text(&mut document, "BucketRegion", read.bucket_region());
+    insert_text(&mut document, "BucketArn", read.bucket_arn());
+    insert_text(&mut document, "BucketLocationName", read.bucket_location_name());
+    insert_text(
+        &mut document,
+        "BucketLocationType",
+        read.bucket_location_type()
+            .map(::aws_sdk_s3::types::LocationType::as_str),
+    );
+    insert_flag(&mut document, "AccessPointAlias", read.access_point_alias());
+    observed.answer(document, Vec::new())
+}
+
+/// `ListBuckets`: one page of the buckets the calling identity may list.
+pub(super) async fn list_buckets(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&["MaxBuckets", "ContinuationToken", "Prefix", "BucketRegion"])?;
+    let sent = client
+        .list_buckets()
+        .set_max_buckets(input.number("MaxBuckets")?)
+        .set_continuation_token(input.text("ContinuationToken")?)
+        .set_prefix(input.text("Prefix")?)
+        .set_bucket_region(input.text("BucketRegion")?)
+        .send()
+        .await;
+    let listed = match sent {
+        Ok(listed) => listed,
+        Err(error) => return refused(&error, observed),
+    };
+    let mut document = Map::new();
+    document.insert(
+        "Buckets".to_string(),
+        Value::Array(
+            listed
+                .buckets()
+                .iter()
+                .map(|bucket| {
+                    let mut entry = Map::new();
+                    insert_text(&mut entry, "Name", bucket.name());
+                    insert_text(&mut entry, "BucketRegion", bucket.bucket_region());
+                    insert_text(&mut entry, "BucketArn", bucket.bucket_arn());
+                    insert_timestamp(&mut entry, "CreationDate", bucket.creation_date());
+                    Value::Object(entry)
+                })
+                .collect(),
+        ),
+    );
+    insert_owner(&mut document, listed.owner());
+    insert_text(
+        &mut document,
+        "ContinuationToken",
+        listed.continuation_token(),
+    );
+    insert_text(&mut document, "Prefix", listed.prefix());
+    observed.answer(document, Vec::new())
+}
 
 /// `GetBucketNotificationConfiguration`: the notification container the bucket carries.
 ///

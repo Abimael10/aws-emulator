@@ -28,6 +28,15 @@
 //!    federated-user session — "the session permissions are the intersection of the IAM
 //!    user policies and the session policies that you pass" (`GetFederationToken`) — since a
 //!    federated user is no IAM identity and carries no document of its own.
+//! 2a. **what CAPS what those documents may grant** — the permissions boundary attached to
+//!    that same identity, read through the IAM service's own accessor
+//!    (`permissions_boundary_document`), so one definition of "the ceiling in force on this
+//!    identity" serves this service and every other one. "A permissions boundary sets the
+//!    maximum permissions that an identity-based policy can grant" (IAM, permissions
+//!    boundaries): it grants nothing of its own, so a request it does not allow is refused
+//!    even where the documents in force allow it, and the refusal names the BOUNDARY as what
+//!    withheld the grant. A boundary whose document this emulator does not hold is a ceiling
+//!    it cannot read, which caps nothing.
 //! 3. **what the CREDENTIAL itself was scoped to** — the session policies the mint of the
 //!    credential passed, which STS holds on the session the access key id names
 //!    (`sts_store::session_scoping_documents`) and which are read by the one reading of a
@@ -43,17 +52,20 @@
 //!
 //! In IAM's own order ("Determining whether a request is allowed or denied within an
 //! account"): an explicit `Deny` about the request — in the bucket policy, in an
-//! identity-based document or in a session policy — refuses it, whatever any grant says.
+//! identity-based document, in the principal's permissions boundary or in a session policy —
+//! refuses it, whatever any grant says.
 //! Otherwise the request
 //! needs a grant: an `Allow` about it among the caller's identity-based documents, or one in
 //! the bucket policy that names the CALLER ("the resource-based policy and the
 //! identity-based policy are evaluated together, and access is granted if either allows
 //! it"). With neither the request falls to IAM's implicit deny and is refused 403
 //! `AccessDenied` ([`state::ACCESS_DENIED_CODE`]), naming the principal, the action and the
-//! resource it addressed. A grant still has to pass the scope the credential was minted
-//! with: a request the session policies do not allow is refused even where the documents in
-//! force on the identity allow it, and the refusal names THEM as the document that withheld
-//! the grant, because that needs a different fix.
+//! resource it addressed. A grant the identity's own documents make still has to pass the two
+//! things that CAP them, each named by the refusal of a request it withholds, because each
+//! needs a different fix: the permissions boundary in force on that identity, and the scope
+//! the credential was minted with. A grant the BUCKET's own policy makes is capped by the
+//! scope alone — a boundary bounds "the maximum permissions that an identity-based policy can
+//! grant" and this grant is the resource owner's.
 //!
 //! A statement may be CONDITIONED, and a condition is decided against the keys the request
 //! carries values for — the request's own members, the global keys this gate answers for
@@ -292,6 +304,11 @@ pub struct Caller {
     pub account_principals: Vec<String>,
     /// The identity-based policy documents in force on the principal.
     pub documents: Vec<String>,
+    /// The permissions boundary in force on the IDENTITY whose documents are in force, when
+    /// it carries one whose document this emulator holds: the ceiling those documents grant
+    /// under (see the module docs). `None` for an identity carrying none and for one whose
+    /// boundary names a policy this emulator does not carry, which caps nothing.
+    pub boundary: Option<String>,
     /// The session policy documents the mint of this credential scoped it with, as they read
     /// at the instant of this request, and whether a managed one among them names a document
     /// the IAM store does not hold (see the module docs). Empty for a credential no mint
@@ -539,6 +556,10 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
             // catalog this emulator does not carry: a grant it cannot read.
             caller.unreadable_attachment = !policies.uncarried.is_empty();
         }
+        // The CEILING those documents grant under, read through the IAM service's own one
+        // definition of it, and for the same identity: a boundary attached to a role caps
+        // every session of that role.
+        caller.boundary = held.permissions_boundary_document(&policies_arn);
         caller.scope = sts_store::session_scoping_documents(Some(&held), &session_policies);
     } else {
         // No IAM store to read a managed scoping policy out of; the inline document the mint
@@ -719,6 +740,23 @@ pub fn denial(
     {
         return refusal(IDENTITY_POLICY_DENY_REASON);
     }
+    // What the CEILING in force on the identity says about this request: a permissions
+    // boundary "sets the maximum permissions that an identity-based policy can grant", so a
+    // request it explicitly denies is refused whatever any grant says — decided here, before
+    // the grants are read — and a grant it does not also allow is withheld below, naming the
+    // boundary. An identity carrying none, or one whose boundary this emulator cannot read,
+    // is capped by nothing.
+    let bounded = boundary_outcomes(caller, &addressed, action, conditions, published);
+    if bounded
+        .iter()
+        .any(|said| authorization::deny_is_decided(said, published))
+    {
+        return refusal(iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY);
+    }
+    let within_boundary = caller.boundary.is_none()
+        || bounded
+            .iter()
+            .any(|said| said.decision == Decision::Allowed);
     // What the SCOPE the credential was minted with says about this request, read by the
     // tree's one reading of a resolved scope (`sts_store::ScopingPolicies::decision`): a
     // session policy CAPS what the documents in force grant and grants nothing of its own, so
@@ -744,11 +782,11 @@ pub fn denial(
     // Whether the scope leaves the request to the documents in force on the identity: a
     // credential scoped by nothing readable is in that position for every request.
     let within_scope = scoped.contains(&Decision::Allowed);
-    if identity_said
+    let identity_allows = identity_said
         .iter()
         .any(|said| said.decision == Decision::Allowed)
-        || caller.identity_is_unbounded()
-    {
+        || caller.identity_is_unbounded();
+    if identity_allows && within_boundary {
         return if within_scope {
             None
         } else {
@@ -757,7 +795,9 @@ pub fn denial(
     }
     // A grant in the BUCKET's own policy — or in the policy of the access point the request
     // came through — names this principal directly, which is a permission of its own (see
-    // the module docs).
+    // the module docs). It is also a grant no permissions boundary caps: a boundary bounds
+    // what the identity's OWN documents may grant ("the maximum permissions that an
+    // identity-based policy can grant"), and this one is the resource owner's.
     let granted = |document: &iam::PreparedDocument| {
         addressed.iter().any(|resource| {
             iam::resource_outcome_prepared(
@@ -775,9 +815,42 @@ pub fn denial(
             refusal(&iam::no_session_policy_allows(action))
         };
     }
-    refusal(&format!(
-        "because no identity-based policy allows the {action} action"
-    ))
+    // The documents in force DO allow it and the ceiling does not, which is a different fix
+    // from a missing grant, so the refusal names the boundary.
+    if identity_allows {
+        return refusal(&iam::no_permissions_boundary_allows(action));
+    }
+    refusal(&iam::no_identity_policy_allows(action))
+}
+
+/// What the permissions boundary in force on `caller` says about `action` on each of the
+/// resources the request addresses — one outcome per resource — and nothing at all for a
+/// caller carrying no readable boundary.
+///
+/// The boundary is an IDENTITY-based document ("the ARN of the managed policy that is used to
+/// set the permissions boundary"), so it is read by the same evaluation the identity's own
+/// documents are, over the same request and publishing the same keys: that is what makes the
+/// ceiling and the grant comparable at all.
+fn boundary_outcomes(
+    caller: &Caller,
+    addressed: &[String],
+    action: &str,
+    conditions: &[(String, String)],
+    published: &[&str],
+) -> Vec<iam::Outcome> {
+    let Some(boundary) = caller.boundary.as_deref() else {
+        return Vec::new();
+    };
+    let documents = [iam::PreparedDocument::read(boundary)];
+    addressed
+        .iter()
+        .map(|resource| {
+            iam::identity_outcome_prepared(
+                &documents,
+                &request_over(action, resource, &caller.principals, conditions, published),
+            )
+        })
+        .collect()
 }
 
 /// Why the policies in force refuse `caller` an IAM `action` that addresses NO resource of
@@ -818,6 +891,21 @@ pub fn account_wide_denial(caller: &Caller, action: &str) -> Option<String> {
     if authorization::deny_is_decided(&said, &published) {
         return refusal(IDENTITY_POLICY_DENY_REASON);
     }
+    // The CEILING in force on the identity, read over the one resource such a statement can
+    // name, exactly as in [`denial`]: an explicit deny in it refuses whatever a grant says,
+    // and a grant it does not also allow is withheld below.
+    let account_wide = vec![ACCOUNT_WIDE_RESOURCE.to_string()];
+    let bounded = boundary_outcomes(caller, &account_wide, action, &context, &published);
+    if bounded
+        .iter()
+        .any(|outcome| authorization::deny_is_decided(outcome, &published))
+    {
+        return refusal(iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY);
+    }
+    let within_boundary = caller.boundary.is_none()
+        || bounded
+            .iter()
+            .any(|outcome| outcome.decision == Decision::Allowed);
     // What the SCOPE the credential was minted with says about this request, read by the
     // tree's one reading of a resolved scope: a session policy caps what the documents in
     // force grant and grants nothing of its own, so a request it explicitly denies is refused
@@ -828,6 +916,9 @@ pub fn account_wide_denial(caller: &Caller, action: &str) -> Option<String> {
         return refusal(iam::SESSION_POLICY_EXPLICIT_DENY);
     }
     if said.decision == Decision::Allowed || caller.identity_is_unbounded() {
+        if !within_boundary {
+            return refusal(&iam::no_permissions_boundary_allows(action));
+        }
         return if scoped == Decision::Allowed {
             None
         } else {
