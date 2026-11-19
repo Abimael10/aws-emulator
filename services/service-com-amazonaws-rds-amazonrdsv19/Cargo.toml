@@ -127,6 +127,12 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # `sts:GetCallerIdentity` answers from — so a call a role session makes is judged on the
 # policies in force on that role, exactly as the service that minted the session reports it.
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The databases a DB cluster serves through the RDS DATA API are that service's own state,
+# keyed by the cluster's ARN — so a DB cluster snapshot taken here carries a copy of them and
+# a restore installs it, through the capture and install that service publishes
+# (`src/state/data_api_cluster_data.rs`). The copy is made and installed by the service that
+# OWNS those databases, on the same shared engine; this crate never reads or writes one.
+service-com-amazonaws-rdsdata-rdsdataservice = { workspace = true }
 # Every lifecycle change this service records is also published onto the account's DEFAULT
 # EventBridge bus as an `aws.rds` event, the way Amazon RDS publishes one with no opt-in:
 # this is the EventBridge client that publication goes out over the in-process callback with

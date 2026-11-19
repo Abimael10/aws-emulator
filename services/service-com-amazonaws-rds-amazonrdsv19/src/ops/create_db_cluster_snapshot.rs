@@ -213,6 +213,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let data_bytes = crate::state::captured_data_bytes(storage.as_ref())
             .await
             .map_err(CreateDBClusterSnapshotError::internal_failure)?;
+        // The other half of the data the cluster holds: the databases it serves through the
+        // RDS Data API, which that service owns. Copied under the same contract as the
+        // storage above — before the store is locked, on a blocking task — so the snapshot
+        // carries every database the cluster held at this instant, whichever surface wrote
+        // it (`crate::state::capture_data_api_cluster_data`).
+        let data_api_storage = crate::state::capture_data_api_cluster_data(
+            &*self.engine,
+            &crate::state::db_cluster_arn(&region, &source_cluster),
+        )
+        .await
+        .map_err(CreateDBClusterSnapshotError::internal_failure)?;
         let mut store = state.lock();
         // The transitions the clock already made due, so the snapshot is taken of the
         // cluster as it really stands.
@@ -306,6 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             !store.cluster_members(cluster).is_empty(),
             &snapshot_key,
             storage,
+            data_api_storage,
             data_bytes,
             tags,
         );

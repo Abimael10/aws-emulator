@@ -233,6 +233,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::captured_data_bytes(final_snapshot_storage.as_ref())
                 .await
                 .map_err(DeleteDBClusterError::internal_failure)?;
+        // The other half of the data a final snapshot holds: the databases the cluster
+        // serves through the RDS Data API, copied under the same contract as the storage
+        // above — before the store is locked, on a blocking task — so the final snapshot
+        // carries every database the cluster held, whichever surface wrote it.
+        let final_snapshot_data_api_storage = match &input.final_db_snapshot_identifier {
+            Some(_) => crate::state::capture_data_api_cluster_data(
+                &*self.engine,
+                &crate::state::db_cluster_arn(&region, &identifier),
+            )
+            .await
+            .map_err(DeleteDBClusterError::internal_failure)?,
+            None => None,
+        };
         // What this call ANSWERS with and what it leaves for Secrets Manager, computed
         // under the store's one guard — which is RELEASED with this block, because the
         // secrets below are another service's resources, reached over the emulator's own
@@ -460,6 +473,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     !live_members.is_empty(),
                     &snapshot_identifier,
                     final_snapshot_storage,
+                    final_snapshot_data_api_storage,
                     final_snapshot_data_bytes,
                     tags,
                 );

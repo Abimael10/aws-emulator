@@ -18888,6 +18888,7 @@ dependencies = [
  "service-com-amazonaws-eventbridge-awsevents",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kms-trentservice",
+ "service-com-amazonaws-rdsdata-rdsdataservice",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-secretsmanager-secretsmanager",
  "service-com-amazonaws-sns-amazonsimplenotificationservice",

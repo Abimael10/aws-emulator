@@ -862,13 +862,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         let Resolved {
-            source,
+            mut source,
             mint,
             engine_version,
             engine_mode,
             default_parameter_group,
             default_ca_certificate,
         } = resolved;
+        // The DATA API databases the snapshot carries, taken out of the source before the
+        // restored cluster's record is built from the rest of it: they are installed on the
+        // restored cluster below, beside the storage the snapshot holds.
+        let data_api_storage = source.data_api_storage.take();
 
         // `KmsKeyId`: "the Amazon Web Services KMS key identifier to use when restoring an
         // encrypted DB cluster", so the restored cluster is encrypted only under a key KMS
@@ -1274,6 +1278,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // THE OTHER HALF OF THE RESTORE: the databases the snapshot's cluster served through
+        // the RDS Data API are installed as the restored cluster's own, under the ARN a Data
+        // API call addresses it by — so a client that wrote its rows through that surface
+        // finds them on the restored cluster, and a cluster restored from a snapshot that
+        // carried none serves none. Installed by the service that OWNS those databases
+        // ([`crate::state::install_data_api_cluster_data`]), with this service's store
+        // unlocked, and only once THIS call is the one that created the cluster: a restore
+        // another request's cluster was already holding the identifier for is refused above
+        // and replaces nothing. The restored cluster serves no Data API endpoint until
+        // `EnableHttpEndpoint` turns one on, so no call can reach it before this.
+        //
+        // The semantics a failure here leaves, deliberately the same ones the storage load
+        // above leaves: the cluster EXISTS, the data is missing, and the call is answered as
+        // a failure of this emulator. The alternative — installing before the cluster is
+        // admitted — would let a restore that is then refused for the identifier replace a
+        // LIVE cluster's databases, which is worse than a failed restore a caller can see
+        // and delete.
+        crate::state::install_data_api_cluster_data(
+            &*self.engine,
+            &crate::state::db_cluster_arn(&region, &identifier),
+            data_api_storage,
+        )
+        .await
+        .map_err(RestoreDBClusterFromSnapshotError::internal_failure)?;
+
         Ok(RestoreDBClusterFromSnapshotOutput {
             db_cluster: Some(db_cluster),
         })
@@ -1336,6 +1365,9 @@ struct SourceSnapshot {
     tags: Vec<crate::ops::types::Tag>,
     /// The copy of the source's storage the snapshot holds, if the source had any.
     storage: Option<::std::sync::Arc<crate::state::data_plane::sql_engine::InstanceDatabase>>,
+    /// The copy of the DATA API databases the snapshot holds, if the cluster it was taken
+    /// from served any: the other half of the data the restored cluster is given.
+    data_api_storage: Option<::std::sync::Arc<crate::state::DataApiClusterData>>,
 }
 
 /// Resolve the snapshot `requested` names in `region`, and read the settings a restore of it
@@ -1407,6 +1439,7 @@ fn resolve_source(
                 &snapshot.tags,
             ),
             storage: snapshot.storage.clone(),
+            data_api_storage: snapshot.data_api_storage.clone(),
         });
     }
     // A DB SNAPSHOT, which only an ARN can name here.
@@ -1482,6 +1515,10 @@ fn resolve_source(
                 &snapshot.tags,
             ),
             storage: snapshot.storage.clone(),
+            // A DB snapshot was taken of a standalone DB INSTANCE, which serves no Data API
+            // surface at all — that endpoint belongs to a DB cluster — so there is no such
+            // database to carry over.
+            data_api_storage: None,
         });
     }
     Err(cluster_snapshot_not_found(requested))

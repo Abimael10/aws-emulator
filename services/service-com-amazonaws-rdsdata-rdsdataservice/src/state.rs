@@ -123,6 +123,12 @@ pub mod authorization;
 /// identity, the cluster, the secret, the login and the database.
 pub mod preconditions;
 
+/// A COPY of every database one cluster holds, and the installation of such a copy on
+/// another cluster: what a DB cluster snapshot of that cluster carries, and what a restore
+/// of that snapshot serves.
+pub mod cluster_copies;
+pub use cluster_copies::CapturedClusterData;
+
 use postgres::{PgType, Plan, TypeClass};
 
 /// A handle on this service's store, as a handler gets it from [`service_state`].

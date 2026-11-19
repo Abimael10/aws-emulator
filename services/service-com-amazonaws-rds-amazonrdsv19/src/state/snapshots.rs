@@ -97,6 +97,22 @@ pub struct DbClusterSnapshotRecord {
     /// [`DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION`] and [`MAX_REGIONS`], like every other record
     /// here. Deleting the snapshot drops it.
     pub storage: Option<::std::sync::Arc<data_plane::sql_engine::InstanceDatabase>>,
+    /// A COPY of the databases the source cluster served through the RDS DATA API when the
+    /// snapshot was taken, which is the other half of the data that cluster held: those
+    /// databases are the Data API service's own state, so the copy is made and installed by
+    /// that service and is opaque here ([`DataApiClusterData`]).
+    ///
+    /// `None` for a snapshot of a cluster no Data API statement had ever been run against,
+    /// and for one taken on an emulator assembled without that service — both of which held
+    /// no such database to copy. Carried by `CopyDBClusterSnapshot` with the rest of the
+    /// record, and installed on the cluster `RestoreDBClusterFromSnapshot` creates.
+    ///
+    /// [`Self::data_bytes`] does NOT include it: that number is measured by walking the
+    /// VOLUME copy's own tables ([`snapshot_data_bytes`]), and these databases belong to
+    /// another service, which publishes a copy rather than a size. The two surfaces are to
+    /// become one volume per cluster, at which point there is one thing to measure; until
+    /// then the member reports the volume the cluster's own engine endpoint serves.
+    pub data_api_storage: Option<::std::sync::Arc<DataApiClusterData>>,
     /// The full size, in bytes, of the data [`Self::storage`] holds — what
     /// `FullSnapshotSizeInBytes` reports for a snapshot that has been taken.
     ///
@@ -124,11 +140,15 @@ impl DbClusterSnapshotRecord {
     /// store ([`capture_cluster_storage`]), so the settings the snapshot reports and the
     /// data it holds are from one instant, and `data_bytes` is the size of that copy as the
     /// same caller measured it ([`captured_data_bytes`]).
+    /// `data_api_storage` is the copy of the cluster's DATA API databases the caller took
+    /// beside that one ([`capture_data_api_cluster_data`]), for the same reason: they are
+    /// part of the data the cluster held when the snapshot was taken.
     pub fn from_cluster(
         cluster: &DbClusterRecord,
         cluster_has_instances: bool,
         snapshot_identifier: &str,
         storage: Option<::std::sync::Arc<data_plane::sql_engine::InstanceDatabase>>,
+        data_api_storage: Option<::std::sync::Arc<DataApiClusterData>>,
         data_bytes: i64,
         tags: Vec<Tag>,
     ) -> Self {
@@ -182,6 +202,7 @@ impl DbClusterSnapshotRecord {
             source_snapshot_arn: None,
             restore_attribute: BTreeSet::new(),
             storage,
+            data_api_storage,
             data_bytes,
             tags,
         }

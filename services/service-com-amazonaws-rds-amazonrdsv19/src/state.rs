@@ -319,6 +319,10 @@ pub use maintenance_window::{stored_maintenance_window, window_is_open};
 // The Data API HTTP endpoint of a DB cluster: the one write `EnableHttpEndpoint` and
 // `DisableHttpEndpoint` share, and the preconditions both hold a request to.
 mod data_api_endpoint;
+// The data a DB cluster holds through the Data API, which a snapshot of that cluster carries
+// and a restore of that snapshot installs: the hand-off to the service that owns those
+// databases.
+mod data_api_cluster_data;
 // The address a resource publishes when its data plane is an AWS API this emulator serves
 // at its own endpoint (Amazon Neptune's graph API) rather than a native engine wire.
 mod api_plane_address;
@@ -359,6 +363,7 @@ pub use published_values::*;
 pub use clusters::*;
 pub use api_plane_address::*;
 pub use data_api_endpoint::*;
+pub use data_api_cluster_data::*;
 pub use instances::*;
 pub use managed_master_secret::*;
 pub use managed_secret_rotation::*;

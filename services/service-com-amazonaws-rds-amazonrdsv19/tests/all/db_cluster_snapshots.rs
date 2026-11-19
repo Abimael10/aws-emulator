@@ -100,6 +100,7 @@ fn stored_snapshot(region: &str, identifier: &str, cluster: &str) -> DbClusterSn
         // and a snapshot that captured no storage holds no data at all.
         master_user_password: None,
         storage: None,
+        data_api_storage: None,
         data_bytes: 0,
         availability_zones: vec![format!("{region}a"), format!("{region}b")],
         port: 5432,
