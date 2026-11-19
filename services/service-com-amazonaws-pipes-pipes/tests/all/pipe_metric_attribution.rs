@@ -17,13 +17,23 @@
 //! holds at 0, and the two targets look identical (one holds the record, the other holds
 //! nothing) only because the counters say which happened.
 //!
+//! Every wait here LOOKS AGAIN until the condition it needs holds, on a generous deadline,
+//! and every step that depends on an earlier one waits for the EVIDENCE of that step rather
+//! than for a span it is assumed to fit in: a counter that moved past what it read before
+//! the record was sent is the pipe having taken a pass over it, and a refused poll is a
+//! narrowed role having reached the pipe. A target expected to stay empty and a counter
+//! expected to stay quiet are invariants, so each is looked at repeatedly across its span
+//! instead of once at the end of one. Nothing here is asserted about elapsed time, so what
+//! a row reports is what the pipes did and never how fast the host they ran on happened to
+//! be.
+//!
 //! The rows differ along what the rule generalises over — which stage of the row's own pipe
 //! fails (none, the target, the enrichment, the source) and how its role bars that stage
 //! (a grant that omits the action, an explicit deny, a grant naming only the other
 //! queue, a grant narrowed once the pipe is running) — so every counter of the set is moved
 //! by at least one pipe of the table and quiet for at least one other.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_pipes_pipes::state::execution_role::SERVICE_PRINCIPAL;
@@ -33,18 +43,23 @@ use service_com_amazonaws_pipes_pipes::state::metrics::{
 };
 
 use crate::pipe_data_plane::{
-    collect_at_least, given_express_workflow, given_queue, receive_now, send, QUIET,
+    collect_at_least, collect_during, given_express_workflow, given_queue, send, QUIET,
 };
 use crate::pipe_lifecycle::{call, REGION};
 use crate::pipe_metrics::{
-    datapoints, emulator, given_role_stating, listed_dimension_sets, series, wait_for_sum,
-    withdraw_from_role,
+    datapoints, emulator, given_role_stating, listed_dimension_sets, quiet_counters_hold, series,
+    wait_for_every_counter, wait_for_sum, withdraw_from_role,
 };
 
 /// How long a wait for something a pipe has to do — a delivery, or a counter moving — is
-/// given before the row is a failure. Well above the poll interval and the state-settle
-/// span, so a row fails only when the pipe did not do the work at all.
-const BUDGET: Duration = Duration::from_secs(25);
+/// given before the row is a failure.
+///
+/// Every wait below LOOKS AGAIN until the condition it needs holds, so this bounds only how
+/// long a row whose pipe never did the work takes to fail, and a row whose work the pipe did
+/// spends none of it. It is therefore generous rather than tight: this table stands five
+/// pipes up on one emulator, and a budget tuned to an idle host is what makes a test report
+/// the host's load as the emulator's defect.
+const BUDGET: Duration = Duration::from_secs(60);
 
 /// An enrichment that hands back what it was given, for the row whose pipe carries one its
 /// role may not invoke.
@@ -120,6 +135,12 @@ struct Prepared<'row> {
     row: &'row Row,
     target_url: String,
     marker: String,
+    /// What each counter of [`Row::moved`] read just BEFORE this pipe's source was written
+    /// to, in that order — 0 for every row but the one whose role was narrowed while it
+    /// ran, whose failure counter the narrowing itself has already driven. The waits below
+    /// are for the pipe moving each counter FURTHER than this, so no row's wait is a
+    /// condition that already held.
+    before: Vec<f64>,
 }
 
 /// RULE: every datapoint a pipe publishes to `AWS/EventBridge/Pipes` is dimensioned on the
@@ -278,6 +299,27 @@ async fn each_pipes_counters_account_for_its_own_executions_only() {
                 row.case
             );
             withdraw_from_role(&router, row.case, &format!("{}-role", row.case), allowed).await;
+            // And the record is sent only once the pipe has ALREADY been refused a poll
+            // under the narrowed role, which its own failure counter is the report of. The
+            // poller takes one pass at a time, so a pass that was refused is a pass no
+            // earlier poll of that source outlived: the record cannot then be taken by a
+            // receive the wider role authorized. Waiting for that refusal — rather than
+            // sending straight away and trusting the narrowing to land first — is what
+            // keeps the row from turning on how fast the host runs.
+            let refused = wait_for_sum(&router, row.case, EXECUTION_FAILED_METRIC, 1.0).await;
+            assert!(
+                refused >= 1.0,
+                "case {:?}: expected the pipe to be refused a source poll once its role no \
+                 longer allows one, its {EXECUTION_FAILED_METRIC} reads {refused}",
+                row.case
+            );
+        }
+        // What each counter this row expects to move reads before its source is written to,
+        // so the waits below are for the pipe moving them FURTHER than that.
+        let mut before: Vec<f64> = Vec::with_capacity(row.moved.len());
+        for metric in row.moved {
+            let (_, sum) = series(&router, row.case, metric).await;
+            before.push(sum);
         }
         let marker = format!("{}-probe", row.case);
         send(&router, &source_url, std::slice::from_ref(&marker)).await;
@@ -285,57 +327,56 @@ async fn each_pipes_counters_account_for_its_own_executions_only() {
             row,
             target_url,
             marker,
+            before,
         });
     }
 
-    // What a client sees at each target: its own record, or nothing at all. The quiet
-    // window every "nothing arrived" is decided after is waited out ONCE for the table.
-    let quiet_until = Instant::now() + QUIET + QUIET;
-    for entry in &prepared {
-        if !entry.row.delivered {
-            continue;
-        }
-        let delivered = collect_at_least(&router, &entry.target_url, 1, BUDGET).await;
-        assert_eq!(
-            delivered.len(),
-            1,
-            "case {:?}: expected the target to hold the one record this pipe moved, got {delivered:?}",
-            entry.row.case
-        );
-        assert!(
-            delivered[0].contains(&entry.marker),
-            "case {:?}: expected the delivered record to carry this pipe's own probe {:?}, got {:?}",
-            entry.row.case,
-            entry.marker,
-            delivered[0]
-        );
-    }
-    let remaining = quiet_until.saturating_duration_since(Instant::now());
-    if !remaining.is_zero() {
-        tokio::time::sleep(remaining).await;
-    }
-    for entry in &prepared {
-        if entry.row.delivered {
-            continue;
-        }
-        let delivered = receive_now(&router, &entry.target_url).await;
-        assert!(
-            delivered.is_empty(),
-            "case {:?}: expected the target of a pipe whose stage was refused to hold \
-             nothing, got {delivered:?}",
-            entry.row.case
-        );
-    }
-
-    // First every counter the rows expect to MOVE, so that each "reads 0" below is
-    // asserted at an instant when other pipes of the same account have already
+    // First every counter the rows expect to MOVE: each is waited for past what it read
+    // before that pipe's source was written to, which is the EVIDENCE that the pipe took a
+    // pass over the record it was sent. Every read below is then about pipes that have done
+    // their work rather than about ones the host has not got round to — and each "reads 0"
+    // is asserted at an instant when other pipes of the same account have already
     // accumulated that same counter.
     for entry in &prepared {
-        for metric in entry.row.moved {
-            let sum = wait_for_sum(&router, entry.row.case, metric, 1.0).await;
+        for (metric, read_before) in entry.row.moved.iter().zip(&entry.before) {
+            let want = read_before + 1.0;
+            let sum = wait_for_sum(&router, entry.row.case, metric, want).await;
             assert!(
-                sum >= 1.0,
-                "case {:?}: expected {metric} to read at least 1 for this pipe, got {sum}",
+                sum >= want,
+                "case {:?}: expected {metric} to read at least {want} once the pipe has taken \
+                 a pass over the record it was sent (it read {read_before} before that), got \
+                 {sum}",
+                entry.row.case
+            );
+        }
+    }
+
+    // What a client sees at each target: its own record, or nothing at all. A pipe whose
+    // stage was refused has already published that refusal above, so its target is watched
+    // for the whole of a quiet window — looked at again and again across it — rather than
+    // read once after a span the delivery was assumed to fit in.
+    for entry in &prepared {
+        if entry.row.delivered {
+            let delivered = collect_at_least(&router, &entry.target_url, 1, BUDGET).await;
+            assert_eq!(
+                delivered.len(),
+                1,
+                "case {:?}: expected the target to hold the one record this pipe moved, got {delivered:?}",
+                entry.row.case
+            );
+            assert!(
+                delivered[0].contains(&entry.marker),
+                "case {:?}: expected the delivered record to carry this pipe's own probe {:?}, got {:?}",
+                entry.row.case,
+                entry.marker,
+                delivered[0]
+            );
+        } else {
+            let delivered = collect_during(&router, &entry.target_url, QUIET).await;
+            assert!(
+                delivered.is_empty(),
+                "case {:?}: expected the target of a pipe whose stage was refused to hold \
+                 nothing, got {delivered:?}",
                 entry.row.case
             );
         }
@@ -343,8 +384,16 @@ async fn each_pipes_counters_account_for_its_own_executions_only() {
 
     // Then every counter of every pipe: the ones this pipe never had EXIST and read
     // exactly 0, and each datapoint of each counter carries the unit the namespace
-    // publishes in.
+    // publishes in. A counter exists once the pipe has opened a window, which is waited
+    // for rather than assumed to have happened by now.
     for entry in &prepared {
+        let absent = wait_for_every_counter(&router, entry.row.case).await;
+        assert!(
+            absent.is_none(),
+            "case {:?}: expected every counter of a running pipe to have a datapoint, \
+             {absent:?} had none",
+            entry.row.case
+        );
         for metric in PIPE_COUNTERS {
             let points = datapoints(&router, entry.row.case, metric).await;
             assert!(
@@ -378,21 +427,12 @@ async fn each_pipes_counters_account_for_its_own_executions_only() {
     }
 
     // And it HOLDS at 0 for the whole window, while the pipes that are failing go on
-    // failing: a counter of one pipe never takes another pipe's execution.
-    tokio::time::sleep(QUIET).await;
+    // failing: a counter of one pipe never takes another pipe's execution. That is an
+    // invariant, so each quiet counter is LOOKED AT again and again across the span
+    // instead of once at the end of a sleep — a counter that moves anywhere in the span
+    // fails its row.
     for entry in &prepared {
-        for metric in PIPE_COUNTERS {
-            if entry.row.moved.contains(metric) {
-                continue;
-            }
-            let (points, held) = series(&router, entry.row.case, metric).await;
-            assert!(
-                points > 0 && held == 0.0,
-                "case {:?}: expected the counter {metric} of a pipe that never had one to \
-                 hold at 0, got {held} over {points} datapoint(s)",
-                entry.row.case
-            );
-        }
+        quiet_counters_hold(&router, entry.row.case, entry.row.moved, QUIET).await;
     }
 
     // The catalogue a dashboard builds from: one series per pipe per counter, each

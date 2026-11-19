@@ -351,7 +351,11 @@ pub(crate) async fn series(router: &MultiServiceRouter, pipe: &str, metric: &str
 /// LOOKED AT repeatedly across the span instead of once at the end of a sleep: a counter
 /// that moves at any point in the span fails the row, whatever the host's speed decides
 /// about when in the span that is.
-async fn quiet_counters_hold(
+///
+/// `pub(crate)` because `tests/all/pipe_metric_attribution.rs` asks the same invariant of
+/// every pipe of an account at once, and watches their quiet counters through this one
+/// path rather than a copy of it.
+pub(crate) async fn quiet_counters_hold(
     router: &MultiServiceRouter,
     case: &str,
     moved: &[&str],
@@ -397,7 +401,12 @@ pub(crate) async fn wait_for_sum(
 
 /// Wait until every counter of `pipe` has a datapoint, answering the counter that was
 /// still absent when the budget ran out.
-async fn wait_for_every_counter(router: &MultiServiceRouter, pipe: &str) -> Option<&'static str> {
+///
+/// `pub(crate)` because `tests/all/pipe_metric_attribution.rs` asks the same question of
+/// several pipes running at once: a counter exists once the pipe it belongs to has opened
+/// a window, which is something to WAIT for rather than to assume the host has got round
+/// to.
+pub(crate) async fn wait_for_every_counter(router: &MultiServiceRouter, pipe: &str) -> Option<&'static str> {
     let deadline = Instant::now() + BUDGET;
     loop {
         let mut absent = None;
