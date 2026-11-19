@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the endpoints a request names from one stored endpoint group and persists the
+//! membership that is left in [`crate::state`], so the next `DescribeEndpointGroup`
+//! reports the remaining endpoints in the order the group held them. Only the endpoints
+//! the request names are removed — "you only need to specify the endpoints that you want
+//! to remove" — and the output carries no members.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +168,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveEndpoints"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RemoveEndpointsErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Global Accelerator store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Checked before the store is touched, so a refused remove writes nothing. An
+        // identifier is how the request names the endpoint to remove
+        // (`EndpointIdentifier$EndpointId`), so one carrying no id at all names no
+        // endpoint — the same rule the configuring legs state for an
+        // `EndpointConfiguration` that names none.
+        if input
+            .endpoint_identifiers
+            .iter()
+            .any(|identifier| identifier.endpoint_id.is_empty())
+        {
+            return Err(RemoveEndpointsErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(
+                        "an EndpointIdentifier must carry an EndpointId".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(record) = store.endpoint_groups.get_mut(&input.endpoint_group_arn) else {
+            return Err(RemoveEndpointsErrorModeled::EndpointGroupNotFoundException(
+                EndpointGroupNotFoundException {
+                    message: Some(crate::state::endpoint_group_not_found_message(
+                        &input.endpoint_group_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The call states the endpoints the group should no longer hold, and an endpoint
+        // the group does not hold is one it already does not hold: this operation models
+        // no error for an endpoint that is not a member (its errors are the group's own
+        // not-found, an invalid argument, access and an in-progress transaction), so a
+        // request naming one leaves the rest of the removal standing and the membership
+        // otherwise untouched. An endpoint is named by its `EndpointId`; the identifier's
+        // `ClientIPPreservationEnabled` describes the endpoint's own setting rather than
+        // selecting which endpoint is meant, so it takes no part in the match.
+        record.endpoints.retain(|stored| {
+            !input
+                .endpoint_identifiers
+                .iter()
+                .any(|identifier| identifier.endpoint_id == stored.endpoint_id)
+        });
+
+        Ok(RemoveEndpointsOutput)
     }
 }

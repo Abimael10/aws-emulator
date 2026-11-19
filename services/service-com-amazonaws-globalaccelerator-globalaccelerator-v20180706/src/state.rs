@@ -1298,6 +1298,34 @@ pub fn attachment_grants_nothing_message(attachment_arn: &str, endpoint_id: &str
     )
 }
 
+/// The message an add states for an endpoint the group already holds.
+///
+/// A group holds each endpoint once — the rule [`endpoints_from_configurations`] states
+/// inside one request — so naming a member again asks to change it rather than to add
+/// it, which is what the service's sentence says: fixed text and the request's own
+/// `EndpointId` as the only variable part (recorded wire behaviour on `AddEndpoints`),
+/// naming neither the group nor the member's stored configuration.
+pub fn cannot_update_existing_endpoint_message(endpoint_id: &str) -> String {
+    format!("Cannot update an existing endpoint: {endpoint_id}.")
+}
+
+/// The message an add states when the endpoints it would leave behind exceed
+/// [`MAX_ENDPOINTS_PER_ENDPOINT_GROUP`].
+///
+/// One place for the wording, with the group, the membership it already holds and the
+/// quota interpolated rather than written into the sentence — the same rule
+/// [`accelerator_quota_exceeded_message`] states one level up.
+pub fn endpoint_quota_exceeded_message(
+    endpoint_group_arn: &str,
+    held: usize,
+    added: usize,
+) -> String {
+    format!(
+        "Endpoint group {endpoint_group_arn} already holds {held} of the maximum of \
+         {MAX_ENDPOINTS_PER_ENDPOINT_GROUP} endpoints; adding {added} more would exceed it."
+    )
+}
+
 /// The message for deleting an accelerator that is still enabled.
 ///
 /// "Before you can delete an accelerator, you must disable it" (`DeleteAccelerator`

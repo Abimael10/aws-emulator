@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Appends endpoints to one stored endpoint group and persists them in [`crate::state`],
+//! so the next `DescribeEndpointGroup` reports the group's membership with the new
+//! endpoints at the end of it. Only the endpoints the request names are added — "you
+//! don't need to specify the current endpoints that are already in the endpoint group" —
+//! and a refused add leaves the stored membership untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddEndpoints"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AddEndpointsErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Global Accelerator store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let invalid = |message: String| -> Self::Error {
+            AddEndpointsErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // Everything that depends only on the request is checked before the store is
+        // touched, so a refused add writes nothing. The endpoints are read through the
+        // same helper the create and the update legs configure a group's endpoints with,
+        // so all three refuse the same list with the same words: an entry that names no
+        // `EndpointId`, one endpoint named twice in a single request, and a list longer
+        // than a group may hold.
+        let additions =
+            match crate::state::endpoints_from_configurations(&input.endpoint_configurations) {
+                Ok(endpoints) => endpoints,
+                Err(message) => return Err(invalid(message)),
+            };
+
+        let mut store = state.lock();
+        let Some(record) = store.endpoint_groups.get_mut(&input.endpoint_group_arn) else {
+            return Err(AddEndpointsErrorModeled::EndpointGroupNotFoundException(
+                EndpointGroupNotFoundException {
+                    message: Some(crate::state::endpoint_group_not_found_message(
+                        &input.endpoint_group_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The same rule the create and the update legs state, in the same words: an
+        // `AttachmentArn` names the cross-account attachment that permits an endpoint,
+        // the store holds none (the attachment operations are not implemented), so the
+        // permission the caller claims cannot be established. Asked after the
+        // endpoint-group lookup, so a request that also names a group the store does not
+        // hold is answered the not-found, and before anything is written.
+        if let Some(endpoint) = input
+            .endpoint_configurations
+            .iter()
+            .find(|configuration| configuration.attachment_arn.is_some())
+        {
+            let attachment = endpoint.attachment_arn.clone().unwrap_or_default();
+            let endpoint_id = endpoint.endpoint_id.clone().unwrap_or_default();
+            return Err(AddEndpointsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::attachment_grants_nothing_message(
+                        &attachment,
+                        &endpoint_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An endpoint group holds each endpoint once — the rule
+        // [`crate::state::endpoints_from_configurations`] states inside one request —
+        // and this operation ADDS endpoints to the ones already there, so naming an
+        // endpoint the group already holds asks to change that member rather than to add
+        // one: a member's weight or its client-IP preservation is changed through
+        // `UpdateEndpointGroup`, which restates the whole list.
+        if let Some(duplicate) = additions.iter().find(|addition| {
+            record
+                .endpoints
+                .iter()
+                .any(|stored| stored.endpoint_id == addition.endpoint_id)
+        }) {
+            return Err(invalid(
+                crate::state::cannot_update_existing_endpoint_message(&duplicate.endpoint_id),
+            ));
+        }
+
+        // The documented per-group endpoint quota, counted over the membership the add
+        // would LEAVE BEHIND: a request within the modelled list length can still carry
+        // a group past the quota, and exceeding a quota is the modelled
+        // `LimitExceededException`, not an invalid argument.
+        if record.endpoints.len() + additions.len()
+            > crate::state::MAX_ENDPOINTS_PER_ENDPOINT_GROUP
+        {
+            return Err(AddEndpointsErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::endpoint_quota_exceeded_message(
+                        &record.arn,
+                        record.endpoints.len(),
+                        additions.len(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Global Accelerator only has to resolve the new endpoints that you're adding":
+        // the response reports the endpoints THIS call added, each as the group now holds
+        // it, while the group's whole membership is what a read of the group reports.
+        let endpoint_descriptions = additions
+            .iter()
+            .map(crate::state::StoredEndpoint::to_wire)
+            .collect();
+        record.endpoints.extend(additions);
+
+        Ok(AddEndpointsOutput {
+            endpoint_descriptions: Some(endpoint_descriptions),
+            endpoint_group_arn: Some(record.arn.clone()),
+        })
     }
 }

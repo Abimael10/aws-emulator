@@ -1409,3 +1409,581 @@ async fn a_listeners_endpoint_groups_are_listed_from_the_store() {
         "case missing-listener: expected the refusal to name the listener, got {body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A group's endpoint MEMBERSHIP: `AddEndpoints` and `RemoveEndpoints`.
+// ---------------------------------------------------------------------------
+
+/// Four identifier forms `EndpointConfiguration$EndpointId` names — "If the endpoint is
+/// a Network Load Balancer or Application Load Balancer, this is the Amazon Resource
+/// Name (ARN) of the resource. If the endpoint is an Elastic IP address, this is the
+/// Elastic IP address allocation ID" (and an EC2 instance id) — so the rules below are
+/// tested on more than one shape of identifier.
+const EIP_ENDPOINT: &str = "eipalloc-0123456789abcdef0";
+/// See [`EIP_ENDPOINT`].
+const INSTANCE_ENDPOINT: &str = "i-0123456789abcdef0";
+/// See [`EIP_ENDPOINT`].
+const ALB_ENDPOINT: &str =
+    "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/web/50dc6c495c0c9188";
+/// See [`EIP_ENDPOINT`].
+const NLB_ENDPOINT: &str =
+    "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/net/edge/3dc1e2f5a9b74c10";
+
+/// `AddEndpoints` over the group `arn`, with the configurations a row names.
+async fn add_endpoints(
+    router: &MultiServiceRouter,
+    arn: &str,
+    configurations: Value,
+) -> (u16, Value) {
+    call(
+        router,
+        "AddEndpoints",
+        json!({ "EndpointGroupArn": arn, "EndpointConfigurations": configurations }),
+    )
+    .await
+}
+
+/// `RemoveEndpoints` over the group `arn`, with the identifiers a row names.
+async fn remove_endpoints(
+    router: &MultiServiceRouter,
+    arn: &str,
+    identifiers: Value,
+) -> (u16, Value) {
+    call(
+        router,
+        "RemoveEndpoints",
+        json!({ "EndpointGroupArn": arn, "EndpointIdentifiers": identifiers }),
+    )
+    .await
+}
+
+/// The group's stored membership, as `DescribeEndpointGroup` reports it.
+async fn membership(router: &MultiServiceRouter, arn: &str) -> Value {
+    describe_group(router, arn).await["EndpointDescriptions"].clone()
+}
+
+/// The `EndpointId`s of that membership, in the order it reports them.
+async fn member_ids(router: &MultiServiceRouter, arn: &str) -> Vec<String> {
+    membership(router, arn)
+        .await
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|endpoint| {
+            endpoint["EndpointId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// One endpoint group, on an accelerator and listener of its own, holding
+/// `configurations` to begin with. Returns the group's ARN.
+async fn group_holding(
+    router: &MultiServiceRouter,
+    suffix: &str,
+    configurations: Value,
+) -> String {
+    let listener_arn = fixture(router, suffix).await;
+    let (status, body) = create_group(
+        router,
+        &listener_arn,
+        "us-west-2",
+        &format!("grp-{suffix}"),
+        json!({ "EndpointConfigurations": configurations }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "fixture {suffix:?}: expected HTTP 200, got {status} with {body}"
+    );
+    group_arn(&body["EndpointGroup"])
+}
+
+/// RULE: an add appends the endpoints the request names to the group's stored membership,
+/// defaulting the members the caller leaves out, and answers the endpoints THAT call
+/// added together with the group's ARN; the endpoints already in the group are neither
+/// re-stated by the caller nor disturbed, so a read reports the whole membership in the
+/// order it was built.
+#[tokio::test]
+async fn an_add_appends_the_endpoints_it_names_to_the_stored_membership() {
+    let router = emulator();
+    let arn = group_holding(&router, "add", json!([])).await;
+
+    // Rows differ along what the rule generalises over: how many endpoints one call
+    // adds, which optional members they carry, and which identifier form names them.
+    // The expectations are the member docs of `EndpointDescription` — a weight the
+    // caller omits is the default 128, `HealthState` is the state before any health
+    // check has completed, `HealthReason` "Returns a null result", and
+    // `ClientIPPreservationEnabled` is reported only where the caller set it.
+    // (case, the call's configurations, the endpoints it answers, the membership after)
+    let rows: Vec<(&str, Value, Value, Value)> = vec![
+        (
+            "one-endpoint-defaulted-weight",
+            json!([{ "EndpointId": EIP_ENDPOINT }]),
+            json!([{ "EndpointId": EIP_ENDPOINT, "Weight": 128, "HealthState": "INITIAL" }]),
+            json!([{ "EndpointId": EIP_ENDPOINT, "Weight": 128, "HealthState": "INITIAL" }]),
+        ),
+        (
+            "two-endpoints-in-one-call",
+            json!([
+                { "EndpointId": INSTANCE_ENDPOINT, "Weight": 0 },
+                { "EndpointId": ALB_ENDPOINT, "Weight": 255 },
+            ]),
+            json!([
+                { "EndpointId": INSTANCE_ENDPOINT, "Weight": 0, "HealthState": "INITIAL" },
+                { "EndpointId": ALB_ENDPOINT, "Weight": 255, "HealthState": "INITIAL" },
+            ]),
+            json!([
+                { "EndpointId": EIP_ENDPOINT, "Weight": 128, "HealthState": "INITIAL" },
+                { "EndpointId": INSTANCE_ENDPOINT, "Weight": 0, "HealthState": "INITIAL" },
+                { "EndpointId": ALB_ENDPOINT, "Weight": 255, "HealthState": "INITIAL" },
+            ]),
+        ),
+        (
+            "client-ip-preservation-named",
+            json!([
+                { "EndpointId": NLB_ENDPOINT, "Weight": 7,
+                  "ClientIPPreservationEnabled": false },
+            ]),
+            json!([
+                { "EndpointId": NLB_ENDPOINT, "Weight": 7, "HealthState": "INITIAL",
+                  "ClientIPPreservationEnabled": false },
+            ]),
+            json!([
+                { "EndpointId": EIP_ENDPOINT, "Weight": 128, "HealthState": "INITIAL" },
+                { "EndpointId": INSTANCE_ENDPOINT, "Weight": 0, "HealthState": "INITIAL" },
+                { "EndpointId": ALB_ENDPOINT, "Weight": 255, "HealthState": "INITIAL" },
+                { "EndpointId": NLB_ENDPOINT, "Weight": 7, "HealthState": "INITIAL",
+                  "ClientIPPreservationEnabled": false },
+            ]),
+        ),
+        (
+            // `EndpointConfigurations` is `@length 0..10`, so a list naming no endpoint
+            // is a valid argument: it adds nothing and takes nothing away.
+            "nothing-to-add",
+            json!([]),
+            json!([]),
+            json!([
+                { "EndpointId": EIP_ENDPOINT, "Weight": 128, "HealthState": "INITIAL" },
+                { "EndpointId": INSTANCE_ENDPOINT, "Weight": 0, "HealthState": "INITIAL" },
+                { "EndpointId": ALB_ENDPOINT, "Weight": 255, "HealthState": "INITIAL" },
+                { "EndpointId": NLB_ENDPOINT, "Weight": 7, "HealthState": "INITIAL",
+                  "ClientIPPreservationEnabled": false },
+            ]),
+        ),
+    ];
+
+    for (case, configurations, added, after) in rows {
+        let (status, body) = add_endpoints(&router, &arn, configurations).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["EndpointDescriptions"], added,
+            "case {case:?}: expected the endpoints this call added, got {body}"
+        );
+        assert_eq!(
+            body["EndpointGroupArn"],
+            json!(arn),
+            "case {case:?}: expected the group's own ARN, got {body}"
+        );
+        let stored = membership(&router, &arn).await;
+        assert_eq!(
+            stored, after,
+            "case {case:?}: expected the accumulated membership, got {stored}"
+        );
+    }
+}
+
+/// RULE: an add is an ADD — a group holds each endpoint once, so an endpoint the group
+/// already holds, or one a single request names twice, is refused with the modelled
+/// `InvalidArgumentException` and leaves the stored membership exactly as it was.
+#[tokio::test]
+async fn an_endpoint_the_group_already_holds_cannot_be_added_again() {
+    let router = emulator();
+    let arn = group_holding(
+        &router,
+        "dup",
+        json!([
+            { "EndpointId": EIP_ENDPOINT, "Weight": 10 },
+            { "EndpointId": INSTANCE_ENDPOINT },
+        ]),
+    )
+    .await;
+    let before = membership(&router, &arn).await;
+
+    // (case, the call's configurations, the message the refusal states if it names one)
+    let rows: Vec<(&str, Value, Option<String>)> = vec![
+        (
+            "already-a-member",
+            json!([{ "EndpointId": EIP_ENDPOINT }]),
+            Some(format!("Cannot update an existing endpoint: {EIP_ENDPOINT}.")),
+        ),
+        (
+            "already-a-member-under-another-weight",
+            json!([{ "EndpointId": INSTANCE_ENDPOINT, "Weight": 200 }]),
+            Some(format!(
+                "Cannot update an existing endpoint: {INSTANCE_ENDPOINT}."
+            )),
+        ),
+        (
+            // The refusal is the whole call's: the endpoint that WOULD have been new is
+            // not added either.
+            "one-new-endpoint-beside-a-member",
+            json!([{ "EndpointId": ALB_ENDPOINT }, { "EndpointId": EIP_ENDPOINT }]),
+            Some(format!("Cannot update an existing endpoint: {EIP_ENDPOINT}.")),
+        ),
+        (
+            // The same rule inside ONE request, stated by the configuration reader the
+            // create and the update legs share, so its wording is pinned there.
+            "named-twice-in-one-call",
+            json!([{ "EndpointId": ALB_ENDPOINT }, { "EndpointId": ALB_ENDPOINT }]),
+            None,
+        ),
+        (
+            "an-entry-naming-no-endpoint",
+            json!([{ "Weight": 5 }]),
+            None,
+        ),
+    ];
+
+    for (case, configurations, message) in rows {
+        let (status, body) = add_endpoints(&router, &arn, configurations).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidArgumentException"),
+            "case {case:?}: expected the modelled refusal, got {status} with {body}"
+        );
+        if let Some(expected) = message {
+            let actual = error_message(&body);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+        let stored = membership(&router, &arn).await;
+        assert_eq!(
+            stored, before,
+            "case {case:?}: a refused add must leave the membership untouched, got {stored}"
+        );
+    }
+}
+
+/// RULE: a remove takes away exactly the endpoints the request names, by `EndpointId`,
+/// and nothing else: an endpoint the group does not hold is already absent, so naming it
+/// takes nothing away and refuses nothing, the endpoints that remain keep their order,
+/// and an endpoint removed can be added again.
+#[tokio::test]
+async fn a_remove_takes_away_only_the_endpoints_it_names() {
+    let router = emulator();
+    let arn = group_holding(
+        &router,
+        "remove",
+        json!([
+            { "EndpointId": EIP_ENDPOINT },
+            { "EndpointId": INSTANCE_ENDPOINT },
+            { "EndpointId": ALB_ENDPOINT },
+            { "EndpointId": NLB_ENDPOINT, "ClientIPPreservationEnabled": false },
+        ]),
+    )
+    .await;
+    let absent = "eipalloc-ffffffffffffffff0";
+
+    // Rows differ along what the rule generalises over: how many endpoints one call
+    // names, whether the group holds them, and which other members the identifier
+    // carries. (case, the call's identifiers, the membership left behind)
+    let rows: Vec<(&str, Value, Vec<&str>)> = vec![
+        (
+            "an-endpoint-the-group-never-held",
+            json!([{ "EndpointId": absent }]),
+            vec![
+                EIP_ENDPOINT,
+                INSTANCE_ENDPOINT,
+                ALB_ENDPOINT,
+                NLB_ENDPOINT,
+            ],
+        ),
+        (
+            "one-member",
+            json!([{ "EndpointId": INSTANCE_ENDPOINT }]),
+            vec![EIP_ENDPOINT, ALB_ENDPOINT, NLB_ENDPOINT],
+        ),
+        (
+            "the-same-one-again",
+            json!([{ "EndpointId": INSTANCE_ENDPOINT }]),
+            vec![EIP_ENDPOINT, ALB_ENDPOINT, NLB_ENDPOINT],
+        ),
+        (
+            "a-member-beside-an-absent-endpoint",
+            json!([{ "EndpointId": ALB_ENDPOINT }, { "EndpointId": absent }]),
+            vec![EIP_ENDPOINT, NLB_ENDPOINT],
+        ),
+        (
+            // `EndpointIdentifier$ClientIPPreservationEnabled` describes the endpoint's
+            // own setting; the endpoint is named by its id, so a flag that disagrees with
+            // the stored one still names it.
+            "an-identifier-carrying-the-preservation-flag",
+            json!([{ "EndpointId": NLB_ENDPOINT, "ClientIPPreservationEnabled": true }]),
+            vec![EIP_ENDPOINT],
+        ),
+        (
+            "every-endpoint-left",
+            json!([{ "EndpointId": EIP_ENDPOINT }]),
+            vec![],
+        ),
+        (
+            "from-a-group-that-holds-none",
+            json!([{ "EndpointId": EIP_ENDPOINT }, { "EndpointId": absent }]),
+            vec![],
+        ),
+    ];
+
+    for (case, identifiers, left) in rows {
+        let (status, body) = remove_endpoints(&router, &arn, identifiers).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body,
+            json!({}),
+            "case {case:?}: expected the modelled empty output, got {body}"
+        );
+        let ids = member_ids(&router, &arn).await;
+        let expected: Vec<String> = left.iter().map(|id| (*id).to_string()).collect();
+        assert_eq!(
+            ids, expected,
+            "case {case:?}: expected the membership left behind, got {ids:?}"
+        );
+    }
+
+    // A removed endpoint is free to be added again, with a configuration of its own.
+    let (status, body) = add_endpoints(
+        &router,
+        &arn,
+        json!([{ "EndpointId": EIP_ENDPOINT, "Weight": 3 }]),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case re-add: expected HTTP 200, got {status} with {body}"
+    );
+    let stored = membership(&router, &arn).await;
+    assert_eq!(
+        stored,
+        json!([{ "EndpointId": EIP_ENDPOINT, "Weight": 3, "HealthState": "INITIAL" }]),
+        "case re-add: expected the re-added endpoint to be the group's membership, \
+         got {stored}"
+    );
+}
+
+/// RULE: both membership operations are refused with the group's own modelled not-found
+/// error — in the wording this service states that class with, naming the ARN the request
+/// carried — when the store holds no such endpoint group, and an identifier that names no
+/// endpoint is the modelled `InvalidArgumentException`.
+#[tokio::test]
+async fn a_membership_call_against_a_group_the_store_does_not_hold_is_refused() {
+    let router = emulator();
+    let live = group_holding(&router, "missing", json!([{ "EndpointId": EIP_ENDPOINT }])).await;
+    let before = membership(&router, &live).await;
+
+    // Two ARNs, so the message is tested as a function of the request rather than on one
+    // value: one never minted, one this emulator minted and then deleted.
+    let unminted = format!("{live}-not-a-group");
+    let deleted = group_holding(&router, "deleted", json!([])).await;
+    ok(
+        &router,
+        "DeleteEndpointGroup",
+        json!({ "EndpointGroupArn": deleted }),
+    )
+    .await;
+
+    for arn in [unminted, deleted] {
+        for (case, body) in [
+            (
+                "AddEndpoints",
+                json!({
+                    "EndpointGroupArn": arn,
+                    "EndpointConfigurations": [{ "EndpointId": EIP_ENDPOINT }],
+                }),
+            ),
+            (
+                "RemoveEndpoints",
+                json!({
+                    "EndpointGroupArn": arn,
+                    "EndpointIdentifiers": [{ "EndpointId": EIP_ENDPOINT }],
+                }),
+            ),
+        ] {
+            let (status, answer) = call(&router, case, body).await;
+            assert_eq!(
+                (status, error_code(&answer).as_str()),
+                (400, "EndpointGroupNotFoundException"),
+                "case {case}/{arn}: expected the modelled not-found, got {status} \
+                 with {answer}"
+            );
+            let actual = error_message(&answer);
+            assert_eq!(
+                actual,
+                format!("EndpointGroup {arn} does not exist."),
+                "case {case}/{arn}: expected the refusal to name the group, got {actual:?}"
+            );
+        }
+    }
+
+    // An identifier that carries no endpoint id names no endpoint, and refusing it
+    // changes nothing.
+    let (status, body) = remove_endpoints(&router, &live, json!([{ "EndpointId": "" }])).await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "InvalidArgumentException"),
+        "case empty-identifier: expected the modelled refusal, got {status} with {body}"
+    );
+    let stored = membership(&router, &live).await;
+    assert_eq!(
+        stored, before,
+        "case empty-identifier: a refused remove must change nothing, got {stored}"
+    );
+}
+
+/// RULE: the per-group endpoint quota bounds the membership an add LEAVES BEHIND, not the
+/// length of one request, and exceeding a quota is the modelled `LimitExceededException`
+/// rather than an invalid argument; a call refused by it leaves the membership untouched,
+/// while a call that lands exactly on the bound is accepted.
+#[tokio::test]
+async fn the_per_group_endpoint_quota_bounds_the_membership_an_add_leaves_behind() {
+    let router = emulator();
+    // The bound is the model's own `@length` on `EndpointConfigurations` (0..10), which
+    // is also the documented quota ("Endpoints per endpoint group: 10").
+    let quota = 10;
+    let endpoint = |n: usize| json!({ "EndpointId": format!("eipalloc-{n:017}") });
+    let arn = group_holding(
+        &router,
+        "quota",
+        json!((1..=8).map(endpoint).collect::<Vec<Value>>()),
+    )
+    .await;
+
+    // One past the bound: eight held plus three asked for.
+    let (status, body) = add_endpoints(&router, &arn, json!([endpoint(9), endpoint(10), endpoint(11)])).await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (403, "LimitExceededException"),
+        "case past-the-bound: expected the modelled quota refusal, got {status} with {body}"
+    );
+    let actual = error_message(&body);
+    assert_eq!(
+        actual,
+        format!(
+            "Endpoint group {arn} already holds 8 of the maximum of {quota} endpoints; adding \
+             3 more would exceed it."
+        ),
+        "case past-the-bound: expected the quota refusal to state the group and the limit, \
+         got {actual:?}"
+    );
+    let ids = member_ids(&router, &arn).await;
+    assert_eq!(
+        ids.len(),
+        8,
+        "case past-the-bound: a refused add must leave the membership untouched, got {ids:?}"
+    );
+
+    // Exactly on the bound: the add that fills the group is accepted.
+    let (status, body) = add_endpoints(&router, &arn, json!([endpoint(9), endpoint(10)])).await;
+    assert_eq!(
+        status, 200,
+        "case on-the-bound: expected HTTP 200, got {status} with {body}"
+    );
+    let ids = member_ids(&router, &arn).await;
+    assert_eq!(
+        ids.len(),
+        quota,
+        "case on-the-bound: expected a full group, got {ids:?}"
+    );
+
+    // One endpoint past a full group.
+    let (status, body) = add_endpoints(&router, &arn, json!([endpoint(11)])).await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (403, "LimitExceededException"),
+        "case full-group: expected the modelled quota refusal, got {status} with {body}"
+    );
+    let actual = error_message(&body);
+    assert_eq!(
+        actual,
+        format!(
+            "Endpoint group {arn} already holds {quota} of the maximum of {quota} endpoints; \
+             adding 1 more would exceed it."
+        ),
+        "case full-group: expected the quota refusal to state the group and the limit, \
+         got {actual:?}"
+    );
+    let ids = member_ids(&router, &arn).await;
+    assert_eq!(
+        ids.len(),
+        quota,
+        "case full-group: a refused add must leave the membership untouched, got {ids:?}"
+    );
+
+    // The quota is not a cap on the request: a group with room takes a full-length list.
+    let roomy = group_holding(&router, "roomy", json!([])).await;
+    let (status, body) = add_endpoints(
+        &router,
+        &roomy,
+        json!((1..=quota).map(endpoint).collect::<Vec<Value>>()),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case fill-in-one-call: expected HTTP 200, got {status} with {body}"
+    );
+    let ids = member_ids(&router, &roomy).await;
+    assert_eq!(
+        ids.len(),
+        quota,
+        "case fill-in-one-call: expected the whole list to be stored, got {ids:?}"
+    );
+}
+
+/// RULE: an endpoint whose `AttachmentArn` claims a cross-account attachment the store
+/// does not hold is refused with the modelled `AccessDeniedException` — the permission it
+/// claims cannot be established — on the add leg exactly as on the create and the update
+/// legs, and the refusal adds nothing.
+#[tokio::test]
+async fn an_add_claiming_an_attachment_that_grants_nothing_is_refused() {
+    let router = emulator();
+    let arn = group_holding(&router, "attachment", json!([{ "EndpointId": EIP_ENDPOINT }])).await;
+    let before = membership(&router, &arn).await;
+    let attachment = "arn:aws:globalaccelerator::000000000000:attachment/0a0a0a0a";
+
+    let (status, body) = add_endpoints(
+        &router,
+        &arn,
+        json!([{ "EndpointId": ALB_ENDPOINT, "AttachmentArn": attachment }]),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (403, "AccessDeniedException"),
+        "case claimed-attachment: expected the modelled refusal, got {status} with {body}"
+    );
+    let actual = error_message(&body);
+    assert_eq!(
+        actual,
+        format!(
+            "cross-account attachment {attachment} does not exist, so it grants no permission \
+             to add endpoint {ALB_ENDPOINT}"
+        ),
+        "case claimed-attachment: expected the refusal to name the attachment and the \
+         endpoint, got {actual:?}"
+    );
+    let stored = membership(&router, &arn).await;
+    assert_eq!(
+        stored, before,
+        "case claimed-attachment: a refused add must add nothing, got {stored}"
+    );
+}
