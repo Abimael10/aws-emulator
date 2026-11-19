@@ -38,7 +38,9 @@
 //! What `GetGeneratedTemplate` answers is a TEMPLATE, rendered from the record rather than
 //! stored as text: the resources the generation covers, each keyed by the logical id it has
 //! in the final template ([`final_logical_ids`]) and carrying the `TemplateConfiguration`
-//! the record holds. It is rendered on demand because the language is the READ's choice —
+//! the record holds — which every record holds, since a create that asks for no
+//! configuration leaves the generator's own ([`DEFAULT_TEMPLATE_POLICY`]) in force. It is
+//! rendered on demand because the language is the READ's choice —
 //! `GetGeneratedTemplateInput$Format` is "the language to use to retrieve for the generated
 //! template", `JSON` or `YAML` — so one record answers either spelling of the same
 //! template.
@@ -103,6 +105,20 @@ pub mod policy {
     pub const DELETE: &str = "DELETE";
     pub const RETAIN: &str = "RETAIN";
 }
+
+/// The policy a generated template's `TemplateConfiguration` is in force as when the create
+/// that started it supplied no value for it.
+///
+/// A generated template is built to be DEPLOYED over resources that ALREADY exist, which is
+/// what the whole scan → generate → import workflow is for, so the generator states both
+/// attributes on every resource of the template rather than leaving them to the template
+/// language's own default: the IaC generator "sets the `DeletionPolicy` and
+/// `UpdateReplacePolicy` attributes to `Retain` by default", so that bringing a live resource
+/// under a stack's management cannot take it down later. Each of the two settings defaults on
+/// its own — a create that states one leaves the other at this value — and a template whose
+/// resources carry the attribute is what an IMPORT change set requires of them
+/// ([`crate::state::resource_import`]).
+pub const DEFAULT_TEMPLATE_POLICY: &str = policy::RETAIN;
 
 /// The `GeneratedTemplateResourceStatus` values one resource of a generated template
 /// reports (the model's enum: `PENDING | IN_PROGRESS | FAILED | COMPLETE`), as
@@ -237,9 +253,12 @@ pub struct StoredGeneratedTemplate {
     pub status_reason: Option<String>,
     pub creation_time: SystemTime,
     pub last_updated_time: SystemTime,
-    /// `TemplateConfiguration$DeletionPolicy`, as the request supplied it.
+    /// `TemplateConfiguration$DeletionPolicy`, as the request supplied it — or
+    /// [`DEFAULT_TEMPLATE_POLICY`], which is what it is in force as for a request that
+    /// supplied none.
     pub deletion_policy: Option<String>,
-    /// `TemplateConfiguration$UpdateReplacePolicy`, as the request supplied it.
+    /// `TemplateConfiguration$UpdateReplacePolicy`, as the request supplied it — or
+    /// [`DEFAULT_TEMPLATE_POLICY`] for a request that supplied none.
     pub update_replace_policy: Option<String>,
     /// The terminal status the clock owes this generation, until
     /// [`crate::state::ComAmazonawsCloudformationCloudformationState::settle`] materialises
@@ -270,8 +289,11 @@ impl StoredGeneratedTemplate {
             status_reason: None,
             creation_time: now,
             last_updated_time: now,
-            deletion_policy: None,
-            update_replace_policy: None,
+            // The configuration is in force whether or not the create asked for one
+            // ([`DEFAULT_TEMPLATE_POLICY`]): a record always carries both settings, so the
+            // template it renders always states both attributes on its resources.
+            deletion_policy: Some(DEFAULT_TEMPLATE_POLICY.to_string()),
+            update_replace_policy: Some(DEFAULT_TEMPLATE_POLICY.to_string()),
             pending: Some(PendingGeneration {
                 status: status::COMPLETE.to_string(),
                 status_reason: Some(GENERATION_COMPLETE_REASON.to_string()),
@@ -408,8 +430,9 @@ impl StoredGeneratedTemplate {
             );
             // "The DeletionPolicy assigned to resources in the generated template" — and the
             // same for UpdateReplacePolicy: the configuration is assigned to every resource
-            // of the template, so it is rendered onto each one, and a configuration the
-            // record does not carry assigns no attribute at all.
+            // of the template, so it is rendered onto each one. Every record carries both
+            // settings ([`DEFAULT_TEMPLATE_POLICY`] where the create asked for neither), so
+            // every rendered resource states both attributes.
             for (attribute, configured) in [
                 ("DeletionPolicy", completed.deletion_policy.as_deref()),
                 (
@@ -555,7 +578,10 @@ pub fn already_exists(generated_template_name: &str) -> String {
 /// do were worded from a recording of this surface answering them, and there is no evidence
 /// of how AWS words THIS one — a sentence of this crate's own in that envelope would be an
 /// invented message, so what it answers is the model's statement of the error and nothing
-/// more. (See the open issue that still carries this cause.)
+/// more. Three readings of the model's text have been tried against the recorded refusal and
+/// none is AWS's: this sentence, this sentence with its terminal period inside the envelope,
+/// and the whole documented paragraph (both of its sentences). (See the open issue that
+/// still carries this cause.)
 pub fn concurrent_generations_exceeded() -> String {
     format!(
         "No more than {MAX_CONCURRENT_GENERATIONS} generated templates can be in an \

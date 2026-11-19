@@ -136,6 +136,10 @@ struct UpdateCase {
     policies: (Option<&'static str>, Option<&'static str>),
 }
 
+/// The configuration a record a create asked for none carries: the generator's own default,
+/// which an update that names neither setting leaves where it is.
+const DEFAULT_POLICY: Option<&str> = Some(generated::DEFAULT_TEMPLATE_POLICY);
+
 /// The rows: every way the rule says an update rewrites a record, over records of both
 /// origins.
 const UPDATE_CASES: &[UpdateCase] = &[
@@ -166,7 +170,7 @@ const UPDATE_CASES: &[UpdateCase] = &[
         remove: &[],
         configuration: &[],
         logical_ids: &["AddedBucket", "Topic"],
-        policies: (None, None),
+        policies: (DEFAULT_POLICY, DEFAULT_POLICY),
     },
     UpdateCase {
         case: "two resources added, one of them onto a logical id the record already covers",
@@ -191,7 +195,7 @@ const UPDATE_CASES: &[UpdateCase] = &[
         remove: &[],
         configuration: &[],
         logical_ids: &["AddedTable", "Alpha", "Beta", "Bucket"],
-        policies: (None, None),
+        policies: (DEFAULT_POLICY, DEFAULT_POLICY),
     },
     UpdateCase {
         case: "one resource removed by its logical id",
@@ -203,7 +207,7 @@ const UPDATE_CASES: &[UpdateCase] = &[
         remove: &["Beta"],
         configuration: &[],
         logical_ids: &["Alpha", "Bucket"],
-        policies: (None, None),
+        policies: (DEFAULT_POLICY, DEFAULT_POLICY),
     },
     UpdateCase {
         case: "two resources removed and one added in the same call",
@@ -220,7 +224,7 @@ const UPDATE_CASES: &[UpdateCase] = &[
         remove: &["Alpha", "Beta"],
         configuration: &[],
         logical_ids: &["AddedTable", "Bucket"],
-        policies: (None, None),
+        policies: (DEFAULT_POLICY, DEFAULT_POLICY),
     },
     UpdateCase {
         case: "a resource removed and re-added under the same logical id in one call",
@@ -237,7 +241,7 @@ const UPDATE_CASES: &[UpdateCase] = &[
         remove: &["Bucket"],
         configuration: &[],
         logical_ids: &["Alpha", "Beta", "Bucket"],
-        policies: (None, None),
+        policies: (DEFAULT_POLICY, DEFAULT_POLICY),
     },
     UpdateCase {
         case: "one setting of the configuration changed, the other left alone",

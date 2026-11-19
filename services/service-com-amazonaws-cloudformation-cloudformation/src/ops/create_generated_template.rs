@@ -295,8 +295,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         template.stack_id = stack_id;
         template.resources = resources;
         if let Some(configuration) = input.template_configuration.as_ref() {
-            template.deletion_policy = configuration.deletion_policy.clone();
-            template.update_replace_policy = configuration.update_replace_policy.clone();
+            // Each setting the request STATES is the one in force for it; one it leaves out
+            // stays at the generator's own default, which
+            // `StoredGeneratedTemplate::starting` has already put on the record. So a
+            // configuration naming one of the two settings changes only that one.
+            if configuration.deletion_policy.is_some() {
+                template.deletion_policy = configuration.deletion_policy.clone();
+            }
+            if configuration.update_replace_policy.is_some() {
+                template.update_replace_policy = configuration.update_replace_policy.clone();
+            }
         }
         store.generated_templates.push(template);
 

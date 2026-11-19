@@ -132,3 +132,45 @@ endpoint the deploy published. 3) Deploy the two-stack CDK app, change the produ
 and read the producer's calls and its stack status. 4) Scan a resource no stack manages, create a
 generated template for it with no `TemplateConfiguration`, and use the template it answers in an
 IMPORT change set.
+
+## What the change resolving this report did, and what it left open
+
+FIXED — cause 4: a generated template's `TemplateConfiguration` is now in force on every record,
+whether or not the create stated one. Each of the two settings a create leaves out is in force as
+the generator's own default, `RETAIN` (`state::generated_template::DEFAULT_TEMPLATE_POLICY`, put on
+the record by `StoredGeneratedTemplate::starting` and overridden setting by setting by a create that
+states one), so `DescribeGeneratedTemplate` reports both settings and the template
+`GetGeneratedTemplate` renders states a `DeletionPolicy` and an `UpdateReplacePolicy` on every
+resource it declares — which is what an IMPORT change set requires of every resource it adopts. The
+scan → generate → import workflow therefore completes: its replay unit
+(`cloudformation.e2e-resource-scan-generated-template-to-managed-stack`) passes. Covered by
+`tests/all/generated_template_default_configuration.rs`, which spans every combination of stated and
+defaulted settings and takes an unmanaged Amazon SNS topic from the generated template through an
+IMPORT change set to a stack that manages it.
+
+ALREADY FIXED ELSEWHERE — causes 2 and 3: the CDK L2 deploys that must then serve HTTP
+(`cdk-deployed-l2-trio-serves-http-and-persists`,
+`cdk-restapi-added-method-forces-a-new-deployment-that-serves`,
+`cdk-restapi-cloudwatch-role-flag-governs-account-global-write`) and the in-use export guard on a
+CDK-driven producer update (`deploy-cdk-cross-stack-export-ordering-and-in-use-guard`) all pass:
+the Amazon API Gateway REST provisioning arm this report said was missing exists
+(`state/provisioning/apigateway_rest_api.rs` and the modules under it), so nothing on those paths
+needed changing here.
+
+STILL OPEN — carried, unchanged, with its trace ids and replay keys, to
+`issues/things-that-do-not-work/20261110T090000Z-cloudformation-generated-template-concurrency-limit-wording.md`:
+cause 1, the generated-template concurrency refusal's wording. Three readings of the model's own
+text have now been tried against the recorded refusal and none is AWS's (the documented sentence,
+that sentence with its period inside this surface's SDK envelope, and the whole documented
+paragraph), so the sentence has to come from a recording of the refusal; inventing one would be a
+value no rule produces. What the model DOES fix about that refusal is now asserted end to end
+(`tests/all/generated_template_limit_wording.rs`: HTTP 429, the awsQuery code
+`ConcurrentResourcesLimitExceeded`, a `Message` inside the modelled 1..255 bound, and that the
+refused call leaves no record), so the refusal cannot regress while its wording waits for a
+recording.
+
+NOT PART OF THIS REPORT — `cdk-nested-stack-is-tracked-and-cascades-on-delete` (whose key this
+report carried for cause 2) now gets through the CDK deploy and fails later, on the message
+`UpdateTerminationProtection` answers for a nested stack ("Cannot change termination protection
+directly on the nested stack [...]"), which is a cause of its own that no key of this report names.
+

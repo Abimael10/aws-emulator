@@ -19,7 +19,8 @@
 //!
 //! 1. **The rendered template.** How many resources a generation covers (none, one, two and
 //!    three), where each came from (a base stack, the request's own list, and both), whether
-//!    the record carries a template configuration, whether a listed resource was given a
+//!    the create asked for a template configuration of its own (a record whose create asked
+//!    for none carries the generator's default), whether a listed resource was given a
 //!    logical id at all, and both languages the model's `TemplateFormat` offers plus a read
 //!    that names none. Each row's body is read back with this service's OWN template
 //!    reader (`state::template::parse`, the reader every operation that takes a
@@ -146,7 +147,7 @@ struct BodyCase {
 /// `UpdateReplacePolicy` resource attributes of a template take that attribute's own
 /// documented values — `Delete` and `Retain` — which is what the rendered template has to
 /// carry for a client to deploy it.
-fn attribute_policy(case: &str, configured: &str) -> &'static str {
+pub(crate) fn attribute_policy(case: &str, configured: &str) -> &'static str {
     match configured {
         "DELETE" => "Delete",
         "RETAIN" => "Retain",
@@ -406,7 +407,7 @@ fn answered_template(case: &str, status: u16, body: &str) -> (String, String) {
 
 /// One rendered template body, read back with this service's own template reader — the
 /// same reader every operation that takes a `TemplateBody` hands a submitted body to.
-fn parsed_template(case: &str, body: &str) -> template::Template {
+pub(crate) fn parsed_template(case: &str, body: &str) -> template::Template {
     template::parse(body)
         .unwrap_or_else(|| panic!("case {case:?}: expected a readable template, got {body:?}"))
 }
@@ -498,8 +499,9 @@ async fn the_generated_template_body_is_rendered_from_the_record() {
                     panic!("case {case:?}: expected {logical_id:?} declared, got {template_body:?}")
                 });
             // The configuration the record carries is assigned to the template's
-            // resources, in the resource attribute's own vocabulary; a record that carries
-            // none assigns no such attribute.
+            // resources, in the resource attribute's own vocabulary; a create that asked for
+            // none leaves the generator's own default in force, so every resource states
+            // both attributes.
             for (attribute, configured) in [
                 ("DeletionPolicy", row.configuration.map(|(policy, _)| policy)),
                 (
@@ -507,7 +509,10 @@ async fn the_generated_template_body_is_rendered_from_the_record() {
                     row.configuration.map(|(_, policy)| policy),
                 ),
             ] {
-                let expected = configured.map(|policy| attribute_policy(case, policy));
+                let expected = Some(attribute_policy(
+                    case,
+                    configured.unwrap_or(generated::DEFAULT_TEMPLATE_POLICY),
+                ));
                 assert_eq!(
                     declaration
                         .declaration

@@ -10,7 +10,8 @@
 //!    `DescribeGeneratedTemplate` reports that record: the generation in flight right after
 //!    the call and `COMPLETE` once the clock has made its conclusion due, the resources it
 //!    covers (the base stack's, the ones the request listed itself, or both), the base
-//!    stack's ARN when one was named, the `TemplateConfiguration` the request supplied, and a
+//!    stack's ARN when one was named, the `TemplateConfiguration` in force (the one the
+//!    request supplied, or the generator's own default where it supplied none), and a
 //!    `TemplateProgress` counting the covered resources.
 //!
 //! 2. **The in-flight cap, and that it lifts.** At most
@@ -335,13 +336,23 @@ async fn a_generation_is_read_back_through_describe_generated_template() {
         );
         assert_eq!(
             xml_text(&body, "DeletionPolicy").as_deref(),
-            row.configuration.map(|(deletion, _)| deletion),
-            "case {case:?}: expected the configuration the request supplied, got {body}"
+            Some(
+                row.configuration
+                    .map(|(deletion, _)| deletion)
+                    .unwrap_or(generated::DEFAULT_TEMPLATE_POLICY)
+            ),
+            "case {case:?}: expected the configuration in force — the one the request \
+             supplied, or the generator's own default, got {body}"
         );
         assert_eq!(
             xml_text(&body, "UpdateReplacePolicy").as_deref(),
-            row.configuration.map(|(_, update_replace)| update_replace),
-            "case {case:?}: expected the configuration the request supplied, got {body}"
+            Some(
+                row.configuration
+                    .map(|(_, update_replace)| update_replace)
+                    .unwrap_or(generated::DEFAULT_TEMPLATE_POLICY)
+            ),
+            "case {case:?}: expected the configuration in force — the one the request \
+             supplied, or the generator's own default, got {body}"
         );
         // A resource the REQUEST identified is reported under the identifier it supplied;
         // the identifiers are the only ones reported, since a base stack's resource carries
