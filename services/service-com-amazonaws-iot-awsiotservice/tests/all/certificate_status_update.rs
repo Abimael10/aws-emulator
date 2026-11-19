@@ -23,6 +23,12 @@
 //! (`smithy_query(query="shape",shape="CertificateStatus")`), from each of the two
 //! statuses a created certificate can start in, and ids that satisfy the modelled
 //! `CertificateId` constraints without the store holding them.
+//!
+//! It also spans the SEQUENCE of calls and the SET of certificates the account holds: a
+//! chain of updates over one certificate, where the customer version counts the status
+//! changes and not the calls, and a store of several certificates where a call that names
+//! one of them leaves every other record as it was — read back through both readers of
+//! those records, `DescribeCertificate` and `ListCertificates`.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -86,6 +92,19 @@ impl Reply {
     /// A string member of the reported `CertificateDescription`.
     fn member_str(&self, name: &str) -> Option<&str> {
         self.member(name).and_then(Value::as_str)
+    }
+
+    /// The listed `Certificate` entry the account's certificate listing reports under
+    /// `certificate_id`, or `None` when the listing does not report it.
+    fn listed(&self, certificate_id: &str) -> Option<&Value> {
+        self.body
+            .get("certificates")
+            .and_then(Value::as_array)
+            .and_then(|entries| {
+                entries.iter().find(|entry| {
+                    entry.get("certificateId").and_then(Value::as_str) == Some(certificate_id)
+                })
+            })
     }
 
     /// Whether the body carries no member at all — what an operation whose output shape is
@@ -174,6 +193,12 @@ impl Emulator {
             &format!("/certificates/{certificate_id}?newStatus={new_status}"),
         )
         .await
+    }
+
+    /// `ListCertificates`: `GET /certificates` — the OTHER reader of the same records, so
+    /// what a status update leaves is read back through both of them.
+    async fn list(&self) -> Reply {
+        self.call("GET", "/certificates").await
     }
 
     /// `DeleteCertificate`: `DELETE /certificates/{certificateId}`.
@@ -467,5 +492,165 @@ async fn deactivating_a_certificate_is_what_lets_it_be_deleted() {
             "case {label:?}: expected DescribeCertificate to answer {expected_read} after the \
              delete, got {read:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn a_sequence_of_updates_counts_the_changes_and_not_the_calls() {
+    let emulator = Emulator::new();
+    let id = emulator.issue("a sequence of updates", true).await;
+
+    // One certificate taken through a SEQUENCE of calls rather than a single hop: the
+    // sequence repeats a status and comes back to one the certificate already held, so what
+    // is asserted is that each call leaves the status it named — "Updates the status of the
+    // specified certificate. This operation is idempotent" — and that the record's customer
+    // version counts the status CHANGES and not the calls that asked for them.
+    let sequence = [
+        CERTIFICATE_STATUS_INACTIVE,
+        CERTIFICATE_STATUS_INACTIVE,
+        CERTIFICATE_STATUS_ACTIVE,
+        CERTIFICATE_STATUS_INACTIVE,
+        CERTIFICATE_STATUS_REVOKED,
+    ];
+
+    let issued = emulator.describe(&id).await;
+    let mut current = CERTIFICATE_STATUS_ACTIVE;
+    let mut changes = 0_i64;
+    let mut last_modified = issued
+        .member("lastModifiedDate")
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| {
+            panic!("the issued certificate must report a lastModifiedDate: {issued:?}")
+        });
+
+    for (step, new_status) in sequence.iter().enumerate() {
+        let label = format!("step {step}: {current} -> {new_status}");
+        let updated = emulator.update(&id, new_status).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {label:?}: UpdateCertificate must succeed, got {updated:?}"
+        );
+        if *new_status != current {
+            changes += 1;
+        }
+        current = new_status;
+
+        let after = emulator.describe(&id).await;
+        assert_eq!(
+            after.member_str("status"),
+            Some(*new_status),
+            "case {label:?}: the description must report {new_status}, got {after:?}"
+        );
+        let expected_version = i64::from(FIRST_CERTIFICATE_CUSTOMER_VERSION) + changes;
+        assert_eq!(
+            after.member("customerVersion").and_then(Value::as_i64),
+            Some(expected_version),
+            "case {label:?}: expected customerVersion {expected_version} after {changes} \
+             status change(s), got {after:?}"
+        );
+        let modified_at = after
+            .member("lastModifiedDate")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| {
+                panic!("case {label:?}: the description reported no lastModifiedDate: {after:?}")
+            });
+        assert!(
+            modified_at >= last_modified,
+            "case {label:?}: lastModifiedDate {modified_at} must not go backwards from \
+             {last_modified}, got {after:?}"
+        );
+        last_modified = modified_at;
+
+        // The account's listing is the other reader of the same record, so it reports the
+        // status the single-certificate reader does.
+        let listing = emulator.list().await;
+        assert_eq!(
+            listing.status, 200,
+            "case {label:?}: ListCertificates must succeed, got {listing:?}"
+        );
+        assert_eq!(
+            listing
+                .listed(&id)
+                .and_then(|entry| entry.get("status"))
+                .and_then(Value::as_str),
+            Some(*new_status),
+            "case {label:?}: the listing must report {new_status}, got {listing:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn updating_one_certificate_leaves_every_other_one_as_it_was() {
+    // The id is the certificate's identity, so a call that names one certificate writes to
+    // that one record: every other certificate the account holds is reported afterwards
+    // exactly as it was, by both readers. Each case updates a DIFFERENT one of the
+    // certificates in a store of several, so no single position is privileged.
+    const CERTIFICATES: usize = 3;
+
+    for target in 0..CERTIFICATES {
+        let emulator = Emulator::new();
+        let mut ids = Vec::new();
+        for index in 0..CERTIFICATES {
+            // Alternating, so the store holds both of the statuses a created certificate
+            // can start in.
+            let id = emulator
+                .issue(&format!("certificate {index}"), index % 2 == 0)
+                .await;
+            ids.push(id);
+        }
+        let mut before = Vec::new();
+        for id in &ids {
+            before.push(emulator.describe(id).await);
+        }
+
+        let label =
+            format!("certificate {target} of {CERTIFICATES} -> {CERTIFICATE_STATUS_REVOKED}");
+        let updated = emulator
+            .update(&ids[target], CERTIFICATE_STATUS_REVOKED)
+            .await;
+        assert_eq!(
+            updated.status, 200,
+            "case {label:?}: UpdateCertificate must succeed, got {updated:?}"
+        );
+
+        let listing = emulator.list().await;
+        assert_eq!(
+            listing.status, 200,
+            "case {label:?}: ListCertificates must succeed, got {listing:?}"
+        );
+        for (index, id) in ids.iter().enumerate() {
+            let expected = if index == target {
+                CERTIFICATE_STATUS_REVOKED
+            } else {
+                before[index].member_str("status").unwrap_or_else(|| {
+                    panic!(
+                        "case {label:?}: certificate {index} reported no status before the \
+                         update: {:?}",
+                        before[index]
+                    )
+                })
+            };
+            let after = emulator.describe(id).await;
+            assert_eq!(
+                after.member_str("status"),
+                Some(expected),
+                "case {label:?}: certificate {index} must report {expected}, got {after:?}"
+            );
+            assert_eq!(
+                listing
+                    .listed(id)
+                    .and_then(|entry| entry.get("status"))
+                    .and_then(Value::as_str),
+                Some(expected),
+                "case {label:?}: the listing must report {expected} for certificate {index}, \
+                 got {listing:?}"
+            );
+            if index != target {
+                assert_eq!(
+                    after.body, before[index].body,
+                    "case {label:?}: certificate {index} must be untouched, got {after:?}"
+                );
+            }
+        }
     }
 }
