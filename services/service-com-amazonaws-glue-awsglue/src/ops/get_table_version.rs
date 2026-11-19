@@ -247,13 +247,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
+            // A table this database does not hold is the catalog's table miss, worded the
+            // way every operation that resolves a table BY NAME words it: the sentence
+            // names the table the request addressed
+            // (`crate::state::messages::table_not_found`), as the version listing over the
+            // same history does. The table READ's own generic sentence belongs to
+            // `GetTable` alone, so a client can tell an absent table from an absent
+            // version of a stored one.
             let Some(entry) = database
                 .tables
                 .get(&crate::state::fold_name(&input.table_name))
             else {
                 return Err(GetTableVersionErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        message: Some(crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string()),
+                        message: Some(crate::state::messages::table_not_found(&input.table_name)),
                         from_federation_source: None,
                     },
                 )

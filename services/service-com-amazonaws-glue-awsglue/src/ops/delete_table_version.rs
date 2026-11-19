@@ -240,10 +240,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Read off the database before the table is borrowed out of it, so the log line
         // below names the database this delete was served out of.
         let database_name = database.name.clone();
+        // A table this database does not hold is the catalog's table miss, worded over the
+        // table the request addressed (`crate::state::messages::table_not_found`) like
+        // every other operation that resolves a table by name; `GetTable`'s own generic
+        // sentence is that read's alone.
         let Some(entry) = database.tables.get_mut(&folded_table) else {
             return Err(DeleteTableVersionErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string()),
+                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
                     from_federation_source: None,
                 },
             )

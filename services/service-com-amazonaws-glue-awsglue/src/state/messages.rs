@@ -1177,13 +1177,19 @@ pub fn connection_test_did_not_reach_the_source(connection_type: &str) -> String
 /// answers ONE wording whichever step of the address missed, and it names neither the
 /// table nor the database, which is why the read does not share
 /// [`database_not_found`] with the operations that address a database itself.
+///
+/// It is the TABLE READ's own sentence, not the catalog's refusal of every table
+/// address: every other operation that resolves a table by name — the writes, the
+/// version operations and the partition operations — answers the templated
+/// [`table_not_found`] instead.
 pub const TABLE_ENTITY_NOT_FOUND: &str = "Entity Not Found";
 
-/// `DeleteTable` (and `UpdateTable`, the other write that addresses one table), the
-/// version listing (`GetTableVersions`) and every partition operation's parent-table
-/// miss, for a table the database does not hold. Recorded template naming no database —
-/// a different refusal from `GetTable`'s, which is why the two are not one shared
-/// string.
+/// `DeleteTable` (and `UpdateTable`, the other write that addresses one table), every
+/// operation over ONE table's version history (`GetTableVersion`, `GetTableVersions`,
+/// `DeleteTableVersion` and `BatchDeleteTableVersion`, which names the table once for
+/// the whole batch) and every partition operation's parent-table miss, for a table the
+/// database does not hold. Recorded template naming no database — a different refusal
+/// from `GetTable`'s, which is why the two are not one shared string.
 ///
 /// Its one variable part is the table the request addressed, rendered in the same
 /// Hive-compatible fold the catalog keys it under as [`database_not_found`] renders its
@@ -1206,7 +1212,8 @@ pub const TABLE_ALREADY_EXISTS: &str = "Table already exists.";
 /// resolved to nothing and echoes back neither the `VersionId` the request addressed nor
 /// the table it was addressed in. Which of this and [`VERSION_NOT_FOUND`] a miss earns is
 /// decided by [`super::TableEntry::version_miss_message`], so no operation picks the
-/// wording itself.
+/// wording itself — the batch delete's per-item `ErrorDetail$ErrorMessage` included,
+/// since that record carries the id and the table in its own members.
 pub const TABLE_VERSION_NOT_FOUND: &str = "Table version not found.";
 
 /// The same two operations for an id that is NO version of the addressed table at all —
@@ -1216,18 +1223,6 @@ pub const TABLE_VERSION_NOT_FOUND: &str = "Table version not found.";
 /// Recorded CONSTANT, and the whole message: it states that the VERSION resolved to
 /// nothing, and like [`TABLE_VERSION_NOT_FOUND`] carries no part of the request.
 pub const VERSION_NOT_FOUND: &str = "Version not found.";
-
-/// The per-item failure of the BATCH version delete (`BatchDeleteTableVersion`) for a
-/// version the addressed table's history does not hold.
-///
-/// Recorded TEMPLATE, and a different sentence from the single-version read's and
-/// delete's constants above — which is why they are not one shared string: the batch
-/// answers 200 and reports this failure inside `Errors`, so its per-item message carries
-/// the `VersionId` the item sent, in parentheses and exactly as sent, and ends without a
-/// period. That id is what tells a caller WHICH of its items failed.
-pub fn batch_table_version_not_found(version_id: &str) -> String {
-    format!("Table version ({version_id}) not found")
-}
 
 /// Any table-version operation whose `VersionId` spells no version counter
 /// ([`super::parse_version_counter`]) — the version read's and the version delete's

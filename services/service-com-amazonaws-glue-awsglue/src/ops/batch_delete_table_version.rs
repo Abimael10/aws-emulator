@@ -233,13 +233,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Read off the database before the table is borrowed out of it, so the log line
         // below names the database this batch was served out of.
         let database_name = database.name.clone();
+        // The table is named ONCE for the whole batch, so a table this database does not
+        // hold refuses the whole call with the catalog's table miss, worded over the table
+        // the request addressed (`crate::state::messages::table_not_found`) like every
+        // other operation that resolves a table by name — the single-version delete and
+        // the version reads included.
         let Some(entry) = database
             .tables
             .get_mut(&crate::state::fold_name(&input.table_name))
         else {
             return Err(BatchDeleteTableVersionErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string()),
+                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
                     from_federation_source: None,
                 },
             )
@@ -278,9 +283,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         deleted += 1;
                         None
                     } else {
+                        // `TableVersionError` carries the id and the table in its OWN
+                        // members, so the per-item message carries no part of the request:
+                        // it is the sentence this table words that miss with
+                        // (`crate::state::TableEntry::version_miss_message`), the same one
+                        // the single-version read and delete of that version answer.
                         Some((
                             "EntityNotFoundException",
-                            crate::state::messages::batch_table_version_not_found(requested),
+                            entry.version_miss_message(Some(counter)).to_string(),
                         ))
                     }
                 }

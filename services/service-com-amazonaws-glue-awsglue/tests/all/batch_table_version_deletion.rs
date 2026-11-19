@@ -42,14 +42,15 @@ const MAX_VERSIONS_PER_BATCH: usize = 100;
 /// The error code a per-item failure carries for a version the history does not hold.
 const MISS_CODE: &str = "EntityNotFoundException";
 
-/// The per-item wording a batch reports for a version the table's history does not hold.
-/// A DIFFERENT sentence from the one a READ or a single-version delete of that version
-/// answers ([`MISSING_VERSION_REFUSAL`]): the batch answers 200 and reports this failure
-/// inside `Errors`, so the message carries the `VersionId` the item sent, in parentheses,
-/// which is what tells a caller which of its items failed.
-fn missing_item_refusal(version_id: &str) -> String {
-    format!("Table version ({version_id}) not found")
-}
+/// The per-item wording a batch reports for an id the table NEVER MINTED — one past the
+/// counter its live definition carries.
+///
+/// The batch reports a version miss with the very sentence a READ or a single-version
+/// delete of that version answers, carrying no part of the request: `TableVersionError`
+/// has its own `VersionId` and `TableName` members, which is what tells a caller which of
+/// its items failed. An id the table DID mint earns the service's other version-miss
+/// sentence ([`MISSING_VERSION_REFUSAL`]).
+const NEVER_MINTED_REFUSAL: &str = "Version not found.";
 
 /// The error code a per-item failure carries for an id that addresses no deletable
 /// version: one that spells no integer, and the table's own current version.
@@ -275,7 +276,7 @@ async fn an_item_the_history_cannot_give_up_fails_only_itself() {
         FailureCase {
             case: "a counter past the newest version",
             sent: ids(&["7"]),
-            expected: vec![("7", MISS_CODE, missing_item_refusal("7"))],
+            expected: vec![("7", MISS_CODE, NEVER_MINTED_REFUSAL.to_string())],
             survivors: vec![0, 1, 2, 3],
         },
         FailureCase {
@@ -311,14 +312,14 @@ async fn an_item_the_history_cannot_give_up_fails_only_itself() {
         FailureCase {
             case: "the same archived version addressed twice in one batch",
             sent: ids(&["0", "0"]),
-            expected: vec![("0", MISS_CODE, missing_item_refusal("0"))],
+            expected: vec![("0", MISS_CODE, MISSING_VERSION_REFUSAL.to_string())],
             survivors: vec![1, 2, 3],
         },
         FailureCase {
             case: "two deletes beside three kinds of failing item",
             sent: ids(&["0", "7", "1", "nope", "3"]),
             expected: vec![
-                ("7", MISS_CODE, missing_item_refusal("7")),
+                ("7", MISS_CODE, NEVER_MINTED_REFUSAL.to_string()),
                 ("nope", INVALID_CODE, malformed_refusal("nope")),
                 ("3", INVALID_CODE, LATEST_REFUSAL.to_string()),
             ],
@@ -515,9 +516,10 @@ async fn a_batch_naming_no_stored_table_is_refused_whole() {
             "a table the database does not hold",
             request("batch_present_db", "absent", &sent),
             MISS_CODE,
-            // The table miss of a version operation names neither the table nor the
-            // database, exactly as the single-version delete and `GetTable` word it.
-            "Entity Not Found".to_string(),
+            // The table is named once for the whole batch, so its miss is the catalog's
+            // table miss: it names the table the request addressed and no database,
+            // exactly as the single-version delete and the version reads word it.
+            "Table absent not found.".to_string(),
         ),
     ];
 
