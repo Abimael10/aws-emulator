@@ -9,9 +9,10 @@
 //!
 //! * the RETRIEVAL is a real free-text search over the stored datasets — the one shared
 //!   search this workspace has ([`::service_common::document_text_search`]): the message's
-//!   terms are matched against each dataset's id, name and description, a dataset carrying
-//!   none of them is not a result, and the datasets that do carry some rank by the share of
-//!   the message's terms each one carries;
+//!   terms are matched against each dataset's caller-written name and description, and
+//!   against its service-minted id only when the message names that id WHOLE, a dataset
+//!   carrying none of them is not a result, and the datasets that do carry some rank by the
+//!   share of the message's terms each one carries;
 //! * the ANSWER opens with the notice that no model generated it
 //!   ([`EMULATED_ASSISTANT_NOTICE`]), states which turn of which conversation it is and how
 //!   much of the account it searched, and then QUOTES the matched text of each cited dataset
@@ -198,7 +199,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         // [`MAX_ASSISTANT_QUERY_TERMS`].
         terms.truncate(MAX_ASSISTANT_QUERY_TERMS);
         let searched = self.datasets.len();
-        let matched = self.assistant_retrieval(&terms);
+        let matched = self.assistant_retrieval(message, &terms);
         let citations: Vec<AssistantCitation> = matched
             .iter()
             .take(MAX_ASSISTANT_CITATIONS)
@@ -221,7 +222,8 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         let mut traces = vec![
             format!(
                 "Read the {searched} datasets this account holds and matched the {} terms \
-                 searched for against each dataset's id, name and description.",
+                 searched for against each dataset's name and description, and against the \
+                 id of a dataset this message names in full.",
                 terms.len(),
             ),
             format!(
@@ -249,17 +251,27 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// — the share of the terms a dataset carries, then its name, then its id, so one store
     /// ranks one way whatever order its map iterates in.
     ///
-    /// A dataset's searchable text is its id, its name and its description, which is
-    /// everything of a dataset a caller can state in words; the excerpt reported is of the
-    /// text the match was found in.
-    fn assistant_retrieval(&self, terms: &[String]) -> Vec<(f64, AssistantCitation)> {
+    /// A dataset's searchable text is its caller-written name and description, plus the id it
+    /// was minted under when `message` names that id WHOLE: an id is an opaque identifier, so
+    /// a caller reaches a dataset by it by stating it in full, and a run of characters that
+    /// merely occurs inside one never makes a different dataset a result. The excerpt
+    /// reported is of the text the match was found in.
+    fn assistant_retrieval(
+        &self,
+        message: &str,
+        terms: &[String],
+    ) -> Vec<(f64, AssistantCitation)> {
+        // The message, prepared once, to ask of it which ids it names: the ids are
+        // lowercase, which is the folded form this asks in.
+        let asked = ::service_common::document_text_search::SearchableText::new(message);
         let mut matched: Vec<(f64, AssistantCitation)> = self
             .datasets
             .values()
             .filter_map(|record| {
+                let named_by_id = asked.carries(&record.id);
                 let hit = ::service_common::document_text_search::match_document(
                     ::service_common::document_text_search::DocumentFields {
-                        name: &record.id,
+                        name: if named_by_id { record.id.as_str() } else { "" },
                         title: &record.name,
                         body: record.description.as_deref(),
                     },

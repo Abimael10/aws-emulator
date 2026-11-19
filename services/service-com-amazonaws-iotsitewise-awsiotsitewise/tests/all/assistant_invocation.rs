@@ -13,12 +13,12 @@
 //! * the conversation is STATE: a request naming none starts one under a minted id, a
 //!   request naming one continues it, and the turn the answer reports is the count that
 //!   conversation has taken;
-//! * the answer is RETRIEVED from the datasets this account holds: a dataset whose id, name
-//!   or description carries a term the message names is cited — the datasets carrying more
-//!   of those terms first — with the dataset's ARN, the source its text was read through and
-//!   the text itself, and a message naming nothing the account holds cites nothing. No
-//!   language model runs in this emulator, so the answer is never the submitted message
-//!   handed back;
+//! * the answer is RETRIEVED from the datasets this account holds: a dataset whose name or
+//!   description carries a term the message names, or whose service-minted id the message
+//!   names WHOLE, is cited — the datasets carrying more of those terms first — with the
+//!   dataset's ARN, the source its text was read through and the text itself, and a message
+//!   naming nothing the account holds cites nothing. No language model runs in this
+//!   emulator, so the answer is never the submitted message handed back;
 //! * a request that breaks one of the model's own rules is refused with the modelled
 //!   `InvalidRequestException` (HTTP 400) before any of the stream is framed.
 //!
@@ -542,6 +542,9 @@ async fn the_answer_cites_the_datasets_whose_stored_text_the_message_names() {
             cites: vec!["Compressor runbook", "Boiler pressure"],
         },
         Row {
+            // An id is matched WHOLE, so this row's outcome is the same whatever ids the
+            // creates above minted: a run of characters out of one id never reaches
+            // another dataset. The rule has its own table below.
             case: "a message naming the dataset by its minted id",
             message: boiler.id.clone(),
             cites: vec!["Boiler pressure"],
@@ -630,6 +633,149 @@ async fn the_answer_cites_the_datasets_whose_stored_text_the_message_names() {
                 "case {:?}: an answer citing nothing must say so, got {message:?}",
                 row.case
             );
+        }
+    }
+}
+
+/// RULE: a dataset's service-minted id is an opaque identifier, matched WHOLE — a message
+/// stating one in full cites that dataset, and a message stating only a run of characters
+/// out of one cites nothing — so what a turn answers depends on the text the account holds
+/// and the message, never on which ids the creates happened to mint.
+#[tokio::test]
+async fn a_minted_id_is_matched_whole_and_a_fragment_of_one_cites_nothing() {
+    /// One message built out of a minted id, and the dataset the answer must cite for it.
+    struct Row {
+        case: &'static str,
+        message: String,
+        /// The name of the dataset cited, or `None` for a message citing nothing.
+        cites: Option<&'static str>,
+    }
+
+    let router = crate::asset_lifecycle::router();
+    // Neither stored text carries a run of four characters that are all hexadecimal digits,
+    // so a row naming a fragment of an id can only be answered through an id — which is
+    // what these rows are about.
+    let boiler = create_dataset(
+        &router,
+        "Boiler pressure",
+        Some("Hourly pressure readings from the main boiler."),
+        None,
+    )
+    .await;
+    let turbine = create_dataset(&router, "Turbine vibration", None, None).await;
+    let held = [
+        ("Boiler pressure", &boiler),
+        ("Turbine vibration", &turbine),
+    ];
+
+    // The hyphen-separated groups of the modelled id form (8-4-4-4-12 hexadecimal
+    // characters), which is what a fragment row names one of.
+    let groups: Vec<&str> = boiler.id.split('-').collect();
+    assert_eq!(
+        groups.len(),
+        5,
+        "case \"the minted id\": expected the modelled five groups, got {:?}",
+        boiler.id
+    );
+
+    let rows = vec![
+        Row {
+            case: "the whole id of the first dataset",
+            message: boiler.id.clone(),
+            cites: Some("Boiler pressure"),
+        },
+        Row {
+            case: "the whole id of the second dataset",
+            message: turbine.id.clone(),
+            cites: Some("Turbine vibration"),
+        },
+        Row {
+            case: "the whole id inside a sentence the caller typed",
+            message: format!("what does dataset {} hold?", boiler.id),
+            cites: Some("Boiler pressure"),
+        },
+        Row {
+            case: "the whole id in upper case",
+            message: boiler.id.to_uppercase(),
+            cites: Some("Boiler pressure"),
+        },
+        Row {
+            case: "the id's first group alone, of eight characters",
+            message: groups[0].to_string(),
+            cites: None,
+        },
+        Row {
+            case: "the id's middle group alone, of four characters",
+            message: groups[2].to_string(),
+            cites: None,
+        },
+        Row {
+            case: "the id's last group alone, of twelve characters",
+            message: groups[4].to_string(),
+            cites: None,
+        },
+        Row {
+            case: "the id's first two groups, the hyphen between them kept",
+            message: format!("{}-{}", groups[0], groups[1]),
+            cites: None,
+        },
+        Row {
+            case: "the id with its last character dropped",
+            message: boiler.id[..boiler.id.len() - 1].to_string(),
+            cites: None,
+        },
+    ];
+
+    for row in rows {
+        let served = invoke(&router, turn(&row.message, None, true)).await;
+        let output = output_event(row.case, &served, true);
+        let message = answered(row.case, &output);
+        let citations = output["citations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {:?}: expected citations, got {output:?}", row.case));
+        let cited: Vec<String> = citations
+            .iter()
+            .map(|citation| {
+                citation["reference"]["dataset"]["datasetArn"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        let expected: Vec<String> = row
+            .cites
+            .iter()
+            .map(|name| {
+                held.iter()
+                    .find(|(held_name, _)| held_name == name)
+                    .map(|(_, dataset)| dataset.arn.clone())
+                    .expect("a dataset this suite created")
+            })
+            .collect();
+        assert_eq!(
+            cited, expected,
+            "case {:?}: expected the datasets {:?} cited, got {message:?}",
+            row.case, row.cites
+        );
+        match row.cites {
+            Some(name) => {
+                let dataset = held
+                    .iter()
+                    .find(|(held_name, _)| *held_name == name)
+                    .map(|(_, dataset)| (*dataset).clone())
+                    .expect("a dataset this suite created");
+                assert!(
+                    message.contains(&dataset.id),
+                    "case {:?}: the answer must name the dataset it cites, got {message:?}",
+                    row.case
+                );
+            }
+            None => assert!(
+                message.contains("cites no dataset"),
+                "case {:?}: an answer citing nothing must say so, got {message:?}",
+                row.case
+            ),
         }
     }
 }
