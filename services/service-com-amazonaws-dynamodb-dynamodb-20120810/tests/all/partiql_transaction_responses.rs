@@ -4,19 +4,21 @@
 //!
 //! `ItemResponse` carries a single optional `Item` and nothing else, so an entry for a
 //! statement that returned none states nothing a caller can read. The rule the rows below
-//! assert is that the list holds one entry per item a statement returned: a write returns
-//! one only when its `RETURNING` clause asks for it, so a transaction of writes that ask
-//! for no image reports an empty list rather than one empty structure per statement, while
-//! a read returns the item its key addresses — an empty response where that key holds
-//! none, exactly as a transactional read reports a missing item.
+//! assert is that the list holds one entry per item a statement returned — and a WRITE
+//! statement of a transaction returns none: the transaction is applied as a whole, so no
+//! statement of it has an image of its own to report, and the clause that asks for one is
+//! refused behind the slot that carried it rather than served. A READ returns the item its
+//! key addresses, with an empty response where that key holds none, exactly as a
+//! transactional read reports a missing item.
 //!
-//! The rows differ in how many statements the transaction carries, in which of them state
-//! a `RETURNING` clause, in which image that clause asks for, and in which verb writes.
+//! The rows differ in how many statements the transaction carries, in which verb writes,
+//! in which `RETURNING` form the refused statements ask for, and in which slot carries
+//! the clause.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::emulator::{call, emulator, ok};
+use crate::emulator::{call, emulator, message, ok};
 use crate::table_items::create_active_table;
 
 /// The table every statement below addresses.
@@ -73,10 +75,11 @@ async fn a_transaction_reports_one_response_per_item_its_statements_returned() {
     let router = seeded().await;
 
     // Each row: the statements, and the whole `Responses` list the transaction must
-    // report for them.
+    // report for them. Every write reports nothing, whichever verb it is and however many
+    // statements the transaction carries.
     let rows: Vec<(&str, Vec<Value>, Vec<Value>)> = vec![
         (
-            "two writes that ask for no image",
+            "two writes, an insert and an update",
             vec![
                 statement("INSERT INTO ledger VALUE {'id': 'fresh', 'balance': 1}"),
                 statement("UPDATE ledger SET balance = 11 WHERE id = 'a'"),
@@ -84,33 +87,20 @@ async fn a_transaction_reports_one_response_per_item_its_statements_returned() {
             vec![],
         ),
         (
-            "one write of two asking for the image it left",
+            "two updates, over two items",
             vec![
-                statement("UPDATE ledger SET balance = 12 WHERE id = 'a' RETURNING ALL NEW *"),
-                statement("UPDATE ledger SET balance = 21 WHERE id = 'b'"),
+                statement("UPDATE ledger SET balance = 13 WHERE id = 'a'"),
+                statement("UPDATE ledger SET balance = 22 WHERE id = 'b'"),
             ],
-            vec![json!({"Item": {"id": {"S": "a"}, "balance": {"N": "12"}}})],
+            vec![],
         ),
         (
-            "both writes asking for an image, one old and one new",
-            vec![
-                statement("UPDATE ledger SET balance = 13 WHERE id = 'a' RETURNING ALL OLD *"),
-                statement("UPDATE ledger SET balance = 22 WHERE id = 'b' RETURNING ALL NEW *"),
-            ],
-            vec![
-                json!({"Item": {"id": {"S": "a"}, "balance": {"N": "12"}}}),
-                json!({"Item": {"id": {"S": "b"}, "balance": {"N": "22"}}}),
-            ],
+            "a delete of the item an earlier transaction inserted",
+            vec![statement("DELETE FROM ledger WHERE id = 'fresh'")],
+            vec![],
         ),
         (
-            "a delete asking for the item it removed",
-            vec![statement(
-                "DELETE FROM ledger WHERE id = 'fresh' RETURNING ALL OLD *",
-            )],
-            vec![json!({"Item": {"id": {"S": "fresh"}, "balance": {"N": "1"}}})],
-        ),
-        (
-            "a delete asking for no image",
+            "a delete of a stored item",
             vec![statement("DELETE FROM ledger WHERE id = 'c'")],
             vec![],
         ),
@@ -166,6 +156,99 @@ async fn a_transaction_reports_one_response_per_item_its_statements_returned() {
             read.get("Item").cloned().unwrap_or(Value::Null),
             stored,
             "case {case}: expected the store to hold {stored}, got {read}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_statement_asking_for_an_image_is_refused_behind_its_slot() {
+    let router = seeded().await;
+
+    // Each row: the case, the statements the transaction carries, and the zero-based
+    // position of the one asking for an image. The rows span the verb that asks, the
+    // `RETURNING` form it asks for, and where in the list it sits.
+    let rows: Vec<(&str, Vec<Value>, usize)> = vec![
+        (
+            "an UPDATE asking for the image it leaves",
+            vec![statement(
+                "UPDATE ledger SET balance = 12 WHERE id = 'a' RETURNING ALL NEW *",
+            )],
+            0,
+        ),
+        (
+            "an UPDATE asking for the image it replaced",
+            vec![statement(
+                "UPDATE ledger SET balance = 12 WHERE id = 'a' RETURNING ALL OLD *",
+            )],
+            0,
+        ),
+        (
+            "an UPDATE asking for the attributes it modified",
+            vec![statement(
+                "UPDATE ledger SET balance = 12 WHERE id = 'a' RETURNING MODIFIED NEW *",
+            )],
+            0,
+        ),
+        (
+            "a DELETE asking for the item it removed",
+            vec![statement(
+                "DELETE FROM ledger WHERE id = 'b' RETURNING ALL OLD *",
+            )],
+            0,
+        ),
+        (
+            "the second statement of two asking for an image",
+            vec![
+                statement("UPDATE ledger SET balance = 14 WHERE id = 'a'"),
+                statement("DELETE FROM ledger WHERE id = 'b' RETURNING ALL OLD *"),
+            ],
+            1,
+        ),
+        (
+            "the third statement of three asking for an image",
+            vec![
+                statement("UPDATE ledger SET balance = 14 WHERE id = 'a'"),
+                statement("DELETE FROM ledger WHERE id = 'b'"),
+                statement(
+                    "UPDATE ledger SET balance = 31 WHERE id = 'c' RETURNING ALL NEW *",
+                ),
+            ],
+            2,
+        ),
+    ];
+
+    for (case, statements, slot) in rows {
+        let (status, body) = call(
+            &router,
+            "ExecuteTransaction",
+            json!({"TransactStatements": statements}),
+        )
+        .await;
+        let expected = format!(
+            "Validation failed in TransactStatements[{slot}]: RETURNING clause is not supported \
+             in ExecuteTransaction."
+        );
+        assert_eq!(
+            (status, message(&body).as_str()),
+            (400, expected.as_str()),
+            "case {case}: expected the message {expected:?}, got {status} with {body}"
+        );
+    }
+
+    // Every row was refused BEFORE anything was applied, so the three seeded items stand
+    // exactly as they were — including the ones the well-formed statements beside the
+    // refused clause addressed.
+    for (id, balance) in [("a", "10"), ("b", "20"), ("c", "30")] {
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": TABLE, "Key": {"id": {"S": id}}}),
+        )
+        .await;
+        assert_eq!(
+            read["Item"],
+            json!({"id": {"S": id}, "balance": {"N": balance}}),
+            "case a refused clause commits nothing: {id} must still hold {balance}, got {read}"
         );
     }
 }

@@ -493,17 +493,17 @@ const MAX_NUMBER_TEXT_DIGITS: usize =
     MAX_SIGNIFICANT_DIGITS + (MAX_POINT - MIN_POINT) as usize;
 
 /// The most CHARACTERS one `N` value's EXPONENT text may carry, sign included: the
-/// widest decimal spelling of the 64-bit integer the exponent is read into
-/// (`-9223372036854775808`).
+/// widest decimal spelling of the 32-bit integer a decimal exponent is carried in
+/// (`-2147483648`).
 ///
-/// An exponent is read with `parse::<i64>`, which accepts any run of leading zeros, so a
+/// An exponent is read with `parse::<i32>`, which accepts any run of leading zeros, so a
 /// bound on the exponent's VALUE (the documented range, enforced below as an over- or
 /// underflow) bounds no amount of exponent TEXT. A text wider than that integer's widest
 /// spelling carries no exponent that integer can hold — the same fault as an exponent
 /// that is not digits at all — and bounding the text keeps what one value retains
 /// bounded, which is what the byte budgets measured against a number's accounted size
 /// ([`attribute_value_size`], which sizes a number from its significant digits) rely on.
-const MAX_EXPONENT_TEXT_CHARS: usize = 20;
+const MAX_EXPONENT_TEXT_CHARS: usize = 11;
 
 /// How often the figures a description reports as `ItemCount` and
 /// `TableSizeBytes`/`IndexSizeBytes` are recomputed from what is stored.

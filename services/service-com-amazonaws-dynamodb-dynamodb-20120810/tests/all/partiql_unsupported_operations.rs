@@ -186,9 +186,11 @@ async fn a_statement_naming_an_operation_this_surface_does_not_run_names_it_in_t
             "Expected data manipulation",
         ),
         (
+            // The words read as the language's type test (`this IS NOT …`), whose type
+            // position the next word is not a type name for.
             "words that name nothing",
             "this is not a statement".to_string(),
-            "Unexpected token after expression",
+            "Expected type name",
         ),
     ] {
         let (status, answered) = call(

@@ -15,7 +15,8 @@
 //! the `DeleteItem` doc), and `ConditionalCheckFailedException` is only what an item that
 //! IS stored and fails the condition earns. The rows span what the rule generalises
 //! over: which surface runs the statement (`ExecuteStatement`, `BatchExecuteStatement`,
-//! `ExecuteTransaction`), whether the addressed key holds an item, whether the clause
+//! `ExecuteTransaction` — which reports no per-statement image at all, so a `RETURNING`
+//! clause is refused there), whether the addressed key holds an item, whether the clause
 //! states a condition besides the key, which FORM that condition takes and whether the
 //! stored item holds it, which `RETURNING` form the statement asks for, and how many key
 //! attributes the table has.
@@ -541,10 +542,31 @@ async fn a_guarded_delete_of_an_absent_key_is_served_on_every_statement_surface(
         "case a batched guarded delete of an absent key: expected no image, got {slot}"
     );
 
+    // A transaction reports no per-statement image at all, so the same statement asks
+    // there for something that surface does not serve and is refused behind its slot;
+    // the statement WITHOUT the clause is served, having removed nothing.
     let (status, body) = call(
         &router,
         "ExecuteTransaction",
         json!({"TransactStatements": [{"Statement": guarded}]}),
+    )
+    .await;
+    assert_eq!(
+        (status, message(&body).as_str()),
+        (
+            400,
+            "Validation failed in TransactStatements[0]: RETURNING clause is not supported in \
+             ExecuteTransaction."
+        ),
+        "case a transactional guarded delete asking for an image: expected the clause \
+         refused, got {status} with {body}"
+    );
+    let (status, body) = call(
+        &router,
+        "ExecuteTransaction",
+        json!({"TransactStatements": [{"Statement": format!(
+            "DELETE FROM \"{PAIRED}\" WHERE pk = 'ghost' AND sk = 's1' AND note = 'n1'"
+        )}]}),
     )
     .await;
     assert_eq!(

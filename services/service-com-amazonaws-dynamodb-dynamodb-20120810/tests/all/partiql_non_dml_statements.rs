@@ -49,6 +49,11 @@ const NO_DATA_MANIPULATION: &str = "Expected data manipulation";
 /// The parser's phrase for text a token is left over past the expression it read in.
 const TRAILING_TOKEN: &str = "Unexpected token after expression";
 
+/// The parser's phrase for a position where a TYPE NAME belongs and the text names none:
+/// the language's `IS [NOT] <type>` test names the type it tests for, so what follows the
+/// operator is read as one.
+const EXPECTED_TYPE_NAME: &str = "Expected type name";
+
 /// An emulator holding one active table with one item in it, so a statement that IS served
 /// can be seen to have run.
 async fn seeded() -> smithy_server_runtime::MultiServiceRouter {
@@ -127,9 +132,11 @@ async fn text_that_states_none_of_the_served_verbs_manipulates_no_data() {
             TRAILING_TOKEN,
         ),
         (
+            // The words read as the language's type test (`this IS NOT …`), whose type
+            // position the next word is not a type name for.
             "text that is no statement in any dialect",
             "this is not a statement".to_string(),
-            TRAILING_TOKEN,
+            EXPECTED_TYPE_NAME,
         ),
     ];
 

@@ -28,8 +28,8 @@
 //!   `ValidationError` in its own slot.
 //! * "The entire batch must consist of either read statements or write statements, you
 //!   cannot mix both in one batch": a batch that mixes them is refused as a whole, with
-//!   a 400 `ValidationException`, because the refusal is of the REQUEST rather than of
-//!   any one statement in it.
+//!   a 400 `ValidationException` ([`MIXED_BATCH_MESSAGE`]), because the refusal is of the
+//!   REQUEST rather than of any one statement in it.
 //! * A write batch applies at most one write per item, like every other multi-item
 //!   write path here ([`crate::state::DUPLICATE_BATCH_KEYS_MESSAGE`]): two statements
 //!   addressing one item would leave a result that depends on which ran first, so the
@@ -231,7 +231,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The entire batch must consist of either read statements or write statements,
         // you cannot mix both in one batch" — a rule about the request, so a mixed
-        // batch is refused whole and nothing of it is applied.
+        // batch is refused whole and nothing of it is applied
+        // ([`MIXED_BATCH_MESSAGE`] is the sentence it is refused with).
         let reads = parsed
             .iter()
             .flatten()
@@ -293,10 +294,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// This service's store, as the slot paths below take it.
 type Store = crate::state::ComAmazonawsDynamodbDynamodb20120810State;
 
-/// How a batch that mixes reads and writes is refused: the rule the operation's own
-/// doc states.
-const MIXED_BATCH_MESSAGE: &str = "The entire batch must consist of either read statements or \
-                                   write statements, you cannot mix both in one batch";
+/// How a batch that mixes reads and writes is refused: the fixed sentence DynamoDB
+/// states that rule with, which is NOT the prose the operation's doc explains it in.
+///
+/// The doc says what the rule IS ("The entire batch must consist of either read statements
+/// or write statements, you cannot mix both in one batch"); the refusal is one sentence
+/// about the request, with no variable part — the trailing period included, because the
+/// sentence is what a client matches.
+const MIXED_BATCH_MESSAGE: &str = "Read and write requests together in the same batch is not \
+                                   supported.";
 
 /// How a read statement that does not address ONE item of the table by its primary key
 /// is refused, in the fixed sentence DynamoDB states that rule with.
@@ -498,6 +504,12 @@ fn run_slot<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             requested_capacity,
             return_old_on_failure,
         ),
+        // A check guards a write it is applied WITH, and a batch applies each statement
+        // on its own, so this slot has nothing for one to guard
+        // ([`crate::state::EXISTS_ONLY_IN_TRANSACTION_MESSAGE`]).
+        crate::state::PartiqlStatement::Exists(_) => Err(SlotFailure::validation(
+            crate::state::EXISTS_ONLY_IN_TRANSACTION_MESSAGE,
+        )),
     }
     // Every slot is reported against the table its statement addressed — the one it
     // failed on, and the one it ran against — so a caller that batched statements over
@@ -538,8 +550,10 @@ fn check_distinct_write_targets(
         };
         let key = match statement {
             // A read addresses an item without changing it, so two reads of one item
-            // are two reads of one item.
-            crate::state::PartiqlStatement::Select(_) => continue,
+            // are two reads of one item — and a check this surface does not serve at
+            // all writes nothing either.
+            crate::state::PartiqlStatement::Select(_)
+            | crate::state::PartiqlStatement::Exists(_) => continue,
             crate::state::PartiqlStatement::Insert(insert) => table.key_of_item(&insert.item),
             crate::state::PartiqlStatement::Update(update) => {
                 crate::state::singleton_key(table, &update.filter)
@@ -820,7 +834,7 @@ fn delete_item(
         let table = store.active_table(region, name, now)?;
         (
             crate::state::singleton_key(table, &delete.filter)?,
-            crate::state::parsed_delete_condition(table, &delete.filter)?,
+            crate::state::parsed_condition_beside_the_key(table, &delete.filter)?,
         )
     };
     let before = store

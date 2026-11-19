@@ -27,19 +27,20 @@ impl NumberKey {
         let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
             Some(at) => {
                 let text = &unsigned[at + 1..];
-                // The exponent is read as a 64-BIT integer and only then held to the
-                // documented range below, so the two defects stay apart: a text whose
-                // exponent is a number states a magnitude, which over- or underflows
-                // that range, and only a text whose exponent is NO 64-bit integer — not
-                // digits at all, or wider than that integer can hold — is a text this
-                // service cannot convert to a number. Bounded before it is parsed,
+                // A decimal exponent is carried in a 32-BIT integer — the width a
+                // decimal value's scale is held in — and only then held to the documented
+                // range below, so the two defects stay apart: a text whose exponent that
+                // integer can hold states a magnitude, which over- or underflows the
+                // documented range, and only a text whose exponent is NO such integer —
+                // not digits at all, or wider than that integer can hold — is a text this
+                // service cannot convert to a number at all. Bounded before it is parsed,
                 // because `parse` reads through any number of leading zeros.
                 if text.len() > MAX_EXPONENT_TEXT_CHARS {
                     return Err(NumberFault::NotNumeric);
                 }
                 (
                     &unsigned[..at],
-                    text.parse::<i64>().map_err(|_| NumberFault::NotNumeric)?,
+                    i64::from(text.parse::<i32>().map_err(|_| NumberFault::NotNumeric)?),
                 )
             }
             None => (unsigned, 0),
@@ -70,9 +71,9 @@ impl NumberKey {
         // sits after the integral digits, shifted by the exponent. Both terms come
         // from the request, so every step is checked: an exponent that leaves the
         // documented range is refused as an over- or underflow, whichever direction
-        // it left it in. The arithmetic is done in the width the exponent was READ in,
-        // so a magnitude stated with an exponent at that integer's own limit is still
-        // reported as the over- or underflow it is.
+        // it left it in. The arithmetic is done in a width WIDER than the exponent was
+        // read in, so a magnitude stated with an exponent at that integer's own limit is
+        // still reported as the over- or underflow it is.
         let shifted = i64::try_from(integral.len())
             .ok()
             .and_then(|len| len.checked_add(exponent));

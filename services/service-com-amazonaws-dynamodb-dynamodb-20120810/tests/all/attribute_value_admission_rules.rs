@@ -8,12 +8,12 @@
 //!   stored. The rows span the write surfaces a value can arrive through, where in the
 //!   value it sits (top level, inside a list, inside a map, as a set-free scalar of an
 //!   update) and the read surface that compares against one.
-//! * A number's EXPONENT is read as a 64-bit integer and only then held to the
-//!   documented range, so the two defects stay apart: a text whose exponent is a number
-//!   states a magnitude, which over- or underflows that range, and only a text whose
-//!   exponent is no 64-bit integer cannot be converted to a number at all. The rows walk
-//!   both published bounds, one past each of them, both limits of the integer the
-//!   exponent is read into and one past each of those.
+//! * A number's EXPONENT is read as a 32-bit integer — the width a decimal exponent is
+//!   carried in — and only then held to the documented range, so the two defects stay
+//!   apart: a text whose exponent that integer can hold states a magnitude, which over- or
+//!   underflows that range, and only a text whose exponent is no such integer cannot be
+//!   converted to a number at all. The rows walk both published bounds, one past each of
+//!   them, both limits of the integer the exponent is read into and one past each of those.
 //! * A value's NESTING is bounded wherever it is read: one inside the documented quota
 //!   ("DynamoDB supports nested attributes up to 32 levels deep") is stored, and one past
 //!   it is refused with a 400 `ValidationException` and stores nothing — including one
@@ -43,9 +43,10 @@ const NULL_CLAUSE: &str = "One or more parameter values were invalid: Null attri
 const MAX_EXPONENT: i32 = 125;
 const MIN_EXPONENT: i32 = -130;
 
-/// The two limits of the 64-bit integer an exponent is read into, as a text spells them.
-const MAX_SIGNED_64: &str = "9223372036854775807";
-const MIN_SIGNED_64: &str = "-9223372036854775808";
+/// The two limits of the 32-bit integer a decimal exponent is carried in, as a text
+/// spells them.
+const MAX_SIGNED_32: &str = "2147483647";
+const MIN_SIGNED_32: &str = "-2147483648";
 
 /// The clause a magnitude outside the documented range earns, either way out.
 const OVERFLOW_CLAUSE: &str =
@@ -499,11 +500,11 @@ async fn a_value_nesting_past_the_supported_levels_is_refused_however_deep_it_go
 }
 
 #[tokio::test]
-async fn an_exponent_is_read_as_a_64_bit_integer_and_then_range_checked() {
+async fn an_exponent_is_read_as_a_32_bit_integer_and_then_range_checked() {
     let router = seeded().await;
 
     // Each row: the case, the `N` text, and the clause the refusal must carry — the
-    // magnitude clauses for an exponent that IS a 64-bit integer and leaves the
+    // magnitude clauses for an exponent that IS such an integer and leaves the
     // documented range, and the conversion clause only for a text whose exponent is no
     // such integer. The rows walk one past each published bound, both limits of that
     // integer and one past each of them, and a mantissa that normalises to zero (which
@@ -522,33 +523,38 @@ async fn an_exponent_is_read_as_a_64_bit_integer_and_then_range_checked() {
         ),
         (
             "an exponent at the top of the integer it is read into",
-            format!("1E{MAX_SIGNED_64}"),
+            format!("1E{MAX_SIGNED_32}"),
             OVERFLOW_CLAUSE.to_string(),
         ),
         (
             "an exponent at the bottom of the integer it is read into",
-            format!("1E{MIN_SIGNED_64}"),
+            format!("1E{MIN_SIGNED_32}"),
             UNDERFLOW_CLAUSE.to_string(),
         ),
         (
             "a zero carrying an exponent at the top of that integer",
-            format!("0E{MAX_SIGNED_64}"),
+            format!("0E{MAX_SIGNED_32}"),
             OVERFLOW_CLAUSE.to_string(),
         ),
         (
             "a zero carrying an exponent at the bottom of that integer",
-            format!("0E{MIN_SIGNED_64}"),
+            format!("0E{MIN_SIGNED_32}"),
             UNDERFLOW_CLAUSE.to_string(),
         ),
         (
             "an exponent one past the top of that integer",
-            "1E9223372036854775808".to_string(),
-            conversion_clause("1E9223372036854775808"),
+            "1E2147483648".to_string(),
+            conversion_clause("1E2147483648"),
         ),
         (
             "an exponent one past the bottom of that integer",
-            "1E-9223372036854775809".to_string(),
-            conversion_clause("1E-9223372036854775809"),
+            "1E-2147483649".to_string(),
+            conversion_clause("1E-2147483649"),
+        ),
+        (
+            "an exponent far past the width of that integer",
+            "1E99999999999".to_string(),
+            conversion_clause("1E99999999999"),
         ),
         (
             "an exponent that is not digits at all",

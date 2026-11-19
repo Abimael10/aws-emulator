@@ -1078,8 +1078,39 @@ fn as_stated(violation: &Violation) -> Violation {
             ),
             ..violation.clone()
         },
-        _ => violation.clone(),
+        _ => quoting_an_empty_collection(violation),
     }
+}
+
+/// `violation` with the walk's SUMMARY of an empty collection replaced by the collection
+/// itself, where the clause echoes a value.
+///
+/// A clause states the value the request carried, and the validating walk hands this seam
+/// its own summary of a collection it length-checked (`<n> items` for a list, `<n>
+/// entries` for a map) rather than the collection — neither of which any caller sent. For
+/// a collection that HOLDS something there is nothing here to render from (see the
+/// paragraph above [`violation_clause`]), but a collection the walk counted as EMPTY has
+/// exactly one rendering whatever it held nothing of, so that one is restored: an empty
+/// list is quoted as the empty list and an empty map as the empty map, through the shared
+/// renderings every service quotes a submitted collection with
+/// (`service_common::validation_message::quoting_the_submitted_collection`, which is also
+/// what holds the restoring to the two `@length` classes). The requirement half, the path
+/// and the envelope stay the framework's.
+fn quoting_an_empty_collection(violation: &Violation) -> Violation {
+    let Some(stored) = violation.value.as_deref() else {
+        return violation.clone();
+    };
+    let empty = if ::service_common::validation_message::list_item_count(stored) == Some(0) {
+        ::service_common::validation::rendered_list(&[])
+    } else if ::service_common::validation_message::map_entry_count(stored) == Some(0) {
+        ::service_common::validation::rendered_map(&[])
+    } else {
+        return violation.clone();
+    };
+    ::service_common::validation_message::quoting_the_submitted_collection(
+        violation.clone(),
+        ::service_common::validation::SubmittedEcho::Rendered(empty),
+    )
 }
 
 /// The member whose violation is reported ALONE, masking every other violation the same

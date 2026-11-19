@@ -289,6 +289,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 )));
             }
+            // A statement of a transaction reports no item of its own: "the entire
+            // transaction must succeed or fail", so a write of one commits with the rest
+            // and there is no per-statement image for a `RETURNING` clause to project.
+            // A clause that asks for one is refused BEFORE anything is applied, behind
+            // the slot that carried it, so the transaction commits nothing.
+            if statement.returning().is_some() {
+                return Err(lift(in_slot(
+                    slot,
+                    crate::state::RequestError::Validation(
+                        RETURNING_IN_TRANSACTION_MESSAGE.to_string(),
+                    ),
+                )));
+            }
             parsed.push(statement);
         }
 
@@ -410,11 +423,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// This service's store, as the two transaction paths below take it.
 type Store = crate::state::ComAmazonawsDynamodbDynamodb20120810State;
 
-/// How a transaction that mixes reads and writes is refused: the rule the operation's
-/// own doc states.
+/// How a transaction that mixes reads and writes is refused: the fixed sentence DynamoDB
+/// states that rule with, which is NOT the prose the operation's doc explains it in.
+///
+/// The doc says what the rule IS ("The entire transaction must consist of either read
+/// statements or write statements, you cannot mix both in one transaction"); the refusal
+/// is one sentence about the REQUEST, naming the operation that does not support it and
+/// nothing of the statements, so no part of it comes from what the request carried.
 const MIXED_TRANSACTION_MESSAGE: &str =
-    "The entire transaction must consist of either read statements or write statements, you \
-     cannot mix both in one transaction";
+    "ExecuteTransaction API does not support both read and write operations in the same request.";
 
 /// How a `SELECT` that does not address ONE item of the table is refused.
 ///
@@ -435,6 +452,17 @@ const SINGLE_ITEM_READ_MESSAGE: &str = "Select statements within ExecuteTransact
 /// statement in the request.
 const INDEX_READ_IN_TRANSACTION_MESSAGE: &str =
     "Reads on indices are not supported within transactions.";
+
+/// How a statement whose `RETURNING` clause asks for an item image is refused.
+///
+/// A transaction answers `Responses` for the statements it ran and nothing else — it is
+/// applied as a whole, so no statement of it has an image of its own to project — and a
+/// `RETURNING` clause asks for exactly such an image. The sentence is fixed and names
+/// neither the clause nor the table; the slot it is stated behind ([`in_slot`]) is what
+/// locates the statement in the request, and the refusal precedes every write, so a
+/// transaction carrying one changes nothing.
+const RETURNING_IN_TRANSACTION_MESSAGE: &str =
+    "RETURNING clause is not supported in ExecuteTransaction.";
 
 /// One statement's refusal, reported against the slot the request sent that statement
 /// in.
@@ -549,23 +577,30 @@ fn read_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // not use leaves nothing this statement could decrypt — and a transaction is
         // served whole or not at all ([`crate::state::check_table_key_accessible`]).
         crate::state::check_table_key_accessible(engine, table).map_err(lift)?;
+        // Every refusal from here on is about THIS statement, so each is stated behind
+        // the slot the request sent it in ([`in_slot`]).
+        let refused = |message: &str| {
+            lift(in_slot(
+                at,
+                crate::state::RequestError::Validation(message.to_string()),
+            ))
+        };
         if select.order_by.is_some() {
-            return Err(crate::scaffolded::Scaffolded::validation(ORDER_BY_MESSAGE));
+            return Err(refused(ORDER_BY_MESSAGE));
         }
         let Some(filter) = select.filter.as_ref() else {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                SINGLE_ITEM_READ_MESSAGE,
-            ));
+            return Err(refused(SINGLE_ITEM_READ_MESSAGE));
         };
-        let condition = crate::state::parsed_condition(filter).map_err(lift)?;
+        let condition = crate::state::parsed_condition(filter)
+            .map_err(|error| lift(in_slot(at, error)))?;
         let key = crate::state::singleton_key(table, filter).map_err(|error| {
             // A `WHERE` clause that leaves a key attribute free addresses no ONE item of
             // the table, which this operation states in the sentence above rather than in
             // the one a single-statement write earns.
             if error.message() == crate::state::MANDATORY_KEY_EQUALITY_MESSAGE {
-                return crate::scaffolded::Scaffolded::validation(SINGLE_ITEM_READ_MESSAGE);
+                return refused(SINGLE_ITEM_READ_MESSAGE);
             }
-            lift(error)
+            lift(in_slot(at, error))
         })?;
         // "Transaction request cannot include multiple operations on one item."
         if !keyed.insert((name.clone(), key.clone())) {
@@ -737,8 +772,6 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     before,
                     satisfied,
                     returns_old_on_failure,
-                    // An `INSERT` states no `RETURNING` clause, so it reports no item.
-                    reported: None,
                 }
             }
             crate::state::PartiqlStatement::Update(update) => {
@@ -777,7 +810,6 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                         before,
                         satisfied,
                         returns_old_on_failure,
-                        reported: None,
                     }
                 } else {
                     let mut item = before.clone().unwrap_or_default();
@@ -816,14 +848,6 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                             .map_err(lift)?;
                         table.check_vector_attributes(&item).map_err(lift)?;
                     }
-                    let reported = crate::state::projected_return_values(
-                        update
-                            .returning
-                            .map(crate::state::ReturnedValues::as_return_value),
-                        before.as_ref(),
-                        Some(&item),
-                        &touched,
-                    );
                     Planned {
                         table: name,
                         key,
@@ -831,7 +855,6 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                         before,
                         satisfied,
                         returns_old_on_failure,
-                        reported,
                     }
                 }
             }
@@ -840,7 +863,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     let table = store.active_table(region, &name, now).map_err(lift)?;
                     (
                         crate::state::singleton_key(table, &delete.filter).map_err(lift)?,
-                        crate::state::parsed_delete_condition(table, &delete.filter)
+                        crate::state::parsed_condition_beside_the_key(table, &delete.filter)
                             .map_err(lift)?,
                     )
                 };
@@ -859,13 +882,6 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     before.as_ref(),
                 )
                 .map_err(lift)?;
-                // A delete removes every attribute of the item, so the `MODIFIED OLD`
-                // projection of what it changed IS the item as it stood — both OLD forms
-                // report that item.
-                let reported = delete
-                    .returning
-                    .and_then(|_| before.clone())
-                    .filter(|item| satisfied && !item.is_empty());
                 Planned {
                     table: name,
                     key,
@@ -877,7 +893,65 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     before,
                     satisfied,
                     returns_old_on_failure,
-                    reported,
+                }
+            }
+            // `EXISTS(<select>)`: the check holds when the ONE item its inner `SELECT`
+            // addresses is stored and satisfies whatever else that clause states. It
+            // writes nothing either way — it is the condition the writes beside it are
+            // applied under, so a check that does not hold cancels the transaction like
+            // any other unmet predicate.
+            crate::state::PartiqlStatement::Exists(select) => {
+                // The check must name the ONE item it is about and state something
+                // besides that item's key
+                // ([`crate::state::EXISTS_SINGLE_ITEM_MESSAGE`]).
+                let malformed = || {
+                    lift(in_slot(
+                        at,
+                        crate::state::RequestError::Validation(
+                            crate::state::EXISTS_SINGLE_ITEM_MESSAGE.to_string(),
+                        ),
+                    ))
+                };
+                let Some(filter) = select.filter.as_ref() else {
+                    return Err(malformed());
+                };
+                let (key, condition) = {
+                    let table = store.active_table(region, &name, now).map_err(lift)?;
+                    (
+                        crate::state::singleton_key(table, filter).map_err(|error| {
+                            if error.message() == crate::state::MANDATORY_KEY_EQUALITY_MESSAGE {
+                                return malformed();
+                            }
+                            lift(in_slot(at, error))
+                        })?,
+                        crate::state::parsed_condition_beside_the_key(table, filter)
+                            .map_err(|error| lift(in_slot(at, error)))?,
+                    )
+                };
+                let Some(condition) = condition else {
+                    return Err(malformed());
+                };
+                let before = store
+                    .active_table(region, &name, now)
+                    .map_err(lift)?
+                    .items
+                    .get(&key)
+                    .cloned();
+                // The check HOLDS when the item it names is stored and satisfies the
+                // condition the clause states besides its key; a key that holds nothing
+                // satisfies no condition, so the check does not hold and the transaction
+                // is cancelled like any other unmet predicate.
+                let satisfied = match before.as_ref() {
+                    Some(item) => condition.evaluate(Some(item)).map_err(lift)?,
+                    None => false,
+                };
+                Planned {
+                    table: name,
+                    key,
+                    write: PlannedWrite::Check,
+                    before,
+                    satisfied,
+                    returns_old_on_failure,
                 }
             }
         };
@@ -945,8 +1019,34 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     for statement in &planned {
         let after = match &statement.write {
             PlannedWrite::Put(item) => Some(item.clone()),
-            PlannedWrite::Delete | PlannedWrite::Nothing => None,
+            PlannedWrite::Delete | PlannedWrite::Check | PlannedWrite::Nothing => None,
         };
+        if matches!(statement.write, PlannedWrite::Check) {
+            // A check writes nothing, so it lands in no item collection; it is still part
+            // of the transactional write and it READ one item, so the table is charged
+            // for that item and no index is — exactly as the classic transactional
+            // condition check is charged ([`crate::ops::transact_write_items`]).
+            let capacity = crate::state::WriteCapacity {
+                table: crate::state::write_capacity_units(
+                    statement.before.as_ref().map_or(0, crate::state::item_size),
+                ),
+                ..crate::state::WriteCapacity::default()
+            };
+            let mut per_statement = crate::state::WriteLedger::default();
+            per_statement.record(&statement.table, &capacity);
+            per_statement.scale(crate::state::TRANSACTIONAL_CAPACITY_FACTOR);
+            consumed.extend(
+                per_statement
+                    .consumed_capacity(
+                        requested_capacity,
+                        crate::state::CapacityKind::Write,
+                        crate::state::KindReport::Named,
+                    )
+                    .unwrap_or_default(),
+            );
+            recorded.record(&statement.table, &capacity);
+            continue;
+        }
         undo.push((
             statement.table.clone(),
             statement.key.clone(),
@@ -1049,9 +1149,11 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     }
 
     Ok(ExecuteTransactionOutput {
-        // A write reports what its `RETURNING` clause asked to see, and a statement that
-        // states no such clause produced nothing to report ([`reported_responses`]).
-        responses: reported_responses(planned.into_iter().map(|statement| statement.reported)),
+        // A WRITE statement of a transaction produces no item to report: the transaction is
+        // applied as a whole, so no statement of it has an image of its own, and the clause
+        // that would ask for one is refused before anything is applied
+        // ([`RETURNING_IN_TRANSACTION_MESSAGE`]).
+        responses: reported_responses(planned.iter().map(|_| None)),
         consumed_capacity: (!consumed.is_empty()).then_some(consumed),
     })
 }
@@ -1087,8 +1189,6 @@ struct Planned {
     before: Option<crate::state::Item>,
     satisfied: bool,
     returns_old_on_failure: bool,
-    /// What this statement's `RETURNING` clause asked to see, when it states one.
-    reported: Option<crate::state::Item>,
 }
 
 impl Planned {
@@ -1110,6 +1210,9 @@ enum PlannedWrite {
     Put(crate::state::Item),
     /// A `DELETE`, which removes whatever its key held.
     Delete,
+    /// An `EXISTS` check, which writes nothing: it only has to HOLD for the writes
+    /// beside it to land.
+    Check,
     /// A statement whose predicate was not met, which writes nothing because the
     /// transaction carrying it is cancelled.
     Nothing,

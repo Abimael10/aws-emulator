@@ -9,6 +9,14 @@
 //! `DELETE` mutate them, so a statement's effect is visible to every later `GetItem`,
 //! `Query` or statement and a classic write is visible to every later `SELECT`.
 //!
+//! Beside those four verbs the language states two forms that manipulate no data, and
+//! both are parsed here so each surface can answer for the one it serves: the CHECK
+//! statement `EXISTS(<select>)` ([`PartiqlStatement::Exists`]), which guards the writes of
+//! a transaction and is refused everywhere else
+//! ([`EXISTS_ONLY_IN_TRANSACTION_MESSAGE`]), and the TYPE TEST `operand IS <type>`, which
+//! is a predicate of a `WHERE` clause ([`IS_OPERATOR_TYPES`]) and, standing alone, an
+//! operation this surface does not run.
+//!
 //! This module is the dialect's front end only. A statement is lexed and parsed here
 //! into
 //!
@@ -144,6 +152,9 @@ enum ParseDefect {
     TrailingToken,
     /// The token at that position is not one the grammar admits there.
     UnexpectedTerm,
+    /// A TYPE NAME was required there — the language's `IS` test names the type it tests
+    /// for ([`STATEMENT_TYPE_NAMES`]) — and what the statement spells is not one.
+    TypeName,
     /// A bare word at a position where only a NAME may stand is one of the dialect's
     /// keywords: a name that collides with a keyword is spelled `"quoted"`, so the
     /// unquoted word is read as the keyword it is and the grammar has no place for it
@@ -177,6 +188,7 @@ impl ParseDefect {
             Self::AfterSemicolon => "Unexpected token after semicolon. (Only one query is allowed.)",
             Self::TrailingToken => "Unexpected token after expression",
             Self::UnexpectedTerm => "Unexpected term",
+            Self::TypeName => "Expected type name",
             Self::UnexpectedKeyword => "Unexpected keyword",
             Self::Unterminated | Self::Lexeme => "",
             Self::ExpectedRightCurly => "Expected RIGHT_CURLY",
@@ -219,6 +231,10 @@ const NON_DML_STATEMENT_OPERATIONS: [(&str, &str, &str); 4] = [
     ("drop", "index", "DropIndex"),
 ];
 
+/// The name of the language's TYPE TEST operation — `operand IS <type>` — as a refusal
+/// about a statement that is one names it ([`StatementParser::query_operation`]).
+const IS_TYPE_OPERATION: &str = "IsType";
+
 /// How text naming an operation this surface does not run is refused: the fixed sentence,
 /// over the name of the operation the text's leading keywords name
 /// ([`NON_DML_STATEMENT_OPERATIONS`]).
@@ -233,8 +249,17 @@ fn unsupported_statement_operation(operation: &str) -> RequestError {
 
 /// How a call to a function this dialect does not define is refused: the name the
 /// statement called, and where it spells it.
+///
+/// A function name is matched without regard to case — `SIZE(a)` calls `size` — so the
+/// name a refusal states is the name the parser RESOLVED, in the one spelling this
+/// language holds its function names in: folded to lower case. The position is still the
+/// statement's own ([`Position`]), which is where the caller finds the text it wrote.
 fn unrecognized_function(name: &str, at: Position) -> RequestError {
-    RequestError::Validation(format!("Unrecognized function: {name} at {}", at.stated()))
+    RequestError::Validation(format!(
+        "Unrecognized function: {} at {}",
+        name.to_ascii_lowercase(),
+        at.stated()
+    ))
 }
 
 /// How an operand that is not a document path is refused, naming the operator or
@@ -401,6 +426,128 @@ fn unexpected_token_after_statement() -> RequestError {
 /// expression refusals use.
 const STATEMENT_ATTRIBUTE_TYPE_NAMES: [&str; 10] =
     ["N", "BS", "L", "B", "NULL", "M", "S", "SS", "NS", "BOOL"];
+
+/// The data types the language's `IS` operator tests for, in the order DynamoDB lists
+/// them in its refusal of one it does not support — each with the keywords that spell it
+/// and the `AttributeValue` members it names.
+///
+/// `path IS <typeName>` asks whether the stored attribute is of the type the statement
+/// names. The language spells many more types than these ([`STATEMENT_TYPE_NODE_NAMES`]
+/// holds every one), and the operator takes only the ones a DynamoDB value can have: the
+/// two spellings of a boolean, a blob, a string, a number, the two spellings of a map, a
+/// list, and the two forms a value can be ABSENT in — `MISSING`, which is an attribute the
+/// item does not carry, and `NULL`, which is one carrying the null type. Those two are
+/// read as the clauses they are before this table is consulted
+/// ([`StatementParser::primary`]), which is why they name no attribute type here.
+///
+/// A keyword is matched without regard to case, the way every keyword of this dialect is.
+const IS_OPERATOR_TYPES: [(&str, &[&str], &[&str]); 9] = [
+    ("MISSING", &["missing"], &[]),
+    ("NULL", &["null"], &[]),
+    ("BOOLEAN", &["bool", "boolean"], &["BOOL"]),
+    ("BLOB", &["blob"], &["B"]),
+    ("STRING", &["string"], &["S"]),
+    ("NUMERIC", &["numeric"], &["N"]),
+    ("STRUCT", &["struct"], &["M"]),
+    ("TUPLE", &["tuple"], &["M"]),
+    ("LIST", &["list"], &["L"]),
+];
+
+/// Every TYPE the statement language spells, as the name a refusal about it states — the
+/// language's own name for that type, which is not the keyword the statement spells it
+/// with: the three integer widths share four spellings between them, and two types are
+/// spelled in two words.
+///
+/// What this is for: the `IS` operator takes nine of these ([`IS_OPERATOR_TYPES`]) and a
+/// statement naming any of the rest is told WHICH type it named and which the operator
+/// takes ([`unsupported_is_type`]) — so the name has to be the language's, not the
+/// statement's spelling.
+const STATEMENT_TYPE_NODE_NAMES: [(&str, &str); 35] = [
+    ("any", "AnyType"),
+    ("bag", "BagType"),
+    ("bigint", "Integer8Type"),
+    ("blob", "BlobType"),
+    ("bool", "BooleanType"),
+    ("boolean", "BooleanType"),
+    ("char", "CharacterType"),
+    ("character", "CharacterType"),
+    ("clob", "ClobType"),
+    ("date", "DateType"),
+    ("decimal", "DecimalType"),
+    ("double", "DoublePrecisionType"),
+    ("float", "FloatType"),
+    ("int", "IntegerType"),
+    ("int2", "SmallintType"),
+    ("int4", "Integer4Type"),
+    ("int8", "Integer8Type"),
+    ("integer", "IntegerType"),
+    ("integer2", "SmallintType"),
+    ("integer4", "Integer4Type"),
+    ("integer8", "Integer8Type"),
+    ("list", "ListType"),
+    ("missing", "MissingType"),
+    ("null", "NullType"),
+    ("numeric", "NumericType"),
+    ("real", "RealType"),
+    ("sexp", "SexpType"),
+    ("smallint", "SmallintType"),
+    ("string", "StringType"),
+    ("struct", "StructType"),
+    ("symbol", "SymbolType"),
+    ("time", "TimeType"),
+    ("timestamp", "TimestampType"),
+    ("tuple", "TupleType"),
+    ("varchar", "CharacterVaryingType"),
+];
+
+/// The types the language spells in TWO keywords, as the first keyword, the second one
+/// that completes it, and the language's name for the type the pair names — which is NOT
+/// the name the first keyword alone names (`CHARACTER` is one type and `CHARACTER
+/// VARYING` another).
+const TWO_WORD_TYPE_NAMES: [(&str, &str, &str); 3] = [
+    ("double", "precision", "DoublePrecisionType"),
+    ("character", "varying", "CharacterVaryingType"),
+    ("char", "varying", "CharacterVaryingType"),
+];
+
+/// The attribute types `IS <typeName>` names, for a type the operator SUPPORTS, and
+/// `None` for every other word — a type of the language the operator does not take, or a
+/// word that names no type at all.
+fn is_operator_codes(word: &str) -> Option<&'static [&'static str]> {
+    IS_OPERATOR_TYPES
+        .iter()
+        .find(|(_, keywords, _)| {
+            keywords
+                .iter()
+                .any(|keyword| word.eq_ignore_ascii_case(keyword))
+        })
+        .map(|(_, _, codes)| *codes)
+}
+
+/// The language's name for the type `word` spells, and `None` for a word that spells no
+/// type of it.
+fn statement_type_node_name(word: &str) -> Option<&'static str> {
+    STATEMENT_TYPE_NODE_NAMES
+        .iter()
+        .find(|(keyword, _)| word.eq_ignore_ascii_case(keyword))
+        .map(|(_, name)| *name)
+}
+
+/// How an `IS` test naming a type the operator does not take is refused: the type the
+/// statement named, every type the operator takes, and where the statement spells the
+/// test.
+///
+/// The position is where the test OPENS — the token its left operand begins with, with
+/// that token's own width ([`Position`]) — which is how every positioned sentence of this
+/// surface reports a construct spelled over several tokens.
+fn unsupported_is_type(named: &str, at: Position) -> RequestError {
+    let supported: Vec<&str> = IS_OPERATOR_TYPES.iter().map(|(name, _, _)| *name).collect();
+    RequestError::Validation(format!(
+        "Unsupported data type for IS operator: {named}. Supported data types are [{}] at {}",
+        supported.join(", "),
+        at.stated()
+    ))
+}
 
 /// `attribute_type`'s second operand names a TYPE, so a statement that spells a literal
 /// which is not one of the type codes is refused as it is read.
@@ -1068,24 +1215,65 @@ pub enum PartiqlStatement {
     Insert(InsertStatement),
     Update(UpdateStatement),
     Delete(DeleteStatement),
+    /// `EXISTS(<select>)`: the CHECK statement, which reads the one item its inner
+    /// `SELECT` addresses and manipulates nothing. It takes part in a transaction's
+    /// all-or-nothing write as the condition it is, and every other statement surface
+    /// refuses it ([`EXISTS_ONLY_IN_TRANSACTION_MESSAGE`]).
+    Exists(SelectStatement),
 }
+
+/// How a `EXISTS(<select>)` check sent to a surface that does not serve one is refused:
+/// the fixed sentence DynamoDB states for the one place the check belongs.
+///
+/// A check holds for an item only as part of a write it guards, so the operation that
+/// applies several statements as ONE write is the only one it can be sent to — a check on
+/// its own has nothing to guard, which is what a single statement and a batch are told.
+pub const EXISTS_ONLY_IN_TRANSACTION_MESSAGE: &str =
+    "EXISTS can only be used in ExecuteTransaction write requests.";
+
+/// How a check whose inner `SELECT` is not one item read under a further condition is
+/// refused: the fixed sentence DynamoDB states for the clause such a check must carry.
+///
+/// A check guards the writes beside it, so it has to name the ONE item it is about — its
+/// clause pinning every key attribute by equality, the way every singleton statement
+/// names one — and it has to state something BESIDES that key: a check that only names a
+/// key asks nothing of the item, because the writes it guards already address their own.
+pub const EXISTS_SINGLE_ITEM_MESSAGE: &str =
+    "EXISTS() must contain a single item read with additional condition";
 
 impl PartiqlStatement {
     /// The table this statement addresses.
     pub fn table(&self) -> &str {
         match self {
-            Self::Select(select) => &select.table,
+            Self::Select(select) | Self::Exists(select) => &select.table,
             Self::Insert(insert) => &insert.table,
             Self::Update(update) => &update.table,
             Self::Delete(delete) => &delete.table,
         }
     }
 
+    /// What this statement's `RETURNING` clause asks to see, when it states one.
+    ///
+    /// Only the two statements that CHANGE a stored item can state the clause: an
+    /// `INSERT` adds an item, a `SELECT` reports them and a check reads one, so none of
+    /// those has a before- or after-image to project.
+    pub fn returning(&self) -> Option<ReturnedValues> {
+        match self {
+            Self::Update(update) => update.returning,
+            Self::Delete(delete) => delete.returning,
+            Self::Select(_) | Self::Insert(_) | Self::Exists(_) => None,
+        }
+    }
+
     /// The IAM action this statement performs, which is what a table's
     /// resource-based policy is read for: PartiQL has its own four actions.
+    ///
+    /// A check READS the item it is about, so it performs the action a read performs: it
+    /// reports nothing of that item and changes nothing, whatever the write it guards
+    /// does.
     pub fn action(&self) -> &'static str {
         match self {
-            Self::Select(_) => "dynamodb:PartiQLSelect",
+            Self::Select(_) | Self::Exists(_) => "dynamodb:PartiQLSelect",
             Self::Insert(_) => "dynamodb:PartiQLInsert",
             Self::Update(_) => "dynamodb:PartiQLUpdate",
             Self::Delete(_) => "dynamodb:PartiQLDelete",
@@ -1471,11 +1659,32 @@ impl StatementParser<'_> {
         if self.accept_word("delete") {
             return self.delete().map(PartiqlStatement::Delete);
         }
+        // `EXISTS(<select>)` is the language's CHECK statement: it states no manipulation
+        // of data and reads one item to say whether it is there, which is what a
+        // transaction's condition check is. It is a statement FORM rather than a function
+        // of the predicate grammar — a call to `exists` standing inside a clause is a
+        // function this dialect does not define ([`unrecognized_function`]) — so it is
+        // read here, beside the four verbs, and the surfaces that do not serve it refuse
+        // it as the statement it is ([`EXISTS_ONLY_IN_TRANSACTION_MESSAGE`]).
+        if self.peek_word("exists") && self.tokens.get(self.at + 1) == Some(&Token::Open) {
+            self.at += 2;
+            let select = self.nested(|parser| {
+                parser.expect_clause_word("select")?;
+                parser.select()
+            })?;
+            self.expect(&Token::Close)?;
+            return Ok(PartiqlStatement::Exists(select));
+        }
         // Text whose leading keywords name one of the language's OTHER operations names
         // an operation this surface does not run, which is what it is told — before the
         // parse carries on into the clauses of a statement that would never run.
         if let Some(operation) = self.non_dml_operation() {
             return Err(unsupported_statement_operation(operation));
+        }
+        // A query that IS one of the language's operations names that operation too, even
+        // where no leading keyword pair spells it ([`Self::query_type_test`]).
+        if let Some(refusal) = self.query_type_test() {
+            return Err(refusal);
         }
         // Text that opens with none of the four verbs this surface serves, and names no
         // operation of the language either, is read as the language's OTHER statement form:
@@ -2034,19 +2243,29 @@ impl StatementParser<'_> {
                 }
             }
         }
+        // Where the statement spells the operand this predicate OPENS with, which is the
+        // position a refusal about the whole predicate reports ([`Position`]).
+        let opens_at = self.position();
         let left = self.operand()?;
         if self.accept_word("is") {
             let negated = self.accept_word("not");
             let PredicateOperand::Path(path) = left else {
                 return Err(statement_refused(
-                    "IS NULL and IS MISSING read an attribute of the item",
+                    "IS NULL, IS MISSING and IS <type> read an attribute of the item",
                 ));
             };
             if self.accept_word("null") {
                 return Ok(Predicate::IsNull(path, !negated));
             }
-            self.expect_word("missing")?;
-            return Ok(Predicate::IsMissing(path, !negated));
+            if self.accept_word("missing") {
+                return Ok(Predicate::IsMissing(path, !negated));
+            }
+            let holds = self.type_name_predicate(path, opens_at)?;
+            return Ok(if negated {
+                Predicate::Not(Box::new(holds))
+            } else {
+                holds
+            });
         }
         let negated = self.accept_word("not");
         if self.accept_word("between") {
@@ -2093,6 +2312,117 @@ impl StatementParser<'_> {
         let right = self.operand()?;
         check_relational_operands(operator, &left, &right)?;
         Ok(Predicate::Compare(left, operator, right))
+    }
+
+    /// What a query form that is one of the language's OPERATIONS is refused with, when
+    /// the text is one rather than an expression of values.
+    ///
+    /// Text that states none of the data-manipulation verbs is read as the language's
+    /// other statement form, one query — and a query whose whole text is one of the
+    /// language's OPERATIONS names that operation just as surely as a leading keyword pair
+    /// does ([`NON_DML_STATEMENT_OPERATIONS`]), so it is refused as the operation this
+    /// surface does not run rather than as a parse defect: the client wrote something the
+    /// language spells and is told this surface does not run it.
+    ///
+    /// The one such form is the TYPE TEST — `operand IS [NOT] <type>`, which the language
+    /// states for `NULL` and `MISSING` as well, since both are types of it
+    /// ([`IS_OPERATOR_TYPES`]) — read here as the whole of the statement. Inside a `WHERE`
+    /// clause the same predicate is part of a statement that DOES manipulate data
+    /// ([`Self::type_name_predicate`]), which is where this surface serves it, and the
+    /// test is held to the same rule either way at its type POSITION: it must name a type
+    /// of the language ([`ParseDefect::TypeName`]). `None` is text that is no type test,
+    /// which keeps the defect its own parse stopped at ([`Self::query_defect`]).
+    ///
+    /// A LOOK, like [`Self::query_defect`]: the cursor is put back, because what the text
+    /// is refused with is decided before anything is read from it again.
+    fn query_type_test(&mut self) -> Option<RequestError> {
+        let (opened_at, used) = (self.at, self.used_parameters);
+        let outcome = self.read_type_test();
+        self.at = opened_at;
+        self.used_parameters = used;
+        outcome
+    }
+
+    /// Whether the text reads as ONE type test, and what such a test is refused with.
+    ///
+    /// A statement that IS the test names an operation this surface does not run, so that
+    /// is what it is told whichever type it tests for: the operation is not served, so
+    /// nothing of it is validated beyond reading a type at the type position. The TYPE is
+    /// held to what the operator takes where the test is part of a statement that does
+    /// manipulate data ([`Self::type_name_predicate`]), which is the only place the
+    /// operator runs.
+    fn read_type_test(&mut self) -> Option<RequestError> {
+        if self.operand().is_err() || !self.accept_word("is") {
+            return None;
+        }
+        self.accept_word("not");
+        if self.read_type_name().is_none() {
+            return Some(statement_parse_error(ParseDefect::TypeName));
+        }
+        // The `;` that ends a query is part of no expression, so a query terminated by one
+        // is still the whole of the text ([`Self::query_defect`] reads it the same way);
+        // text that CARRIES ON past the test is no bare type test, so it keeps the defect
+        // its own parse stops at.
+        (self.at_end() || self.peek() == Some(&Token::Semicolon))
+            .then(|| unsupported_statement_operation(IS_TYPE_OPERATION))
+    }
+
+    /// The TYPE the statement names at this position: the language's name for it, and the
+    /// attribute types it names when the `IS` operator takes it
+    /// ([`IS_OPERATOR_TYPES`]). `None` for a word that names no type of the language.
+    ///
+    /// The type is CONSUMED when it is one, the second keyword of a two-word spelling
+    /// included — and such a pair names the type the PAIR names
+    /// ([`TWO_WORD_TYPE_NAMES`]).
+    fn read_type_name(&mut self) -> Option<(&'static str, Option<&'static [&'static str]>)> {
+        let Some(Token::Word(word)) = self.peek().cloned() else {
+            return None;
+        };
+        let mut named = statement_type_node_name(&word)?;
+        self.at += 1;
+        for (first, second, paired) in TWO_WORD_TYPE_NAMES {
+            if word.eq_ignore_ascii_case(first) && self.accept_word(second) {
+                named = paired;
+            }
+        }
+        Some((named, is_operator_codes(&word)))
+    }
+
+    /// `path IS <typeName>`: whether the stored attribute is of the TYPE the statement
+    /// names.
+    ///
+    /// The type predicate of the language, over the types its `IS` operator takes
+    /// ([`IS_OPERATOR_TYPES`]): it reads the type of what the item holds at that path,
+    /// which is exactly what `attribute_type` reads, so the clause is the same predicate
+    /// and has the same one implementation — a name that stands for several stored types
+    /// is the disjunction of them. A type the language spells that the operator does not
+    /// take is refused naming both ([`unsupported_is_type`]), and a word that is no type
+    /// of the language is refused for the position it stands at.
+    fn type_name_predicate(
+        &mut self,
+        path: StatementPath,
+        opens_at: Position,
+    ) -> Result<Predicate, RequestError> {
+        let Some((named, codes)) = self.read_type_name() else {
+            return Err(statement_parse_error(ParseDefect::TypeName));
+        };
+        let Some(codes) = codes else {
+            return Err(unsupported_is_type(named, opens_at));
+        };
+        let mut branches: Vec<Predicate> = codes
+            .iter()
+            .map(|code| {
+                Predicate::AttributeType(
+                    path.clone(),
+                    PredicateOperand::Value(AttributeValue::S((*code).to_string())),
+                )
+            })
+            .collect();
+        Ok(if branches.len() == 1 {
+            branches.remove(0)
+        } else {
+            Predicate::Any(branches)
+        })
     }
 
     /// One comparison operand: `size(path)`, a path, or a value.
@@ -2672,19 +3002,21 @@ pub fn parsed_condition(predicate: &Predicate) -> Result<ParsedCondition, Reques
     )
 }
 
-/// The CONDITION a `DELETE`'s `WHERE` clause states: everything in that clause EXCEPT
-/// the equalities that address the item, or `None` when it states nothing else.
+/// The condition a `WHERE` clause states BESIDES the equalities that address the item, or
+/// `None` when it states nothing else.
 ///
-/// A single-item delete is addressed BY ITS PRIMARY KEY: the equalities on the key
-/// attributes say which item the statement is about, not what must hold of that item, so
-/// they are not part of the condition the delete is held to. What is left is that
-/// condition, and it is held to THE ADDRESSED ITEM — so it decides the statement only
-/// when the key holds one ([`delete_condition_satisfied`]).
+/// A statement addressed BY ITS PRIMARY KEY — a single-item `DELETE`, the `EXISTS` check —
+/// names the item it is about through the equalities on the key attributes: they say WHICH
+/// item, not what must hold of it, so they are not part of the condition the statement is
+/// held to. What is left is that condition, and it is held to THE ADDRESSED ITEM — so for a
+/// delete it decides the statement only when the key holds one
+/// ([`delete_condition_satisfied`]), and for a check it is the further condition such a
+/// statement must state at all ([`EXISTS_SINGLE_ITEM_MESSAGE`]).
 ///
 /// Only the equalities the TOP-LEVEL conjunction states are addressing, exactly as
 /// [`pinned_equalities`] reads them — a term inside an `OR` requires nothing, so it stays
 /// part of the condition.
-pub fn parsed_delete_condition(
+pub fn parsed_condition_beside_the_key(
     table: &Table,
     predicate: &Predicate,
 ) -> Result<Option<ParsedCondition>, RequestError> {
@@ -2701,7 +3033,7 @@ pub fn parsed_delete_condition(
 
 /// `predicate` with the top-level equalities on the attributes in `addressing` dropped,
 /// or `None` when that leaves nothing: those terms ADDRESS the item rather than state a
-/// condition on it ([`parsed_delete_condition`]).
+/// condition on it ([`parsed_condition_beside_the_key`]).
 ///
 /// The walk descends only into the conjunctions the PARSE produced, and the parser has
 /// already held the statement's nesting to [`MAX_STATEMENT_DEPTH`], so how deep this
@@ -2730,7 +3062,8 @@ fn without_addressing(predicate: &Predicate, addressing: &[&str]) -> Option<Pred
 }
 
 /// Whether a single-item `DELETE` addressed by primary key proceeds: the condition its
-/// `WHERE` clause states BESIDES that key ([`parsed_delete_condition`]), held to the item
+/// `WHERE` clause states BESIDES that key ([`parsed_condition_beside_the_key`]), held to
+/// the item
 /// the key holds.
 ///
 /// A key that holds NO item decides the statement by itself, whatever the clause states
@@ -3132,6 +3465,61 @@ pub fn singleton_key(table: &Table, predicate: &Predicate) -> Result<ItemKey, Re
         key.insert(element.attribute_name.clone(), value.clone());
     }
     table.key_of_key_map(&key)
+}
+
+/// The name of the sort key of the SOURCE a statement reads: the index's own, when its
+/// `FROM` clause names one, and otherwise the table's.
+///
+/// An index is keyed by its own schema — that is what a read of it walks — so which
+/// attribute is "the range key" of a statement is a fact of the source it names, not of
+/// the table alone.
+pub fn source_sort_key_name(table: &Table, index: Option<&str>) -> Option<String> {
+    match index.and_then(|index| index_shape(table, index)) {
+        Some((key_schema, _)) => key_schema
+            .iter()
+            .find(|element| element.key_type == "RANGE")
+            .map(|element| element.attribute_name.clone()),
+        None => table.sort_key_name().map(str::to_string),
+    }
+}
+
+/// How a `WHERE` clause that states a condition on the source's RANGE key inside a
+/// disjunction is refused, in the fixed sentence DynamoDB states that rule with.
+pub const OVERLAPPING_RANGE_KEY_MESSAGE: &str =
+    "Overlapping conditions with range keys are not supported in where clause";
+
+/// Whether this predicate states a condition on `sort_key` inside a DISJUNCTION.
+///
+/// A read is served over ONE range of the source's keys, and the branches of an `OR`
+/// each state their own: a branch that constrains the range key covers part of the
+/// partition while every branch beside it covers more of it — all of it, where that
+/// branch names the range key not at all — so the ranges the clause asks for overlap and
+/// no one range read answers it. DynamoDB refuses such a clause
+/// ([`OVERLAPPING_RANGE_KEY_MESSAGE`]) rather than planning one of the branches and
+/// filtering the rest, which would report rows from a plan the service never ran.
+///
+/// The walk is an explicit WORKLIST over the tree, the way [`pinned_equalities`] and
+/// [`predicate_attributes`] walk it, so how deeply a clause nests is not a function of
+/// this walk's own memory.
+pub fn overlapping_range_key_conditions(predicate: &Predicate, sort_key: &str) -> bool {
+    let mut pending = vec![predicate];
+    while let Some(predicate) = pending.pop() {
+        match predicate {
+            Predicate::Any(branches) => {
+                if branches
+                    .iter()
+                    .any(|branch| predicate_attributes(branch).contains(sort_key))
+                {
+                    return true;
+                }
+                pending.extend(branches.iter());
+            }
+            Predicate::All(branches) => pending.extend(branches.iter()),
+            Predicate::Not(inner) => pending.push(inner.as_ref()),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Hold every attribute a statement's `WHERE` clause pins BY EQUALITY to the type the

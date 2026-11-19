@@ -286,22 +286,21 @@ async fn a_write_transaction_lands_every_statement_or_none() {
     }
 
     // An UPDATE and a DELETE in one transaction, every predicate of which holds, apply
-    // together — and a `RETURNING` clause reports the item through that statement's own
-    // response.
+    // together — and the transaction reports no image for either, because a transaction
+    // answers no per-statement image at all (a `RETURNING` clause is refused there).
     let changed = ok(
         &router,
         "ExecuteTransaction",
         json!({"TransactStatements": [
-            statement("UPDATE accounts SET balance = balance - 40 WHERE id = 'a1' RETURNING ALL NEW *"),
+            statement("UPDATE accounts SET balance = balance - 40 WHERE id = 'a1'"),
             statement("DELETE FROM audit WHERE id = 'e1'"),
         ]}),
     )
     .await;
     assert_eq!(
-        responses(&changed).first().cloned().unwrap_or(Value::Null),
-        json!({"Item": {"id": {"S": "a1"}, "balance": {"N": "60"}}}),
-        "case UPDATE then DELETE: RETURNING ALL NEW reports the item the write left, got \
-         {changed}"
+        responses(&changed),
+        Vec::<Value>::new(),
+        "case UPDATE then DELETE: neither statement reports an image, got {changed}"
     );
     assert_eq!(
         stored(&router, ACCOUNTS, "a1").await,

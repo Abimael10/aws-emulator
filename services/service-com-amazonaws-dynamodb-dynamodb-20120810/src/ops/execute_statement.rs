@@ -291,6 +291,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let parameters = input.parameters.clone().unwrap_or_default();
         let statement =
             crate::state::parse_statement(&input.statement, &parameters).map_err(lift)?;
+        // A check guards a write it is applied WITH, so there is nothing for one to guard
+        // here ([`crate::state::EXISTS_ONLY_IN_TRANSACTION_MESSAGE`]).
+        if matches!(&statement, crate::state::PartiqlStatement::Exists(_)) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::EXISTS_ONLY_IN_TRANSACTION_MESSAGE,
+            ));
+        }
         let name = crate::state::resolve_table_name_in(statement.table(), &region).map_err(lift)?;
 
         // WHO this request speaks for, resolved before this service's store is locked
@@ -343,6 +350,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 delete,
                 &input,
                 return_old_on_failure,
+            ),
+            // Refused above, before this service's store was reached at all.
+            crate::state::PartiqlStatement::Exists(_) => Err(
+                crate::scaffolded::Scaffolded::validation(
+                    crate::state::EXISTS_ONLY_IN_TRANSACTION_MESSAGE,
+                ),
             ),
         };
         // A statement that changed an item owes the table's stream a record, exactly as
@@ -423,6 +436,19 @@ fn select_items(
     // hold, so the statement is refused rather than planned as a scan that answers no
     // rows.
     crate::state::check_pinned_key_types(table, select.filter.as_ref()).map_err(lift)?;
+    // A clause whose `OR` branches each ask for their own range of the source's keys
+    // asks for ranges that overlap, which no one range read answers
+    // ([`crate::state::overlapping_range_key_conditions`]).
+    if let (Some(filter), Some(sort_key)) = (
+        select.filter.as_ref(),
+        crate::state::source_sort_key_name(table, select.index.as_deref()),
+    ) {
+        if crate::state::overlapping_range_key_conditions(filter, &sort_key) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::OVERLAPPING_RANGE_KEY_MESSAGE,
+            ));
+        }
+    }
     let pinned = select
         .filter
         .as_ref()
@@ -932,7 +958,7 @@ fn delete_item(
         let table = store.active_table(region, name, now).map_err(lift)?;
         (
             crate::state::singleton_key(table, &delete.filter).map_err(lift)?,
-            crate::state::parsed_delete_condition(table, &delete.filter).map_err(lift)?,
+            crate::state::parsed_condition_beside_the_key(table, &delete.filter).map_err(lift)?,
         )
     };
     let before = store

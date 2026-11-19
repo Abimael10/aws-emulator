@@ -471,6 +471,12 @@ impl AddressedKeys {
                 }
                 None => Self::whole_table(),
             },
+            // A check reads the ONE item its inner `SELECT` addresses, so the partition
+            // that clause pins is the partition it is about.
+            PartiqlStatement::Exists(select) => match &select.filter {
+                Some(filter) => pinned(filter),
+                None => Self::whole_table(),
+            },
             PartiqlStatement::Update(update) => pinned(&update.filter),
             PartiqlStatement::Delete(delete) => pinned(&delete.filter),
         }
