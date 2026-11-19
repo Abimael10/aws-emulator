@@ -46,23 +46,23 @@ const SIGNING_NAME: &str = "monitoring";
 const API_VERSION: &str = "2010-08-01";
 
 /// The error code an authorization refusal carries.
-const ACCESS_DENIED: &str = "AccessDenied";
+pub(crate) const ACCESS_DENIED: &str = "AccessDenied";
 
 /// The status it carries.
-const DENIED_STATUS: u16 = 403;
+pub(crate) const DENIED_STATUS: u16 = 403;
 
 /// The namespace every datapoint and every read below names: a custom one, so nothing here
 /// touches a reserved `AWS/` namespace.
-const NAMESPACE: &str = "Emulator/Authorization";
+pub(crate) const NAMESPACE: &str = "Emulator/Authorization";
 
 /// The metric every datapoint and every read below names.
-const METRIC: &str = "Probe";
+pub(crate) const METRIC: &str = "Probe";
 
 /// The access-key id standing for the account's own published credential: neither the session
 /// directory nor IAM holds a record for it, so it resolves to the account's ambient identity,
 /// which holds no IAM policies — the position AWS account root credentials are in. Every
 /// fixture is made with it.
-const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
+pub(crate) const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
 
 /// The `RoleSessionName` every `AssumeRole` here asks for — the last segment of the
 /// assumed-role ARN a refusal names as the principal.
@@ -70,7 +70,7 @@ const SESSION: &str = "probe";
 
 /// This service beside the IAM and token services its callers are made with, all on ONE
 /// shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Nothing here signs: the `Authorization` header carries only the credential scope, which
@@ -101,7 +101,7 @@ fn authorization(access_key_id: &str, signing_name: &str) -> String {
 }
 
 /// One call to this service in its `awsJson1_0` protocol, signed with `access_key_id`.
-async fn call_as(
+pub(crate) async fn call_as(
     router: &MultiServiceRouter,
     access_key_id: &str,
     operation: &str,
@@ -158,7 +158,7 @@ async fn query_call_as(
 
 /// One `awsQuery` call to IAM or the token service, signed with the account's own credential,
 /// which must succeed; answers the raw XML.
-async fn setup_query(
+pub(crate) async fn setup_query(
     router: &MultiServiceRouter,
     signing_name: &str,
     version: &str,
@@ -206,7 +206,7 @@ fn form_encode(value: &str) -> String {
 }
 
 /// The text of the first `<name>…</name>` element of an awsQuery response.
-fn xml_element(body: &str, name: &str) -> Option<String> {
+pub(crate) fn xml_element(body: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let start = body.find(&open)? + open.len();
@@ -215,7 +215,7 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
 }
 
 /// One identity-based policy document carrying one statement.
-fn statement(effect: &str, action: &str, resource: &str) -> String {
+pub(crate) fn statement(effect: &str, action: &str, resource: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{"Effect": effect, "Action": action, "Resource": resource}],
@@ -225,14 +225,14 @@ fn statement(effect: &str, action: &str, resource: &str) -> String {
 
 /// A principal a call is signed as: the access key id it presents, and the ARN a refusal must
 /// blame it by — what `sts:GetCallerIdentity` reports for that key.
-struct Principal {
-    access_key_id: String,
-    arn: String,
+pub(crate) struct Principal {
+    pub(crate) access_key_id: String,
+    pub(crate) arn: String,
 }
 
 /// Create an IAM role carrying one inline policy per document in `policies`, assume it through
 /// the token service, and answer the session's access key id with the session ARN.
-async fn assumed_role(
+pub(crate) async fn assumed_role(
     router: &MultiServiceRouter,
     role_name: &str,
     policies: &[String],
@@ -303,7 +303,7 @@ fn now_seconds() -> f64 {
 }
 
 /// The request body of one operation under test.
-fn body_of(operation: &str) -> Value {
+pub(crate) fn body_of(operation: &str) -> Value {
     let now = now_seconds();
     match operation {
         "PutMetricData" => json!({
