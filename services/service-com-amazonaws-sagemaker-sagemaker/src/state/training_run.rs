@@ -528,6 +528,16 @@ pub async fn run_training_job(
     // the run performs over the records it read.
     phases.push(TRAINING_SECONDARY_STATUS_TRAINING.to_string());
 
+    // The job's ALGORITHM CONTAINER starts here, and SageMaker publishes a training job's
+    // container output to CloudWatch Logs — so the group and the stream it writes to are
+    // CloudWatch Logs' own resources from this instant on, and a client that lists, reads or
+    // deletes the streams of a job that has trained finds them (see [`super::job_logs`]). A
+    // run that stopped on an earlier leg never started a container, so it publishes none.
+    //
+    // The stream is opened with no event in it, for the reason that module states: the lines a
+    // container printed are not a record this emulator holds, and none is invented for them.
+    crate::state::publish_training_job_logs(ctx, region, job_name, SystemTime::now()).await;
+
     // The ALGORITHM the job names, which decides the file its container writes the model into
     // and the metric it emits per channel (see [`super::training_algorithm`]).
     let algorithm = super::TrainingAlgorithm::of(request);

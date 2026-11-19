@@ -1265,6 +1265,11 @@ pub use notebook_lifecycle_hook::*;
 pub mod notebook_hook_logs;
 pub use notebook_hook_logs::*;
 
+/// The CloudWatch Logs group and stream a JOB's container writes to, and the publication
+/// that materialises them where CloudWatch Logs holds them: see `state/job_logs.rs`.
+pub mod job_logs;
+pub use job_logs::*;
+
 /// The partner-AI-app slice: see `state/partner_app.rs`.
 pub mod partner_app;
 pub use partner_app::*;
