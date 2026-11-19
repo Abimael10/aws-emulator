@@ -245,6 +245,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Whether this edit SUPPLIES metadata at all: `customMetadata` is an optional patch
+        // member, so an edit that leaves it out asserts nothing about the record's metadata
+        // and is not refused for what the record already carries (the verdict a read reports
+        // is what says whether that still satisfies the registry's schema). An edit that
+        // does carry the member — a replacement set, or an explicit clearing — is held to the
+        // schema for what it would leave behind.
+        let supplies_metadata = input.custom_metadata.is_some();
+
         // The metadata and the record type this edit would leave on the record — the stored
         // values with the patch applied — and the registry's schema they are checked
         // against. All three are read under the lock and the lock is released with them: the
@@ -302,20 +310,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The registry's `customMetadataSchemaConfiguration` states the fields a record of
-        // its type may carry, so a patch that would leave metadata the applicable schema
-        // does not admit is refused — the same check a create runs, applied to the result of
-        // the patch, so the invariant holds whichever operation wrote the metadata. Nothing
-        // of the record has been written yet, and this runs before every precondition on
-        // the stored state, because what does not hold is the request itself.
+        // its type may carry, so a patch that SUPPLIES metadata the applicable schema does
+        // not admit is refused — the same check a create runs on the metadata its request
+        // carries, applied to the result of the patch, so the invariant holds whichever
+        // operation wrote the metadata. The verdict itself is computed either way: it is
+        // what this operation's answer reports for the edited record. Nothing of the record
+        // has been written yet, and this runs before every precondition on the stored state,
+        // because what does not hold is the request itself.
         let verdict = crate::state::custom_metadata_verdict_of(
             schema_configuration,
             &patched_record_type,
             patched_metadata.as_ref(),
         )
         .await;
-        if let Some(message) =
-            crate::state::custom_metadata_refusal_of(&verdict, &patched_record_type)
-        {
+        // The refusal applies only where the request SUPPLIED metadata; the verdict itself
+        // is computed either way, because it is what this operation's answer reports.
+        let refusal = supplies_metadata
+            .then(|| crate::state::custom_metadata_refusal_of(&verdict, &patched_record_type))
+            .flatten();
+        if let Some(message) = refusal {
             return Err(UpdateRegistryRecordErrorModeled::ValidationException(
                 ValidationException {
                     message,

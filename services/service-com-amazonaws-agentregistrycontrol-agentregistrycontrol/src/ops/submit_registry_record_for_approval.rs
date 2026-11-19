@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SubmitRegistryRecordForApproval
+//! IMPLEMENTED: moves a `DRAFT` record into its registry's approval workflow, landing it
+//! where the registry's approval configuration decides. A record whose `customMetadata`
+//! the registry's CURRENT custom-metadata schema does not admit is refused instead, and
+//! stays where it was: the submission is what would publish it.
 //!
 //! ## Shape of an operation
 //!
@@ -170,90 +174,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let mut state = state.lock();
-        state.materialise_due_transitions();
 
         // Both labels accept the resource's ARN or its bare id.
         let registry_id = crate::state::identifier_to_id(&input.registry_id).to_string();
         let record_id = crate::state::identifier_to_id(&input.record_id).to_string();
 
-        let Some(registry) = state.registries.get(&registry_id) else {
-            return Err(
-                SubmitRegistryRecordForApprovalErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::registry_not_found_message(
-                            &input.registry_id,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        };
-        let Some(record) = registry.records.get(&record_id) else {
-            return Err(
-                SubmitRegistryRecordForApprovalErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::record_not_found_message(&record_id)),
-                    },
-                )
-                .into(),
-            );
-        };
-
-        // A registry is usable once it reaches READY, so a record cannot enter the
-        // approval workflow of one that is still being created or is being deleted.
-        if registry.status != crate::state::REGISTRY_READY {
-            return Err(SubmitRegistryRecordForApprovalErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "registry {registry_id} is in status {}; records can be submitted for \
-                         approval once it is {}",
-                        registry.status,
-                        crate::state::REGISTRY_READY
-                    )),
-                },
+        // What deciding this submission takes, read under the lock and released with it:
+        // the metadata the record carries and the schema its registry declares now. The
+        // compliance verdict below is caller-driven work (the caller's schema applied to the
+        // caller's metadata), so it runs neither under this service's lock nor on the worker
+        // serving this request.
+        let (schema_configuration, record_type, custom_metadata) = {
+            let mut state = state.lock();
+            state.materialise_due_transitions();
+            let (registry, record) = submittable_record(&state, &input, &registry_id, &record_id)?;
+            (
+                registry.custom_metadata_schema_configuration.clone(),
+                record.record_type.clone(),
+                record.custom_metadata.clone(),
             )
-            .into());
-        }
+        };
 
-        // Deprecation retires a record: the status it is stored in is the lifecycle's
-        // terminal one, so NO later change applies to it — an edit, a status change and a
-        // submission all state that, in the one sentence this service refuses a change to a
-        // retired record with.
-        if crate::state::is_terminal_record_status(&record.status) {
+        // A submission moves the record into the registry's approval workflow, which is
+        // what publishes it, so the record's metadata has to satisfy the registry's CURRENT
+        // schema to enter it: a record whose metadata does not — one created or left without
+        // a field the schema requires, or one the registry's schema stopped admitting — is
+        // refused with the same sentence a write of that metadata is refused with, and
+        // stays where it is.
+        let verdict = crate::state::custom_metadata_verdict_of(
+            schema_configuration,
+            &record_type,
+            custom_metadata.as_ref(),
+        )
+        .await;
+        if let Some(message) = crate::state::custom_metadata_refusal_of(&verdict, &record_type) {
             return Err(SubmitRegistryRecordForApprovalErrorModeled::ValidationException(
                 ValidationException {
-                    message: crate::state::terminal_record_status_message(&record.status),
-                    // The request's fields are all well formed; what does not hold is the
-                    // state of the resource they address.
-                    reason: crate::state::RESOURCE_CONFLICT.to_string(),
+                    message,
+                    reason: crate::state::FIELD_VALIDATION_FAILED.to_string(),
                     field_list: None,
                 },
             )
             .into());
         }
 
-        // Only a DRAFT record enters the approval workflow: one that is still being
-        // created has nothing to review yet, and one that has already been through the
-        // workflow is moved on with `UpdateRegistryRecordStatus` or taken back to DRAFT
-        // by an edit instead. This operation states all of them in ONE sentence whose only
-        // variable part is the status the record is stored in, which is what tells the
-        // caller which of those it is.
-        if record.status != crate::state::RECORD_DRAFT {
-            return Err(SubmitRegistryRecordForApprovalErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "{}{}",
-                        crate::state::NOT_SUBMITTABLE_IN_STATUS, record.status
-                    ),
-                    // The request's fields are all well formed; what does not hold is the
-                    // state of the resource they address.
-                    reason: crate::state::RESOURCE_CONFLICT.to_string(),
-                    field_list: None,
-                },
-            )
-            .into());
-        }
+        // The submission holds; what is left is the preconditions on the stored state, which
+        // are checked again because the store was released while the verdict was computed,
+        // and the write itself.
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+        let (registry, _) = submittable_record(&state, &input, &registry_id, &record_id)?;
 
         // The registry's approval configuration AS IT STANDS NOW decides this
         // submission: an auto-approval rule that covers the record approves it on
@@ -299,4 +269,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at,
         })
     }
+}
+
+/// Every precondition the STORED STATE puts on a submission, checked in one place so the
+/// check before the compliance verdict and the one before the write cannot drift apart:
+/// both resources resolve, the registry is usable, and the record is a `DRAFT` that has not
+/// been retired.
+///
+/// Answers the two of them, borrowed from the store, so a caller takes only what it needs
+/// out of them — the first pass clones what the verdict is computed from, the second clones
+/// nothing.
+fn submittable_record<'a>(
+    state: &'a crate::state::ComAmazonawsAgentregistrycontrolAgentregistrycontrolState,
+    input: &SubmitRegistryRecordForApprovalInput,
+    registry_id: &str,
+    record_id: &str,
+) -> Result<
+    (&'a crate::state::Registry, &'a crate::state::RegistryRecord),
+    SubmitRegistryRecordForApprovalError,
+> {
+    let Some(registry) = state.registries.get(registry_id) else {
+        return Err(
+            SubmitRegistryRecordForApprovalErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::registry_not_found_message(&input.registry_id)),
+                },
+            )
+            .into(),
+        );
+    };
+    let Some(record) = registry.records.get(record_id) else {
+        return Err(
+            SubmitRegistryRecordForApprovalErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::record_not_found_message(record_id)),
+                },
+            )
+            .into(),
+        );
+    };
+
+    // A registry is usable once it reaches READY, so a record cannot enter the
+    // approval workflow of one that is still being created or is being deleted.
+    if registry.status != crate::state::REGISTRY_READY {
+        return Err(SubmitRegistryRecordForApprovalErrorModeled::ConflictException(
+            ConflictException {
+                message: Some(format!(
+                    "registry {registry_id} is in status {}; records can be submitted for \
+                     approval once it is {}",
+                    registry.status,
+                    crate::state::REGISTRY_READY
+                )),
+            },
+        )
+        .into());
+    }
+
+    // Deprecation retires a record: the status it is stored in is the lifecycle's
+    // terminal one, so NO later change applies to it — an edit, a status change and a
+    // submission all state that, in the one sentence this service refuses a change to a
+    // retired record with.
+    if crate::state::is_terminal_record_status(&record.status) {
+        return Err(SubmitRegistryRecordForApprovalErrorModeled::ValidationException(
+            ValidationException {
+                message: crate::state::terminal_record_status_message(&record.status),
+                // The request's fields are all well formed; what does not hold is the
+                // state of the resource they address.
+                reason: crate::state::RESOURCE_CONFLICT.to_string(),
+                field_list: None,
+            },
+        )
+        .into());
+    }
+
+    // Only a DRAFT record enters the approval workflow: one that is still being
+    // created has nothing to review yet, and one that has already been through the
+    // workflow is moved on with `UpdateRegistryRecordStatus` or taken back to DRAFT
+    // by an edit instead. This operation states all of them in ONE sentence whose only
+    // variable part is the status the record is stored in, which is what tells the
+    // caller which of those it is.
+    if record.status != crate::state::RECORD_DRAFT {
+        return Err(SubmitRegistryRecordForApprovalErrorModeled::ValidationException(
+            ValidationException {
+                message: format!(
+                    "{}{}",
+                    crate::state::NOT_SUBMITTABLE_IN_STATUS, record.status
+                ),
+                // The request's fields are all well formed; what does not hold is the
+                // state of the resource they address.
+                reason: crate::state::RESOURCE_CONFLICT.to_string(),
+                field_list: None,
+            },
+        )
+        .into());
+    }
+
+    Ok((registry, record))
 }

@@ -18,6 +18,13 @@
 //! declared types. NON_COMPLIANT means the metadata does not satisfy the current schema, for
 //! example because the schema was updated after the record was last modified."
 //!
+//! Those schemas also state WHICH fields a record may carry, not only what the fields they
+//! name have to hold: a `CustomMetadataSchemaDefinition` is "the custom metadata fields that
+//! records ... can carry", so a metadata member none of the applicable schemas enumerates
+//! does not satisfy them either ([`undeclared_member`]) — which a schema says by naming its
+//! `properties` and nothing further about the members it does not name
+//! ([`enumerated_fields`]).
+//!
 //! The verdict is decided in process by the `boon` evaluator, and it is BOUNDED on every
 //! axis a caller controls, because both documents are caller-supplied:
 //!
@@ -51,7 +58,7 @@
 //! the store. A handler therefore reads what it needs out of the store, releases it, and only
 //! then asks for a verdict.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use ::aws_smithy_types::{Document, Number};
@@ -129,7 +136,7 @@ pub struct SchemaEvaluation<'a> {
     /// The registry's configuration, or `None` for a registry that declares no schema.
     configuration: Option<&'a CustomMetadataSchemaConfiguration>,
     /// The schemas that apply to a record type, prepared on first use.
-    prepared: HashMap<String, Vec<Prepared>>,
+    prepared: HashMap<String, ApplicableSchemas>,
     /// What is left of this request's step budget.
     budget: usize,
 }
@@ -152,6 +159,11 @@ impl<'a> SchemaEvaluation<'a> {
     /// one message. Metadata the request did not carry is evaluated as the empty object it
     /// is: a schema that requires a property is not satisfied by a record that carries no
     /// metadata at all.
+    ///
+    /// Those schemas also ENUMERATE the fields a record may carry — they are "the custom
+    /// metadata fields that records in the registry can carry" — so a member none of them
+    /// declares is a failure as much as a declared member whose value they do not admit
+    /// ([`undeclared_member`]).
     pub fn verdict(&mut self, record_type: &str, metadata: Option<&Document>) -> SchemaVerdict {
         let Some(configuration) = self.configuration else {
             // The registry constrains nothing, so there is nothing the metadata can violate.
@@ -164,7 +176,7 @@ impl<'a> SchemaEvaluation<'a> {
         let Some(prepared) = self.prepared.get(record_type) else {
             return SchemaVerdict::NoVerdict;
         };
-        if prepared.is_empty() {
+        if prepared.schemas.is_empty() {
             // No schema applies to this record type, so nothing constrains its metadata.
             return SchemaVerdict::Compliant;
         }
@@ -183,7 +195,7 @@ impl<'a> SchemaEvaluation<'a> {
         self.budget = self.budget.saturating_sub(instance_nodes);
 
         let mut verdict = SchemaVerdict::Compliant;
-        for entry in prepared {
+        for entry in &prepared.schemas {
             match entry {
                 // A schema that yields nothing is remembered and only reported once every
                 // other schema has been satisfied, since what one schema does not say about
@@ -210,6 +222,15 @@ impl<'a> SchemaEvaluation<'a> {
                         return SchemaVerdict::Violation(failure(&failed, &instance));
                     }
                 }
+            }
+        }
+        // Then the fields those schemas enumerate between them: a member none of them
+        // declares is reported AFTER the declared members' own constraints, so a caller is
+        // told what is wrong with a field the schema knows before being told about one it
+        // does not.
+        if let Some(admitted) = &prepared.admitted {
+            if let Some(failure) = undeclared_member(&instance, admitted) {
+                return SchemaVerdict::Violation(failure);
             }
         }
         verdict
@@ -366,26 +387,139 @@ enum Prepared {
     Unevaluable,
 }
 
+/// Everything the registry's configuration says about the metadata of one record type: the
+/// schemas to apply to it, and the fields they enumerate between them.
+struct ApplicableSchemas {
+    /// The schemas that apply, in the order they are applied.
+    schemas: Vec<Prepared>,
+    /// The custom-metadata fields a record of this type may carry, where every applicable
+    /// schema enumerates the fields it admits; `None` where any of them admits fields it
+    /// does not enumerate, so no member is undeclared.
+    admitted: Option<BTreeSet<String>>,
+}
+
 /// The schemas that apply to a record of `record_type`, compiled: the registry's
 /// `defaultSchema` first, then the override declared for this record type — the common
-/// attributes before the record type's own fields.
+/// attributes before the record type's own fields — and the fields they enumerate.
 fn prepare(
     configuration: &CustomMetadataSchemaConfiguration,
     record_type: &str,
-) -> Vec<Prepared> {
-    let mut prepared: Vec<Prepared> = Vec::new();
+) -> ApplicableSchemas {
+    let mut documents: Vec<(&str, &str)> = Vec::new();
     if let Some(schema) = configuration.default_schema.as_deref() {
-        prepared.push(compile(schema, DEFAULT_SCHEMA_LABEL));
+        documents.push((DEFAULT_SCHEMA_LABEL, schema));
     }
     if let Some(overrides) = &configuration.record_type_schema_overrides {
         for declared in overrides
             .iter()
             .filter(|declared| declared.record_type == record_type)
         {
-            prepared.push(compile(&declared.schema, RECORD_TYPE_SCHEMA_LABEL));
+            documents.push((RECORD_TYPE_SCHEMA_LABEL, declared.schema.as_str()));
         }
     }
-    prepared
+
+    let mut schemas: Vec<Prepared> = Vec::new();
+    // The fields the applicable schemas admit between them: a record of this type carries
+    // the common attributes plus its own type's fields, so the sets are UNITED rather than
+    // applied one schema at a time. A schema that enumerates nothing leaves no field
+    // undeclared, and neither does one this evaluator reaches no verdict from at all: an
+    // unevaluable schema claims nothing about the metadata, the fields it names included.
+    let mut admitted: Option<BTreeSet<String>> = Some(BTreeSet::new());
+    for (label, document) in documents {
+        let Ok(parsed) = ::serde_json::from_str::<Value>(document) else {
+            schemas.push(Prepared::Unevaluable);
+            admitted = None;
+            continue;
+        };
+        let enumerated = enumerated_fields(&parsed);
+        let prepared = compile(parsed, label);
+        admitted = match (admitted, enumerated, &prepared) {
+            (Some(mut united), Some(fields), Prepared::Ready { .. }) => {
+                united.extend(fields);
+                Some(united)
+            }
+            _ => None,
+        };
+        schemas.push(prepared);
+    }
+    ApplicableSchemas { schemas, admitted }
+}
+
+/// The custom-metadata fields ONE of a registry's schemas enumerates, or `None` where it
+/// admits fields it does not enumerate.
+///
+/// A `CustomMetadataSchemaDefinition` states "the custom metadata fields that records ... can
+/// carry", which is what the schema's own `properties` names; a document is read as
+/// enumerating them only where it says nothing else about the members it does not name — a
+/// schema that admits further members (`additionalProperties` as anything but `false`), that
+/// matches member names rather than naming them, or that states its members in a subschema
+/// this reading does not follow (a combinator or a reference) enumerates nothing, so no
+/// member of the metadata is undeclared under it.
+fn enumerated_fields(schema: &Value) -> Option<BTreeSet<String>> {
+    let Value::Object(members) = schema else {
+        return None;
+    };
+    if members
+        .get("additionalProperties")
+        .is_some_and(|declared| declared != &Value::Bool(false))
+    {
+        return None;
+    }
+    if UNENUMERATED_KEYWORDS
+        .iter()
+        .any(|keyword| members.contains_key(*keyword))
+    {
+        return None;
+    }
+    let Some(Value::Object(properties)) = members.get("properties") else {
+        return None;
+    };
+    Some(properties.keys().cloned().collect())
+}
+
+/// The keywords that put members of an instance somewhere [`enumerated_fields`] does not
+/// read them: the ones that match member names instead of naming them, and the ones that
+/// state a subschema — every reference form ([`REFERENCE_KEYWORDS`]) included, since a
+/// schema reached through one may name members of its own.
+const UNENUMERATED_KEYWORDS: [&str; 15] = [
+    "patternProperties",
+    "propertyNames",
+    "unevaluatedProperties",
+    "dependentSchemas",
+    "dependencies",
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    REFERENCE_KEYWORDS[0],
+    REFERENCE_KEYWORDS[1],
+    REFERENCE_KEYWORDS[2],
+];
+
+/// The failure for a member of `instance` that `admitted` does not name, in the words this
+/// error class states an undeclared field with, or `None` where every member is one the
+/// applicable schemas enumerate.
+///
+/// Only the metadata's own members are read: `customMetadata` is a flat set of fields whose
+/// "values are strings or JSON booleans", so a member of it is a field the schemas either
+/// name or do not. One member is reported, as the required-property finding reports one, and
+/// where several are undeclared it is the smallest of their names — so the refusal a request
+/// gets does not depend on the order a map happened to hold its members in. The pointer the
+/// failure opens with is the one of the object carrying the member — the metadata document
+/// itself, which JSON pointers write as the empty text — so it reads the same way as the
+/// deeper failures [`failure`] builds.
+fn undeclared_member(instance: &Value, admitted: &BTreeSet<String>) -> Option<String> {
+    let Value::Object(members) = instance else {
+        return None;
+    };
+    let undeclared = members
+        .keys()
+        .filter(|member| !admitted.contains(member.as_str()))
+        .min()?;
+    Some(format!(": {}", undeclared_property_finding(undeclared)))
 }
 
 /// The label the registry's `defaultSchema` is compiled under; see [`schema_url`].
@@ -400,13 +534,10 @@ fn schema_url(label: &str) -> String {
     format!("https://agent-registry.amazonaws.com/customMetadataSchemaConfiguration/{label}")
 }
 
-/// Read and compile one of a registry's schema documents, inside the shape bounds this
-/// module documents. A document that is not JSON, is no schema this evaluator can compile, or
-/// is beyond those bounds yields no verdict about any metadata.
-fn compile(document: &str, label: &str) -> Prepared {
-    let Ok(schema) = ::serde_json::from_str::<Value>(document) else {
-        return Prepared::Unevaluable;
-    };
+/// Compile one of a registry's schema documents, inside the shape bounds this module
+/// documents. A document that is no schema this evaluator can compile, or that is beyond
+/// those bounds, yields no verdict about any metadata.
+fn compile(schema: Value, label: &str) -> Prepared {
     let measured = shape(&schema);
     if measured.depth > MAX_SCHEMA_DEPTH
         || measured.nodes > MAX_SCHEMA_NODES
@@ -497,8 +628,30 @@ fn finding(kind: &::boon::ErrorKind, node: Option<&Value>) -> String {
                 .collect::<Vec<String>>()
                 .join(", ")
         ),
+        // A member beside the ones the schema names, where the schema spells out that it
+        // admits none: the same finding as for a schema that enumerates its fields and says
+        // nothing further ([`undeclared_member`]), since it is the same failure. Where
+        // several members are undeclared the smallest name is the one reported, for the
+        // reason [`undeclared_member`] states.
+        ::boon::ErrorKind::AdditionalProperties { got } => {
+            match got.iter().map(|property| property.to_string()).min() {
+                Some(property) => undeclared_property_finding(&property),
+                None => kind.to_string(),
+            }
+        }
         other => other.to_string(),
     }
+}
+
+/// How this error class states a member the schemas that apply do not admit beside the ones
+/// they name. The ONE place this finding is worded, so a schema that spells out that it
+/// admits no further members and one that simply enumerates the fields it does state the
+/// same failure the same way.
+fn undeclared_property_finding(property: &str) -> String {
+    format!(
+        "property '{property}' is not defined in the schema and the schema does not allow \
+         additional properties"
+    )
 }
 
 /// The JSON type of a metadata node, as JSON Schema names the types a `type` keyword

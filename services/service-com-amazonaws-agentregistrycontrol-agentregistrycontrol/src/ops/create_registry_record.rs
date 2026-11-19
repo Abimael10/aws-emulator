@@ -2,9 +2,11 @@
 
 //! @op CreateRegistryRecord
 //! IMPLEMENTED: mints a record id under the parent registry, persists the whole
-//! request in [`crate::state`] and answers the record ARN and status. The record's
-//! `customMetadata` has to satisfy the registry's `customMetadataSchemaConfiguration`
-//! first, so metadata the schema does not admit is refused before anything is written.
+//! request in [`crate::state`] and answers the record ARN and status. `customMetadata`
+//! the request SUPPLIES has to satisfy the registry's `customMetadataSchemaConfiguration`
+//! first, so metadata the schema does not admit is refused before anything is written; a
+//! create that supplies none is accepted, and the record's conformity to the registry's
+//! schema is then the verdict a read reports.
 //! Creation is asynchronous, so the record is stored `CREATING` with the clock owing it
 //! `DRAFT`.
 //!
@@ -307,22 +309,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // uniqueness of the record's name), because what does not hold is the request
         // itself: a schema-invalid create is a 400 `ValidationException` naming the
         // offending field, never a report about another record.
-        let verdict = crate::state::custom_metadata_verdict_of(
-            schema_configuration,
-            &input.record_type,
-            input.custom_metadata.as_ref(),
-        )
-        .await;
-        if let Some(message) = crate::state::custom_metadata_refusal_of(&verdict, &input.record_type)
-        {
-            return Err(CreateRegistryRecordErrorModeled::ValidationException(
-                ValidationException {
-                    message,
-                    reason: crate::state::FIELD_VALIDATION_FAILED.to_string(),
-                    field_list: None,
-                },
+        //
+        // What is checked is the metadata the REQUEST SUPPLIES: `customMetadata` is not a
+        // required member, so a create that carries none asserts nothing about the record's
+        // metadata and there is nothing of the request to refuse. Whether the record then
+        // conforms to the registry's schema is a verdict a read reports
+        // (`customMetadataSchemaComplianceStatus`, `NON_COMPLIANT` where the schema requires
+        // a field the record carries none of), and the gate the record has to pass is the
+        // submission that would publish it.
+        if let Some(metadata) = input.custom_metadata.as_ref() {
+            let verdict = crate::state::custom_metadata_verdict_of(
+                schema_configuration,
+                &input.record_type,
+                Some(metadata),
             )
-            .into());
+            .await;
+            if let Some(message) =
+                crate::state::custom_metadata_refusal_of(&verdict, &input.record_type)
+            {
+                return Err(CreateRegistryRecordErrorModeled::ValidationException(
+                    ValidationException {
+                        message,
+                        reason: crate::state::FIELD_VALIDATION_FAILED.to_string(),
+                        field_list: None,
+                    },
+                )
+                .into());
+            }
         }
 
         // The request holds; what is left is the preconditions on the stored state and the

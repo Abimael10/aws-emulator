@@ -1584,7 +1584,8 @@ fn router_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// Replace the schema a stored registry declares for `record_type`, which is the state an
 /// update of the registry's `customMetadataSchemaConfiguration` leaves behind: what a
-/// record's compliance verdict is computed against from then on.
+/// record's compliance verdict is computed against from then on. The common attributes the
+/// registry declares are left alone, so only the record type's own schema changes.
 fn declare_record_type_schema(
     engine: &Arc<engine::InMemoryEngine>,
     registry_id: &str,
@@ -1602,13 +1603,29 @@ fn declare_record_type_schema(
         .registries
         .get_mut(registry_id)
         .expect("the registry under test is stored");
+    let default_schema = registry
+        .custom_metadata_schema_configuration
+        .as_ref()
+        .and_then(|configuration| configuration.default_schema.clone());
     registry.custom_metadata_schema_configuration = Some(CustomMetadataSchemaConfiguration {
-        default_schema: None,
+        default_schema,
         record_type_schema_overrides: Some(vec![RecordTypeSchemaOverride {
             record_type: record_type.to_string(),
             schema: schema.to_string(),
         }]),
     });
+}
+
+/// What a create carrying a row's metadata must answer: a refusal naming the failure the
+/// registry's schema reports, or the record created and reading back a compliance verdict.
+/// A create is refused for metadata it SUPPLIES; what the record then conforms to is read
+/// back as `customMetadataSchemaComplianceStatus`.
+enum Expected {
+    /// 400 `ValidationException` whose message states this failure.
+    Refused(&'static str),
+    /// 202, and the stored record reads back this compliance status — or no status at all
+    /// (`None`), where no verdict about its metadata could be reached.
+    Created(Option<&'static str>),
 }
 
 #[tokio::test]
@@ -1624,63 +1641,79 @@ async fn custom_metadata_must_satisfy_the_schema_the_registry_declares_for_the_r
     .await;
 
     // Rows differ along the record type whose schema applies, the keyword that fails
-    // (enumeration, required property, declared type), whether the metadata is present at
-    // all, and which of the two schemas is the one that is not satisfied — the override's
-    // or the common attributes', which apply to a record type that has no override of its
-    // own. The last column is the failure the refusal must state, or `None` for metadata
-    // the schema admits.
-    let cases: Vec<(&str, &str, Option<Value>, Option<&str>)> = vec![
+    // (enumeration, required property, declared type, a field the schemas do not
+    // enumerate), whether the metadata is present at all, and which of the two schemas is
+    // the one that is not satisfied — the override's or the common attributes', which apply
+    // to a record type that has no override of its own. The last column is what the create
+    // must answer.
+    let cases: Vec<(&str, &str, Option<Value>, Expected)> = vec![
         (
             "a value outside the enumeration the override declares",
             "CUSTOM",
             Some(json!({ "environment": "staging" })),
-            Some("/environment: does not have a value in the enumeration [\"dev\", \"prod\"]"),
+            Expected::Refused(
+                "/environment: does not have a value in the enumeration [\"dev\", \"prod\"]",
+            ),
         ),
         (
             "metadata omitting a property the override requires",
             "CUSTOM",
             Some(json!({ "owner": "platform" })),
-            Some(": required property 'environment' not found"),
+            Expected::Refused(": required property 'environment' not found"),
         ),
         (
+            // `customMetadata` is not a required member, so a create that carries none
+            // asserts nothing about the record's metadata: it is accepted, and the record
+            // reads back the verdict its missing metadata earns.
             "no metadata at all where the override requires a property",
             "CUSTOM",
             None,
-            Some(": required property 'environment' not found"),
+            Expected::Created(Some("NON_COMPLIANT")),
         ),
         (
             "metadata the override and the common attributes both admit",
             "CUSTOM",
             Some(json!({ "environment": "prod", "owner": "platform" })),
-            None,
+            Expected::Created(Some("COMPLIANT")),
+        ),
+        (
+            // `tier` is enumerated by the MCP override alone, so it is not a field a
+            // CUSTOM record may carry.
+            "a field only another record type's override declares",
+            "CUSTOM",
+            Some(json!({ "environment": "dev", "tier": 3 })),
+            Expected::Refused(
+                ": property 'tier' is not defined in the schema and the schema does not \
+                 allow additional properties",
+            ),
         ),
         (
             "a value whose type is not the one the override declares",
             "MCP",
             Some(json!({ "tier": "gold" })),
-            Some("/tier: string found, integer expected"),
+            Expected::Refused("/tier: string found, integer expected"),
         ),
         (
             "a second record type's own override, satisfied",
             "MCP",
             Some(json!({ "tier": 3 })),
-            None,
+            Expected::Created(Some("COMPLIANT")),
         ),
         (
             "a record type with no override, satisfying the common attributes",
             "AGENT",
             Some(json!({ "owner": "agents" })),
-            None,
+            Expected::Created(Some("COMPLIANT")),
         ),
         (
             "a record type with no override, violating the common attributes",
             "AGENT",
             Some(json!({ "owner": 7 })),
-            Some("/owner: integer found, string expected"),
+            Expected::Refused("/owner: integer found, string expected"),
         ),
     ];
 
-    for (at, (case, record_type, metadata, failure)) in cases.into_iter().enumerate() {
+    for (at, (case, record_type, metadata, expected)) in cases.into_iter().enumerate() {
         let name = format!("probe-{at}");
         let mut body = json!({
             "name": name,
@@ -1692,22 +1725,26 @@ async fn custom_metadata_must_satisfy_the_schema_the_registry_declares_for_the_r
         }
         let created = create_record(&router, &registry_id, body).await;
 
-        let Some(failure) = failure else {
-            assert_eq!(
-                created.status, 202,
-                "case {case:?}: metadata the schema admits is accepted, got {} {:?}",
-                created.status, created.body
-            );
-            // And the record reads back compliant with the schema it was written under.
-            let record_id = id_of(created.str_field("recordArn")).to_string();
-            let got = record_at_status(&router, &registry_id, &record_id, "DRAFT", case).await;
-            assert_eq!(
-                got.field("customMetadataSchemaComplianceStatus"),
-                &json!("COMPLIANT"),
-                "case {case:?}: metadata that satisfies the registry's schema reads back COMPLIANT, got {:?}",
-                got.body
-            );
-            continue;
+        let failure = match expected {
+            Expected::Created(compliance) => {
+                assert_eq!(
+                    created.status, 202,
+                    "case {case:?}: a create the schema does not refuse is accepted, got {} {:?}",
+                    created.status, created.body
+                );
+                // And the record reads back the verdict the registry's schema gives what it
+                // carries — or no verdict, where nothing could be known about it.
+                let record_id = id_of(created.str_field("recordArn")).to_string();
+                let got = record_at_status(&router, &registry_id, &record_id, "DRAFT", case).await;
+                assert_eq!(
+                    got.field("customMetadataSchemaComplianceStatus"),
+                    &compliance.map_or(Value::Null, |status| json!(status)),
+                    "case {case:?}: the stored record reads back {compliance:?}, got {:?}",
+                    got.body
+                );
+                continue;
+            }
+            Expected::Refused(failure) => failure,
         };
 
         assert_eq!(
@@ -1874,6 +1911,14 @@ async fn a_records_compliance_is_computed_against_the_registrys_current_schema()
             "a schema that admits the stored metadata again",
             r#"{"type":"object","properties":{"environment":{"type":"string"}}}"#,
             json!("COMPLIANT"),
+        ),
+        (
+            // The common attributes still declare `owner`, so what this schema no longer
+            // enumerates is `environment`: a field the stored metadata carries and no
+            // applicable schema declares any more.
+            "a schema that no longer enumerates a field the stored metadata carries",
+            r#"{"type":"object","properties":{"tier":{"type":"integer"}}}"#,
+            json!("NON_COMPLIANT"),
         ),
         (
             // No verdict can be reached about metadata whose schema cannot be read, so
@@ -2053,6 +2098,322 @@ async fn an_edit_must_leave_custom_metadata_the_registrys_schema_admits() {
                 );
             }
         }
+    }
+}
+
+/// Submit a record for approval: `POST /registries/{registryId}/records/{recordId}/submit-for-approval`.
+async fn submit_record(router: &MultiServiceRouter, registry_id: &str, record_id: &str) -> Reply {
+    call(
+        router,
+        "POST",
+        &format!(
+            "/registries/{}/records/{}/submit-for-approval",
+            encode_label(registry_id),
+            encode_label(record_id)
+        ),
+        None,
+    )
+    .await
+}
+
+/// Patch a record: `PATCH /registries/{registryId}/records/{recordId}`.
+async fn patch_record(
+    router: &MultiServiceRouter,
+    registry_id: &str,
+    record_id: &str,
+    body: Value,
+) -> Reply {
+    call(
+        router,
+        "PATCH",
+        &format!(
+            "/registries/{}/records/{}",
+            encode_label(registry_id),
+            encode_label(record_id)
+        ),
+        Some(body),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn custom_metadata_may_carry_only_the_fields_the_registrys_schema_enumerates() {
+    let router = router();
+
+    // A registry's schema states "the custom metadata fields that records in the registry
+    // can carry", so a member it does not enumerate is as much a failure as a member whose
+    // value it does not admit. Rows differ along HOW the schema speaks about members it does
+    // not name: one that names its `properties` and nothing else (the closed case, with and
+    // without the keyword spelled out), one that admits further members, one that matches
+    // member names by pattern, one that names no members at all, and one that states its
+    // members in a subschema this service does not read — the last four leaving nothing
+    // undeclared. The metadata of every row carries the same two fields, so what changes
+    // the answer is the schema alone.
+    let metadata = json!({ "environment": "dev", "costCentre": "RD-7" });
+    let undeclared = ": property 'costCentre' is not defined in the schema and the schema \
+                      does not allow additional properties";
+    let cases: Vec<(&str, &str, Expected)> = vec![
+        (
+            "a schema naming its properties and nothing further",
+            r#"{"type":"object","properties":{"environment":{"type":"string","enum":["dev","prod"]}},"required":["environment"]}"#,
+            Expected::Refused(undeclared),
+        ),
+        (
+            "a schema that spells out that it admits no further members",
+            r#"{"type":"object","properties":{"environment":{"type":"string"}},"additionalProperties":false}"#,
+            Expected::Refused(undeclared),
+        ),
+        (
+            "a schema that enumerates the member too",
+            r#"{"type":"object","properties":{"environment":{"type":"string"},"costCentre":{"type":"string"}}}"#,
+            Expected::Created(Some("COMPLIANT")),
+        ),
+        (
+            "a schema that admits further members",
+            r#"{"type":"object","properties":{"environment":{"type":"string"}},"additionalProperties":true}"#,
+            Expected::Created(Some("COMPLIANT")),
+        ),
+        (
+            "a schema that matches member names by pattern",
+            r#"{"type":"object","patternProperties":{"^[a-zA-Z]+$":{"type":"string"}}}"#,
+            Expected::Created(Some("COMPLIANT")),
+        ),
+        (
+            "a schema that names no member at all",
+            r#"{"type":"object"}"#,
+            Expected::Created(Some("COMPLIANT")),
+        ),
+        (
+            "a schema stating its members in a subschema",
+            r#"{"allOf":[{"type":"object","properties":{"environment":{"type":"string"}}}]}"#,
+            Expected::Created(Some("COMPLIANT")),
+        ),
+        (
+            // It names `properties`, but it is no schema this evaluator can apply, so it
+            // claims NOTHING about the metadata — the fields it names included. Nothing is
+            // refused for being undeclared under it, and no verdict is reported.
+            "a document that names properties but is no schema at all",
+            r#"{"type":"object","properties":{"environment":{"type":"not-a-json-type"}}}"#,
+            Expected::Created(None),
+        ),
+    ];
+
+    for (at, (case, schema, expected)) in cases.into_iter().enumerate() {
+        let registry_id = ready_registry_with(
+            &router,
+            json!({
+                "name": format!("enumerated-fields-{at}"),
+                "customMetadataSchemaConfiguration": { "defaultSchema": schema }
+            }),
+        )
+        .await;
+        let created = create_record(
+            &router,
+            &registry_id,
+            json!({
+                "name": "enumerated-probe",
+                "recordType": "CUSTOM",
+                "descriptors": descriptors_for("CUSTOM"),
+                "customMetadata": metadata.clone()
+            }),
+        )
+        .await;
+
+        match expected {
+            Expected::Refused(failure) => {
+                assert_eq!(
+                    created.status, 400,
+                    "case {case:?}: a member the schema does not enumerate is refused, got {} {:?}",
+                    created.status, created.body
+                );
+                assert_eq!(
+                    created.error_code.as_deref(),
+                    Some("ValidationException"),
+                    "case {case:?}: the modelled error code is ValidationException, got {:?}",
+                    created.error_code
+                );
+                assert_eq!(
+                    created.str_field("message"),
+                    schema_refusal("CUSTOM", failure),
+                    "case {case:?}: the refusal names the undeclared member, got {:?}",
+                    created.body
+                );
+                // Nothing was written, so the registry still holds no record.
+                let listed = list_records(&router, &registry_id, json!({})).await;
+                assert_eq!(
+                    listed.field("registryRecords"),
+                    &json!([]),
+                    "case {case:?}: a refused create writes no record, got {:?}",
+                    listed.body
+                );
+            }
+            Expected::Created(compliance) => {
+                assert_eq!(
+                    created.status, 202,
+                    "case {case:?}: a schema that leaves the member declared accepts it, got {} {:?}",
+                    created.status, created.body
+                );
+                let record_id = id_of(created.str_field("recordArn")).to_string();
+                let got = record_at_status(&router, &registry_id, &record_id, "DRAFT", case).await;
+                assert_eq!(
+                    got.field("customMetadataSchemaComplianceStatus"),
+                    &compliance.map_or(Value::Null, |status| json!(status)),
+                    "case {case:?}: the record reads back {compliance:?}, got {:?}",
+                    got.body
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_create_that_supplies_no_metadata_is_accepted_and_its_verdict_gates_the_submission() {
+    let router = router();
+
+    // `customMetadata` is not a required member of a create, so a create that supplies none
+    // asserts nothing about metadata and is accepted; what the record conforms to is then a
+    // verdict a read reports, and the gate it has to pass is the submission that would
+    // publish it. Rows differ along the registry's approval configuration, since that
+    // decides only what an ACCEPTED submission lands at, never whether the record's
+    // metadata lets it be submitted at all.
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "a registry that auto-approves submissions",
+            json!({ "autoApprovalRules": ["APPROVE_ALL"] }),
+            "APPROVED",
+        ),
+        (
+            "a registry whose submissions wait for a curator",
+            json!({ "autoApprovalRules": [] }),
+            "PENDING_APPROVAL",
+        ),
+    ];
+    // The field the registry requires of every record type, and the only one it enumerates.
+    let schema = r#"{"type":"object","properties":{"environment":{"type":"string","enum":["dev","prod"]},"critical":{"type":"boolean"}},"required":["environment"]}"#;
+    let missing_required = ": required property 'environment' not found";
+
+    for (at, (case, approval, submitted_status)) in cases.into_iter().enumerate() {
+        let registry_id = ready_registry_with(
+            &router,
+            json!({
+                "name": format!("verdict-gate-{at}"),
+                "approvalConfiguration": approval,
+                "customMetadataSchemaConfiguration": { "defaultSchema": schema }
+            }),
+        )
+        .await;
+
+        let created = create_record(
+            &router,
+            &registry_id,
+            json!({
+                "name": "gated-probe",
+                "recordType": "CUSTOM",
+                "descriptors": descriptors_for("CUSTOM")
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: a create supplying no metadata is accepted, got {} {:?}",
+            created.status, created.body
+        );
+        let record_id = id_of(created.str_field("recordArn")).to_string();
+        let draft = record_at_status(&router, &registry_id, &record_id, "DRAFT", case).await;
+
+        // The record exists and reads back the verdict its missing metadata earns, in a
+        // read of the record itself and in a summary of the page it is listed on.
+        assert_eq!(
+            draft.field("customMetadataSchemaComplianceStatus"),
+            &json!("NON_COMPLIANT"),
+            "case {case:?}: a record missing a required field reads NON_COMPLIANT, got {:?}",
+            draft.body
+        );
+        let listed = list_records(&router, &registry_id, json!({})).await;
+        assert_eq!(
+            &listed.field("registryRecords")[0]["customMetadataSchemaComplianceStatus"],
+            &json!("NON_COMPLIANT"),
+            "case {case:?}: the summary carries the same verdict, got {:?}",
+            listed.body
+        );
+
+        // Submitting it is what the registry's schema refuses, in the same sentence a write
+        // of that metadata is refused with — and the record stays where it was.
+        let refused = submit_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: submitting a record the schema does not admit is refused, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: the modelled error code is ValidationException, got {:?}",
+            refused.error_code
+        );
+        assert_eq!(
+            refused.str_field("message"),
+            schema_refusal("CUSTOM", missing_required),
+            "case {case:?}: the refusal names the record type and the failure, got {:?}",
+            refused.body
+        );
+        let still_draft = get_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            still_draft.str_field("status"),
+            "DRAFT",
+            "case {case:?}: a refused submission leaves the record in DRAFT, got {:?}",
+            still_draft.body
+        );
+
+        // An edit that supplies no metadata either is not refused for what the record
+        // already carries: it asserts nothing about the metadata.
+        let described = patch_record(
+            &router,
+            &registry_id,
+            &record_id,
+            json!({ "description": { "optionalValue": "awaiting its metadata" } }),
+        )
+        .await;
+        assert_eq!(
+            described.status, 202,
+            "case {case:?}: an edit supplying no metadata is accepted, got {} {:?}",
+            described.status, described.body
+        );
+        record_at_status(&router, &registry_id, &record_id, "DRAFT", case).await;
+
+        // And once an edit supplies metadata the schema admits, the record reads COMPLIANT
+        // and the submission the verdict held back is accepted.
+        let filled = patch_record(
+            &router,
+            &registry_id,
+            &record_id,
+            json!({ "customMetadata": { "optionalValue": { "environment": "prod" } } }),
+        )
+        .await;
+        assert_eq!(
+            filled.status, 202,
+            "case {case:?}: an edit supplying metadata the schema admits is accepted, got {} {:?}",
+            filled.status, filled.body
+        );
+        let compliant = record_at_status(&router, &registry_id, &record_id, "DRAFT", case).await;
+        assert_eq!(
+            compliant.field("customMetadataSchemaComplianceStatus"),
+            &json!("COMPLIANT"),
+            "case {case:?}: the filled-in metadata satisfies the schema, got {:?}",
+            compliant.body
+        );
+        let submitted = submit_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            submitted.status, 202,
+            "case {case:?}: a compliant record is submitted, got {} {:?}",
+            submitted.status, submitted.body
+        );
+        assert_eq!(
+            submitted.str_field("status"),
+            submitted_status,
+            "case {case:?}: the submission lands where the approval configuration decides, got {:?}",
+            submitted.body
+        );
     }
 }
 
