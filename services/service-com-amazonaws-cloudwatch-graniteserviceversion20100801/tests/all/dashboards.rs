@@ -9,6 +9,7 @@
 //! the dashboard a recorded request happened to create is one row among many rather than the
 //! specification.
 
+use crate::dashboard_document_size::expected_size;
 use crate::harness::{build_router, call, error_code, ok};
 use serde_json::{json, Value};
 
@@ -187,10 +188,11 @@ async fn every_dashboard_form_round_trips_through_get_dashboard() {
             Some(expected_arn(&name).as_str()),
             "case {case:?}: the listed entry carries the same ARN, got {entry}"
         );
-        // "The size of the dashboard, in bytes." (`DashboardEntry$Size`)
+        // "The size of the dashboard, in bytes." (`DashboardEntry$Size`) — the document the
+        // service holds for this body.
         assert_eq!(
             entry.get("Size").and_then(Value::as_i64),
-            Some(i64::try_from(body.len()).expect("the body size fits")),
+            Some(expected_size(body.as_str())),
             "case {case:?}: expected the document's size in bytes, got {entry}"
         );
         assert!(
@@ -263,7 +265,7 @@ async fn a_put_replaces_the_dashboard_it_names_and_creates_none() {
         let entry = entry_named(&listed, "replaced").expect("the dashboard is listed");
         assert_eq!(
             entry.get("Size").and_then(Value::as_i64),
-            Some(i64::try_from(body.len()).expect("the body size fits")),
+            Some(expected_size(&body)),
             "case {case:?}: the reported size follows the stored document, got {entry}"
         );
         let modified = stamp(&entry, "LastModified").expect("the entry carries LastModified");

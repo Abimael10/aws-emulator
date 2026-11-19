@@ -211,8 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 dashboard_arn: Some(crate::state::dashboard_arn(name)),
                 last_modified: Some(crate::state::to_timestamp(stored.last_modified_secs)),
                 // "The size of the dashboard, in bytes." (`DashboardEntry$Size`) — the size of
-                // the document this dashboard holds.
-                size: Some(i64::try_from(stored.body.len()).unwrap_or(i64::MAX)),
+                // the document this dashboard holds, which is the body the write submitted
+                // completed with the top-level members it left to the service, as that write
+                // counted it (`crate::state::stored_dashboard_document`).
+                size: Some(i64::try_from(stored.document_bytes).unwrap_or(i64::MAX)),
             })
             .collect();
 

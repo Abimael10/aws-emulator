@@ -176,6 +176,14 @@ pub mod alarm_history_documents;
 
 pub use alarm_history_documents::*;
 
+/// The dashboard document this store holds for a dashboard — the submitted body completed with
+/// the top-level members the service defaults — and how many bytes it holds, which is the size a
+/// dashboard is listed with. Re-exported below, so a handler reaches it as `crate::state::…`
+/// like every other part of this store.
+pub mod dashboard_document;
+
+pub use dashboard_document::*;
+
 /// A dimension set, normalised: dimension name to value, ordered by name, so the same set
 /// keys the same time series whatever order a request listed it in.
 pub type DimensionSet = BTreeMap<String, String>;
@@ -1421,10 +1429,19 @@ pub struct StoredMetricStream {
 /// DashboardBody as the template for the new dashboard when you call PutDashboard"
 /// (`GetDashboard`) — a document that round-trips character for character, which is what lets
 /// a caller copy a dashboard by putting back what it read.
+///
+/// The dashboard the service HOLDS is that body completed with the top-level members the body
+/// left to the service ([`stored_dashboard_document`]), and the size of that document is what a
+/// listing reports — so it is counted once, by the write, and kept beside the body.
 #[derive(Debug, Clone, Default)]
 pub struct StoredDashboard {
     /// The dashboard document, exactly as the write that stored it was given.
     pub body: String,
+    /// How many bytes the document this dashboard HOLDS holds — the body above completed with
+    /// the top-level members the service defaults ([`stored_dashboard_document`]) — as the write
+    /// that stored the dashboard counted them: "The size of the dashboard, in bytes."
+    /// (`DashboardEntry$Size`)
+    pub document_bytes: usize,
     /// When this dashboard was last written, as epoch seconds: "The time stamp of when the
     /// dashboard was last modified, either by an API call or through the console."
     /// (`DashboardEntry$LastModified`)

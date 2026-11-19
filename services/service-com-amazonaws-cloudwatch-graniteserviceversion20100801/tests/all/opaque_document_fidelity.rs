@@ -16,7 +16,8 @@
 //!   (`smithy_query(query="operation",operation="GetDashboard")` targets `DashboardBody`, a
 //!   string the model constrains in no other way), read back by `GetDashboard` and measured by
 //!   `ListDashboards`: "The size of the dashboard, in bytes." (`DashboardEntry$Size`, a long),
-//!   so the reported size is the byte length of the submitted text.
+//!   so the reported size follows those same bytes — the document the service holds for them
+//!   (`tests/all/dashboard_document_size.rs`).
 //! * `Definition` — "The definition of the rule, as a JSON object."
 //!   (`smithy_query(query="shape",shape="InsightRule")`, member `Definition`, an
 //!   `InsightRuleDefinition`: a 1..8192 string whose pattern `^[\x00-\x7F]+$` admits ASCII
@@ -28,6 +29,7 @@
 //! whether the document carries anything at all. The one document a recorded request happened
 //! to submit is a single row.
 
+use crate::dashboard_document_size::expected_size;
 use crate::harness::{build_router, ok};
 use serde_json::{json, Value};
 
@@ -144,17 +146,17 @@ async fn every_dashboard_document_reads_back_as_the_text_that_was_submitted() {
             );
         }
 
-        // "The size of the dashboard, in bytes." (`DashboardEntry$Size`) — the byte length of
-        // those same bytes, which for a document holding a multi-byte character is more than
-        // its character count.
+        // "The size of the dashboard, in bytes." (`DashboardEntry$Size`) — the document the
+        // service holds for those same bytes, which for a document holding a multi-byte
+        // character holds more bytes than it has characters.
         let entry = listed_entry(&router, name)
             .await
             .unwrap_or_else(|| panic!("case {case:?}: the stored dashboard must be listed"));
-        let expected_size = i64::try_from(document.len()).expect("a test document fits in i64");
+        let wanted = expected_size(&document);
         assert_eq!(
             entry.get("Size").and_then(Value::as_i64),
-            Some(expected_size),
-            "case {case:?}: expected Size to be the {expected_size} bytes submitted, got {entry}"
+            Some(wanted),
+            "case {case:?}: expected Size to be the {wanted} bytes the service holds, got {entry}"
         );
 
         // Submitting the document a read returned changes nothing, so a client that
@@ -179,8 +181,8 @@ async fn every_dashboard_document_reads_back_as_the_text_that_was_submitted() {
             .unwrap_or_else(|| panic!("case {case:?}: the stored dashboard must be listed"));
         assert_eq!(
             entry_after.get("Size").and_then(Value::as_i64),
-            Some(expected_size),
-            "case {case:?}: the size after the round trip must still be {expected_size}, got \
+            Some(wanted),
+            "case {case:?}: the size after the round trip must still be {wanted}, got \
              {entry_after}"
         );
     }
@@ -213,8 +215,9 @@ async fn a_multi_byte_document_is_measured_in_bytes_rather_than_characters() {
         .expect("case \"the multi-byte document\": the stored dashboard must be listed");
     assert_eq!(
         entry.get("Size").and_then(Value::as_i64),
-        Some(i64::try_from(document.len()).expect("a test document fits in i64")),
-        "case \"the multi-byte document\": expected the byte length {}, got {entry}",
+        Some(expected_size(document)),
+        "case \"the multi-byte document\": expected the document the service holds for its {} \
+         bytes, got {entry}",
         document.len()
     );
 }
@@ -245,7 +248,7 @@ async fn an_update_stores_the_text_the_second_write_submitted() {
             .unwrap_or_else(|| panic!("case {case:?}: the stored dashboard must be listed"));
         assert_eq!(
             entry.get("Size").and_then(Value::as_i64),
-            Some(i64::try_from(document.len()).expect("a test document fits in i64")),
+            Some(expected_size(document)),
             "case {case:?}: expected Size to follow the stored text, got {entry}"
         );
     }

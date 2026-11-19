@@ -4,23 +4,24 @@
 //!
 //! The rule under test: **"The size of the dashboard, in bytes." (`DashboardEntry$Size`, a long
 //! — `smithy_query(query="shape",shape="DashboardEntry")`) is the byte length of the dashboard
-//! DOCUMENT as the write stored it, and carries no other term**: not the dashboard's name, not
-//! its ARN, not its tags, not a per-dashboard overhead, and not the length of any re-rendering
-//! of the document. A client reads the same document back through `GetDashboard` ("The detailed
-//! information about the dashboard, including what widgets are included and their location on
-//! the dashboard."), so the number it is told is one it can verify byte for byte against what
-//! that read answers — which is what makes `Size` usable for change detection and for budgeting
-//! against the dashboard size quota.
+//! DOCUMENT as the service holds it, and carries no other term**: not the dashboard's name, not
+//! its ARN, not its tags, and not a term for how many dashboards the account holds. A client
+//! reads that document back through `GetDashboard` ("The detailed information about the
+//! dashboard, including what widgets are included and their location on the dashboard."), so the
+//! number it is told moves only when the document does — which is what makes `Size` usable for
+//! change detection and for budgeting against the dashboard size quota.
 //!
-//! `tests/all/dashboard_body_byte_fidelity.rs` walks the DOCUMENT dimension of that rule (two
-//! renderings of one JSON value are two documents, measured by the bytes they hold). What is
-//! walked here is the complement: everything else about a dashboard is varied — how long its
-//! name is, how many tags it carries, whether those tags arrived with the write or later, and
-//! whether the document was replaced — while the document's bytes are held fixed, and the
-//! reported size must not move. A size carrying a constant overhead, a term for the name or a
-//! term for the tags fails these rows while matching the one dashboard a single recorded
-//! request happened to create.
+//! `tests/all/dashboard_document_size.rs` walks the DOCUMENT dimension of that rule (which
+//! document the size is the size of: the submitted body completed with the top-level members it
+//! left to the service), and `tests/all/dashboard_body_byte_fidelity.rs` the renderings of one
+//! value. What is walked here is the complement: everything else about a dashboard is varied —
+//! how long its name is, how many tags it carries, whether those tags arrived with the write or
+//! later, and whether the document was replaced — while the document's bytes are held fixed, and
+//! the reported size must not move. A size carrying a term for the name or a term for the tags
+//! fails these rows while matching the one dashboard a single recorded request happened to
+//! create.
 
+use crate::dashboard_document_size::expected_size;
 use crate::harness::{build_router, ok};
 use serde_json::{json, Value};
 
@@ -78,7 +79,8 @@ async fn reported_size_and_body(
     (size, body)
 }
 
-/// Assert that the listing measures `name` by the bytes of the document a client reads back.
+/// Assert that the listing measures `name` by the document the service holds for the body a
+/// client reads back.
 async fn assert_size_is_the_readable_document(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
@@ -91,12 +93,12 @@ async fn assert_size_is_the_readable_document(
         Some(expected),
         "case {case:?}: GetDashboard must answer the document that was stored, got {body:?}"
     );
-    let expected_size = i64::try_from(expected.len()).expect("a test document fits in an i64");
+    let wanted = expected_size(expected);
     assert_eq!(
         size,
-        Some(expected_size),
-        "case {case:?}: expected Size to be the {expected_size} bytes of the stored document, \
-         got {size:?}"
+        Some(wanted),
+        "case {case:?}: expected Size to be the {wanted} bytes of the document the service \
+         holds, got {size:?}"
     );
 }
 

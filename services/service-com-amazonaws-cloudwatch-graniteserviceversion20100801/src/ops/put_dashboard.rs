@@ -246,6 +246,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "If you update a dashboard, the entire contents are replaced with what you
                 // specify here." (`PutDashboard`)
                 body: input.dashboard_body.clone(),
+                // The dashboard this write stores is the body COMPLETED with the top-level
+                // members the body left to the service, and its size is what a listing reports:
+                // "The size of the dashboard, in bytes." (`DashboardEntry$Size`). Counted here,
+                // once, from the one function that builds that document
+                // (`crate::state::stored_dashboard_document`).
+                document_bytes: crate::state::stored_dashboard_document_bytes(
+                    &input.dashboard_body,
+                ),
                 last_modified_secs: now,
                 tags,
             },

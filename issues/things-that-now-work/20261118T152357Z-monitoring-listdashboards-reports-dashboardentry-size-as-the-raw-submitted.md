@@ -56,3 +56,30 @@ In both clusters the served value equals the byte length of the DashboardBody st
    b. `ListDashboards` with DashboardNamePrefix=<name>.
 3. Observe `DashboardEntries[0].Size` == N (125). Real CloudWatch reports the size of the stored document for the same request (149 in the recording, i.e. N+24).
 4. Repeat with the 141-byte body from `monitoring-dashboard-put-get-delete-lifecycle`: the emulator reports 141, the recording reports 165.
+
+## Disposition
+
+FIXED: a dashboard is measured by the document the service HOLDS for it, not by the request
+string. A dashboard body's top-level `periodOverride` member has a documented default (`auto`),
+so a body that does not choose one is stored completed with it, and the size reported is the
+size of that completed document — `crate::state::stored_dashboard_document` builds it, the
+`PutDashboard` write counts it once onto `StoredDashboard`, and `ListDashboards` projects that
+count. `tests/all/dashboard_document_size.rs` walks the rule over the class (documents that name
+the member and documents that leave it to the service, in several shapes, sizes and renderings),
+and the suites that measured the raw submitted length now state the same rule through one helper.
+
+Cause 1 (`cloudwatch-dashboard-create-update-and-invalid-body#task#3`, with
+`cloudwatch-dashboard-crud-round-trip#task#3` and `monitoring-dashboard-lifecycle#task#3`) and
+cause 2's representative (`monitoring-dashboard-put-get-delete-lifecycle#task#3`) replay clean,
+and the `$.DashboardEntries[*]` key is fixed.
+
+DECLINED, as in the earlier report
+(`20261029T203422Z-monitoring-cloudwatch-dashboard-bodies-are-re-serialized-breaking-byte.md`,
+`20261108T134822Z-…-describealarmcontributors-skips-its.md`): the second unit of cause 2,
+`monitoring-dashboard-tags-and-not-found-boundary#task#2`, whose recorded `Size` is not a
+function of the document the replayed request carries. Its document has the same shape as the
+other fixtures' (one text widget) and 106 bytes, yet its recorded size matches neither those
+bytes, nor those bytes completed as above (the rule that makes the other four units pass), nor
+the compact rendering of the completed document — measured by replay here, and by the earlier
+report for the dashboard's name, its tag and a flat per-tag cost. Reproducing it would mean
+writing a recorded number into the handler for one fixture's body.

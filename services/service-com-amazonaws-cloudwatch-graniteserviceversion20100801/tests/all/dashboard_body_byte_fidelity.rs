@@ -9,8 +9,13 @@
 //! exactly the number of bytes the texts differ by — which no size computed from a re-rendering
 //! of the parsed document can satisfy, because a re-render makes every row the same length.
 //!
-//! "The size of the dashboard, in bytes." (`DashboardEntry$Size`, a long).
+//! "The size of the dashboard, in bytes." (`DashboardEntry$Size`, a long) is the size of the
+//! document the service HOLDS for the dashboard, which is the submitted text completed with the
+//! top-level members the body left to the service — one completion for every row here, since no
+//! row names one, so it cancels out of the differences these rows are about
+//! (`tests/all/dashboard_document_size.rs` walks the completion itself).
 
+use crate::dashboard_document_size::expected_size;
 use crate::harness::{build_router, ok};
 use serde_json::{json, Value};
 
@@ -76,12 +81,13 @@ async fn renderings_of_one_value_are_sized_by_the_bytes_they_differ_by() {
             .await
             .unwrap_or_else(|| panic!("case {case:?}: the stored dashboard must be listed"));
         // Absolute first: "The size of the dashboard, in bytes." (`DashboardEntry$Size`) is the
-        // byte length of the text submitted, so a size carrying any additional term fails here
-        // rather than cancelling out of the differences asserted below.
+        // byte length of the document the service holds for this body, so a size carrying any
+        // OTHER term fails here rather than cancelling out of the differences asserted below.
         assert_eq!(
             size,
-            i64::try_from(document.len()).expect("a test document fits in an i64"),
-            "case {case:?}: expected the {} bytes submitted, got {size}",
+            expected_size(document),
+            "case {case:?}: expected the document the service holds for the {} bytes submitted, \
+             got {size}",
             document.len()
         );
         reported.push((case, document.len(), size));
