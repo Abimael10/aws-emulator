@@ -347,7 +347,7 @@ fn fractional_digits(number: &Value) -> String {
 /// Assert that every timestamp member anywhere in `body` is serialized at millisecond
 /// resolution, and answer how many were found, so a response carrying none cannot pass the
 /// assertion vacuously.
-fn assert_millisecond_timestamps(case: &str, operation: &str, body: &Value) -> usize {
+pub(crate) fn assert_millisecond_timestamps(case: &str, operation: &str, body: &Value) -> usize {
     match body {
         Value::Object(members) => members
             .iter()

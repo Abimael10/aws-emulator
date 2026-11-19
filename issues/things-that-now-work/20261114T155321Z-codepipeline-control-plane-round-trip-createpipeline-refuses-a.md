@@ -70,3 +70,40 @@ Cause 2 (ListPipelines timestamp precision):
 2. At step task#8, after the fixture's two CreatePipeline calls, call ListPipelines.
 3. Read each PipelineSummary's created and updated: both are epoch-seconds JSON numbers with six or seven fractional digits (e.g. 1794671182.3194258).
 4. Compare with the recorded CodePipeline responses in this corpus, where every timestamp carries at most three fractional digits (e.g. 1793700369.272). The step replays 200/200 and fails only the timestamp shape assertion, on all four keys.
+
+## Resolution
+
+Cause 2 — closed. Every timestamp this service puts on the wire is encoded by one encoder
+(`state::to_date_time`), which truncates to millisecond resolution, so no projection can report
+an instant at a different precision from another's. The four `ListPipelines` replay keys of this
+issue report `fixed`. Pinned by `core/router/tests/all/codepipeline_source_and_deploy_declaration.rs`,
+over the `ListPipelines` summaries and each `GetPipeline` metadata, through the one body walk the
+sibling suite `codepipeline_action_execution_provenance.rs` owns.
+
+Cause 1 — the declaration IS accepted; no pre-store gate refuses it. `CreatePipeline` serves this
+exact declaration with HTTP 200 and stores it: in the same replay, the fixture's own
+`setup#5` step sends the identical request and is answered 200, and the new suite above asserts
+acceptance and the `GetPipeline` round trip over a table of such declarations (CodeCommit source
+to Lambda invoke, S3 source to S3 deploy, a three-stage pipeline with an approval between
+producer and consumer, and an invoke action at the input-artifact maximum its action type
+publishes).
+
+The two `codepipeline|CreatePipeline|2xx->4xx|…` replay keys stay red because that fixture
+replays this one create TWICE in a single emulator — once in its setup phase (`setup#5`) and
+again as the graded step (`task#7`) — so the second call names a pipeline the account already
+holds. Instrumented replays established this: at `task#7` the store already held a pipeline under
+the requested name, created ~38 ms earlier, with a structure `state::declarations_match` reports
+identical, in the same Region and account, after exactly two creates of that name and with no
+`DeletePipeline` in between; refusing the first create instead made the harness name it
+`…#setup#5`, whose own recorded expectation is HTTP 200.
+
+`PipelineNameInUseException` is the modelled answer for that second call ("The specified pipeline
+name is already in use"; `CreatePipeline` carries no idempotency token), so answering it 200 —
+even for a byte-identical declaration — would contradict both the model and this repo's recorded
+behaviour, which
+`services/service-com-amazonaws-codepipeline-codepipeline-20150709/tests/all/validation_and_messages.rs`
+pins by sending one body twice and requiring that refusal. The new suite asserts that rule too,
+for the identical structure and for a different one, and that the refused create leaves the
+stored pipeline and its version untouched. The remaining red keys are therefore a property of the
+fixture's setup/task split, not of this service: re-file them against the fixture if they are to
+be closed.
