@@ -79,6 +79,33 @@ const SERVING_CASES: &[(&str, &str)] = &[
     ),
 ];
 
+/// One host a CLIENT can address this emulator by, in the request authority and the
+/// `Host` header — the only place a value of the caller's own choosing reaches this
+/// operation, since the answer carries an address and nothing else.
+///
+/// None of these rows is the address this emulator is served at ([`SERVED_AT`]), so a
+/// published address that carried any of them would be naming a host the caller picked
+/// rather than the one the emulator answers on. The rows span the forms such a host takes:
+/// a name of the caller's own, an AWS endpoint host for another region, another AWS
+/// service's endpoint host, a loopback address on a port nothing here is served at, and a
+/// bracketed IPv6 address.
+const ADDRESSING_CASES: &[(&str, &str)] = &[
+    ("a host name of the caller's own", "endpoint.example.net"),
+    (
+        "an AWS IoT endpoint host for another region",
+        "iot.ap-northeast-3.amazonaws.com",
+    ),
+    (
+        "another AWS service's endpoint host",
+        "s3.us-east-1.amazonaws.com",
+    ),
+    (
+        "loopback on a port this emulator is not served at",
+        "127.0.0.1:1",
+    ),
+    ("a bracketed IPv6 address", "[::1]:65535"),
+];
+
 /// One endpoint-type case: what the request asks for.
 ///
 /// There is no per-type address form here on purpose: this emulator serves every one of
@@ -176,6 +203,19 @@ impl Emulator {
             }
         };
         let host = format!("iot.{host_region}.amazonaws.com");
+        self.describe_endpoint_addressed_to(&host, signing, endpoint_type)
+            .await
+    }
+
+    /// The same call, addressed to the `host` a client CHOSE: that host is both the
+    /// request's authority and its `Host` header, which is the only place a caller can put
+    /// a host of its own.
+    async fn describe_endpoint_addressed_to(
+        &self,
+        host: &str,
+        signing: Signing<'_>,
+        endpoint_type: Option<&str>,
+    ) -> Reply {
         let query = match endpoint_type {
             Some(value) => format!("?endpointType={}", percent_encode(value)),
             None => String::new(),
@@ -183,7 +223,7 @@ impl Emulator {
         let mut request = http::Request::builder()
             .method("GET")
             .uri(format!("https://{host}/endpoint{query}"))
-            .header("host", host.clone());
+            .header("host", host);
         match signing {
             // The credential scope names the `iot` signing name the model's
             // `aws.auth#sigv4` trait declares, which is also what routes the request.
@@ -544,6 +584,73 @@ async fn the_published_address_is_not_rendered_from_the_endpoint_record() {
             );
         }
     }
+}
+
+/// The host a CLIENT addressed the emulator by never becomes the address it is handed:
+/// whatever host the request carries, the answer is the address this emulator is served
+/// at, so the value a caller then dials is the emulator's own and no host of the caller's
+/// choosing — or of AWS's — can be published through it.
+#[tokio::test]
+async fn the_published_address_is_never_the_host_the_client_addressed() {
+    let served = service_common::data_plane_addressing::url_authority(SERVED_AT);
+
+    for (name, addressed) in ADDRESSING_CASES {
+        assert_ne!(
+            *addressed, served,
+            "case {name}: the row must address a host other than the served one"
+        );
+        let emulator = Emulator::new();
+        for type_case in TYPE_CASES {
+            let case = format!("{} addressed to {addressed} ({name})", type_case.name);
+            let reply = emulator
+                .describe_endpoint_addressed_to(
+                    addressed,
+                    Signing::SignedFor(REGION),
+                    type_case.endpoint_type,
+                )
+                .await;
+            assert_eq!(
+                reply.status,
+                200,
+                "case {case}: expected 200, got {} body {}",
+                reply.status,
+                reply.text()
+            );
+            let address = reply.endpoint_address();
+            assert_eq!(
+                address, served,
+                "case {case}: expected the served address {served:?}, got {address:?}"
+            );
+            assert!(
+                !address.contains(addressed),
+                "case {case}: the published address carries the host the client addressed, \
+                 got {address:?}"
+            );
+            assert_addresses_the_emulator(&case, &address);
+        }
+    }
+
+    // The request that addresses the emulator's own endpoint directly is told the same
+    // address, so the rule above is not "anything but the request's host": it is "the
+    // address this emulator is served at", whichever host asked.
+    let emulator = Emulator::new();
+    let reply = emulator
+        .describe_endpoint_addressed_to(served, Signing::SignedFor(REGION), Some("iot:Data-ATS"))
+        .await;
+    assert_eq!(
+        reply.status,
+        200,
+        "case addressed to the served address: expected 200, got {} body {}",
+        reply.status,
+        reply.text()
+    );
+    assert_eq!(
+        reply.endpoint_address(),
+        served,
+        "case addressed to the served address: expected {served:?}, got {:?}",
+        reply.endpoint_address()
+    );
+    assert_addresses_the_emulator("addressed to the served address", &reply.endpoint_address());
 }
 
 /// An `endpointType` outside the documented catalog is refused with the modelled
