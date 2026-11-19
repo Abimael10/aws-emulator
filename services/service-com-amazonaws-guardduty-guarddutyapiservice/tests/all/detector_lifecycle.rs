@@ -117,16 +117,61 @@ async fn call_signed(
 /// names another ([`call_at`]).
 const DEFAULT_HOST: &str = "guardduty.us-east-1.amazonaws.com";
 
-/// The `Location` an uploaded-list read-back REPORTS for a list created at `stored`.
+/// The `Location` an uploaded-list read-back ANNOUNCES for a list created at `stored`,
+/// for a read sent to this harness's default host.
 ///
-/// The URI the create or the update supplied, character for character: a `Location`
-/// addresses an object of another service's storage, which GuardDuty only records, so
-/// nothing re-addresses it and a read-back answers with the value the caller submitted
-/// whatever endpoint the read arrives at. The `uploaded_list_location_endpoint` suite is
-/// where that rule is asserted over a table of spellings and endpoints; this is how
-/// every other suite spells the value it expects back.
+/// A `Location` is an address a caller FOLLOWS to read the uploaded file, so the one a
+/// read reports leads back to THIS emulator: the bucket and the key are the caller's own,
+/// taken out of the value it submitted, and the host is the endpoint serving the read. A
+/// request addressed to one of this service's own published hosts is answered the base the
+/// framework reports for an emulator served on no port of its own ([`EMULATOR_BASE`]),
+/// which is what every request of this harness carries. The
+/// `uploaded_list_location_endpoint` suite is where that rule is asserted over a table of
+/// spellings and endpoints; this is how every other suite spells the value it expects back.
 pub(crate) fn announced_location(stored: &str) -> String {
-    stored.to_string()
+    announced_location_at(EMULATOR_BASE, stored)
+}
+
+/// The base a location announced to a caller that resolves this service's OWN published
+/// hosts is rooted at: an emulator served on no port of its own reports
+/// [`smithy_server_runtime::UNSERVED_URL_BASE`], a host RFC 6761 reserves so nothing
+/// resolves it, and these tests dispatch in-process with no socket behind them.
+pub(crate) const EMULATOR_BASE: &str = smithy_server_runtime::UNSERVED_URL_BASE;
+
+/// [`announced_location`] for a read answered at `base` (`scheme://host[:port]`): the
+/// object `stored` names, addressed path-style beneath that base.
+pub(crate) fn announced_location_at(base: &str, stored: &str) -> String {
+    let (bucket, key) = s3_object_of(stored);
+    format!("{}/{bucket}/{key}", base.trim_end_matches('/'))
+}
+
+/// The bucket and the object key an S3 URL names, written out here as the EXPECTATION the
+/// suites compare against: the authority of an `s3://` URL is the bucket and its path the
+/// key; an object URL whose host carries an `s3` label after a leading label is
+/// virtual-hosted style, so those leading labels are the bucket and the whole path the
+/// key; and any other object URL is path-style, its first path segment being the bucket.
+fn s3_object_of(location: &str) -> (String, String) {
+    let (scheme, rest) = location
+        .split_once("://")
+        .unwrap_or_else(|| panic!("the location {location:?} names no scheme"));
+    let (authority, key) = rest.split_once('/').unwrap_or((rest, ""));
+    if scheme == "s3" {
+        return (authority.to_string(), key.to_string());
+    }
+    let host = authority.split(':').next().unwrap_or(authority);
+    let labels: Vec<&str> = host.split('.').collect();
+    let s3_label = labels
+        .iter()
+        .position(|label| *label == "s3" || label.starts_with("s3-"));
+    match s3_label {
+        Some(index) if index > 0 => (labels[..index].join("."), key.to_string()),
+        _ => {
+            let (bucket, object_key) = key
+                .split_once('/')
+                .unwrap_or_else(|| panic!("the location {location:?} names no object key"));
+            (bucket.to_string(), object_key.to_string())
+        }
+    }
 }
 
 /// [`call_in`], answering with the response body's RAW bytes as the service

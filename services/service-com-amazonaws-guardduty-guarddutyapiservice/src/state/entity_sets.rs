@@ -177,31 +177,71 @@ pub fn is_entity_set_name(name: &str) -> bool {
 /// with are all S3 endpoints, and which of them is in force is environment-specific.
 /// What stays refused is a value that is no S3 URL at all: free text, a bare path,
 /// another scheme, or a URL that names no object (a bucket with no key).
+///
+/// It is the PREDICATE of [`s3_object_of_location`], the one reading of which object
+/// such a value addresses, so the syntax a create is held to and the object a read
+/// announces are decided by the same code.
 pub fn is_s3_location(location: &str) -> bool {
-    let Ok(url) = ::url::Url::parse(location) else {
-        return false;
-    };
-    let Some(host) = url.host_str() else {
-        return false;
-    };
+    s3_object_of_location(location).is_some()
+}
+
+/// The S3 OBJECT `location` addresses — the `(bucket, key)` of the uploaded list — or
+/// `None` for a value that addresses no object at all, which is exactly what
+/// [`is_s3_location`] refuses.
+///
+/// The ONE reading of an uploaded list's `Location`, so what a create and an update
+/// VALIDATE and what a read ANNOUNCES ([`announced_list_location`]) cannot drift: the
+/// accepted spellings are the ones [`is_s3_location`] documents, and the bucket and the
+/// key are read off whichever of them the caller wrote — the authority of an `s3://` URL
+/// is the bucket and its path the key, a virtual-hosted-style object URL carries the
+/// bucket in the leading host labels, and every other object URL is read path-style, its
+/// first path segment being the bucket and the rest the key.
+///
+/// The KEY is taken out of the submitted value as the caller WROTE it
+/// ([`raw_location_key`]) rather than off the parsed URL, which reports its path
+/// percent-ENCODED: a key naming the object in any script is the caller's own and comes
+/// back as it went in, encoded exactly as far as it was submitted encoded.
+pub fn s3_object_of_location(location: &str) -> Option<(String, String)> {
+    let url = ::url::Url::parse(location).ok()?;
+    let host = url.host_str()?;
     if host.is_empty() {
-        return false;
+        return None;
     }
-    let key = url.path().trim_start_matches('/');
+    let key = raw_location_key(location);
     match url.scheme() {
         // `s3://bucket/key`: the authority IS the bucket and the path the key.
-        "s3" => !key.is_empty(),
+        "s3" => (!key.is_empty()).then(|| (host.to_string(), key.to_string())),
         // An object URL on an S3 endpoint. Virtual-hosted style carries the bucket
         // in the host and the key in the path; every other host is read path-style,
         // the first path segment being the bucket and the rest the key.
         "http" | "https" => match virtual_hosted_bucket(host) {
-            Some(bucket) => !bucket.is_empty() && !key.is_empty(),
-            None => key
-                .split_once('/')
-                .is_some_and(|(bucket, object_key)| !bucket.is_empty() && !object_key.is_empty()),
+            Some(bucket) => (!bucket.is_empty() && !key.is_empty())
+                .then(|| (bucket.to_string(), key.to_string())),
+            None => key.split_once('/').and_then(|(bucket, object_key)| {
+                (!bucket.is_empty() && !object_key.is_empty())
+                    .then(|| (bucket.to_string(), object_key.to_string()))
+            }),
         },
-        _ => false,
+        _ => None,
     }
+}
+
+/// What `location` carries after its authority, with the leading `/` and any query or
+/// fragment removed: the path as the caller wrote it, which is the key (or the
+/// `bucket/key` of a path-style object URL).
+///
+/// The empty string for a value that carries no path at all, and for one this module's
+/// reader has not established is a URL — such a value never reaches an announced location,
+/// because [`s3_object_of_location`] answers `None` for it.
+fn raw_location_key(location: &str) -> &str {
+    let Some((_scheme, after_scheme)) = location.split_once("://") else {
+        return "";
+    };
+    let path = match after_scheme.find('/') {
+        Some(end) => after_scheme[end..].trim_start_matches('/'),
+        None => return "",
+    };
+    path.split(['?', '#']).next().unwrap_or(path)
 }
 
 /// The bucket a virtual-hosted-style S3 `host` carries — the labels before its `s3`
