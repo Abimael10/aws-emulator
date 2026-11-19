@@ -5,8 +5,8 @@
 pub mod mapped_resources;
 
 use crate::ops::types::{
-    App, AppAssessment, AppComponent, FailurePolicy, LogicalResourceId, PhysicalResource,
-    ResiliencyPolicy, DISRUPTION_TYPE_VALUES, ESTIMATED_COST_TIER_VALUES,
+    App, AppAssessment, AppComponent, DisruptionCompliance, FailurePolicy, LogicalResourceId,
+    PhysicalResource, ResiliencyPolicy, DISRUPTION_TYPE_VALUES, ESTIMATED_COST_TIER_VALUES,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -157,10 +157,22 @@ pub const ASSESSMENT_STATUS_SUCCESS: &str = "Success";
 /// opposed to one this service's assessment schedule started.
 pub const ASSESSMENT_INVOKER_USER: &str = "User";
 
-/// The `DriftStatus` an assessment reports for a drift check that was not run:
-/// this service compares no assessment against an earlier one, so no assessment
-/// reports drift it did not look for.
+/// The `DriftStatus` an assessment reports while the drift check has not run:
+/// evaluating drift is part of ASSESSING, so an assessment answers the drift
+/// question only once it has finished, and until then the question has not been
+/// asked.
 pub const DRIFT_STATUS_NOT_CHECKED: &str = "NotChecked";
+
+/// The `DriftStatus` a finished assessment reports when the compliance it computed
+/// does not deviate from the compliance of the previous assessment of the same
+/// application — including the FIRST assessment of one, which has nothing to
+/// deviate from.
+pub const DRIFT_STATUS_NOT_DETECTED: &str = "NotDetected";
+
+/// The `DriftStatus` a finished assessment reports when the compliance it computed
+/// DOES deviate from that of the previous assessment of the same application — the
+/// deviation the model's `DriftType` calls an application compliance drift.
+pub const DRIFT_STATUS_DETECTED: &str = "Detected";
 
 /// The most application assessments this emulator stores for ONE application.
 ///
@@ -223,9 +235,11 @@ pub struct AppVersionContents {
     /// stable order across calls. At most [`MAX_RESOURCES_PER_APP_VERSION`]
     /// entries.
     pub resources: BTreeMap<String, PhysicalResource>,
-    /// The `versionName` the `PublishAppVersion` call that minted this version
-    /// carried, when it named one — the modelled `AppVersionSummary$versionName`.
-    /// Always `None` for the draft, which nobody names.
+    /// The `versionName` of this version — the modelled
+    /// `AppVersionSummary$versionName`: the one the `PublishAppVersion` call that
+    /// minted it carried, or the name the service gives a snapshot that call did
+    /// not name ([`default_published_version_name`]). Always `None` for the draft,
+    /// which no publish froze and nobody names.
     pub version_name: Option<String>,
     /// The modelled `AppVersionSummary$identifier` of this version: the publish
     /// sequence number a published version was minted with. `None` for the draft,
@@ -378,8 +392,10 @@ impl AppAssessmentRecord {
     ///
     /// Until the clock reaches [`Self::completes_at`] the assessment is still
     /// running, so it reports [`ASSESSMENT_STATUS_PENDING`] and NONE of the
-    /// members it has not finished computing — its verdict, its score and its end
-    /// time — rather than a verdict nothing has reached yet.
+    /// members it has not finished computing — its verdict, its score, the cost it
+    /// adds up and its end time — rather than a verdict nothing has reached yet,
+    /// and its drift verdict is that of a check that has not run
+    /// ([`DRIFT_STATUS_NOT_CHECKED`]).
     pub fn assessment_at(&self, now: ::std::time::SystemTime) -> AppAssessment {
         let mut reported = self.assessment.clone();
         if now < self.completes_at {
@@ -388,8 +404,17 @@ impl AppAssessmentRecord {
             reported.compliance = None;
             reported.compliance_status = None;
             reported.resiliency_score = None;
+            reported.cost = None;
+            reported.drift_status = Some(DRIFT_STATUS_NOT_CHECKED.to_string());
         }
         reported
+    }
+
+    /// The compliance this assessment COMPUTED, whether or not it has finished
+    /// reporting it — what the next assessment of the same application is compared
+    /// against to decide whether its compliance has drifted.
+    pub fn computed_compliance(&self) -> Option<&HashMap<String, DisruptionCompliance>> {
+        self.assessment.compliance.as_ref()
     }
 
     /// The application this assessment is of.
@@ -682,8 +707,9 @@ impl ComAmazonawsResiliencehubAwsresiliencehubState {
 
     /// `app_arn`'s application as a read finds it at `now`: the stored record,
     /// carrying the members an ASSESSMENT computes — the compliance verdict, the
-    /// resiliency score and the instants they were evaluated at — from the newest
-    /// assessment of this application that has finished by `now`.
+    /// recovery times it measured, the resiliency score, the drift verdict and the
+    /// instants they were evaluated at — from the newest assessment of this
+    /// application that has finished by `now`.
     ///
     /// DERIVED on read rather than written onto the application when an assessment
     /// finishes: an assessment finishes on the clock, whether or not anybody calls,
@@ -700,6 +726,19 @@ impl ComAmazonawsResiliencehubAwsresiliencehubState {
                 .map(|score| score.score)
                 .unwrap_or_default();
             app.last_resiliency_score_evaluation_time = assessed.end_time;
+            // The application's own RTO and RPO are the WORST of the recovery times
+            // the assessment measured: an application recovers from everything its
+            // policy judges it on only as slowly as its slowest disruption, so that
+            // is the recovery time the application reports. An assessment that
+            // judged no objective measured no recovery, and leaves both unanswered.
+            app.rto_in_secs =
+                worst_recovery(assessed.compliance.as_ref(), |entry| entry.current_rto_in_secs);
+            app.rpo_in_secs =
+                worst_recovery(assessed.compliance.as_ref(), |entry| entry.current_rpo_in_secs);
+            // Running the assessment IS the drift evaluation, so the application
+            // carries that assessment's verdict and the instant it reached it.
+            app.drift_status = assessed.drift_status;
+            app.last_drift_evaluation_time = assessed.end_time;
         }
         Some(app)
     }
@@ -713,10 +752,27 @@ impl ComAmazonawsResiliencehubAwsresiliencehubState {
         now: ::std::time::SystemTime,
     ) -> Option<AppAssessment> {
         self.assessments
-            .values()
-            .filter(|record| record.app_arn() == Some(app_arn) && record.completes_at <= now)
-            .max_by_key(|record| record.completes_at)
-            .map(|record| record.assessment_at(now))
+            .iter()
+            .filter(|(_, record)| record.app_arn() == Some(app_arn) && record.completes_at <= now)
+            // The assessment ARN breaks a tie, so two assessments of one
+            // application that finish at the same instant do not leave which of
+            // them the application reports to the store's iteration order.
+            .max_by_key(|(assessment_arn, record)| (record.completes_at, assessment_arn.as_str()))
+            .map(|(_, record)| record.assessment_at(now))
+    }
+
+    /// The assessment of `app_arn` started LAST — the PREVIOUS assessment a new
+    /// assessment of the same application is compared against to decide whether its
+    /// compliance has drifted. Every record finishes one [`ASSESSMENT_SPAN`] after
+    /// it was started, so the latest to finish is the latest to have been started,
+    /// and the assessment ARN breaks a tie so the baseline is the same whichever
+    /// order the store iterates in.
+    pub fn newest_assessment_of(&self, app_arn: &str) -> Option<&AppAssessmentRecord> {
+        self.assessments
+            .iter()
+            .filter(|(_, record)| record.app_arn() == Some(app_arn))
+            .max_by_key(|(assessment_arn, record)| (record.completes_at, assessment_arn.as_str()))
+            .map(|(_, record)| record)
     }
 
     /// Record `record` under `assessment_arn` as an assessment of one application.
@@ -1081,6 +1137,165 @@ pub fn estimated_cost_tier(policy: &HashMap<String, FailurePolicy>) -> String {
         .max()
         .unwrap_or(0);
     ESTIMATED_COST_TIER_VALUES[broadest.min(ESTIMATED_COST_TIER_VALUES.len() - 1)].to_string()
+}
+
+/// Where `disruption_type` sits on [`DISRUPTION_SCOPE_LADDER`] — how much
+/// redundancy recovering from it needs — and `None` for a token that names no
+/// disruption type.
+///
+/// The ONE place the ladder is read by position besides
+/// [`estimated_cost_tier`], so no reader of it can order the scopes differently.
+pub fn disruption_scope_rank(disruption_type: &str) -> Option<usize> {
+    DISRUPTION_SCOPE_LADDER
+        .iter()
+        .position(|scope| *scope == disruption_type)
+}
+
+/// The disruption scope redundancy cannot recover — the narrowest rung of
+/// [`DISRUPTION_SCOPE_LADDER`].
+///
+/// A software fault is a fault in the application itself: a bad change or an
+/// erroneous write reaches every replica of the data it touches, so holding the
+/// resource in more places does not undo it. What recovers one is a point-in-time
+/// copy of the data, which is why this rung is answered by what a resource HOLDS
+/// rather than by where its service holds it; see [`RESOURCE_RECOVERY`].
+pub const DISRUPTION_SOFTWARE: &str = DISRUPTION_SCOPE_LADDER[0];
+
+/// The broadest disruption scope a resource's own service absorbs where the
+/// resource stands, for one it spreads over the Availability Zones of its Region —
+/// a REGIONAL resource, which is what most of the types Resilience Hub supports
+/// are.
+const SPANS_AVAILABILITY_ZONES: &str = DISRUPTION_SCOPE_LADDER[2];
+
+/// The same, for a resource whose service holds it in more than one Region.
+const SPANS_REGIONS: &str = DISRUPTION_SCOPE_LADDER[3];
+
+/// The same, for a resource that lives in ONE Availability Zone while its service
+/// replaces the hardware under it.
+const SPANS_HARDWARE: &str = DISRUPTION_SCOPE_LADDER[1];
+
+/// The same, for a resource that is lost with the host it runs on, so its service
+/// absorbs no disruption at all.
+const SPANS_NOTHING: &str = "";
+
+/// What the service owning a mapped resource recovers BY ITSELF, one row per entry
+/// of [`SUPPORTED_RESOURCE_TYPES`].
+///
+/// Two facts per resource type, read off what each owning service publishes about
+/// the resource's own durability — the same supported-resources material
+/// [`SUPPORTED_RESOURCE_TYPES`] is transcribed from, read for what a resource
+/// SURVIVES rather than for whether it can be assessed:
+///
+/// * the broadest rung of [`DISRUPTION_SCOPE_LADDER`] the owning service's own
+///   redundancy spans ([`SPANS_REGIONS`], [`SPANS_AVAILABILITY_ZONES`],
+///   [`SPANS_HARDWARE`] or [`SPANS_NOTHING`]), so a disruption at that rung or
+///   narrower is absorbed where the resource stands and one broader than it is
+///   not;
+/// * whether the resource holds application DATA, which is what decides the
+///   [`DISRUPTION_SOFTWARE`] rung: a resource that holds data loses it to a
+///   software fault unless a point-in-time copy of that data exists, and an app
+///   template records none, while a resource that holds none carries nothing a
+///   software fault can corrupt and comes back with the next deployment of it.
+const RESOURCE_RECOVERY: &[(&str, &str, bool)] = &[
+    ("AWS::ApiGateway::RestApi", SPANS_AVAILABILITY_ZONES, false),
+    ("AWS::ApiGatewayV2::Api", SPANS_AVAILABILITY_ZONES, false),
+    (
+        "AWS::AutoScaling::AutoScalingGroup",
+        SPANS_AVAILABILITY_ZONES,
+        false,
+    ),
+    ("AWS::DocDB::DBCluster", SPANS_AVAILABILITY_ZONES, true),
+    ("AWS::DocDB::DBInstance", SPANS_HARDWARE, true),
+    ("AWS::DocDB::DBSubnetGroup", SPANS_AVAILABILITY_ZONES, false),
+    ("AWS::DynamoDB::GlobalTable", SPANS_REGIONS, true),
+    ("AWS::DynamoDB::Table", SPANS_AVAILABILITY_ZONES, true),
+    ("AWS::EC2::EC2Fleet", SPANS_AVAILABILITY_ZONES, false),
+    ("AWS::EC2::Instance", SPANS_NOTHING, false),
+    ("AWS::EC2::NatGateway", SPANS_HARDWARE, false),
+    ("AWS::EC2::Volume", SPANS_HARDWARE, true),
+    ("AWS::ECS::Cluster", SPANS_AVAILABILITY_ZONES, false),
+    ("AWS::ECS::Service", SPANS_AVAILABILITY_ZONES, false),
+    ("AWS::EFS::FileSystem", SPANS_AVAILABILITY_ZONES, true),
+    ("AWS::EKS::Cluster", SPANS_AVAILABILITY_ZONES, false),
+    ("AWS::ElastiCache::CacheCluster", SPANS_HARDWARE, true),
+    (
+        "AWS::ElastiCache::ReplicationGroup",
+        SPANS_AVAILABILITY_ZONES,
+        true,
+    ),
+    (
+        "AWS::ElasticLoadBalancing::LoadBalancer",
+        SPANS_AVAILABILITY_ZONES,
+        false,
+    ),
+    (
+        "AWS::ElasticLoadBalancingV2::LoadBalancer",
+        SPANS_AVAILABILITY_ZONES,
+        false,
+    ),
+    ("AWS::FSx::FileSystem", SPANS_HARDWARE, true),
+    ("AWS::Lambda::Function", SPANS_AVAILABILITY_ZONES, false),
+    ("AWS::RDS::DBCluster", SPANS_AVAILABILITY_ZONES, true),
+    ("AWS::RDS::DBInstance", SPANS_HARDWARE, true),
+    ("AWS::Route53::RecordSet", SPANS_REGIONS, false),
+    ("AWS::S3::Bucket", SPANS_AVAILABILITY_ZONES, true),
+    ("AWS::SNS::Topic", SPANS_AVAILABILITY_ZONES, false),
+    ("AWS::SQS::Queue", SPANS_AVAILABILITY_ZONES, true),
+    (
+        "AWS::StepFunctions::StateMachine",
+        SPANS_AVAILABILITY_ZONES,
+        false,
+    ),
+];
+
+/// Whether a resource of `resource_type`, as an app template maps one, recovers
+/// from a disruption of `disruption_type` — the question an assessment asks of
+/// every resource the version it grades maps.
+///
+/// Answered from [`RESOURCE_RECOVERY`]: a software fault is recovered only where
+/// the resource holds no data to lose to it, and any broader disruption only where
+/// the owning service's own redundancy spans that scope. A resource type the
+/// catalogue does not carry recovers nothing: nothing is known about what it
+/// survives, and an assessment reports no recovery it cannot account for.
+pub fn recovers_disruption(resource_type: &str, disruption_type: &str) -> bool {
+    let Some((_, spans, holds_data)) = RESOURCE_RECOVERY
+        .iter()
+        .find(|(catalogued, _, _)| *catalogued == resource_type)
+    else {
+        return false;
+    };
+    if disruption_type == DISRUPTION_SOFTWARE {
+        return !holds_data;
+    }
+    match (
+        disruption_scope_rank(spans),
+        disruption_scope_rank(disruption_type),
+    ) {
+        (Some(spanned), Some(asked)) => spanned >= asked,
+        _ => false,
+    }
+}
+
+/// The worst — the longest — of the recovery times `measured` reads off the
+/// compliance entries an assessment reported, and `None` when it judged no
+/// objective, so there is no recovery time to roll up.
+fn worst_recovery(
+    compliance: Option<&HashMap<String, DisruptionCompliance>>,
+    measured: impl Fn(&DisruptionCompliance) -> i32,
+) -> Option<i32> {
+    compliance?.values().map(measured).max()
+}
+
+/// The `versionName` the service itself gives a published app version the publish
+/// did not name.
+///
+/// `PublishAppVersion$versionName` is optional, while every reader of a published
+/// version — `ListAppVersions`, and the assessment of that version — reports the
+/// name the published snapshot carries, so a snapshot nobody named still has one.
+/// The name is the publish SEQUENCE NUMBER the snapshot was minted with, which is
+/// the one thing that tells two unnamed snapshots of one application apart.
+pub fn default_published_version_name(identifier: i64) -> String {
+    format!("Version-{identifier}")
 }
 
 /// The key [`AppVersionContents::resources`] stores a physical resource under: its
@@ -1596,7 +1811,30 @@ fn elided(text: &str) -> String {
 
 /// "Now", as the wire timestamp type every creation/evaluation time uses.
 pub fn now() -> ::aws_smithy_types::DateTime {
-    ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
+    wire_timestamp(::std::time::SystemTime::now())
+}
+
+/// How much of a second a `TimeStamp` member carries on the wire: thousandths.
+///
+/// Every timestamp this service answers targets the model's `TimeStamp`, which
+/// restJson1 carries as epoch seconds with a fraction, and the finest fraction AWS
+/// states one at is the millisecond — while an instant read off the host clock
+/// counts in nanoseconds, so it carries more precision than the encoding does.
+const NANOS_PER_WIRE_FRACTION: u32 = 1_000_000;
+
+/// `instant` as a `TimeStamp` member carries it: truncated to the precision the
+/// encoding states, so a reader parsing it with AWS-shaped expectations reads the
+/// instant this service recorded.
+///
+/// The ONE place an instant becomes a reported timestamp, applied where a record is
+/// BUILT rather than at each read, so two instants stored together (an assessment's
+/// start and its end) keep their relationship however often they are read.
+pub fn wire_timestamp(instant: ::std::time::SystemTime) -> ::aws_smithy_types::DateTime {
+    let unrounded = ::aws_smithy_types::DateTime::from(instant);
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(
+        unrounded.secs(),
+        unrounded.subsec_nanos() / NANOS_PER_WIRE_FRACTION * NANOS_PER_WIRE_FRACTION,
+    )
 }
 
 // =============================================================================

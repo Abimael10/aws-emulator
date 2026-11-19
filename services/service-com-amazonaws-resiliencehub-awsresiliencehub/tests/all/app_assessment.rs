@@ -29,9 +29,14 @@ use serde_json::{json, Value};
 // The sentence an app-version refusal of an assessment states, from the module that
 // owns this crate's shared test harness, so there is ONE literal of it in the tests.
 use super::application_lifecycle::invalid_app_version_sentence as invalid_app_version;
+use service_com_amazonaws_resiliencehub_awsresiliencehub::ops::types::{
+    COST_FREQUENCY_VALUES, DISRUPTION_TYPE_VALUES,
+};
 use service_com_amazonaws_resiliencehub_awsresiliencehub::state::{
+    default_published_version_name, recovers_disruption,
     ComAmazonawsResiliencehubAwsresiliencehubState, ASSESSMENT_SPAN, ASSESSMENT_STATUS_PENDING,
-    ASSESSMENT_STATUS_SUCCESS, DRAFT_APP_VERSION, RELEASE_APP_VERSION,
+    ASSESSMENT_STATUS_SUCCESS, DRAFT_APP_VERSION, DRIFT_STATUS_DETECTED, DRIFT_STATUS_NOT_CHECKED,
+    DRIFT_STATUS_NOT_DETECTED, RELEASE_APP_VERSION, SUPPORTED_RESOURCE_TYPES,
 };
 use service_com_amazonaws_resiliencehub_awsresiliencehub::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -225,12 +230,38 @@ async fn add_a_component(router: &MultiServiceRouter, app_arn: &str, id: &str) {
     reply.ok(id);
 }
 
+/// The `resourceType` every case that is not about the recovery derivation itself
+/// maps: a DNS record, which holds no application data and whose service holds it
+/// in more than one Region, so it recovers every disruption a resiliency policy can
+/// state an objective for. A case about WHICH resource recovers WHICH disruption
+/// picks its own types; see [`recovery_table`].
+const FULLY_RECOVERED_RESOURCE_TYPE: &str = "AWS::Route53::RecordSet";
+
 /// Add one physical resource to `app_arn`'s draft version, mapped to `component`.
 async fn add_a_resource(
     router: &MultiServiceRouter,
     app_arn: &str,
     identifier: &str,
     component: &str,
+) {
+    add_a_resource_of_type(
+        router,
+        app_arn,
+        identifier,
+        component,
+        FULLY_RECOVERED_RESOURCE_TYPE,
+    )
+    .await;
+}
+
+/// Add one physical resource of `resource_type` to `app_arn`'s draft version,
+/// mapped to `component`.
+async fn add_a_resource_of_type(
+    router: &MultiServiceRouter,
+    app_arn: &str,
+    identifier: &str,
+    component: &str,
+    resource_type: &str,
 ) {
     let reply = post(
         router,
@@ -240,7 +271,7 @@ async fn add_a_resource(
             "resourceName": identifier,
             "logicalResourceId": {"identifier": identifier},
             "physicalResourceId": identifier,
-            "resourceType": "AWS::S3::Bucket",
+            "resourceType": resource_type,
             "appComponents": [component],
         }),
     )
@@ -495,25 +526,21 @@ async fn the_verdict_follows_the_policy_and_what_the_published_version_maps() {
                 json!(expected_status),
                 "case {case:?}: {disruption_type} must be {expected_status}, got {entry:?}"
             );
-            // Whatever the verdict, the objective itself is what is ACHIEVABLE: it
-            // is the policy's own target.
-            assert_eq!(
-                (
-                    entry["achievableRtoInSecs"].clone(),
-                    entry["achievableRpoInSecs"].clone()
-                ),
-                (target["rtoInSecs"].clone(), target["rpoInSecs"].clone()),
-                "case {case:?}: {disruption_type}'s achievable times are the policy's \
-                 targets, got {entry:?}"
-            );
             if met {
+                // The recovery times are what the assessment MEASURED on the
+                // version's resources, not the objectives they were judged
+                // against: every resource of these rows recovers every disruption
+                // where it stands, which takes no time at all.
                 assert_eq!(
                     (
                         entry["currentRtoInSecs"].clone(),
-                        entry["currentRpoInSecs"].clone()
+                        entry["currentRpoInSecs"].clone(),
+                        entry["achievableRtoInSecs"].clone(),
+                        entry["achievableRpoInSecs"].clone()
                     ),
-                    (target["rtoInSecs"].clone(), target["rpoInSecs"].clone()),
-                    "case {case:?}: a met {disruption_type} objective is reached, got {entry:?}"
+                    (json!(0), json!(0), json!(0), json!(0)),
+                    "case {case:?}: an absorbed {disruption_type} disruption is recovered in \
+                     no time, got {entry:?}"
                 );
             } else {
                 // The breach says which component has nothing to recover — the
@@ -524,6 +551,29 @@ async fn the_verdict_follows_the_policy_and_what_the_published_version_maps() {
                     "case {case:?}: the breach of {disruption_type} must name the component \
                      {:?} that has nothing mapped to it, got {entry:?}",
                     row.unmapped[0]
+                );
+                // Nothing recovers a component with nothing mapped to it, and
+                // nothing recommended for it would until a resource is: so
+                // neither the current nor the achievable recovery reaches the
+                // objective, and each is reported one second past the objective it
+                // was judged by.
+                let past_rto = target["rtoInSecs"].as_i64().unwrap_or_default() + 1;
+                let past_rpo = target["rpoInSecs"].as_i64().unwrap_or_default() + 1;
+                assert_eq!(
+                    (
+                        entry["currentRtoInSecs"].clone(),
+                        entry["currentRpoInSecs"].clone(),
+                        entry["achievableRtoInSecs"].clone(),
+                        entry["achievableRpoInSecs"].clone()
+                    ),
+                    (
+                        json!(past_rto),
+                        json!(past_rpo),
+                        json!(past_rto),
+                        json!(past_rpo)
+                    ),
+                    "case {case:?}: an unreached {disruption_type} recovery is reported one \
+                     second past the objective, got {entry:?}"
                 );
                 assert!(
                     entry["currentRtoInSecs"].as_i64().unwrap_or_default()
@@ -636,13 +686,26 @@ async fn an_assessment_reports_no_verdict_until_it_has_finished() {
             "case {case:?}: an assessment that has not finished is {ASSESSMENT_STATUS_PENDING}, \
              got {reported:?}"
         );
-        for member in ["compliance", "complianceStatus", "resiliencyScore", "endTime"] {
+        for member in [
+            "compliance",
+            "complianceStatus",
+            "resiliencyScore",
+            "endTime",
+            "cost",
+        ] {
             assert_eq!(
                 reported[member],
                 Value::Null,
                 "case {case:?}: an unfinished assessment reports no {member}, got {reported:?}"
             );
         }
+        // Evaluating drift is part of assessing, so an assessment that has not
+        // finished has not asked the drift question yet.
+        assert_eq!(
+            reported["driftStatus"],
+            json!(DRIFT_STATUS_NOT_CHECKED),
+            "case {case:?}: an unfinished assessment has checked no drift, got {reported:?}"
+        );
         assert_eq!(
             reported["appArn"].as_str(),
             Some(app_arn.as_str()),
@@ -709,16 +772,21 @@ async fn an_assessment_pins_the_published_version_it_graded() {
         ("the third release", Some("v3.0.0")),
     ];
 
-    let mut graded: Vec<(&str, String, i64, Option<&str>)> = Vec::new();
+    let mut graded: Vec<(&str, String, i64, String)> = Vec::new();
     for (index, (case, version_name)) in rows.iter().enumerate() {
         add_a_resource(
             &router,
             &app_arn,
-            &format!("bucket-{index}"),
+            &format!("record-{index}"),
             "compute-tier",
         )
         .await;
         let sequence = publish(&router, &app_arn, *version_name).await;
+        // A publish that named no version still froze a NAMED snapshot: the
+        // service names it after the publish sequence number it was minted with.
+        let expected_name = version_name
+            .map(str::to_string)
+            .unwrap_or_else(|| default_published_version_name(sequence));
 
         let assessed = assess(&router, &engine, &app_arn, &format!("run-{index}")).await;
         assert_eq!(
@@ -729,7 +797,7 @@ async fn an_assessment_pins_the_published_version_it_graded() {
         );
         assert_eq!(
             assessed["versionName"].as_str(),
-            *version_name,
+            Some(expected_name.as_str()),
             "case {case:?}: the assessment carries the published version's own name, got \
              {assessed:?}"
         );
@@ -740,7 +808,7 @@ async fn an_assessment_pins_the_published_version_it_graded() {
                 .expect("an assessmentArn")
                 .to_string(),
             sequence,
-            *version_name,
+            expected_name,
         ));
 
         // Every earlier assessment still reports the snapshot IT graded.
@@ -749,7 +817,10 @@ async fn an_assessment_pins_the_published_version_it_graded() {
             let reread = reread.ok(earlier)["assessment"].clone();
             assert_eq!(
                 (reread["appVersion"].clone(), reread["versionName"].as_str()),
-                (json!(earlier_sequence.to_string()), *earlier_name),
+                (
+                    json!(earlier_sequence.to_string()),
+                    Some(earlier_name.as_str())
+                ),
                 "case {case:?}: {earlier} must still report version {earlier_sequence}, got \
                  {reread:?}"
             );
@@ -946,7 +1017,29 @@ async fn the_application_reports_its_newest_finished_assessment() {
             "case {case:?}: the application must report the finished assessment's verdict, \
              score and evaluation time, got {app:?}"
         );
+        // The application's own recovery times are the worst the assessment
+        // measured, and running that assessment is what evaluated drift.
+        assert_eq!(
+            (
+                app["rtoInSecs"].as_i64(),
+                app["rpoInSecs"].as_i64(),
+                app["driftStatus"].clone()
+            ),
+            (Some(0), Some(0), json!(DRIFT_STATUS_NOT_DETECTED)),
+            "case {case:?}: the application must report the recovery it was measured at and \
+             the drift the assessment evaluated, got {app:?}"
+        );
     }
+
+    // `lastDriftEvaluationTime` is the application record's own member — the
+    // instant the assessment that evaluated drift finished.
+    let described = describe_app(&router, &app_arn).await.ok("describe")["app"].clone();
+    assert_eq!(
+        described["lastDriftEvaluationTime"],
+        finished["endTime"].clone(),
+        "case \"DescribeApp after the assessment\": the application must report when drift \
+         was last evaluated, got {described:?}"
+    );
 
     // A NEWER assessment of a version that breaches the policy replaces the verdict.
     add_a_component(&router, &app_arn, "empty-tier").await;
@@ -969,6 +1062,19 @@ async fn the_application_reports_its_newest_finished_assessment() {
         (json!(POLICY_BREACHED), Some(0.0), breached["endTime"].clone()),
         "case \"after the breaching assessment\": the application reports its NEWEST verdict, \
          got {after:?}"
+    );
+    // The worst recovery the newer assessment measured is one second past the
+    // objective it judged, and the compliance it found DOES deviate from the
+    // previous assessment's — which is a drift.
+    assert_eq!(
+        (
+            after["rtoInSecs"].as_i64(),
+            after["rpoInSecs"].as_i64(),
+            after["driftStatus"].clone()
+        ),
+        (Some(3601), Some(3601), json!(DRIFT_STATUS_DETECTED)),
+        "case \"after the breaching assessment\": the application reports the recovery the \
+         newest assessment measured and the drift it detected, got {after:?}"
     );
 }
 
@@ -1225,4 +1331,390 @@ async fn a_replayed_client_token_answers_the_first_assessment() {
             409,
             "ConflictException",
         );
+}
+
+/// The objectives every row of [`recovery_table`] is judged against: one per
+/// disruption type a resiliency policy can state an objective for, each a different
+/// number, so a reported recovery time can be told apart from the objective it was
+/// compared with.
+fn graded_objectives() -> Value {
+    json!({
+        "Software": {"rtoInSecs": 60, "rpoInSecs": 30},
+        "Hardware": {"rtoInSecs": 600, "rpoInSecs": 300},
+        "AZ": {"rtoInSecs": 7200, "rpoInSecs": 3600},
+        "Region": {"rtoInSecs": 86400, "rpoInSecs": 43200},
+    })
+}
+
+/// A row of the recovery table: the resource types the assessed version maps, and
+/// the disruption types those resources recover from.
+struct Recovery {
+    label: &'static str,
+    resource_types: &'static [&'static str],
+    recovers: &'static [&'static str],
+}
+
+/// The table. Each row's expectation comes from the service's own recovery
+/// catalogue (`crate::state`'s `RESOURCE_RECOVERY`, one row per entry of
+/// `SUPPORTED_RESOURCE_TYPES`): a resource recovers a software fault only where it
+/// holds no application data to lose to one, and any broader disruption only where
+/// its own service's redundancy spans that scope. The rows differ along what the
+/// rule generalises over: how wide that redundancy reaches (a multi-Region record, a
+/// multi-Region table, a regional store, a single-Zone database, a single host),
+/// whether the resource holds data, and how many resources the version maps — none
+/// of them the `AWS::S3::Bucket` the issue cited alone.
+fn recovery_table() -> Vec<Recovery> {
+    vec![
+        Recovery {
+            label: "a DNS record: no data, held in every Region",
+            resource_types: &["AWS::Route53::RecordSet"],
+            recovers: &["Software", "Hardware", "AZ", "Region"],
+        },
+        Recovery {
+            label: "a global table: data, replicated across Regions",
+            resource_types: &["AWS::DynamoDB::GlobalTable"],
+            recovers: &["Hardware", "AZ", "Region"],
+        },
+        Recovery {
+            label: "a serverless function: no data, regional service",
+            resource_types: &["AWS::Lambda::Function"],
+            recovers: &["Software", "Hardware", "AZ"],
+        },
+        Recovery {
+            label: "a bucket: data, regional service",
+            resource_types: &["AWS::S3::Bucket"],
+            recovers: &["Hardware", "AZ"],
+        },
+        Recovery {
+            label: "a single database instance: data, one Availability Zone",
+            resource_types: &["AWS::RDS::DBInstance"],
+            recovers: &["Hardware"],
+        },
+        Recovery {
+            label: "a single compute instance: no data, lost with its host",
+            resource_types: &["AWS::EC2::Instance"],
+            recovers: &["Software"],
+        },
+        Recovery {
+            label: "a function beside a bucket: the application recovers only what \
+                    BOTH of them do",
+            resource_types: &["AWS::Lambda::Function", "AWS::S3::Bucket"],
+            recovers: &["Hardware", "AZ"],
+        },
+    ]
+}
+
+/// The whole table: a compliance entry's recovery times are MEASURED on the
+/// resources the assessed version maps — a disruption those resources absorb where
+/// they stand is recovered in no time at all, one they do not recover from is
+/// reported one second past the objective it was judged by — and the entry's verdict
+/// is that comparison. No reported recovery time is a copy of the objective, so an
+/// application whose every component is mapped can still breach its policy.
+#[tokio::test]
+async fn the_recovery_an_assessment_measures_follows_the_version_resources() {
+    let objectives = graded_objectives();
+    for (index, row) in recovery_table().into_iter().enumerate() {
+        let (router, engine) = emulator();
+        let case = row.label;
+
+        let policy_arn = create_a_policy(&router, &format!("recovery-policy-{index}"), &objectives)
+            .await;
+        let app_arn = create_an_app(&router, &format!("recovery-app-{index}"), Some(&policy_arn))
+            .await;
+        add_a_component(&router, &app_arn, "the-tier").await;
+        for (position, resource_type) in row.resource_types.iter().enumerate() {
+            add_a_resource_of_type(
+                &router,
+                &app_arn,
+                &format!("resource-{position}"),
+                "the-tier",
+                resource_type,
+            )
+            .await;
+        }
+        publish(&router, &app_arn, None).await;
+
+        let assessed = assess(&router, &engine, &app_arn, &format!("recovery-run-{index}")).await;
+        let compliance = compliance_of(&assessed);
+        let objectives = objectives.as_object().expect("a JSON object");
+        for (disruption_type, target) in objectives {
+            let entry = &compliance[disruption_type];
+            let recovered = row.recovers.contains(&disruption_type.as_str());
+            let expected_status = if recovered { POLICY_MET } else { POLICY_BREACHED };
+            assert_eq!(
+                entry["complianceStatus"],
+                json!(expected_status),
+                "case {case:?}: {disruption_type} must be {expected_status}, got {entry:?}"
+            );
+            let expected_current = if recovered {
+                (json!(0), json!(0))
+            } else {
+                (
+                    json!(target["rtoInSecs"].as_i64().unwrap_or_default() + 1),
+                    json!(target["rpoInSecs"].as_i64().unwrap_or_default() + 1),
+                )
+            };
+            assert_eq!(
+                (
+                    entry["currentRtoInSecs"].clone(),
+                    entry["currentRpoInSecs"].clone()
+                ),
+                expected_current,
+                "case {case:?}: the {disruption_type} recovery measured on the version must \
+                 be {expected_current:?}, got {entry:?}"
+            );
+            // Whatever the version recovers today, the recovery its resources
+            // COULD be given is the absorbed one: every mapped type can be given
+            // the recovery its class needs.
+            assert_eq!(
+                (
+                    entry["achievableRtoInSecs"].clone(),
+                    entry["achievableRpoInSecs"].clone()
+                ),
+                (json!(0), json!(0)),
+                "case {case:?}: the achievable {disruption_type} recovery of a mapped \
+                 component is the absorbed one, got {entry:?}"
+            );
+            if !recovered {
+                let message = entry["message"].as_str().unwrap_or_default();
+                assert!(
+                    row.resource_types
+                        .iter()
+                        .any(|resource_type| message.contains(resource_type)),
+                    "case {case:?}: the breached {disruption_type} entry must name a resource \
+                     that does not recover it, got {entry:?}"
+                );
+            }
+        }
+
+        let every_disruption_recovered = objectives
+            .keys()
+            .all(|disruption_type| row.recovers.contains(&disruption_type.as_str()));
+        let expected_rollup = if every_disruption_recovered {
+            POLICY_MET
+        } else {
+            POLICY_BREACHED
+        };
+        assert_eq!(
+            assessed["complianceStatus"],
+            json!(expected_rollup),
+            "case {case:?}: the roll-up must be {expected_rollup}, got {assessed:?}"
+        );
+
+        // The application reports the WORST recovery the assessment measured.
+        let worst = objectives
+            .iter()
+            .filter(|(disruption_type, _)| !row.recovers.contains(&disruption_type.as_str()))
+            .map(|(_, target)| {
+                (
+                    target["rtoInSecs"].as_i64().unwrap_or_default() + 1,
+                    target["rpoInSecs"].as_i64().unwrap_or_default() + 1,
+                )
+            })
+            .fold((0, 0), |worst, measured| {
+                (worst.0.max(measured.0), worst.1.max(measured.1))
+            });
+        let app = describe_app(&router, &app_arn).await.ok(case)["app"].clone();
+        assert_eq!(
+            (app["rtoInSecs"].as_i64(), app["rpoInSecs"].as_i64()),
+            (Some(worst.0), Some(worst.1)),
+            "case {case:?}: the application must report the worst measured recovery \
+             {worst:?}, got {app:?}"
+        );
+    }
+}
+
+/// Every resource type this service supports is in the recovery catalogue, so an
+/// assessment can say what each one recovers: a type the catalogue does not carry
+/// recovers nothing at all, which no supported type does — each recovers at least
+/// the disruption class its own service absorbs or its lack of data makes
+/// irrelevant.
+#[test]
+fn every_supported_resource_type_recovers_something() {
+    for resource_type in SUPPORTED_RESOURCE_TYPES {
+        let recovered: Vec<&&str> = DISRUPTION_TYPE_VALUES
+            .iter()
+            .filter(|disruption_type| recovers_disruption(resource_type, disruption_type))
+            .collect();
+        assert!(
+            !recovered.is_empty(),
+            "case {resource_type:?}: a supported resource type must be in the recovery \
+             catalogue, so it recovers at least one disruption type, got {recovered:?}"
+        );
+    }
+    // Not vacuous: a type the catalogue does not carry recovers nothing.
+    for disruption_type in DISRUPTION_TYPE_VALUES {
+        assert!(
+            !recovers_disruption("AWS::Nothing::Known", disruption_type),
+            "case \"an uncatalogued resource type\": nothing is known about what it survives, \
+             so it must recover no {disruption_type} disruption"
+        );
+    }
+}
+
+/// A finished assessment states what the application costs as a COMPLETE cost
+/// object — an amount in a currency at a frequency, the three members the model
+/// makes required — however many resources the assessed version maps. This service
+/// holds no price for any resource it stores, so the amount they add up to is 0.
+#[tokio::test]
+async fn a_finished_assessment_states_what_the_application_costs() {
+    // The rows differ along how much the assessed version maps, which is what the
+    // amount adds up over.
+    for resources in 1..=3usize {
+        let (router, engine) = emulator();
+        let case = format!("{resources} mapped resource(s)");
+        let policy_arn =
+            create_a_policy(&router, &format!("cost-policy-{resources}"), &required_objectives(3600))
+                .await;
+        let app_arn =
+            create_an_app(&router, &format!("cost-app-{resources}"), Some(&policy_arn)).await;
+        add_a_component(&router, &app_arn, "compute-tier").await;
+        for index in 0..resources {
+            add_a_resource(&router, &app_arn, &format!("record-{index}"), "compute-tier").await;
+        }
+        publish(&router, &app_arn, None).await;
+
+        let assessed = assess(&router, &engine, &app_arn, &format!("cost-run-{resources}")).await;
+        assert_eq!(
+            assessed["cost"],
+            json!({"amount": 0.0, "currency": "USD", "frequency": "Monthly"}),
+            "case {case:?}: a finished assessment states a complete cost, got {assessed:?}"
+        );
+        assert!(
+            COST_FREQUENCY_VALUES.contains(&assessed["cost"]["frequency"].as_str().unwrap_or("")),
+            "case {case:?}: the frequency must be one the model admits, got {assessed:?}"
+        );
+    }
+}
+
+/// Running an assessment IS the drift evaluation, so a finished one answers the
+/// drift question: `NotDetected` while the compliance it computed matches the
+/// compliance of the application's previous assessment — the first assessment of an
+/// application included, which has nothing to deviate from — and `Detected` when it
+/// does not.
+#[tokio::test]
+async fn the_drift_verdict_compares_the_previous_assessment_of_the_application() {
+    let (router, engine) = emulator();
+    let policy_arn = create_a_policy(&router, "drift-policy", &required_objectives(3600)).await;
+    let app_arn = create_an_app(&router, "drift-app", Some(&policy_arn)).await;
+    add_a_component(&router, &app_arn, "compute-tier").await;
+    add_a_resource(&router, &app_arn, "record", "compute-tier").await;
+    publish(&router, &app_arn, None).await;
+
+    // The rows differ along what happened to the application between assessments:
+    // nothing at all, a change that moves its compliance, and a change that does
+    // not.
+    let assessed = assess(&router, &engine, &app_arn, "first-run").await;
+    assert_eq!(
+        assessed["driftStatus"],
+        json!(DRIFT_STATUS_NOT_DETECTED),
+        "case \"the first assessment\": the first assessment of an application deviates from \
+         nothing, got {assessed:?}"
+    );
+
+    let unchanged = assess(&router, &engine, &app_arn, "unchanged-run").await;
+    assert_eq!(
+        unchanged["driftStatus"],
+        json!(DRIFT_STATUS_NOT_DETECTED),
+        "case \"an unchanged application\": the same compliance twice is no deviation, got \
+         {unchanged:?}"
+    );
+
+    // A component with nothing mapped to it moves the compliance, so the next
+    // assessment finds a deviation.
+    add_a_component(&router, &app_arn, "empty-tier").await;
+    publish(&router, &app_arn, None).await;
+    let moved = assess(&router, &engine, &app_arn, "breached-run").await;
+    assert_eq!(
+        (moved["driftStatus"].clone(), moved["complianceStatus"].clone()),
+        (json!(DRIFT_STATUS_DETECTED), json!(POLICY_BREACHED)),
+        "case \"compliance that moved\": a compliance that differs from the previous \
+         assessment's is a drift, got {moved:?}"
+    );
+
+    // And a further assessment of that same breached application deviates from
+    // nothing again.
+    let settled = assess(&router, &engine, &app_arn, "settled-run").await;
+    assert_eq!(
+        settled["driftStatus"],
+        json!(DRIFT_STATUS_NOT_DETECTED),
+        "case \"a settled breach\": the breach is now the baseline, so there is no further \
+         deviation, got {settled:?}"
+    );
+}
+
+/// How many digits of a second a `TimeStamp` member may carry on the wire: AWS
+/// carries restJson1 timestamps as epoch seconds with at most a millisecond
+/// fraction, so a reported instant has at most three.
+const MAX_FRACTION_DIGITS: usize = 3;
+
+/// Assert `reported` is an epoch-seconds number in that shape.
+fn assert_timestamp_shape(case: &str, member: &str, reported: &Value) {
+    let number = reported
+        .as_number()
+        .unwrap_or_else(|| panic!("case {case:?}: {member} must be an epoch-seconds number, got {reported:?}"));
+    // The serialized form, so the precision asserted on is the one on the wire and
+    // not a re-rounding of it.
+    let rendered = number.to_string();
+    let fraction = rendered.split_once('.').map_or("", |(_, fraction)| fraction);
+    assert!(
+        fraction.len() <= MAX_FRACTION_DIGITS,
+        "case {case:?}: {member} must carry at most {MAX_FRACTION_DIGITS} fractional digits, \
+         got {rendered}"
+    );
+}
+
+/// Every `TimeStamp` member this service reports — the assessment's start and end,
+/// the application's creation, compliance, score and drift evaluation times, and a
+/// published version's creation time — is carried in the epoch-seconds shape AWS
+/// uses, whichever operation reports it.
+#[tokio::test]
+async fn every_reported_timestamp_carries_at_most_millisecond_precision() {
+    let (router, engine) = emulator();
+    let policy_arn = create_a_policy(&router, "shape-policy", &required_objectives(3600)).await;
+    let app_arn = create_an_app(&router, "shape-app", Some(&policy_arn)).await;
+    add_a_component(&router, &app_arn, "compute-tier").await;
+    add_a_resource(&router, &app_arn, "record", "compute-tier").await;
+    publish(&router, &app_arn, None).await;
+
+    // The started assessment: it reports when it began, and nothing of its end yet.
+    let started = start_assessment(&router, &app_arn, RELEASE_APP_VERSION, "shape-run").await;
+    let started = started.ok("the started assessment")["assessment"].clone();
+    assert_timestamp_shape("the started assessment", "startTime", &started["startTime"]);
+    let assessment_arn = started["assessmentArn"]
+        .as_str()
+        .expect("a minted assessmentArn")
+        .to_string();
+
+    finish_the_assessment(&engine, &assessment_arn);
+    let finished = describe_assessment(&router, &assessment_arn).await;
+    let finished = finished.ok("the finished assessment")["assessment"].clone();
+    for member in ["startTime", "endTime"] {
+        assert_timestamp_shape("the finished assessment", member, &finished[member]);
+    }
+    // The start a read reports is the one the starter answered: the instant is
+    // truncated where the record is built, not at each read.
+    assert_eq!(
+        finished["startTime"], started["startTime"],
+        "case \"the finished assessment\": a read must report the start the call answered, got \
+         {finished:?}"
+    );
+
+    let app = describe_app(&router, &app_arn).await.ok("the application")["app"].clone();
+    for member in [
+        "creationTime",
+        "lastAppComplianceEvaluationTime",
+        "lastResiliencyScoreEvaluationTime",
+        "lastDriftEvaluationTime",
+    ] {
+        assert_timestamp_shape("the application", member, &app[member]);
+    }
+
+    let versions = post(&router, "/list-app-versions", &json!({"appArn": app_arn})).await;
+    for summary in versions.ok("the listed versions")["appVersions"]
+        .as_array()
+        .expect("appVersions is @required")
+    {
+        assert_timestamp_shape("a listed app version", "creationTime", &summary["creationTime"]);
+    }
 }

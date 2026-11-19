@@ -211,10 +211,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A frozen COPY of the draft: the draft stays as it is, editable, so a later
         // change to it cannot alter what was published.
+        //
+        // A published version always carries a NAME: one the request did not name
+        // gets the name the service gives it
+        // ([`crate::state::default_published_version_name`]), which is what every
+        // later reader of the snapshot reports, while this call answers the
+        // `versionName` the request carried.
         let published = crate::state::AppVersionContents {
             app_components: draft.app_components,
             resources: draft.resources,
-            version_name: input.version_name.clone(),
+            version_name: Some(
+                input
+                    .version_name
+                    .clone()
+                    .unwrap_or_else(|| crate::state::default_published_version_name(identifier)),
+            ),
             identifier: Some(identifier),
             creation_time: Some(crate::state::now()),
         };

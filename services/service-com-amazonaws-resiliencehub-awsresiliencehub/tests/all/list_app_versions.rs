@@ -10,7 +10,8 @@
 //! application is created and carries the application's own `creationTime`, and
 //! every version `PublishAppVersion` froze from it, the newest under the release
 //! alias and every superseded one under its own publish sequence number, each with
-//! that number as its `identifier` and the `versionName` the publish named —
+//! that number as its `identifier` and its `versionName` — the one the publish
+//! named, or the one the service gave a snapshot the publish did not name —
 //! oldest first, narrowed to the `startTime`/`endTime` bounds on a
 //! version's creation time, in pages of at most `maxResults` that a `nextToken`
 //! resumes exactly where the previous page stopped; an `appArn` naming no stored
@@ -21,7 +22,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_resiliencehub_awsresiliencehub::state::{
-    DRAFT_APP_VERSION, DRAFT_APP_VERSION_IDENTIFIER, RELEASE_APP_VERSION,
+    default_published_version_name, DRAFT_APP_VERSION, DRAFT_APP_VERSION_IDENTIFIER,
+    RELEASE_APP_VERSION,
 };
 use service_com_amazonaws_resiliencehub_awsresiliencehub::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -232,8 +234,9 @@ fn max_length_version_name() -> String {
 /// `versionName` (if any) the publish names.
 ///
 /// The rows differ along what the rule generalises over — how many components the
-/// published draft holds, and the form of the `versionName`: absent, a short name,
-/// one carrying punctuation, and one at the top of `EntityVersion`'s length.
+/// published draft holds, and the form of the `versionName`: absent (which the
+/// service names itself), a short name, one carrying punctuation, one at the top of
+/// `EntityVersion`'s length, and absent again after named publishes.
 struct Publish {
     label: &'static str,
     adds: &'static [&'static str],
@@ -262,6 +265,11 @@ fn publish_table() -> Vec<Publish> {
             label: "fourth publish, a 50-character versionName",
             adds: &["queue-tier"],
             version_name: Some(max_length_version_name()),
+        },
+        Publish {
+            label: "fifth publish, no versionName again",
+            adds: &["cache-tier"],
+            version_name: None,
         },
     ]
 }
@@ -298,7 +306,7 @@ async fn lists_the_draft_and_then_every_published_version() {
         listed.body["nextToken"]
     );
 
-    let mut expected_names: Vec<Option<String>> = Vec::new();
+    let mut expected_names: Vec<String> = Vec::new();
     for (index, row) in publish_table().into_iter().enumerate() {
         let case = row.label;
         for id in row.adds {
@@ -311,7 +319,13 @@ async fn lists_the_draft_and_then_every_published_version() {
             "case {case:?}: publish number {sequence} is addressed by the release \
              alias, got {minted:?}"
         );
-        expected_names.push(row.version_name.clone());
+        expected_names.push(
+            row.version_name
+                .clone()
+                // A published version always carries a name: one the publish did
+                // not name is named after its own sequence number.
+                .unwrap_or_else(|| default_published_version_name(sequence)),
+        );
 
         let listed = list_versions(&router, &app_arn, &json!({})).await;
         let page = summaries(&listed, case);
@@ -359,7 +373,7 @@ async fn lists_the_draft_and_then_every_published_version() {
             );
             assert_eq!(
                 summary.get("versionName").and_then(Value::as_str),
-                expected_name.as_deref(),
+                Some(expected_name.as_str()),
                 "case {case:?}: version {number} must report versionName \
                  {expected_name:?}, got {summary:?}"
             );

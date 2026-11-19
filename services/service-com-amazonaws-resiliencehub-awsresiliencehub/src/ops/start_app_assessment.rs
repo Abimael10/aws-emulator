@@ -7,7 +7,12 @@
 //! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState`] so
 //! `DescribeAppAssessment` reports it. The verdict is computed from the assessed
 //! version's contents and the policy as they are at the call, and frozen: a later
-//! edit to either cannot change what a finished assessment reports. Assessing takes
+//! edit to either cannot change what a finished assessment reports. Each
+//! disruption type the policy states an objective for is judged on the recovery
+//! the assessment MEASURES on the version's own resources, compared against that
+//! objective; the assessment also states what the application costs and whether
+//! its compliance has drifted from the application's previous assessment.
+//! Assessing takes
 //! time, so the call answers the assessment it STARTED — the non-terminal
 //! `Pending` — and the terminal status, the verdict and the score are what a read
 //! finds one [`crate::state::ASSESSMENT_SPAN`] later. An `appVersion` label that
@@ -241,10 +246,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What is assessed: a COPY of the version's contents and of the policy the
         // application names, so the verdict below cannot move under a later edit to
         // either.
-        let assessed = store
+        //
+        // The label was established above to address a version of this application,
+        // so its contents are there; a store that disagrees with itself is answered
+        // as the server failure it is rather than assessed as an empty version,
+        // which would report a live verdict on an application nothing was read of.
+        let Some(assessed) = store
             .app_version(&input.app_arn, &input.app_version)
             .cloned()
-            .unwrap_or_default();
+        else {
+            return Err(internal_failure());
+        };
         let policy = store
             .apps
             .get(&input.app_arn)
@@ -257,7 +269,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing to recover them. The same set decides the verdict on every
         // objective and how much is outstanding, so it is walked once.
         let breaching_components = components_without_resources(&assessed);
-        let compliance = disruption_compliance(policy.as_ref(), &breaching_components);
+        let compliance = disruption_compliance(policy.as_ref(), &assessed, &breaching_components);
+        // Running this assessment IS the drift evaluation, so the verdict is
+        // reached here, against the compliance of the application's PREVIOUS
+        // assessment — the one this call supersedes.
+        let drift_status = drift_status(
+            store
+                .newest_assessment_of(&input.app_arn)
+                .and_then(|previous| previous.computed_compliance()),
+            &compliance,
+        );
         // An assessment PINS the version it graded: the release alias is a label the
         // next publish moves, so what the assessment records is the publish sequence
         // number that label resolved to at this call — a later read of the assessment
@@ -272,15 +293,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             app_version: Some(assessed_version),
             // Started by this caller, not by an assessment schedule.
             invoker: crate::state::ASSESSMENT_INVOKER_USER.to_string(),
-            // `cost` is left out: this emulator holds no pricing for the resources
-            // an application maps, so there is no amount to report.
-            cost: None,
+            cost: Some(application_cost()),
             resiliency_score: Some(resiliency_score(&compliance, &breaching_components)),
             compliance_status: Some(overall_compliance_status(policy.as_ref(), &compliance)),
             compliance: Some(compliance),
             assessment_status: crate::state::ASSESSMENT_STATUS_SUCCESS.to_string(),
-            start_time: Some(::aws_smithy_types::DateTime::from(now)),
-            end_time: Some(::aws_smithy_types::DateTime::from(
+            start_time: Some(crate::state::wire_timestamp(now)),
+            end_time: Some(crate::state::wire_timestamp(
                 now + crate::state::ASSESSMENT_SPAN,
             )),
             message: None,
@@ -295,9 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_errors_details: None,
             // The version's own name, as the publish that froze it recorded it.
             version_name: assessed.version_name.clone(),
-            // No assessment is compared against an earlier one here, so none
-            // reports drift it did not look for.
-            drift_status: Some(crate::state::DRIFT_STATUS_NOT_CHECKED.to_string()),
+            drift_status: Some(drift_status.to_string()),
             // `summary` carries the risks and recommendations a real assessment
             // writes up; this service computes none, so there is nothing to
             // summarise.
@@ -317,11 +334,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The `currentRtoInSecs` / `currentRpoInSecs` an assessment reports for a
-/// disruption the assessed version has nothing to recover from — "no recovery at
-/// all", as the widest value the modelled `Seconds` integer carries (`smithy_query
-/// query="shape" shape="Seconds"`: bounded below by 0 and not above).
-const UNRECOVERED_SECONDS: i32 = i32::MAX;
+/// How long a recovery takes where the service owning the resources ABSORBS the
+/// disruption with redundancy it holds itself: no time at all, because nothing has
+/// to be restored for the application to carry on.
+const ABSORBED_SECONDS: i32 = 0;
+
+/// The recovery time an assessment reports for a recovery the application does not
+/// reach, judged against an objective of `objective` seconds: one second past it.
+///
+/// A recovery nothing performs has no duration to measure, and the member it is
+/// reported in is a plain `Seconds` (`smithy_query query="shape" shape="Seconds"`:
+/// an integer bounded below by 0 and not above) with no value reserved for "never",
+/// so the service states the one thing that IS known about it — that it is past the
+/// objective — as the smallest value that says so.
+fn unreached_seconds(objective: i32) -> i32 {
+    objective.saturating_add(1)
+}
 
 /// What the assessment makes of a version against `policy`, one entry per
 /// disruption type the POLICY states an objective for — an application is only
@@ -329,14 +357,21 @@ const UNRECOVERED_SECONDS: i32 = i32::MAX;
 /// leaves out is not judged, and an application with no policy is not judged at
 /// all.
 ///
-/// Recovery is backed by what the assessed version actually maps: an Application
-/// Component with no resource mapped to it has nothing to recover, so while one of
-/// `breaching_components` exists no objective is met and the assessment reports the
-/// recovery times as unreached ([`UNRECOVERED_SECONDS`]) while reporting the
-/// objective itself as achievable — mapping a resource into the component is what
-/// reaches it.
+/// The recovery times are MEASURED on the assessed version, never copied from the
+/// objectives they are judged against: a disruption every resource of the version
+/// recovers from is absorbed where those resources stand ([`ABSORBED_SECONDS`] —
+/// nothing is restored, so no time passes), and one that some resource does not
+/// recover from is not reached at all ([`unreached_seconds`]). What a resource
+/// recovers is [`crate::state::recovers_disruption`]; an Application Component with
+/// no resource mapped to it recovers nothing, whatever the disruption, and nothing
+/// that could be recommended for it changes that until a resource is mapped, so
+/// neither the current nor the ACHIEVABLE recovery reaches the objective there.
+/// Everywhere else the achievable recovery is the absorbed one: every resource type
+/// this service assesses can be given the recovery its class needs, and that
+/// recovery is its own service's, which restores nothing.
 fn disruption_compliance(
     policy: Option<&ResiliencyPolicy>,
+    assessed: &crate::state::AppVersionContents,
     breaching_components: &[String],
 ) -> ::std::collections::HashMap<String, DisruptionCompliance> {
     let Some(objectives) = policy.and_then(|policy| policy.policy.as_ref()) else {
@@ -346,31 +381,192 @@ fn disruption_compliance(
     objectives
         .iter()
         .map(|(disruption_type, objective)| {
-            let compliance = match breaching_components.first() {
-                None => DisruptionCompliance {
-                    current_rto_in_secs: objective.rto_in_secs,
-                    achievable_rto_in_secs: objective.rto_in_secs,
-                    current_rpo_in_secs: objective.rpo_in_secs,
-                    achievable_rpo_in_secs: objective.rpo_in_secs,
-                    compliance_status: COMPLIANCE_STATUS_MET.to_string(),
-                    ..DisruptionCompliance::default()
+            let measured = measured_recovery(assessed, breaching_components, disruption_type);
+            let current_rto = measured
+                .current
+                .unwrap_or_else(|| unreached_seconds(objective.rto_in_secs));
+            let current_rpo = measured
+                .current
+                .unwrap_or_else(|| unreached_seconds(objective.rpo_in_secs));
+            let compliance = DisruptionCompliance {
+                current_rto_in_secs: current_rto,
+                achievable_rto_in_secs: measured
+                    .achievable
+                    .unwrap_or_else(|| unreached_seconds(objective.rto_in_secs)),
+                current_rpo_in_secs: current_rpo,
+                achievable_rpo_in_secs: measured
+                    .achievable
+                    .unwrap_or_else(|| unreached_seconds(objective.rpo_in_secs)),
+                // The verdict is that comparison and nothing else: an objective is
+                // met while the recovery measured on the application is within it.
+                compliance_status: if current_rto > objective.rto_in_secs
+                    || current_rpo > objective.rpo_in_secs
+                {
+                    COMPLIANCE_STATUS_BREACHED.to_string()
+                } else {
+                    COMPLIANCE_STATUS_MET.to_string()
                 },
-                Some(component) => DisruptionCompliance {
-                    current_rto_in_secs: UNRECOVERED_SECONDS,
-                    achievable_rto_in_secs: objective.rto_in_secs,
-                    current_rpo_in_secs: UNRECOVERED_SECONDS,
-                    achievable_rpo_in_secs: objective.rpo_in_secs,
-                    compliance_status: COMPLIANCE_STATUS_BREACHED.to_string(),
-                    message: Some(format!(
-                        "Application Component {component} has no resources, so nothing \
-                         recovers it"
-                    )),
-                    ..DisruptionCompliance::default()
-                },
+                message: measured.message,
+                ..DisruptionCompliance::default()
             };
             (disruption_type.clone(), compliance)
         })
         .collect()
+}
+
+/// What an assessment measures about recovering one application from one
+/// disruption: the recovery the version reaches AS IT STANDS and the one it could
+/// reach, each in seconds, with `None` for a recovery it does not reach — which the
+/// entry then reports against the objective it was judged by.
+struct MeasuredRecovery {
+    current: Option<i32>,
+    achievable: Option<i32>,
+    /// What stopped the recovery being reached, when something did — the
+    /// `DisruptionCompliance$message` of the entry.
+    message: Option<String>,
+}
+
+/// The recovery [`disruption_compliance`] reports for one disruption type, measured
+/// on the assessed version: what recovers the resources it maps, and what it leaves
+/// with nothing to recover it.
+fn measured_recovery(
+    assessed: &crate::state::AppVersionContents,
+    breaching_components: &[String],
+    disruption_type: &str,
+) -> MeasuredRecovery {
+    // An Application Component with nothing mapped to it has nothing that could
+    // recover it, whichever disruption is asked about.
+    if let Some(component) = breaching_components.first() {
+        return MeasuredRecovery {
+            current: None,
+            achievable: None,
+            message: Some(format!(
+                "Application Component {component} has no resources, so nothing recovers it"
+            )),
+        };
+    }
+    let included = assessed.included_resources();
+    // A version that maps nothing describes nothing to recover.
+    if included.is_empty() {
+        return MeasuredRecovery {
+            current: None,
+            achievable: None,
+            message: Some(
+                "The assessed app version maps no resource, so nothing recovers it".to_string(),
+            ),
+        };
+    }
+
+    // One resource that does not recover this disruption is enough: an application
+    // recovers only as far as its least recoverable resource does.
+    let unrecovered = included.iter().find(|resource| {
+        !crate::state::recovers_disruption(&resource.resource_type, disruption_type)
+    });
+    match unrecovered {
+        // Every resource of the version recovers this disruption where it stands.
+        None => MeasuredRecovery {
+            current: Some(ABSORBED_SECONDS),
+            achievable: Some(ABSORBED_SECONDS),
+            message: None,
+        },
+        // At least one does not, so the application does not — while the recovery
+        // its resources could be given still would.
+        Some(resource) => MeasuredRecovery {
+            current: None,
+            achievable: Some(ABSORBED_SECONDS),
+            message: Some(format!(
+                "Resource {} ({}) does not recover a {disruption_type} disruption",
+                resource
+                    .resource_name
+                    .as_deref()
+                    .unwrap_or(resource.logical_resource_id.identifier.as_str()),
+                resource.resource_type
+            )),
+        },
+    }
+}
+
+/// The `currency` every cost this service states is in — the `CurrencyCode` a
+/// Resilience Hub assessment reports a cost in.
+const COST_CURRENCY: &str = "USD";
+
+/// The `frequency` every cost this service states carries: a cost per month, as the
+/// model's `CostFrequency` enum spells it.
+const COST_FREQUENCY: &str = "Monthly";
+
+/// What one mapped resource adds to the application's cost: nothing this service
+/// stores about a resource carries a price — a `PhysicalResource` records what a
+/// resource IS and what it is grouped into — so there is no price to add up for any
+/// of them.
+const UNPRICED_RESOURCE_AMOUNT: f64 = 0.0;
+
+/// What the assessed application costs, as the model's `Cost` — whose `amount`,
+/// `currency` and `frequency` are all REQUIRED (`smithy_query query="shape"
+/// shape="Cost"`), so an assessment reports a complete cost object or no cost at
+/// all.
+///
+/// The amount is what the resources the assessed version maps cost, which is
+/// [`UNPRICED_RESOURCE_AMOUNT`] for every one of them, so the application's cost of
+/// resiliency is STATED, in a currency and at a frequency, rather than left
+/// unanswered. Should this service ever record what a resource costs, the amount is
+/// the sum of those prices over the version's included resources.
+fn application_cost() -> Cost {
+    Cost {
+        amount: UNPRICED_RESOURCE_AMOUNT,
+        currency: COST_CURRENCY.to_string(),
+        frequency: COST_FREQUENCY.to_string(),
+    }
+}
+
+/// The drift verdict a finishing assessment reaches: whether the compliance it
+/// computed DEVIATES from the compliance of the application's previous assessment,
+/// which is the application-compliance drift the model's `DriftType` names.
+///
+/// Running an assessment is what evaluates drift, so the verdict is one of the two
+/// answers and never [`crate::state::DRIFT_STATUS_NOT_CHECKED`] — the first
+/// assessment of an application establishes the baseline, and so deviates from
+/// nothing.
+fn drift_status(
+    previous: Option<&::std::collections::HashMap<String, DisruptionCompliance>>,
+    computed: &::std::collections::HashMap<String, DisruptionCompliance>,
+) -> &'static str {
+    let Some(previous) = previous else {
+        return crate::state::DRIFT_STATUS_NOT_DETECTED;
+    };
+    if deviates(previous, computed) {
+        return crate::state::DRIFT_STATUS_DETECTED;
+    }
+    crate::state::DRIFT_STATUS_NOT_DETECTED
+}
+
+/// Whether two assessments' compliance differ: in WHICH disruption types they
+/// judged, or in what either of them found about one — its verdict or any of the
+/// recovery times it measured. The reference ids, the descriptions and the message
+/// are no part of it: they state the same finding in words.
+fn deviates(
+    previous: &::std::collections::HashMap<String, DisruptionCompliance>,
+    computed: &::std::collections::HashMap<String, DisruptionCompliance>,
+) -> bool {
+    if previous.len() != computed.len() {
+        return true;
+    }
+    computed.iter().any(|(disruption_type, entry)| {
+        previous.get(disruption_type).is_none_or(|earlier| {
+            (
+                earlier.compliance_status.as_str(),
+                earlier.current_rto_in_secs,
+                earlier.current_rpo_in_secs,
+                earlier.achievable_rto_in_secs,
+                earlier.achievable_rpo_in_secs,
+            ) != (
+                entry.compliance_status.as_str(),
+                entry.current_rto_in_secs,
+                entry.current_rpo_in_secs,
+                entry.achievable_rto_in_secs,
+                entry.achievable_rpo_in_secs,
+            )
+        })
+    })
 }
 
 /// The names of `assessed`'s Application Components that no resource of `assessed`

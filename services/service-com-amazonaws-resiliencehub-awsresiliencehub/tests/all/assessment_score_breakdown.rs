@@ -174,8 +174,13 @@ pub(crate) async fn add_a_component(router: &MultiServiceRouter, app_arn: &str, 
 }
 
 /// Add one physical resource to `app_arn`'s draft version, mapped to `component`.
+///
+/// A DNS record: it holds no application data and its service holds it in more than
+/// one Region, so it recovers every disruption a resiliency policy can state an
+/// objective for, and these cases are about how the SCORE breaks down rather than
+/// about which resource recovers which disruption.
 pub(crate) async fn add_a_resource(router: &MultiServiceRouter, app_arn: &str, component: &str) {
-    let identifier = format!("{component}-bucket");
+    let identifier = format!("{component}-record");
     let reply = post(
         router,
         "/create-app-version-resource",
@@ -184,7 +189,7 @@ pub(crate) async fn add_a_resource(router: &MultiServiceRouter, app_arn: &str, c
             "resourceName": identifier,
             "logicalResourceId": {"identifier": identifier},
             "physicalResourceId": identifier,
-            "resourceType": "AWS::S3::Bucket",
+            "resourceType": "AWS::Route53::RecordSet",
             "appComponents": [component],
         }),
     )
