@@ -18,6 +18,10 @@
 //! sequences are the ones a lifecycle client drives:
 //!
 //! * `CreateMicrosoftAD` -> `DescribeDirectories` until the directory is in service;
+//! * a create -> `DescribeDirectories` polled past the stage the create was accepted in,
+//!   over a table of creates spanning every directory type this service creates: the stage
+//!   the poll first reads after that one is the stage the build runs in, and only a later
+//!   poll reads the one a directory in service carries;
 //! * `CreateSnapshot` -> `DescribeSnapshots` until the snapshot is complete -> `DeleteSnapshot`
 //!   -> the snapshot is no longer in the inventory;
 //! * `AddIpRoutes` -> `ListIpRoutes` until the block is in service -> `RemoveIpRoutes` -> the
@@ -37,8 +41,12 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::ad_connector::minimal_connect;
+use crate::directory_lifecycle::{
+    describe_one, minimal_create, PASSWORD, STAGE_ACTIVE, STAGE_CREATING, STAGE_REQUESTED,
+};
 use crate::directory_networking_and_settings::routes_of;
-use crate::harness::{call, ok, service, string};
+use crate::harness::{call, ok, poll_until_reported, service, string};
 use crate::microsoft_ad::minimal_microsoft_ad;
 
 /// How long one polled state may take to advance before the case fails: far longer than
@@ -416,4 +424,188 @@ async fn the_trust_lifecycle_converges_through_describe_trusts() {
             format!("DescribeTrusts answered {status} with {parsed}"),
         )
     });
+}
+
+/// The member of a description `path` names: a top-level member, or a member of one of its
+/// structures where the path is dotted (`VpcSettings.VpcId`).
+fn member<'a>(description: &'a Value, path: &str) -> &'a Value {
+    let mut value = description;
+    for segment in path.split('.') {
+        value = &value[segment];
+    }
+    value
+}
+
+/// One row of the build table: the create that starts a directory build, and what the
+/// description of that directory must report WHILE the build is still running.
+struct BuildCase {
+    case: &'static str,
+    operation: &'static str,
+    body: Value,
+    /// The members of the description, each named by the path [`member`] reads, and the
+    /// value it must carry from the build stage onwards.
+    expected: Vec<(&'static str, Value)>,
+}
+
+#[tokio::test]
+async fn a_polled_create_leaves_the_accepted_stage_for_the_build_stage_before_service() {
+    let router = service();
+
+    // The rows span every directory type this service creates, both Simple AD sizes and
+    // both Managed Microsoft AD editions, so the chain is a rule about a directory build
+    // rather than about one create.
+    let rows: Vec<BuildCase> = vec![
+        BuildCase {
+            case: "Simple AD, Small",
+            operation: "CreateDirectory",
+            body: minimal_create("polled-small.example.com"),
+            expected: vec![
+                ("Name", json!("polled-small.example.com")),
+                ("Type", json!("SimpleAD")),
+                ("Size", json!("Small")),
+            ],
+        },
+        BuildCase {
+            case: "Simple AD, Large",
+            operation: "CreateDirectory",
+            body: json!({
+                "Name": "polled-large.example.com",
+                "Password": PASSWORD,
+                "Size": "Large"
+            }),
+            expected: vec![
+                ("Name", json!("polled-large.example.com")),
+                ("Type", json!("SimpleAD")),
+                ("Size", json!("Large")),
+            ],
+        },
+        BuildCase {
+            case: "AD Connector",
+            operation: "ConnectDirectory",
+            body: minimal_connect("polled-connected.example.com"),
+            expected: vec![
+                ("Name", json!("polled-connected.example.com")),
+                ("Type", json!("ADConnector")),
+            ],
+        },
+        BuildCase {
+            case: "Managed Microsoft AD, default edition",
+            operation: "CreateMicrosoftAD",
+            body: minimal_microsoft_ad("polled-managed.example.com"),
+            expected: vec![
+                ("Name", json!("polled-managed.example.com")),
+                ("Type", json!("MicrosoftAD")),
+                ("Edition", json!("Enterprise")),
+                // No short name in the request: the first label of the DNS name.
+                ("ShortName", json!("POLLED-MANAGED")),
+                ("DesiredNumberOfDomainControllers", json!(2)),
+                ("VpcSettings.VpcId", json!("vpc-0a1b2c3d")),
+                (
+                    "VpcSettings.SubnetIds",
+                    json!(["subnet-0a1b2c3d", "subnet-1a2b3c4d"]),
+                ),
+            ],
+        },
+        BuildCase {
+            case: "Managed Microsoft AD, Standard, with every optional member given",
+            operation: "CreateMicrosoftAD",
+            body: json!({
+                "Name": "polled-standard.example.com",
+                "Password": PASSWORD,
+                "Edition": "Standard",
+                "ShortName": "POLLEDSTD",
+                "Description": "polled through the build",
+                "VpcSettings": {
+                    "VpcId": "vpc-11223344",
+                    "SubnetIds": ["subnet-11223344", "subnet-55667788"]
+                }
+            }),
+            expected: vec![
+                ("Name", json!("polled-standard.example.com")),
+                ("Type", json!("MicrosoftAD")),
+                ("Edition", json!("Standard")),
+                ("ShortName", json!("POLLEDSTD")),
+                ("Description", json!("polled through the build")),
+                ("VpcSettings.VpcId", json!("vpc-11223344")),
+                (
+                    "VpcSettings.SubnetIds",
+                    json!(["subnet-11223344", "subnet-55667788"]),
+                ),
+            ],
+        },
+    ];
+
+    // Each row is polled past the stage its own create was accepted in BEFORE the next row
+    // is created, so what each poll reads is the position of that row's own build.
+    let mut created: Vec<(&str, String)> = Vec::new();
+    for BuildCase {
+        case,
+        operation,
+        body,
+        expected,
+    } in rows
+    {
+        let answer = ok(&router, operation, body, case).await;
+        let directory_id = string(&answer, "DirectoryId", case);
+
+        // A client's waiter polls past the stage the create was accepted in. The stage it
+        // first reads after that one is the stage the build runs in — a directory whose
+        // servers are not up yet is not one in service, so the chain cannot skip it.
+        let building = poll_until_reported(
+            case,
+            "the create to leave the stage it was accepted in",
+            POLL_DEADLINE,
+            || describe_one(&router, &directory_id, case),
+            |described: &Value| described["Stage"] != json!(STAGE_REQUESTED),
+        )
+        .await;
+        assert_eq!(
+            building["Stage"],
+            json!(STAGE_CREATING),
+            "case {case:?}: expected the first stage after the accepted one to be \
+             {STAGE_CREATING}, got {building}"
+        );
+
+        // The whole record is reported from that stage onwards, not only once the build
+        // ends: a client that reads the directory while it is being built reads what the
+        // create persisted.
+        for (path, expected_value) in &expected {
+            let actual = member(&building, path);
+            assert_eq!(
+                actual, expected_value,
+                "case {case:?}: expected {path} to be {expected_value} while the directory \
+                 is {STAGE_CREATING}, got {actual}"
+            );
+        }
+
+        created.push((case, directory_id));
+    }
+
+    // And every row settles on the stage a directory in service carries, on the clock
+    // alone — the polls above only read.
+    for (case, directory_id) in &created {
+        let settled = poll_until_reported(
+            case,
+            "the build the create started to end",
+            POLL_DEADLINE,
+            || describe_one(&router, directory_id, case),
+            |described: &Value| described["Stage"] != json!(STAGE_CREATING),
+        )
+        .await;
+        assert_eq!(
+            settled["Stage"],
+            json!(STAGE_ACTIVE),
+            "case {case:?}: expected the stage the chain ends on, got {settled}"
+        );
+        let again = describe_one(&router, directory_id, case).await;
+        assert_eq!(
+            again["Stage"], settled["Stage"],
+            "case {case:?}: expected a second read to report the same stage, got {again}"
+        );
+        assert_eq!(
+            again["StageLastUpdatedDateTime"], settled["StageLastUpdatedDateTime"],
+            "case {case:?}: expected a second read to report the same stage timestamp, got \
+             {again}"
+        );
+    }
 }
