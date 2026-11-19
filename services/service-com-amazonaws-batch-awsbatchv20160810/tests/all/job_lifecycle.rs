@@ -1775,15 +1775,16 @@ async fn a_dependent_job_is_released_however_its_dependency_ended() {
             "case {case:?}: expected the documented dependency reason, got {detail}"
         );
         // `stoppedAt` is the RUNNING -> terminal transition, which a job nothing ran never
-        // made, so it is absent even on a terminal job — as is `startedAt`.
+        // made, so it is absent even on a terminal job; `startedAt` is modelled `@required`,
+        // so it reports the Long default rather than an instant anything ran at.
         assert_eq!(
             detail["stoppedAt"],
             Value::Null,
             "case {case:?}: a job nothing ran reports no stoppedAt, got {detail}"
         );
         assert_eq!(
-            detail["startedAt"],
-            Value::Null,
+            detail["startedAt"].as_i64(),
+            Some(0),
             "case {case:?}: no startedAt is invented for work nothing ran, got {detail}"
         );
         assert_eq!(

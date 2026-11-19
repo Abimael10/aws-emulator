@@ -136,90 +136,23 @@ pub fn job_state_change_detail(job: &Job) -> ::serde_json::Value {
     Value::Object(detail)
 }
 
-/// The `container` member of a job state change's detail: the stored effective
-/// container, in the member names `ContainerDetail` documents.
+/// The `container` member of a job state change's detail: the container the READER reports
+/// for this job, in the member names `ContainerDetail` documents.
 ///
-/// Only the members this store actually holds are rendered — the effective
-/// container the definition and the request's overrides add up to, beside what the run of
-/// its declared program produced ([`super::container_run`]): the status that program exited
-/// with and the task and log stream the placement named. A member no run produced is left
-/// out rather than invented, so a container nothing ran reports no `exitCode` and a
-/// container whose output went to another log driver reports no `logStreamName`.
+/// AWS documents the event's detail as the job's details "in the same form as the
+/// `DescribeJobs` API returns them", so this renders the SAME document that reader does —
+/// the stored effective container with the collections a read materialises
+/// ([`super::described_container`]), walked through the shape's own schema
+/// ([`::service_common::management_events::recorded_shape`], the one projection of a modelled
+/// shape onto JSON this tree has). ONE rendering, so the two views of one container cannot
+/// disagree about a member and neither can forget one the other reports: what the run of the
+/// container's declared program produced ([`super::container_run`]) and the task and log
+/// stream the placement named travel with the rest, and a member no run produced is absent
+/// because the record holds none.
 fn container_event_detail(container: &ContainerDetail) -> ::serde_json::Value {
-    use ::serde_json::{json, Map, Value};
-
-    let mut rendered = Map::new();
-    if let Some(image) = &container.image {
-        rendered.insert("image".to_string(), json!(image));
-    }
-    if let Some(vcpus) = container.vcpus {
-        rendered.insert("vcpus".to_string(), json!(vcpus));
-    }
-    if let Some(memory) = container.memory {
-        rendered.insert("memory".to_string(), json!(memory));
-    }
-    if let Some(command) = &container.command {
-        rendered.insert("command".to_string(), json!(command));
-    }
-    if let Some(role) = &container.job_role_arn {
-        rendered.insert("jobRoleArn".to_string(), json!(role));
-    }
-    if let Some(role) = &container.execution_role_arn {
-        rendered.insert("executionRoleArn".to_string(), json!(role));
-    }
-    if let Some(user) = &container.user {
-        rendered.insert("user".to_string(), json!(user));
-    }
-    if let Some(privileged) = container.privileged {
-        rendered.insert("privileged".to_string(), json!(privileged));
-    }
-    if let Some(readonly) = container.readonly_root_filesystem {
-        rendered.insert("readonlyRootFilesystem".to_string(), json!(readonly));
-    }
-    if let Some(reason) = &container.reason {
-        rendered.insert("reason".to_string(), json!(reason));
-    }
-    if let Some(code) = container.exit_code {
-        rendered.insert("exitCode".to_string(), json!(code));
-    }
-    if let Some(task_arn) = &container.task_arn {
-        rendered.insert("taskArn".to_string(), json!(task_arn));
-    }
-    if let Some(stream) = &container.log_stream_name {
-        rendered.insert("logStreamName".to_string(), json!(stream));
-    }
-    if let Some(environment) = &container.environment {
-        rendered.insert(
-            "environment".to_string(),
-            Value::Array(
-                environment
-                    .iter()
-                    .map(|pair| {
-                        let mut entry = Map::new();
-                        if let Some(name) = &pair.name {
-                            entry.insert("name".to_string(), json!(name));
-                        }
-                        if let Some(value) = &pair.value {
-                            entry.insert("value".to_string(), json!(value));
-                        }
-                        Value::Object(entry)
-                    })
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(requirements) = &container.resource_requirements {
-        rendered.insert(
-            "resourceRequirements".to_string(),
-            Value::Array(
-                requirements
-                    .iter()
-                    .map(|requirement| {
-                        json!({ "type": requirement.r#type, "value": requirement.value })
-                    })
-                    .collect(),
-            ),
-        );
-    }
-    Value::Object(rendered)
+    ::service_common::management_events::recorded_shape(
+        &described_container(container),
+        &ContainerDetail::SCHEMA,
+        ::service_common::management_events::WithheldFromRecord::default(),
+    )
 }

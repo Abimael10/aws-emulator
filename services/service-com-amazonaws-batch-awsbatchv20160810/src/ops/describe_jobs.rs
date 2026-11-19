@@ -25,11 +25,13 @@
 //! ARN of the task the job was placed as, the log stream that task's container writes to
 //! and the reason that attempt ended. The member is ALWAYS reported: a job no placement has
 //! started an attempt for has had none, and that is the EMPTY list — the evidence that
-//! nothing has run yet — never a missing member. An attempt whose container RAN the program
-//! that container declares reports the instant it started and the status it exited with
-//! ([`crate::state::container_run`]); one whose container never ran — a fetch the registry
-//! refused, a program this emulator performs none of — reports neither, because the engine
-//! contract forbids inventing a result for work that did not happen.
+//! nothing has run yet — never a missing member. An attempt whose container RAN reports the
+//! instant it started and the status it exited with: read off the Amazon ECS task the job runs
+//! as where the capacity takes one ([`crate::state::ecs_task`]), and off the program this
+//! service performed for it where it takes none ([`crate::state::container_run`]), beside the
+//! network interfaces that task is reached on. One whose container never ran — a fetch the
+//! registry refused, a program this emulator performs none of — reports neither, because the
+//! engine contract forbids inventing a result for work that did not happen.
 //!
 //! The same holds for every other collection of the document: `attempts`, `dependsOn`,
 //! `parameters` and `tags` are materialised, so a client that indexes a modelled collection
@@ -37,14 +39,14 @@
 //! members the `Batch Job State Change` detail materialises, which AWS documents as the
 //! job's details "in the same form as the `DescribeJobs` API returns them".
 //!
-//! `JobDetail$startedAt` is a KNOWN DEPARTURE forced by the model: it is `@required`
-//! (`smithy_query(query="shape",shape="JobDetail")`), so the framework would serialize a
-//! value for every job, and a job whose container never ran has none to report. The member is
-//! therefore left out of this projection altogether (`ops::types`) rather than filled with a
-//! `0` a client would read as "started at the epoch"; the instant a placed job's container
-//! started is reported where the model leaves the member optional — `AttemptDetail$startedAt`
-//! on the attempt that ran it, and `JobSummary$startedAt` in `ListJobs`. The crate's
-//! integration tests pin this.
+//! `JobDetail$startedAt` is "when the job transitioned from the `STARTING` state to the
+//! `RUNNING` state": the instant the run of the job's container began — read off the Amazon
+//! ECS task it runs as, or off the program this service performed for it. The member is
+//! `@required` (`smithy_query(query="shape",shape="JobDetail")`), so a value is serialized for
+//! every described job: one whose container never started reports the Long default, 0 — the
+//! same answer this service's other `@required` `startedAt` gives for a service job nothing
+//! has started yet (`DescribeServiceJob`) — and never an instant anything ran at. The crate's
+//! integration tests pin both halves.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -223,6 +225,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     attempts: Some(job.attempts.iter().map(batch::JobAttempt::detail).collect()),
                     status_reason: job.status_reason.clone(),
                     created_at: Some(job.created_at),
+                    // "When the job transitioned from the `STARTING` state to the `RUNNING`
+                    // state" (`JobDetail$startedAt`): the instant the task this job runs as
+                    // started its container ([`crate::state::ecs_task`]). The member is
+                    // `@required`, so a job whose container has not started reports the Long
+                    // default rather than an instant nothing ran at.
+                    started_at: job.started_at.unwrap_or_default(),
                     retry_strategy: job.retry_strategy.clone(),
                     stopped_at: job.stopped_at,
                     // Materialised like the other collections of a described job — and like
@@ -234,10 +242,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     depends_on: Some(job.depends_on.clone().unwrap_or_default()),
                     job_definition: job.job_definition_arn.clone(),
                     parameters: Some(job.parameters.clone().unwrap_or_default()),
-                    // The effective container is reported as the record holds it: the same
-                    // document the job state change event renders from that record, so the
-                    // two projections of one container cannot disagree.
-                    container: job.container.clone(),
+                    // The effective container is reported as the record holds it, with the
+                    // collections a read materialises present and empty
+                    // ([`crate::state::described_container`]): the same document the job state
+                    // change event renders from that record, so the two projections of one
+                    // container cannot disagree.
+                    container: job.container.as_ref().map(batch::described_container),
                     node_details: None,
                     node_properties: job.node_properties.clone(),
                     // "The array properties of the job, if it's an array job"
@@ -250,7 +260,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     propagate_tags: job.propagate_tags,
                     platform_capabilities: job.platform_capabilities.clone(),
                     eks_properties: None,
-                    eks_attempts: None,
+                    // "A list of job attempts that are associated with this job"
+                    // (`JobDetail$eksAttempts`): the attempts of a job running as a POD of an
+                    // Amazon EKS cluster, of which a container job has none — materialised
+                    // like every other collection of a described job, so a client that
+                    // iterates it reads "nothing has run as a pod" rather than failing on a
+                    // member that is not there.
+                    eks_attempts: Some(Vec::new()),
                     ecs_properties: None,
                     is_cancelled: Some(job.is_cancelled),
                     is_terminated: Some(job.is_terminated),

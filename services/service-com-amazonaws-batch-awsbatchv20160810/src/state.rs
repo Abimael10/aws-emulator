@@ -97,9 +97,11 @@ mod container_run;
 mod described_collections;
 mod ec2_capacity;
 mod ecs_cluster;
+mod ecs_task;
 mod fargate;
 mod image_pull;
 mod input_rules;
+mod job_clock;
 mod job_definition_projection;
 mod job_logs;
 mod placement;
@@ -112,9 +114,11 @@ pub use container_run::*;
 pub use described_collections::*;
 pub use ec2_capacity::*;
 pub use ecs_cluster::*;
+pub use ecs_task::*;
 pub use fargate::*;
 pub use image_pull::*;
 pub use input_rules::*;
+pub use job_clock::*;
 pub use job_definition_projection::*;
 pub use job_logs::*;
 pub use placement::*;
@@ -126,7 +130,7 @@ use crate::ops::types::{
     ComputeResource,
     ConsumableResourceProperties, ContainerDetail, ContainerOverrides, ContainerProperties,
     EcsProperties, EcsSettings, EksConfiguration, FairsharePolicy, JobDefinition, JobDependency,
-    JobStateTimeLimitAction, JobTimeout, KeyValuePair, NodeProperties,
+    JobStateTimeLimitAction, JobTimeout, KeyValuePair, NetworkInterface, NodeProperties,
     QuotaShareCapacityLimit, QuotaSharePolicy, QuotaSharePreemptionConfiguration,
     QuotaShareResourceSharingConfiguration, ResourceRequirement, RetryStrategy, ServerException,
     ServiceEnvironmentOrder, ServiceJobPreemptionConfiguration, ServiceJobRetryStrategy,
@@ -1343,7 +1347,11 @@ pub struct QuotaShare {
 
 /// A submitted job: the request's own members, the definition it resolved to, and
 /// the effective container the definition and the overrides add up to.
-#[derive(Debug, Clone)]
+///
+/// `Default` is derived for the same reason [`ServiceJob`]'s is: a test of one rule of the
+/// lifecycle states the handful of members that rule is about and leaves the rest alone. Every
+/// job this service HOLDS is built by `SubmitJob`, which states all of them.
+#[derive(Debug, Clone, Default)]
 pub struct Job {
     pub job_id: String,
     pub job_arn: String,
@@ -1446,13 +1454,40 @@ pub struct Job {
     /// materialises — a job whose image could not be fetched ends with the fetch failure and
     /// has no container, and so no container output, at all.
     pub image_fetch: Option<ImageFetch>,
+    /// How far the Amazon ECS task this job's container runs as has got ([`ecs_task`]).
+    ///
+    /// Internal bookkeeping, not a modelled member: it is what decides which call this
+    /// service owes Amazon ECS for the job, and it is `Waiting` for every job nothing has
+    /// placed on capacity that runs a task.
+    pub task_dispatch: JobTaskDispatch,
+    /// When the last of those calls went out, in epoch milliseconds, so one whose answer
+    /// never came is made again ([`TASK_DISPATCH_RETRY_AFTER_MILLIS`]).
+    pub task_attempted_at: Option<i64>,
+    /// The Amazon ECS cluster the task runs in — the cluster backing the compute environment
+    /// the job was placed on — and `None` for a job no task was run for.
+    pub task_cluster: Option<String>,
+    /// The ARN of that task, as Amazon ECS answered it, and `None` for a job no task was run
+    /// for. It is the ARN the attempt and the job's container report
+    /// ([`Self::attempts`]), kept here so the reads that follow the run address the task
+    /// without re-deriving it from a projection — and what tells a job whose container an
+    /// Amazon ECS task RAN from one whose program this service performs itself
+    /// ([`container_run`]).
+    pub task_arn: Option<String>,
+    /// How many reads of that task in a row have said NOTHING about it
+    /// ([`MAX_UNANSWERED_TASK_READS`]), reset by the first one that answers.
+    ///
+    /// Internal bookkeeping: a read Amazon ECS could not answer leaves the job exactly as it
+    /// was and is made again, and this is what bounds that waiting so a task that service no
+    /// longer answers for cannot leave the job in a non-terminal status for ever.
+    pub unanswered_task_reads: u32,
     /// What this job's container PROGRAM did, or `None` while nothing has performed it
     /// ([`container_run`]).
     ///
     /// Internal bookkeeping, not a modelled member: it is what the clock materialises after
     /// the placement — the move into `RUNNING` and the terminal status the program's exit
     /// status decides are both read off this one recording, so two readers cannot see a job
-    /// end differently.
+    /// end differently. `None` for every job whose container ran as an Amazon ECS task
+    /// instead, whose moves are read off that task ([`ecs_task`]).
     pub container_run: Option<ContainerRun>,
 }
 
@@ -2177,6 +2212,26 @@ pub fn resource_requirements_of<'a>(
     requirements
 }
 
+/// The `value` a `resourceRequirements` list states for one resource, or `None` when it
+/// states none.
+///
+/// `ResourceRequirement$type` is "the type of resource to assign to a container" and `value`
+/// "the quantity of the specified resource to reserve for the container", so a list states at
+/// most one quantity per resource and this is the ONE place the quantity for a resource is
+/// read out of it — the admission check below and the task size a Fargate job runs under
+/// ([`ecs_task`]) read the same entry the same way. A reading that AGGREGATES the entries
+/// instead (the vCPUs a job's container reserves against an environment's capacity,
+/// [`ec2_capacity`]) is a different question and keeps its own walk.
+pub fn stated_resource_value<'a>(
+    requirements: &'a [ResourceRequirement],
+    resource: &str,
+) -> Option<&'a str> {
+    requirements
+        .iter()
+        .find(|requirement| requirement.r#type == resource)
+        .map(|requirement| requirement.value.as_str())
+}
+
 /// The reason `requirements` is not a Fargate-supported reservation, or `None` when it is.
 ///
 /// `ResourceRequirement$value`'s own doc pairs the two: "For jobs that are running on
@@ -2186,15 +2241,9 @@ pub fn resource_requirements_of<'a>(
 /// them is incomplete, which is a different rule ("you must specify at least one vCPU", "you
 /// must specify at least 4 MiB of memory") and not this function's.
 pub fn fargate_reservation_refusal(requirements: &[ResourceRequirement]) -> Option<String> {
-    let stated = |resource: &str| {
-        requirements
-            .iter()
-            .find(|requirement| requirement.r#type == resource)
-            .map(|requirement| requirement.value.as_str())
-    };
     let (Some(vcpu), Some(memory)) = (
-        stated(RESOURCE_TYPE_VCPU),
-        stated(RESOURCE_TYPE_MEMORY),
+        stated_resource_value(requirements, RESOURCE_TYPE_VCPU),
+        stated_resource_value(requirements, RESOURCE_TYPE_MEMORY),
     ) else {
         return None;
     };
@@ -3156,8 +3205,18 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                         if !self.job_is_placeable(id) {
                             self.set_job_due(id, None);
                             None
-                        } else if self.image_fetch_of(id).is_some() {
-                            if self.place_job(id) {
+                        } else if let Some(fetch) = self.image_fetch_of(id) {
+                            // WHAT places the job is the capacity its queue offers: capacity
+                            // that can take an Amazon ECS task runs the job's container as
+                            // one, which is a call to that service and not a tick of this
+                            // clock, so the job waits here until that task exists
+                            // ([`ecs_task`]). An image the registry would not serve is never
+                            // run at all, so such a job takes the placement below and ends
+                            // with the fetch failure.
+                            if fetch == ImageFetch::Served && self.task_placement(id).is_some() {
+                                self.arm_task_dispatch(id);
+                                None
+                            } else if self.place_job(id) {
                                 // Placed: the attempt that placement started is recorded with
                                 // the task it was placed as, and the job is reported in
                                 // `STARTING` — where "the relevant container initiation
@@ -3176,6 +3235,19 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                             // a verdict nothing took.
                             None
                         }
+                    }
+                    // A job whose container RUNS as an Amazon ECS task is moved by that task
+                    // and by nothing else: what this clock owes it is the next READ of the
+                    // task ([`ecs_task`]), which the drain of this pass performs, so the due
+                    // instant is pointed at the one after that.
+                    JOB_STARTING | JOB_RUNNING
+                        if self
+                            .jobs
+                            .get(id)
+                            .is_some_and(|job| job.task_dispatch != JobTaskDispatch::Waiting) =>
+                    {
+                        self.set_job_due(id, Some(now + JOB_TASK_POLL_MILLIS));
+                        None
                     }
                     // The container initiation a placement started comes to its end here.
                     // A fetch the registry REFUSED ends it before any container exists, so
@@ -3212,7 +3284,16 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     // it started, and the status it exited with is the status the job ends
                     // on ([`container_run`]).
                     JOB_RUNNING => {
-                        let run = self.container_run_of(id)?;
+                        // A job RUNNING with neither a live task nor a recorded run is one
+                        // whose task is GONE ([`ecs_task`] gives up on a task this service
+                        // can learn nothing more from): its run ended with nothing to report,
+                        // so it ends with the reason that names what was not performed rather
+                        // than resting in a status nothing can move again.
+                        let run = self.container_run_of(id).unwrap_or_else(|| {
+                            ContainerRun::NotPerformed {
+                                reason: container_lost_its_task_reason(),
+                            }
+                        });
                         self.end_running_job(id, &run, due);
                         Some(Advanced::Terminal)
                     }
@@ -3327,6 +3408,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             || self.has_pending_log_streams()
             || self.has_pending_ecs_clusters()
             || self.has_pending_image_fetches()
+            || self.has_pending_job_tasks()
             || self.has_pending_container_runs()
         {
             return Some(now);
@@ -4517,210 +4599,6 @@ const MAX_PUT_EVENTS_ENTRIES: usize = 10;
 /// the changes a realistic burst produces (a job contributes at most three).
 const MAX_PUBLISHED_PER_DRAIN: usize = 50;
 
-/// Publish every job state change this store has recorded onto the account's
-/// default EventBridge bus, and leave the queue empty.
-///
-/// This is Batch's side of the documented, polling-free way to observe a job:
-/// "AWS Batch sends job state change events to EventBridge" with
-/// `source` [`EVENT_SOURCE`] and `detail-type`
-/// [`JOB_STATE_CHANGE_DETAIL_TYPE`] ("AWS Batch events"), so a rule on the
-/// default bus matching that pair reaches its targets. EventBridge is reached the
-/// way any emulated service reaches another: through the in-process callback
-/// ([`smithy_server_runtime::OperationContext::callback`]), so this crate names
-/// no other service crate.
-///
-/// Called by a handler AFTER it has released this store's lock, so no lock is
-/// held across the call. Nothing about the answer changes what the caller is
-/// told: publication is "on a best-effort basis" ("AWS Batch events"), and an
-/// emulator with no EventBridge mounted has nowhere to publish, so a failure is
-/// logged and the operation's own result stands.
-pub async fn publish_job_state_changes<Eng: Send + Sync + 'static>(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    engine: &Eng,
-    region: &str,
-) {
-    publish_pending(ctx.callback(), engine, region).await;
-}
-
-/// [`publish_job_state_changes`] over the callback alone, so the clock pump
-/// ([`drive_job_clock`]) — which outlives the request that started it and has no
-/// `OperationContext` — publishes through exactly the same path a handler does.
-async fn publish_pending<Eng: Send + Sync + 'static>(
-    callback: &smithy_server_runtime::EmbeddedEmulator,
-    engine: &Eng,
-    region: &str,
-) {
-    let Some(state) = service_state(engine) else {
-        return;
-    };
-    // The image fetch a job waiting to be placed needs, answered by the registry that holds
-    // the image, with this store's lock released (see [`image_pull`]). It runs before the
-    // streams and the events below, because the verdict it records is what the placement
-    // ahead of it materialises.
-    settle_job_image_fetches(engine);
-    // The program the container of a job the scheduler has just PLACED runs, performed in
-    // process with this store's lock released (see [`container_run`]). It runs after the
-    // fetch above, because a job is only placed once its image has been answered for, and
-    // before the streams and the events below, because the lines it wrote are delivered to
-    // the job's own log stream.
-    settle_job_container_runs(engine).await;
-    // The clusters backing this store's compute environments, created and deleted where
-    // Amazon ECS holds them, over the same callback (see [`ecs_cluster`]).
-    settle_backing_clusters(callback, &state).await;
-    // The other side effect a job transition leaves for this drain: the CloudWatch Logs
-    // stream a placement named is created where that service holds it, over the same
-    // callback and with this store's lock released (see [`job_logs`]).
-    open_pending_log_streams(callback, &state).await;
-    // The guard is taken and dropped inside this statement: the records are moved
-    // out here so nothing is published twice, and no lock is held across an await.
-    let changes = state.lock().take_pending_events(MAX_PUBLISHED_PER_DRAIN);
-    if changes.is_empty() {
-        return;
-    }
-    let config = ::aws_sdk_eventbridge::Config::builder()
-        .behavior_version(::aws_sdk_eventbridge::config::BehaviorVersion::latest())
-        .http_client(callback.http_client())
-        .credentials_provider(callback.aws_credentials_provider())
-        .region(::aws_sdk_eventbridge::config::Region::new(region.to_string()))
-        .endpoint_url(format!("https://events.{region}.amazonaws.com"))
-        // The transport is in-process: there is nothing to retry, time out or
-        // watch for a stalled stream, and each of those would need a sleep
-        // implementation this client is not given. The same goes for caching the
-        // identity: the credentials are handed over directly.
-        .retry_config(::aws_sdk_eventbridge::config::retry::RetryConfig::disabled())
-        .timeout_config(::aws_sdk_eventbridge::config::timeout::TimeoutConfig::disabled())
-        .identity_cache(::aws_sdk_eventbridge::config::IdentityCache::no_cache())
-        .stalled_stream_protection(
-            ::aws_sdk_eventbridge::config::StalledStreamProtectionConfig::disabled(),
-        )
-        .build();
-    let client = ::aws_sdk_eventbridge::Client::from_conf(config);
-    for window in changes.chunks(MAX_PUT_EVENTS_ENTRIES) {
-        let mut request = client.put_events();
-        for change in window {
-            let entry = ::aws_sdk_eventbridge::types::PutEventsRequestEntry::builder()
-                .event_bus_name(DEFAULT_EVENT_BUS)
-                .source(EVENT_SOURCE)
-                .detail_type(JOB_STATE_CHANGE_DETAIL_TYPE)
-                // The event's `time` is WHEN the job moved, not when this queue was
-                // drained: `PutEventsRequestEntry$Time` is "the time stamp of the
-                // event, per RFC3339. If no time stamp is provided, the time stamp
-                // of the PutEvents call is used."
-                .time(::aws_sdk_eventbridge::primitives::DateTime::from_millis(
-                    change.at,
-                ))
-                // "resources: the job's ARN" — the event names the resource it is
-                // about, which is what a rule filtering on `resources` reads.
-                .resources(&change.job_arn)
-                .detail(change.detail.to_string())
-                .build();
-            request = request.entries(entry);
-        }
-        if let Err(error) = request.send().await {
-            ::tracing::warn!(
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "a Batch job state change could not be published to EventBridge"
-            );
-        }
-    }
-}
-
-/// The shortest one wake-up of the clock pump waits.
-///
-/// A due instant already in the past is materialised on the NEXT wake-up, not on
-/// this one's instant, so the pump always hands the runtime back and a wake-up
-/// that materialises nothing cannot turn the loop into a spin. It is far below
-/// [`JOB_PHASE_MILLIS`], so it never delays a transition noticeably.
-const MIN_CLOCK_WAIT_MILLIS: i64 = 5;
-
-/// The longest one wake-up of the clock pump waits before it looks at the store
-/// again.
-///
-/// Every transition this service owes falls due [`JOB_PHASE_MILLIS`] after the one
-/// before it, so a wait is never near this value; it is a backstop, so a due
-/// instant far in the future cannot park the pump indefinitely.
-const MAX_CLOCK_WAIT_MILLIS: i64 = 5_000;
-
-/// How many wake-ups one pump makes before it stands down.
-///
-/// A backstop, not a budget: the transitions the store owes are already finite
-/// (each job makes at most a handful, and the store is capped by
-/// [`limits::MAX_JOBS`]), and every wake-up either materialises a transition or
-/// clears the due instant that woke it. The cap guarantees termination even if a
-/// later change left a due instant that materialising does not clear, and the next
-/// submit starts a fresh pump.
-const MAX_CLOCK_WAKE_UPS: usize = 10_000;
-
-/// Publish the job state changes the CLOCK owes, as they fall due, with no further
-/// call from anybody.
-///
-/// AWS Batch notifies EventBridge as a job moves, which is the whole point of the
-/// event path: a client that reacts to job completion through EventBridge makes no
-/// further Batch call, so a transition published only by the next reader would
-/// never be published at all. This starts ONE in-process task that waits for the
-/// earliest due instant the store holds, materialises what is then due
-/// ([`ComAmazonawsBatchAwsbatchv20160810State::materialize_due`], the same call
-/// every operation makes) and publishes what that produced, until nothing is owed.
-///
-/// It does not change WHEN a transition happens: `materialize_due` applies only
-/// what the stored due instant has already made due, so a caller reading before
-/// that instant still sees the transient status, and two reads at the same instant
-/// still answer identically. The task waits for the clock so that no request ever
-/// has to.
-///
-/// At most one pump runs per store (the store carries the flag), it is bounded by
-/// [`MAX_CLOCK_WAKE_UPS`] wake-ups, and it exits as soon as the store owes nothing.
-/// With no async runtime to spawn onto there is no pump, and the transitions are
-/// materialised and published by the next operation instead.
-pub fn drive_job_clock<Eng: Send + Sync + 'static>(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    engine: &::std::sync::Arc<Eng>,
-    region: &str,
-) {
-    let Some(state) = service_state(&**engine) else {
-        return;
-    };
-    let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    let Some(generation) = state.lock().start_clock_pump() else {
-        return;
-    };
-    let callback = ctx.callback().clone();
-    let engine = ::std::sync::Arc::clone(engine);
-    let region = region.to_string();
-    let pumped = ::engine::ServiceState::clone(&state);
-    let handle = runtime.spawn(async move {
-        // `true` only if the wake-up cap below is what ended the loop; a pump that
-        // ran out of work has already released its claim inside the one critical
-        // section that observed it (`next_job_due_or_release_pump`).
-        let mut capped = true;
-        for _ in 0..MAX_CLOCK_WAKE_UPS {
-            let Some(due) = state
-                .lock()
-                .next_job_due_or_release_pump(now_millis(), generation)
-            else {
-                capped = false;
-                break;
-            };
-            // Every wake-up waits, even for an instant already past: that is what
-            // keeps the backstop above from ever costing a CPU-bound spin, and it
-            // hands the runtime back between wake-ups.
-            let wait = (due - now_millis()).clamp(MIN_CLOCK_WAIT_MILLIS, MAX_CLOCK_WAIT_MILLIS);
-            ::tokio::time::sleep(::std::time::Duration::from_millis(
-                u64::try_from(wait).unwrap_or(1),
-            ))
-            .await;
-            state.lock().materialize_due(now_millis());
-            publish_pending(&callback, &*engine, &region).await;
-        }
-        if capped {
-            // Only THIS pump's claim, so a pump started since is left holding its own.
-            state.lock().release_clock_pump(generation);
-        }
-    });
-    // The handle is kept so the pump it replaces is aborted rather than merely
-    // forgotten: that is what guarantees no earlier pump task runs beside the one
-    // holding the claim.
-    pumped.lock().set_clock_pump(handle);
-}
+// The job state changes this drain publishes, and the side effects it settles first, live in
+// `job_clock::job_publication`; the clock PUMP that drives them as they fall due lives in
+// `job_clock`.

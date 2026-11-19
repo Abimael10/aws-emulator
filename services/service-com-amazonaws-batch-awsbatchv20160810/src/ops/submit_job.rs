@@ -440,8 +440,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Nothing has fetched this job's container image yet: the fetch is attempted
                 // while the job waits in `RUNNABLE` for capacity (`state::image_pull`).
                 image_fetch: None,
+                // Nothing is owed Amazon ECS for this job yet: the task its container runs as
+                // is owed when the scheduler places it (`state::ecs_task`).
+                task_dispatch: batch::JobTaskDispatch::Waiting,
+                task_attempted_at: None,
+                task_cluster: None,
+                task_arn: None,
+                unanswered_task_reads: 0,
                 // And nothing has performed its container's program: that happens once the
-                // scheduler has placed the job (`state::container_run`).
+                // scheduler has placed the job on capacity no task runs for it
+                // (`state::container_run`).
                 container_run: None,
                 node_properties: definition.node_properties.clone(),
                 retry_strategy: input.retry_strategy.or(definition.retry_strategy),

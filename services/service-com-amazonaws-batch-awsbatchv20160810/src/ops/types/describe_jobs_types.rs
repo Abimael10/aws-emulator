@@ -23,20 +23,17 @@ pub struct DescribeJobsOutput {
     pub jobs: Option<Vec<JobDetail>>,
 }
 
-// `JobDetail` models `startedAt` @required (with `clientOptional`, so every SDK reads it as
-// optional), but AWS Batch does not put it on the wire for a job that never reached
-// `RUNNING`: the member is documented as "when the job transitioned from the STARTING state
-// to the RUNNING state", and every recorded detail of a job that was not placed carries
-// `createdAt` and no `startedAt` at all. A @required member must not be `Option<T>` here, so
-// reporting it at all would mean reporting a 0 a client would read as "started at the epoch"
-// for every job whose container never ran; the member is therefore declared unsupported,
-// which keeps it out of the shape's schema and so out of the body the framework writes. The
-// instant a placed job's container STARTED is reported where the model leaves it optional:
-// `AttemptDetail$startedAt` on the attempt that ran it (`state::container_run`).
-#[smithy_macros::smithy(
-    shape = "com.amazonaws.batch#JobDetail",
-    unsupported = ["startedAt"]
-)]
+// `JobDetail` models `startedAt` @required — "the Unix timestamp (in milliseconds) for when
+// the job was started. More specifically, it's when the job transitioned from the STARTING
+// state to the RUNNING state" — and the recorded detail of a job that DID start carries it, so
+// a job that ran has to report it. A @required member must not be `Option<T>` here, so the
+// member is serialized for every described job and a job whose container never started reports
+// the Long default, 0 — exactly as this service's other @required `startedAt` does for a
+// service job nothing has started yet (`ServiceJobDetail$startedAt`, pinned by
+// `tests/all/service_job_submission.rs`). Nothing is invented by it: the instant a job that
+// started reports is the one its run began at, and 0 is what a @required Long with nothing to
+// report serializes as rather than an instant anything ran at.
+#[smithy_macros::smithy(shape = "com.amazonaws.batch#JobDetail")]
 #[derive(Debug, Clone, Default)]
 pub struct JobDetail {
     pub job_arn: Option<String>,
@@ -50,6 +47,7 @@ pub struct JobDetail {
     pub status_reason: Option<String>,
     pub created_at: Option<i64>,
     pub retry_strategy: Option<RetryStrategy>,
+    pub started_at: i64,
     pub stopped_at: Option<i64>,
     pub depends_on: Option<Vec<JobDependency>>,
     pub job_definition: String,

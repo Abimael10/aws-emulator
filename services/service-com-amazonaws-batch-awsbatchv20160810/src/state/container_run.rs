@@ -335,6 +335,11 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// container initiation is underway — until its outcome is recorded, and only when the
     /// image its container runs was there to be fetched: a fetch the registry refused ended
     /// the initiation before any container was created, so there is no program to perform.
+    ///
+    /// A job whose container RUNS as an Amazon ECS task is not one of them: that task performs
+    /// the program, and everything the job reports of the run is read off it
+    /// ([`super::ecs_task`]), so performing it here as well would run one container's program
+    /// twice. This is the program of a job placed on capacity that can take no task.
     /// Costs one walk of the jobs map, which [`limits::MAX_JOBS`] bounds, and answers at most
     /// [`MAX_CONTAINER_RUNS_PER_DRAIN`] of them.
     pub fn jobs_awaiting_container_run(&self) -> Vec<JobContainerRun> {
@@ -343,6 +348,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .filter(|job| {
                 job.status == JOB_STARTING
                     && job.container_run.is_none()
+                    && job.task_arn.is_none()
                     && matches!(job.image_fetch, Some(ImageFetch::Served) | None)
             })
             .filter_map(|job| {

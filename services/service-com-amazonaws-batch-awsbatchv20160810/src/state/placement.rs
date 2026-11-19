@@ -24,12 +24,15 @@
 //! placed has had no attempt, so the list it reports is EMPTY — present, because an empty
 //! list is what "nothing has run yet" looks like, and a missing member is not that answer.
 //!
-//! What a placed job can report of the RUN is what its container's own program did
-//! ([`container_run`]): the argument vector the container declares is performed in process,
-//! so the attempt a placement starts reports the instant that program started, the status it
-//! exited with and the lines it wrote — and an attempt whose container declared a program
-//! nothing here performs, or whose image the registry would not serve ([`image_pull`]),
-//! reports none of those, because nothing ran.
+//! What a placed job reports OF THE RUN is decided by the CAPACITY it was placed on. Capacity
+//! that can take an Amazon ECS task runs the container as one ([`ecs_task`]), and everything
+//! the attempt then reports — the instant its container started, the instant the task stopped,
+//! the status that container exited with and the elastic network interface the task is reached
+//! on — is read off that task. Capacity that can take none performs the program the container
+//! declares in this process instead ([`container_run`]), so the attempt reports the instant
+//! that program started, the status it exited with and the lines it wrote. Either way an
+//! attempt whose container never ran — a program nothing performed, an image the registry
+//! would not serve ([`image_pull`]) — reports none of those, because nothing ran.
 //! It does carry the log stream its container's output goes to, which the
 //! placement already decides ([`job_log_stream_name`]) — and that stream is MATERIALISED
 //! where CloudWatch Logs holds it, so a client can list, read or delete it
@@ -70,6 +73,11 @@ pub struct JobAttempt {
     /// attempt" — which is also the attempt container's `reason` ("additional details for a
     /// running or stopped container"). `None` while the attempt is still open.
     pub status_reason: Option<String>,
+    /// `AttemptContainerDetail$networkInterfaces`: "the network interfaces associated with
+    /// the container", which is the elastic network interface the task this attempt was made
+    /// for is reached on — read off that task ([`ecs_task`]) and empty for an attempt whose
+    /// task holds none.
+    pub network_interfaces: Vec<NetworkInterface>,
     /// When this attempt ENDED, in epoch milliseconds, or `None` while it is still open.
     ///
     /// Internal bookkeeping, not a modelled member: it is what tells the attempt a job's
@@ -95,7 +103,10 @@ impl JobAttempt {
                 exit_code: self.exit_code,
                 reason: self.status_reason.clone(),
                 log_stream_name: self.log_stream_name.clone(),
-                network_interfaces: None,
+                // Materialised like every other collection of a described job: an attempt
+                // whose task holds no interface reports the EMPTY list, which is what
+                // "nothing is attached" looks like, rather than a missing member.
+                network_interfaces: Some(self.network_interfaces.clone()),
             }),
             started_at: self.started_at,
             stopped_at: self.stopped_at,
@@ -128,8 +139,9 @@ pub(super) fn arn_region(value: &str) -> Option<&str> {
 }
 
 /// The container name AWS Batch gives the single container of a container job, and so the
-/// middle segment of the log stream the `awslogs` driver writes that container to.
-const LOG_STREAM_CONTAINER_NAME: &str = "default";
+/// middle segment of the log stream the `awslogs` driver writes that container to — and the
+/// name of the one container of the Amazon ECS task the job runs as ([`ecs_task`]).
+pub(super) const LOG_STREAM_CONTAINER_NAME: &str = "default";
 
 /// The CloudWatch Logs stream a placed job's container writes to:
 /// `<stream prefix>/default/<ECS task id>`, in the log group the driver delivers to
@@ -170,35 +182,19 @@ pub(super) fn end_open_attempt(job: &mut Job, reason: Option<&str>, at: i64) {
     attempt.stopped_at = Some(at);
 }
 
-/// The `detail` rendering of one attempt for a `Batch Job State Change` event, in the
-/// member names `AttemptDetail` documents — the SAME members the `DescribeJobs` projection
-/// reports, so the two cannot disagree about an attempt.
+/// The `detail` rendering of one attempt for a `Batch Job State Change` event: the SAME
+/// `AttemptDetail` document the `DescribeJobs` projection reports for it ([`Self::detail`]),
+/// walked through the shape's own schema
+/// ([`::service_common::management_events::recorded_shape`]) — AWS documents the event's
+/// detail as the job's details "in the same form as the `DescribeJobs` API returns them", and
+/// ONE rendering is what keeps the two from disagreeing about an attempt, or from one of them
+/// forgetting a member the other reports.
 pub(super) fn attempt_event_detail(attempt: &JobAttempt) -> ::serde_json::Value {
-    use ::serde_json::{json, Map, Value};
-
-    let mut container = Map::new();
-    container.insert("taskArn".to_string(), json!(attempt.task_arn));
-    if let Some(code) = attempt.exit_code {
-        container.insert("exitCode".to_string(), json!(code));
-    }
-    if let Some(reason) = &attempt.status_reason {
-        container.insert("reason".to_string(), json!(reason));
-    }
-    if let Some(name) = &attempt.log_stream_name {
-        container.insert("logStreamName".to_string(), json!(name));
-    }
-    let mut rendered = Map::new();
-    rendered.insert("container".to_string(), Value::Object(container));
-    if let Some(at) = attempt.started_at {
-        rendered.insert("startedAt".to_string(), json!(at));
-    }
-    if let Some(at) = attempt.stopped_at {
-        rendered.insert("stoppedAt".to_string(), json!(at));
-    }
-    if let Some(reason) = &attempt.status_reason {
-        rendered.insert("statusReason".to_string(), json!(reason));
-    }
-    Value::Object(rendered)
+    ::service_common::management_events::recorded_shape(
+        &attempt.detail(),
+        &AttemptDetail::SCHEMA,
+        ::service_common::management_events::WithheldFromRecord::default(),
+    )
 }
 
 impl ComAmazonawsBatchAwsbatchv20160810State {
@@ -246,14 +242,17 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         self.placement_environment(id).is_some()
     }
 
-    /// PLACE `id` on the capacity its queue offers, recording the job attempt the placement
-    /// starts, and answer whether it was placed at all.
+    /// PLACE `id` on the capacity its queue offers under a task this service NAMES itself, and
+    /// answer whether it was placed at all.
     ///
-    /// A placement is what makes a task: the attempt is recorded carrying the ARN of the
-    /// task this job was placed as ("each container attempt receives a task ARN when they
-    /// reach the `STARTING` status"), named under the Amazon ECS cluster backing the compute
-    /// environment that took it ([`ecs_cluster`]), and the log stream that task's container
-    /// writes to ([`job_log_stream_name`], created where CloudWatch Logs holds it by
+    /// The placement of a job whose container an Amazon ECS task RUNS is made by that task
+    /// ([`ecs_task`], which records the placement through [`Self::record_placement`] with the
+    /// ARN that service answered). This is the placement of every other one: capacity no task
+    /// could be placed on, and a run nothing served. The attempt is recorded carrying the ARN
+    /// of the task this job was placed as ("each container attempt receives a task ARN when
+    /// they reach the `STARTING` status"), named under the Amazon ECS cluster backing the
+    /// compute environment that took it ([`ecs_cluster`]), and the log stream that task's
+    /// container writes to ([`job_log_stream_name`], created where CloudWatch Logs holds it by
     /// [`job_logs`]); the job's own container reports the same two — `ContainerDetail$taskArn`
     /// is "the Amazon Resource Name (ARN) of the Amazon ECS task that's associated with the
     /// container job".
@@ -262,7 +261,8 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// image, which the job already carries by the time it is placed ([`image_pull`]): an
     /// image the registry would not serve stops the initiation before any container is
     /// created, while one that is there to be fetched gets the container that runs the
-    /// program the job declared ([`container_run`]).
+    /// program the job declared — as the Amazon ECS task the capacity takes ([`ecs_task`]), or
+    /// performed in this process where it can take none ([`container_run`]).
     /// Either way the task was made, so the stream its container's output goes to
     /// is named and held, and nothing about a RUN is recorded by the placement itself:
     /// the attempt has no exit code and no start instant until the program it runs reaches
@@ -287,13 +287,30 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .and_then(|job| arn_region(&job.job_arn))
             .unwrap_or(DEFAULT_REGION)
             .to_string();
+        let task_id = self.new_uuid().replace('-', "");
+        let task_arn = ecs_task_arn(&region, &cluster, &task_id);
+        self.record_placement(id, task_arn, &task_id, &region);
+        true
+    }
+
+    /// Record the placement of `id` as the task `task_arn`: the attempt it starts, the stream
+    /// that task's container writes to, and the same two on the job's own container.
+    ///
+    /// The ONE place a placement is written, whether this service named the task itself
+    /// ([`Self::place_job`]) or Amazon ECS answered with the task it created for the job
+    /// ([`ecs_task`]) — so an attempt reports the same members however the job was placed.
+    pub(super) fn record_placement(
+        &mut self,
+        id: &str,
+        task_arn: String,
+        task_id: &str,
+        region: &str,
+    ) {
         let definition = self
             .jobs
             .get(id)
             .map(|job| job.job_definition_arn.clone())
             .unwrap_or_default();
-        let task_id = self.new_uuid().replace('-', "");
-        let task_arn = ecs_task_arn(&region, &cluster, &task_id);
         // WHERE that stream is — and whether there is a CloudWatch Logs stream for this
         // container at all — is decided by the log driver the job's container configures
         // ([`job_log_target`]), so a container whose output goes to another driver reports
@@ -305,9 +322,9 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .and_then(|container| container.log_configuration.clone());
         let log_stream_name = job_log_stream_name(
             &job_log_stream_prefix(configuration.as_ref(), &definition),
-            &task_id,
+            task_id,
         );
-        let target = job_log_target(configuration.as_ref(), &log_stream_name, &region);
+        let target = job_log_target(configuration.as_ref(), &log_stream_name, region);
         let reported_stream = target.as_ref().map(|target| target.log_stream.clone());
         if let Some(job) = self.jobs.get_mut(id) {
             job.attempts.push(JobAttempt {
@@ -317,6 +334,9 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                 exit_code: None,
                 log_stream_name: reported_stream.clone(),
                 status_reason: None,
+                // Nothing has read the interface of the task this placement made yet: it is
+                // reported off that task ([`ecs_task`]) once the task reports one.
+                network_interfaces: Vec::new(),
                 ended_at: None,
             });
             if let Some(container) = job.container.as_mut() {
@@ -333,19 +353,20 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         if let Some(target) = target {
             self.queue_log_stream(target);
         }
-        true
     }
 
     /// Move the job the placement just took out of its queue and into `STARTING` at `at`,
-    /// owing its end one span later.
+    /// owing its next step one span later.
     ///
     /// `JobStatus$STARTING` is where "these jobs have been scheduled to a host and the
     /// relevant container initiation operations are underway", which is exactly what a
     /// placement has started: the task exists, the logger its container's output goes to is
     /// initialised, and the image the container runs is fetched. So a placed job is reported
     /// there — never in `RUNNABLE`, which it has left: it is out of its queue's ordering, and
-    /// the jobs behind it move forward at this instant — until the program its container
-    /// declares starts, one span later like every other transition this service owes.
+    /// the jobs behind it move forward at this instant — until what the capacity does with
+    /// that container happens, one span later like every other transition this service owes:
+    /// the next READ of the Amazon ECS task the job runs as ([`ecs_task`]), or the start of
+    /// the program this service performs for a job no task ran ([`container_run`]).
     pub(super) fn start_placed_job(&mut self, id: &str, at: i64) {
         self.advance_queue_positions(id, at);
         if let Some(job) = self.jobs.get_mut(id) {

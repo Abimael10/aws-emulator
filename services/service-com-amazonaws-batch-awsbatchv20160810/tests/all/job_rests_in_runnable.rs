@@ -90,16 +90,20 @@ async fn poll_until_status(batch: &Batch, job_id: &str, status: &str) -> Value {
     detail
 }
 
-/// Assert that `detail` reports a job nothing ran: no `startedAt`, no `stoppedAt` and no
-/// attempt, whatever status it is in.
+/// Assert that `detail` reports a job nothing ran: no `stoppedAt`, no attempt and no start
+/// instant of its own, whatever status it is in. `startedAt` is modelled `@required`, so it
+/// reports the Long default rather than being absent.
 fn assert_nothing_ran(case: &str, detail: &Value) {
-    for member in ["startedAt", "stoppedAt"] {
-        assert_eq!(
-            detail[member],
-            Value::Null,
-            "case {case}: a job nothing ran reports no {member}, got {detail}"
-        );
-    }
+    assert_eq!(
+        detail["startedAt"].as_i64(),
+        Some(0),
+        "case {case}: a job nothing ran invents no startedAt, got {detail}"
+    );
+    assert_eq!(
+        detail["stoppedAt"],
+        Value::Null,
+        "case {case}: a job nothing ran reports no stoppedAt, got {detail}"
+    );
     assert_eq!(
         detail["attempts"].as_array().map(Vec::len),
         Some(0),

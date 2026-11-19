@@ -272,7 +272,7 @@ pub(super) async fn settle_backing_clusters(
 /// CloudWatch Logs client beside it in [`super::job_logs`]): nothing to retry, time out or
 /// watch for a stalled stream, because the transport is in process, and the credentials the
 /// callback hands over are the emulator's own.
-fn ecs_client(
+pub(super) fn ecs_client(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_ecs::Client {

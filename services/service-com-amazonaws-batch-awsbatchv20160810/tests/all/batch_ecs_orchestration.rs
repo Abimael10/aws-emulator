@@ -903,6 +903,13 @@ async fn an_image_no_registry_here_serves_fails_the_job_at_the_fetch() {
             row.refused,
             "case {case}: startedAt belongs to an attempt whose container ran, got {attempt}"
         );
+        // `JobDetail$startedAt` is modelled `@required`, so the job reports the Long default
+        // where its container never started and the instant it began where it did.
+        assert_eq!(
+            detail["startedAt"].as_i64() == Some(0),
+            row.refused,
+            "case {case}: no startedAt is invented for a job nothing ran, got {detail}"
+        );
         assert!(
             detail["stoppedAt"].as_i64().is_some(),
             "case {case}: a placed job reports when its task stopped, got {detail}"

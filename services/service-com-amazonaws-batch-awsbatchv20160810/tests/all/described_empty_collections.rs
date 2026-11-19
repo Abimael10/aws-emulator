@@ -13,7 +13,11 @@
 //! configured. `JobDetail$attempts` is "a list of job attempts that are associated with this
 //! job", so a job that has made none reports `[]` and `len(job["attempts"])` is the evidence
 //! that nothing has run yet. The same holds for the rest of each document: the `tags` map of
-//! a compute environment's resources, and a job's `dependsOn` and `parameters`.
+//! a compute environment's resources, a job's `dependsOn`, `parameters` and `eksAttempts`, and
+//! every list of the CONTAINER a described job reports — `volumes`, `environment`,
+//! `mountPoints`, `ulimits`, `secrets` and the `networkInterfaces` of the task it runs as — so
+//! a client that iterates `container["environment"]` of a container whose definition set none
+//! reads "nothing configured" rather than failing on a member that is not there.
 //!
 //! An absent STRUCTURE is not an empty one, which the unmanaged-environment case pins: an
 //! environment Batch manages no resources for reports no `computeResources` document at all,
@@ -51,6 +55,20 @@ const COMPUTE_RESOURCE_LISTS: &[&str] = &[
 /// here, from `smithy_query(query = "shape", shape = "ContainerDetail")`: the effective
 /// container is reported as the record holds it, which is what the rows below check.
 const CONTAINER_LISTS: &[&str] = &["command", "resourceRequirements"];
+
+/// The LIST members of `ContainerDetail` a described job MATERIALISES, from
+/// `smithy_query(query = "shape", shape = "ContainerDetail")`: the collections a container
+/// job holds nothing in come back present and empty, the way the rest of the document's do.
+/// `command` and `resourceRequirements` are not among them — they are stated by the
+/// definition and asserted as stated beside these.
+const MATERIALISED_CONTAINER_LISTS: &[&str] = &[
+    "volumes",
+    "environment",
+    "mountPoints",
+    "ulimits",
+    "secrets",
+    "networkInterfaces",
+];
 
 /// One row of the compute-environment table: an environment of `compute_type` created with
 /// `resources` as its `computeResources`, whose described collections must be exactly what
@@ -370,6 +388,15 @@ async fn a_described_job_reports_every_collection_of_its_document() {
             Some(&json!({})),
             "case {case}: expected the materialised tags map, got {detail}"
         );
+        // "A list of job attempts that are associated with this job"
+        // (`JobDetail$eksAttempts`): the attempts of a job running as a pod of an Amazon EKS
+        // cluster, of which a container job has none — present and empty, like every other
+        // collection of the document.
+        assert_eq!(
+            list(case, &detail, "eksAttempts").len(),
+            0,
+            "case {case}: expected the materialised eksAttempts list, got {detail}"
+        );
 
         let container = detail
             .get("container")
@@ -377,7 +404,34 @@ async fn a_described_job_reports_every_collection_of_its_document() {
         for member in CONTAINER_LISTS {
             list(case, container, member);
         }
-        // What the job definition and the submit's overrides state is reported as stated.
+        // Every collection the container holds nothing in is present and empty.
+        let overrode_environment = row
+            .extra
+            .pointer("/containerOverrides/environment")
+            .is_some();
+        for member in MATERIALISED_CONTAINER_LISTS {
+            if overrode_environment && *member == "environment" {
+                continue;
+            }
+            assert_eq!(
+                list(case, container, member).len(),
+                0,
+                "case {case}: expected the materialised {member} list, got {container}"
+            );
+        }
+        // What the job definition and the submit's overrides state is reported as stated — and
+        // the submit that overrode no environment leaves the materialised empty list.
+        let wanted_environment = row
+            .extra
+            .pointer("/containerOverrides/environment")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        assert_eq!(
+            container.get("environment"),
+            Some(&wanted_environment),
+            "case {case}: expected the submitted environment override {wanted_environment:?}, \
+             got {container}"
+        );
         assert_eq!(
             container.get("command"),
             Some(&json!(["echo", "hi"])),
@@ -387,13 +441,6 @@ async fn a_described_job_reports_every_collection_of_its_document() {
             list(case, container, "resourceRequirements").len(),
             2,
             "case {case}: expected the definition's two resource requirements, got {container}"
-        );
-        let wanted_environment = row.extra.pointer("/containerOverrides/environment");
-        assert_eq!(
-            container.get("environment"),
-            wanted_environment,
-            "case {case}: expected the submitted environment override {wanted_environment:?}, \
-             got {container}"
         );
     }
 }

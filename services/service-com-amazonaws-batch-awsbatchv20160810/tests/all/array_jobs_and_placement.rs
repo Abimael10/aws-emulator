@@ -170,14 +170,18 @@ async fn submit_ok(fixture: &Fixture, name: &str, extra: Value) -> String {
 /// record itself belongs to the PLACEMENT, not to a run, and what a placed job's attempt
 /// carries is pinned in `job_attempt_records.rs`.
 ///
+/// `JobDetail$startedAt` is modelled `@required`, so a value is serialized for every described
+/// job: a job nothing started reports the Long default, 0, where its ATTEMPT — whose own
+/// `startedAt` the model leaves optional — reports none at all.
+///
 /// `stoppedAt` is NOT one of them: it is when the job's work stopped, which a job the
 /// scheduler placed has — the task it ran as — whatever that task's container got to, so a
 /// placed job reports one and a job no placement took reports none.
 fn assert_nothing_ran(case: &str, detail: &Value) {
     assert_eq!(
-        detail["startedAt"],
-        Value::Null,
-        "case {case}: a job nothing ran reports no startedAt, got {detail}"
+        detail["startedAt"].as_i64(),
+        Some(0),
+        "case {case}: a job nothing ran invents no startedAt, got {detail}"
     );
     let placed = detail["attempts"]
         .as_array()

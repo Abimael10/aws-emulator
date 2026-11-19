@@ -40,8 +40,9 @@
 //!
 //! A reference naming any OTHER registry is not one this emulator holds and so not one it
 //! answers for: nothing is decided about such an image, and the job's container runs the
-//! program it declares exactly as one whose registry served it does ([`container_run`]).
-//! Neither is anything decided when
+//! program it declares exactly as one whose registry served it does — as the Amazon ECS task
+//! the capacity takes ([`super::ecs_task`]) or performed in this process
+//! ([`container_run`]). Neither is anything decided when
 //! the engine carries no store for the registry the reference names at all — an absent store
 //! is not evidence that an image is missing.
 //!

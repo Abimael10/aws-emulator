@@ -59,3 +59,29 @@ pub fn described_compute_resource(resource: &ComputeResource) -> ComputeResource
     }
     described
 }
+
+/// The `container` a reader reports for the stored `container`: the record itself, with its
+/// collections materialised.
+///
+/// Every list member `ContainerDetail` declares that a container job holds nothing in —
+/// `volumes`, `environment`, `mountPoints`, `ulimits`, `secrets` and the
+/// `networkInterfaces` of the task it runs as
+/// (`smithy_query(query = "shape", shape = "ContainerDetail")`) — comes back present and
+/// EMPTY, which is what AWS answers a described job with: a client that iterates the
+/// `environment` of a container whose definition set none reads "nothing configured" rather
+/// than failing on a member that is not there.
+///
+/// `resourceRequirements` is left exactly as stored, because a container job of this service
+/// always states its reservation and an empty list is not what a container with none reads
+/// as; so are the scalars and the nested structures, for the reason this module's header
+/// gives — an absent scalar is not an empty one.
+pub fn described_container(container: &ContainerDetail) -> ContainerDetail {
+    let mut described = container.clone();
+    materialize_list(&mut described.volumes);
+    materialize_list(&mut described.environment);
+    materialize_list(&mut described.mount_points);
+    materialize_list(&mut described.ulimits);
+    materialize_list(&mut described.secrets);
+    materialize_list(&mut described.network_interfaces);
+    described
+}

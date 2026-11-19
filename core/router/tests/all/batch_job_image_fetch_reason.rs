@@ -822,6 +822,13 @@ async fn a_placed_job_reports_what_the_fetch_of_its_image_answered() {
             "case {case:?}: the exit code belongs to a container that exited, got {:?}",
             attempts[0]
         );
+        // `JobDetail$startedAt` is modelled `@required`, so a job whose container never
+        // started reports the Long default rather than being absent.
+        assert_eq!(
+            detail["startedAt"].as_i64() == Some(0),
+            *refused,
+            "case {case:?}: no startedAt is invented for a job nothing ran, got {detail}"
+        );
         assert_eq!(
             attempts[0]["startedAt"].is_null(),
             *refused,
