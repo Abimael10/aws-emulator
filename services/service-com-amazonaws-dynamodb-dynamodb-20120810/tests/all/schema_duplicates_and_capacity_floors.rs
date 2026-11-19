@@ -18,8 +18,10 @@
 //!    AttributeDefinitions must include the key element(s) of the new index" —
 //!    `UpdateTable$AttributeDefinitions`), and which refusal it earns follows from what
 //!    the request declared: one that declares no definition at all is told the MEMBER it
-//!    is missing and the index that needed it, while one that declares some, but not the
-//!    index's key attributes, is told what each of the two lists holds;
+//!    is missing and the index that needed it; one that declares fewer definitions than
+//!    the new index's key has elements is told the element left without one; and one that
+//!    declares at least as many, but not the index's key attributes, is told what each of
+//!    the two lists holds;
 //! 3. warm throughput is "the minimum provisioned capacity maintained for immediate data
 //!    access" (the `TableWarmThroughputDescription` doc), so it is a FLOOR a capacity move
 //!    only ever RAISES: a pair nobody named rises, per dimension, to the capacity the
@@ -49,10 +51,10 @@ use crate::emulator::{call, describe_when_active, emulator, error_code, index_na
 const DUPLICATE_KEY_ATTRIBUTE: &str =
     "Both the Hash Key and the Range Key element in the KeySchema have the same name";
 
-/// AWS's fixed sentence for a key schema with fewer attribute definitions than elements:
-/// a TABLE's own key schema naming an attribute `AttributeDefinitions` does not declare
-/// while every definition declared is used, and a SECONDARY INDEX's key schema that names
-/// one attribute twice.
+/// AWS's fixed sentence for a key schema the request declared fewer attribute definitions
+/// than it has elements for: a schema naming an attribute `AttributeDefinitions` does not
+/// declare where the request declared too few definitions to have one per element, and a
+/// schema that names one attribute twice in the same circumstance.
 const KEY_WITHOUT_DEFINITION: &str = "Invalid KeySchema: Some index key attribute have no \
                                       definition";
 
@@ -263,8 +265,9 @@ async fn a_key_schema_naming_one_attribute_twice_is_refused_in_one_wording() {
 
     // A schema that repeats an attribute NOTHING DECLARES is refused for the missing
     // definition: the repeat is settled only once every element has its definition. One
-    // row per schema kind, and both state the missing definition in the same wording — the
-    // two lists, the key schema's names (each once) beside the declared ones.
+    // row per schema kind, and the sentence each earns is the one the COUNT the request
+    // declared selects — fewer definitions than the schema has elements is the element
+    // left without one, and at least as many is the two lists.
     let (status, body) = call(
         &router,
         "CreateTable",
@@ -278,10 +281,32 @@ async fn a_key_schema_naming_one_attribute_twice_is_refused_in_one_wording() {
     .await;
     assert_eq!(
         refusal("a repeated table key attribute with no definition", status, &body),
-        "One or more parameter values were invalid: Some index key attributes are not defined in \
-         AttributeDefinitions. Keys: [id], AttributeDefinitions: []",
+        KEY_WITHOUT_DEFINITION,
         "case \"a repeated table key attribute with no definition\": expected the missing \
          definition to be refused first, got {body}"
+    );
+    // The same repeat with as many definitions declared as the schema has elements: enough
+    // of them were stated for the schema, so the refusal reports both lists.
+    let (status, body) = call(
+        &router,
+        "CreateTable",
+        json!({
+            "TableName": "undefined_duplicate_table_key_two_definitions",
+            "BillingMode": "PAY_PER_REQUEST",
+            "KeySchema": [key("id", "HASH"), key("id", "RANGE")],
+            "AttributeDefinitions": definitions(&["elsewhere", "other"]),
+        }),
+    )
+    .await;
+    let stated = refusal(
+        "a repeated table key attribute with two definitions declared",
+        status,
+        &body,
+    );
+    assert!(
+        stated.starts_with(UNDECLARED_INDEX_KEYS),
+        "case \"a repeated table key attribute with two definitions declared\": expected the \
+         two lists, got {stated:?}"
     );
     let (status, body) = call(
         &router,
@@ -299,11 +324,13 @@ async fn a_key_schema_naming_one_attribute_twice_is_refused_in_one_wording() {
         }),
     )
     .await;
-    let stated = refusal("a repeated index key attribute with no definition", status, &body);
-    assert!(
-        stated.starts_with(UNDECLARED_INDEX_KEYS),
+    // One definition for a two-element index key schema: fewer than it has elements, so
+    // the element left without one is the fact stated.
+    assert_eq!(
+        refusal("a repeated index key attribute with no definition", status, &body),
+        KEY_WITHOUT_DEFINITION,
         "case \"a repeated index key attribute with no definition\": expected the missing \
-         definition to be refused first, got {stated:?}"
+         definition to be refused first, got {body}"
     );
 
     // The control: the same schemas over DISTINCT attributes are accepted, and the stored
@@ -343,7 +370,11 @@ async fn a_key_schema_naming_one_attribute_twice_is_refused_in_one_wording() {
 enum Expected {
     /// The request declared nothing, so the refusal names the MEMBER and the index.
     MemberMissing,
-    /// The request declared something, so the refusal reports both lists.
+    /// The request declared fewer definitions than the index's key has elements, so one
+    /// element is left with no definition whatever the names say.
+    ElementWithoutDefinition,
+    /// The request declared at least as many definitions as the index's key has elements,
+    /// so the refusal reports both lists.
     BothLists,
     /// The request declared the index's whole key, so the index is created.
     Accepted,
@@ -362,8 +393,9 @@ struct IndexRow {
 }
 
 /// The rows span how much of the new index's key the request declares — nothing at all,
-/// an empty list, an unrelated name, part of the key, the whole key — and the number of
-/// key elements the index is built on.
+/// an empty list, an unrelated name, part of the key, part of it beside an unrelated name,
+/// the whole key — and the number of key elements the index is built on against the number
+/// of definitions the request declares.
 const INDEX_TABLE: &[IndexRow] = &[
     IndexRow {
         case: "no AttributeDefinitions member at all",
@@ -395,6 +427,14 @@ const INDEX_TABLE: &[IndexRow] = &[
         index: "by-status",
         keys: &[("order_id", "HASH"), ("status", "RANGE")],
         declared: Some(&["order_id"]),
+        expected: Expected::ElementWithoutDefinition,
+    },
+    IndexRow {
+        case: "one key attribute declared beside an unrelated name",
+        name: "definitions_partial_and_unrelated",
+        index: "by-status",
+        keys: &[("order_id", "HASH"), ("status", "RANGE")],
+        declared: Some(&["order_id", "unrelated"]),
         expected: Expected::BothLists,
     },
     IndexRow {
@@ -481,6 +521,13 @@ async fn an_update_that_creates_an_index_is_refused_by_what_it_declared() {
                         row.index
                     ),
                     "case {case:?}: expected the missing member and the index named, got {body}"
+                );
+            }
+            Expected::ElementWithoutDefinition => {
+                assert_eq!(
+                    refusal(case, status, &body),
+                    KEY_WITHOUT_DEFINITION,
+                    "case {case:?}: expected the element left without a definition, got {body}"
                 );
             }
             Expected::BothLists => {

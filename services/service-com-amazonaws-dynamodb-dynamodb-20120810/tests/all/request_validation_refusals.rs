@@ -500,13 +500,17 @@ async fn an_index_a_request_adds_declares_its_key_attributes() {
         // WHICH refusal it earns follows from what the request DECLARED. A request that
         // declares no definition at all states nothing for the two lists to be compared
         // over, so AWS names the MEMBER that is missing and the index that needed it; one
-        // that declares some names both lists — the index's whole key schema, and the
-        // attributes the request declared.
+        // that declares fewer definitions than the index's key has elements cannot have
+        // one per element, so it is told the element left without one; and one that
+        // declares at least as many names both lists — the index's whole key schema, and
+        // the attributes the request declared.
         let expected = if declared_names.is_empty() {
             format!(
                 "One or more parameter values were invalid: AttributeDefinitions is not \
                  specified for index: {index}"
             )
+        } else if declared_names.len() < keys.len() {
+            "Invalid KeySchema: Some index key attribute have no definition".to_string()
         } else {
             format!(
                 "One or more parameter values were invalid: Some index key attributes are not \

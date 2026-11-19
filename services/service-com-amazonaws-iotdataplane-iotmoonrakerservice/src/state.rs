@@ -170,24 +170,40 @@ pub fn too_many_topic_bytes(max_bytes: usize) -> String {
     format!("Topic can't contain more than {max_bytes} bytes")
 }
 
+/// Why `topic` is not one concrete topic at all, or `None` when it names one.
+///
+/// MQTT keeps the single-level (`+`) and multi-level (`#`) wildcards for topic FILTERS,
+/// which only a subscription may be: a string carrying either matches a SET of topics and
+/// so identifies none, whatever store or destination the request meant it as. The rule is
+/// therefore about a topic's IDENTITY and holds on every path that takes a topic as one
+/// topic — the paths that deliver a message to it ([`topic_name_refusal`]) and the ones
+/// that resolve it as a key — and it is the only topic rule the latter borrow: the
+/// broker's publish-time ceilings below bound what it will CARRY, so a name past them is
+/// a name nothing could be stored under rather than no name at all.
+pub fn topic_filter_refusal(topic: &str) -> Option<String> {
+    if topic.contains('+') || topic.contains('#') {
+        return Some(INVALID_TOPIC_FILTER.to_string());
+    }
+    None
+}
+
 /// Why the broker will not publish to `topic`, or `None` when the name is one it will.
 ///
 /// The rule is the MQTT topic-NAME rule, which holds wherever a topic names the
 /// destination of one message rather than a subscription's filter: a name carrying a
-/// wildcard is a FILTER and not a name, a name may not carry more levels than
-/// [`MAX_TOPIC_PARTS`], and a name may not be longer than [`MAX_TOPIC_BYTES`]. Each
-/// condition has its own message naming its own limit, so a caller is told which ceiling
-/// it crossed; the limits are independent, so a name of legal depth is still weighed
-/// against the byte ceiling.
+/// wildcard is a FILTER and not a name at all ([`topic_filter_refusal`]), a name may not
+/// carry more levels than [`MAX_TOPIC_PARTS`], and a name may not be longer than
+/// [`MAX_TOPIC_BYTES`]. Each condition has its own message naming its own limit, so a
+/// caller is told which ceiling it crossed; the limits are independent, so a name of legal
+/// depth is still weighed against the byte ceiling.
 ///
 /// This is the rule of the paths that DELIVER a message (`Publish`, `SendDirectMessage`).
-/// A path that only resolves a topic as a store key does not borrow it: a name this
-/// function refuses can hold nothing, so a read of it reports absence.
+/// A path that only resolves a topic as a store key borrows the IDENTITY rule alone: a
+/// name past one of the two ceilings can hold nothing, so a read of it reports absence.
 pub fn topic_name_refusal(topic: &str) -> Option<String> {
-    // MQTT forbids the single-level (`+`) and multi-level (`#`) wildcards in a publish
-    // topic: a topic carrying one is a topic FILTER, which only a subscription may be.
-    if topic.contains('+') || topic.contains('#') {
-        return Some(INVALID_TOPIC_FILTER.to_string());
+    // A string carrying an MQTT wildcard is a topic filter and not a topic name.
+    if let Some(refusal) = topic_filter_refusal(topic) {
+        return Some(refusal);
     }
     // A topic name is a path of levels separated by `/`, and the broker bounds how many
     // levels one carries.

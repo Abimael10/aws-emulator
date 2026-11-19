@@ -14,10 +14,14 @@
 //! 2. a key element is resolved to the attribute it keys on BEFORE the role that element
 //!    plays is read: a schema naming an attribute `AttributeDefinitions` does not declare
 //!    is refused for the missing definition whatever its key types say, and whatever else
-//!    the declaration carries — a definition no key schema uses does not change the
-//!    sentence, which reports the whole key schema beside every declared attribute name. A
-//!    schema whose elements are all declared is then held to the roles, which is the refusal
-//!    that names the element;
+//!    the declaration carries. WHICH sentence states that follows from the COUNT the
+//!    request declared: fewer definitions than the schema has elements cannot be one per
+//!    element, so the fact is the element left with no definition, in a sentence that
+//!    interpolates nothing; at least as many definitions means the request stated enough
+//!    of them and got the NAMES wrong, so it is told both lists — the whole key schema
+//!    beside every declared attribute name — and a definition no key schema uses does not
+//!    change that. A schema whose elements are all declared is then held to the roles,
+//!    which is the refusal that names the element;
 //! 3. an INDEX key schema of the kind that admits SEVERAL keys of a role — a global
 //!    secondary index, with "up to 4 partition keys and up to 4 sort keys"
 //!    (`CreateTable$GlobalSecondaryIndexes`) — that carries more of a role than it admits
@@ -114,10 +118,17 @@ fn over_length(key_schema: &[(&str, &str)]) -> String {
 
 /// AWS's sentence for a key element the request declares no definition for, up to the two
 /// bracketed lists that follow it: the whole key schema at fault, then every declared
-/// attribute name.
+/// attribute name. Stated for a request that declared at least as many definitions as the
+/// schema has elements.
 const UNDEFINED_KEY_PREFIX: &str =
     "One or more parameter values were invalid: Some index key attributes are not defined in \
      AttributeDefinitions. Keys: [";
+
+/// AWS's fixed sentence for a schema the request declared FEWER definitions than it has
+/// elements for: one of them is left with no definition of its own whatever the names say,
+/// and the sentence interpolates nothing.
+const KEY_WITHOUT_DEFINITION: &str = "Invalid KeySchema: Some index key attribute have no \
+                                      definition";
 
 /// Assert `said` is that sentence, over exactly the key schema's attribute names and exactly
 /// the declared ones. The ORDER each list is rendered in is a property of the names, pinned
@@ -254,26 +265,30 @@ async fn a_primary_key_past_the_two_elements_it_admits_is_refused_over_the_submi
 }
 
 /// RULE 2: rows differ in which element has no definition, what key type that element
-/// claims, and whether the request also declares a definition no key schema uses.
+/// claims, how many definitions the request declares against the number of elements the
+/// schema has, and whether the request also declares a definition no key schema uses.
 #[tokio::test]
 async fn a_key_element_with_no_definition_is_refused_before_the_role_it_claims_is_read() {
     let router = emulator();
-    let rows: [DefinitionRow<'_>; 5] = [
+    let rows: [DefinitionRow<'_>; 8] = [
         (
+            // The recorded case: one definition for a two-element schema.
             "a sort key with no definition, in the role its position requires",
             "KeyRoleDefinedFirst",
             &[("pk", "HASH"), ("sk", "RANGE")],
             &["pk"],
-            None,
+            Some(KEY_WITHOUT_DEFINITION),
         ),
         (
             "a second element claiming the partition role, with no definition",
             "KeyRoleSecondHash",
             &[("pk", "HASH"), ("other", "HASH")],
             &["pk"],
-            None,
+            Some(KEY_WITHOUT_DEFINITION),
         ),
         (
+            // The same schema with one more definition declared: the request has stated
+            // enough of them for the schema, so both lists are reported.
             "the same, with a definition no key schema uses declared beside it",
             "KeyRoleSecondHashAndExtra",
             &[("pk", "HASH"), ("other", "HASH")],
@@ -281,11 +296,32 @@ async fn a_key_element_with_no_definition_is_refused_before_the_role_it_claims_i
             None,
         ),
         (
+            "a schema with more definitions declared than it has elements",
+            "KeyRoleSpareDefinitions",
+            &[("pk", "HASH"), ("other", "RANGE")],
+            &["pk", "spare", "another"],
+            None,
+        ),
+        (
+            "a one-element schema with one definition, of another name",
+            "KeyRoleOneForOne",
+            &[("only", "HASH")],
+            &["elsewhere"],
+            None,
+        ),
+        (
             "the FIRST element claiming the sort role, with no definition",
             "KeyRoleFirstRange",
             &[("only", "RANGE")],
             &[],
-            None,
+            Some(KEY_WITHOUT_DEFINITION),
+        ),
+        (
+            "a two-element schema the request declares nothing for",
+            "KeyRoleNothingDeclared",
+            &[("pk", "HASH"), ("sk", "RANGE")],
+            &[],
+            Some(KEY_WITHOUT_DEFINITION),
         ),
         (
             // Every element is declared, so what is left to read is the ROLE each one

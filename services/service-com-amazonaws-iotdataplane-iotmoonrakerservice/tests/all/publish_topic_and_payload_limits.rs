@@ -18,7 +18,9 @@
 //!   and not one). A name of legal depth is still weighed against the byte ceiling. The
 //!   READ path draws a different conclusion from the same name: it resolves the topic as
 //!   a store key, so a name no publish could store under is reported absent —
-//!   `ResourceNotFoundException` (HTTP 404) — and not malformed.
+//!   `ResourceNotFoundException` (HTTP 404) — and not malformed. A string carrying an MQTT
+//!   wildcard is the one exception, because it names no single topic to resolve at all:
+//!   both paths refuse it (`super::refusal_wording` holds that rule).
 //!
 //! Every limit is named by the crate (`state::MAX_PUBLISH_PAYLOAD_BYTES`,
 //! `state::MAX_TOPIC_PARTS`, `state::MAX_TOPIC_BYTES`) and every message by the crate's
@@ -284,32 +286,52 @@ async fn a_publish_topic_is_weighed_against_the_part_and_the_byte_ceiling() {
                     case.name,
                     message(&answer)
                 );
-                // A name the broker refused is a name nothing can be stored under, so
-                // the READ of it reports absence rather than borrowing the refusal.
+                // A name the broker refused for a CEILING is a name nothing can be stored
+                // under, so the READ of it reports absence rather than borrowing the
+                // refusal; a string carrying a wildcard names no topic to read at all, so
+                // the read refuses it with the same sentence.
+                let names_one_topic = !case.topic.contains('+') && !case.topic.contains('#');
                 let read = harness.get_retained_message(&encoded).await;
+                let (expected_status, expected_code) = if names_one_topic {
+                    (404, "ResourceNotFoundException")
+                } else {
+                    (400, "InvalidRequestException")
+                };
                 assert_eq!(
                     read.status,
-                    404,
-                    "case {:?}: expected the read of a name no publish could store to be \
-                     404, got {} with body {}",
+                    expected_status,
+                    "case {:?}: expected the read of this string to be {expected_status}, \
+                     got {} with body {}",
                     case.name,
                     read.status,
                     String::from_utf8_lossy(&read.body)
                 );
                 assert_eq!(
                     read.error_code(),
-                    "ResourceNotFoundException",
-                    "case {:?}: expected ResourceNotFoundException on the read, got {}",
+                    expected_code,
+                    "case {:?}: expected {expected_code} on the read, got {}",
                     case.name,
                     String::from_utf8_lossy(&read.body)
                 );
-                assert_ne!(
-                    message(&read),
-                    *expected,
-                    "case {:?}: expected the read NOT to answer the publish refusal, got {:?}",
-                    case.name,
-                    message(&read)
-                );
+                if names_one_topic {
+                    assert_ne!(
+                        message(&read),
+                        *expected,
+                        "case {:?}: expected the read NOT to answer the publish refusal, \
+                         got {:?}",
+                        case.name,
+                        message(&read)
+                    );
+                } else {
+                    assert_eq!(
+                        message(&read),
+                        *expected,
+                        "case {:?}: expected the read to refuse the filter with \
+                         {expected:?}, got {:?}",
+                        case.name,
+                        message(&read)
+                    );
+                }
                 // …and the refused publish retained nothing under that name, which the
                 // listing observes independently of the read.
                 let listed = retained_topics(&harness).await;

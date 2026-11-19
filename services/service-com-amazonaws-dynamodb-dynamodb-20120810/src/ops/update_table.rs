@@ -1672,10 +1672,11 @@ fn retained_definitions(
 /// names the MEMBER that is missing and the index that needed it
 /// ([`definitions_required_message`]) — the wording every member an index of this service
 /// requires is stated with ([`crate::state::index_capacity_required_message`] for its
-/// capacity pair). A request that declares some, but not the index's key attributes, is
-/// told what each of the two lists holds, which is the one sentence a key attribute with
-/// no definition earns wherever a schema declares one
-/// ([`super::create_table::undefined_schema_keys`]).
+/// capacity pair). A request that declares some, but not the index's key attributes, earns
+/// the sentence a key attribute with no definition earns wherever a schema declares one,
+/// chosen by the same count ([`super::create_table::undefined_key_refusal`]): both lists
+/// where the request declared at least as many definitions as the index's key has
+/// elements, and the element left without a definition where it declared fewer.
 fn check_index_definitions(
     index_name: &str,
     key_schema: &[KeySchemaElement],
@@ -1697,7 +1698,7 @@ fn check_index_definitions(
             definitions_required_message(index_name),
         ));
     }
-    Err(super::create_table::undefined_schema_keys(
+    Err(super::create_table::undefined_key_refusal(
         key_schema,
         requested_definitions,
     ))

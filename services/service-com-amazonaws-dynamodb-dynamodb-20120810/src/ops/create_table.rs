@@ -1116,16 +1116,15 @@ pub fn validated_key_schema(
             .find(|definition| definition.attribute_name == name)
         else {
             // A key element the request declares no definition for has no attribute to key
-            // on, and DynamoDB states that with its parameter-value sentence over the two
-            // lists the caller has to reconcile: the WHOLE key schema this element belongs
-            // to and the attribute names the request defined
-            // ([`undefined_schema_keys`]) — the same sentence a SECONDARY INDEX's key
-            // schema earns for the same defect, since the table's primary key is a key
-            // schema like any other. It reads the same whatever else the declaration
-            // carries: a request that also defines an attribute no schema uses breaks two
+            // on, and WHICH sentence states that follows from the COUNT the request
+            // declared against the number of elements this schema has
+            // ([`undefined_key_refusal`]) — the table's primary key is a key schema like
+            // any other here, and earns the same two sentences a SECONDARY INDEX's key
+            // schema does. Whether the declaration carries anything else does not enter
+            // it: a request that also defines an attribute no schema uses breaks two
             // rules, and this is the one it is told about, because a key with nothing
             // declared for it is what the primary key itself cannot be built from.
-            return Err(undefined_schema_keys(&key_schema, &definitions));
+            return Err(undefined_key_refusal(&key_schema, &definitions));
         };
         if !matches!(definition.attribute_type.as_str(), "S" | "N" | "B") {
             return Err(crate::state::RequestError::Validation(format!(
@@ -1162,7 +1161,7 @@ pub fn validated_key_schema(
     // AFTER the elements have been paired with their definitions: each element is resolved
     // to the attribute it keys on before the ROLE that element plays is read, so a schema
     // naming an attribute the request declares no definition for is refused for the missing
-    // definition whatever its key types say ([`undefined_schema_keys`]) — a key
+    // definition whatever its key types say ([`undefined_key_refusal`]) — a key
     // with nothing declared for it has no attribute to key on at all, which is the earlier
     // defect of the two.
     validated_key_type_order(None, &key_schema, crate::state::MAX_TABLE_PARTITION_KEYS)?;
@@ -1633,10 +1632,12 @@ pub(crate) fn validated_index_key_schema(
             .iter()
             .find(|definition| definition.attribute_name == name)
         else {
-            // The WHOLE key schema of this index is named, not just the attributes with
-            // no definition: AWS reports the keys the index is built on beside the
-            // attribute names the request defined, so the caller sees both lists.
-            return Err(undefined_schema_keys(key_schema, definitions));
+            // The same two sentences a TABLE's own key schema earns, chosen the same way
+            // ([`undefined_key_refusal`]): a request that declared at least as many
+            // definitions as this schema has elements is told both lists — the keys the
+            // index is built on beside the attribute names the request defined — and one
+            // that declared fewer is told the element left with no definition.
+            return Err(undefined_key_refusal(key_schema, definitions));
         };
         if !matches!(definition.attribute_type.as_str(), "S" | "N" | "B") {
             return Err(crate::state::RequestError::Validation(format!(
@@ -1752,11 +1753,14 @@ pub(crate) const THROUGHPUT_WITHOUT_PROVISIONED_MESSAGE: &str =
     "One or more parameter values were invalid: ProvisionedThroughput must be specified when \
      BillingMode is PROVISIONED";
 
-/// AWS's fixed text for a key schema left with fewer attribute definitions than it has
-/// elements: a key schema that names one attribute in two of its elements, which leaves one
-/// of them with no definition of its own ([`check_distinct_key_attributes`]). The sentence
-/// interpolates nothing. A schema naming an attribute `AttributeDefinitions` simply does not
-/// declare is refused over the two lists instead ([`undefined_schema_keys`]).
+/// AWS's fixed text for a key schema the request declared fewer attribute definitions
+/// than it has elements for: a schema that names one attribute in two of its elements,
+/// which leaves one of them with no definition of its own
+/// ([`check_distinct_key_attributes`]), and a schema naming an attribute nothing declares
+/// where the request declared too few definitions to have one per element
+/// ([`undefined_key_refusal`]). The sentence interpolates nothing. A schema whose request
+/// declared at least as many definitions as it has elements is refused over the two lists
+/// instead ([`undefined_schema_keys`]).
 pub(crate) const KEY_WITHOUT_DEFINITION_MESSAGE: &str =
     "Invalid KeySchema: Some index key attribute have no definition";
 
@@ -1767,6 +1771,31 @@ pub(crate) const HASH_AFTER_RANGE_MESSAGE: &str =
     "One or more parameter values were invalid: All HASH key attributes must precede RANGE key \
      attributes in the KeySchema";
 
+/// The refusal one key schema earns for an element `AttributeDefinitions` does not
+/// declare, in the wording the COUNT the request declared selects.
+///
+/// A request that declares FEWER `AttributeDefinitions` entries than the schema at fault
+/// has elements cannot have one per element whatever the names say, so the fact stated is
+/// the element left with no definition at all, in a sentence that interpolates nothing
+/// ([`KEY_WITHOUT_DEFINITION_MESSAGE`]). A request that declared at least as many has
+/// stated enough definitions for the schema and got the NAMES wrong, so it is told what
+/// each of the two lists holds and has to reconcile them ([`undefined_schema_keys`]).
+///
+/// This is the one comparison that settles every key-schema sentence of a declaration —
+/// the same count that decides which sentence a REPEATED key attribute earns
+/// ([`check_distinct_key_attributes`]) — and it holds for each schema the declaration
+/// carries: the table's own primary key and every secondary index's key, which draw their
+/// definitions from the one `AttributeDefinitions` list the request declared.
+pub(crate) fn undefined_key_refusal(
+    key_schema: &[KeySchemaElement],
+    definitions: &[AttributeDefinition],
+) -> crate::state::RequestError {
+    if definitions.len() < key_schema.len() {
+        return crate::state::RequestError::Validation(KEY_WITHOUT_DEFINITION_MESSAGE.to_string());
+    }
+    undefined_schema_keys(key_schema, definitions)
+}
+
 /// The refusal for KEY attributes `AttributeDefinitions` does not declare: AWS's
 /// parameter-value template over the WHOLE key schema the request declared and the
 /// attribute names it defined.
@@ -1776,9 +1805,9 @@ pub(crate) const HASH_AFTER_RANGE_MESSAGE: &str =
 /// the caller which of the two lists to extend — and the definitions are the ones the
 /// request declared. Neither list is in the order the request stated it
 /// ([`hash_table_order`]). A TABLE's own primary key is a key schema like any other and is
-/// refused with this same sentence; only a schema that REPEATS an attribute has a fixed
-/// sentence of its own ([`KEY_WITHOUT_DEFINITION_MESSAGE`],
-/// [`DUPLICATE_KEY_ATTRIBUTE_MESSAGE`]).
+/// refused with this same sentence; which requests reach it is [`undefined_key_refusal`]'s
+/// count, and the sentences a schema earns instead are
+/// [`KEY_WITHOUT_DEFINITION_MESSAGE`] and [`DUPLICATE_KEY_ATTRIBUTE_MESSAGE`].
 pub(crate) fn undefined_schema_keys(
     key_schema: &[KeySchemaElement],
     definitions: &[AttributeDefinition],

@@ -9,14 +9,15 @@
 //! * The broker's over-size refusal states the published PAYLOAD CEILING and nothing of
 //!   the request that crossed it: one fixed sentence, the same for every over-size
 //!   message, so a client matching it reads one number — the limit it has to shrink to.
-//! * The broker's topic-name rules belong to the paths that DELIVER a message. A
-//!   retained-message read resolves the topic as a store key and nothing else, so every
-//!   name holding no retained message — one carrying an MQTT subscription wildcard or
-//!   past the broker's part or byte ceiling just as much as a well-formed one — is
-//!   `ResourceNotFoundException` (HTTP 404) with the service's fixed not-found sentence,
-//!   never `InvalidRequestException` (HTTP 400). The 400-vs-404 distinction is the whole
-//!   signal: a 400 would tell a caller to stop retrying a probe that simply found
-//!   nothing, and a publish to the same name keeps answering its own 400.
+//! * A topic a retained-message read resolves has to BE one topic: a string carrying an
+//!   MQTT subscription wildcard matches a set of topics and identifies none, so the read
+//!   refuses it `InvalidRequestException` (HTTP 400) with the same sentence the publish
+//!   path answers it with. The broker's publish-time part and byte CEILINGS are not
+//!   borrowed: they bound what the broker carries, so a name past one of them is a key
+//!   the store holds nothing under and is `ResourceNotFoundException` (HTTP 404) with the
+//!   service's fixed not-found sentence, exactly as a well-formed absent name is. The
+//!   400-vs-404 distinction is the whole signal: a 404 tells a caller its probe found
+//!   nothing, while a 400 tells it the string it asked about is no topic to probe.
 //! * A shadow name in this service's reserved `$` namespace is not a name a client may
 //!   address — on the write path or on either read path — and is refused
 //!   `InvalidRequestException` (HTTP 400) naming the shadow the request asked for. Only
@@ -105,11 +106,14 @@ async fn an_oversize_payload_refusal_states_the_ceiling_and_nothing_of_the_reque
     }
 }
 
-/// One topic name the broker will not take, and the message it is refused with.
+/// One topic name the broker will not take, the message it is refused with, and whether
+/// the string names ONE topic at all — a name past a ceiling does, a topic filter does
+/// not, which is what the read path draws its own line on.
 struct MalformedTopic {
     name: &'static str,
     topic: String,
     expected: String,
+    one_topic: bool,
 }
 
 fn malformed_topics() -> Vec<MalformedTopic> {
@@ -124,67 +128,80 @@ fn malformed_topics() -> Vec<MalformedTopic> {
             name: "a trailing multi-level wildcard under a base topic",
             topic: "fleet-telemetry/#".to_string(),
             expected: filter.clone(),
+            one_topic: false,
         },
         MalformedTopic {
             name: "a bare multi-level wildcard",
             topic: "#".to_string(),
             expected: filter.clone(),
+            one_topic: false,
         },
         MalformedTopic {
             name: "a bare single-level wildcard",
             topic: "+".to_string(),
             expected: filter.clone(),
+            one_topic: false,
         },
         MalformedTopic {
             name: "a single-level wildcard between levels",
             topic: "fleet-telemetry/+/temperature".to_string(),
             expected: filter.clone(),
+            one_topic: false,
         },
         MalformedTopic {
             name: "a single-level wildcard inside a level",
             topic: "fleet+telemetry".to_string(),
             expected: filter.clone(),
+            one_topic: false,
         },
         MalformedTopic {
             name: "a multi-level wildcard inside a level",
             topic: "fleet#telemetry".to_string(),
             expected: filter,
+            one_topic: false,
         },
         MalformedTopic {
             name: "one level past the part ceiling",
             topic: name_of_parts(MAX_TOPIC_PARTS + 1),
             expected: too_deep.clone(),
+            one_topic: true,
         },
         MalformedTopic {
             name: "far past the part ceiling",
             topic: name_of_parts(3 * MAX_TOPIC_PARTS),
             expected: too_deep,
+            one_topic: true,
         },
         MalformedTopic {
             name: "one byte past the byte ceiling",
             topic: "y".repeat(MAX_TOPIC_BYTES + 1),
             expected: too_long.clone(),
+            one_topic: true,
         },
         MalformedTopic {
             name: "far past the byte ceiling",
             topic: "z".repeat(4 * MAX_TOPIC_BYTES),
             expected: too_long,
+            one_topic: true,
         },
         MalformedTopic {
             // The ceiling counts BYTES, so a two-byte character costs two of them.
             name: "multi-byte characters past the byte ceiling in bytes, not in characters",
             topic: "é".repeat(MAX_TOPIC_BYTES / 2 + 1),
             expected: format!("Topic can't contain more than {MAX_TOPIC_BYTES} bytes"),
+            one_topic: true,
         },
         MalformedTopic {
             name: "past both ceilings at once",
             topic: name_of_parts(MAX_TOPIC_PARTS + 1) + &"z".repeat(MAX_TOPIC_BYTES),
             expected: format!("Topic can't contain more than {MAX_TOPIC_PARTS} parts"),
+            one_topic: true,
         },
         MalformedTopic {
             name: "a wildcard on a name that is also too deep",
             topic: name_of_parts(MAX_TOPIC_PARTS + 2) + "/#",
             expected: "Invalid topic filter".to_string(),
+            one_topic: false,
         },
     ]
 }
@@ -194,7 +211,7 @@ fn malformed_topics() -> Vec<MalformedTopic> {
 const RETAINED_MESSAGE_NOT_FOUND: &str = "Retained message not found";
 
 #[tokio::test]
-async fn a_retained_message_read_reports_absence_for_a_name_the_broker_would_not_publish_to() {
+async fn a_retained_message_read_refuses_a_filter_and_reports_absence_past_a_ceiling() {
     let harness = Harness::new();
 
     // A legal sibling under the same base, so the contrast is between two reads that
@@ -239,38 +256,43 @@ async fn a_retained_message_read_reports_absence_for_a_name_the_broker_would_not
             message(&published)
         );
 
-        // …and the read path's, which reports the store and not the broker's rules: the
-        // name the publish was refused for can hold nothing, so it is absent.
+        // …and the read path's, which asks only whether the string names ONE topic. A
+        // topic filter names none, so the read refuses it with the publish path's own
+        // sentence; a name past a ceiling names one the store simply holds nothing under.
         let read = harness.get_retained_message(&encoded).await;
+        let (expected_status, expected_code, expected_message) = if case.one_topic {
+            (404, "ResourceNotFoundException", RETAINED_MESSAGE_NOT_FOUND)
+        } else {
+            (400, "InvalidRequestException", case.expected.as_str())
+        };
         assert_eq!(
             read.status,
-            404,
-            "case {:?}: expected the read of a name no publish could store to be 404, got \
-             {} with body {}",
+            expected_status,
+            "case {:?}: expected the read of this name to be {expected_status}, got {} with \
+             body {}",
             case.name,
             read.status,
             String::from_utf8_lossy(&read.body)
         );
         assert_eq!(
             read.error_code(),
-            "ResourceNotFoundException",
-            "case {:?}: expected ResourceNotFoundException on the read, got {}",
+            expected_code,
+            "case {:?}: expected {expected_code} on the read, got {}",
             case.name,
             String::from_utf8_lossy(&read.body)
         );
         assert_eq!(
             message(&read),
-            RETAINED_MESSAGE_NOT_FOUND,
-            "case {:?}: expected the fixed not-found sentence, got {:?}",
+            expected_message,
+            "case {:?}: expected {expected_message:?}, got {:?}",
             case.name,
             message(&read)
         );
-        // The not-found answer is one fixed sentence: it carries neither the name the
-        // caller asked about nor the ceiling the publish path would have named.
+        // Either answer is one fixed sentence: neither carries the name the caller asked
+        // about.
         assert!(
-            !message(&read).contains(&case.topic) && message(&read) != case.expected,
-            "case {:?}: expected nothing of the request or of the publish refusal in the \
-             not-found answer, got {:?}",
+            !message(&read).contains(&case.topic),
+            "case {:?}: expected nothing of the request in the refusal, got {:?}",
             case.name,
             message(&read)
         );
@@ -284,8 +306,8 @@ async fn a_retained_message_read_reports_absence_for_a_name_the_broker_would_not
         );
     }
 
-    // A name the broker WOULD publish to and that holds nothing answers exactly the
-    // same, so the read path draws no distinction between the two kinds of absence.
+    // A name the broker WOULD publish to and that holds nothing answers the same as one
+    // past a ceiling, so the read path draws its line at whether the string names a topic.
     for (case, topic) in [
         ("a legal sibling under the same base", "fleet-telemetry/never"),
         ("a single-character name", "q"),
@@ -334,18 +356,20 @@ async fn a_retained_message_read_reports_absence_for_a_name_the_broker_would_not
     );
 }
 
-/// One topic name, and whether the broker's PUBLISH path takes it. The read path's
-/// answer is not a function of this flag: it is a function of the store alone.
+/// One topic name, whether the broker's PUBLISH path takes it, and whether the string
+/// names ONE topic. The read path's answer is not a function of the publish flag: for a
+/// name it is a function of the store alone, and for a filter it is the refusal.
 struct ReadKeyCase {
     name: String,
     topic: String,
     publishable: bool,
+    one_topic: bool,
 }
 
 /// Rows spanning what the rule generalises over — how many `/`-separated levels the name
 /// carries, how many bytes it is, and whether it carries an MQTT wildcard — with a row at
-/// each published ceiling and past it. The recorded case, a name one level past the part
-/// ceiling, is one row among them.
+/// each published ceiling and past it. The recorded cases, a name one level past the part
+/// ceiling and a trailing multi-level wildcard, are two rows among them.
 fn read_key_cases() -> Vec<ReadKeyCase> {
     let mut cases = Vec::new();
     for parts in [
@@ -360,6 +384,7 @@ fn read_key_cases() -> Vec<ReadKeyCase> {
             name: format!("{parts} `/`-separated level(s)"),
             topic: name_of_parts(parts),
             publishable: parts <= MAX_TOPIC_PARTS,
+            one_topic: true,
         });
     }
     for bytes in [
@@ -373,6 +398,7 @@ fn read_key_cases() -> Vec<ReadKeyCase> {
             name: format!("a single level of {bytes} byte(s)"),
             topic: "n".repeat(bytes),
             publishable: bytes <= MAX_TOPIC_BYTES,
+            one_topic: true,
         });
     }
     for (name, topic) in [
@@ -383,41 +409,49 @@ fn read_key_cases() -> Vec<ReadKeyCase> {
             name: name.to_string(),
             topic: topic.to_string(),
             publishable: false,
+            one_topic: false,
         });
     }
     cases
 }
 
 #[tokio::test]
-async fn a_retained_message_read_answers_from_the_store_whatever_the_topics_shape() {
+async fn a_retained_message_read_answers_from_the_store_for_every_topic_name() {
     let harness = Harness::new();
 
     for case in read_key_cases() {
         let encoded = encode_component(&case.topic);
+        // What a read of this string answers while the store holds nothing for it: a name
+        // is absent, a filter is no topic to probe.
+        let (empty_status, empty_code, empty_message) = if case.one_topic {
+            (404, "ResourceNotFoundException", RETAINED_MESSAGE_NOT_FOUND)
+        } else {
+            (400, "InvalidRequestException", "Invalid topic filter")
+        };
 
-        // Nothing is retained yet, so every name — one the broker would publish to and
-        // one it would not — is absent, with the one fixed not-found sentence.
+        // Nothing is retained yet, so every NAME — one the broker would publish to and
+        // one past a ceiling alike — is absent, with the one fixed not-found sentence.
         let before = harness.get_retained_message(&encoded).await;
         assert_eq!(
             before.status,
-            404,
-            "case {:?}: expected an empty store to answer 404 for every name, got {} with \
-             body {}",
+            empty_status,
+            "case {:?}: expected an empty store to answer {empty_status} for this string, got \
+             {} with body {}",
             case.name,
             before.status,
             String::from_utf8_lossy(&before.body)
         );
         assert_eq!(
             before.error_code(),
-            "ResourceNotFoundException",
-            "case {:?}: expected ResourceNotFoundException, got {}",
+            empty_code,
+            "case {:?}: expected {empty_code}, got {}",
             case.name,
             String::from_utf8_lossy(&before.body)
         );
         assert_eq!(
             message(&before),
-            RETAINED_MESSAGE_NOT_FOUND,
-            "case {:?}: expected the fixed not-found sentence, got {:?}",
+            empty_message,
+            "case {:?}: expected {empty_message:?}, got {:?}",
             case.name,
             message(&before)
         );
@@ -436,27 +470,28 @@ async fn a_retained_message_read_answers_from_the_store_whatever_the_topics_shap
                 published.status,
                 String::from_utf8_lossy(&published.body)
             );
-            // …and the read still reports the store, which the refusal left empty.
+            // …and the read answers exactly as it did before it, the refusal having
+            // stored nothing.
             assert_eq!(
                 after.status,
-                404,
-                "case {:?}: expected the read to stay 404 after the refused publish, got {} \
-                 with body {}",
+                empty_status,
+                "case {:?}: expected the read to stay {empty_status} after the refused \
+                 publish, got {} with body {}",
                 case.name,
                 after.status,
                 String::from_utf8_lossy(&after.body)
             );
             assert_eq!(
                 after.error_code(),
-                "ResourceNotFoundException",
-                "case {:?}: expected ResourceNotFoundException, got {}",
+                empty_code,
+                "case {:?}: expected {empty_code}, got {}",
                 case.name,
                 String::from_utf8_lossy(&after.body)
             );
             assert_eq!(
                 message(&after),
-                RETAINED_MESSAGE_NOT_FOUND,
-                "case {:?}: expected the fixed not-found sentence, got {:?}",
+                empty_message,
+                "case {:?}: expected {empty_message:?}, got {:?}",
                 case.name,
                 message(&after)
             );
@@ -659,6 +694,188 @@ async fn an_ordinary_shadow_name_round_trips_whatever_its_form() {
         assert!(
             names.contains(&(*name).to_string()),
             "case {name:?}: expected the accepted shadow name among {names:?}"
+        );
+    }
+}
+
+/// Strings carrying an MQTT wildcard, spanning which wildcard it is, where it sits
+/// (alone, leading, between levels, trailing, inside a level), how many the string
+/// carries, and what the rest of the string looks like. The recorded case, a multi-level
+/// wildcard on the leaf of a base topic, is one row among them.
+const TOPIC_FILTERS: &[(&str, &str)] = &[
+    // The recorded case.
+    ("a multi-level wildcard on the leaf of a base topic", "fleet-telemetry/#"),
+    ("a bare multi-level wildcard", "#"),
+    ("a bare single-level wildcard", "+"),
+    ("a single-level wildcard as the leaf", "sensors/plant-1/+"),
+    ("a single-level wildcard between levels", "sensors/+/temperature"),
+    ("a single-level wildcard as the first level", "+/temperature"),
+    ("a multi-level wildcard inside a level", "fleet#telemetry"),
+    ("a single-level wildcard inside a level", "fleet+telemetry"),
+    ("both wildcards in one string", "sensors/+/readings/#"),
+    ("two single-level wildcards", "+/+"),
+    ("a wildcard past the part ceiling too", "a/b/c/d/e/f/g/h/i/#"),
+    ("a wildcard beside a multi-byte level", "temperatur-mäßig/+"),
+];
+
+/// Topic NAMES the read path resolves against the store. The first rows carry the
+/// characters that NEIGHBOUR `+` (0x2B) and `#` (0x23) in the ASCII table — `*`, `,`, `"`,
+/// `$` — so no row can pass by refusing a whole character class, and the rest vary the
+/// depth, the width and the alphabet of the name.
+const TOPIC_NAMES: &[(&str, &str)] = &[
+    ("an asterisk, the character below `+`", "sensors/*/temperature"),
+    ("a comma, the character above `+`", "sensors/,/temperature"),
+    ("a quote, the character below `#`", "sensors/\"/temperature"),
+    ("a dollar outside the first position", "sensors/$batch/temperature"),
+    ("a single level", "heartbeat"),
+    ("a deep name", "a/b/c/d/e/f/g/h"),
+    ("a multi-byte name", "temperatur-mäßig/温度"),
+    ("the word hash spelt out", "fleet-telemetry/hash"),
+    ("the word plus spelt out", "fleet-telemetry/plus"),
+];
+
+#[tokio::test]
+async fn a_retained_message_read_refuses_every_topic_filter() {
+    let harness = Harness::new();
+
+    // A retained message under the base the first rows filter on, so a refusal cannot be
+    // read as "the store is empty": the filter would MATCH this topic if a filter were a
+    // key.
+    let stored = harness
+        .publish(
+            &encode_component("fleet-telemetry/leaf"),
+            1,
+            true,
+            None,
+            b"leaf".to_vec(),
+        )
+        .await;
+    assert_eq!(
+        stored.status,
+        200,
+        "the setup publish must be accepted, got {} with body {}",
+        stored.status,
+        String::from_utf8_lossy(&stored.body)
+    );
+
+    for (case, topic) in TOPIC_FILTERS {
+        let read = harness.get_retained_message(&encode_component(topic)).await;
+        assert_eq!(
+            read.status,
+            400,
+            "case {case:?}: expected the filter {topic:?} to be refused 400, got {} with \
+             body {}",
+            read.status,
+            String::from_utf8_lossy(&read.body)
+        );
+        assert_eq!(
+            read.error_code(),
+            "InvalidRequestException",
+            "case {case:?}: expected InvalidRequestException for {topic:?}, got {}",
+            String::from_utf8_lossy(&read.body)
+        );
+        assert_eq!(
+            message(&read),
+            "Invalid topic filter",
+            "case {case:?}: expected the filter sentence, got {:?}",
+            message(&read)
+        );
+        // One fixed sentence: it carries nothing of the string the caller sent.
+        assert!(
+            !message(&read).contains(topic),
+            "case {case:?}: expected nothing of {topic:?} in the refusal, got {:?}",
+            message(&read)
+        );
+    }
+
+    // The refused reads neither consumed nor cleared the retained message the filters
+    // would have matched: the read path reports, it does not write.
+    let read = harness
+        .get_retained_message(&encode_component("fleet-telemetry/leaf"))
+        .await;
+    assert_eq!(
+        read.status,
+        200,
+        "expected the retained message to still be readable, got {} with body {}",
+        read.status,
+        String::from_utf8_lossy(&read.body)
+    );
+    assert_eq!(
+        read.json().get("topic").and_then(Value::as_str),
+        Some("fleet-telemetry/leaf"),
+        "expected the stored topic back, got {}",
+        String::from_utf8_lossy(&read.body)
+    );
+}
+
+#[tokio::test]
+async fn a_retained_message_read_resolves_every_topic_name_against_the_store() {
+    let harness = Harness::new();
+
+    for (case, topic) in TOPIC_NAMES {
+        let encoded = encode_component(topic);
+        // Nothing is retained under it yet, so the name is ABSENT — the answer a probe
+        // reads as "nothing here", which no name may be refused with instead.
+        let absent = harness.get_retained_message(&encoded).await;
+        assert_eq!(
+            absent.status,
+            404,
+            "case {case:?}: expected the unretained name {topic:?} to be 404, got {} with \
+             body {}",
+            absent.status,
+            String::from_utf8_lossy(&absent.body)
+        );
+        assert_eq!(
+            absent.error_code(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException for {topic:?}, got {}",
+            String::from_utf8_lossy(&absent.body)
+        );
+        assert_eq!(
+            message(&absent),
+            RETAINED_MESSAGE_NOT_FOUND,
+            "case {case:?}: expected the fixed not-found sentence, got {:?}",
+            message(&absent)
+        );
+
+        // …and once a publish retains one under the same name, the same read answers from
+        // the store, so the name is a key the whole way through.
+        let published = harness
+            .publish(&encoded, 1, true, None, case.as_bytes().to_vec())
+            .await;
+        assert_eq!(
+            published.status,
+            200,
+            "case {case:?}: expected the broker to take {topic:?}, got {} with body {}",
+            published.status,
+            String::from_utf8_lossy(&published.body)
+        );
+        let read = harness.get_retained_message(&encoded).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: expected the retained message under {topic:?} to be readable, \
+             got {} with body {}",
+            read.status,
+            String::from_utf8_lossy(&read.body)
+        );
+        assert_eq!(
+            read.json().get("topic").and_then(Value::as_str),
+            Some(*topic),
+            "case {case:?}: expected the stored topic back, got {}",
+            String::from_utf8_lossy(&read.body)
+        );
+        let payload = read
+            .json()
+            .get("payload")
+            .and_then(Value::as_str)
+            .map(|encoded| aws_smithy_types::base64::decode(encoded).expect("base64"))
+            .unwrap_or_default();
+        assert_eq!(
+            payload,
+            case.as_bytes(),
+            "case {case:?}: expected the published payload back, got {:?}",
+            String::from_utf8_lossy(&payload)
         );
     }
 }

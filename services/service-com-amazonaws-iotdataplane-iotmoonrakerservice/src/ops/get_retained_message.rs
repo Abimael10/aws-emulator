@@ -5,12 +5,14 @@
 //! topic: the payload byte-for-byte as published, its QoS, its user properties and
 //! when it was stored. A topic with no retained message is a 404.
 //!
-//! The topic is the retained-message store's KEY on this path, so the key is resolved
-//! and nothing else: the broker's publish-time topic-name ceilings and its topic-filter
-//! rule belong to the paths that deliver a message, and a name they would refuse can
-//! hold no retained message at all. Such a name is therefore ABSENT rather than
-//! malformed, and this operation answers its modelled 404 for it, which is what tells a
-//! caller probing a topic that nothing is retained there.
+//! The topic is the retained-message store's KEY on this path, so what is asked of it is
+//! that it be one topic: a string carrying an MQTT subscription wildcard matches a SET of
+//! topics and identifies none, so it is MALFORMED on this path as much as on the paths
+//! that deliver a message, and this operation answers its modelled 400 for it. The
+//! broker's publish-time topic-name CEILINGS are not borrowed: they bound what the broker
+//! will carry, so a name past one of them is a key nothing could have been stored under
+//! and is reported ABSENT with the modelled 404, which is what tells a caller probing a
+//! topic that nothing is retained there.
 //!
 //! ## Shape of an operation
 //!
@@ -169,13 +171,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The topic is a STORE KEY here, not a message destination: this operation only
-        // reports what is retained under it, so the lookup alone decides the answer and
-        // the broker's publish-time topic-name ceilings (`crate::state::topic_name_refusal`)
-        // are not applied. A name the broker would refuse to publish to can hold nothing,
-        // so it is simply absent — which is why the key is resolved first and a name that
-        // holds no retained message is the operation's modelled not-found, whatever its
-        // shape.
+        // The topic is a STORE KEY here, but a key still has to BE one topic: a string
+        // carrying an MQTT wildcard is a topic filter, which matches a set of topics and
+        // names none, so it is not a retained message's identity on this path any more
+        // than it is a publish destination (`crate::state::topic_filter_refusal`, the one
+        // place that rule lives). The broker's publish-time ceilings
+        // (`crate::state::topic_name_refusal`) are NOT applied: they bound what the broker
+        // carries, so a name past one of them is simply a key the store holds nothing
+        // under, which is the lookup's own answer below.
+        if let Some(refusal) = crate::state::topic_filter_refusal(&input.topic) {
+            return Err(GetRetainedMessageErrorModeled::InvalidRequestException(
+                InvalidRequestException::new(refusal),
+            )
+            .into());
+        }
+
         let guard = state.lock();
         // Reporting only: reading a retained message does not consume it — MQTT keeps
         // a retained message until it is overwritten or cleared.

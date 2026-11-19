@@ -12,8 +12,11 @@
 //!    the one at fault;
 //! 2. a TABLE's own key schema naming an attribute `AttributeDefinitions` does not declare
 //!    is refused with the SAME parameter-value sentence a secondary index's is — the whole
-//!    key schema beside the declared attribute names — and reads the same whatever else the
-//!    declaration carries, including a definition no key schema uses;
+//!    key schema beside the declared attribute names — whenever the request declared at
+//!    least as many definitions as that schema has elements, and reads the same whatever
+//!    else the declaration carries, including a definition no key schema uses. (A request
+//!    that declared FEWER definitions than the schema has elements earns the fixed sentence
+//!    instead; `super::table_key_schema_declaration_refusals` spans that count.);
 //! 3. an INDEX key schema naming one is refused with the parameter-value sentence that
 //!    carries the index's whole key schema beside the declared attribute names — and
 //!    NEITHER list is in the order the request stated it, so the same names declared in
@@ -234,26 +237,27 @@ async fn a_partition_key_after_a_sort_key_is_refused_with_the_order_rule() {
 
 /// Rule 2: a TABLE key attribute with no definition earns the same parameter-value sentence a
 /// secondary index's does — the whole key schema beside every declared definition — whatever
-/// else the declaration carries.
+/// else the declaration carries, for a request that declared at least as many definitions as
+/// the schema has elements.
 #[tokio::test]
 async fn a_table_key_with_no_definition_reports_both_lists() {
     let router = emulator();
 
-    // Rows differ along WHICH element has no definition, the number of definitions the
-    // request declares, what consumes them, and whether the request ALSO declares a
+    // Rows differ along WHICH element has no definition, how long the schema is, what
+    // consumes the definitions declared beside it, and whether the request ALSO declares a
     // definition no key schema uses: the key with nothing declared for it is the fact
     // stated either way.
     let rows: [(&str, Keys, Names, bool); 5] = [
         (
-            "the sort key has no definition",
-            &[("pk", "HASH"), ("sk", "RANGE")],
-            &["pk"],
+            "the only element has no definition",
+            &[("pk", "HASH")],
+            &["other"],
             false,
         ),
         (
             "the partition key has no definition",
             &[("Alpha", "HASH"), ("Beta", "RANGE")],
-            &["Beta"],
+            &["Beta", "Gamma"],
             false,
         ),
         (
