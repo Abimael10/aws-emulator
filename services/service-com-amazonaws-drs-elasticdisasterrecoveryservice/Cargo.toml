@@ -37,6 +37,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 # Declares tests/all/main.rs's suite modules, one per tests/all/<name>.rs.
 automod = { workspace = true }
+# Percent-encodes a tag key into a query value the way a client does, so a test can send
+# a key holding reserved or non-ASCII characters without hand-rolling the escaping.
+percent-encoding = "2"
 sha2 = { workspace = true }
 # Shipped by the scaffold; left declared so this crate's Cargo.lock entry stays
 # exactly the generated one.

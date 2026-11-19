@@ -13294,6 +13294,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "percent-encoding",
  "serde_json",
  "service-com-amazonaws-ec2-amazonec2",
  "service-common",
