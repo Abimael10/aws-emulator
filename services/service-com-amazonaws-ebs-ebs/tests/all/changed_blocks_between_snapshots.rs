@@ -36,6 +36,13 @@
 //!    block tokens and reports the instant they expire together with the geometry of the
 //!    blocks it reported; a page that reports no changed block hands out no token and omits
 //!    `ExpiryTime`, `VolumeSize` and `BlockSize` altogether.
+//! 7. A REPORTED TOKEN IS THE ONE ITS OWN SIDE HANDS OUT: the token reported for a side at a
+//!    changed index is a token of THAT snapshot, so `GetSnapshotBlock` on that snapshot at
+//!    that index answers with exactly the bytes that side holds there, and the token of the
+//!    other side names no block of it.
+//! 8. A COMPARISON IS A READ: it changes nothing a later caller sees — repeating it answers
+//!    the same thing, and each side still lists and serves the same blocks under the same
+//!    tokens afterwards.
 //!
 //! Each table row is a distinct input along what the rules generalise over — how the two
 //! snapshots are related (parent/child, two generations, two siblings, a snapshot against
@@ -47,8 +54,8 @@ use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::snapshot_block_loop::{
-    block_bytes, checksum, complete_snapshot, member, put_block, router, send, start_snapshot,
-    Reply, BLOCK_SIZE,
+    block_bytes, checksum, complete_snapshot, get_block, list_blocks, listed_blocks, member,
+    put_block, router, send, start_snapshot, Reply, BLOCK_SIZE,
 };
 
 /// The HTTP status the modelled `ValidationException` carries (`@httpError 400`).
@@ -974,5 +981,372 @@ async fn a_page_with_no_changed_block_omits_the_token_members() {
             reply.json()
         );
         assert_token_members(case, &reply, !expected.is_empty(), volume_size);
+    }
+}
+
+/// The reason the modelled `ValidationException` carries for a `blockToken` that names no
+/// block of the snapshot the request addressed (`ValidationExceptionReason`).
+const INVALID_BLOCK_TOKEN_REASON: &str = "INVALID_BLOCK_TOKEN";
+
+/// One row of the token table: the case, the first side's id and the `(block index, byte
+/// seed)` pairs it holds, then the second side's id and the pairs it holds.
+///
+/// The content each side holds is what a token reported for it must read back, so the row
+/// states it rather than the answer being compared with itself.
+type TokenRow<'a> = (&'a str, &'a str, Vec<(i32, u8)>, &'a str, Vec<(i32, u8)>);
+
+/// The byte seed a side holds at `block_index`, or `None` when it holds no block there.
+fn seed_at(blocks: &[(i32, u8)], block_index: i32) -> Option<u8> {
+    blocks
+        .iter()
+        .find(|(index, _)| *index == block_index)
+        .map(|(_, seed)| *seed)
+}
+
+/// Every index at which the two sides do not hold the same bytes, ascending: the union of
+/// their indexes, minus the ones both hold the same seed at.
+fn differing_indexes(first: &[(i32, u8)], second: &[(i32, u8)]) -> Vec<i32> {
+    let mut indexes: Vec<i32> = first
+        .iter()
+        .chain(second.iter())
+        .map(|(index, _)| *index)
+        .collect();
+    indexes.sort_unstable();
+    indexes.dedup();
+    indexes
+        .into_iter()
+        .filter(|index| seed_at(first, *index) != seed_at(second, *index))
+        .collect()
+}
+
+/// RULE 7, for one reported token: reading `block_index` of `snapshot_id` with it answers
+/// with exactly the bytes `seed` names, and the geometry derived from those bytes.
+async fn assert_token_reads_back(
+    router: &MultiServiceRouter,
+    case: &str,
+    side: &str,
+    snapshot_id: &str,
+    block_index: i32,
+    block_token: &str,
+    seed: u8,
+) {
+    let expected = block_bytes(seed);
+    let fetched = get_block(router, snapshot_id, block_index, block_token).await;
+    assert_eq!(
+        fetched.status,
+        200,
+        "case {case:?}: the {side} token for block {block_index} must read that block of \
+         {snapshot_id} back, got {} with body {}",
+        fetched.status,
+        String::from_utf8_lossy(&fetched.body)
+    );
+    assert!(
+        fetched.body == expected,
+        "case {case:?}: the {side} token for block {block_index} must read the bytes that side \
+         holds, got {} bytes with checksum {:?}",
+        fetched.body.len(),
+        checksum(&fetched.body)
+    );
+    assert_eq!(
+        fetched.header("x-amz-Checksum"),
+        checksum(&expected),
+        "case {case:?}: the {side} read of block {block_index} must report the checksum of \
+         those bytes, got {:?}",
+        fetched.header("x-amz-Checksum")
+    );
+    assert_eq!(
+        fetched.header("x-amz-Data-Length"),
+        BLOCK_SIZE.to_string(),
+        "case {case:?}: the {side} read of block {block_index} must report the stored length, \
+         got {:?}",
+        fetched.header("x-amz-Data-Length")
+    );
+}
+
+/// RULE 7, the other half: `block_token` names no block of `snapshot_id` at `block_index`,
+/// so the read is refused as an invalid block token and hands out no bytes.
+async fn assert_token_names_no_block(
+    router: &MultiServiceRouter,
+    case: &str,
+    note: &str,
+    snapshot_id: &str,
+    block_index: i32,
+    block_token: &str,
+) {
+    let fetched = get_block(router, snapshot_id, block_index, block_token).await;
+    assert_eq!(
+        fetched.status, VALIDATION_STATUS,
+        "case {case:?}: {note} must be refused, got {} with body {}",
+        fetched.status,
+        String::from_utf8_lossy(&fetched.body)
+    );
+    assert_eq!(
+        fetched.error_code(),
+        VALIDATION_ERROR_TYPE,
+        "case {case:?}: {note} must be refused as a validation error, got {:?}",
+        fetched.error_code()
+    );
+    assert_eq!(
+        member(&fetched, "Reason"),
+        INVALID_BLOCK_TOKEN_REASON,
+        "case {case:?}: {note} must be refused as an invalid block token, got {}",
+        fetched.json()
+    );
+}
+
+/// The `(block index, block token)` pairs `ListSnapshotBlocks` reports for `snapshot_id`.
+async fn listing_of(
+    router: &MultiServiceRouter,
+    case: &str,
+    snapshot_id: &str,
+) -> Vec<(i32, String)> {
+    let reply = list_blocks(router, snapshot_id, "").await;
+    assert_eq!(
+        reply.status,
+        200,
+        "case {case:?}: ListSnapshotBlocks of {snapshot_id} must answer 200, got {} with body {}",
+        reply.status,
+        String::from_utf8_lossy(&reply.body)
+    );
+    listed_blocks(&reply)
+}
+
+/// RULE 7: every token a comparison reports belongs to the side it was reported for — it
+/// reads that side's own bytes back through `GetSnapshotBlock`, and it names no block of the
+/// other side.
+///
+/// One lineage is built once — an empty base, a parent taken from it, a child of the parent
+/// that rewrites one block and adds one, a grandchild that rewrites another, and a second
+/// child of the parent — and the rows compare different pairs of it, so the rows differ along
+/// how the two sides are related (parent/child, the same pair reversed, two generations, two
+/// siblings, a snapshot against an ancestor that holds nothing), along which indexes each side
+/// holds, and along whether the changed index is held by one side or by both with other bytes.
+#[tokio::test]
+async fn each_reported_token_reads_its_own_sides_bytes_back() {
+    let router = router();
+    let case = "the lineage whose tokens are read back";
+
+    // The base holds nothing. The parent holds 0 and 5. The child inherits both, rewrites 5
+    // with other bytes and adds 9. The grandchild inherits all three and rewrites 0. The
+    // sibling inherits the parent's two and rewrites 5 with bytes of its own.
+    let base = sealed_snapshot(&router, case, 2, None, &[]).await;
+    let parent = sealed_snapshot(&router, case, 2, Some(&base), &[(0, 61), (5, 62)]).await;
+    let child = sealed_snapshot(&router, case, 2, Some(&parent), &[(5, 63), (9, 64)]).await;
+    let grandchild = sealed_snapshot(&router, case, 2, Some(&child), &[(0, 65)]).await;
+    let sibling = sealed_snapshot(&router, case, 2, Some(&parent), &[(5, 66)]).await;
+
+    // What each snapshot HOLDS, inherited blocks included: a snapshot taken from a parent
+    // starts with the parent's blocks, and its own writes replace them at the indexes it
+    // wrote.
+    let parent_blocks = vec![(0, 61), (5, 62)];
+    let child_blocks = vec![(0, 61), (5, 63), (9, 64)];
+    let grandchild_blocks = vec![(0, 65), (5, 63), (9, 64)];
+    let sibling_blocks = vec![(0, 61), (5, 66)];
+
+    let rows: Vec<TokenRow<'_>> = vec![
+        (
+            "a child that rewrote one block and added one",
+            parent.as_str(),
+            parent_blocks.clone(),
+            child.as_str(),
+            child_blocks.clone(),
+        ),
+        (
+            "the same pair with the two sides swapped",
+            child.as_str(),
+            child_blocks.clone(),
+            parent.as_str(),
+            parent_blocks.clone(),
+        ),
+        (
+            "two generations apart",
+            parent.as_str(),
+            parent_blocks.clone(),
+            grandchild.as_str(),
+            grandchild_blocks.clone(),
+        ),
+        (
+            "two siblings of one parent",
+            sibling.as_str(),
+            sibling_blocks.clone(),
+            child.as_str(),
+            child_blocks.clone(),
+        ),
+        (
+            "an ancestor that holds nothing",
+            base.as_str(),
+            Vec::new(),
+            child.as_str(),
+            child_blocks.clone(),
+        ),
+    ];
+
+    for (case, first, first_blocks, second, second_blocks) in rows {
+        let reply = compared(&router, case, first, second, "").await;
+        let blocks = reported(&reply);
+        let expected = differing_indexes(&first_blocks, &second_blocks);
+        let indexes: Vec<i32> = blocks.iter().map(|block| block.block_index).collect();
+        assert_eq!(
+            indexes, expected,
+            "case {case:?}: expected the changed indexes {expected:?}, got {}",
+            reply.json()
+        );
+
+        for block in &blocks {
+            let index = block.block_index;
+            let first_seed = seed_at(&first_blocks, index);
+            let second_seed = seed_at(&second_blocks, index);
+            assert_eq!(
+                block.first_block_token.is_some(),
+                first_seed.is_some(),
+                "case {case:?}: block {index} must carry a FirstBlockToken exactly when the \
+                 first snapshot holds that block, got {block:?}"
+            );
+            assert_eq!(
+                block.second_block_token.is_some(),
+                second_seed.is_some(),
+                "case {case:?}: block {index} must carry a SecondBlockToken exactly when the \
+                 second snapshot holds that block, got {block:?}"
+            );
+
+            if let (Some(token), Some(seed)) = (block.first_block_token.as_deref(), first_seed) {
+                assert_token_reads_back(&router, case, "first", first, index, token, seed).await;
+            }
+            if let (Some(token), Some(seed)) = (block.second_block_token.as_deref(), second_seed) {
+                assert_token_reads_back(&router, case, "second", second, index, token, seed).await;
+            }
+
+            // At an index BOTH sides hold, each side hands out its own token for its own
+            // version of the block, so the two tokens differ and neither names a block of
+            // the other snapshot.
+            let both = (
+                block.first_block_token.as_deref(),
+                block.second_block_token.as_deref(),
+            );
+            if let (Some(first_token), Some(second_token)) = both {
+                assert_ne!(
+                    first_token, second_token,
+                    "case {case:?}: the two sides of block {index} must hand out their own \
+                     tokens, got {block:?}"
+                );
+                assert_token_names_no_block(
+                    &router,
+                    case,
+                    "the first side's token read against the second snapshot",
+                    second,
+                    index,
+                    first_token,
+                )
+                .await;
+                assert_token_names_no_block(
+                    &router,
+                    case,
+                    "the second side's token read against the first snapshot",
+                    first,
+                    index,
+                    second_token,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// RULE 8: comparing two snapshots is a READ — it changes nothing a later caller sees.
+///
+/// Each row compares a pair twice and asserts the second answer is the first one again, then
+/// asserts each side still lists exactly the blocks it listed before, under the same tokens,
+/// and that those tokens still serve their bytes. The rows differ along which pair is
+/// compared, along the direction of the comparison, along the query the comparison carries,
+/// and along whether the answer reports changed blocks at all.
+#[tokio::test]
+async fn comparing_two_snapshots_leaves_both_sides_as_they_were() {
+    let router = router();
+    let case = "the lineage compared twice";
+
+    let base = sealed_snapshot(&router, case, 3, None, &[]).await;
+    let parent = sealed_snapshot(&router, case, 3, Some(&base), &[(1, 71), (2, 72)]).await;
+    let child = sealed_snapshot(&router, case, 3, Some(&parent), &[(2, 73), (7, 74)]).await;
+
+    // (case, the first side, the second side, the query the comparison carries).
+    let rows: [(&str, &str, &str, &str); 5] = [
+        (
+            "a parent against its child",
+            parent.as_str(),
+            child.as_str(),
+            "",
+        ),
+        ("the same pair reversed", child.as_str(), parent.as_str(), ""),
+        (
+            "a comparison that starts past the first changed index",
+            parent.as_str(),
+            child.as_str(),
+            "startingBlockIndex=7",
+        ),
+        (
+            "a comparison that reports nothing",
+            child.as_str(),
+            child.as_str(),
+            "",
+        ),
+        (
+            "an ancestor that holds nothing",
+            base.as_str(),
+            child.as_str(),
+            "",
+        ),
+    ];
+
+    for (case, first, second, query) in rows {
+        let first_before = listing_of(&router, case, first).await;
+        let second_before = listing_of(&router, case, second).await;
+
+        let once = compared(&router, case, first, second, query).await;
+        let twice = compared(&router, case, first, second, query).await;
+        assert_eq!(
+            reported(&once),
+            reported(&twice),
+            "case {case:?}: the comparison must report the same changed blocks every time, got \
+             {} then {}",
+            once.json(),
+            twice.json()
+        );
+        assert_eq!(
+            once.json(),
+            twice.json(),
+            "case {case:?}: the comparison must answer the same thing every time, got {} then \
+             {}",
+            once.json(),
+            twice.json()
+        );
+
+        let first_after = listing_of(&router, case, first).await;
+        let second_after = listing_of(&router, case, second).await;
+        assert_eq!(
+            first_before, first_after,
+            "case {case:?}: the first snapshot must list the same blocks under the same tokens \
+             after the comparison, got {first_after:?}"
+        );
+        assert_eq!(
+            second_before, second_after,
+            "case {case:?}: the second snapshot must list the same blocks under the same tokens \
+             after the comparison, got {second_after:?}"
+        );
+
+        // The tokens the sides still hand out still serve their blocks: the comparison
+        // neither consumed them nor released the bytes they name.
+        for (snapshot_id, listed) in [(first, &first_after), (second, &second_after)] {
+            for (block_index, block_token) in listed {
+                let fetched = get_block(&router, snapshot_id, *block_index, block_token).await;
+                assert_eq!(
+                    fetched.status,
+                    200,
+                    "case {case:?}: block {block_index} of {snapshot_id} must still be served \
+                     after the comparison, got {} with body {}",
+                    fetched.status,
+                    String::from_utf8_lossy(&fetched.body)
+                );
+            }
+        }
     }
 }
