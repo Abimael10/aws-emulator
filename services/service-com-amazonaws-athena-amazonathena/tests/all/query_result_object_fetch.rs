@@ -23,14 +23,9 @@
 use serde_json::{json, Value};
 
 use crate::query_result_objects::{
-    create_bucket, create_work_group, emulator, listed_keys, s3_served, start, succeeded, BUCKET,
-    DECOY_BUCKET,
+    create_bucket, create_work_group, emulator, listed_keys, parse_location, s3_served, start,
+    succeeded, BUCKET, DECOY_BUCKET, GOVERNED_BUCKET,
 };
-
-/// A third bucket, the one an ENFORCING workgroup keeps its results in: a different bucket
-/// from the one such a request named, which is what confining results to a governed bucket
-/// rests on.
-const GOVERNED_BUCKET: &str = "athena-governed-results";
 
 /// The media type the results of a statement whose results are rows are saved as: Athena
 /// saves those results as the CSV the object's own extension announces.
@@ -43,18 +38,6 @@ const CSV_MEDIA_TYPE: &str = "text/csv";
 const ROWS_EXTENSION: &str = ".csv";
 /// See [`ROWS_EXTENSION`].
 const METADATA_EXTENSION: &str = ".csv.metadata";
-
-/// The bucket and key an `s3://` location names: the address a consumer turns the location the
-/// control plane reported into.
-fn parse_location(case: &str, location: &str) -> (String, String) {
-    let rest = location.strip_prefix("s3://").unwrap_or_else(|| {
-        panic!("case {case:?}: expected an s3:// results location, got {location:?}")
-    });
-    let (bucket, key) = rest.split_once('/').unwrap_or_else(|| {
-        panic!("case {case:?}: expected the location to name an object, got {location:?}")
-    });
-    (bucket.to_string(), key.to_string())
-}
 
 /// One row of the table below: what is submitted, and where its results must be fetchable
 /// from afterwards.

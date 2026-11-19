@@ -39,6 +39,11 @@ pub(crate) const BUCKET: &str = "athena-saved-results";
 /// there.
 pub(crate) const DECOY_BUCKET: &str = "athena-decoy-results";
 
+/// A third bucket, the one an ENFORCING workgroup keeps its results in: a different bucket
+/// from the one such a request named, which is what confining results to a governed bucket
+/// rests on.
+pub(crate) const GOVERNED_BUCKET: &str = "athena-governed-results";
+
 /// How long past [`QUERY_EXECUTION_COMPLETION`] a test waits for a started query to be
 /// readable in its terminal state.
 const SETTLE_GRACE: Duration = Duration::from_millis(600);
@@ -125,6 +130,18 @@ pub(crate) async fn s3_served(
         media_type,
         String::from_utf8_lossy(response.body()).to_string(),
     )
+}
+
+/// The bucket and key an `s3://` location names: the address a consumer turns the location
+/// the control plane reported into.
+pub(crate) fn parse_location(case: &str, location: &str) -> (String, String) {
+    let rest = location.strip_prefix("s3://").unwrap_or_else(|| {
+        panic!("case {case:?}: expected an s3:// results location, got {location:?}")
+    });
+    let (bucket, key) = rest.split_once('/').unwrap_or_else(|| {
+        panic!("case {case:?}: expected the location to name an object, got {location:?}")
+    });
+    (bucket.to_string(), key.to_string())
 }
 
 /// `PUT /<bucket>` — `CreateBucket` — so a query's results have somewhere to land.
