@@ -8,8 +8,10 @@
 //! A template's value functions are resolved by CloudFormation itself, and the roster of
 //! them the service advertises as supported is what a template may use
 //! ([`super::template_validation`] refuses anything else by name). `Fn::GetStackOutput` is
-//! one of that roster: its argument is `[stack, output]`, and its value is the value that
-//! output carries on the stack named — in the account and Region the deployment runs in.
+//! one of that roster: its arguments are the STACK and the OUTPUT KEY — spelled as the named
+//! members `{"StackName": …, "OutputName": …}` or as the positional pair `[stack, output]`,
+//! the two spellings of the same two arguments — and its value is the value that output
+//! carries on the stack named, in the account and Region the deployment runs in.
 //!
 //! Two things separate it from `Fn::ImportValue`, and both are what this module is for:
 //!
@@ -45,7 +47,9 @@ pub const FN_GET_STACK_OUTPUT: &str = "Fn::GetStackOutput";
 
 /// The member of an `Fn::GetStackOutput` argument that names the stack to read, as the
 /// function's requests spell it: `{"Fn::GetStackOutput": {"StackName": <stack>,
-/// "OutputName": <output>}}`.
+/// "OutputName": <output>}}`. The same two arguments are also spelled POSITIONALLY —
+/// `{"Fn::GetStackOutput": [<stack>, <output>]}`, the stack first — and both spellings name
+/// the same [`Reference`].
 pub const STACK_NAME: &str = "StackName";
 
 /// The member that names the output to read. See [`STACK_NAME`].

@@ -213,32 +213,35 @@ pub(super) fn collect_stack_output_reads(
     }
 }
 
-/// The stack and the output one `Fn::GetStackOutput` argument names:
-/// `{"StackName": <stack>, "OutputName": <output>}`, the two members the function takes.
-/// Each is evaluated the way every other function's arguments are, so a member spelled by an
-/// expression names what it resolves to.
+/// The stack and the output one `Fn::GetStackOutput` argument names, in either spelling the
+/// function's two arguments take: the NAMED members
+/// (`{"StackName": <stack>, "OutputName": <output>}`) or the POSITIONAL pair
+/// (`[<stack>, <output>]`), the stack first, as every other two-argument value function
+/// spells its arguments. Each argument is evaluated the way every other function's are, so
+/// one spelled by an expression names what it resolves to.
 ///
-/// `None` for an argument that names neither member, which is no reference at all — the
-/// same answer every other expression this evaluator cannot read gives.
+/// `None` for an argument that is neither — which names no stack and no output, so it is no
+/// reference at all, the same answer every other expression this evaluator cannot read
+/// gives.
 pub(crate) fn stack_output_reference(
     argument: &Value,
     scope: &Scope<'_>,
     depth: usize,
     budget: &mut Budget,
 ) -> Option<crate::state::stack_outputs::Reference> {
-    let members = argument.as_object()?;
-    let stack = text(
-        members.get(crate::state::stack_outputs::STACK_NAME)?,
-        scope,
-        depth + 1,
-        budget,
-    )?;
-    let output = text(
-        members.get(crate::state::stack_outputs::OUTPUT_NAME)?,
-        scope,
-        depth + 1,
-        budget,
-    )?;
+    let (stack, output) = match argument {
+        Value::Object(members) => (
+            members.get(crate::state::stack_outputs::STACK_NAME)?,
+            members.get(crate::state::stack_outputs::OUTPUT_NAME)?,
+        ),
+        Value::Array(arguments) => match arguments.as_slice() {
+            [stack, output] => (stack, output),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let stack = text(stack, scope, depth + 1, budget)?;
+    let output = text(output, scope, depth + 1, budget)?;
     Some(crate::state::stack_outputs::Reference::new(stack, output))
 }
 
