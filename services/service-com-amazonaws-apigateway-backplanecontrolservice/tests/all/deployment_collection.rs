@@ -12,15 +12,26 @@
 //! in creation order, oldest first, one `position`/`limit` page at a time, each entry
 //! being the record the single-deployment read reports; it changes nothing. The page member
 //! is reported whatever the page holds, so a listing whose page came out empty is a success
-//! carrying an EMPTY `items` list. So the tests
+//! carrying an EMPTY `items` list — including after a write this collection REFUSED, which
+//! is the read a caller makes to prove the refused call created nothing. So the tests
 //! assert over SETS of inputs — a table of deployment shapes and counts (including none
 //! at all), the whole documented page-size range with one value past each bound, a cursor
-//! that names nothing, and APIs that own the collection and APIs that do not.
+//! that names nothing, APIs that own the collection and APIs that do not, and a table of
+//! the ways a `CreateDeployment` on the collection is refused.
 
 use serde_json::{json, Value};
 
+// The signing helper, the seeded session and the document builder are the siblings' own —
+// one spelling of a control-plane request's credential scope and one seeded principal — so
+// the suite that denies a write and this one cannot drive that gate with two different ones.
+use service_com_amazonaws_apigateway_backplanecontrolservice::state::MAX_STRING_CHARS;
+
+use crate::control_plane_fidelity_rules::call_as;
 use crate::rest_api_lifecycle::{
     assert_failure, create_api, create_resource, page_items, string_member, Answer, Gateway,
+};
+use crate::stage_invoke_identity_policy::{
+    allow, given_policy, given_session, Entity, SESSION_KEY_ID,
 };
 use crate::stage_lifecycle::create_deployment;
 
@@ -417,6 +428,212 @@ async fn the_page_member_is_reported_whatever_the_page_holds() {
         json!([]),
         "case \"an api a caller emptied\": expected the empty page member, got {:?}",
         emptied.body
+    );
+}
+
+/// One `CreateDeployment` this collection REFUSES, and the modelled failure it answers.
+struct Refusal {
+    /// The case name every assertion of the row carries.
+    case: &'static str,
+    /// Whether the row's API carries a method, i.e. has anything to deploy at all.
+    method: bool,
+    /// The request body the refused call carries.
+    request: Value,
+    /// The modelled status and `x-amzn-errortype` the refusal answers.
+    status: u16,
+    code: &'static str,
+}
+
+/// A `stageName` carrying a character outside the set the member is spelled from: "Stage
+/// names can only contain alphanumeric characters, hyphens, and underscores"
+/// (`smithy_query(query="doc",shape="com.amazonaws.apigateway#CreateDeploymentRequest",member="stageName")`).
+const STAGE_NAME_WITH_A_SPACE: &str = "not a stage name";
+
+/// The largest share of a stage's traffic a canary may take is 100: "The percent (0-100) of
+/// traffic diverted to a canary deployment"
+/// (`smithy_query(query="doc",shape="com.amazonaws.apigateway#CanarySettings",member="percentTraffic")`),
+/// so this share is one past that bound.
+const CANARY_SHARE_PAST_THE_BOUND: f64 = 150.0;
+
+#[tokio::test]
+async fn a_refused_deployment_leaves_the_listing_reporting_the_empty_page_member() {
+    // The read a caller writes to prove a REFUSED write created nothing is the collection's
+    // own listing, so the refusal must leave a listing a client can count — the page member
+    // present and empty — rather than one it has to branch on. Rows differ along WHY the
+    // write was refused: nothing to deploy at all, a member outside the grammar it
+    // publishes, a member past its length bound, and a nested member outside its published
+    // range.
+    let refusals = vec![
+        Refusal {
+            case: "an api with no method to deploy",
+            method: false,
+            request: json!({}),
+            status: 400,
+            code: "BadRequestException",
+        },
+        Refusal {
+            case: "a stageName outside the character set the member publishes",
+            method: true,
+            request: json!({ "stageName": STAGE_NAME_WITH_A_SPACE }),
+            status: 400,
+            code: "BadRequestException",
+        },
+        Refusal {
+            case: "a description past the length a stored string is bounded at",
+            method: true,
+            // One character past the bound this service holds a caller-supplied string to,
+            // read off the constant rather than restated here.
+            request: json!({ "description": "d".repeat(MAX_STRING_CHARS + 1) }),
+            status: 400,
+            code: "BadRequestException",
+        },
+        Refusal {
+            case: "a canary share past the window the member publishes",
+            method: true,
+            request: json!({
+                "stageName": "canary",
+                "canarySettings": { "percentTraffic": CANARY_SHARE_PAST_THE_BOUND },
+            }),
+            status: 400,
+            code: "BadRequestException",
+        },
+    ];
+
+    for refusal in &refusals {
+        // A fresh emulator per row, so the collection the listing reads is exactly the one
+        // the refused write addressed.
+        let gateway = Gateway::new();
+        let api = if refusal.method {
+            api_with_a_method(&gateway, "deployment-refused-write").await
+        } else {
+            let (api, _root) = create_api(&gateway, "deployment-refused-write").await;
+            api
+        };
+
+        let refused = gateway
+            .call(
+                "POST",
+                &format!("/restapis/{api}/deployments"),
+                Some(refusal.request.clone()),
+            )
+            .await;
+        assert_failure(&refused, refusal.status, refusal.code, refusal.case);
+
+        let listed = get_deployments(&gateway, &api, "").await;
+        assert_eq!(
+            listed.status, 200,
+            "case {}: expected the collection of the api the refused write addressed to be \
+             served, got {} with {:?}",
+            refusal.case, listed.status, listed.body
+        );
+        assert_eq!(
+            listed.body["item"],
+            json!([]),
+            "case {}: expected the page member present and empty after the refusal, got {:?}",
+            refusal.case,
+            listed.body
+        );
+        assert!(
+            listed.body["position"].is_null(),
+            "case {}: a page the collection holds nothing after reports no cursor, got {:?}",
+            refusal.case,
+            listed.body["position"]
+        );
+
+        // The positive control: the collection is empty because nothing is in it, not
+        // because the listing answers an empty page whatever the collection holds.
+        let deployed = create_deployment(
+            &gateway,
+            &api,
+            &format!("CreateDeployment after {}", refusal.case),
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            reported_ids(
+                &get_deployments(&gateway, &api, "").await.body,
+                refusal.case
+            ),
+            vec![deployed],
+            "case {}: expected the servable deployment to be on the page",
+            refusal.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_deployment_the_callers_policies_deny_leaves_the_listing_reporting_the_empty_page_member()
+{
+    // The same effect-absent read for the refusal that is taken AHEAD of the operation: a
+    // principal whose identity-based policies allow the plane's reads and no write at all.
+    let gateway = Gateway::new();
+    given_session(&gateway);
+    given_policy(&gateway, Entity::Role, Some(&allow("apigateway:GET", "*")));
+    let api = api_with_a_method(&gateway, "deployment-denied-write").await;
+
+    let denied = call_as(
+        &gateway,
+        SESSION_KEY_ID,
+        "POST",
+        &format!("/restapis/{api}/deployments"),
+        Some(json!({})),
+    )
+    .await;
+    assert_failure(
+        &denied,
+        403,
+        "AccessDeniedException",
+        "CreateDeployment under a principal with no write grant",
+    );
+
+    // Read back both as the account's own credential and as the denied principal itself —
+    // whose grant covers the listing — because the read a caller writes after a denial is
+    // made with the credential it was denied under.
+    for (case, answer) in [
+        (
+            "the account's own credential",
+            get_deployments(&gateway, &api, "").await,
+        ),
+        (
+            "the principal the write was denied for",
+            call_as(
+                &gateway,
+                SESSION_KEY_ID,
+                "GET",
+                &format!("/restapis/{api}/deployments"),
+                None,
+            )
+            .await,
+        ),
+    ] {
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected the listing to be served, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.body["item"],
+            json!([]),
+            "case {case}: expected the page member present and empty after the denial, got {:?}",
+            answer.body
+        );
+    }
+
+    // And the denial changed nothing about what a deployment the plane DOES serve reports.
+    let deployed = create_deployment(
+        &gateway,
+        &api,
+        "CreateDeployment after the denial",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        reported_ids(
+            &get_deployments(&gateway, &api, "").await.body,
+            "after the denial"
+        ),
+        vec![deployed],
+        "case after the denial: expected the served deployment to be on the page"
     );
 }
 
