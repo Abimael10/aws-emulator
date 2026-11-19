@@ -16,20 +16,14 @@
 //! and both request levels of the same quota. The harness (`Client`, `walk_pages`) is
 //! the one `quota_workflow.rs` owns.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use service_com_amazonaws_servicequotas_servicequotasv20190624::state::{
     CONTEXT_ID_EVERY_RESOURCE, LEVEL_ACCOUNT, LEVEL_ALL, LEVEL_RESOURCE,
 };
 
-use crate::quota_workflow::{client, emulator, walk_pages, Client, ACCOUNT};
-
-/// Comfortably past BOTH steps the clock owes a quota increase request
-/// (`crate::state::SUPPORT_CASE_OPEN_DELAY`, then
-/// `crate::state::REQUEST_DECISION_DELAY` once its support case is open), so a request
-/// made before this wait has settled afterwards.
-const PAST_DECISION: Duration = Duration::from_millis(1_800);
+use crate::quota_workflow::{
+    await_value_in_force, client, emulator, walk_pages, Client, ACCOUNT,
+};
 
 /// The history listing, whose name is too long to repeat in every call.
 const HISTORY: &str = "ListRequestedServiceQuotaChangeHistoryByQuota";
@@ -38,7 +32,7 @@ const HISTORY: &str = "ListRequestedServiceQuotaChangeHistoryByQuota";
 /// the resource type its per-resource plane applies to (`src/state.rs`, the `es` rows
 /// — `QuotaContextInfo`'s own worked example).
 const RESOURCE_QUOTA_NAME: &str = "Instances per domain";
-const RESOURCE_SCOPE_TYPE: &str = "AWS::Elasticsearch::Domain";
+const RESOURCE_SCOPE_TYPE: &str = "AWS::OpenSearchService::Domain";
 
 /// A quota of the SAME service that is adjustable at the account level only, so the
 /// contrast is not between two services.
@@ -102,6 +96,22 @@ async fn request_increase(
     caller.ok("RequestServiceQuotaIncrease", body).await["RequestedQuota"].clone()
 }
 
+/// Read the quota back on `context`'s plane until the value the clock owes that plane is
+/// in force, so a wait is for the CONDITION and never for a fixed time.
+async fn awaiting(caller: &Client, quota_code: &str, context: Option<&str>, expected: f64) {
+    let mut pair = json!({"ServiceCode": "es", "QuotaCode": quota_code});
+    if let Some(context) = context {
+        pair["ContextId"] = json!(context);
+    }
+    await_value_in_force(
+        caller,
+        &pair,
+        expected,
+        &format!("the increase on {}", context.unwrap_or("the account")),
+    )
+    .await;
+}
+
 /// Read one applied quota, optionally for a resource context.
 async fn get_quota(
     caller: &Client,
@@ -134,7 +144,7 @@ async fn the_quota_context_is_reported_exactly_for_the_quotas_adjustable_per_res
             "es",
             resource_code.clone(),
             Some(json!({
-                "ContextScope": LEVEL_ACCOUNT,
+                "ContextScope": LEVEL_RESOURCE,
                 "ContextScopeType": RESOURCE_SCOPE_TYPE,
                 "AdjustableAtLevel": LEVEL_ALL,
             })),
@@ -247,9 +257,9 @@ async fn a_context_id_selects_the_value_applied_to_that_resource() {
     // decided, which is also what pins that one plane's open request does not block
     // another's.
     let increases = [
-        (alpha.clone(), 120.0_f64),
-        (beta.clone(), 200.0),
-        (CONTEXT_ID_EVERY_RESOURCE.to_string(), 90.0),
+        (alpha.clone(), 320.0_f64),
+        (beta.clone(), 400.0),
+        (CONTEXT_ID_EVERY_RESOURCE.to_string(), 290.0),
     ];
     for (context, desired) in &increases {
         let requested = request_increase(&caller, "es", &quota_code, *desired, Some(context)).await;
@@ -281,25 +291,27 @@ async fn a_context_id_selects_the_value_applied_to_that_resource() {
         );
     }
 
-    tokio::time::sleep(PAST_DECISION).await;
+    for (context, desired) in &increases {
+        awaiting(&caller, &quota_code, Some(context), *desired).await;
+    }
 
     // (case, the ContextId read, the value it must now report).
     let expectations = [
         (
             "the resource its own value was applied to",
             Some(alpha.clone()),
-            120.0_f64,
+            320.0_f64,
         ),
-        ("another resource with its own value", Some(beta.clone()), 200.0),
+        ("another resource with its own value", Some(beta.clone()), 400.0),
         (
             "the every-resource context",
             Some(CONTEXT_ID_EVERY_RESOURCE.to_string()),
-            90.0,
+            290.0,
         ),
         (
             "a resource no value of its own was applied to",
             Some(untouched.clone()),
-            90.0,
+            290.0,
         ),
         ("the account-wide record", None, default_value),
     ];
@@ -349,21 +361,21 @@ async fn a_context_id_selects_the_value_applied_to_that_resource() {
 
     // An account-wide increase on the same quota lands on the account plane only: a
     // resource with a value of its own keeps it.
-    let account_wide = request_increase(&caller, "es", &quota_code, 500.0, None).await;
+    let account_wide = request_increase(&caller, "es", &quota_code, 700.0, None).await;
     assert_eq!(
         account_wide["QuotaRequestedAtLevel"],
         json!(LEVEL_ACCOUNT),
         "case an account-wide request: it must be recorded at the ACCOUNT level, got \
          {account_wide}"
     );
-    tokio::time::sleep(PAST_DECISION).await;
+    awaiting(&caller, &quota_code, None, 700.0).await;
     let after = [
-        ("the account-wide record", None, 500.0_f64),
-        ("a resource with its own value", Some(alpha.clone()), 120.0),
+        ("the account-wide record", None, 700.0_f64),
+        ("a resource with its own value", Some(alpha.clone()), 320.0),
         (
             "a resource covered by the every-resource value",
             Some(untouched.clone()),
-            90.0,
+            290.0,
         ),
     ];
     for (case, context, expected) in &after {
@@ -423,12 +435,14 @@ async fn the_applied_level_filter_picks_the_plane_the_listing_reports() {
             &caller,
             "es",
             &quota_code,
-            150.0 + index as f64,
+            350.0 + index as f64,
             Some(context),
         )
         .await;
     }
-    tokio::time::sleep(PAST_DECISION).await;
+    for (index, context) in contexts.iter().enumerate() {
+        awaiting(&caller, &quota_code, Some(context), 350.0 + index as f64).await;
+    }
 
     let resource_records = walk_pages(
         &caller,
@@ -507,7 +521,7 @@ async fn a_resource_level_request_is_stored_and_listed_at_its_own_level() {
     let alpha = domain("alpha");
     let beta = domain("beta");
 
-    let first = request_increase(&caller, "es", &quota_code, 120.0, Some(&alpha)).await;
+    let first = request_increase(&caller, "es", &quota_code, 320.0, Some(&alpha)).await;
     let id = first["Id"]
         .as_str()
         .unwrap_or_else(|| panic!("case a resource-level request: expected an Id, got {first}"))
@@ -522,7 +536,7 @@ async fn a_resource_level_request_is_stored_and_listed_at_its_own_level() {
     );
 
     // Another resource's plane accepts its own open request; the SAME plane does not.
-    let second = request_increase(&caller, "es", &quota_code, 130.0, Some(&beta)).await;
+    let second = request_increase(&caller, "es", &quota_code, 330.0, Some(&beta)).await;
     assert_eq!(
         second["Status"],
         json!("PENDING"),
@@ -534,7 +548,7 @@ async fn a_resource_level_request_is_stored_and_listed_at_its_own_level() {
             json!({
                 "ServiceCode": "es",
                 "QuotaCode": quota_code,
-                "DesiredValue": 140.0,
+                "DesiredValue": 340.0,
                 "ContextId": alpha,
             }),
         )
@@ -550,7 +564,7 @@ async fn a_resource_level_request_is_stored_and_listed_at_its_own_level() {
     );
 
     // An account-wide request on the same quota is its own plane, recorded at ACCOUNT.
-    let account_wide = request_increase(&caller, "es", &quota_code, 400.0, None).await;
+    let account_wide = request_increase(&caller, "es", &quota_code, 600.0, None).await;
     assert_eq!(
         account_wide["QuotaRequestedAtLevel"],
         json!(LEVEL_ACCOUNT),
@@ -559,11 +573,12 @@ async fn a_resource_level_request_is_stored_and_listed_at_its_own_level() {
     assert_eq!(
         account_wide["QuotaContext"],
         json!({
-            "ContextScope": LEVEL_ACCOUNT,
+            "ContextScope": LEVEL_RESOURCE,
             "ContextScopeType": RESOURCE_SCOPE_TYPE,
             "AdjustableAtLevel": LEVEL_ALL,
         }),
-        "case an account-wide request: it must describe the account plane, got {account_wide}"
+        "case an account-wide request: it must describe the plane the quota is counted on, got \
+         {account_wide}"
     );
 
     // The history filter keeps the requests made at the level asked for.

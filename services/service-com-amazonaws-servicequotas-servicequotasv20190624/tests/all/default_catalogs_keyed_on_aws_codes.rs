@@ -196,7 +196,7 @@ const ROWS: &[Row] = &[
         unit: "None",
         adjustable: true,
         description: "The maximum number of AD Connector directories that you can create in \
-                      this account in the current Region.",
+                      the current Region.",
         period: None,
         metric: Metric::None,
     },
@@ -208,7 +208,9 @@ const ROWS: &[Row] = &[
         unit: "None",
         adjustable: true,
         description: "The maximum number of write capacity units that can be provisioned for a \
-                      single table.",
+                      single table or global secondary index. For more information, see \
+                      https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Limits\
+                      .html#default-limits-throughput-capacity-modes.",
         period: None,
         metric: Metric::None,
     },
@@ -301,15 +303,15 @@ const ROWS: &[Row] = &[
     Row {
         service_code: "elasticache",
         quota_code: "L-3E7F7726",
-        quota_name: "Nodes per Region",
+        quota_name: "Subnet groups per Region",
         value: 300.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of nodes in this account in the current Region.",
+        description: "The maximum number of subnet groups in this account in the current Region.",
         period: Some((5, "MINUTE")),
         metric: Metric::Resources {
             usage_service: "ElastiCache",
-            resource: "NodesPerRegion",
+            resource: "SubnetGroup",
         },
     },
     Row {
@@ -326,12 +328,13 @@ const ROWS: &[Row] = &[
     Row {
         service_code: "elasticbeanstalk",
         quota_code: "L-8EFC1C51",
-        quota_name: "Application versions",
-        value: 1000.0,
+        quota_name: "Environments",
+        value: 200.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of application versions in this account in the \
-                      current Region.",
+        description: "The maximum number of environments that you can create in this account in \
+                      the current Region. The limit applies across applications, not per \
+                      application.",
         period: None,
         metric: Metric::None,
     },
@@ -342,20 +345,19 @@ const ROWS: &[Row] = &[
         value: 50.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of custom platform versions in this account in the \
-                      current Region.",
+        description: "The maximum number of custom platform versions that you can create in \
+                      this account in the current Region.",
         period: None,
         metric: Metric::None,
     },
     Row {
         service_code: "elasticfilesystem",
         quota_code: "L-4CCB99B3",
-        quota_name: "Total provisioned throughput per Region",
-        value: 3072.0,
-        unit: "Megabytes/Second",
-        adjustable: true,
-        description: "The maximum throughput, in MiB/s, that can be provisioned across all \
-                      file systems in this account in the current Region.",
+        quota_name: "Access points per file system",
+        value: 10_000.0,
+        unit: "None",
+        adjustable: false,
+        description: "The maximum number of access points per file system.",
         period: None,
         metric: Metric::None,
     },
@@ -407,18 +409,18 @@ const ROWS: &[Row] = &[
         value: 150.0,
         unit: "None",
         adjustable: false,
-        description: "The maximum number of UltraWarm instances per domain.",
+        description: "The maximum number of warm nodes in a single cluster.",
         period: None,
         metric: Metric::None,
     },
     Row {
         service_code: "es",
         quota_code: "L-E9BC8C95",
-        quota_name: "Packages per domain",
-        value: 25.0,
+        quota_name: "T2 instances per domain",
+        value: 10.0,
         unit: "None",
-        adjustable: true,
-        description: "The maximum number of packages that can be associated with one domain.",
+        adjustable: false,
+        description: "The maximum number of T2 instances in a single cluster.",
         period: None,
         metric: Metric::None,
     },

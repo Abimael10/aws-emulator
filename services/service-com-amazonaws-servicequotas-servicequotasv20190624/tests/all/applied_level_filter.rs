@@ -23,22 +23,16 @@
 //! The harness (`Client`, `walk_pages`) is the one `quota_workflow.rs` owns, and the
 //! quota-code lookup the one `resource_quota_context.rs` owns.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use service_com_amazonaws_servicequotas_servicequotasv20190624::ops::types::APPLIED_LEVEL_ENUM_VALUES;
 use service_com_amazonaws_servicequotas_servicequotasv20190624::state::{
     CONTEXT_ID_EVERY_RESOURCE, LEVEL_ACCOUNT, LEVEL_ALL, LEVEL_RESOURCE,
 };
 
-use crate::quota_workflow::{client, emulator, walk_pages, Client, ACCOUNT};
+use crate::quota_workflow::{
+    await_value_in_force, client, emulator, walk_pages, Client, ACCOUNT,
+};
 use crate::resource_quota_context::quota_code_for;
-
-/// Comfortably past BOTH steps the clock owes a quota increase request
-/// (`crate::state::SUPPORT_CASE_OPEN_DELAY`, then
-/// `crate::state::REQUEST_DECISION_DELAY` once its support case is open), so a request
-/// made before this wait has settled afterwards and its value is in force.
-const PAST_DECISION: Duration = Duration::from_millis(1_800);
 
 /// The quota the catalog publishes as adjustable per resource AND account-wide, so one
 /// quota carries records on both planes (`src/state.rs`, the `es` rows).
@@ -89,11 +83,12 @@ async fn every_listing_applies_the_one_applied_level_filter_rule() {
 
     // Records on BOTH planes of one quota: an account-wide increase, one applied to a
     // single resource, and one applied to every resource with no value of its own.
-    for (desired, context) in [
+    let increases = [
         (400.0, None),
-        (120.0, Some(alpha.as_str())),
-        (130.0, Some(CONTEXT_ID_EVERY_RESOURCE)),
-    ] {
+        (320.0, Some(alpha.as_str())),
+        (330.0, Some(CONTEXT_ID_EVERY_RESOURCE)),
+    ];
+    for (desired, context) in increases {
         let mut body = json!({
             "ServiceCode": "es",
             "QuotaCode": quota_code,
@@ -104,7 +99,21 @@ async fn every_listing_applies_the_one_applied_level_filter_rule() {
         }
         caller.ok("RequestServiceQuotaIncrease", body).await;
     }
-    tokio::time::sleep(PAST_DECISION).await;
+    // Wait for what the clock OWES each request — the value it puts in force on that
+    // request's own plane — by reading the quota back, never for a fixed time.
+    for (desired, context) in increases {
+        let mut pair = json!({"ServiceCode": "es", "QuotaCode": quota_code});
+        if let Some(context) = context {
+            pair["ContextId"] = json!(context);
+        }
+        await_value_in_force(
+            &caller,
+            &pair,
+            desired,
+            &format!("the increase on {}", context.unwrap_or("the account")),
+        )
+        .await;
+    }
 
     let listings = [
         Listing {

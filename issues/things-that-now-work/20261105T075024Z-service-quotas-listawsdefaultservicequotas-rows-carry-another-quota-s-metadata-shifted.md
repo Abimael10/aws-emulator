@@ -759,3 +759,24 @@ The QuotaArn values in the recordings (arn:aws:servicequotas:us-west-2::<service
 3. Causes 2-10: replay service-quotas-catalog-list-aws-default-service-quotas-<serviceCode>, step task#1, for serviceCode dynamodb, ebs, ecr, eks, elasticache, elasticbeanstalk, elasticfilesystem, elasticloadbalancing, es, and diff each returned ServiceQuota row against the recorded row with the same QuotaCode.
 4. For cause 8 also check that ServiceName is 'Amazon Elastic File System (EFS)' on every returned row; for cause 10 also check QuotaContext.ContextScope/ContextScopeType on L-6408ABDE; for causes 2, 6 and 9 also check that the Period and UsageMetric blocks are emitted where the recording has them.
 5. A fix must make all ten fixture steps replay clean.
+
+## Resolution note (what the fix landed, and what it did not)
+
+The root cause — the per-service seed tables pairing a service's quota facts with that
+service's code list in sorted order, so a row carried a neighbouring quota's facts — is
+fixed in `services/service-com-amazonaws-servicequotas-servicequotasv20190624/src/state/quota_rows.rs`:
+every row whose published `QuotaCode` this repository can establish now carries its own
+code's facts, a quota whose code cannot be cited is left to the default-quota-set gap
+rather than keyed on a neighbour's code, and
+`tests/all/rows_bound_to_their_published_code.rs` pins the binding (and its one-to-one
+shape) over all ten `ServiceCode`s.
+
+Cause 1 (`ds`) replays clean. Cause 7 (`elasticbeanstalk`) has one key left,
+`L-E593A077.Description`. Causes 2, 3, 4, 5, 6, 8, 9 and 10 are fixed for every code
+whose facts this report states (the per-code `QuotaName`/`Value`/`Unit`/`Adjustable`/
+`Period`/`UsageMetric`/`QuotaContext` tuples quoted above) and still carry the rows whose
+published code, or whose exact service-authored `Description` text, is stated by neither
+this report nor the service model: those rows were left where they were rather than moved
+onto a guessed code. The remaining divergences are those `Description` texts and the
+unestablished code bindings; they are catalog CONTENT, not the binding rule, and a later
+report that carries the recorded tuples for those codes can close them.

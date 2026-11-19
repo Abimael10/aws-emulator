@@ -89,40 +89,54 @@ async fn refused_message(caller: &Client, operation: &str, body: Value) -> Strin
 /// Every catalog row published at a level the seeded catalog carries: a read and a
 /// write are served on exactly the planes that level publishes, and refused on the
 /// others.
+///
+/// THE RULE ABOUT `ContextScope`, asserted here rather than enumerated: the scope a
+/// record reports is the plane THE RECORD ANSWERS FOR — `RESOURCE` naming the resource a
+/// read asked for, and otherwise the plane the catalog publishes the quota as COUNTED on
+/// (`ACCOUNT` for a quota whose value is managed for the account, `RESOURCE` for one the
+/// service publishes as a quota OF a resource whichever record is read, which is a
+/// published fact of the quota and so a column of the table below). A quota the catalog
+/// publishes no resource type for has no plane to describe and carries no context at all.
 #[tokio::test]
 async fn a_call_is_served_on_exactly_the_planes_the_published_level_has() {
     let engine = emulator();
     let caller = client(&engine, "us-east-1");
 
-    // (case, ServiceCode, QuotaName, the AdjustableAtLevel the catalog publishes it at).
+    // (case, ServiceCode, QuotaName, the AdjustableAtLevel the catalog publishes it at,
+    // the ContextScope its account-wide record reports — the plane the catalog publishes
+    // the quota as COUNTED on, which for a quota of one resource is that resource).
     let rows = [
         (
             "a quota adjustable at either level",
             "es",
             "Instances per domain",
             LEVEL_ALL,
+            CONTEXT_SCOPE_RESOURCE,
         ),
         (
             "a quota of the same service adjustable account-wide only",
             "es",
             "Domains per Region",
             LEVEL_ACCOUNT,
+            CONTEXT_SCOPE_ACCOUNT,
         ),
         (
             "a quota of another service adjustable account-wide only",
             "vpc",
             "VPCs per Region",
             LEVEL_ACCOUNT,
+            CONTEXT_SCOPE_ACCOUNT,
         ),
         (
             "a measured quota of a third service adjustable account-wide only",
             "lambda",
             "Concurrent executions",
             LEVEL_ACCOUNT,
+            CONTEXT_SCOPE_ACCOUNT,
         ),
     ];
 
-    for (case, service_code, quota_name, level) in &rows {
+    for (case, service_code, quota_name, level, account_record_scope) in &rows {
         let quota_code = quota_code_for(&caller, service_code, quota_name).await;
         let (account_plane, resource_plane) = planes_of(level);
 
@@ -202,7 +216,7 @@ async fn a_call_is_served_on_exactly_the_planes_the_published_level_has() {
             let wanted_scope = match (resource_plane, context.is_some()) {
                 (false, _) => Value::Null,
                 (true, true) => json!(CONTEXT_SCOPE_RESOURCE),
-                (true, false) => json!(CONTEXT_SCOPE_ACCOUNT),
+                (true, false) => json!(account_record_scope),
             };
             assert_eq!(
                 scope, wanted_scope,

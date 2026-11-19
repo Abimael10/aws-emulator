@@ -174,12 +174,12 @@ async fn both_history_listings_apply_the_one_status_and_level_rule() {
             settled: "APPROVED",
         },
         Minted {
-            id: raise(&caller, "es", &quota_code, 120.0, Some(&alpha), true).await,
+            id: raise(&caller, "es", &quota_code, 320.0, Some(&alpha), true).await,
             level: LEVEL_RESOURCE,
             settled: "APPROVED",
         },
         Minted {
-            id: raise(&caller, "es", &quota_code, 130.0, Some(&beta), false).await,
+            id: raise(&caller, "es", &quota_code, 330.0, Some(&beta), false).await,
             level: LEVEL_RESOURCE,
             settled: "NOT_APPROVED",
         },

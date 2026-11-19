@@ -2103,36 +2103,49 @@ pub(super) fn monitoring_quotas() -> Vec<QuotaRow> {
 /// OpenSearch Service quotas" page of its Developer Guide), and the recorded
 /// default-quota listing of that code for which `QuotaCode` names which quota. The
 /// service publishes the domain plane of the Region beside the planes counted inside
-/// one domain.
+/// one domain. The cross-cluster-search and package planes of a domain are left to the
+/// default-quota-set gap: this catalog can cite no code for either, and a code identifies
+/// ONE quota (see [`super::descriptive_quota_code`]).
 pub(super) fn es_quotas() -> Vec<QuotaRow> {
     vec![
-        quota("Domains per Region", 100.0)
+        quota("Domains per Region", 500.0)
             .code("L-076D529E")
             .describe(
-                "The maximum number of OpenSearch Service domains in this account in the \
-                 current Region.",
+                "The maximum number of Amazon OpenSearch Service domains you can create in \
+                 each AWS Region.",
             ),
-        // The warm-tier instance plane of a domain, which AWS publishes as fixed.
+        // The warm-tier instance plane of a domain, which AWS publishes as fixed. The
+        // service describes its instance planes as planes of the CLUSTER a domain runs.
         quota("Warm instances per domain", 150.0)
             .code("L-1F053E6F")
             .fixed()
-            .describe("The maximum number of UltraWarm instances per domain."),
+            .describe("The maximum number of warm nodes in a single cluster."),
         // The quota `QuotaContextInfo`'s own documentation uses as its worked
         // example of a RESOURCE-level quota: the instance count is applied per
         // OpenSearch Service domain, and can also be set account-wide, so AWS
         // publishes it as adjustable at either level. The scope type names the
         // resource type the per-resource plane applies to, which for this service is
-        // its domain resource.
-        quota("Instances per domain", 80.0)
+        // its OpenSearch Service domain resource, and the quota is published as a
+        // quota OF THAT RESOURCE — the recorded default-quota listing of this code
+        // reports the `RESOURCE` scope on the record that names no resource — so every
+        // record of it, the account-wide one included, reports that scope.
+        quota("Instances per domain", 200.0)
             .code("L-6408ABDE")
-            .adjustable_at(LEVEL_ALL, "AWS::Elasticsearch::Domain")
-            .describe("The maximum number of instances per domain."),
-        quota("Cross-cluster search connections per domain", 20.0)
+            .adjustable_at(LEVEL_ALL, "AWS::OpenSearchService::Domain")
+            .counted_per_resource()
+            .describe("The maximum number of instances in a single cluster."),
+        // The dedicated-master plane of a domain, which AWS publishes as fixed.
+        quota("Dedicated master instances per domain", 5.0)
             .code("L-AE676A72")
-            .describe("The maximum number of cross-cluster search connections per domain."),
-        quota("Packages per domain", 25.0)
+            .fixed()
+            .describe("The maximum number of dedicated master instances in a single cluster."),
+        // The burstable-instance plane of a domain, which AWS publishes as fixed: the
+        // value is the number of T2 data nodes a cluster may run, as the service's own
+        // published cluster limits state it.
+        quota("T2 instances per domain", 10.0)
             .code("L-E9BC8C95")
-            .describe("The maximum number of packages that can be associated with one domain."),
+            .fixed()
+            .describe("The maximum number of T2 instances in a single cluster."),
     ]
 }
 
@@ -2502,35 +2515,40 @@ pub(super) fn secretsmanager_quotas() -> Vec<QuotaRow> {
 /// of each type it snapshots and the domain-controller plane of a managed directory.
 pub(super) fn ds_quotas() -> Vec<QuotaRow> {
     vec![
+        // A directory plane of one directory TYPE: the sentence names the Region the
+        // directories are created in, and no account, which is how the service words
+        // the whole class.
         quota("AD Connector directories", 10.0)
             .code("L-092080C3")
             .describe(
-                "The maximum number of AD Connector directories that you can create in this \
-                 account in the current Region.",
+                "The maximum number of AD Connector directories that you can create in the \
+                 current Region.",
             ),
-        quota("AWS Managed Microsoft AD directories", 20.0)
+        // The domain-controller plane of a managed directory: counted inside ONE
+        // directory, so its sentence names the directory the controllers are added to
+        // rather than a Region, and the service publishes it as adjustable.
+        quota("AWS Managed Microsoft AD domain controllers", 20.0)
             .code("L-25146888")
             .describe(
-                "The maximum number of AWS Managed Microsoft AD directories that you can \
-                 create in this account in the current Region.",
+                "The maximum number of domain controllers that you can add to your AWS \
+                 Managed Microsoft AD directory.",
             ),
         quota("Simple AD directories", 10.0)
             .code("L-5B5620DE")
             .describe(
-                "The maximum number of Simple AD directories that you can create in this \
-                 account in the current Region.",
-            ),
-        quota("Domain controllers per directory", 20.0)
-            .code("L-92A19B29")
-            // AWS publishes the domain-controller plane of a managed directory as fixed.
-            .fixed()
-            .describe(
-                "The maximum number of domain controllers that you can deploy for your AWS \
-                 Managed Microsoft AD directory.",
+                "The maximum number of Simple AD directories that you can create in the \
+                 current Region.",
             ),
         // The two manual-snapshot planes, which AWS publishes as NOT adjustable: a
         // directory's snapshot allowance is fixed, so no increase can be requested
         // for it.
+        quota("AWS Managed Microsoft AD manual snapshots", 5.0)
+            .code("L-92A19B29")
+            .fixed()
+            .describe(
+                "The maximum number of manual snapshots that you can take for your AWS \
+                 Managed Microsoft AD directory.",
+            ),
         quota("Simple AD manual snapshots", 5.0)
             .code("L-A18F1612")
             .fixed()
@@ -2538,12 +2556,11 @@ pub(super) fn ds_quotas() -> Vec<QuotaRow> {
                 "The maximum number of manual snapshots that you can take for your Simple AD \
                  directory.",
             ),
-        quota("AWS Managed Microsoft AD manual snapshots", 5.0)
+        quota("AWS Managed Microsoft AD directories", 20.0)
             .code("L-EF86B739")
-            .fixed()
             .describe(
-                "The maximum number of manual snapshots that you can take for your AWS \
-                 Managed Microsoft AD directory.",
+                "The maximum number of AWS Managed Microsoft AD directories that you can \
+                 create in the current region.",
             ),
     ]
 }
@@ -2559,45 +2576,53 @@ const DYNAMODB_USAGE_SERVICE: &str = "DynamoDB";
 /// which `QuotaCode` names which quota. DynamoDB publishes its throughput planes
 /// TWICE over — once for the account and once for a single table, and once for each of
 /// the two capacity modes — which is why the rows are named for the plane and the mode
-/// rather than for throughput as a whole.
+/// rather than for throughput as a whole. The two account-level PROVISIONED planes are
+/// the ones CloudWatch meters, each under its own `AccountProvisioned*CapacityUnits`
+/// series.
 pub(super) fn dynamodb_quotas() -> Vec<QuotaRow> {
+    // The account-level provisioned-throughput planes, the two DynamoDB publishes an
+    // `AWS/Usage` resource count for: the capacity units provisioned across the
+    // account's tables, read and write. CloudWatch publishes each under its own
+    // `Resource` series, and the rows carry no window of their own.
+    let account_provisioned = |code: &str, capacity: &str, resource: &str| {
+        quota(
+            format!("Account-level {capacity} throughput limit (Provisioned mode)"),
+            80_000.0,
+        )
+        .code(code)
+        .metric_without_period(usage_metric(
+            DYNAMODB_USAGE_SERVICE,
+            &[
+                ("Class", "None"),
+                ("Resource", resource),
+                ("Type", "Resource"),
+            ],
+        ))
+        .describe(&format!(
+            "The maximum number of {capacity} capacity units that can be provisioned across \
+             all tables in this account in the current Region."
+        ))
+    };
     vec![
-        quota(
-            "Account-level read throughput limit (Provisioned mode)",
-            80_000.0,
-        )
-        .code("L-1BB77E89")
-        .describe(
-            "The maximum number of read capacity units that can be provisioned across all \
-             tables in this account in the current Region.",
-        ),
-        quota(
-            "Account-level write throughput limit (Provisioned mode)",
-            80_000.0,
-        )
-        .code("L-2A593B99")
-        .describe(
-            "The maximum number of write capacity units that can be provisioned across all \
-             tables in this account in the current Region.",
-        ),
-        quota("Table-level read throughput limit", 40_000.0)
-            .code("L-34F6A552")
-            .describe(
-                "The maximum number of read capacity units that can be provisioned for a \
-                 single table.",
-            ),
-        // The secondary-index plane of a table, which AWS publishes as fixed.
-        quota("Global secondary indexes per table", 20.0)
-            .code("L-34F8CCC8")
-            .fixed()
-            .describe("The maximum number of global secondary indexes for a single table."),
         quota("Concurrent control plane operations", 500.0)
-            .code("L-6F30DCE1")
-            .fixed()
+            .code("L-1BB77E89")
             .describe(
                 "The maximum number of concurrent control plane operations in this account in \
                  the current Region.",
             ),
+        quota("Table-level read throughput limit", 40_000.0)
+            .code("L-2A593B99")
+            .describe(
+                "The maximum number of read capacity units that can be provisioned for a \
+                 single table.",
+            ),
+        account_provisioned("L-34F6A552", "read", "AccountProvisionedReadCapacityUnits"),
+        account_provisioned("L-34F8CCC8", "write", "AccountProvisionedWriteCapacityUnits"),
+        // The secondary-index plane of a table, which AWS publishes as fixed.
+        quota("Global secondary indexes per table", 20.0)
+            .code("L-6F30DCE1")
+            .fixed()
+            .describe("The maximum number of global secondary indexes for a single table."),
         quota(
             "Account-level read throughput limit (On-demand mode)",
             40_000.0,
@@ -2611,7 +2636,9 @@ pub(super) fn dynamodb_quotas() -> Vec<QuotaRow> {
             .code("L-AB614373")
             .describe(
                 "The maximum number of write capacity units that can be provisioned for a \
-                 single table.",
+                 single table or global secondary index. For more information, see \
+                 https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Limits.html\
+                 #default-limits-throughput-capacity-modes.",
             ),
         quota(
             "Account-level write throughput limit (On-demand mode)",
@@ -2685,6 +2712,11 @@ const EBS_USAGE_SERVICE: &str = "EBS";
 /// capacity is bought under — so a storage row is named for the type and carries the
 /// `TiB` unit AWS publishes it in; a request-rate row carries the one-second window
 /// and the `AWS/Usage` `CallCount` of the operation it throttles ([`request_rate`]).
+/// A quota of this service the data available here names no code for is NOT published
+/// under a neighbouring code or a stand-in — a code identifies ONE quota (see
+/// [`super::descriptive_quota_code`]) — so the snapshot plane of the Region and the
+/// per-API rates whose codes are not among the recorded ones are left to the
+/// default-quota-set gap.
 pub(super) fn ebs_quotas() -> Vec<QuotaRow> {
     let rate =
         |code: &str, api: &str, per_second: f64| request_rate(code, EBS_USAGE_SERVICE, api, per_second);
@@ -2717,13 +2749,36 @@ pub(super) fn ebs_quotas() -> Vec<QuotaRow> {
         rate("L-028ACFB9", "AttachVolume", 100.0).fixed(),
         rate("L-07399329", "CompleteSnapshot", 100.0),
         rate("L-09BD8365", "CopySnapshot", 10.0),
-        rate("L-1774F84A", "CreateSnapshot", 50.0),
-        rate("L-18E976AB", "CreateSnapshots", 50.0),
+        // The two EBS direct-API request planes the service publishes as FIXED: the
+        // block-write rate of one snapshot and the block-listing rate of the account.
+        // The block-listing plane keeps the value the recorded listing reports for its
+        // code, which is the one this catalog already served there; only the quota the
+        // code names, its adjustability and its text move.
+        quota("PutSnapshotBlock requests per snapshot", 1000.0)
+            .code("L-1774F84A")
+            .fixed()
+            .describe(
+                "The maximum number of PutSnapshotBlock requests per second for one snapshot.",
+            ),
+        quota("ListSnapshotBlocks requests allowed per account", 50.0)
+            .code("L-18E976AB")
+            .fixed()
+            .describe(
+                "The maximum number of ListSnapshotBlocks requests per second in this account \
+                 in the current Region.",
+            ),
         rate("L-1D4D9345", "CreateVolume", 100.0),
         storage("L-17AF77E8", "Throughput Optimized HDD (st1)", 50.0),
         rate("L-309BACF6", "DeleteSnapshot", 100.0),
         rate("L-35B31D98", "DeleteVolume", 100.0),
-        rate("L-39BD5252", "DescribeFastSnapshotRestores", 100.0),
+        // The volume-copy plane of the account: how many copies may run AT ONCE, which
+        // is a concurrency and not one of the per-API rates beside it.
+        quota("Max concurrent copy volume operations per account", 5.0)
+            .code("L-39BD5252")
+            .describe(
+                "The maximum number of concurrent volume copy operations in this account in \
+                 the current Region.",
+            ),
         rate("L-3A0E616D", "DescribeSnapshots", 100.0),
         rate("L-59C8FC87", "DescribeVolumeStatus", 100.0),
         rate("L-5F80CA91", "DescribeVolumes", 100.0),
@@ -2787,11 +2842,18 @@ pub(super) fn ebs_quotas() -> Vec<QuotaRow> {
                 "The maximum number of snapshots of one volume that can be in the archive \
                  storage tier.",
             ),
-        quota("Snapshots per Region", 100_000.0)
-            .code("L-F06E64A8")
-            .describe(
-                "The maximum number of snapshots in this account in the current Region.",
-            ),
+        // The storage a volume type's volumes may be MODIFIED to, which the service
+        // publishes beside the storage plane itself. The TiB it is counted in is named
+        // in the quota's own name, and the row carries no `Unit` of its own.
+        quota(
+            "Storage modifications for General Purpose SSD (gp2) volumes, in TiB",
+            500.0,
+        )
+        .code("L-F06E64A8")
+        .describe(
+            "The maximum aggregated storage, in TiB, that all General Purpose SSD (gp2) \
+             volumes in this account in the current Region can be modified to.",
+        ),
         storage("L-FD252861", "Provisioned IOPS SSD (io1)", 50.0),
     ]
 }
@@ -2843,16 +2905,17 @@ pub(super) fn ecr_quotas() -> Vec<QuotaRow> {
             .unit("Gigabytes")
             .fixed()
             .describe("The maximum size, in GiB, of one image layer."),
-        quota("Pull through cache rules per registry", 25.0)
-            .code("L-44194860")
+        quota("Pull through cache rules per registry", 50.0)
+            .code("L-6EF7FC96")
+            .fixed()
             .describe("The maximum number of pull through cache rules in one registry."),
         quota("Replication destinations per registry", 25.0)
-            .code("L-55A41110")
+            .code("L-44194860")
             .describe(
                 "The maximum number of destinations in one registry's replication \
                  configuration.",
             ),
-        rate("L-6EF7FC96", "BatchCheckLayerAvailability", 1000.0),
+        rate("L-55A41110", "GetAuthorizationToken", 500.0),
         rate("L-8BE1781E", "BatchDeleteImage", 100.0),
         rate("L-95B28F8D", "BatchGetImage", 10_000.0),
         rate("L-9B60BFFB", "CompleteLayerUpload", 100.0),
@@ -2860,8 +2923,8 @@ pub(super) fn ecr_quotas() -> Vec<QuotaRow> {
         rate("L-A1670B10", "DeleteRepository", 10.0),
         rate("L-A60A366D", "DescribeImages", 100.0),
         rate("L-A71EAF5A", "DescribeRepositories", 100.0),
-        rate("L-AD52DFB2", "GetAuthorizationToken", 500.0),
-        rate("L-B9173138", "GetDownloadUrlForLayer", 3000.0),
+        rate("L-AD52DFB2", "GetDownloadUrlForLayer", 3000.0),
+        rate("L-B9173138", "BatchCheckLayerAvailability", 1000.0),
         rate("L-C0B33BA1", "InitiateLayerUpload", 100.0),
         rate("L-CB63E564", "ListImages", 100.0),
         rate("L-CFEB8E8D", "PutImage", 100.0),
@@ -2877,6 +2940,9 @@ pub(super) fn ecr_quotas() -> Vec<QuotaRow> {
 /// each code's adjustability. EKS publishes its planes per CLUSTER as well as per
 /// Region — a cluster is the unit its node groups, Fargate profiles and access
 /// configuration are counted in — so a row names the plane it is counted on.
+/// A quota this catalog can cite no code for is left to the default-quota-set gap rather
+/// than published under a neighbouring code (see [`super::descriptive_quota_code`]), which
+/// is why the add-on plane of a cluster is absent.
 pub(super) fn eks_quotas() -> Vec<QuotaRow> {
     vec![
         quota("Clusters", 100.0)
@@ -2887,20 +2953,20 @@ pub(super) fn eks_quotas() -> Vec<QuotaRow> {
         quota("Managed node groups per cluster", 30.0)
             .code("L-1194D53C")
             .describe("The maximum number of managed node groups per cluster."),
-        quota("Nodes per managed node group", 450.0)
+        quota("Label pairs per Fargate profile selector", 5.0)
             .code("L-23414FF3")
-            .describe("The maximum number of nodes per managed node group."),
+            .describe("The maximum number of label pairs per Fargate profile selector."),
         quota("Fargate profiles per cluster", 10.0)
             .code("L-33415657")
             .describe("The maximum number of Fargate profiles per cluster."),
-        quota("Selectors per Fargate profile", 5.0)
+        quota("Nodes per managed node group", 450.0)
             .code("L-5C12D558")
-            .fixed()
-            .describe("The maximum number of selectors per Fargate profile."),
-        quota("Label pairs per Fargate profile selector", 5.0)
+            .describe("The maximum number of nodes per managed node group."),
+        // The remote-network plane of a hybrid cluster: the pod networks a cluster may
+        // reach outside the VPC, which AWS publishes as adjustable.
+        quota("Remote pod networks per cluster", 15.0)
             .code("L-6AFFD1D8")
-            .fixed()
-            .describe("The maximum number of label pairs per Fargate profile selector."),
+            .describe("The maximum number of remote pod networks per cluster."),
         quota("Control plane security groups per cluster", 4.0)
             .code("L-6D54EA21")
             .fixed()
@@ -2918,20 +2984,20 @@ pub(super) fn eks_quotas() -> Vec<QuotaRow> {
         quota("Pod identity associations per cluster", 1000.0)
             .code("L-C56B9FC3")
             .describe("The maximum number of EKS Pod Identity associations per cluster."),
-        quota("Registered clusters", 10.0)
+        quota("Selectors per Fargate profile", 5.0)
             .code("L-D78D8AF8")
+            .describe("The maximum number of selectors per Fargate profile."),
+        quota("EKS Anywhere Enterprise Subscriptions", 10.0)
+            .code("L-EA277FDC")
+            .describe(
+                "The maximum number of EKS Anywhere Enterprise Subscriptions in this account \
+                 in the current Region.",
+            ),
+        quota("Registered clusters", 10.0)
+            .code("L-FDFA5F81")
             .describe(
                 "The maximum number of Kubernetes clusters that can be connected to EKS in \
                  this account in the current Region.",
-            ),
-        quota("Add-ons per cluster", 20.0)
-            .code("L-EA277FDC")
-            .describe("The maximum number of EKS add-ons per cluster."),
-        quota("EKS Anywhere subscriptions", 10.0)
-            .code("L-FDFA5F81")
-            .describe(
-                "The maximum number of EKS Anywhere subscriptions in this account in the \
-                 current Region.",
             ),
     ]
 }
@@ -2949,6 +3015,9 @@ const ELASTICACHE_USAGE_SERVICE: &str = "ElastiCache";
 /// counts PER REGION are the ones CloudWatch publishes an `AWS/Usage` resource count
 /// for, so those rows carry that metric and the window those counts are published
 /// over, while a plane counted inside one cluster carries neither.
+/// A plane this catalog can cite no code for — the node plane of the Region and the
+/// replica plane of a shard — is left to the default-quota-set gap rather than published
+/// under a neighbouring code (see [`super::descriptive_quota_code`]).
 pub(super) fn elasticache_quotas() -> Vec<QuotaRow> {
     let metered = |code: &str, name: &str, value: f64, resource: &str, counted: &str| {
         resource_count_plane(code, name, value, ELASTICACHE_USAGE_SERVICE, resource, counted)
@@ -2956,17 +3025,25 @@ pub(super) fn elasticache_quotas() -> Vec<QuotaRow> {
     vec![
         metered(
             "L-3E7F7726",
-            "Nodes per Region",
+            "Subnet groups per Region",
             300.0,
-            "NodesPerRegion",
-            "nodes",
+            "SubnetGroup",
+            "subnet groups",
         ),
         quota("Nodes per cluster (Memcached)", 40.0)
             .code("L-3F15A733")
             .describe("The maximum number of nodes in one Memcached cluster."),
-        quota("Replicas per shard", 5.0)
-            .code("L-75A7B5A4")
-            .describe("The maximum number of read replicas per shard."),
+        // The snapshot plane of ONE serverless cache, metered like every other counted
+        // plane but counted inside a cache rather than across the Region, which is what
+        // its own sentence names.
+        metered(
+            "L-75A7B5A4",
+            "Serverless snapshots per day per cache",
+            24.0,
+            "SnapshotsPerDayPerCache",
+            "serverless snapshots per day per cache",
+        )
+        .describe("The maximum number of snapshots that can be taken per day for one cache."),
         metered(
             "L-7D6587E6",
             "Parameter groups per Region",
@@ -2984,13 +3061,15 @@ pub(super) fn elasticache_quotas() -> Vec<QuotaRow> {
         quota("Shards per cluster (cluster mode enabled)", 500.0)
             .code("L-8C334AD1")
             .describe("The maximum number of shards in one cluster with cluster mode enabled."),
+        // The user plane of ONE user group, counted inside the group.
         metered(
             "L-943F0F1C",
-            "Subnet groups per Region",
-            150.0,
-            "SubnetGroupsPerRegion",
-            "subnet groups",
-        ),
+            "Users per User Group",
+            100.0,
+            "UsersPerUserGroup",
+            "users per user group",
+        )
+        .describe("The maximum number of users in one user group."),
         quota("Subnets per subnet group", 20.0)
             .code("L-A87EE522")
             .describe("The maximum number of subnets in one subnet group."),
@@ -3031,35 +3110,41 @@ pub(super) fn elasticache_quotas() -> Vec<QuotaRow> {
 /// applications hold, the environments running them, and the custom platform versions
 /// they run on.
 pub(super) fn elasticbeanstalk_quotas() -> Vec<QuotaRow> {
+    // Every plane of this service is a count of what an account may CREATE in the
+    // Region, and the service words all of them the same way, so the sentence is
+    // built once from what the row counts.
+    let created = |counted: &str| {
+        format!(
+            "The maximum number of {counted} that you can create in this account in the \
+             current Region."
+        )
+    };
     vec![
         quota("Applications", 75.0)
             .code("L-1CEABD17")
-            .describe(
-                "The maximum number of applications in this account in the current Region.",
-            ),
-        quota("Application versions", 1000.0)
-            .code("L-8EFC1C51")
-            .describe(
-                "The maximum number of application versions in this account in the current \
-                 Region.",
-            ),
-        quota("Configuration templates", 300.0)
-            .code("L-9838E43F")
-            .describe(
-                "The maximum number of configuration templates in this account in the current \
-                 Region.",
-            ),
+            .describe(&created("applications")),
         quota("Environments", 200.0)
+            .code("L-8EFC1C51")
+            // The environment plane is counted across the account's applications, not
+            // inside one, which the service states in the row's own text.
+            .describe(&format!(
+                "{} The limit applies across applications, not per application.",
+                created("environments")
+            )),
+        quota("Configuration templates", 2000.0)
+            .code("L-9838E43F")
+            .describe(&created("configuration templates")),
+        quota("Application versions", 1000.0)
             .code("L-D64F1F14")
-            .describe(
-                "The maximum number of environments in this account in the current Region.",
-            ),
+            // The version plane is counted across the account's applications, the same way
+            // the environment plane is.
+            .describe(&format!(
+                "{} The limit applies across applications, not per application.",
+                created("application versions")
+            )),
         quota("Custom platform versions", 50.0)
             .code("L-E593A077")
-            .describe(
-                "The maximum number of custom platform versions in this account in the current \
-                 Region.",
-            ),
+            .describe(&created("custom platform versions")),
     ]
 }
 
@@ -3076,6 +3161,9 @@ const EFS_USAGE_SERVICE: &str = "EFS";
 /// planes. A throughput row carries the unit AWS publishes it in rather than being a
 /// count, and a request-rate row carries the one-second window and the `AWS/Usage`
 /// `CallCount` of the operation it throttles ([`request_rate`]).
+/// The tag plane of a file system is left to the default-quota-set gap: this catalog can
+/// cite no code for it, and a code identifies ONE quota (see
+/// [`super::descriptive_quota_code`]).
 pub(super) fn elasticfilesystem_quotas() -> Vec<QuotaRow> {
     let rate =
         |code: &str, api: &str, per_second: f64| request_rate(code, EFS_USAGE_SERVICE, api, per_second);
@@ -3085,9 +3173,13 @@ pub(super) fn elasticfilesystem_quotas() -> Vec<QuotaRow> {
             .describe(
                 "The maximum number of file systems in this account in the current Region.",
             ),
-        quota("Access points per file system", 1000.0)
+        quota("Total provisioned throughput per Region", 3072.0)
             .code("L-06519EB8")
-            .describe("The maximum number of access points per file system."),
+            .unit("Megabytes/Second")
+            .describe(
+                "The maximum throughput, in MiB/s, that can be provisioned across all file \
+                 systems in this account in the current Region.",
+            ),
         quota("Mount targets per file system per Availability Zone", 1.0)
             .code("L-1E30FF38")
             .fixed()
@@ -3103,10 +3195,13 @@ pub(super) fn elasticfilesystem_quotas() -> Vec<QuotaRow> {
             .code("L-29770CF9")
             .fixed()
             .describe("The maximum number of security groups per mount target."),
-        quota("Tags per file system", 50.0)
+        // The file-system operation rate, which the service publishes as a count with
+        // no window of its own rather than as one of the per-API rates below.
+        quota("Rate of file system operations", 250_000.0)
             .code("L-336A920F")
-            .fixed()
-            .describe("The maximum number of tags per file system."),
+            .describe(
+                "The maximum number of file system operations per second for one file system.",
+            ),
         quota("Replication configurations per file system", 1.0)
             .code("L-3D348029")
             .fixed()
@@ -3118,13 +3213,10 @@ pub(super) fn elasticfilesystem_quotas() -> Vec<QuotaRow> {
                 "The maximum throughput, in MiB/s, that can be provisioned for one file \
                  system.",
             ),
-        quota("Total provisioned throughput per Region", 3072.0)
+        quota("Access points per file system", 10_000.0)
             .code("L-4CCB99B3")
-            .unit("Megabytes/Second")
-            .describe(
-                "The maximum throughput, in MiB/s, that can be provisioned across all file \
-                 systems in this account in the current Region.",
-            ),
+            .fixed()
+            .describe("The maximum number of access points per file system."),
         rate("L-509A1582", "CreateAccessPoint", 5.0),
         rate("L-6D380DD0", "CreateFileSystem", 5.0),
         rate("L-7391004C", "CreateMountTarget", 5.0),
@@ -3146,6 +3238,23 @@ pub(super) fn elasticfilesystem_quotas() -> Vec<QuotaRow> {
 /// under, which is the `Service` dimension of every metered load-balancing quota.
 const ELB_USAGE_SERVICE: &str = "Elastic Load Balancing";
 
+/// The `AWS/Usage` resource count of one plane counted INSIDE a single Application Load
+/// Balancer, under the series CloudWatch publishes that plane's count as.
+///
+/// The per-Region planes of the service go through [`resource_count_plane`], which also
+/// fills in the window those counts are published over; a plane of one balancer carries
+/// the metric alone.
+fn alb_plane_metric(resource: &str) -> MetricInfo {
+    usage_metric(
+        ELB_USAGE_SERVICE,
+        &[
+            ("Class", "None"),
+            ("Resource", resource),
+            ("Type", "Resource"),
+        ],
+    )
+}
+
 /// Elastic Load Balancing's published default-quota catalog.
 ///
 /// SOURCE: AWS's published Service Quotas data for the `elasticloadbalancing` service
@@ -3157,7 +3266,9 @@ const ELB_USAGE_SERVICE: &str = "Elastic Load Balancing";
 /// PER LOAD BALANCER TYPE — a type is what a listener, rule or target allowance is
 /// bought under — so a row is named for the type it is counted on, and the per-Region
 /// planes of each type are the ones CloudWatch publishes an `AWS/Usage` resource count
-/// for.
+/// for. The target plane of a Gateway Load Balancer is left to the default-quota-set gap:
+/// this catalog can cite no code for it, and a code identifies ONE quota (see
+/// [`super::descriptive_quota_code`]).
 pub(super) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
     // One per-Region plane of a load-balancer type, metered like every other counted
     // plane ([`resource_count_plane`]).
@@ -3186,13 +3297,16 @@ pub(super) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
             "NetworkLoadBalancersPerRegion",
             "Network Load Balancers",
         ),
+        // The network-interface plane of a VPC: the ENIs every Network Load Balancer of
+        // the VPC takes together, metered by CloudWatch like the per-Region planes.
         metered(
             "L-23568085",
-            "Gateway Load Balancers per Region",
-            100.0,
-            "GatewayLoadBalancersPerRegion",
-            "Gateway Load Balancers",
-        ),
+            "Network Load Balancer ENIs per VPC",
+            1200.0,
+            "NetworkLoadBalancersENIsPerVPC",
+            "Network Load Balancer ENIs per VPC",
+        )
+        .describe("The maximum number of Network Load Balancer ENIs per VPC."),
         metered(
             "L-332EE142",
             "Target groups per Region",
@@ -3213,12 +3327,13 @@ pub(super) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
         quota("Listeners per Classic Load Balancer", 100.0)
             .code("L-53DA6B97")
             .describe("The maximum number of listeners per Classic Load Balancer."),
-        quota("Rules per Application Load Balancer", 100.0)
-            .code("L-57A373D6")
-            .describe(
-                "The maximum number of rules per Application Load Balancer, not counting \
-                 default rules.",
-            ),
+        metered(
+            "L-57A373D6",
+            "Gateway Load Balancers per Region",
+            100.0,
+            "GatewayLoadBalancersPerRegion",
+            "Gateway Load Balancers",
+        ),
         quota("Certificates per Application Load Balancer", 25.0)
             .code("L-69A177A2")
             .describe(
@@ -3231,10 +3346,9 @@ pub(super) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
                 "The maximum number of certificates per Network Load Balancer, not counting \
                  default certificates.",
             ),
-        quota("Target groups per Application Load Balancer", 100.0)
+        quota("Targets per Network Load Balancer", 3000.0)
             .code("L-7A15E3C5")
-            .fixed()
-            .describe("The maximum number of target groups per Application Load Balancer."),
+            .describe("The maximum number of targets per Network Load Balancer."),
         quota("Target groups per action per Application Load Balancer", 5.0)
             .code("L-7C45F98A")
             .fixed()
@@ -3245,12 +3359,21 @@ pub(super) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
         quota("Targets per Application Load Balancer", 1000.0)
             .code("L-7E6692B2")
             .describe("The maximum number of targets per Application Load Balancer."),
-        quota("Targets per Network Load Balancer", 3000.0)
+        // The two planes of an Application Load Balancer CloudWatch meters: the routing
+        // rules of the balancer and the target groups attached to it. They are counted
+        // inside ONE balancer, so each carries its own sentence and no window.
+        quota("Rules per Application Load Balancer", 100.0)
             .code("L-7EED9B64")
-            .describe("The maximum number of targets per Network Load Balancer."),
-        quota("Targets per Gateway Load Balancer", 300.0)
+            .metric_without_period(alb_plane_metric("RoutingRulesPerApplicationLoadBalancer"))
+            .describe(
+                "The maximum number of rules per Application Load Balancer, not counting \
+                 default rules.",
+            ),
+        quota("Target Groups per Application Load Balancer", 100.0)
             .code("L-822D1B1B")
-            .describe("The maximum number of targets per Gateway Load Balancer."),
+            .fixed()
+            .metric_without_period(alb_plane_metric("TargetGroupsPerApplicationLoadBalancer"))
+            .describe("The maximum number of target groups per Application Load Balancer."),
         quota(
             "Targets per Availability Zone per Network Load Balancer",
             500.0,

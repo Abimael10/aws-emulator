@@ -51,6 +51,10 @@ aws-sdk-organizations = { version = "1", default-features = false }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `automod::dir!` is what declares this crate's integration-test suites: `tests/all/main.rs`
+# names the directory and every `tests/all/<name>.rs` beside it compiles as one module of
+# the single test target.
+automod = { workspace = true }
 # `tokio::time::sleep` in tests/all/quota_workflow.rs, to wait past the span a
 # quota increase request takes to be decided.
 tokio = { workspace = true, features = ["time"] }

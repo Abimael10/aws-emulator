@@ -381,7 +381,7 @@ async fn a_request_that_allows_a_support_case_passes_through_case_opened_with_a_
             why: "allowed for ONE resource of a quota adjustable per resource",
             service_code: "es",
             quota_name: "Instances per domain",
-            desired: 200.0,
+            desired: 400.0,
             support_case_allowed: None,
             context_id: Some(format!("arn:aws:es:us-east-1:{ACCOUNT}:domain/search-index")),
         },

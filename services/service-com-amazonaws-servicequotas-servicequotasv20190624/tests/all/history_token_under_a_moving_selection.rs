@@ -321,9 +321,9 @@ async fn shrinking_rows(caller: &Client) -> Vec<Shrinking> {
                 "QuotaRequestedAtLevel": LEVEL_ALL,
             }),
             seeds: vec![
-                Increase::on_resource("es", &resource_quota, 120.0, &domain("alpha")),
-                Increase::on_resource("es", &resource_quota, 130.0, &domain("beta")),
-                Increase::on_resource("es", &resource_quota, 140.0, &domain("gamma")),
+                Increase::on_resource("es", &resource_quota, 320.0, &domain("alpha")),
+                Increase::on_resource("es", &resource_quota, 330.0, &domain("beta")),
+                Increase::on_resource("es", &resource_quota, 340.0, &domain("gamma")),
             ],
             page_size: 2,
         },

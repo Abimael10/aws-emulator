@@ -325,12 +325,12 @@ fn applied_quota_row(quota_code: &str) -> Row {
         identity: &["QuotaCode", "QuotaContext.ContextId"],
         page_size: 1,
         setup: vec![
-            raise("es", quota_code, 120.0, Some(&domain("beta"))),
-            raise("es", quota_code, 140.0, Some(&domain("gamma"))),
+            raise("es", quota_code, 320.0, Some(&domain("beta"))),
+            raise("es", quota_code, 340.0, Some(&domain("gamma"))),
             Step::Settle(PAST_DECISION),
         ],
         mutation: vec![
-            raise("es", quota_code, 90.0, Some("*")),
+            raise("es", quota_code, 290.0, Some("*")),
             Step::Settle(PAST_DECISION),
         ],
         needs_organization: false,
