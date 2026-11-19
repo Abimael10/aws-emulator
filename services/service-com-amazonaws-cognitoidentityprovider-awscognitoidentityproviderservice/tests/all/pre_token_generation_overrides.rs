@@ -61,14 +61,14 @@ const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 const HANDLER: &str = "lambda_function.lambda_handler";
 
 /// A password satisfying a default pool's password policy.
-const GOOD_PASSWORD: &str = "Passw0rd!2024";
+pub(crate) const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
 /// The password the `NEW_PASSWORD_REQUIRED` row chooses.
 const CHOSEN_PASSWORD: &str = "Ch0sen!Passw0rd";
 
 /// The group every user below is a member of, which is what the tokens would carry if the
 /// trigger changed nothing.
-const STORED_GROUP: &str = "stored-group";
+pub(crate) const STORED_GROUP: &str = "stored-group";
 
 /// The role that group grants, which is what the identity token's `cognito:roles` and
 /// `cognito:preferred_role` would carry unchanged.
@@ -79,7 +79,7 @@ const REPLACEMENT_ROLE: &str = "arn:aws:iam::000000000000:role/replacement";
 
 /// The one scope an access token of a sign-in is granted, which the rows that change the
 /// access token's scopes add to or take out of.
-const GRANTED_SCOPE: &str = "aws.cognito.signin.user.admin";
+pub(crate) const GRANTED_SCOPE: &str = "aws.cognito.signin.user.admin";
 
 /// How long a wait for a function to report `Active`, or for the warm-up invocation to
 /// answer, is given before it is a failure. Generous: the span is the emulator's to choose
@@ -91,7 +91,7 @@ const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// Cognito and Lambda over ONE shared engine, as `core/router/src/lib.rs` mounts them, so
 /// the trigger dispatch's in-process invocation reaches this very Lambda.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -159,7 +159,7 @@ fn answer(response: http::Response<Bytes>) -> (u16, Value) {
 }
 
 /// A Cognito call that must succeed, with its response body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, payload) = cognito(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -208,7 +208,7 @@ def lambda_handler(event, context):
 /// The warm-up is also the proof that the package RUNS: its answer is the document this
 /// handler builds, so a row that later reads an override out of a token is reading the
 /// return value of code that had already run once.
-async fn trigger_function(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn trigger_function(router: &MultiServiceRouter, name: &str) -> String {
     let (status, created) = lambda(
         router,
         "POST",
@@ -279,7 +279,7 @@ async fn trigger_function(router: &MultiServiceRouter, name: &str) -> String {
 
 /// Create a pool whose `LambdaConfig` is `lambda_config`, with an app client admitting every
 /// sign-in flow these suites drive, and return their minted ids.
-async fn pool_with_client(
+pub(crate) async fn pool_with_client(
     router: &MultiServiceRouter,
     name: &str,
     lambda_config: Value,
@@ -322,7 +322,7 @@ async fn pool_with_client(
 
 /// Create `username` with a permanent password and put it in the pool's stored group, which
 /// is the group configuration a trigger that overrides nothing leaves in the tokens.
-async fn grouped_user(router: &MultiServiceRouter, user_pool_id: &str, username: &str) {
+pub(crate) async fn grouped_user(router: &MultiServiceRouter, user_pool_id: &str, username: &str) {
     ok(
         router,
         "AdminCreateUser",
@@ -369,13 +369,13 @@ async fn grouped_user(router: &MultiServiceRouter, user_pool_id: &str, username:
 }
 
 /// The `ClientMetadata` that asks the handler to answer with `response`.
-fn asking_for(response: &Value) -> Value {
+pub(crate) fn asking_for(response: &Value) -> Value {
     json!({ "overrides": response.to_string() })
 }
 
 /// The decoded claims of a JWT this service issued: the payload segment, read the way every
 /// verifier of a Cognito token reads it.
-fn claims(case: &str, kind: &str, token: &str) -> Value {
+pub(crate) fn claims(case: &str, kind: &str, token: &str) -> Value {
     let payload = token
         .split('.')
         .nth(1)
@@ -392,7 +392,7 @@ fn claims(case: &str, kind: &str, token: &str) -> Value {
 
 /// What one claim of a minted token must be.
 #[derive(Debug, Clone)]
-enum Expect {
+pub(crate) enum Expect {
     /// The claim carries exactly this value.
     Is(Value),
     /// The claim is not in the token at all.
@@ -405,7 +405,7 @@ enum Expect {
 }
 
 /// Assert the `kind` token's `claims` against what the row expects of them.
-fn assert_claims(case: &str, kind: &str, claims: &Value, expected: &[(&str, Expect)]) {
+pub(crate) fn assert_claims(case: &str, kind: &str, claims: &Value, expected: &[(&str, Expect)]) {
     for (claim, expect) in expected {
         let got = claims.get(*claim).cloned();
         match expect {
