@@ -8,18 +8,18 @@
 //!
 //! ## The order the checks run in
 //!
-//! 1. **IAM**, for the principal the request's credentials speak for
+//! 1. **The modelled input constraints**, at the centralized boundary before this handler
+//!    runs: a `Resource` or `ChatConfiguration` outside the member's `@length`/`@pattern`
+//!    is malformed client input, refused 400 `InvalidRequestException` (`crate::service`).
+//! 2. **IAM**, for the principal the request's credentials speak for
 //!    ([`crate::service::authorization`]): a principal no identity-based policy allows
 //!    `chatbot:AssociateToConfiguration` on the custom action for is refused
 //!    `AccessDeniedException` (403) and nothing is linked.
-//! 2. **The resource-scoped authorization check on `Resource`**, BEFORE that member's ARN
-//!    shape is judged: an ARN no custom action of this account can be minted under names
-//!    no target in the account's namespace, so the request fails closed with the modelled
-//!    `UnauthorizedException` (403, [`crate::state::UNAUTHORIZED_MESSAGE`]) — the member's
-//!    modelled `@pattern` is therefore off the boundary (`skip_validation` on
-//!    `AssociateToConfigurationRequest`), since a boundary refusal would answer the
-//!    client-input class instead and so invert the two decisions.
-//! 3. **The target**: a channel configuration that can HOST the link
+//! 3. **The resource-scoped authorization check on `Resource`**, for an ARN that satisfies
+//!    the member's pattern yet no custom action of this account can be minted under: it
+//!    names no target in the account's namespace, so the request fails closed with the
+//!    modelled `UnauthorizedException` (403, [`crate::state::UNAUTHORIZED_MESSAGE`]).
+//! 4. **The target**: a channel configuration that can HOST the link
 //!    (`ComAmazonawsChatbotWheatleyorchestration20171011State::hosts_resource_associations`).
 //!    Anything else — an Amazon Chime webhook configuration, which is a webhook
 //!    destination with no channel to surface an action in, or an ARN this account holds no
@@ -162,9 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the store at all.
         crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, &input.resource)?;
 
-        // The resource-scoped authorization decision, taken before the `Resource` member's
-        // ARN shape is judged: an ARN outside the form this account's custom actions are
-        // minted under names no target in its namespace, so the request fails closed.
+        // The resource-scoped authorization decision, on an ARN the boundary already found
+        // well formed: an ARN outside the form this account's custom actions are minted
+        // under names no target in its namespace, so the request fails closed.
         if !crate::state::is_mintable_custom_action_arn(&input.resource) {
             return Err(AssociateToConfigurationErrorModeled::UnauthorizedException(
                 UnauthorizedException {

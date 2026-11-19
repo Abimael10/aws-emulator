@@ -11,18 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-chatbot-wheatleyorchestration-20171011.json");
 
-// `skip_validation = ["Resource"]`: AWS Chatbot takes the resource-scoped AUTHORIZATION
-// decision on this member before it judges the member's ARN shape, so a `Resource` outside
-// the modelled `@pattern` is answered 403 `UnauthorizedException` and not as a client-input
-// failure. A modelled constraint is refused at the centralized boundary, BEFORE the handler
-// runs, and this service words every boundary refusal as `InvalidRequestException` (400,
-// `crate::service`) — which would invert the two decisions — so the constraint comes off
-// here and the ARN is judged by the handler, through
-// `crate::state::is_mintable_custom_action_arn`.
-#[smithy_macros::smithy(
-    shape = "com.amazonaws.chatbot#AssociateToConfigurationRequest",
-    skip_validation = ["Resource"]
-)]
+// Every member is judged against its modelled constraints at the centralized boundary, as
+// on every other shape of this service: a `Resource` outside `ResourceIdentifier`'s
+// `@length`/`@pattern` is malformed client input, so it is refused 400
+// `InvalidRequestException` (`crate::service`) before the handler runs. The handler's
+// resource-scoped authorization decision (`crate::state::is_mintable_custom_action_arn`)
+// then applies to ARNs that DO satisfy the pattern yet name no target in this account's
+// namespace — the two classes judge different things, so neither shadows the other.
+#[smithy_macros::smithy(shape = "com.amazonaws.chatbot#AssociateToConfigurationRequest")]
 #[derive(Debug, Clone, Default)]
 pub struct AssociateToConfigurationInput {
     pub resource: String,
