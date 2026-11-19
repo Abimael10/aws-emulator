@@ -31,7 +31,7 @@ use super::domain_lifecycle::{
 };
 
 /// `POST /2021-01-01/opensearch/domain/{DomainName}/config/cancel`.
-async fn cancel(emulator: &Emulator, name: &str, dry_run: Option<bool>) -> Answer {
+pub(crate) async fn cancel(emulator: &Emulator, name: &str, dry_run: Option<bool>) -> Answer {
     let body = match dry_run {
         None => json!({}),
         Some(dry_run) => json!({ "DryRun": dry_run }),

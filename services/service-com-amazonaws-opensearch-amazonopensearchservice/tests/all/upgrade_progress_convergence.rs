@@ -47,6 +47,16 @@ use super::domain_lifecycle::{string_member, Answer, Emulator, SETTLE_WAIT};
 use super::upgrade_history::{entries as history_entries, expected_name, history, upgrade};
 use super::upgrade_status::{reported, status};
 
+/// The other axis of the same rule: WHEN a client may issue the upgrade at all — that the
+/// readiness a domain publishes and the state `UpgradeDomain` admits a run in are one
+/// condition, whatever work the domain has just finished.
+///
+/// The `#[path]` is what points this child at its own directory: this suite is itself
+/// reached through a `#[path]` from `tests/all.rs`, so a bare `mod` would resolve to a
+/// SIBLING suite.
+#[path = "upgrade_progress_convergence/readiness_admits_the_next_upgrade.rs"]
+mod readiness_admits_the_next_upgrade;
+
 /// The values of `UpgradeStatus` a run that has finished its work reports — the enum
 /// admits `IN_PROGRESS | SUCCEEDED | SUCCEEDED_WITH_ISSUES | FAILED`
 /// (`smithy_query(query="shape",shape="UpgradeStatus")`), of which these two are the
