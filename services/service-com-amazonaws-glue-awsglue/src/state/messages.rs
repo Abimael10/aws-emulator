@@ -10,6 +10,26 @@ pub fn crawler_not_found(name: &str) -> String {
     format!("Crawler entry with name {name} does not exist")
 }
 
+/// `StartCrawlerSchedule` for a `CrawlerName` no crawler in this account has.
+///
+/// Recorded template, reproduced as the service words this error class and NOT shortened:
+/// the sentence names the crawler the request addressed — the only variable part, read off
+/// the request's `CrawlerName` — states that it does not exist, and then states the miss a
+/// second time, because the component that answers this refusal composes its own sentence
+/// with the generic one, exactly as the classifier read's miss
+/// ([`classifier_not_found`]) does. A client matching on the refusal sees that doubled
+/// wording, so dropping the second half would be a divergence rather than a tidy-up. This
+/// is why this operation's miss is not [`crawler_not_found`], the sentence the
+/// crawler-definition reads answer with.
+///
+/// Pinned for THIS operation only, which is the one the corpus records. The sibling
+/// schedule writes (`StopCrawlerSchedule`, `UpdateCrawlerSchedule`) keep their own
+/// wording, which no recording pins, rather than being reworded on this operation's
+/// evidence.
+pub fn schedule_crawler_not_found(name: &str) -> String {
+    format!("Crawler with name {name} does not exist not found.")
+}
+
 /// `UpdateCrawler` for a crawler whose crawl is still in progress ("if a crawler is
 /// running, you must stop it using `StopCrawler` before updating it"). NOT recorded:
 /// what is pinned is the behaviour — 400 with the operation's modelled

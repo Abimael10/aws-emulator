@@ -479,7 +479,7 @@ async fn a_start_against_an_absent_crawler_is_the_modelled_miss() {
         );
         assert_eq!(
             error_message(&body),
-            messages::crawler_not_found(name),
+            messages::schedule_crawler_not_found(name),
             "case {case}: expected the crawler miss for {name}, got {body}"
         );
 
