@@ -36,6 +36,12 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # accessors (`src/state/query_authorization.rs`): a policy `iam:PutUserPolicy` wrote
 # takes effect on the next query.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# VPCs and subnets are Amazon EC2 resources: a `CreatePrivateGraphEndpoint` request that
+# leaves its `vpcId` or `subnetIds` to the service resolves them out of the account's
+# inventory in THAT service's store (`src/state/endpoint_network.rs`), so an endpoint
+# reports the ids `ec2:DescribeVpcs` and `ec2:DescribeSubnets` answer with rather than a
+# second answer to what networks the account holds.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # An accepted import task reads the data its `source` names out of this emulator's own
 # Amazon S3 (`src/state/import_load.rs`), over the in-process callback into this same
 # emulator: no network client feature is enabled, because the transport is the

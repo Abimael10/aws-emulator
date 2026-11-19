@@ -22,6 +22,11 @@
 //!   transition still outstanding (`CREATING`, `DELETING`) is refused 409, and a value
 //!   outside the modelled `VpcId` / `SubnetIds` / `SecurityGroupIds` constraints is
 //!   refused 400 rather than served.
+//! * `vpcId` and `subnetIds` are OPTIONAL input and REQUIRED output, so a member the
+//!   request leaves out is RESOLVED from the account's own network inventory in the
+//!   Region the request was signed for — the Region's default VPC, and the subnets the
+//!   VPC the endpoint is created in holds — and the endpoint reports the ids the service
+//!   that OWNS VPCs and subnets answers its own reads with.
 //!
 //! So each table below spans what its rule generalises over — the subnet count at the
 //! published bound and one past it, the presence and count of security groups, the form
@@ -32,8 +37,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+// The account's VPCs and subnets live in the service that owns them, mounted beside this
+// one on the same engine in the rows that drive the resolution of an absent member.
+use service_com_amazonaws_ec2_amazonec2 as ec2;
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{
-    DELETION_SPAN, ENDPOINT_DELETION_SPAN, PROVISIONING_SPAN,
+    DELETION_SPAN, ENDPOINT_DELETION_SPAN, MAX_ENDPOINT_SUBNET_IDS, PROVISIONING_SPAN,
 };
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -46,8 +54,9 @@ const REGION: &str = "us-east-1";
 const MIN_PROVISIONED_MEMORY: i64 = 16;
 
 /// The most subnets one endpoint may name: `SubnetIds` is `@length(1..6)`
-/// (`smithy_query(query="shape",shape="SubnetIds")`).
-const MAX_SUBNET_IDS: usize = 6;
+/// (`smithy_query(query="shape",shape="SubnetIds")`), as the crate itself states the
+/// bound ([`MAX_ENDPOINT_SUBNET_IDS`]).
+const MAX_SUBNET_IDS: usize = MAX_ENDPOINT_SUBNET_IDS;
 
 /// The most security groups one endpoint may name: `SecurityGroupIds` is
 /// `@length(1..10)` (`smithy_query(query="shape",shape="SecurityGroupIds")`).
@@ -62,9 +71,25 @@ fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// Dispatch one `restJson1` request and return its status and parsed JSON body.
+/// Dispatch one `restJson1` request signed for [`REGION`] and return its status and
+/// parsed JSON body.
 async fn call(
     router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    call_in(router, REGION, method, path, body).await
+}
+
+/// Dispatch one `restJson1` request signed for `region`.
+///
+/// The Region of the credential scope is the Region this regional control plane answers
+/// for, so a row about what the account holds in ONE Region sends its whole exchange
+/// through here.
+async fn call_in(
+    router: &MultiServiceRouter,
+    region: &str,
     method: &str,
     path: &str,
     body: Option<Value>,
@@ -79,7 +104,7 @@ async fn call(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/neptune-graph/\
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/neptune-graph/\
                  aws4_request, SignedHeaders=host, Signature=deadbeef"
             ),
         )
@@ -104,6 +129,11 @@ fn error_code(body: &Value) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+/// The text of one member of a response body, or the empty string when it carries none.
+fn text_of(body: &Value, member: &str) -> String {
+    body[member].as_str().unwrap_or_default().to_string()
 }
 
 /// Whether `value` matches the modelled `VpcEndpointId` pattern `^vpce-[0-9a-f]{17}$`.
@@ -916,30 +946,521 @@ async fn a_request_outside_the_modelled_list_constraints_is_refused() {
     }
 }
 
-#[tokio::test]
-async fn a_create_that_asks_the_service_to_default_the_vpc_is_not_implemented() {
-    let router = emulator();
-    let graph_id = graph_in_service(&router, "defaulting-source").await;
+// ---------------------------------------------------------------------------
+// The network the service resolves when the request leaves it out
+// ---------------------------------------------------------------------------
 
-    // The real service defaults an absent `vpcId` to the account's default VPC and an
-    // absent `subnetIds` to that VPC's subnets. This emulator holds no VPC inventory,
-    // so it answers the scaffold's 501 for that facet rather than inventing ids; every
-    // row that names both is served (asserted by the tables above).
-    let cases: Vec<(&str, Value)> = vec![
-        ("no vpcId", json!({"subnetIds": subnets(1)})),
-        ("no subnetIds", json!({"vpcId": "vpc-nodefault"})),
-        ("neither", json!({})),
-    ];
-    for (case, body) in cases {
-        let (status, response) = create_endpoint(&router, &graph_id, body.clone()).await;
-        assert_eq!(
-            status, 501,
-            "case {case:?} ({body}): expected 501, got {status}: {response}"
-        );
-        let code = error_code(&response);
-        assert_eq!(
-            code, "NotImplemented",
-            "case {case:?} ({body}): expected NotImplemented, got {code:?}: {response}"
-        );
+/// The EC2 API version an `ec2Query` body carries.
+const EC2_API_VERSION: &str = "2016-11-15";
+
+/// The Regions the regional row of the resolution runs over: the one the rest of this
+/// suite uses and two more, so "the network of the Region the request was signed for" is
+/// asserted over Regions rather than over one.
+const INVENTORY_REGIONS: [&str; 3] = [REGION, "us-west-2", "eu-central-1"];
+
+/// A Region code that is well formed but names no Region: an account holds a default VPC
+/// in the Regions that EXIST, so a scope naming this one resolves to no network.
+const REGION_OUTSIDE_THE_CATALOG: &str = "zz-nowhere-1";
+
+/// An emulator holding this service AND the service that owns the account's VPCs and
+/// subnets, on ONE engine — the way the assembled router mounts every service, and what
+/// lets a row read the network back out of the service that owns it.
+fn emulator_with_vpc_inventory() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(ec2::EmulatedService::new(engine));
+    router
+}
+
+/// One `ec2Query` call signed for `region` — an `application/x-www-form-urlencoded` POST
+/// whose body carries `Action=`, answered with XML — asserted successful, as its body.
+async fn ec2_call(
+    router: &MultiServiceRouter,
+    region: &str,
+    action: &str,
+    params: &[(&str, &str)],
+) -> String {
+    let mut form = format!("Action={action}&Version={EC2_API_VERSION}");
+    for (name, value) in params {
+        form.push('&');
+        form.push_str(name);
+        form.push('=');
+        form.push_str(value);
     }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://ec2.{region}.amazonaws.com/"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/ec2/aws4_request, \
+                 SignedHeaders=host, Signature=deadbeef"
+            ),
+        )
+        .body(bytes::Bytes::from(form))
+        .expect("a well-formed ec2Query request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(response.body()).to_string();
+    assert_eq!(
+        status, 200,
+        "case {region}/{action}: expected 200 from the VPC inventory, got {status}: {body}"
+    );
+    body
+}
+
+/// The text of every `<name>…</name>` element of an XML body, in document order.
+fn xml_elements(xml: &str, name: &str) -> Vec<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let mut found = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        rest = &rest[start + open.len()..];
+        match rest.find(&close) {
+            Some(end) => {
+                found.push(rest[..end].to_string());
+                rest = &rest[end + close.len()..];
+            }
+            None => break,
+        }
+    }
+    found
+}
+
+/// The subnets the account holds in `vpc_id`, read through the OWNING service's own
+/// `DescribeSubnets` narrowed by its documented `vpc-id` filter.
+async fn subnets_of_vpc(router: &MultiServiceRouter, region: &str, vpc_id: &str) -> Vec<String> {
+    let body = ec2_call(
+        router,
+        region,
+        "DescribeSubnets",
+        &[("Filter.1.Name", "vpc-id"), ("Filter.1.Value.1", vpc_id)],
+    )
+    .await;
+    xml_elements(&body, "subnetId")
+}
+
+/// The account's default VPC in `region` and the subnets it holds, read through the
+/// owning service's own reads: `DescribeVpcs` narrowed by the documented `is-default`
+/// filter, then [`subnets_of_vpc`]. What a resolved endpoint reports has to be exactly
+/// this.
+async fn default_network(router: &MultiServiceRouter, region: &str) -> (String, Vec<String>) {
+    let body = ec2_call(
+        router,
+        region,
+        "DescribeVpcs",
+        &[("Filter.1.Name", "is-default"), ("Filter.1.Value.1", "true")],
+    )
+    .await;
+    let reported = xml_elements(&body, "vpcId");
+    assert_eq!(
+        reported.len(),
+        1,
+        "case {region}: expected exactly one default VPC of the Region, got {reported:?} \
+         from {body}"
+    );
+    let vpc_id = reported[0].clone();
+    let subnet_ids = subnets_of_vpc(router, region, &vpc_id).await;
+    (vpc_id, subnet_ids)
+}
+
+/// A VPC of the account in `region` at `cidr_block`, created through the owning service's
+/// own `CreateVpc`, as its `VpcId`.
+async fn created_vpc(router: &MultiServiceRouter, region: &str, cidr_block: &str) -> String {
+    let body = ec2_call(router, region, "CreateVpc", &[("CidrBlock", cidr_block)]).await;
+    xml_elements(&body, "vpcId")
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("case {region}/{cidr_block}: expected a vpcId in {body}"))
+}
+
+/// A subnet of `vpc_id` at `cidr_block`, created through the owning service's own
+/// `CreateSubnet`.
+async fn created_subnet(
+    router: &MultiServiceRouter,
+    region: &str,
+    vpc_id: &str,
+    cidr_block: &str,
+) -> String {
+    let body = ec2_call(
+        router,
+        region,
+        "CreateSubnet",
+        &[("VpcId", vpc_id), ("CidrBlock", cidr_block)],
+    )
+    .await;
+    xml_elements(&body, "subnetId")
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("case {region}/{cidr_block}: expected a subnetId in {body}"))
+}
+
+/// Create a graph in `region` and wait it into service, returning its id.
+async fn graph_in_service_in(router: &MultiServiceRouter, region: &str, name: &str) -> String {
+    let body = json!({
+        "graphName": name,
+        "provisionedMemory": MIN_PROVISIONED_MEMORY,
+    });
+    let (status, created) = call_in(router, region, "POST", "/graphs", Some(body.clone())).await;
+    assert_eq!(
+        status, 201,
+        "case {region}/{name}: expected 201 from CreateGraph, got {status}: {created}"
+    );
+    let id = created["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {region}/{name}: no id in {created}"))
+        .to_string();
+    // The graph's provisioning is owed by the clock; no handler sleeps, this row only
+    // looks again until the condition it is waiting for holds.
+    for _ in 0..40 {
+        let (status, graph) = call_in(router, region, "GET", &format!("/graphs/{id}"), None).await;
+        assert_eq!(
+            status, 200,
+            "case {region}/{name}: expected 200 from GetGraph, got {status}: {graph}"
+        );
+        if graph["status"] == json!("AVAILABLE") {
+            return id;
+        }
+        tokio::time::sleep(PROVISIONING_SPAN / 4).await;
+    }
+    panic!("case {region}/{name}: the graph never became AVAILABLE");
+}
+
+/// One row of the resolution table: the case, the request body, the `vpcId` the answer
+/// must carry and the `subnetIds` it must carry.
+type ResolutionCase = (&'static str, Value, String, Vec<String>);
+
+#[tokio::test]
+async fn a_create_resolves_the_members_it_is_not_given_from_the_account_inventory() {
+    let router = emulator_with_vpc_inventory();
+    let (default_vpc, default_subnets) = default_network(&router, REGION).await;
+    assert!(
+        (1..=MAX_SUBNET_IDS).contains(&default_subnets.len()),
+        "case the account's default network: expected between one and {MAX_SUBNET_IDS} \
+         subnets, got {default_subnets:?}"
+    );
+
+    // A SECOND VPC of the account, with subnets of its own, so a row that names a VPC is
+    // resolved against THAT VPC's subnets and not against the default VPC's.
+    let other_vpc = created_vpc(&router, REGION, "10.20.0.0/16").await;
+    let mut other_subnets = Vec::new();
+    for index in 0..2 {
+        let cidr_block = format!("10.20.{index}.0/24");
+        other_subnets.push(created_subnet(&router, REGION, &other_vpc, &cidr_block).await);
+    }
+    assert_eq!(
+        subnets_of_vpc(&router, REGION, &other_vpc).await,
+        other_subnets,
+        "case the account's second VPC: the subnets it holds are the ones just created"
+    );
+
+    // The rows differ in WHICH member the request leaves to the service, and in which VPC
+    // of the account the resolution has to read: the recorded form (neither member) is one
+    // row of it.
+    let cases: Vec<ResolutionCase> = vec![
+        (
+            "neither member",
+            json!({}),
+            default_vpc.clone(),
+            default_subnets.clone(),
+        ),
+        (
+            "no vpcId, one subnet of the default VPC named",
+            json!({"subnetIds": default_subnets[..1]}),
+            default_vpc.clone(),
+            default_subnets[..1].to_vec(),
+        ),
+        (
+            "no subnetIds, the default VPC named",
+            json!({"vpcId": default_vpc}),
+            default_vpc.clone(),
+            default_subnets.clone(),
+        ),
+        (
+            "no subnetIds, another VPC of the account named",
+            json!({"vpcId": other_vpc}),
+            other_vpc.clone(),
+            other_subnets.clone(),
+        ),
+        (
+            // A subnet belongs to ONE VPC, so naming the subnets of a non-default VPC
+            // names that VPC: the resolved `vpcId` must be their holder rather than the
+            // account's default VPC.
+            "no vpcId, the subnets of another VPC of the account named",
+            json!({"subnetIds": other_subnets}),
+            other_vpc.clone(),
+            other_subnets.clone(),
+        ),
+        (
+            "neither member, security groups attached",
+            json!({"vpcSecurityGroupIds": security_groups(2)}),
+            default_vpc.clone(),
+            default_subnets.clone(),
+        ),
+    ];
+
+    for (index, (case, body, expected_vpc, expected_subnets)) in cases.into_iter().enumerate() {
+        // One endpoint per (graph, vpc), so each row gets its own graph and the rows that
+        // land in the same VPC do not conflict with one another.
+        let case_graph = format!("resolution-source-{index}");
+        let graph_id = graph_in_service_in(&router, REGION, &case_graph).await;
+        let (status, created) = create_endpoint(&router, &graph_id, body.clone()).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?} ({body}): expected 201, got {status}: {created}"
+        );
+        assert_eq!(
+            created["vpcId"],
+            json!(expected_vpc),
+            "case {case:?}: expected vpcId {expected_vpc:?}, got {}",
+            created["vpcId"]
+        );
+        assert_eq!(
+            created["subnetIds"],
+            json!(expected_subnets),
+            "case {case:?}: expected subnetIds {}, got {}",
+            json!(expected_subnets),
+            created["subnetIds"]
+        );
+        assert_eq!(
+            created["status"],
+            json!("CREATING"),
+            "case {case:?}: an endpoint is not reachable when the call returns, expected \
+             CREATING, got {}",
+            created["status"]
+        );
+        let vpc_endpoint_id = created["vpcEndpointId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no vpcEndpointId in {created}"))
+            .to_string();
+        assert!(
+            is_vpc_endpoint_id(&vpc_endpoint_id),
+            "case {case:?}: expected an id matching ^vpce-[0-9a-f]{{17}}$, got \
+             {vpc_endpoint_id:?}"
+        );
+
+        // The resolved network is one the ACCOUNT holds: every subnet reported is a subnet
+        // the owning service reports in the VPC reported beside it.
+        let held = subnets_of_vpc(&router, REGION, &expected_vpc).await;
+        for subnet_id in &expected_subnets {
+            assert!(
+                held.contains(subnet_id),
+                "case {case:?}: the endpoint reports the subnet {subnet_id:?}, which the \
+                 account does not hold in {expected_vpc}: {held:?}"
+            );
+        }
+
+        // The round trip: the read reports the resolved record, so what was stored is what
+        // the create answered.
+        let (read_status, read) = get_endpoint(&router, &graph_id, &expected_vpc).await;
+        assert_eq!(
+            read_status, 200,
+            "case {case:?}: expected 200 from GetPrivateGraphEndpoint for the resolved \
+             {expected_vpc}, got {read_status}: {read}"
+        );
+        for member in ["vpcId", "subnetIds", "vpcEndpointId"] {
+            assert_eq!(
+                read[member], created[member],
+                "case {case:?}: GetPrivateGraphEndpoint's {member} must be the stored value \
+                 {}, got {}",
+                created[member], read[member]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_resolved_network_is_the_one_the_account_holds_in_the_signed_region() {
+    let router = emulator_with_vpc_inventory();
+
+    let mut resolved: Vec<(&str, String, Vec<String>)> = Vec::new();
+    for region in INVENTORY_REGIONS {
+        // A graph name is unique per Region, so the same name in each Region is one graph
+        // of that Region.
+        let graph_id = graph_in_service_in(&router, region, "regional-endpoint-source").await;
+        let (status, created) = call_in(
+            &router,
+            region,
+            "POST",
+            &format!("/graphs/{graph_id}/endpoints/"),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {region:?}: expected 201, got {status}: {created}"
+        );
+        // Read the account's network AFTER the create, so the ids the create answered have
+        // to be the ids the owning service's own reads report.
+        let (expected_vpc, expected_subnets) = default_network(&router, region).await;
+        assert_eq!(
+            created["vpcId"],
+            json!(expected_vpc),
+            "case {region:?}: expected the Region's default VPC {expected_vpc:?}, got {}",
+            created["vpcId"]
+        );
+        assert_eq!(
+            created["subnetIds"],
+            json!(expected_subnets),
+            "case {region:?}: expected the subnets of {expected_vpc}, {}, got {}",
+            json!(expected_subnets),
+            created["subnetIds"]
+        );
+
+        for (other_region, other_vpc, other_subnets) in &resolved {
+            assert_ne!(
+                &expected_vpc, other_vpc,
+                "case {region:?} vs {other_region:?}: each Region resolves to its OWN \
+                 default VPC, got {expected_vpc} twice"
+            );
+            let shared: Vec<&String> = expected_subnets
+                .iter()
+                .filter(|id| other_subnets.contains(id))
+                .collect();
+            assert!(
+                shared.is_empty(),
+                "case {region:?} vs {other_region:?}: a subnet belongs to one Region, got \
+                 {shared:?}"
+            );
+        }
+        resolved.push((region, expected_vpc, expected_subnets));
+    }
+}
+
+#[tokio::test]
+async fn a_vpc_holding_more_subnets_than_the_member_carries_resolves_to_the_bound() {
+    let router = emulator_with_vpc_inventory();
+    let graph_id = graph_in_service_in(&router, REGION, "crowded-vpc-source").await;
+
+    // A VPC of the account holding one subnet more than `SubnetIds` may carry.
+    let vpc_id = created_vpc(&router, REGION, "10.30.0.0/16").await;
+    for index in 0..=MAX_SUBNET_IDS {
+        created_subnet(&router, REGION, &vpc_id, &format!("10.30.{index}.0/24")).await;
+    }
+    let held = subnets_of_vpc(&router, REGION, &vpc_id).await;
+    assert_eq!(
+        held.len(),
+        MAX_SUBNET_IDS + 1,
+        "case the crowded VPC: expected {} subnets in the account, got {held:?}",
+        MAX_SUBNET_IDS + 1
+    );
+
+    let (status, created) = create_endpoint(&router, &graph_id, json!({"vpcId": vpc_id})).await;
+    assert_eq!(
+        status, 201,
+        "case the crowded VPC: expected 201, got {status}: {created}"
+    );
+    assert_eq!(
+        created["subnetIds"],
+        json!(held[..MAX_SUBNET_IDS]),
+        "case the crowded VPC: a resolved list carries at most the modelled {MAX_SUBNET_IDS} \
+         subnets, expected {}, got {}",
+        json!(held[..MAX_SUBNET_IDS]),
+        created["subnetIds"]
+    );
+}
+
+#[tokio::test]
+async fn a_network_the_account_does_not_hold_is_refused_rather_than_invented() {
+    let router = emulator_with_vpc_inventory();
+    let graph_id = graph_in_service_in(&router, REGION, "empty-vpc-source").await;
+
+    // A VPC of the account with no subnet in it: `subnetIds` is `@length(1..6)`, so there
+    // is nothing for the service to resolve the member from, and the endpoint is refused
+    // rather than created with a subnet nothing holds.
+    let empty_vpc = created_vpc(&router, REGION, "10.40.0.0/16").await;
+    assert!(
+        subnets_of_vpc(&router, REGION, &empty_vpc).await.is_empty(),
+        "case the empty VPC: this row needs a VPC the account holds no subnet in"
+    );
+    let (status, response) =
+        create_endpoint(&router, &graph_id, json!({"vpcId": empty_vpc})).await;
+    assert_eq!(
+        status, 400,
+        "case the empty VPC: expected 400, got {status}: {response}"
+    );
+    let code = error_code(&response);
+    assert_eq!(
+        code, "ValidationException",
+        "case the empty VPC: expected ValidationException, got {code:?}: {response}"
+    );
+    assert_eq!(
+        response["reason"],
+        json!("BAD_REQUEST"),
+        "case the empty VPC: a well-formed request the account's state leaves nothing to \
+         resolve from is the bad request it is, got {}",
+        response["reason"]
+    );
+    let (read_status, read) = get_endpoint(&router, &graph_id, &empty_vpc).await;
+    assert_ne!(
+        read_status, 200,
+        "case the empty VPC: a refused create must persist nothing, but the read answered \
+         {read}"
+    );
+    let empty_vpc_message = text_of(&response, "message");
+
+    // A VPC the account does NOT hold, with the subnets left to the service: there is no
+    // VPC to read them off at all, which is a different condition and is worded apart so a
+    // caller learns which of the two it sent.
+    let absent_vpc = "vpc-0000000000nosuch";
+    assert!(
+        subnets_of_vpc(&router, REGION, absent_vpc).await.is_empty(),
+        "case a VPC the account does not hold: this row needs an id naming no VPC"
+    );
+    let (status, response) =
+        create_endpoint(&router, &graph_id, json!({"vpcId": absent_vpc})).await;
+    assert_eq!(
+        status, 400,
+        "case a VPC the account does not hold: expected 400, got {status}: {response}"
+    );
+    let code = error_code(&response);
+    assert_eq!(
+        code, "ValidationException",
+        "case a VPC the account does not hold: expected ValidationException, got {code:?}: \
+         {response}"
+    );
+    let absent_vpc_message = text_of(&response, "message");
+    assert!(
+        absent_vpc_message.contains(absent_vpc),
+        "case a VPC the account does not hold: the refusal must name the VPC the request \
+         sent, got {absent_vpc_message:?}"
+    );
+    assert_ne!(
+        absent_vpc_message, empty_vpc_message,
+        "case a VPC the account does not hold: a VPC that does not exist and a VPC holding \
+         no subnet are two conditions, so they cannot share one sentence"
+    );
+
+    // And a request signed for a Region code that names no Region at all: an account has
+    // a default VPC in the Regions that EXIST, so caller-controlled scope text resolves to
+    // no network and the request is refused rather than answered with ids nothing holds.
+    let unknown_region_graph =
+        graph_in_service_in(&router, REGION_OUTSIDE_THE_CATALOG, "unknown-region-source").await;
+    let (status, response) = call_in(
+        &router,
+        REGION_OUTSIDE_THE_CATALOG,
+        "POST",
+        &format!("/graphs/{unknown_region_graph}/endpoints/"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case a Region outside the catalog: expected 400, got {status}: {response}"
+    );
+    let code = error_code(&response);
+    assert_eq!(
+        code, "ValidationException",
+        "case a Region outside the catalog: expected ValidationException, got {code:?}: \
+         {response}"
+    );
+    assert_eq!(
+        response["reason"],
+        json!("BAD_REQUEST"),
+        "case a Region outside the catalog: expected the bad-request reason, got {}",
+        response["reason"]
+    );
 }

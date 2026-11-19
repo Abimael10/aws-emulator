@@ -4740,11 +4740,13 @@ pub fn locked_store_now(
 #[cfg(test)]
 mod tests;
 
+mod endpoint_network;
 mod import_formats;
 mod import_load;
 mod open_cypher;
 mod query_authorization;
 
+pub use endpoint_network::*;
 pub use import_formats::*;
 pub use import_load::*;
 pub use open_cypher::*;

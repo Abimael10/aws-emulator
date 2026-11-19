@@ -2,7 +2,8 @@
 
 //! @op CreatePrivateGraphEndpoint
 //! IMPLEMENTED: mints and persists the private graph endpoint of one graph in one VPC,
-//! and reports the stored record.
+//! resolving the VPC and the subnets a request leaves to the service out of the account's
+//! own VPC inventory, and reports the stored record.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -170,26 +171,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // `vpcId` and `subnetIds` are optional on the wire because the real service
-        // defaults them from the account's VPC inventory — the default VPC, and the
-        // subnets of the VPC the endpoint is created in. This emulator holds no VPC
-        // inventory, and `subnetIds` is a REQUIRED output member, so defaulting them
-        // would mean inventing a VPC and subnets that exist nowhere. The facet this
-        // emulator cannot perform is reported as the 501 it has not been written for,
-        // rather than answered with fabricated ids; a request that names both is served
-        // in full below.
-        let (Some(vpc_id), Some(subnet_ids)) = (input.vpc_id, input.subnet_ids) else {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CreatePrivateGraphEndpoint without vpcId and subnetIds (which the service \
-                 defaults from the account's default VPC and that VPC's subnets)",
-            ));
+        // `vpcId` and `subnetIds` are OPTIONAL on the wire and REQUIRED in the answer, so
+        // what the request does not name, the service chooses: the network a new endpoint
+        // is created in is resolved out of the account's own VPC inventory in the Region
+        // this request was signed for (`crate::state::resolve_endpoint_network`), which
+        // reads it from the service that OWNS VPCs and subnets in this same engine. A
+        // request that names both is resolved from the request alone, without consulting
+        // the inventory.
+        //
+        // Taken before this service's store is locked, so no handler holds two stores at
+        // once; the only write it can make is the one the owning service owes the account
+        // anyway — the default VPC every Region of an account has, materialised there by
+        // the one place that service has for it, which its own reads materialise too.
+        let region = crate::state::request_region(ctx);
+        let network = match crate::state::resolve_endpoint_network(
+            &*self.engine,
+            &region,
+            input.vpc_id,
+            input.subnet_ids,
+        ) {
+            Ok(network) => network,
+            Err(refusal) => {
+                return Err(
+                    CreatePrivateGraphEndpointErrorModeled::ValidationException(refusal).into(),
+                );
+            }
         };
+        let crate::state::EndpointNetwork {
+            vpc_id,
+            subnet_ids,
+        } = network;
         // Both lists arrive within their modelled `@length` and `@uniqueItems` bounds
         // and with every element matching its member `@pattern`: the boundary validator
         // refuses the rest before this handler runs.
         let security_group_ids = input.vpc_security_group_ids.unwrap_or_default();
 
-        let region = crate::state::request_region(ctx);
         let (mut store, now) = crate::state::locked_store_now(&state);
 
         // A private graph endpoint is the private route INTO a graph, so the graph has
