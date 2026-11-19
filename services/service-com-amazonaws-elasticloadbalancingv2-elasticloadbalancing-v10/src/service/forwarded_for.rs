@@ -40,10 +40,15 @@ pub(super) const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
 /// list the client supplied.
 const ENTRY_SEPARATOR: &str = ", ";
 
-/// The address a request to a load balancer's own socket comes from. The core does not hand
-/// the handler the peer address, and every connection to a loopback listener comes from
-/// loopback, so that is the address a request is attributed to — the same reading every other
-/// plane of this emulator that reports the address a request came from uses.
+/// The address a request is attributed to where this emulator observed none of its own: the
+/// core does not hand a handler the peer of a connection it accepted, and every connection to
+/// a loopback listener comes from loopback, so that is the address such a request came from —
+/// the same reading every other plane of this emulator that reports the address a request came
+/// from uses.
+///
+/// A connection whose own end STATED where it was opened from carries that address instead
+/// ([`super::data_plane`]): a client inside this emulator says so when it opens one, and that
+/// is then the address the load balancer has for the request.
 pub(super) const CONNECTION_ADDRESS: &str = "127.0.0.1";
 
 /// What a load balancer does to the header before a target sees it.

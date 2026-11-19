@@ -12,6 +12,15 @@
 //! the port range), and reports the `host:port` that socket answers on as its DNS name. A
 //! client dials exactly what it was told.
 //!
+//! That address is served at BOTH ends: the connections the core accepts on the socket, and
+//! the connections a client INSIDE this emulator opens to the same `host:port`
+//! ([`::service_common::dialable_data_planes`]) — a function, an instance or a task of the
+//! emulated network. One handler serves both, so a load balancer answers the same request
+//! however the connection reached it; and because such a client STATES the address it opens
+//! the connection from, that is the address the load balancer HAS for it — what a
+//! `source-ip` condition is evaluated against, what an `append` of `X-Forwarded-For` adds,
+//! and the `client:port` of its own access-log record.
+//!
 //! Only a load balancer whose listeners carry the traffic a client on this machine sends, and
 //! whose nodes carry PUBLIC addresses, gets one. Those listeners are the Application family's,
 //! which answer the client's own request, and the Network family's, which hand the connection
@@ -55,6 +64,10 @@ pub struct LoadBalancerEndpoint {
     load_balancer: Arc<OnceLock<String>>,
     /// The listener itself. Never read: it is held because dropping it closes the port.
     _listener: ::emulator_server::ResourceListener,
+    /// The record that says this emulator SERVES that address, for a client of its own
+    /// ([`::service_common::dialable_data_planes`]). Never read: it is held because
+    /// dropping it withdraws the address, exactly as dropping the listener closes the port.
+    _dialable: Option<::service_common::dialable_data_planes::OpenedPlanes>,
 }
 
 impl std::fmt::Debug for LoadBalancerEndpoint {
@@ -95,7 +108,7 @@ pub async fn open_load_balancer_endpoint<Eng: Send + Sync + 'static>(
     let shared = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()?;
     let load_balancer: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
     let listeners = shared.listeners();
-    let handler = crate::service::listener_socket::ListenerSocket::new(
+    let handler = Arc::new(crate::service::listener_socket::ListenerSocket::new(
         Arc::clone(&load_balancer),
         shared.state::<super::ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State>(),
         super::certificate_key_material_directory(engine),
@@ -105,18 +118,43 @@ pub async fn open_load_balancer_endpoint<Eng: Send + Sync + 'static>(
         // are served by the handler itself, which is the only way the certificate ACM holds
         // can be the one presented.
         listeners.tls_upgrader().ok(),
-    );
+    ));
+    // The SAME handler serves both ends of the address: the connections the core accepts on
+    // the socket, and the ones a client INSIDE this emulator opens to it below.
+    let served = Arc::clone(&handler);
     // Opened on a task of its OWN, so a runtime that cannot bind a socket at all — one
     // built with no IO driver, which is what a host that drives this emulator in process
     // may hand a request — leaves this create without an address of its own instead of
     // taking the request down with it: the join answers `Err`, this answers `None`, and the
     // caller falls back to the name Elastic Load Balancing's own zone would carry.
-    let opened = ::tokio::spawn(async move { listeners.tcp_plaintext(handler).await.ok() }).await;
+    let opened = ::tokio::spawn(async move {
+        listeners
+            .tcp_plaintext(::service_common::dialable_data_planes::SharedHandler(handler))
+            .await
+            .ok()
+    })
+    .await;
     let listener = opened.ok().flatten()?;
+    let authority = ::service_common::data_plane_addressing::listener_authority(&listener);
+    // The published address is recorded as one this emulator SERVES, so a client of the
+    // emulator's own — the one an INTERNAL load balancer exists for, a function or an
+    // instance inside the emulated network — reaches this load balancer's listeners by the
+    // very address the control plane published, instead of being answered as a client of an
+    // address nothing listens at. Such a client STATES the address it opens the connection
+    // from, which is what the load balancer then has for it: the address a `source-ip`
+    // condition is evaluated against and the `client:port` of its access-log record
+    // ([`crate::service::listener_socket`]). The plane reads byte 0 itself, exactly as it
+    // does on the socket, so the record carries no TLS upgrader of its own.
+    let dialable =
+        ::service_common::dialable_data_planes::DialablePlanes::of(engine).map(|planes| {
+            let plane = ::service_common::dialable_data_planes::served_in_process(served, None);
+            planes.opening([authority.clone()], super::SERVICE_NAMESPACE, &plane)
+        });
     Some(LoadBalancerEndpoint {
-        authority: ::service_common::data_plane_addressing::listener_authority(&listener),
+        authority,
         load_balancer,
         _listener: listener,
+        _dialable: dialable,
     })
 }
 

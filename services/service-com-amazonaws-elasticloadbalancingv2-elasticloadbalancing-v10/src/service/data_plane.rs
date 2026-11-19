@@ -321,6 +321,27 @@ pub(super) const TLS_HEADERS: [&str; 4] = [
     TLS_CERTIFICATE_ARN_HEADER,
 ];
 
+/// The address the CONNECTION this request arrived over was opened from, as the end that
+/// accepted it knows it.
+///
+/// It is read off the CONNECTION and never off the request: a client of this emulator states
+/// where it opens a connection from when it opens one
+/// ([`::service_common::dialable_data_planes`]), and that statement belongs to the connection
+/// the load balancer's own address is served on — the socket and the in-process end alike
+/// ([`crate::state::LoadBalancerEndpoint`]) — so no header a client writes can become the
+/// address its own request is attributed to. That is what makes a `source-ip` condition
+/// unspoofable: "this condition is not satisfied by the addresses in the X-Forwarded-For
+/// header" (`SourceIpConditionConfig$Values`).
+///
+/// `None` for a connection this emulator observed no address for — one the core accepted on a
+/// load balancer's socket, whose peer the core hands its handlers nothing about, and a request
+/// made against this plane's own endpoint directly. The load balancer then reports no client
+/// address for the request, which is what Elastic Load Balancing reports for a field it has no
+/// value for.
+fn connection_opened_from() -> Option<std::net::SocketAddr> {
+    ::service_common::dialable_data_planes::connected_from()
+}
+
 /// The five placeholders a `redirect` action's components may be written with, from
 /// `RedirectActionConfig`: "You can reuse URI components using the following reserved
 /// keywords: #{protocol}, #{host}, #{port}, #{path} (the leading "/" is not included) and
@@ -656,12 +677,18 @@ pub(super) struct DataPlaneRequest {
     /// The address this load balancer RECEIVED the request from — the other end of the
     /// connection, which is what a `source-ip` condition is evaluated against.
     ///
-    /// It is the address a client reaches this emulator's sockets from for the load balancer
-    /// the client itself addressed ([`super::forwarded_for::CONNECTION_ADDRESS`]), and the
+    /// It is the address the connection was opened from where this emulator knows it
+    /// ([`connection_opened_from`]), the address a client reaches this emulator's sockets
+    /// from where it does not ([`super::forwarded_for::CONNECTION_ADDRESS`]), and the
     /// forwarding load balancer's own published address for each later hop of a chain,
     /// because that is the address the next load balancer receives the request from. It is
-    /// never read off a header: a header is what the CLIENT wrote.
+    /// never read off a header the CLIENT wrote.
     pub(super) source_address: String,
+    /// The `host:port` the connection this request arrived over was opened from, where the
+    /// end that accepted it knew one ([`connection_opened_from`]) — the `client:port` of the
+    /// load balancer's own access-log record. `None` for a connection this emulator observed
+    /// no address for, which is what that record then reports nothing in.
+    pub(super) client_address: Option<String>,
 }
 
 /// What the TLS handshake that carried a request negotiated, as the socket that ran it
@@ -731,6 +758,9 @@ impl DataPlaneRequest {
             .map(|(name, value)| (name.to_ascii_lowercase(), value.to_string()))
             .collect();
         let tls = ConnectionTls::taken_from(&mut headers);
+        // Where the connection this request arrived over was opened FROM, read off the
+        // CONNECTION and never off the request ([`connection_opened_from`]).
+        let connection = connection_opened_from();
         Self {
             method: req.method().to_string(),
             path: path.to_string(),
@@ -739,7 +769,13 @@ impl DataPlaneRequest {
             headers,
             port: addressed_port(addressed),
             tls,
-            source_address: super::forwarded_for::CONNECTION_ADDRESS.to_string(),
+            // The address the connection came from where this emulator knows one, and the
+            // address a client reaches its sockets from where it does not.
+            source_address: connection.map_or_else(
+                || super::forwarded_for::CONNECTION_ADDRESS.to_string(),
+                |address| address.ip().to_string(),
+            ),
+            client_address: connection.map(|address| address.to_string()),
         }
     }
 
@@ -924,11 +960,17 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     // leads back to one of them is answered rather than walked again.
     let mut walked: Vec<String> = Vec::new();
     // The address the request came from, which is what an `append` of its `X-Forwarded-For`
-    // adds ([`super::forwarded_for`]): the address a client reaches this emulator from for the
-    // load balancer it addressed, and the forwarding load balancer's own published address for
-    // each later hop of a chain, because that is the address the next load balancer receives
-    // the request from.
-    let mut connecting_address = super::forwarded_for::CONNECTION_ADDRESS.to_string();
+    // adds ([`super::forwarded_for`]): the address the connection this request arrived over
+    // was opened from, as the end that accepted it knew it, and the forwarding load
+    // balancer's own published address for each later hop of a chain, because that is the
+    // address the next load balancer receives the request from.
+    let mut connecting_address = request.source_address.clone();
+    // The `client:port` the load balancer's own access-log record carries: the address the
+    // connection was opened from. A request one load balancer PASSES ON is received by the
+    // next one over no connection of its own, so the hop that answers it records no client
+    // address — the address is the forwarding load balancer's, and the port it would have
+    // come from is one nothing here observed.
+    let mut client_address = request.client_address.clone();
     let served = loop {
         // What this service holds about the addressed load balancer and the listener the
         // request reached, under a lock that is RELEASED before anything else is asked.
@@ -1110,6 +1152,7 @@ pub async fn serve<Eng: Send + Sync + 'static>(
                     &connecting_address,
                 );
                 connecting_address = host_only(&published_name).to_string();
+                client_address = None;
             }
         }
     };
@@ -1135,6 +1178,7 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         &load_balancer_arn,
         &listener_arn,
         &request,
+        client_address,
         req.body().bytes().map_or(0, <[u8]>::len),
         &served,
         matched_rule_priority,
@@ -1159,6 +1203,7 @@ async fn deliver_access_log(
     load_balancer_arn: &str,
     listener_arn: &str,
     request: &DataPlaneRequest,
+    client_address: Option<String>,
     received_bytes: usize,
     served: &Served,
     matched_rule_priority: i32,
@@ -1186,6 +1231,7 @@ async fn deliver_access_log(
     let answered = super::access_logs::AnsweredRequest {
         load_balancer_id,
         node_address,
+        client_address,
         listener_protocol: protocol,
         listener_port: port,
         received_at,

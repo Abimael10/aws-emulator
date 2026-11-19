@@ -175,6 +175,16 @@ pub(super) struct AnsweredRequest {
     /// The address of the node that answered — the host of the address the load balancer
     /// publishes, which is where this one answered.
     pub(super) node_address: String,
+    /// The `host:port` the connection this request arrived over was opened from, as the end
+    /// that accepted it knew it — the record's `client:port`.
+    ///
+    /// Known for a connection whose own end STATED where it came from, which is a client
+    /// inside this emulator ([`crate::service::data_plane::CLIENT_ADDRESS_HEADER`]), and
+    /// `None` for one the core accepted on a load balancer's socket, whose peer the core
+    /// hands its handlers nothing about — where the record carries [`ABSENT`], the marker
+    /// Elastic Load Balancing writes for a field it has no value for, rather than an
+    /// invented address or port.
+    pub(super) client_address: Option<String>,
     /// The protocol of the listener the request reached (`HTTP`/`HTTPS`), which is the
     /// record's `type`.
     pub(super) listener_protocol: Option<String>,
@@ -237,6 +247,7 @@ impl Default for AnsweredRequest {
         Self {
             load_balancer_id: String::new(),
             node_address: String::new(),
+            client_address: None,
             listener_protocol: None,
             listener_port: None,
             received_at: SystemTime::UNIX_EPOCH,
@@ -284,9 +295,12 @@ impl AnsweredRequest {
             self.entry_type(),
             timestamp(self.answered_at),
             self.load_balancer_id.clone(),
-            // A request served in-process carries no connection address for this plane to
-            // read (see [`super::data_plane`]), so the client's address is not reported.
-            ABSENT.to_string(),
+            // The address and port the connection was opened from, where the end that
+            // accepted it knew them (see [`Self::client_address`]); the absent marker for a
+            // connection this emulator observed no address for.
+            self.client_address
+                .clone()
+                .unwrap_or_else(|| ABSENT.to_string()),
             // A Lambda target is reached by invoking it rather than by connecting to an
             // address, which is why Elastic Load Balancing reports none for such an entry.
             target_address.clone(),

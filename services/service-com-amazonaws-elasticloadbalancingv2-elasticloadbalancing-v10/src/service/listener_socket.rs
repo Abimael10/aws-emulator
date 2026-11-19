@@ -73,6 +73,13 @@
 //! connection reached — so the plane evaluates the listener the client actually connected
 //! to.
 //!
+//! The same handler serves the connections a client INSIDE this emulator opens to the very
+//! address the load balancer published ([`crate::state::LoadBalancerEndpoint`]), so one load
+//! balancer answers the same request however the connection reached it. Where such a client
+//! came FROM travels on no header: it belongs to the connection, and the plane reads it there
+//! ([`super::data_plane`]), so nothing a client writes can become the address its own request
+//! is attributed to.
+//!
 //! Every status, header and byte is computed from what a create or a modify persisted, and
 //! this module writes NOTHING: serving traffic moves no status, consumes no quota and bumps
 //! no counter.
@@ -895,7 +902,9 @@ fn forwarded(
     }
     // What the handshake this connection ran negotiated, which only this end observed
     // ([`crate::service::data_plane::TLS_HEADERS`]): stated for a connection that ran one,
-    // and for nothing else.
+    // and for nothing else. The ADDRESS the connection was opened from travels on no header
+    // at all: it belongs to the connection, and the plane reads it there
+    // (`crate::service::data_plane`), so nothing a client writes can become it.
     for (name, value) in [
         (
             crate::service::data_plane::TLS_PROTOCOL_HEADER,
@@ -1104,8 +1113,14 @@ mod tests {
                 .body(())
                 .expect("the case's own request");
             let (parts, ()) = request.into_parts();
-            let forwarded = forwarded(parts, Bytes::new(), "my-alb", *port, &NegotiatedTls::default())
-                .unwrap_or_else(|| panic!("case {requested:?}: the request must forward"));
+            let forwarded = forwarded(
+                parts,
+                Bytes::new(),
+                "my-alb",
+                *port,
+                &NegotiatedTls::default(),
+            )
+            .unwrap_or_else(|| panic!("case {requested:?}: the request must forward"));
             assert_eq!(
                 forwarded.uri().to_string(),
                 *expected_uri,
