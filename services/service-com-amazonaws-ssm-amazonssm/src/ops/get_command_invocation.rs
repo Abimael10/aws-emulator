@@ -258,11 +258,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A command is reached through the endpoint it was sent to, so an id another
         // Region holds names no command here.
         let Some(command) = store.command(&region, &input.command_id) else {
-            // The modelled `InvalidCommandId` carries no message member, so the refusal
-            // is the error code alone.
-            return Err(
-                GetCommandInvocationErrorModeled::InvalidCommandId(InvalidCommandId {}).into(),
-            );
+            // "The specified command ID isn't valid": the refusal names the id that
+            // resolved no command, the way every read of this slice words it.
+            return Err(crate::scaffolded::Scaffolded::invalid_command_id(
+                crate::state::commands::command_not_found(&input.command_id),
+            ));
         };
         let Some(invocation) = command.invocation(&input.instance_id) else {
             // "The command ID and managed node ID you specified didn't match any
@@ -299,15 +299,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // invocation's move off `Pending` due: before that there is no finished run to
         // report, and "if the command hasn't finished running, then this string is empty"
         // (`StandardOutputContent`) with "-1 … the command hasn't started running on the
-        // managed node" for the response code (`ResponseCode`).
-        let finished = crate::state::commands::TERMINAL_INVOCATION_STATUSES
-            .contains(&invocation.status.as_str());
-        // An invocation no guest took reports no output and no exit code: nothing ran, so
-        // there is nothing a plugin wrote or exited with to report.
-        let ran = invocation
-            .outcome
-            .as_ref()
-            .filter(|outcome| finished && outcome.delivered);
+        // managed node" for the response code (`ResponseCode`). An invocation no guest took
+        // and one a cancel terminated report neither either — nothing ran to completion, so
+        // there is nothing a plugin wrote or exited with to report. That reading is the
+        // store's own ([`crate::state::commands::CommandInvocationRecord::ran`]), so this
+        // read and the invocation listing agree about what has run.
+        let ran = invocation.ran();
 
         Ok(GetCommandInvocationOutput {
             command_id: Some(command.command_id.clone()),

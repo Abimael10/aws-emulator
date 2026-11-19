@@ -2384,6 +2384,16 @@ impl ComAmazonawsSsmAmazonssmState {
             .get(&(region.to_string(), command_id.to_string()))
     }
 
+    /// The same command, to write it — the cancel a caller asked for, say.
+    pub fn command_mut(
+        &mut self,
+        region: &str,
+        command_id: &str,
+    ) -> Option<&mut commands::CommandRecord> {
+        self.commands
+            .get_mut(&(region.to_string(), command_id.to_string()))
+    }
+
     /// Every command `region` holds, as `(command id, record)`: the history that Region's
     /// endpoint reports, in the store's own ascending command-id order. A read that
     /// reports them in another order ranks them itself.

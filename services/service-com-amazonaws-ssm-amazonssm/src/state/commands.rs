@@ -7,7 +7,9 @@
 //! [`CommandInvocationRecord`] one of its nodes holds and `ListCommands` reports the
 //! commands a Region holds, narrowed by the criteria a request names
 //! ([`CommandRecord::matches_filter`]), so what a send persisted is what a later read
-//! reports. A command is keyed by `(region, command id)`: a command is sent to
+//! reports. `CancelCommand` is the other write of this slice: it stops the invocations of
+//! one command that are still running ([`CommandRecord::cancel`]), which every read of the
+//! command then reports. A command is keyed by `(region, command id)`: a command is sent to
 //! the Systems Manager endpoint of one Region and identified there by the id this service
 //! minted for it.
 //!
@@ -157,6 +159,13 @@ pub struct CommandInvocationRecord {
     /// What the node's agent ran and what it answered, for an invocation something has
     /// been delivered to; `None` for one that reached no guest to run in.
     pub outcome: Option<InvocationOutcome>,
+    /// When the cancel a caller asked for this invocation settles, for one `CancelCommand`
+    /// reached while it was still running; `None` for an invocation nobody cancelled.
+    ///
+    /// A cancelled invocation reports `Cancelling` until that instant and `Cancelled`
+    /// after it, and nothing a step did moves it on — "the command was terminated before
+    /// it was completed" ([`CommandInvocationRecord::materialize_due`]).
+    pub cancel_settles_at: Option<SystemTime>,
 }
 
 /// What the agent on one node ran for one invocation, and what the guest answered.
@@ -313,6 +322,28 @@ pub const INVOCATION_STATUS_FAILED: &str = "Failed";
 /// detailed status is [`DELIVERY_TIMED_OUT_STATUS_DETAILS`].
 pub const INVOCATION_STATUS_TIMED_OUT: &str = "TimedOut";
 
+/// The `CommandInvocationStatus` a cancel is being carried out under: "Cancelling" from
+/// the modelled enum (`crate::ops::types::COMMAND_INVOCATION_STATUS_VALUES`), which a
+/// command carries too (`COMMAND_STATUS_VALUES`) — the cancel has been accepted and the
+/// work it stops has not stopped yet, so it is not a terminal status.
+pub const STATUS_CANCELLING: &str = "Cancelling";
+
+/// The status a settled cancel leaves behind: "Cancelled: The command was terminated
+/// before it was completed. This is a terminal state" (`Command$StatusDetails` and
+/// `CommandInvocation$StatusDetails`), one of [`TERMINAL_INVOCATION_STATUSES`].
+pub const STATUS_CANCELLED: &str = "Cancelled";
+
+/// How long after a `CancelCommand` the cancel it asked for has stopped the work that was
+/// still running.
+///
+/// CHOSEN, the same span this emulator gives every transition the clock owes
+/// ([`INVOCATION_COMPLETES_AFTER`]): a caller reading straight after the cancel still sees
+/// the `Cancelling` the service accepted it as, and a client polling for a terminal status
+/// converges well inside any budget. A cancel with nothing left to stop — a command no
+/// invocation of is still running — settles at once instead, because there is no work in
+/// flight for it to wait on.
+pub const CANCEL_SETTLES_AFTER: Duration = INVOCATION_COMPLETES_AFTER;
+
 /// The `CommandStatus` of a command whose invocations have not all finished: "InProgress:
 /// The command has been sent to at least one managed node but hasn't reached a final state
 /// on all managed nodes" (`Command$StatusDetails`).
@@ -348,7 +379,22 @@ impl CommandInvocationRecord {
             status: COMMAND_STATUS_PENDING.to_string(),
             status_details: COMMAND_STATUS_PENDING.to_string(),
             outcome: None,
+            cancel_settles_at: None,
         }
+    }
+
+    /// Cancel this invocation at `now`, with the cancel settling at
+    /// `now + CANCEL_SETTLES_AFTER`; answers whether there was anything to cancel.
+    ///
+    /// "Attempts to cancel the command specified by the Command ID" (`CancelCommand`): an
+    /// invocation that has already reached a terminal status has finished, so a cancel of it
+    /// stops nothing and leaves the status it reached — only one still running is cancelled.
+    pub fn cancel(&mut self, now: SystemTime) -> bool {
+        if is_terminal_status(&self.status) {
+            return false;
+        }
+        self.cancel_settles_at = Some(now + CANCEL_SETTLES_AFTER);
+        true
     }
 
     /// Record what the agent ran for this invocation, with its move off `Pending` owed at
@@ -360,6 +406,19 @@ impl CommandInvocationRecord {
     /// Materialise the move the clock owes this invocation at `now`: an invocation whose
     /// run had finished by then carries the status the plugin's exit code gives it.
     pub fn materialize_due(&mut self, now: SystemTime) {
+        // A cancelled invocation was terminated before it was completed, so what a step did
+        // no longer decides its status: it is being cancelled until the cancel settles and
+        // cancelled after that, whatever the agent had been asked to run.
+        if let Some(settles_at) = self.cancel_settles_at {
+            let status = if now < settles_at {
+                STATUS_CANCELLING
+            } else {
+                STATUS_CANCELLED
+            };
+            self.status = status.to_string();
+            self.status_details = status.to_string();
+            return;
+        }
         let Some(outcome) = self.outcome.as_ref().filter(|held| now >= held.due_at) else {
             return;
         };
@@ -370,7 +429,12 @@ impl CommandInvocationRecord {
     /// What the node's agent RAN for this invocation, once the clock has made its move off
     /// `Pending` due and a guest really took it — and `None` otherwise, because an
     /// invocation nothing has finished has no exit code and no output a plugin produced.
+    /// A CANCELLED invocation reports none either: its run was terminated before it was
+    /// completed, so there is no finished step to report an exit code or output for.
     pub fn ran(&self) -> Option<&InvocationOutcome> {
+        if self.cancel_settles_at.is_some() {
+            return None;
+        }
         let finished = TERMINAL_INVOCATION_STATUSES.contains(&self.status.as_str());
         self.outcome
             .as_ref()
@@ -432,6 +496,11 @@ pub struct CommandRecord {
     /// One invocation per node the send resolved, keyed by node id so a read of one
     /// node's invocation is a lookup and a listing walks a stable order.
     pub invocations: BTreeMap<String, CommandInvocationRecord>,
+    /// When the cancel a caller asked for this COMMAND settles, for a `CancelCommand` that
+    /// cancelled it on every node it was requested on; `None` for a command nobody
+    /// cancelled and for one cancelled on some of its nodes only, whose status is still
+    /// read off the invocations it holds ([`Self::materialize_due`]).
+    pub cancel_settles_at: Option<SystemTime>,
 }
 
 impl CommandRecord {
@@ -500,31 +569,52 @@ impl CommandRecord {
     /// "Pending: The command hasn't been sent to any managed nodes"; "InProgress: The
     /// command has been sent to at least one managed node but hasn't reached a final state
     /// on all managed nodes"; "Success: The command successfully ran on all invocations";
-    /// "Failed: The value of MaxErrors or more command invocations shows a status of Failed"
+    /// "Failed: The value of MaxErrors or more command invocations shows a status of Failed";
+    /// "Cancelled: The command was terminated before it was completed"
     /// (`Command$StatusDetails`) — so a command is read off its invocations rather than
     /// recorded a second time.
     pub fn materialize_due(&mut self, now: SystemTime) {
         for invocation in self.invocations.values_mut() {
             invocation.materialize_due(now);
         }
-        // Only a command something DELIVERED is read off its invocations: a record whose
-        // invocations nothing has run carries the status whatever wrote it recorded, and
-        // this is not the place to overwrite it.
+        // A command a caller cancelled on every node it was requested on reports the cancel
+        // itself: it is being cancelled until the cancel settles and cancelled after that,
+        // whatever its invocations would otherwise have reached.
+        if let Some(settles_at) = self.cancel_settles_at {
+            let status = if now < settles_at {
+                STATUS_CANCELLING
+            } else {
+                STATUS_CANCELLED
+            };
+            self.status = status.to_string();
+            self.status_details = status.to_string();
+            return;
+        }
+        // Only a command something DELIVERED or CANCELLED is read off its invocations: a
+        // record whose invocations nothing has run and nobody has cancelled carries the
+        // status whatever wrote it recorded, and this is not the place to overwrite it.
         if !self
             .invocations
             .values()
             .any(|invocation| {
-                invocation
-                    .outcome
-                    .as_ref()
-                    .is_some_and(|outcome| outcome.delivered)
+                invocation.cancel_settles_at.is_some()
+                    || invocation
+                        .outcome
+                        .as_ref()
+                        .is_some_and(|outcome| outcome.delivered)
             })
         {
             return;
         }
         let terminal = self.completed_count();
         let failed = self.error_count();
-        let status = if terminal < self.target_count() {
+        let cancelling = self.count_invocations(|invocation| invocation.status == STATUS_CANCELLING);
+        let cancelled = self.count_invocations(|invocation| invocation.status == STATUS_CANCELLED);
+        let status = if cancelling > 0 {
+            // The cancel of some of this command's nodes is still being carried out, which
+            // is what the command is doing.
+            STATUS_CANCELLING
+        } else if terminal < self.target_count() {
             if terminal == 0 {
                 COMMAND_STATUS_PENDING
             } else {
@@ -532,11 +622,58 @@ impl CommandRecord {
             }
         } else if failed > 0 {
             INVOCATION_STATUS_FAILED
+        } else if cancelled > 0 {
+            // Every invocation has finished and one of them was terminated before it
+            // completed, so the command did not run everywhere it was sent.
+            STATUS_CANCELLED
         } else {
             INVOCATION_STATUS_SUCCESS
         };
         self.status = status.to_string();
         self.status_details = status.to_string();
+    }
+
+    /// Cancel this command at `now`, on the nodes `named` — or on every node it was
+    /// requested on when `named` is empty — and materialise what that cancel makes due.
+    ///
+    /// "Attempts to cancel the command specified by the Command ID"; "(Optional) A list of
+    /// managed node IDs on which you want to cancel the command. If not provided, the
+    /// command is canceled on every node on which it was requested" (`CancelCommand`). What
+    /// a cancel stops is work that is still running, so an invocation that has already
+    /// reached a terminal status keeps the status it reached, and a command that has already
+    /// reached one is not cancelled at all. A cancel that covers every node the command was
+    /// requested on is the command's own outcome; one that covers some of them leaves the
+    /// command's status to be read off its invocations.
+    pub fn cancel(&mut self, named: &[String], now: SystemTime) {
+        if is_terminal_status(&self.status) {
+            return;
+        }
+        let selected: Vec<String> = if named.is_empty() {
+            self.invocations.keys().cloned().collect()
+        } else {
+            named.to_vec()
+        };
+        let mut running = false;
+        for id in &selected {
+            if let Some(invocation) = self.invocations.get_mut(id) {
+                running |= invocation.cancel(now);
+            }
+        }
+        if self
+            .invocations
+            .keys()
+            .all(|id| selected.iter().any(|named| named == id))
+        {
+            // A cancel waits only on work that is in flight: a command no invocation of is
+            // still running — one with no invocation at all, or none left to stop — has
+            // nothing for the cancel to reach, so it settles at once.
+            self.cancel_settles_at = Some(if running {
+                now + CANCEL_SETTLES_AFTER
+            } else {
+                now
+            });
+        }
+        self.materialize_due(now);
     }
 
     /// Whether a `Status` filter value selects this command.
@@ -1057,6 +1194,18 @@ pub const NODE_ID_WITH_PENDING_STATUS: &str =
 /// — it states the refusal for the set of ids the request named, whatever that set was,
 /// so neither the ids nor the account are repeated into it.
 pub const NODES_NOT_IN_A_VALID_STATE: &str = "Instances not in a valid state for account";
+
+/// How Run Command words a call naming a command id its endpoint holds no command for.
+///
+/// `InvalidCommandId` states the rule in prose — "the specified command ID isn't valid.
+/// Verify the ID and try again" — and the service words the refusal with the ID that
+/// resolved nothing, taken from the request. The modelled shape declares no message member,
+/// so this travels through [`crate::scaffolded::Scaffolded::invalid_command_id`]; every
+/// operation that RESOLVES a command id words it the same way, because the refusal is about
+/// the id and not about what was being asked of the command.
+pub fn command_not_found(command_id: &str) -> String {
+    format!("Command id {command_id} does not exist.")
+}
 
 /// How Run Command words a read whose command and node hold no invocation between them.
 ///

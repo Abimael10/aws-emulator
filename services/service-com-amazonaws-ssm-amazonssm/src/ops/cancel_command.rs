@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelCommand
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelCommand`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Cancel a command a caller sent — the write that stops Run Command work already in
+//! flight. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelCommand::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What `SendCommand` persisted is what this cancels: both reach the one store in
+//! [`crate::state::commands`], so the command id a send minted resolves here, in the
+//! Region it was sent to, and the cancel is what every later read of that command and of
+//! its invocations reports ([`crate::state::commands::CommandRecord::cancel`]).
+//!
+//! A cancel stops work that is still RUNNING: "Attempts to cancel the command specified by
+//! the Command ID. There is no guarantee that the command will be terminated and the
+//! underlying process stopped" — so an invocation that has already reached a terminal
+//! status keeps the status it reached, and a command that has already reached one is
+//! answered without a change. A cancelled invocation reports `Cancelling` until the cancel
+//! settles and `Cancelled` after it, and no step result moves it on.
+//!
+//! Two things the request names are resolved against the store, and what it cannot resolve
+//! is refused:
+//!
+//! * the COMMAND, among the commands the Region's endpoint holds (`InvalidCommandId`);
+//! * the nodes the request NAMES in `InstanceIds` — "a list of managed node IDs on which
+//!   you want to cancel the command" — which are identities, each named once
+//!   (`DuplicateInstanceId`) and each naming something this cancel can act on: an
+//!   invocation the command created, or a node registered in that Region whose agent is
+//!   reporting (`InvalidInstanceId`). A request that names none cancels the command "on
+//!   every node on which it was requested".
+//!
+//! The result shape carries no member — "whether or not the command was successfully
+//! canceled" is the 200 itself.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +167,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelCommand` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelCommandErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelCommand"))
+        // `CommandId`'s length and `InstanceIds`'s list length and member pattern are
+        // MODELLED constraints, so the centralized walk has already refused anything
+        // outside them: what is resolved here is which command and which of its nodes the
+        // request names.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CancelCommandErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the command store is unavailable".to_string()),
+            })
+        })?;
+
+        // A command is reached through the endpoint it was sent to, so an id another Region
+        // holds names no command here.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        // The registration a node of this Region had already made by now was owed at the
+        // same instant whether or not anybody called, and a cancel resolves the nodes it
+        // names against the inventory, so it is materialised before anything here resolves
+        // one — the same reading `SendCommand` resolves its nodes through.
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+        let mut store = state.lock();
+        // The moves the clock already owed: a command whose history is no longer retained,
+        // and an invocation whose run had finished — so what this cancel sees of a command
+        // is what a read of it would have reported at this instant.
+        store.materialize_due(now);
+
+        let Some(command) = store.command(&region, &input.command_id) else {
+            // "The specified command ID isn't valid": the refusal names the id that
+            // resolved no command, which is the one the request carried.
+            return Err(crate::scaffolded::Scaffolded::invalid_command_id(
+                crate::state::commands::command_not_found(&input.command_id),
+            ));
+        };
+        // "(Optional) A list of managed node IDs on which you want to cancel the command":
+        // an id is an identity, so it is named once and names something this cancel can act
+        // on. The invocations the command PERSISTED are resolved first, because an
+        // invocation is a history record that outlives the node that held it.
+        let named: Vec<String> = input.instance_ids.clone().unwrap_or_default();
+        let has_invocation: Vec<bool> = named
+            .iter()
+            .map(|id| command.invocation(id).is_some())
+            .collect();
+        for (position, id) in named.iter().enumerate() {
+            if named[..position].contains(id) {
+                // The modelled `DuplicateInstanceId` carries no message member, so the
+                // refusal is the error code alone.
+                return Err(
+                    CancelCommandErrorModeled::DuplicateInstanceId(DuplicateInstanceId {}).into(),
+                );
+            }
+        }
+        // A node that holds no invocation of this command has to be one the service can act
+        // on through this endpoint: a node whose agent is not reporting is one of the states
+        // `InvalidInstanceId` is documented for ("SSM Agent isn't registered with the SSM
+        // endpoint … The managed node isn't in a valid state").
+        if named
+            .iter()
+            .zip(&has_invocation)
+            .any(|(id, held)| !held && !store.node_agent_is_responding(&region, id))
+        {
+            return Err(CancelCommandErrorModeled::InvalidInstanceId(InvalidInstanceId {
+                message: Some(crate::state::commands::NODES_NOT_IN_A_VALID_STATE.to_string()),
+            })
+            .into());
+        }
+
+        // The cancel itself, decided and recorded by the store that owns the command: the
+        // invocations still running stop, and the command reports the cancel a caller asked
+        // for. Nothing is refused for a command or an invocation that has already finished —
+        // the attempt is answered, and what had finished keeps the status it reached.
+        if let Some(command) = store.command_mut(&region, &input.command_id) {
+            command.cancel(&named, now);
+        }
+
+        Ok(CancelCommandOutput {})
     }
 }

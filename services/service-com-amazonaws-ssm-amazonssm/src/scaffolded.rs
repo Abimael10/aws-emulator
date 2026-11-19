@@ -308,6 +308,71 @@ impl SerializableStruct for InvocationDoesNotExistMessage {
     }
 }
 
+/// The `Message` member of the synthetic `InvalidCommandId` error shape.
+///
+/// Spelled with a capital `M`, the way this service's own error shapes that DO declare a
+/// message member spell it (`InvalidInstanceId$Message`, `InvalidNextToken$Message`): the
+/// modelled `InvalidCommandId` declares no member at all, yet Run Command words this
+/// refusal, so a client reading it finds it where the service puts it.
+static INVALID_COMMAND_ID_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#InvalidCommandId$Message",
+        "smithy.framework",
+        "Message",
+    ),
+    ShapeType::String,
+    "Message",
+    0,
+)
+.with_xml_name("Message")
+.with_json_name("Message");
+
+/// Schema for the synthetic `InvalidCommandId` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the shapes above: this is not
+/// the shape of that name in any service's model — the modelled one carries no members — so
+/// it must not collide with it. The wire `__type` still comes from
+/// [`OperationError::shape_name`] below, which answers the modelled name.
+pub static INVALID_COMMAND_ID_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#InvalidCommandId",
+        "smithy.framework",
+        "InvalidCommandId",
+    ),
+    ShapeType::Structure,
+    &[&INVALID_COMMAND_ID_MESSAGE],
+);
+
+/// The payload of an `InvalidCommandId`: which command id resolved no command.
+#[derive(Debug, Clone)]
+pub struct InvalidCommandIdMessage {
+    pub message: String,
+}
+
+impl InvalidCommandIdMessage {
+    /// An `InvalidCommandId` carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for InvalidCommandIdMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InvalidCommandId: {}", self.message)
+    }
+}
+
+impl std::error::Error for InvalidCommandIdMessage {}
+
+impl SerializableStruct for InvalidCommandIdMessage {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&INVALID_COMMAND_ID_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// The lowercase `message` member of the synthetic resource-policy error shapes below.
 ///
 /// A member's own name is what the JSON protocols write, so this renders as `message`;
@@ -435,6 +500,13 @@ pub enum Scaffolded<E> {
     /// Command words this refusal. Answer it only where the operation models
     /// `InvocationDoesNotExist`.
     InvocationDoesNotExist(InvocationDoesNotExistMessage),
+    /// A command id the endpoint holds no command for. Renders as HTTP 400 with the error
+    /// code `InvalidCommandId` and a `Message` naming the id that resolved none.
+    ///
+    /// Same reason as the two variants above: the modelled shape declares no members, and
+    /// Run Command words this refusal. Answer it only where the operation models
+    /// `InvalidCommandId`.
+    InvalidCommandId(InvalidCommandIdMessage),
     /// A refusal of this service's resource-policy plane, rendered as HTTP 400 with the
     /// modelled error code it carries and the diagnostic in a lowercase `message`.
     ///
@@ -489,6 +561,15 @@ impl<E> Scaffolded<E> {
         Self::InvocationDoesNotExist(InvocationDoesNotExistMessage::new(message))
     }
 
+    /// Refuse a call naming a command id the endpoint holds no command for, with HTTP 400
+    /// `InvalidCommandId` carrying `message`.
+    ///
+    /// Reach for this only where the operation's own model declares `InvalidCommandId`: the
+    /// error code is that modelled refusal's, and only the member it carries is synthetic.
+    pub fn invalid_command_id(message: impl Into<String>) -> Self {
+        Self::InvalidCommandId(InvalidCommandIdMessage::new(message))
+    }
+
     /// Refuse a call that names no stored resource policy, with HTTP 400
     /// `ResourcePolicyNotFoundException` carrying `message` in a lowercase `message`
     /// member.
@@ -526,6 +607,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::InvalidFilterKey(e) => write!(f, "{e}"),
             Self::InvocationDoesNotExist(e) => write!(f, "{e}"),
+            Self::InvalidCommandId(e) => write!(f, "{e}"),
             Self::ResourcePolicyRefusal(e) => write!(f, "{e}"),
         }
     }
@@ -541,6 +623,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::ValidationException(e) => e.source(),
             Self::InvalidFilterKey(e) => e.source(),
             Self::InvocationDoesNotExist(e) => e.source(),
+            Self::InvalidCommandId(e) => e.source(),
             Self::ResourcePolicyRefusal(e) => e.source(),
         }
     }
@@ -558,6 +641,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(e) => e,
             Self::InvalidFilterKey(e) => e,
             Self::InvocationDoesNotExist(e) => e,
+            Self::InvalidCommandId(e) => e,
             Self::ResourcePolicyRefusal(e) => e,
         }
     }
@@ -569,6 +653,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::InvalidFilterKey(_) => &INVALID_FILTER_KEY_SCHEMA,
             Self::InvocationDoesNotExist(_) => &INVOCATION_DOES_NOT_EXIST_SCHEMA,
+            Self::InvalidCommandId(_) => &INVALID_COMMAND_ID_SCHEMA,
             Self::ResourcePolicyRefusal(e) => e.shape,
         }
     }
@@ -584,6 +669,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => "ValidationException",
             Self::InvalidFilterKey(_) => "InvalidFilterKey",
             Self::InvocationDoesNotExist(_) => "InvocationDoesNotExist",
+            Self::InvalidCommandId(_) => "InvalidCommandId",
             Self::ResourcePolicyRefusal(e) => e.code,
         }
     }
@@ -599,6 +685,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_)
             | Self::InvalidFilterKey(_)
             | Self::InvocationDoesNotExist(_)
+            | Self::InvalidCommandId(_)
             | Self::ResourcePolicyRefusal(_) => 400,
         }
     }
@@ -614,6 +701,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_)
             | Self::InvalidFilterKey(_)
             | Self::InvocationDoesNotExist(_)
+            | Self::InvalidCommandId(_)
             | Self::ResourcePolicyRefusal(_) => None,
         }
     }

@@ -257,9 +257,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let only = input.command_id.as_deref().filter(|id| !id.is_empty());
         if let Some(id) = only {
             if store.command(&region, id).is_none() {
-                // The modelled `InvalidCommandId` carries no message member, so the
-                // refusal is the error code alone.
-                return Err(ListCommandsErrorModeled::InvalidCommandId(InvalidCommandId {}).into());
+                // "The specified command ID isn't valid": the refusal names the id that
+                // resolved no command, the way every read of this slice words it.
+                return Err(crate::scaffolded::Scaffolded::invalid_command_id(
+                    crate::state::commands::command_not_found(id),
+                ));
             }
         }
 

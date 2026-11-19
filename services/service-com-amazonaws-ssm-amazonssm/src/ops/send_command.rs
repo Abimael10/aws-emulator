@@ -651,6 +651,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::commands::COMMAND_STATUS_PENDING.to_string(),
             status_details: crate::state::commands::COMMAND_STATUS_PENDING.to_string(),
             invocations: ::std::collections::BTreeMap::new(),
+            // Nobody has cancelled a command that is only now being sent.
+            cancel_settles_at: None,
         };
         (invocations, scripts, patch_baseline_runs, record)
         };
