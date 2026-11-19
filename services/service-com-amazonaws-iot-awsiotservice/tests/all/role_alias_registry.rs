@@ -24,6 +24,11 @@
 //! name, whether the create names a `credentialDurationSeconds` and where in the modelled
 //! range it sits, the form and length of the role ARN, whether the create carries tags,
 //! and the region the call is signed for — rather than one recorded request.
+//!
+//! Each refusal is stated in THIS FAMILY's own fixed text, whose only variable part is
+//! the name the request carried: `Role alias <name> already exists for this account` for
+//! a create under a taken name, and `Role alias <name> not found` for every operation
+//! that addresses an alias the account does not hold.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -174,6 +179,19 @@ impl Emulator {
 /// The ARN a role alias created in `region` must carry.
 fn expected_arn(region: &str, name: &str) -> String {
     format!("arn:aws:iot:{region}:{ACCOUNT_ID}:rolealias/{name}")
+}
+
+/// The sentence this family refuses a create under a name the account already holds an
+/// alias under with: its own two-word noun, the collision scoped to the account, and the
+/// name taken from the request.
+fn taken_name_message(name: &str) -> String {
+    format!("Role alias {name} already exists for this account")
+}
+
+/// The sentence every operation that addresses ONE role alias refuses a name the account
+/// holds no alias under with.
+fn missing_message(name: &str) -> String {
+    format!("Role alias {name} not found")
 }
 
 /// Epoch seconds now, for bounding a reported timestamp.
@@ -455,9 +473,7 @@ async fn a_repeat_create_of_one_name_is_refused_and_changes_nothing() {
         // taken from the request, not prose about this one request.
         assert_eq!(
             second.text("message"),
-            Some(format!(
-                "RoleAlias cannot be created - name already exists (name={name})"
-            )),
+            Some(taken_name_message(name)),
             "case {label:?}: unexpected conflict message, got {second:?}"
         );
         // The refusal is built from the request: it names the alias that exists and the
@@ -612,4 +628,121 @@ async fn a_create_past_the_stores_ceiling_is_refused_and_records_nothing() {
         survivor.status, 200,
         "the refused create must leave the existing aliases in place, got {survivor:?}"
     );
+}
+
+#[tokio::test]
+async fn every_role_alias_refusal_states_this_familys_own_sentence() {
+    // This family words each refusal in ITS OWN fixed text whose only variable part is
+    // the name the request's `{roleAlias}` label carried: a create under a name the
+    // account already holds an alias under is refused with the account-scoped
+    // already-exists sentence, and every operation that addresses an alias the account
+    // does not hold is refused with the one missing-alias sentence. The table above is
+    // what the rows below are driven over, so the sentences are asserted across the form
+    // and length of the name, the body the create carried and the region it was signed
+    // for; none of those reaches either sentence.
+    for case in cases() {
+        // A fresh emulator per row: each refusal must depend only on what this row did.
+        let emulator = Emulator::new();
+
+        // Every operation the model binds to one alias, with the method it is bound to
+        // (`smithy_query(query="operation",operation="DescribeRoleAlias")`), before the
+        // alias exists at all.
+        let update_body = json!({ "roleArn": "arn:aws:iam::000000000000:role/updated" });
+        let single_alias_operations: Vec<(&str, &str, Option<&Value>)> = vec![
+            ("DescribeRoleAlias", "GET", None),
+            ("UpdateRoleAlias", "PUT", Some(&update_body)),
+            ("DeleteRoleAlias", "DELETE", None),
+        ];
+        let path = format!("/role-aliases/{}", case.name);
+        for (operation, method, body) in &single_alias_operations {
+            let refused = emulator.call(method, &path, *body, case.region).await;
+            assert_eq!(
+                refused.status, 404,
+                "case {:?}: {operation} of a name the account holds no alias under must be \
+                 refused 404, got {refused:?}",
+                case.label
+            );
+            assert_eq!(
+                refused.error_code.as_deref(),
+                Some("ResourceNotFoundException"),
+                "case {:?}: {operation} expected ResourceNotFoundException, got {refused:?}",
+                case.label
+            );
+            assert_eq!(
+                refused.text("message"),
+                Some(missing_message(&case.name)),
+                "case {:?}: {operation} expected message {:?}, got {refused:?}",
+                case.label,
+                missing_message(&case.name)
+            );
+        }
+
+        // With the alias recorded, a second create is the collision this family scopes to
+        // the account.
+        let created = emulator.create_in(&case.name, &case.body, case.region).await;
+        assert_eq!(
+            created.status, 200,
+            "case {:?}: the setup CreateRoleAlias must succeed, got {created:?}",
+            case.label
+        );
+        let refused = emulator.create_in(&case.name, &case.body, case.region).await;
+        assert_eq!(
+            refused.status, 409,
+            "case {:?}: a create under a taken name must be refused 409, got {refused:?}",
+            case.label
+        );
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some("ResourceAlreadyExistsException"),
+            "case {:?}: expected ResourceAlreadyExistsException, got {refused:?}",
+            case.label
+        );
+        assert_eq!(
+            refused.text("message"),
+            Some(taken_name_message(&case.name)),
+            "case {:?}: expected message {:?}, got {refused:?}",
+            case.label,
+            taken_name_message(&case.name)
+        );
+
+        // The delete removes the record, so the reader falls back into the one
+        // missing-alias sentence — reported with the error class in the header and no
+        // description at all — and the name is free for a later create.
+        let deleted = emulator.call("DELETE", &path, None, case.region).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {:?}: DeleteRoleAlias must succeed, got {deleted:?}",
+            case.label
+        );
+        let gone = emulator.describe(&case.name).await;
+        assert_eq!(
+            gone.status, 404,
+            "case {:?}: a read after the delete must be refused 404, got {gone:?}",
+            case.label
+        );
+        assert_eq!(
+            gone.error_code.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {:?}: expected ResourceNotFoundException, got {gone:?}",
+            case.label
+        );
+        assert_eq!(
+            gone.text("message"),
+            Some(missing_message(&case.name)),
+            "case {:?}: expected message {:?}, got {gone:?}",
+            case.label,
+            missing_message(&case.name)
+        );
+        assert!(
+            gone.description().is_none(),
+            "case {:?}: a refusal carries no roleAliasDescription, got {gone:?}",
+            case.label
+        );
+        let recreated = emulator.create_in(&case.name, &case.body, case.region).await;
+        assert_eq!(
+            recreated.status, 200,
+            "case {:?}: the name must be free after the delete, got {recreated:?}",
+            case.label
+        );
+    }
 }

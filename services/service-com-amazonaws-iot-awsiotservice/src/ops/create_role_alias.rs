@@ -203,14 +203,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceAlreadyExistsException` (HTTP 409), naming the alias and the ARN that
         // already exist. Nothing this operation documents makes it idempotent, so even
         // the same role ARN under an existing name is refused rather than re-created —
-        // that is what `UpdateRoleAlias` is for. The message is the sentence AWS IoT
-        // words a create refused for a name already in use with, with the name taken
-        // from the request.
+        // that is what `UpdateRoleAlias` is for. The message is this family's own
+        // sentence for a name already in use, whose only variable part is the name the
+        // request's `{roleAlias}` label carried.
         if let Some(existing) = store.role_aliases.get(&input.role_alias) {
             return Err(CreateRoleAliasErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
                     message: Some(crate::state::existing_role_alias_message(
-                        &existing.role_alias,
+                        &input.role_alias,
                     )),
                     resource_id: Some(existing.role_alias.clone()),
                     resource_arn: Some(existing.role_alias_arn.clone()),

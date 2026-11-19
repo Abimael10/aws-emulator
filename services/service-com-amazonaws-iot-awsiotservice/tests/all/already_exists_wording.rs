@@ -12,9 +12,12 @@
 //! identifier the REQUEST carried, and each family's 409 carries only the members that
 //! family sends:
 //!
-//! * the NAMED-RESOURCE families refused by name — a policy, a role alias — word it
-//!   `<Family> cannot be created - name already exists (name=<name>)` and DO report the
-//!   record that exists, in `resourceId`/`resourceArn`;
+//! * the NAMED-RESOURCE families refused by name — a policy, a mitigation action — word
+//!   it `<Family> cannot be created - name already exists (name=<name>)`, and a policy
+//!   DOES report the record that exists, in `resourceId`/`resourceArn`;
+//! * the ROLE ALIAS family spells its noun as two words and scopes the collision to the
+//!   account — `Role alias <name> already exists for this account` — and reports the
+//!   record that exists too;
 //! * the AUTHORIZER family words it `Authorizer <name> already exist for this account`
 //!   and reports the record too;
 //! * the JOBS and COMMANDS planes word it `<Family> <id> already exists.`, with the
@@ -479,7 +482,7 @@ fn cases() -> Vec<Case> {
             identity: Some((name.clone(), "authorizerArn")),
         });
 
-        // A role alias: the policy family's form with this family's noun.
+        // A role alias: its own two-word noun, with the collision scoped to the account.
         let role_arn = format!("arn:aws:iam::{ACCOUNT_ID}:role/device-role");
         rows.push(Case {
             case: format!("CreateRoleAlias on the existing alias {name:?}"),
@@ -494,7 +497,7 @@ fn cases() -> Vec<Case> {
                 Some(json!({ "roleArn": role_arn })),
             ),
             error_type: ALREADY_EXISTS,
-            message: format!("RoleAlias cannot be created - name already exists (name={name})"),
+            message: format!("Role alias {name} already exists for this account"),
             identity: Some((name.clone(), "roleAliasArn")),
         });
     }

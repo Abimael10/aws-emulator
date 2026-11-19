@@ -8,9 +8,13 @@
 //! text, and the only variable part of it is the identifier the REQUEST carried — never a
 //! value taken from one call.
 //!
-//! * The NAMED-RESOURCE families whose create is refused "by name" — a policy, a role
-//!   alias — word it `<Family> cannot be created - name already exists (name=<name>)`
+//! * The NAMED-RESOURCE families whose create is refused "by name" — a policy, a
+//!   mitigation action — word it
+//!   `<Family> cannot be created - name already exists (name=<name>)`
 //!   ([`name_already_exists`]).
+//! * The ROLE ALIAS family states the collision with the family's own two-word noun and
+//!   scopes it to the account: `Role alias <name> already exists for this account`
+//!   ([`existing_role_alias_message`]).
 //! * The JOBS and COMMANDS planes word it `<Family> <id> already exists.`, with a
 //!   terminating period ([`plane_already_exists`]).
 //! * The THING family names the dimension that conflicts and the account the collision is
@@ -43,8 +47,8 @@
 /// The sentence a family that refuses a create BY NAME states a taken name with: the
 /// family noun, the fixed clause, and the name the request asked for in `name=<...>`.
 ///
-/// The noun is the family's own spelling of itself (`Policy`, `RoleAlias`), and nothing
-/// of the stored record is part of the sentence.
+/// The noun is the family's own spelling of itself (`Policy`, `MitigationAction`), and
+/// nothing of the stored record is part of the sentence.
 fn name_already_exists(family: &str, name: &str) -> String {
     format!("{family} cannot be created - name already exists (name={name})")
 }
@@ -63,9 +67,14 @@ pub fn existing_policy_message(policy_name: &str) -> String {
 }
 
 /// How this service refuses a `CreateRoleAlias` under a name the account already holds an
-/// alias under: the policy family's form, with this family's own noun.
+/// alias under.
+///
+/// This family spells its noun as the two words every refusal about ONE role alias uses
+/// ([`super::missing_role_alias_message`]) and scopes the collision to the account, since
+/// an alias is an account-wide record rather than a regional one; the only variable part
+/// is the name the request carried.
 pub fn existing_role_alias_message(role_alias: &str) -> String {
-    name_already_exists("RoleAlias", role_alias)
+    format!("Role alias {role_alias} already exists for this account")
 }
 
 /// How this service refuses a `CreateJob` under an id a job already holds — the id a job
