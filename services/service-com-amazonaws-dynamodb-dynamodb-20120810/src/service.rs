@@ -182,6 +182,11 @@ mod request_latency_metrics;
 /// for — read off the request body so their clauses join the walk's in one refusal.
 mod request_constraints;
 
+/// The datatype defect of an `AttributeValue` a request sends, for the members that state
+/// that defect behind a sentence of their own — read off the body, because a value the codec
+/// cannot read never reaches a handler that could name its member.
+mod attribute_value_members;
+
 /// The layer BEFORE every constraint: a body value whose JSON class the member it is bound
 /// to cannot be read from, which is a marshalling failure rather than a constraint
 /// violation and is answered as a different error class.
@@ -395,7 +400,7 @@ fn states_service_checked_clause_bare(operation: &str) -> bool {
 ///
 /// Sorted, which [`states_absent_member_as_clause`] relies on for `binary_search` and
 /// `validator_null_clause_operations_are_sorted` pins.
-const VALIDATOR_NULL_CLAUSE_OPERATIONS: &[&str] = &["DeleteTable"];
+const VALIDATOR_NULL_CLAUSE_OPERATIONS: &[&str] = &["DeleteTable", "Scan"];
 
 /// Whether `operation` states an absent such member as the walk's clause.
 fn states_absent_member_as_clause(operation: &str) -> bool {
@@ -498,9 +503,8 @@ const REQUIRED_TAG_LISTS: &[(&str, &str)] = &[
 /// iterates the model's declaration order, and for the enums below the service is
 /// observed to state the same values in a different one. An enum this list does not name
 /// keeps the model's order, because that is the order the service is observed to state it
-/// in (`ReturnConsumedCapacity` as `INDEXES, TOTAL, NONE` and `Select` as
-/// `ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES, SPECIFIC_ATTRIBUTES, COUNT`, both the
-/// declared order — `tests/all/validation_message_wording.rs` pins them).
+/// in (`ReturnConsumedCapacity` as `INDEXES, TOTAL, NONE`, the declared order —
+/// `tests/all/validation_message_wording.rs` pins it).
 ///
 /// Nothing about the model distinguishes the two groups — the same values, a different
 /// sentence — so this is the only place the difference is recorded, and an enum later
@@ -521,6 +525,36 @@ const PUBLISHED_ENUM_ORDERS: &[&[&str]] = &[
     // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ReturnValue")`), and what
     // the literal below holds is the order the refusal STATES, not that declaration.
     &["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"],
+    // `Select`, which a keyed read and a table walk both carry and the model declares as
+    // `ALL_ATTRIBUTES ALL_PROJECTED_ATTRIBUTES SPECIFIC_ATTRIBUTES COUNT`
+    // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#Select")`), while the
+    // service's refusals state the same four in this one.
+    &[
+        "SPECIFIC_ATTRIBUTES",
+        "COUNT",
+        "ALL_ATTRIBUTES",
+        "ALL_PROJECTED_ATTRIBUTES",
+    ],
+    // `Condition$ComparisonOperator`, the comparator a LEGACY filter or key condition states
+    // its operator in, which the model declares as `EQ NE IN LE LT GE GT BETWEEN NOT_NULL
+    // NULL CONTAINS NOT_CONTAINS BEGINS_WITH`
+    // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ComparisonOperator")`),
+    // while the service's refusals state the same thirteen in this one.
+    &[
+        "IN",
+        "NULL",
+        "BETWEEN",
+        "LT",
+        "NOT_CONTAINS",
+        "EQ",
+        "GT",
+        "NOT_NULL",
+        "NE",
+        "LE",
+        "BEGINS_WITH",
+        "GE",
+        "CONTAINS",
+    ],
 ];
 
 /// The admissible set `allowed` is STATED in: the order this service publishes for that
@@ -870,6 +904,14 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
                     return front_door::announced(req, reported(refusal));
                 }
             }
+            // And the DATATYPE of one value the body carries, for the members that state a
+            // defect of it behind a sentence of their own: such a value never becomes an
+            // input, so the member it stood in is known only while the body is still in hand
+            // ([`attribute_value_members`]). Every other value keeps the codec's own refusal,
+            // which the dispatch below raises.
+            if let Some(message) = attribute_value_members::enveloped_refusal(operation, req) {
+                return front_door::announced(req, reported(validation_refusal(message)));
+            }
             // What serving this request TAKES is measured around the operation's own run,
             // which is the elapsed time its latency series reports
             // ([`request_latency_metrics`]).
@@ -941,6 +983,26 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
         // this wrapper cannot weaken them.
         None
     }
+}
+
+/// `message` as this service's own `ValidationException` (HTTP 400), rendered in the
+/// protocol's error envelope — what a request refused AHEAD of any operation is answered
+/// with, for a refusal this service words itself rather than one the framework described
+/// structurally ([`EmulatedService::override_refusal`] answers those).
+///
+/// The status and the envelope stay with the protocol, which owns them
+/// ([`management_events::JSON_ENVELOPE`]); only the class and the sentence are this
+/// service's. No violation is stated, because the chosen wording replaces what the
+/// framework would have rendered from one.
+fn validation_refusal(message: String) -> aws_smithy_runtime_api::http::Response {
+    smithy_server_runtime::protocol_error_response_with(
+        management_events::JSON_ENVELOPE,
+        ::aws_smithy_schema_server::ProtocolError::Invalid(Vec::new()),
+        Some(Refused {
+            code: VALIDATION_EXCEPTION.to_string(),
+            message,
+        }),
+    )
 }
 
 /// The refusal a request addressed to a Region this account has not turned on is answered
@@ -1619,18 +1681,13 @@ mod tests {
 
     #[test]
     fn a_set_with_no_published_order_keeps_the_order_it_arrived_in() {
-        // `ReturnConsumedCapacity` and `Select`, whose recorded refusals state the
-        // model's own declaration order, plus a subset of a published set (same values,
-        // one missing), which is a different set and not that enum.
+        // `ReturnConsumedCapacity`, whose recorded refusals state the model's own
+        // declaration order, plus a subset of a published set (same values, one missing),
+        // which is a different set and not that enum.
         for declared in [
             owned(&["INDEXES", "TOTAL", "NONE"]),
-            owned(&[
-                "ALL_ATTRIBUTES",
-                "ALL_PROJECTED_ATTRIBUTES",
-                "SPECIFIC_ATTRIBUTES",
-                "COUNT",
-            ]),
             owned(&["OLD_IMAGE", "KEYS_ONLY", "NEW_IMAGE"]),
+            owned(&["SPECIFIC_ATTRIBUTES", "COUNT", "ALL_ATTRIBUTES"]),
         ] {
             let stated = stated_enum_order(&declared);
             assert_eq!(

@@ -103,7 +103,9 @@ async fn an_attribute_value_carries_exactly_one_datatype() {
     }
 
     // A value with NO datatype, at each position an `AttributeValue` can stand in: a
-    // top-level attribute, inside a map, inside a list, and as the key itself.
+    // top-level attribute, inside a map, inside a list, and as the key itself. The one
+    // position NOT here is a substitution table's entry, whose own sentence names the table
+    // and the key (`a_substitution_tables_invalid_value_names_its_key`).
     let empty: Vec<(&str, Value)> = vec![
         (
             "an empty value as a top-level attribute",
@@ -122,12 +124,6 @@ async fn an_attribute_value_carries_exactly_one_datatype() {
         (
             "an empty value as the key",
             json!({"TableName": "Values", "Item": {"pk": {}}}),
-        ),
-        (
-            "an empty value in an expression's substitution map",
-            json!({"TableName": "Values", "Key": {"pk": {"S": "k"}},
-                   "UpdateExpression": "SET v = :v",
-                   "ExpressionAttributeValues": {":v": {}}}),
         ),
     ];
     for (case, request) in empty {

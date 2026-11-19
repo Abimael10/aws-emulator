@@ -294,8 +294,8 @@ async fn another_enumerated_member_keeps_the_generic_constraint_clause() {
                 },
             }),
             "Value 'EVERYTHING' at 'select' failed to satisfy constraint: Member must satisfy \
-             enum value set: [ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES, SPECIFIC_ATTRIBUTES, \
-             COUNT]",
+             enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, \
+             ALL_PROJECTED_ATTRIBUTES]",
         ),
     ] {
         let expected = format!("{ENVELOPE}{clause}");

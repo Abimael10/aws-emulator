@@ -76,17 +76,25 @@ struct Row {
 }
 
 /// The sets stated for the members below, each named where it comes from.
-/// `ReturnConsumedCapacity` (`INDEXES TOTAL NONE`), `Select` (`ALL_ATTRIBUTES
-/// ALL_PROJECTED_ATTRIBUTES SPECIFIC_ATTRIBUTES COUNT`), `ProjectionType` (`ALL KEYS_ONLY
+/// `ReturnConsumedCapacity` (`INDEXES TOTAL NONE`), `ProjectionType` (`ALL KEYS_ONLY
 /// INCLUDE`) and `TableClass` (`STANDARD STANDARD_INFREQUENT_ACCESS`) are stated in their
 /// model-declared order (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#…")`);
-/// `StreamViewType` is stated in [`STREAM_VIEW_TYPE_SET`].
+/// `StreamViewType` is stated in [`STREAM_VIEW_TYPE_SET`] and `Select` in [`SELECT_SET`].
 const CONSUMED_CAPACITY_SET: &[&str] = &["INDEXES", "TOTAL", "NONE"];
-const SELECT_SET: &[&str] = &[
-    "ALL_ATTRIBUTES",
-    "ALL_PROJECTED_ATTRIBUTES",
+
+/// The order DynamoDB states `Select`'s admissible set in — the SERVICE's order again: the
+/// model declares the same four values as `ALL_ATTRIBUTES ALL_PROJECTED_ATTRIBUTES
+/// SPECIFIC_ATTRIBUTES COUNT`
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#Select")`), while the
+/// service's refusals state them in this one.
+///
+/// `pub(crate)` so the suite that reads the same set back over other surfaces
+/// (`crate::scratch_enum_order`) states it from here rather than from a second copy.
+pub(crate) const SELECT_SET: &[&str] = &[
     "SPECIFIC_ATTRIBUTES",
     "COUNT",
+    "ALL_ATTRIBUTES",
+    "ALL_PROJECTED_ATTRIBUTES",
 ];
 const PROJECTION_TYPE_SET: &[&str] = &["ALL", "KEYS_ONLY", "INCLUDE"];
 const TABLE_CLASS_SET: &[&str] = &["STANDARD", "STANDARD_INFREQUENT_ACCESS"];
@@ -103,6 +111,29 @@ const EXPORT_VIEW_TYPE_SET: &[&str] = &["NEW_AND_OLD_IMAGES", "NEW_IMAGE"];
 /// `DYNAMODB_JSON ION`) — the boundary for the rule: an enum the service is not observed
 /// to reorder keeps the order the model declares.
 const EXPORT_FORMAT_SET: &[&str] = &["DYNAMODB_JSON", "ION"];
+
+/// The order DynamoDB states `Condition$ComparisonOperator`'s admissible set in — the
+/// SERVICE's order again: the model declares the same thirteen values as `EQ NE IN LE LT GE
+/// GT BETWEEN NOT_NULL NULL CONTAINS NOT_CONTAINS BEGINS_WITH`
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ComparisonOperator")`), while
+/// the service's refusals state them in this one.
+///
+/// `pub(crate)` for the same reason as [`SELECT_SET`].
+pub(crate) const COMPARISON_OPERATOR_SET: &[&str] = &[
+    "IN",
+    "NULL",
+    "BETWEEN",
+    "LT",
+    "NOT_CONTAINS",
+    "EQ",
+    "GT",
+    "NOT_NULL",
+    "NE",
+    "LE",
+    "BEGINS_WITH",
+    "GE",
+    "CONTAINS",
+];
 
 /// An `ExportTableToPointInTime` body carrying both members the model makes required, with
 /// `extra` merged in: a constraint on an enumerated member is reported before the export's
@@ -281,6 +312,30 @@ const ROWS: &[Row] = &[
         value: "PARQUET",
         path: "exportFormat",
         set: EXPORT_FORMAT_SET,
+    },
+    Row {
+        case: "the comparator of a legacy filter entry, in the wrong case",
+        operation: "Scan",
+        request: || {
+            json!({"TableName": "Music",
+                   "ScanFilter": {"tag": {"ComparisonOperator": "eq",
+                                          "AttributeValueList": [{"S": "a"}]}}})
+        },
+        value: "eq",
+        path: "scanFilter.tag.member.comparisonOperator",
+        set: COMPARISON_OPERATOR_SET,
+    },
+    Row {
+        case: "the same comparator on a legacy key condition, misspelled",
+        operation: "Query",
+        request: || {
+            json!({"TableName": "Music",
+                   "KeyConditions": {"Pk": {"ComparisonOperator": "EQUALS",
+                                            "AttributeValueList": [{"S": "a"}]}}})
+        },
+        value: "EQUALS",
+        path: "keyConditions.Pk.member.comparisonOperator",
+        set: COMPARISON_OPERATOR_SET,
     },
 ];
 

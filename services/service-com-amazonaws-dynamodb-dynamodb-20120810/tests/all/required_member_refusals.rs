@@ -11,7 +11,8 @@
 //!    sentence: `The parameter '<Member>' is required but was not present in the
 //!    request`, naming the member as the model spells it on the wire and nothing of the
 //!    operation — except on the operations that are observed to state the validating
-//!    walk's clause for that member too (`DeleteTable`). Every OTHER required member keeps
+//!    walk's clause for that member too (`DeleteTable` and `Scan`). Every OTHER required
+//!    member keeps
 //!    that walk's clause inside the `<N> validation error(s) detected: ` envelope, naming
 //!    the member by the path that walk reports it under, which is lowerCamel.
 //! 2. When several members of one input fail, the clauses appear in the order the service
@@ -106,7 +107,6 @@ async fn an_absent_table_name_is_the_parameter_required_sentence_on_every_operat
             json!({"KeyConditionExpression": "pk = :p",
                    "ExpressionAttributeValues": {":p": {"S": "one"}}}),
         ),
-        ("a scan with no table name", "Scan", json!({})),
         (
             "a backup with no table name",
             "CreateBackup",
@@ -252,13 +252,19 @@ async fn every_other_absent_required_member_keeps_the_walks_clause() {
             json!({"TableName": "Members"}),
             "backupName",
         ),
-        // The table-name member itself on the one operation observed to state the walk's
+        // The table-name member itself on the operations observed to state the walk's
         // clause for it, which is what tells the two groups of rule 1 apart: the same
         // absence of the same member, stated as a clause here and as the service's own
         // sentence by every operation above.
         (
             "a table delete with no table name",
             "DeleteTable",
+            json!({}),
+            "tableName",
+        ),
+        (
+            "a table walk with no table name",
+            "Scan",
             json!({}),
             "tableName",
         ),

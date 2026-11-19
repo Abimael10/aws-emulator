@@ -2000,6 +2000,27 @@ fn invalid_key_condition_operator() -> crate::state::RequestError {
     )
 }
 
+/// The refusal for a comparison that names an ATTRIBUTE on both sides.
+///
+/// A key condition compares one key attribute against a VALUE: "you must provide the name of
+/// the partition key attribute and a single value for that attribute ... Optionally, you can
+/// provide a sort key attribute and use a comparison operator to refine the search results"
+/// (`Query$KeyConditionExpression`, which spells each of its forms over an attribute name and
+/// a value). So a comparison whose operand position carries another attribute name states a
+/// condition BETWEEN two attributes, which the member expresses no form of — and that text IS
+/// readable, so AWS names that defect rather than reporting the position a parse stopped at.
+///
+/// AWS's sentence is FIXED and names neither attribute, so a client matching it recognises
+/// the defect whichever names the condition wrote; it restates the member inside the clause,
+/// which is how this service's refusal of it is worded.
+fn multiple_attribute_names_in_one_condition() -> crate::state::RequestError {
+    crate::state::RequestError::Validation(
+        "Invalid KeyConditionExpression: Invalid condition in KeyConditionExpression: \
+         Multiple attribute names used in one condition"
+            .to_string(),
+    )
+}
+
 /// Parse a `KeyConditionExpression` into its comparisons.
 ///
 /// The grammar is DynamoDB's own (`Query$KeyConditionExpression`): one or more
@@ -2287,12 +2308,21 @@ impl Parser<'_> {
     /// placeholder stands for nor what TYPE it may be is judged here: both are defects of an
     /// OPERAND, answered in the order the expression wrote the operands
     /// ([`first_operand_defect`]).
+    ///
+    /// Two tokens in this position are not a parse stop. An attribute NAME reads as a
+    /// condition between two attributes, which is the defect the member names
+    /// ([`multiple_attribute_names_in_one_condition`]); and this grammar's own
+    /// `begins_with` reads as an operand that is itself an OPERATION, which is the member's
+    /// other named defect ([`nested_operation_key_condition`] — a function written as a NAME
+    /// applied to arguments never reaches here, because the lexer answers it there).
     fn value(&mut self) -> Result<Operand, crate::state::RequestError> {
         match self.peek().cloned() {
             Some(Token::Value(placeholder)) => {
                 self.at += 1;
                 Ok(self.placeholder_value(&placeholder))
             }
+            Some(Token::Name(_)) => Err(multiple_attribute_names_in_one_condition()),
+            Some(Token::BeginsWith) => Err(nested_operation_key_condition()),
             _ => Err(self.syntax()),
         }
     }

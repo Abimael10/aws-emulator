@@ -238,14 +238,59 @@ pub(super) fn table_name_violation(name: &str) -> Option<String> {
     table_name_violations(name).into_iter().next()
 }
 
+/// The requirement phrase an ARN addressing a REGION other than the one the request arrived
+/// at fails: fixed text, stating the FIELD of the ARN that is wrong rather than any form the
+/// value should have taken — exactly as the phrase for an ARN naming a resource of another
+/// kind does ([`INVALID_RESOURCE_TYPE_REQUIREMENT`]).
+pub(super) const INVALID_ARN_REGION_REQUIREMENT: &str = "Invalid AWS region";
+
 /// The clause AWS states for an ARN that addresses a REGION other than the one the
-/// request arrived at: the offending ARN, as the request spelled it.
+/// request arrived at, as the SENTENCE alone: the offending ARN, as the request spelled it.
 ///
 /// An endpoint serves one region, so an ARN naming another names nothing this endpoint
-/// can reach. The clause names the VALUE rather than the member it came in: the fact is
-/// about the ARN's own region field.
+/// can reach. This form of the refusal names the VALUE rather than the member it came in,
+/// because the fact is about the ARN's own region field.
+///
+/// The same fact is observed to be stated the OTHER way as well — as that member's own
+/// constraint clause ([`region_outside_this_endpoint`]) — and which form a refusal takes
+/// follows the operation being served, exactly as the form of a clause about a declared
+/// bound does (`crate::service`'s "Which form a constraint clause takes"). Nothing in the
+/// model distinguishes the two, so the operation that states the clause asks for it.
 pub(super) fn invalid_arn_region(table_name: &str) -> RequestError {
-    refused(format!("Invalid AWS region in '{table_name}'"))
+    refused(format!(
+        "{INVALID_ARN_REGION_REQUIREMENT} in '{table_name}'"
+    ))
+}
+
+/// The same fact as that member's own CONSTRAINT: the member path, the ARN the request sent
+/// and the requirement its region field broke — the form a refusal of this service's
+/// clauses about `tableName` normally takes ([`invalid_member`]).
+///
+/// The echo is held to the longest value the MEMBER itself admits
+/// ([`MAX_ECHOED_TABLE_NAME`]), like every other clause about this member.
+fn region_outside_this_endpoint(member: &str, table_name: &str) -> RequestError {
+    let echoed = ::service_common::validation::quoted_echo_up_to(table_name, MAX_ECHOED_TABLE_NAME);
+    invalid_member(member, Some(&echoed), INVALID_ARN_REGION_REQUIREMENT)
+}
+
+/// Which FORM an operation states a cross-region ARN refusal in, read at the one place the
+/// resolution raises it ([`resolve_region_addressed`]) so the two cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionRefusalForm {
+    /// The sentence alone, naming the ARN ([`invalid_arn_region`]).
+    Sentence,
+    /// That member's own constraint clause ([`region_outside_this_endpoint`]).
+    MemberClause,
+}
+
+impl RegionRefusalForm {
+    /// The refusal this form states for `table_name`, reported under `member`.
+    fn refusal(self, member: &str, table_name: &str) -> RequestError {
+        match self {
+            Self::Sentence => invalid_arn_region(table_name),
+            Self::MemberClause => region_outside_this_endpoint(member, table_name),
+        }
+    }
 }
 
 /// A `TableName` resolved against the REGION the request's endpoint names: the same form
@@ -258,8 +303,42 @@ pub(super) fn invalid_arn_region(table_name: &str) -> RequestError {
 /// another region addresses a table this endpoint has no way of reaching, and the
 /// request is refused rather than served from the same-named table of the region it
 /// reached. A BARE name carries no region and is the endpoint's own, so it is unaffected.
+///
+/// The one statement of that rule; the public entry points below differ only in the member
+/// the refusal is reported under and the FORM it is stated in.
+fn resolve_region_addressed(
+    member: &str,
+    table_name: &str,
+    region: &str,
+    form: RegionRefusalForm,
+) -> Result<String, RequestError> {
+    let name = resolve_table_name_of(member, table_name)?;
+    if table_arn_region(table_name).is_some_and(|addressed| addressed != region) {
+        return Err(form.refusal(member, table_name));
+    }
+    Ok(name)
+}
+
+/// That resolution for the request-level `TableName`, stating the cross-region refusal as the
+/// sentence alone — the form every operation but the ones below is observed to state.
 pub fn resolve_table_name_in(table_name: &str, region: &str) -> Result<String, RequestError> {
     resolve_table_name_in_member(TABLE_NAME_MEMBER_PATH, table_name, region)
+}
+
+/// The same resolution whose cross-region refusal is stated as the table-name member's own
+/// CONSTRAINT CLAUSE rather than as the sentence alone — the form the single-item READ is
+/// observed to state it in, over the `tableName` path with the ARN echoed.
+///
+/// Called by the operations observed to state that form; every other operation keeps
+/// [`invalid_arn_region`]'s sentence. Which form an operation states is recorded at its one
+/// call site rather than in a list here, because the operation is what makes the choice.
+pub fn resolve_table_name_in_clause(table_name: &str, region: &str) -> Result<String, RequestError> {
+    resolve_region_addressed(
+        TABLE_NAME_MEMBER_PATH,
+        table_name,
+        region,
+        RegionRefusalForm::MemberClause,
+    )
 }
 
 /// The same resolution for a `TableName` carried by ONE ELEMENT of a request, naming
@@ -269,11 +348,7 @@ pub fn resolve_table_name_in_member(
     table_name: &str,
     region: &str,
 ) -> Result<String, RequestError> {
-    let name = resolve_table_name_of(member, table_name)?;
-    if table_arn_region(table_name).is_some_and(|addressed| addressed != region) {
-        return Err(invalid_arn_region(table_name));
-    }
-    Ok(name)
+    resolve_region_addressed(member, table_name, region, RegionRefusalForm::Sentence)
 }
 
 /// The REGION field of a value spelled as an ARN, or `None` when the value is not

@@ -924,8 +924,9 @@ async fn an_arn_addresses_this_endpoints_own_region() {
 
     // Each row: the operation and the rest of its request, over the data plane and the
     // control plane — every surface whose `TableName` takes an ARN in place of a name.
+    // `GetItem` is not among them: the single-item read states the same fact as that
+    // member's own constraint clause, which the row after this loop pins.
     let operations: Vec<(&str, Value)> = vec![
-        ("GetItem", json!({"Key": {"pk": {"S": "one"}}})),
         ("PutItem", json!({"Item": {"pk": {"S": "two"}}})),
         ("DeleteItem", json!({"Key": {"pk": {"S": "one"}}})),
         ("Scan", json!({})),
@@ -962,6 +963,31 @@ async fn an_arn_addresses_this_endpoints_own_region() {
         let mut request = rest.clone();
         request["TableName"] = json!("Addressed");
         ok(&router, operation, request).await;
+    }
+
+    // The single-item READ states the same fact as that member's own constraint: the
+    // `tableName` path, the ARN the request sent echoed, and the requirement its region
+    // field broke. Its accepted spellings are the same two every row above accepts.
+    let mut request = json!({"Key": {"pk": {"S": "one"}}});
+    request["TableName"] = json!(arn_in(OTHER_REGION));
+    let case = format!("GetItem addressed by an ARN of {OTHER_REGION}");
+    let stated = refusal(&router, &case, "GetItem", request).await;
+    assert_eq!(
+        stated,
+        format!(
+            "1 validation error detected: Value '{}' at 'tableName' failed to satisfy \
+             constraint: Invalid AWS region",
+            arn_in(OTHER_REGION)
+        ),
+        "case {case:?}: expected the member's constraint clause, got {stated:?}"
+    );
+    for addressed in [arn_in(REGION), "Addressed".to_string()] {
+        ok(
+            &router,
+            "GetItem",
+            json!({"TableName": addressed, "Key": {"pk": {"S": "one"}}}),
+        )
+        .await;
     }
 
     // The rule is about the endpoint the request REACHED, not about one region: the same

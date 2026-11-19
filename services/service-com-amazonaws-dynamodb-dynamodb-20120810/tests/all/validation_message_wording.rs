@@ -314,8 +314,8 @@ async fn a_constraint_violation_is_stated_in_the_validation_envelope() {
                    "KeyConditionExpression": "Artist = :a",
                    "ExpressionAttributeValues": {":a": {"S": "Acme"}}}),
             "1 validation error detected: Value 'EVERYTHING' at 'select' failed to satisfy \
-             constraint: Member must satisfy enum value set: [ALL_ATTRIBUTES, \
-             ALL_PROJECTED_ATTRIBUTES, SPECIFIC_ATTRIBUTES, COUNT]"
+             constraint: Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, \
+             ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]"
                 .to_string(),
         ),
         (
@@ -409,8 +409,8 @@ async fn two_violations_are_counted_and_joined_in_one_envelope() {
     let limit_clause = "Value at 'Limit' failed to satisfy constraint: Member must have \
                         value greater than or equal to 1";
     let select_clause = "Value 'EVERYTHING' at 'select' failed to satisfy constraint: Member \
-                         must satisfy enum value set: [ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES, \
-                         SPECIFIC_ATTRIBUTES, COUNT]";
+                         must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, \
+                         ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]";
     assert!(
         stated.starts_with("2 validation errors detected: "),
         "case two violations: expected the plural envelope counting both, got {stated:?}"
