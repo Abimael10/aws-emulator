@@ -257,13 +257,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A revision whose delete is already under way has no second transition to
             // make, so a repeat call reports it as it stands rather than re-stamping it
             // with a later instant.
+            //
+            // The status the revision held when this call arrived is read FIRST, because it
+            // is what the entry reports beside the new one.
+            let previous_status = record.status.clone();
             if record.status == crate::state::TASK_DEFINITION_INACTIVE {
                 record.status = crate::state::TASK_DEFINITION_DELETE_IN_PROGRESS.to_string();
                 record.delete_requested_at = Some(requested_at);
             }
             // "The list of deleted task definitions", built from the stored revision —
-            // the same projection every other task-definition response uses.
-            task_definitions.push(record.view());
+            // the same projection every other task-definition response uses, plus the
+            // status the revision held before this call, so a caller can tell a delete
+            // from a repeat of one.
+            task_definitions.push(record.transition_view(&previous_status));
         }
 
         Ok(DeleteTaskDefinitionsOutput {

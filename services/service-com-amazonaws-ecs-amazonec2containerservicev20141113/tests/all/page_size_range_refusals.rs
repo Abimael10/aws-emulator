@@ -6,12 +6,12 @@
 //! The rule under test: a `maxResults` outside the inclusive page-size range its own
 //! member documentation states is refused with `InvalidParameterException` and the
 //! sentence its own operation words for an out-of-range page size, with that operation's
-//! own documented bounds and nothing taken from the request — the daemon-plane listings
-//! state the whole range at EITHER end of it ("MaxResults must be a positive number
-//! between <min>-<max>."), while the long-standing listings name the smallest page they
-//! take below the range ("Max results can not be lesser than <min>") and state the range
-//! above it. A `maxResults` inside the range, each published bound included, is accepted
-//! and paged with.
+//! own documented bounds and nothing taken from the request — the long-standing listings
+//! name the BOUND the value crossed ("Max results can not be lesser than <min>" below the
+//! range, "Max results can not be greater than <max>" above it), while the daemon-plane
+//! listings state the whole range at EITHER end of it ("MaxResults must be a positive
+//! number between <min>-<max>."). A `maxResults` inside the range, each published bound
+//! included, is accepted and paged with.
 //!
 //! The refusal is a property of the RANGE and of the sentence that operation words, not of
 //! how far past a bound the value is, so the tables below vary the END crossed (below the
@@ -62,6 +62,12 @@ pub(crate) fn range_sentence(min: i32, max: i32) -> String {
 /// that refusal names it and the one bound the value crossed.
 fn below_minimum_sentence(min: i32) -> String {
     format!("Max results can not be lesser than {min}")
+}
+
+/// The other half of that pair, for a page size above `max`: the same member and the other
+/// bound, with nothing of the value the request carried.
+fn above_maximum_sentence(max: i32) -> String {
+    format!("Max results can not be greater than {max}")
 }
 
 /// A router holding [`REVISIONS`] daemon task-definition revisions, so a page size inside
@@ -235,11 +241,12 @@ async fn a_daemon_plane_page_size_outside_its_range_states_that_range_at_both_en
 }
 
 #[tokio::test]
-async fn a_long_standing_page_size_names_the_bound_it_crossed_below_and_the_range_above() {
+async fn a_long_standing_page_size_names_the_bound_it_crossed_at_either_end() {
     let router = service();
 
-    // The listings that predate the daemon plane keep their own two sentences, each with
-    // that operation's own documented bounds. `request` carries that operation's REQUIRED
+    // The listings that predate the daemon plane name the bound the page size crossed at
+    // either end, each with that operation's own documented bounds. `request` carries that
+    // operation's REQUIRED
     // members (and nothing else), because the page-size rule is a property of the member,
     // not of what the listing would have reported.
     //
@@ -259,7 +266,7 @@ async fn a_long_standing_page_size_names_the_bound_it_crossed_below_and_the_rang
                 "a cluster page one above the range",
                 "ListClusters",
                 json!({ "maxResults": 101 }),
-                range_sentence(1, 100),
+                above_maximum_sentence(100),
             ),
             (
                 "a task page far below the range",
@@ -271,7 +278,7 @@ async fn a_long_standing_page_size_names_the_bound_it_crossed_below_and_the_rang
                 "a task page far above the range",
                 "ListTasks",
                 json!({ "maxResults": 5_000 }),
-                range_sentence(1, 100),
+                above_maximum_sentence(100),
             ),
             (
                 "a service page one below the range",
@@ -313,7 +320,7 @@ async fn a_long_standing_page_size_names_the_bound_it_crossed_below_and_the_rang
                 "a service-deployment page one above the range",
                 "ListServiceDeployments",
                 json!({ "service": "pagedservice", "maxResults": 101 }),
-                range_sentence(1, 100),
+                above_maximum_sentence(100),
             ),
             (
                 "an account-setting page below its narrower range",
@@ -325,13 +332,45 @@ async fn a_long_standing_page_size_names_the_bound_it_crossed_below_and_the_rang
                 "an account-setting page one above its narrower range",
                 "ListAccountSettings",
                 json!({ "maxResults": 11 }),
-                range_sentence(1, 10),
+                above_maximum_sentence(10),
             ),
             (
                 "a capacity-provider page one below its narrower range",
                 "DescribeCapacityProviders",
                 json!({ "maxResults": 0 }),
                 below_minimum_sentence(1),
+            ),
+            // The end ABOVE the range, on every other long-standing listing: one step past
+            // the bound, far past it, and at the ceiling of the member's own type.
+            (
+                "a family page one above the range",
+                "ListTaskDefinitionFamilies",
+                json!({ "maxResults": 101 }),
+                above_maximum_sentence(100),
+            ),
+            (
+                "a task-definition page far above the range",
+                "ListTaskDefinitions",
+                json!({ "maxResults": 5_000 }),
+                above_maximum_sentence(100),
+            ),
+            (
+                "a container-instance page at the ceiling of the member's type",
+                "ListContainerInstances",
+                json!({ "maxResults": i32::MAX }),
+                above_maximum_sentence(100),
+            ),
+            (
+                "an attribute page one above the range",
+                "ListAttributes",
+                json!({ "targetType": "container-instance", "maxResults": 101 }),
+                above_maximum_sentence(100),
+            ),
+            (
+                "a namespace's service page far above the range",
+                "ListServicesByNamespace",
+                json!({ "namespace": "pagedspace", "maxResults": 1_000 }),
+                above_maximum_sentence(100),
             ),
         ],
     )

@@ -239,6 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A revision that is already out of `ACTIVE` is reported as it stands: there is
         // no second transition to make, so the `deregisteredAt` of the call that made it
         // INACTIVE stays as it was recorded.
+        //
+        // The status the revision held when this call arrived is read FIRST, because it is
+        // what the response reports beside the new one.
+        let previous_status = record.status.clone();
         if record.status == crate::state::TASK_DEFINITION_ACTIVE {
             record.status = crate::state::TASK_DEFINITION_INACTIVE.to_string();
             record.deregistered_at = Some(crate::state::now());
@@ -246,8 +250,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(DeregisterTaskDefinitionOutput {
             // "The full description of the deregistered task", built from the stored
-            // revision — the same projection every other task-definition response uses.
-            task_definition: Some(record.view()),
+            // revision — the same projection every other task-definition response uses,
+            // plus the status the revision held before this call, so a caller can tell a
+            // deregistration from a repeat of one.
+            task_definition: Some(record.transition_view(&previous_status)),
         })
     }
 }

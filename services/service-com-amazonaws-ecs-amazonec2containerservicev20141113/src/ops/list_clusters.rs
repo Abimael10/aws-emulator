@@ -185,9 +185,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // "This value can be between 1 and 100."
+        // "This value can be between 1 and 100." This listing names the BOUND the page size
+        // crossed at either end of that range
+        // ([`crate::state::page_size_bound_violation`]).
         if let Some(message) = input.max_results.and_then(|max_results| {
-            crate::state::page_size_violation(
+            crate::state::page_size_bound_violation(
                 max_results,
                 crate::state::MIN_LIST_PAGE_SIZE,
                 crate::state::MAX_LIST_PAGE_SIZE,

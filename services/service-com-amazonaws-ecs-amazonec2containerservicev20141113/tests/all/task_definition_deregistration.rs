@@ -21,6 +21,11 @@
 //!   as the bad parameter it is, while a reference that resolves to no revision at all is
 //!   the unknown identifier it is; the two conditions keep two distinct error codes.
 //!
+//! * A call that MOVES a revision's status answers the revision with `previousStatus` —
+//!   the status it held when the call arrived — beside the `status` it holds now, so a
+//!   caller can tell the transition it asked for from a repeat of one. A projection that
+//!   moved nothing (a registration, a read) carries no such member.
+//!
 //! Every case drives the emulator through the shared wire harness in [`crate::ecs_wire`],
 //! the same front door a client uses, so nothing reaches into the state struct and a
 //! response that is not computed from persisted state cannot pass.
@@ -190,20 +195,27 @@ async fn deregistering_one_revision_marks_only_that_revision_inactive() {
             family,
             "case {case:?}: expected family {family:?} back, got {deregistered}"
         );
-        // Everything but the two members deregistration owns is the stored revision.
-        let mut expected = before.clone();
-        expected["status"] = json!("INACTIVE");
-        expected["deregisteredAt"] = json!(stamp);
+        // The STORED revision after the call: everything but the two members
+        // deregistration owns is as it was registered.
+        let mut stored_after = before.clone();
+        stored_after["status"] = json!("INACTIVE");
+        stored_after["deregisteredAt"] = json!(stamp);
+        // The RESPONSE is that revision plus the status it held when the call arrived, so a
+        // caller comparing the two members sees the transition this call made.
+        let mut expected = stored_after.clone();
+        expected["previousStatus"] = json!("ACTIVE");
         assert_eq!(
             deregistered, expected,
-            "case {case:?}: deregistration must change only status and deregisteredAt, \
-             got {deregistered} for a stored {before}"
+            "case {case:?}: deregistration must report previousStatus beside a changed \
+             status and deregisteredAt, got {deregistered} for a stored {before}"
         );
 
         // Read back through the reader: the write is in the store, not in the response.
+        // `previousStatus` belongs to the call that MOVED the revision, so a read reports
+        // the stored revision without it.
         let read_back = describe(&router, &reference, case).await;
         assert_eq!(
-            read_back, deregistered,
+            read_back, stored_after,
             "case {case:?}: DescribeTaskDefinition must report the deregistered \
              revision, got {read_back}"
         );
@@ -215,7 +227,7 @@ async fn deregistering_one_revision_marks_only_that_revision_inactive() {
         };
         let by_other_form = describe(&router, &other_form, case).await;
         assert_eq!(
-            by_other_form, deregistered,
+            by_other_form, stored_after,
             "case {case:?}: {other_form:?} names the same revision, got {by_other_form}"
         );
 
@@ -285,7 +297,15 @@ async fn a_second_deregistration_changes_nothing_and_the_family_keeps_counting()
         case,
     );
     // The transition happened once, so a repeat reports the revision as it stands
-    // rather than re-stamping it with a later instant.
+    // rather than re-stamping it with a later instant — only `previousStatus`, which
+    // reports the status the revision held when THAT call arrived, tells the two apart.
+    assert_eq!(
+        string(&first, "previousStatus", case),
+        "ACTIVE",
+        "case {case:?}: the first deregistration found the revision ACTIVE, got {first}"
+    );
+    let mut expected_repeat = first.clone();
+    expected_repeat["previousStatus"] = json!("INACTIVE");
     for attempt in ["second", "third"] {
         let again = definition_of(
             &ok(
@@ -298,9 +318,9 @@ async fn a_second_deregistration_changes_nothing_and_the_family_keeps_counting()
             attempt,
         );
         assert_eq!(
-            again, first,
+            again, expected_repeat,
             "case {attempt:?}: a repeated deregistration must report the revision \
-             unchanged, got {again} after {first}"
+             unchanged, with previousStatus already INACTIVE, got {again} after {first}"
         );
     }
 
@@ -323,6 +343,148 @@ async fn a_second_deregistration_changes_nothing_and_the_family_keeps_counting()
         "INACTIVE",
         "case {case:?}: the deregistered revision stays INACTIVE"
     );
+}
+
+/// The projection one status-moving call answers for the revision `reference` names:
+/// `DeleteTaskDefinitions` reports it as the single entry of its `taskDefinitions` list,
+/// every other call as its own `taskDefinition`.
+async fn moved_definition(
+    router: &MultiServiceRouter,
+    operation: &str,
+    reference: &str,
+    case: &str,
+) -> Value {
+    if operation == "DeleteTaskDefinitions" {
+        let body = ok(
+            router,
+            operation,
+            json!({ "taskDefinitions": [reference] }),
+            case,
+        )
+        .await;
+        assert!(
+            list(&body, "failures", case).is_empty(),
+            "case {case:?}: expected the delete to go through, got {body}"
+        );
+        let deleted = list(&body, "taskDefinitions", case);
+        assert_eq!(
+            deleted.len(),
+            1,
+            "case {case:?}: expected one deleted revision, got {body}"
+        );
+        return deleted[0].clone();
+    }
+    definition_of(
+        &ok(
+            router,
+            operation,
+            json!({ "taskDefinition": reference }),
+            case,
+        )
+        .await,
+        case,
+    )
+}
+
+#[tokio::test]
+async fn a_call_that_moves_a_revision_reports_the_status_it_held_before_the_call() {
+    let router = service();
+
+    // The rule: a call that MOVES a revision's status answers the revision with
+    // `previousStatus` — the status it held when the call arrived — beside the `status` it
+    // holds now, whether or not the call had a transition left to make. The rows span the
+    // calls that move a revision (`DeregisterTaskDefinition`, `DeleteTaskDefinitions`), the
+    // status the revision was found in (`ACTIVE`, `INACTIVE`, `DELETE_IN_PROGRESS`), the
+    // length of the chain of calls, and the reference form the request names the revision
+    // by (`family:revision` and the full ARN, the two forms the member documents).
+    //
+    // Each step is (operation, expected previousStatus, expected status).
+    type Step = (&'static str, &'static str, &'static str);
+    let rows: [(&str, &[Step]); 4] = [
+        (
+            "one deregistration",
+            &[("DeregisterTaskDefinition", "ACTIVE", "INACTIVE")],
+        ),
+        (
+            "a deregistration and a repeat of it",
+            &[
+                ("DeregisterTaskDefinition", "ACTIVE", "INACTIVE"),
+                ("DeregisterTaskDefinition", "INACTIVE", "INACTIVE"),
+            ],
+        ),
+        (
+            "a deregistration and the delete it unlocks",
+            &[
+                ("DeregisterTaskDefinition", "ACTIVE", "INACTIVE"),
+                ("DeleteTaskDefinitions", "INACTIVE", "DELETE_IN_PROGRESS"),
+            ],
+        ),
+        (
+            "a delete, a repeat of it, and a deregistration after it",
+            &[
+                ("DeregisterTaskDefinition", "ACTIVE", "INACTIVE"),
+                ("DeleteTaskDefinitions", "INACTIVE", "DELETE_IN_PROGRESS"),
+                (
+                    "DeleteTaskDefinitions",
+                    "DELETE_IN_PROGRESS",
+                    "DELETE_IN_PROGRESS",
+                ),
+                (
+                    "DeregisterTaskDefinition",
+                    "DELETE_IN_PROGRESS",
+                    "DELETE_IN_PROGRESS",
+                ),
+            ],
+        ),
+    ];
+
+    for (index, (case, steps)) in rows.iter().enumerate() {
+        let family = format!("prevstatus{index}");
+        register_revision(&router, &family, 1, case).await;
+        // The REGISTRATION moved nothing, so the revision reports no previous status.
+        let registered = describe(&router, &family, case).await;
+        assert!(
+            registered.get("previousStatus").is_none(),
+            "case {case:?}: a registered revision has no previous status, got {registered}"
+        );
+
+        for (step, (operation, previous, status)) in steps.iter().enumerate() {
+            // Alternate the two documented reference forms down the chain, so neither the
+            // member's form nor the operation decides what is reported.
+            let reference = if step % 2 == 0 {
+                format!("{family}:1")
+            } else {
+                definition_arn(&family, 1)
+            };
+            let case = format!("{case}: step {step} {operation} by {reference:?}");
+            let case = case.as_str();
+            let reported = moved_definition(&router, operation, &reference, case).await;
+            assert_eq!(
+                (
+                    string(&reported, "previousStatus", case).as_str(),
+                    string(&reported, "status", case).as_str(),
+                ),
+                (*previous, *status),
+                "case {case:?}: expected previousStatus {previous:?} beside status \
+                 {status:?}, got {reported}"
+            );
+            // The status the call reported as PREVIOUS is a property of that call, not of
+            // the stored revision: a read of the same revision reports the status it is in
+            // now and no previous one.
+            let read_back = describe(&router, &reference, case).await;
+            assert_eq!(
+                string(&read_back, "status", case),
+                *status,
+                "case {case:?}: expected the read to report status {status:?}, got \
+                 {read_back}"
+            );
+            assert!(
+                read_back.get("previousStatus").is_none(),
+                "case {case:?}: a read moves nothing, so it reports no previous status, \
+                 got {read_back}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

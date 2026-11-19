@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "This value can be between 1 and 100."
         if let Some(message) = input.max_results.and_then(|max_results| {
-            crate::state::page_size_violation(
+            crate::state::page_size_bound_violation(
                 max_results,
                 crate::state::MIN_LIST_PAGE_SIZE,
                 crate::state::MAX_LIST_PAGE_SIZE,

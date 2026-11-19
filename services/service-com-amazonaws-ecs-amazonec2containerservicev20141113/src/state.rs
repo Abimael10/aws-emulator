@@ -1235,11 +1235,11 @@ pub fn task_count_bound_message(count: i32, min: i32, max: i32) -> Option<String
     }
 }
 
-/// `InvalidParameterException$message` for a `maxResults` outside the inclusive page-size
-/// range its own doc states ("This value can be between 1 and 100"). Amazon ECS states the
-/// RANGE the page size has to fall in and echoes neither the value the request carried nor
-/// the member's spelling on the wire — only the two bounds, which are the operation's own
-/// documented minimum and maximum page size.
+/// `InvalidParameterException$message` for a DAEMON-PLANE `maxResults` outside the inclusive
+/// page-size range its own doc states ("This value can be between 1 and 100"). Those
+/// listings state the RANGE the page size has to fall in and echo neither the value the
+/// request carried nor the member's spelling on the wire — only the two bounds, which are the
+/// operation's own documented minimum and maximum page size.
 pub fn page_size_range_message(min: i32, max: i32) -> String {
     format!("MaxResults must be a positive number between {min}-{max}.")
 }
@@ -1266,26 +1266,6 @@ pub fn above_maximum_message(subject: &str, max: i32) -> String {
     format!("{subject} can not be greater than {max}")
 }
 
-/// The refusal a `maxResults` of one of this API's LONG-STANDING list operations earns
-/// when it falls outside the inclusive page-size range `min..=max` its own doc states, or
-/// `None` when it is inside it.
-///
-/// Spelled once for every such operation in this crate, so the refusal cannot drift
-/// between those lists — each with its own documented range. A page BELOW the range is the
-/// below-the-minimum refusal every such member answers ([`below_minimum_message`]); one
-/// above it states the range the page size has to fall in. The operations added with the
-/// daemon plane state that range at EITHER end instead, so they reach for
-/// [`page_size_range_violation`].
-pub fn page_size_violation(max_results: i32, min: i32, max: i32) -> Option<String> {
-    if max_results < min {
-        Some(below_minimum_message(&member_subject("maxResults"), min))
-    } else if max_results > max {
-        Some(page_size_range_message(min, max))
-    } else {
-        None
-    }
-}
-
 /// The refusal a `maxResults` of a DAEMON-PLANE list earns when it falls outside the
 /// inclusive page-size range `min..=max` its own doc states, or `None` when it is inside
 /// it.
@@ -1293,21 +1273,24 @@ pub fn page_size_violation(max_results: i32, min: i32, max: i32) -> Option<Strin
 /// Both ends of one documented range are the same violation of one rule for these
 /// operations, so both earn the one sentence that states that range
 /// ([`page_size_range_message`]) with that operation's own bounds — unlike the
-/// long-standing lists, whose low end names the bound the value crossed
-/// ([`page_size_violation`]).
+/// long-standing lists, which name the BOUND the page size crossed
+/// ([`page_size_bound_violation`]).
 pub fn page_size_range_violation(max_results: i32, min: i32, max: i32) -> Option<String> {
     (max_results < min || max_results > max).then(|| page_size_range_message(min, max))
 }
 
-/// The refusal a `maxResults` earns from a listing that names the BOUND the page size
-/// crossed at either end of its documented range, or `None` when it is inside it.
+/// The refusal a `maxResults` of one of this API's LONG-STANDING list operations earns when
+/// it falls outside the inclusive page-size range `min..=max` its own doc states, or `None`
+/// when it is inside it.
 ///
-/// The two sentences are the pair every bounded count of this API states
-/// ([`below_minimum_message`] / [`above_maximum_message`]) with the page-size member as its
-/// refusal names it — "Max results can not be lesser than <min>" below the range and "Max
-/// results can not be greater than <max>" above it — rather than the range sentence
-/// [`page_size_violation`] states above it. RECORDED behaviour of `ListServices`; the other
-/// long-standing listings keep the sentence each of them answers.
+/// Spelled once for every such operation in this crate, so the refusal cannot drift between
+/// those lists — each with its own documented range. The two sentences are the pair every
+/// bounded count of this API states ([`below_minimum_message`] / [`above_maximum_message`])
+/// with the page-size member as its refusal names it — "Max results can not be lesser than
+/// <min>" below the range and "Max results can not be greater than <max>" above it: a page
+/// size outside a documented range is refused by NAMING the bound it crossed, as RECORDED
+/// for these listings. The operations added with the daemon plane state the whole range at
+/// either end instead, so they reach for [`page_size_range_violation`].
 pub fn page_size_bound_violation(max_results: i32, min: i32, max: i32) -> Option<String> {
     let subject = member_subject("maxResults");
     if max_results < min {
@@ -3864,6 +3847,24 @@ impl TaskDefinitionRecord {
             registered_by: Some(self.registered_by.clone()),
             ephemeral_storage: self.ephemeral_storage.clone(),
             enable_fault_injection: self.enable_fault_injection,
+            // The status the revision held before THIS call is a property of a call that
+            // moved it, not of the stored revision, so a projection that moved nothing
+            // reports none ([`TaskDefinitionRecord::transition_view`]).
+            previous_status: None,
+        }
+    }
+
+    /// The same projection, as the response of a call that MOVED this revision's status
+    /// reports it: `previousStatus` is the status the revision held when the call arrived,
+    /// beside the `status` it holds now.
+    ///
+    /// `previous_status` is read before the call writes, so a call that found the revision
+    /// already in the status it was asked to move it to reports that status at both members
+    /// — which is what tells a caller a repeat from the transition it asked for.
+    pub fn transition_view(&self, previous_status: &str) -> TaskDefinition {
+        TaskDefinition {
+            previous_status: Some(previous_status.to_string()),
+            ..self.view()
         }
     }
 }

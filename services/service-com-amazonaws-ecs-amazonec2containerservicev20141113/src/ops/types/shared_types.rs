@@ -208,7 +208,18 @@ pub struct Setting {
     pub r#type: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ecs#TaskDefinition")]
+/// The details of one task-definition revision, as every task-definition response reports
+/// it: the members `TaskDefinition` declares, in the model's own member order, and
+/// `previousStatus` appended last.
+///
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="TaskDefinition")`, plus `previousStatus` — the status
+/// the revision held BEFORE the call that answered, which the real service reports on the
+/// responses of the calls that MOVE a revision's status and the on-disk model omits, which is
+/// why the schema and the codec come from `types::unmodelled_member_wire` rather than from
+/// the derive (see that module's note). It is filled in by the call that moved the revision
+/// ([`crate::state::TaskDefinitionRecord::transition_view`]) and absent from every projection
+/// that moved nothing, so a read reports the stored revision exactly as the derive did.
 #[derive(Debug, Clone, Default)]
 pub struct TaskDefinition {
     pub task_definition_arn: Option<String>,
@@ -237,7 +248,155 @@ pub struct TaskDefinition {
     pub registered_by: Option<String>,
     pub ephemeral_storage: Option<EphemeralStorage>,
     pub enable_fault_injection: Option<bool>,
+    pub previous_status: Option<String>,
 }
+
+ecs_schema_and_codec!(
+    TaskDefinition,
+    TASK_DEFINITION_SCHEMA,
+    "com.amazonaws.ecs#TaskDefinition",
+    "com.amazonaws.ecs",
+    "TaskDefinition",
+    (
+        M_TASK_DEFINITION_ARN,
+        task_definition_arn,
+        "taskDefinitionArn",
+        0,
+        opt,
+        string
+    ),
+    (
+        M_CONTAINER_DEFINITIONS,
+        container_definitions,
+        "containerDefinitions",
+        1,
+        opt,
+        list_of_struct(ContainerDefinition)
+    ),
+    (M_FAMILY, family, "family", 2, opt, string),
+    (M_TASK_ROLE_ARN, task_role_arn, "taskRoleArn", 3, opt, string),
+    (
+        M_EXECUTION_ROLE_ARN,
+        execution_role_arn,
+        "executionRoleArn",
+        4,
+        opt,
+        string
+    ),
+    (M_NETWORK_MODE, network_mode, "networkMode", 5, opt, string),
+    (M_REVISION, revision, "revision", 6, defaulted, integer),
+    (M_VOLUMES, volumes, "volumes", 7, opt, list_of_struct(Volume)),
+    (M_STATUS, status, "status", 8, opt, string),
+    (
+        M_REQUIRES_ATTRIBUTES,
+        requires_attributes,
+        "requiresAttributes",
+        9,
+        opt,
+        list_of_struct(Attribute)
+    ),
+    (
+        M_PLACEMENT_CONSTRAINTS,
+        placement_constraints,
+        "placementConstraints",
+        10,
+        opt,
+        list_of_struct(TaskDefinitionPlacementConstraint)
+    ),
+    (
+        M_COMPATIBILITIES,
+        compatibilities,
+        "compatibilities",
+        11,
+        opt,
+        list_of_string
+    ),
+    (
+        M_RUNTIME_PLATFORM,
+        runtime_platform,
+        "runtimePlatform",
+        12,
+        opt,
+        struct_of(RuntimePlatform)
+    ),
+    (
+        M_REQUIRES_COMPATIBILITIES,
+        requires_compatibilities,
+        "requiresCompatibilities",
+        13,
+        opt,
+        list_of_string
+    ),
+    (M_CPU, cpu, "cpu", 14, opt, string),
+    (M_MEMORY, memory, "memory", 15, opt, string),
+    (
+        M_INFERENCE_ACCELERATORS,
+        inference_accelerators,
+        "inferenceAccelerators",
+        16,
+        opt,
+        list_of_struct(InferenceAccelerator)
+    ),
+    (M_PID_MODE, pid_mode, "pidMode", 17, opt, string),
+    (M_IPC_MODE, ipc_mode, "ipcMode", 18, opt, string),
+    (
+        M_PROXY_CONFIGURATION,
+        proxy_configuration,
+        "proxyConfiguration",
+        19,
+        opt,
+        struct_of(ProxyConfiguration)
+    ),
+    (
+        M_REGISTERED_AT,
+        registered_at,
+        "registeredAt",
+        20,
+        opt,
+        date_time
+    ),
+    (
+        M_DEREGISTERED_AT,
+        deregistered_at,
+        "deregisteredAt",
+        21,
+        opt,
+        date_time
+    ),
+    (
+        M_DELETE_REQUESTED_AT,
+        delete_requested_at,
+        "deleteRequestedAt",
+        22,
+        opt,
+        date_time
+    ),
+    (M_REGISTERED_BY, registered_by, "registeredBy", 23, opt, string),
+    (
+        M_EPHEMERAL_STORAGE,
+        ephemeral_storage,
+        "ephemeralStorage",
+        24,
+        opt,
+        struct_of(EphemeralStorage)
+    ),
+    (
+        M_ENABLE_FAULT_INJECTION,
+        enable_fault_injection,
+        "enableFaultInjection",
+        25,
+        opt,
+        boolean
+    ),
+    (
+        M_PREVIOUS_STATUS,
+        previous_status,
+        "previousStatus",
+        26,
+        opt,
+        recorded("com.amazonaws.ecs.recorded", string)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ecs#ContainerDefinition")]
 #[derive(Debug, Clone, Default)]

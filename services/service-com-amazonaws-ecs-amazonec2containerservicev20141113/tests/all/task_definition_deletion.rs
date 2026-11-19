@@ -25,6 +25,9 @@
 //!   create new services ... Existing services that reference a `DELETE_IN_PROGRESS` task
 //!   definition revision can still scale up or down by modifying the service's desired
 //!   count."
+//! * Each reported entry carries `previousStatus` — the status that revision held when the
+//!   call arrived — beside the `status` it holds now, so a caller can tell the delete it
+//!   asked for from a repeat of one.
 //!
 //! Every case drives the emulator through the shared wire harness in [`crate::ecs_wire`],
 //! the same front door a client uses, so nothing reaches into the state struct and a
@@ -183,7 +186,10 @@ async fn deleting_deregistered_revisions_moves_only_those_to_delete_in_progress(
             register_revision(&router, &family, slot, case).await;
         }
 
-        // The revisions this row deletes, deregistered first and remembered as stored.
+        // The revisions this row deletes, deregistered first and remembered as the STORE
+        // holds them: the deregister response carries `previousStatus` as well, which is
+        // the answer of that call rather than part of the stored revision, so the stored
+        // one is read back through the reader.
         let mut unique: Vec<i64> = Vec::new();
         let mut inactive: Vec<Value> = Vec::new();
         for target in row.targets {
@@ -191,7 +197,8 @@ async fn deleting_deregistered_revisions_moves_only_those_to_delete_in_progress(
                 continue;
             }
             unique.push(*target);
-            inactive.push(deregister(&router, &format!("{family}:{target}"), case).await);
+            deregister(&router, &format!("{family}:{target}"), case).await;
+            inactive.push(describe(&router, &format!("{family}:{target}"), case).await);
         }
 
         let references: Vec<String> = row
@@ -250,23 +257,29 @@ async fn deleting_deregistered_revisions_moves_only_those_to_delete_in_progress(
                 "case {case:?}: expected deleteRequestedAt {stamp} to be at or after \
                  deregisteredAt {deregistered_at}"
             );
-            // Everything but the two members the delete owns is the stored revision.
-            let mut expected = stored.clone();
-            expected["status"] = json!("DELETE_IN_PROGRESS");
-            expected["deleteRequestedAt"] = json!(stamp);
+            // The STORED revision after the delete: everything but the two members the
+            // delete owns is as it was deregistered.
+            let mut stored_after = stored.clone();
+            stored_after["status"] = json!("DELETE_IN_PROGRESS");
+            stored_after["deleteRequestedAt"] = json!(stamp);
+            // The ENTRY is that revision plus the status it held when the call arrived.
+            let mut expected = stored_after.clone();
+            expected["previousStatus"] = json!("INACTIVE");
             assert_eq!(
                 reported, &expected,
-                "case {case:?}: a delete must change only status and deleteRequestedAt, \
-                 got {reported} for a stored {stored}"
+                "case {case:?}: a delete must report previousStatus beside a changed \
+                 status and deleteRequestedAt, got {reported} for a stored {stored}"
             );
 
             // Read back through the reader: the write is in the store, not in the
             // response — "the task definition name is displayed in the console and
-            // returned in the API" while the delete is outstanding.
+            // returned in the API" while the delete is outstanding. `previousStatus`
+            // belongs to the call that MOVED the revision, so a read reports the stored
+            // revision without it.
             for reference in [format!("{family}:{revision}"), definition_arn(&family, *revision)] {
                 let read_back = describe(&router, &reference, case).await;
                 assert_eq!(
-                    &read_back, reported,
+                    read_back, stored_after,
                     "case {case:?}: DescribeTaskDefinition must report the revision \
                      {reference:?} as the delete left it, got {read_back}"
                 );
@@ -363,7 +376,21 @@ async fn a_second_delete_reports_the_revision_unchanged() {
         "case {case:?}: expected no failures, got {failures:?}"
     );
     // The transition happened once, so a repeat reports the revision as it stands rather
-    // than re-stamping it with a later instant.
+    // than re-stamping it with a later instant — only `previousStatus`, which reports the
+    // status the revision held when THAT call arrived, tells the two apart.
+    assert_eq!(
+        string(&first[0], "previousStatus", case),
+        "INACTIVE",
+        "case {case:?}: the first delete found the revision INACTIVE, got {first:?}"
+    );
+    let expected_repeat: Vec<Value> = first
+        .iter()
+        .map(|entry| {
+            let mut entry = entry.clone();
+            entry["previousStatus"] = json!("DELETE_IN_PROGRESS");
+            entry
+        })
+        .collect();
     for attempt in ["second", "third"] {
         let (again, failures) = delete(&router, &[definition_arn(family, 1)], attempt).await;
         assert!(
@@ -371,9 +398,9 @@ async fn a_second_delete_reports_the_revision_unchanged() {
             "case {attempt:?}: expected no failures, got {failures:?}"
         );
         assert_eq!(
-            again, first,
-            "case {attempt:?}: a repeated delete must report the revision unchanged, \
-             got {again:?} after {first:?}"
+            again, expected_repeat,
+            "case {attempt:?}: a repeated delete must report the revision unchanged, with \
+             previousStatus already DELETE_IN_PROGRESS, got {again:?} after {first:?}"
         );
     }
 }

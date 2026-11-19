@@ -290,8 +290,7 @@ async fn a_page_is_at_most_max_results_and_its_token_resumes_the_walk() {
         "case {case:?}: the last page reports no token, got {token:?}"
     );
 
-    // A page size outside the published range is refused: a page below it states the
-    // smallest page the member takes, one above it states the range.
+    // A page size outside the published range is refused, naming the bound it crossed.
     for (case, max_results, expected) in [
         (
             "a page below the range",
@@ -306,7 +305,7 @@ async fn a_page_is_at_most_max_results_and_its_token_resumes_the_walk() {
         (
             "a page one above the range",
             101,
-            "MaxResults must be a positive number between 1-100.",
+            "Max results can not be greater than 100",
         ),
     ] {
         let (code, message) = refusal(

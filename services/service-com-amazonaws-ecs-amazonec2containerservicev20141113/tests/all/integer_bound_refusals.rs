@@ -192,13 +192,13 @@ async fn an_integer_outside_its_documented_range_is_refused_naming_the_bound_it_
             "a list page above the range",
             "ListTasks",
             json!({ "cluster": CLUSTER, "maxResults": 101 }),
-            "MaxResults must be a positive number between 1-100.",
+            "Max results can not be greater than 100",
         ),
         (
             "a narrower page above its own range",
             "ListAccountSettings",
             json!({ "maxResults": 11 }),
-            "MaxResults must be a positive number between 1-10.",
+            "Max results can not be greater than 10",
         ),
         (
             "a narrower page below its own range",
@@ -222,7 +222,7 @@ async fn an_integer_outside_its_documented_range_is_refused_naming_the_bound_it_
             "a family list page one above the range",
             "ListTaskDefinitionFamilies",
             json!({ "maxResults": 101 }),
-            "MaxResults must be a positive number between 1-100.",
+            "Max results can not be greater than 100",
         ),
     ];
 
