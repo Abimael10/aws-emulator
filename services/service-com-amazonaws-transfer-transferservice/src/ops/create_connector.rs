@@ -236,6 +236,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let connector_id = guard.mint_id("c");
 
+        // Whether this connector configures an SFTP connection, read before the
+        // configuration itself moves onto the record.
+        let sftp_connector = input.sftp_config.is_some();
+
         let connector = st::Connector {
             arn: st::connector_arn(&region, &connector_id),
             url: st::connector_url(input.url.as_deref()),
@@ -246,10 +250,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sftp_config: input.sftp_config.map(st::resolve_sftp_connector_config),
             access_role: input.access_role,
             logging_role: input.logging_role,
-            security_policy_name: input.security_policy_name,
+            // The policy the connector's SSH algorithms come from: the one the request
+            // named, else the service's default for an SFTP connector. A connector that
+            // configures no SFTP connection carries none, for the reason
+            // `state::Connector::security_policy_name` records.
+            security_policy_name: input.security_policy_name.or_else(|| {
+                sftp_connector.then(|| st::DEFAULT_CONNECTOR_SECURITY_POLICY_NAME.to_string())
+            }),
+            // "These IP addresses are assigned automatically when you create the
+            // connector": assigned HERE, once, so every later read of this connector
+            // reports the same set and a caller can allow-list it on the partner's
+            // server.
+            service_managed_egress_ip_addresses: st::service_managed_egress_ip_addresses(
+                &region,
+                egress_type,
+            ),
             egress_config: input.egress_config.map(st::resolve_connector_egress_config),
             egress_type: egress_type.to_string(),
-            ip_address_type: input.ip_address_type,
+            // Every connector's network connections have an address type, so a request
+            // that named none takes the documented default.
+            ip_address_type: input
+                .ip_address_type
+                .unwrap_or_else(|| st::DEFAULT_IP_ADDRESS_TYPE.to_string()),
             // A connector records connection parameters and is usable as soon as this
             // call answers — see `state::CONNECTOR_STATUS_ACTIVE`.
             status: st::CONNECTOR_STATUS_ACTIVE.to_string(),

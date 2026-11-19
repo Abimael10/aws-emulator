@@ -173,10 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: Some(stored.tags.clone()),
             sftp_config: stored.sftp_config.clone(),
             // "These IP addresses are assigned automatically when you create the
-            // connector" — this emulator runs no AS2 or SFTP egress and so assigns
-            // none, and an invented address would claim a network path that does not
-            // exist. Same reading `DescribeServer` gives the server's egress IPs.
-            service_managed_egress_ip_addresses: None,
+            // connector" — the set `CreateConnector` assigned this connector, reported
+            // as stored, and absent for a connector the service manages no egress for
+            // (`state::connector_egress_addresses`).
+            service_managed_egress_ip_addresses: stored.reported_egress_ip_addresses(),
             security_policy_name: stored.security_policy_name.clone(),
             egress_config: stored.egress_config.clone().map(|config| {
                 DescribedConnectorEgressConfig::VpcLattice(
@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // nothing here leaves a connector in that status, so there is none.
             error_message: None,
             status: stored.status.clone(),
-            ip_address_type: stored.ip_address_type.clone(),
+            ip_address_type: Some(stored.ip_address_type.clone()),
         };
 
         Ok(DescribeConnectorOutput { connector })

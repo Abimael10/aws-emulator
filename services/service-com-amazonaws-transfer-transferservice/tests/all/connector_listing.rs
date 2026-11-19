@@ -29,8 +29,10 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_transfer_transferservice::ops::types::SftpConnectorConfig;
 use service_com_amazonaws_transfer_transferservice::state::{
-    connector_arn, Connector, CONNECTOR_STATUS_ACTIVE, DEFAULT_CONNECTOR_EGRESS_TYPE,
-    DEFAULT_MAX_CONCURRENT_CONNECTIONS, MAX_STORED_CONNECTORS,
+    connector_arn, service_managed_egress_ip_addresses, Connector, CONNECTOR_STATUS_ACTIVE,
+    DEFAULT_CONNECTOR_EGRESS_TYPE, DEFAULT_CONNECTOR_SECURITY_POLICY_NAME,
+    DEFAULT_IP_ADDRESS_TYPE, DEFAULT_MAX_CONCURRENT_CONNECTIONS, DEFAULT_SECRET_VERSION_STAGE,
+    MAX_STORED_CONNECTORS,
 };
 
 use crate::harness::{drain_pages, Answer, Emulator, ACCOUNT, REGION, ROLE};
@@ -75,16 +77,22 @@ fn seed_connectors(emulator: &Emulator, urls: &[Option<String>]) -> Vec<(String,
             as2_config: None,
             sftp_config: Some(SftpConnectorConfig {
                 user_secret_id: Some("sftp-partner-credentials".to_string()),
-                trusted_host_keys: None,
+                trusted_host_keys: Some(Vec::new()),
                 max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
-                ordered_user_secret_version_stages: None,
+                ordered_user_secret_version_stages: Some(vec![
+                    DEFAULT_SECRET_VERSION_STAGE.to_string()
+                ]),
             }),
             access_role: ROLE.to_string(),
             logging_role: None,
-            security_policy_name: None,
+            security_policy_name: Some(DEFAULT_CONNECTOR_SECURITY_POLICY_NAME.to_string()),
+            service_managed_egress_ip_addresses: service_managed_egress_ip_addresses(
+                REGION,
+                DEFAULT_CONNECTOR_EGRESS_TYPE,
+            ),
             egress_config: None,
             egress_type: DEFAULT_CONNECTOR_EGRESS_TYPE.to_string(),
-            ip_address_type: None,
+            ip_address_type: DEFAULT_IP_ADDRESS_TYPE.to_string(),
             status: CONNECTOR_STATUS_ACTIVE.to_string(),
             tags: Vec::new(),
         };

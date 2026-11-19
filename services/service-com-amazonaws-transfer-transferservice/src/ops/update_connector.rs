@@ -281,7 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stored.security_policy_name = Some(security_policy_name);
         }
         if let Some(ip_address_type) = input.ip_address_type {
-            stored.ip_address_type = Some(ip_address_type);
+            stored.ip_address_type = ip_address_type;
         }
 
         let connector_id = stored.connector_id.clone();

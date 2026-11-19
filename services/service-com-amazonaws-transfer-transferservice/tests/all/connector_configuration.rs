@@ -2,17 +2,23 @@
 
 //! What `CreateConnector` persists, and what a described connector reports.
 //!
-//! Three rules, each asserted over a TABLE of inputs rather than one recorded call:
+//! Four rules, each asserted over a TABLE of inputs rather than one recorded call:
 //!
 //! 1. a created connector is STORED: the call mints a `ConnectorId` of the modelled
 //!    shape, and a later `DescribeConnector` reports every member the caller supplied
 //!    exactly as supplied plus every member the service resolves — the ARN, the id, the
 //!    egress type, the status and the nested documented defaults
 //!    ([`created_connectors_are_described_exactly_as_configured`]);
-//! 2. a connector whose members cannot hold together is refused with the modelled
+//! 2. every member the SERVICE settles for itself is resolved at create time and
+//!    reported by every read — the address type, the security policy, the egress
+//!    addresses it assigned, the trusted-host-key set and the secret version-stage order
+//!    ([`a_connector_reports_the_members_the_service_settles`], and
+//!    [`service_managed_egress_addresses_are_reported_for_every_region`] along the signed
+//!    region);
+//! 3. a connector whose members cannot hold together is refused with the modelled
 //!    `InvalidRequestException` and NOTHING is persisted for it — the next create mints
 //!    the very next id ([`connectors_whose_members_cannot_hold_together_are_refused`]);
-//! 3. a `ConnectorId` the store does not hold answers this service's generic not-found
+//! 4. a `ConnectorId` the store does not hold answers this service's generic not-found
 //!    error ([`describing_a_connector_that_was_never_created_is_not_found`]).
 //!
 //! The rows differ along the protocol configuration (AS2 or SFTP), the egress type
@@ -119,10 +125,14 @@ async fn created_connectors_are_described_exactly_as_configured() {
                 "SftpConfig": null,
                 "EgressConfig": null,
                 "LoggingRole": null,
+                // `ConnectorSecurityPolicyName`'s modelled pattern
+                // `^TransferSFTPConnectorSecurityPolicy-[A-Za-z0-9-]+$` admits only the
+                // SFTP-connector policies, so an AS2 connector carries none of that kind.
                 "SecurityPolicyName": null,
-                "IpAddressType": null,
+                // Every connector's network connections have an address type, so one
+                // the request did not name takes the documented default.
+                "IpAddressType": "IPV4",
                 "ErrorMessage": null,
-                "ServiceManagedEgressIpAddresses": null,
             }),
         ),
         (
@@ -188,13 +198,21 @@ async fn created_connectors_are_described_exactly_as_configured() {
                 "Url": "sftp://partner.example.com",
                 "SftpConfig": {
                     "UserSecretId": "sftp-partner-credentials",
+                    // The set of trusted keys the connector carries: EMPTY, because the
+                    // request named none, and the order the credentials are read in at
+                    // its default single stage.
+                    "TrustedHostKeys": [],
                     "MaxConcurrentConnections": 1,
+                    "OrderedUserSecretVersionStages": ["AWSCURRENT"],
                 },
                 "EgressType": "SERVICE_MANAGED",
                 "Status": "ACTIVE",
                 "As2Config": null,
                 "EgressConfig": null,
                 "Tags": [],
+                // The default SFTP-connector policy, which the published catalog holds.
+                "SecurityPolicyName": "TransferSFTPConnectorSecurityPolicy-2024-03",
+                "IpAddressType": "IPV4",
             }),
         ),
         (
@@ -256,7 +274,9 @@ async fn created_connectors_are_described_exactly_as_configured() {
                 },
                 "SftpConfig": {
                     "UserSecretId": "sftp-partner-credentials",
+                    "TrustedHostKeys": [],
                     "MaxConcurrentConnections": 1,
+                    "OrderedUserSecretVersionStages": ["AWSCURRENT"],
                 },
             }),
         ),
@@ -280,7 +300,12 @@ async fn created_connectors_are_described_exactly_as_configured() {
                         "PortNumber": 1,
                     },
                 },
-                "SftpConfig": {"UserSecretId": "sftp", "MaxConcurrentConnections": 3},
+                "SftpConfig": {
+                    "UserSecretId": "sftp",
+                    "TrustedHostKeys": [],
+                    "MaxConcurrentConnections": 3,
+                    "OrderedUserSecretVersionStages": ["AWSCURRENT"],
+                },
                 "Url": null,
             }),
         ),
@@ -313,6 +338,7 @@ async fn created_connectors_are_described_exactly_as_configured() {
                     "UserSecretId": "sftp",
                     "TrustedHostKeys": [],
                     "MaxConcurrentConnections": 1,
+                    "OrderedUserSecretVersionStages": ["AWSCURRENT"],
                 },
             }),
         ),
@@ -412,6 +438,319 @@ async fn a_connectors_arn_carries_the_region_the_request_was_signed_for() {
             arn,
             format!("arn:aws:transfer:{region}:{ACCOUNT}:connector/{connector_id}"),
             "case {region:?}: expected the ARN to carry the signed region, got {arn:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 1, stated over the members the SERVICE settles rather than the caller.
+// ---------------------------------------------------------------------------
+
+/// What one row of [`a_connector_reports_the_members_the_service_settles`] expects of
+/// the members the service settles for itself.
+struct Settled {
+    /// `IpAddressType`, which every connector carries.
+    ip_address_type: &'static str,
+    /// `SecurityPolicyName`, or `None` for a connector that carries no policy of the
+    /// SFTP-connector kind the member's pattern admits.
+    security_policy_name: Option<&'static str>,
+    /// Whether the service manages this connector's egress, and so assigns it addresses.
+    service_managed_egress: bool,
+    /// `SftpConfig.TrustedHostKeys`, or `None` for a connector with no `SftpConfig`.
+    trusted_host_keys: Option<Vec<&'static str>>,
+    /// `SftpConfig.OrderedUserSecretVersionStages`, likewise.
+    ordered_user_secret_version_stages: Option<Vec<&'static str>>,
+}
+
+/// Every address of `addresses` parsed as an IPv4 address, so a row asserts the member's
+/// FORM rather than one run's literals.
+///
+/// `ServiceManagedEgressIpAddress` is modelled with the pattern
+/// `^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$`
+/// (`smithy_query(query="shape",shape="ServiceManagedEgressIpAddresses")`), which is a
+/// dotted quad of octets.
+fn assert_ipv4_addresses(case: &str, addresses: &Value) {
+    let listed = addresses
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a list of addresses, got {addresses:?}"));
+    assert!(
+        !listed.is_empty(),
+        "case {case:?}: expected the service-managed egress addresses the connector was \
+         assigned, got an empty list"
+    );
+    for address in listed {
+        let text = address.as_str().unwrap_or_default();
+        assert!(
+            text.parse::<std::net::Ipv4Addr>().is_ok(),
+            "case {case:?}: expected an IPv4 address of four octets, got {address:?}"
+        );
+    }
+}
+
+/// RULE: every member of a connector that the SERVICE settles — rather than the caller
+/// supplying it — is resolved when the connector is created and reported by every read
+/// of it: `IpAddressType` at the caller's value else the documented default,
+/// `SecurityPolicyName` at the caller's value else the service's default SFTP-connector
+/// policy (and absent only for a connector whose protocol carries no policy of that
+/// kind), `ServiceManagedEgressIpAddresses` as the non-empty set of IPv4 addresses
+/// assigned to a connector whose egress the service manages (absent for one it does
+/// not), `SftpConfig.TrustedHostKeys` as the — possibly empty — set of keys the
+/// connector trusts, and `SftpConfig.OrderedUserSecretVersionStages` as the order the
+/// credentials are read in, at its default single stage when the caller named no order.
+///
+/// The rows differ along the protocol configuration (AS2, SFTP), the egress type
+/// (service-managed, VPC Lattice), how many of those members the request supplies (none,
+/// one, all), which enum value each carries, and the list lengths (`TrustedHostKeys` at
+/// 0, 1 and 2 of its modelled `len 0..10`; `OrderedUserSecretVersionStages` at both
+/// bounds of its modelled `len 1..2`).
+///
+/// Each row is also read TWICE, and once more after an update that names none of these
+/// members, which is what proves the set is assigned once and survives a read-modify-write
+/// round trip rather than being re-derived per read.
+#[tokio::test]
+async fn a_connector_reports_the_members_the_service_settles() {
+    let emulator = Emulator::new();
+
+    // `ConnectorsIpAddressType` is `[IPV4, DUALSTACK]` and the published SFTP-connector
+    // policies are the `TransferSFTPConnectorSecurityPolicy-*` generations
+    // (`smithy_query(query="shape",shape="ConnectorsIpAddressType")`, and this service's
+    // `ListSecurityPolicies`), so the rows below name values from those sets only.
+    let cases: Vec<(&str, Value, Settled)> = vec![
+        (
+            "SFTP service-managed, nothing the service settles supplied",
+            json!({
+                "AccessRole": ROLE,
+                "Url": "sftp://partner.example.com",
+                "SftpConfig": {"UserSecretId": "sftp-partner-credentials"},
+            }),
+            Settled {
+                ip_address_type: "IPV4",
+                security_policy_name: Some("TransferSFTPConnectorSecurityPolicy-2024-03"),
+                service_managed_egress: true,
+                trusted_host_keys: Some(Vec::new()),
+                ordered_user_secret_version_stages: Some(vec!["AWSCURRENT"]),
+            },
+        ),
+        (
+            "SFTP service-managed, one trusted host key and the other IpAddressType value",
+            json!({
+                "AccessRole": ROLE,
+                "Url": "sftp://partner.example.com:2222",
+                "IpAddressType": "DUALSTACK",
+                "SftpConfig": {
+                    "UserSecretId": "sftp-partner-credentials",
+                    "TrustedHostKeys": ["ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ=="],
+                },
+            }),
+            Settled {
+                ip_address_type: "DUALSTACK",
+                security_policy_name: Some("TransferSFTPConnectorSecurityPolicy-2024-03"),
+                service_managed_egress: true,
+                trusted_host_keys: Some(vec!["ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ=="]),
+                ordered_user_secret_version_stages: Some(vec!["AWSCURRENT"]),
+            },
+        ),
+        (
+            "SFTP service-managed, every settled member supplied: a FIPS policy from the \
+             published catalog, two trusted host keys and both secret version stages",
+            json!({
+                "AccessRole": ROLE,
+                "Url": "sftp://partner.example.com",
+                "IpAddressType": "IPV4",
+                "SecurityPolicyName": "TransferSFTPConnectorSecurityPolicy-FIPS-2024-10",
+                "SftpConfig": {
+                    "UserSecretId": "sftp-partner-credentials",
+                    "TrustedHostKeys": [
+                        "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ==",
+                        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=",
+                    ],
+                    "OrderedUserSecretVersionStages": ["AWSPREVIOUS", "AWSCURRENT"],
+                },
+            }),
+            Settled {
+                ip_address_type: "IPV4",
+                security_policy_name: Some("TransferSFTPConnectorSecurityPolicy-FIPS-2024-10"),
+                service_managed_egress: true,
+                trusted_host_keys: Some(vec![
+                    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ==",
+                    "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=",
+                ]),
+                // Reported in the caller's own ORDER, which is what the member is for.
+                ordered_user_secret_version_stages: Some(vec!["AWSPREVIOUS", "AWSCURRENT"]),
+            },
+        ),
+        (
+            "SFTP over VPC Lattice: the customer's own VPC carries the egress, so the \
+             service assigns no addresses for it",
+            json!({
+                "AccessRole": ROLE,
+                "SftpConfig": {"UserSecretId": "sftp-partner-credentials"},
+                "EgressConfig": {
+                    "VpcLattice": {"ResourceConfigurationArn": RESOURCE_CONFIGURATION_ARN},
+                },
+            }),
+            Settled {
+                ip_address_type: "IPV4",
+                security_policy_name: Some("TransferSFTPConnectorSecurityPolicy-2024-03"),
+                service_managed_egress: false,
+                trusted_host_keys: Some(Vec::new()),
+                ordered_user_secret_version_stages: Some(vec!["AWSCURRENT"]),
+            },
+        ),
+        (
+            "AS2 service-managed: no SftpConfig, and no policy of the SFTP-connector kind",
+            json!({
+                "AccessRole": ROLE,
+                "Url": "https://partner.example.com/as2",
+                "As2Config": {
+                    "LocalProfileId": LOCAL_PROFILE,
+                    "PartnerProfileId": PARTNER_PROFILE,
+                },
+            }),
+            Settled {
+                ip_address_type: "IPV4",
+                security_policy_name: None,
+                service_managed_egress: true,
+                trusted_host_keys: None,
+                ordered_user_secret_version_stages: None,
+            },
+        ),
+    ];
+
+    // The addresses every service-managed connector of this Region reports: assigned to
+    // the account's managed egress rather than to one connector, so they are collected
+    // here and compared across the rows.
+    let mut regional_egress: Option<Value> = None;
+
+    for (case, request, settled) in cases {
+        let connector_id = create_connector(&emulator, case, request).await;
+        let described = describe_connector(&emulator, case, &connector_id).await;
+
+        assert_members(
+            case,
+            &described,
+            &json!({
+                "IpAddressType": settled.ip_address_type,
+                "SecurityPolicyName": settled.security_policy_name,
+            }),
+        );
+
+        let egress = member_of(&described, "ServiceManagedEgressIpAddresses").clone();
+        if settled.service_managed_egress {
+            assert_ipv4_addresses(case, &egress);
+            if let Some(regional) = regional_egress.as_ref() {
+                assert_eq!(
+                    &egress, regional,
+                    "case {case:?}: the service's managed egress belongs to the account \
+                     and Region, so every service-managed connector of this Region \
+                     reports the same addresses, expected {regional:?}, got {egress:?}"
+                );
+            } else {
+                regional_egress = Some(egress.clone());
+            }
+        } else {
+            assert!(
+                egress.is_null(),
+                "case {case:?}: the service manages no egress for this connector, so it \
+                 reports no addresses, got {egress:?}"
+            );
+        }
+
+        let sftp_config = member_of(&described, "SftpConfig").clone();
+        match settled.trusted_host_keys {
+            Some(keys) => assert_eq!(
+                member_of(&sftp_config, "TrustedHostKeys"),
+                &json!(keys),
+                "case {case:?}: expected TrustedHostKeys {keys:?}, got {sftp_config:?}"
+            ),
+            None => assert!(
+                sftp_config.is_null(),
+                "case {case:?}: a connector with no SftpConfig reports none, got \
+                 {sftp_config:?}"
+            ),
+        }
+        if let Some(stages) = settled.ordered_user_secret_version_stages {
+            assert_eq!(
+                member_of(&sftp_config, "OrderedUserSecretVersionStages"),
+                &json!(stages),
+                "case {case:?}: expected OrderedUserSecretVersionStages {stages:?}, got \
+                 {sftp_config:?}"
+            );
+        }
+
+        // The policy the connector reports is one the service PUBLISHES, so a caller can
+        // read the ciphers it governs: an invented name resolves to nothing.
+        if let Some(name) = settled.security_policy_name {
+            let policy = emulator
+                .call("DescribeSecurityPolicy", json!({"SecurityPolicyName": name}))
+                .await;
+            assert_eq!(
+                policy.status, 200,
+                "case {case:?}: expected the reported policy {name:?} to be published, \
+                 got {} with body {}",
+                policy.status, policy.body
+            );
+        }
+
+        // Assigned once: a second read reports the same connector, and so does a read
+        // after an update that names none of these members — the read-modify-write round
+        // trip a caller makes.
+        let again = describe_connector(&emulator, case, &connector_id).await;
+        assert_eq!(
+            again, described,
+            "case {case:?}: two reads of one connector must answer the same thing, got \
+             {again:?} after {described:?}"
+        );
+        let update = emulator
+            .call(
+                "UpdateConnector",
+                json!({"ConnectorId": &connector_id, "AccessRole": ROLE}),
+            )
+            .await;
+        assert_eq!(
+            update.status, 200,
+            "case {case:?}: expected UpdateConnector 200, got {} with body {}",
+            update.status, update.body
+        );
+        let after_update = describe_connector(&emulator, case, &connector_id).await;
+        assert_eq!(
+            after_update, described,
+            "case {case:?}: an update that names none of the settled members must leave \
+             them all, got {after_update:?} after {described:?}"
+        );
+    }
+}
+
+/// RULE (the same one, varied along the signed region): a connector's service-managed
+/// egress addresses are the ones its own Region's managed egress uses, so a connector
+/// created in another Region reports that Region's set.
+#[tokio::test]
+async fn service_managed_egress_addresses_are_reported_for_every_region() {
+    let emulator = Emulator::new();
+
+    for region in ["us-east-1", "eu-west-2", "ap-southeast-1"] {
+        let answer = emulator
+            .call_in(
+                region,
+                "CreateConnector",
+                json!({
+                    "AccessRole": ROLE,
+                    "Url": "sftp://partner.example.com",
+                    "SftpConfig": {"UserSecretId": "sftp"},
+                }),
+            )
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {region:?}: expected CreateConnector 200, got {} with body {}",
+            answer.status, answer.body
+        );
+        let connector_id = answer.get("ConnectorId").as_str().unwrap_or_default().to_string();
+
+        let described = describe_connector(&emulator, region, &connector_id).await;
+        assert_ipv4_addresses(
+            region,
+            member_of(&described, "ServiceManagedEgressIpAddresses"),
         );
     }
 }

@@ -40,37 +40,33 @@ use crate::state as st;
 /// `StatusMessage` for a connector whose `Url` names no SFTP server this emulator can
 /// open a connection to: no endpoint at all, an endpoint outside this emulator, or a
 /// server of this account that is not serving SFTP right now (one that is not `ONLINE`,
-/// or whose `Protocols` do not include SFTP). The second sentence is the model's own
-/// troubleshooting text for that condition.
-const SFTP_ENDPOINT_UNREACHABLE: &str = "No SFTP connection could be opened to the \
-     endpoint the connector configuration names. Verify the server URL in the \
-     connector configuration, and verify that the login credentials work successfully \
-     outside of the connector.";
+/// or whose `Protocols` do not include SFTP).
+///
+/// A one-line verdict, like every text beside it: what the member's documentation lists
+/// for a caller to check is guidance to the reader of that documentation, not part of
+/// the answer.
+const SFTP_ENDPOINT_UNREACHABLE: &str =
+    "No SFTP connection could be opened to the endpoint the connector configuration \
+     names.";
 
 /// `StatusMessage` for a connector whose `UserSecretId` names a secret whose value
 /// cannot be read, or does not hold the `{\"Username\": ..., \"PrivateKey\": ...}`
-/// document an SFTP connector's secret is made of. The second sentence is the model's
-/// own troubleshooting text for that condition.
+/// document an SFTP connector's secret is made of.
 const SFTP_SECRET_UNUSABLE: &str = "The secret the connector configuration names could \
-     not be read as an SFTP user's credentials. Verify that your secret name aligns \
-     with the one in Transfer Role permissions, and verify that the secret exists and \
-     is formatted correctly.";
+     not be read as an SFTP user's credentials.";
 
 /// `StatusMessage` for credentials the target server did not authenticate: the secret's
 /// `Username` is no user of that server, or the key it holds is not one of that user's
 /// SSH public keys.
 const SFTP_CREDENTIALS_REJECTED: &str = "The SFTP server did not authenticate the \
-     credentials the connector's secret holds. Verify the server URL in the connector \
-     configuration, and verify that the login credentials work successfully outside of \
-     the connector.";
+     credentials the connector's secret holds.";
 
 /// `StatusMessage` for a connection whose host-key exchange presented a key the
 /// connector does not trust: `TrustedHostKeys` is "the public portion of the host key,
 /// or keys, that are used to identify the external server to which you are connecting",
 /// so a key set that does not carry the presented key identifies another server.
 const SFTP_HOST_KEY_NOT_TRUSTED: &str = "The host key the SFTP server presented is not \
-     one of the connector configuration's TrustedHostKeys. Verify that the trusted host \
-     key in the connector configuration matches the ssh-keyscan output.";
+     one of the connector configuration's TrustedHostKeys.";
 
 /// What follows the first label in a Transfer Family server's own endpoint host: a
 /// server is reached at `<server-id>.server.transfer.<region>.amazonaws.com`, so the

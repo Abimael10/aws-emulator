@@ -14,7 +14,9 @@
 //!    ([`testing_an_sftp_connector_reports_the_verdict_its_configuration_earns`]). The
 //!    same suite asserts the text is FIXED per condition (no identifier, secret or key
 //!    body reaches it) and that a test is a pure read: it answers the same thing twice
-//!    and leaves the described connector unchanged;
+//!    and leaves the described connector unchanged. The verdict is ONE LINE, stating the
+//!    condition and nothing else
+//!    ([`a_test_connection_verdict_is_one_line_and_carries_no_troubleshooting_guidance`]);
 //! 2. a connector that configures no SFTP connection has none for this call to test, so
 //!    it is refused with the modelled `InvalidRequestException`
 //!    ([`testing_a_connector_that_configures_no_sftp_connection_is_refused`]);
@@ -418,6 +420,143 @@ async fn testing_an_sftp_connector_reports_the_verdict_its_configuration_earns()
                      got {message:?}"
                 );
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 1, stated over the WORDS of the verdict rather than its condition.
+// ---------------------------------------------------------------------------
+
+/// RULE: a `StatusMessage` is the service's own one-line VERDICT on the connection —
+/// for a connector that trusts no host key, the recorded `No TrustedHostKeys provided.`
+/// — and carries none of the troubleshooting guidance the member's documentation offers
+/// the reader of that documentation ("Verify that your secret name aligns ...", "Verify
+/// the server URL ...", "Verify that the secret exists ...", "Verify that the trusted
+/// host key ... matches the `ssh-keyscan` output"), which is no part of the answer.
+///
+/// The rows differ along which condition the stored configuration is in and the FORM of
+/// the member at fault (absent, blank, the empty list, one unreadable entry among
+/// readable ones), so the rule is asserted over the class of verdicts rather than the
+/// one recorded row.
+#[tokio::test]
+async fn a_test_connection_verdict_is_one_line_and_carries_no_troubleshooting_guidance() {
+    let emulator = Emulator::new();
+
+    let ed25519 = generated_public_key();
+
+    // The sentences the member's documentation offers a reader
+    // (`smithy_query(query="doc",shape="TestConnectionResponse",member="StatusMessage")`),
+    // none of which the service answers.
+    let guidance = [
+        "Verify that your secret name aligns",
+        "Verify the server URL",
+        "Verify that the secret exists",
+        "Verify that the trusted host key",
+        "ssh-keyscan",
+    ];
+
+    // (case, the connector's SftpConfig, the verdict the service states)
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "no TrustedHostKeys member at all",
+            json!({"UserSecretId": SECRET}),
+            "No TrustedHostKeys provided.",
+        ),
+        (
+            "TrustedHostKeys the empty list, at the low bound of its modelled len 0..10",
+            json!({"UserSecretId": SECRET, "TrustedHostKeys": []}),
+            "No TrustedHostKeys provided.",
+        ),
+        (
+            "no UserSecretId member at all",
+            json!({"TrustedHostKeys": [ed25519.clone()]}),
+            "No UserSecretId provided.",
+        ),
+        (
+            "UserSecretId present but blank, which names no secret",
+            json!({"UserSecretId": " ", "TrustedHostKeys": [ed25519.clone()]}),
+            "No UserSecretId provided.",
+        ),
+    ];
+
+    for (case, sftp_config, expected) in cases {
+        let connector_id = create_connector(
+            &emulator,
+            case,
+            json!({
+                "AccessRole": ROLE,
+                "Url": "sftp://partner.example.com",
+                "SftpConfig": sftp_config,
+            }),
+        )
+        .await;
+
+        let answer = emulator
+            .call("TestConnection", json!({"ConnectorId": connector_id}))
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected TestConnection 200, got {} with body {}",
+            answer.status, answer.body
+        );
+        let message = answer.get("StatusMessage").as_str().unwrap_or_default().to_string();
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the verdict {expected:?}, got {message:?}"
+        );
+    }
+
+    // Every verdict this operation states, from every condition reachable without a
+    // server to connect to, is ONE line and carries no guidance sentence.
+    let probes: Vec<(&str, Value)> = vec![
+        (
+            "a configuration that trusts no host key",
+            json!({"UserSecretId": SECRET}),
+        ),
+        ("a configuration with no secret", json!({})),
+        (
+            "a trusted host key that is not an SSH public key",
+            json!({"UserSecretId": SECRET, "TrustedHostKeys": ["ssh-ed25519 not-base64!!"]}),
+        ),
+        (
+            "a configuration with nothing at fault, whose endpoint is no server of this \
+             emulator",
+            json!({"UserSecretId": SECRET, "TrustedHostKeys": [ed25519.clone()]}),
+        ),
+    ];
+
+    for (case, sftp_config) in probes {
+        let connector_id = create_connector(
+            &emulator,
+            case,
+            json!({
+                "AccessRole": ROLE,
+                "Url": "sftp://partner.example.com",
+                "SftpConfig": sftp_config,
+            }),
+        )
+        .await;
+        let answer = emulator
+            .call("TestConnection", json!({"ConnectorId": connector_id}))
+            .await;
+        let message = answer.get("StatusMessage").as_str().unwrap_or_default().to_string();
+        assert!(
+            !message.is_empty() && !message.contains('\n'),
+            "case {case:?}: expected a one-line verdict, got {message:?}"
+        );
+        assert_eq!(
+            message.trim(),
+            message,
+            "case {case:?}: expected no surrounding whitespace in the verdict, got \
+             {message:?}"
+        );
+        for sentence in guidance {
+            assert!(
+                !message.contains(sentence),
+                "case {case:?}: expected no troubleshooting guidance in the verdict, but \
+                 it carries {sentence:?}: {message:?}"
+            );
         }
     }
 }

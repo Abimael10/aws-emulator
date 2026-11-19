@@ -63,6 +63,7 @@ pub mod connector_delivery;
 pub mod home_directory_mappings;
 pub mod identity_provider;
 pub mod vended_log_group;
+pub mod connector_egress_addresses;
 pub mod connector_plane;
 pub mod connector_protocol;
 pub mod identity_center;
@@ -75,6 +76,7 @@ pub mod web_app_write_claim;
 pub mod workflow_runs;
 mod security_policies;
 mod host_key_material;
+pub use connector_egress_addresses::service_managed_egress_ip_addresses;
 pub use host_key_material::*;
 pub use security_policies::*;
 
@@ -672,6 +674,28 @@ pub const DEFAULT_VPC_LATTICE_PORT: i32 = 22;
 /// `SftpConnectorConfig.MaxConcurrentConnections`' documented default ("The default
 /// value is `1`"), which the model also carries as `@default(1)`.
 pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: i32 = 1;
+
+/// The Secrets Manager version stage a connector reads the SFTP user's credentials
+/// from when `OrderedUserSecretVersionStages` names none.
+///
+/// `OrderedUserSecretVersionStages` is "an ordered list of Amazon Web Services Secrets
+/// Manager version stages (staging labels, such as `AWSCURRENT` and `AWSPREVIOUS`) for
+/// the secret identified by `UserSecretId`", and `AWSCURRENT` is the label Secrets
+/// Manager keeps on a secret's current version — so a connector that names no order
+/// reads the current version alone, which is the one-stage order a connector created
+/// without the member reports.
+pub const DEFAULT_SECRET_VERSION_STAGE: &str = "AWSCURRENT";
+
+/// The security policy an SFTP connector gets when no `SecurityPolicyName` is named.
+///
+/// `ConnectorSecurityPolicyName`'s modelled pattern
+/// `^TransferSFTPConnectorSecurityPolicy-[A-Za-z0-9-]+$` admits only the SFTP-connector
+/// generations of [`SECURITY_POLICIES`], and this is the current non-FIPS one of them,
+/// as the recorded response of a connector created without the member reports. The
+/// policy is published by this service's own catalog, so the policy a connector reports
+/// is one a caller can describe.
+pub const DEFAULT_CONNECTOR_SECURITY_POLICY_NAME: &str =
+    "TransferSFTPConnectorSecurityPolicy-2024-03";
 
 /// `SftpConnectorConfig.MaxConcurrentConnections`' documented maximum ("The maximum
 /// values is `5`").
@@ -1352,19 +1376,35 @@ pub struct Connector {
     /// every other connector is refused without one.
     pub url: Option<String>,
     pub as2_config: Option<As2ConnectorConfig>,
-    /// The SFTP settings, with `MaxConcurrentConnections` already resolved at create
-    /// time by [`resolve_sftp_connector_config`].
+    /// The SFTP settings, with every member the service itself settles already resolved
+    /// at create time by [`resolve_sftp_connector_config`].
     pub sftp_config: Option<SftpConnectorConfig>,
     pub access_role: String,
     pub logging_role: Option<String>,
+    /// The security policy governing the connector's SSH algorithms, resolved at create
+    /// time to [`DEFAULT_CONNECTOR_SECURITY_POLICY_NAME`] for a connector that
+    /// configures an SFTP connection and named none.
+    ///
+    /// `None` exactly for a connector that configures no such connection: the member's
+    /// own modelled pattern admits only the `TransferSFTPConnectorSecurityPolicy-*`
+    /// policies this service publishes for SFTP connectors, so an AS2 connector carries
+    /// no policy of that kind to report.
     pub security_policy_name: Option<String>,
+    /// `ServiceManagedEgressIpAddresses`: the egress addresses the service assigned this
+    /// connector when it was created, and empty for a connector it assigned none — see
+    /// [`service_managed_egress_ip_addresses`].
+    pub service_managed_egress_ip_addresses: Vec<String>,
     /// The VPC Lattice egress settings, with `PortNumber` resolved at create time by
     /// [`resolve_connector_egress_config`]. `ConnectorEgressConfig` is a union with one
     /// member, so the variant is carried by [`Self::egress_type`] and this holds the
     /// settings themselves.
     pub egress_config: Option<ConnectorVpcLatticeEgressConfig>,
     pub egress_type: String,
-    pub ip_address_type: Option<String>,
+    /// `IpAddressType`, resolved at create time: the value the caller named, else
+    /// [`DEFAULT_IP_ADDRESS_TYPE`]. Every connector's network connections have an
+    /// address type, so this is materialised for every stored connector rather than
+    /// defaulted by each reader.
+    pub ip_address_type: String,
     pub status: String,
     pub tags: Vec<Tag>,
 }
@@ -1397,22 +1437,54 @@ pub fn connector_url(url: Option<&str>) -> Option<String> {
 
 /// Resolve the `SftpConnectorConfig` a connector is stored with.
 ///
-/// `MaxConcurrentConnections` is the one member the model documents a default for, so
-/// it is materialised HERE, once, at create time. The member is modelled non-optional
-/// with `@default(1)`, so a request that omits it arrives as the schema's default
-/// rather than as "absent", and its `@range{min: 1}` is refused at the boundary before
-/// a handler runs: the floor below is therefore belt-and-braces, for a value that
-/// reaches the store unset, and never a validation rule of its own.
+/// Every member the service itself settles is materialised HERE, once, at create time,
+/// so no reader has to re-apply a default and a configuration read back reports the
+/// connector as the service configured it: `MaxConcurrentConnections` at its documented
+/// default, `TrustedHostKeys` as the (possibly empty) set of keys the connector trusts,
+/// and `OrderedUserSecretVersionStages` at the order the credentials are read in.
+///
+/// `MaxConcurrentConnections` is modelled non-optional with `@default(1)`, so a request
+/// that omits it arrives as the schema's default rather than as "absent", and its
+/// `@range{min: 1}` is refused at the boundary before a handler runs: the floor below is
+/// therefore belt-and-braces, for a value that reaches the store unset, and never a
+/// validation rule of its own.
 pub fn resolve_sftp_connector_config(requested: SftpConnectorConfig) -> SftpConnectorConfig {
+    // Destructured rather than updated through `..requested`, so every member of the
+    // shape is accounted for here: a member the model gains is a compile error until it
+    // is resolved too.
+    let SftpConnectorConfig {
+        user_secret_id,
+        trusted_host_keys,
+        max_concurrent_connections,
+        ordered_user_secret_version_stages,
+    } = requested;
     SftpConnectorConfig {
-        max_concurrent_connections: if requested.max_concurrent_connections
+        user_secret_id,
+        max_concurrent_connections: if max_concurrent_connections
             >= DEFAULT_MAX_CONCURRENT_CONNECTIONS
         {
-            requested.max_concurrent_connections
+            max_concurrent_connections
         } else {
             DEFAULT_MAX_CONCURRENT_CONNECTIONS
         },
-        ..requested
+        // The host keys the connector trusts are a SET the connector carries, so a
+        // request that named none leaves it EMPTY rather than unknown: `TrustedHostKeys`
+        // is modelled `len 0..10`, and "optional for `CreateConnector`. If not provided,
+        // you can use `TestConnection` to retrieve the server host key during the initial
+        // connection attempt, and subsequently update the connector with the observed
+        // host key" — the sequence a caller walks by reading the set back, pinning a key
+        // and reading it again.
+        trusted_host_keys: Some(trusted_host_keys.unwrap_or_default()),
+        // The order the credentials are read in: the one the request named, else the one
+        // stage a connector that named no order reads
+        // ([`DEFAULT_SECRET_VERSION_STAGE`]). The member is modelled `len 1..2`, so an
+        // empty order is refused at the boundary and the emptiness test below is
+        // belt-and-braces for a value that reaches the store unset.
+        ordered_user_secret_version_stages: Some(
+            ordered_user_secret_version_stages
+                .filter(|stages| !stages.is_empty())
+                .unwrap_or_else(|| vec![DEFAULT_SECRET_VERSION_STAGE.to_string()]),
+        ),
     }
 }
 
@@ -1474,6 +1546,12 @@ pub fn merge_sftp_connector_config(
 // before any connection is attempted; what the attempt itself answers is decided in
 // [`sftp_target`]. Each is a FIXED text per condition carrying no request data, for the
 // reason this module's docs give.
+//
+// Each one is a VERDICT: one line saying what stopped the connection, as the recorded
+// answer for a connector that trusts no host key states it. The member's documentation
+// then lists what to check for each verdict a caller receives, which is guidance to the
+// reader of that documentation and no part of the answer, so none of it is appended to a
+// message here.
 
 /// `TestConnection`'s `Status` for a test that succeeded.
 ///
@@ -1499,11 +1577,9 @@ pub const TEST_CONNECTION_SUCCESS_MESSAGE: &str = "Connection succeeded";
 /// `StatusMessage` for an SFTP configuration that names no secret to authenticate
 /// with. `UserSecretId` is "the identifier for the secret ... that contains the SFTP
 /// user's private key, password, or both", so without it the connector has no
-/// credentials to offer; the second sentence is the model's own troubleshooting text
-/// for that condition.
-const SFTP_NO_USER_SECRET: &str = "The connector configuration names no UserSecretId, \
-     so the SFTP user's credentials cannot be read. Verify that the secret exists and \
-     is formatted correctly.";
+/// credentials to offer — and the verdict names the member the configuration provides
+/// none of, in the form the recorded [`SFTP_NO_TRUSTED_HOST_KEY`] verdict states it.
+const SFTP_NO_USER_SECRET: &str = "No UserSecretId provided.";
 
 /// `StatusMessage` for an SFTP configuration that trusts no host key.
 ///
@@ -1513,9 +1589,10 @@ const SFTP_NO_USER_SECRET: &str = "The connector configuration names no UserSecr
 /// key during the initial connection attempt" — so a connector that trusts none has
 /// nothing to identify the remote server by, and the test that says so is the very call
 /// that reports the host key to pin.
-const SFTP_NO_TRUSTED_HOST_KEY: &str = "The connector configuration carries no \
-     TrustedHostKeys, so the remote server cannot be identified. Verify that the \
-     trusted host key in the connector configuration matches the ssh-keyscan output.";
+///
+/// The service's recorded verdict for this condition, word for word, and the form the
+/// verdicts beside it state their own condition in.
+const SFTP_NO_TRUSTED_HOST_KEY: &str = "No TrustedHostKeys provided.";
 
 /// `StatusMessage` for an SFTP configuration whose trusted host key is not a key.
 ///
@@ -1523,10 +1600,8 @@ const SFTP_NO_TRUSTED_HOST_KEY: &str = "The connector configuration carries no \
 /// `<body base64>`" elements of an SSH public key; a value [`ssh_key`] cannot read as
 /// one is not a host key at all, so it can never match what the remote server presents
 /// — whatever that server turns out to be.
-const SFTP_UNREADABLE_TRUSTED_HOST_KEY: &str = "A TrustedHostKeys entry in the \
-     connector configuration is not an SSH public key in 'key-type key-body' form, so \
-     it can never match the remote server's host key. Verify that the trusted host key \
-     in the connector configuration matches the ssh-keyscan output.";
+const SFTP_UNREADABLE_TRUSTED_HOST_KEY: &str = "A TrustedHostKeys entry is not an SSH \
+     public key in 'key-type key-body' form.";
 
 /// Whether `material` is an SSH PUBLIC key this service can read.
 ///
