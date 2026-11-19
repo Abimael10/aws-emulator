@@ -1084,6 +1084,12 @@ impl ContainerShell {
     /// there is no server to start: the invocation is one this session does not perform
     /// ([`Self::declined`]), exactly as it was before this container shipped a server at all.
     ///
+    /// A server that HAS started writes its own startup output
+    /// ([`container_servers::startup_output`]) before it answers anything, on the stream that
+    /// server writes it to — so the lines the log driver delivers for such a container are the
+    /// ones its server really wrote. They travel the same writes every other command's output
+    /// does, so `redirections` applies to them as it does to a command's.
+    ///
     /// The command itself answers success, and what the CONTAINER then exits with is decided by
     /// the signal that ended the wait, not here: a foreground server runs until it is
     /// signalled, and the handler the program installed for that signal — or the signal itself —
@@ -1093,6 +1099,7 @@ impl ContainerShell {
     fn run_server<'a>(
         &'a mut self,
         starting: &'a container_servers::StartingServer,
+        redirections: &'a Redirections,
     ) -> ShellFuture<'a, i32> {
         Box::pin(async move {
             let Some(serving) = self.serving.clone() else {
@@ -1110,6 +1117,17 @@ impl ContainerShell {
                 files,
             );
             self.listening.push(handle);
+            // The server is up, which is what it writes about: the instant it says so is this
+            // one, the instant it started listening.
+            for line in container_servers::startup_output(starting, ::std::time::SystemTime::now())
+            {
+                let written = format!("{}\n", line.text);
+                let _ = if line.to_error {
+                    self.write_stderr(&written, redirections).await
+                } else {
+                    self.write_stdout(&written, redirections).await
+                };
+            }
             // Until the container is stopped, or until this emulator's own bound on the run
             // ends it — which is the wait every other wait of this session is clamped to.
             self.wait_for(None).await;
@@ -1687,7 +1705,7 @@ impl ContainerShell {
             if let Some(starting) =
                 container_servers::server_started_by(name, arguments, self.filesystem.working_in())
             {
-                return self.run_server(&starting).await;
+                return self.run_server(&starting, redirections).await;
             }
             // The AWS CLI, which is a program of the container's ENVIRONMENT rather than a
             // utility of this session: what it performs is the shared reading of that program

@@ -51,6 +51,14 @@
 //! while a container's image ships it, the container's command runs it, and the task's address is
 //! what it answers at.
 //!
+//! # What a server writes when it starts
+//!
+//! A server that starts says so: it logs that it is up, and the container's log driver delivers
+//! those lines like any other output the container's program writes ([`startup_output`]) — so a
+//! task running a web server has events in its log stream before any request is made to it.
+//! What is delivered is each server's OWN output, and a server whose startup output this
+//! emulator does not hold writes nothing: no line is invented for it.
+//!
 //! # Bounds
 //!
 //! A server is read as the document root stood when it STARTED, which is when the program that
@@ -405,6 +413,86 @@ impl ServesHttp for ContainerStaticServer {
             body: answered.body,
         })
     }
+}
+
+/// The server of the shared catalog whose master logs the startup notice below. The catalog
+/// carries it under this name (`::service_common::static_web_servers::WEB_SERVER_PACKAGES`),
+/// which is the name [`StartingServer::program`] holds for an invocation of it — the same way
+/// [`IMAGE_WEB_SERVERS`] names the package each image ships.
+const NGINX_SERVER: &str = "nginx";
+
+/// The LEVEL the nginx master's startup notice is logged at, and the notice itself: once the
+/// worker processes the master forked are up it logs `start worker processes`, which is the
+/// point that server is serving from.
+const NGINX_NOTICE_LEVEL: &str = "notice";
+const NGINX_WORKERS_STARTED: &str = "start worker processes";
+
+/// How the nginx error log spells the instant of a line — `2026/11/08 19:18:14` — which every
+/// line of that log begins with, before the level and the process that wrote it.
+const NGINX_LOG_INSTANT: &str = "%Y/%m/%d %H:%M:%S";
+
+/// The process a container's server runs as, and its thread — the pair an nginx error-log line
+/// carries as `<pid>#<tid>`.
+///
+/// One session runs a container's whole program here and forks nothing
+/// ([`super::container_shell`]), so the server IS that session: the container's main process,
+/// which a container runtime starts as process 1.
+const CONTAINER_MAIN_PROCESS: u32 = 1;
+
+/// The address the interpreter's HTTP server module reports itself serving on: the one it binds
+/// when its invocation names no other, which is the address it prints.
+const MODULE_BOUND_ADDRESS: &str = "0.0.0.0";
+
+/// One line a server writes as it STARTS, and which of the container's two streams it goes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupLine {
+    /// The text of the line, without the newline that ends it.
+    pub text: String,
+    /// Whether the server writes it to standard ERROR rather than to standard output.
+    pub to_error: bool,
+}
+
+/// The lines the server `starting` writes as it begins serving, in the order it writes them.
+///
+/// Starting a server is not silent, and the container's log driver delivers what the server
+/// writes exactly as it delivers everything else the container's program writes. What is
+/// written is each server's OWN output and nothing else:
+///
+/// * the nginx master logs its notices to the error log, each line `<instant> [<level>]
+///   <pid>#<tid>: <message>`, and that image routes the error log to the container's standard
+///   error — so the notice it logs once its workers are up ([`NGINX_WORKERS_STARTED`]) is one
+///   event of the container's stream;
+/// * the interpreter's own HTTP server module PRINTS the address and the port it is serving on,
+///   which is the one line that invocation writes, on its standard output;
+/// * a server whose startup output this emulator does not hold writes nothing here, so a stream
+///   holding none is a container whose program wrote none.
+///
+/// `at` is the instant the server started, which is what the line that carries one reports.
+#[must_use]
+pub fn startup_output(starting: &StartingServer, at: ::std::time::SystemTime) -> Vec<StartupLine> {
+    if starting.program == NGINX_SERVER {
+        let instant = ::chrono::DateTime::<::chrono::Utc>::from(at)
+            .format(NGINX_LOG_INSTANT)
+            .to_string();
+        return vec![StartupLine {
+            text: format!(
+                "{instant} [{NGINX_NOTICE_LEVEL}] {CONTAINER_MAIN_PROCESS}#\
+                 {CONTAINER_MAIN_PROCESS}: {NGINX_WORKERS_STARTED}"
+            ),
+            to_error: true,
+        }];
+    }
+    if starting.program == ::service_common::static_web_servers::HTTP_SERVER_MODULE {
+        let port = starting.port;
+        return vec![StartupLine {
+            text: format!(
+                "Serving HTTP on {MODULE_BOUND_ADDRESS} port {port} \
+                 (http://{MODULE_BOUND_ADDRESS}:{port}/) ..."
+            ),
+            to_error: false,
+        }];
+    }
+    Vec::new()
 }
 
 #[cfg(test)]
