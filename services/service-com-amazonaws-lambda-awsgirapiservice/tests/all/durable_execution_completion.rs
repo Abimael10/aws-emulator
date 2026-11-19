@@ -456,7 +456,11 @@ async fn a_read_of_execution_data_is_refused_while_its_key_cannot_be_used() {
 
 /// A router carrying Lambda and the key service on ONE engine, so the key a function's
 /// durable configuration names is a key this account really holds — and really disables.
-fn router_with_key_service(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+///
+/// `pub(crate)` for the same reason [`kms_call`] is: the suites that put a key into a state
+/// and then assert what Lambda does about it mount the two services together through ONE
+/// caller (`tests/all/invoke_durable_execution_handle.rs` is the other one).
+pub(crate) fn router_with_key_service(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = router_on(engine);
     router.register_service(service_com_amazonaws_kms_trentservice::EmulatedService::new(
         Arc::clone(engine),
@@ -465,7 +469,9 @@ fn router_with_key_service(engine: &Arc<engine::InMemoryEngine>) -> MultiService
 }
 
 /// A symmetric encryption key this account holds, answered by its ARN.
-async fn created_key(router: &MultiServiceRouter) -> String {
+///
+/// `pub(crate)`: see [`router_with_key_service`].
+pub(crate) async fn created_key(router: &MultiServiceRouter) -> String {
     let created = kms_call(router, "CreateKey", &json!({})).await;
     assert_eq!(
         created.status,
@@ -601,7 +607,7 @@ async fn publish_version(router: &MultiServiceRouter, name: &str) -> String {
 /// Bring the activation the clock owes forward and LOOK until Lambda reports `qualifier` of
 /// `name` active, which is the state an invocation needs. The wait is on the condition, with
 /// a generous deadline, so no case here turns on how fast the host runs.
-async fn wait_until_active(
+pub(crate) async fn wait_until_active(
     engine: &Arc<engine::InMemoryEngine>,
     router: &MultiServiceRouter,
     case: &str,

@@ -42,31 +42,35 @@ const INVOCATIONS_URI: &str = "/2015-03-31/functions";
 const DURABLE_EXECUTIONS_URI: &str = "/2025-12-01/functions";
 
 /// The response header `Invoke$DurableExecutionArn` is bound to.
-const DURABLE_EXECUTION_ARN_HEADER: &str = "x-amz-durable-execution-arn";
+///
+/// This and the modelled facts below it are `pub(crate)` so the suites of this target that
+/// assert the same modelled constraint read it from ONE place and cannot drift from the
+/// model (`tests/all/invoke_durable_execution_handle.rs` is the other reader).
+pub(crate) const DURABLE_EXECUTION_ARN_HEADER: &str = "x-amz-durable-execution-arn";
 
 /// The request header `Invoke$DurableExecutionName` is bound to.
-const DURABLE_EXECUTION_NAME_HEADER: &str = "x-amz-durable-execution-name";
+pub(crate) const DURABLE_EXECUTION_NAME_HEADER: &str = "x-amz-durable-execution-name";
 
 /// The infix the model's `DurableExecutionArn` pattern puts between the function version
 /// and the execution's name and id.
-const ARN_INFIX: &str = "/durable-execution/";
+pub(crate) const ARN_INFIX: &str = "/durable-execution/";
 
 /// The bounds the model puts on `DurableExecutionName` (`@length(min: 1, max: 64)`), from
 /// `smithy_query(query="operation", operation="Invoke")`.
-const NAME_MIN: usize = 1;
-const NAME_MAX: usize = 64;
+pub(crate) const NAME_MIN: usize = 1;
+pub(crate) const NAME_MAX: usize = 64;
 
 /// A customer managed key ARN satisfying the model's `KMSKeyArn` pattern, which the
 /// durable functions here name in their `DurableConfig`.
-const KMS_KEY: &str = "arn:aws:kms:us-east-1:000000000000:key/durable-executions";
+pub(crate) const KMS_KEY: &str = "arn:aws:kms:us-east-1:000000000000:key/durable-executions";
 
 /// The `ExecutionStatus` a freshly started execution carries, from
 /// `smithy_query(query="shape", shape="ExecutionStatus")` (`RUNNING | SUCCEEDED | FAILED |
 /// TIMED_OUT | STOPPED`).
-const STATUS_RUNNING: &str = "RUNNING";
+pub(crate) const STATUS_RUNNING: &str = "RUNNING";
 
 /// The unpublished version label, as the model's `Version` pattern spells it.
-const VERSION_LATEST: &str = "$LATEST";
+pub(crate) const VERSION_LATEST: &str = "$LATEST";
 
 /// `Invoke` on the function `reference` names, with `query` appended, carrying `payload`
 /// and naming `execution` as the durable execution when it names one.
@@ -161,13 +165,13 @@ fn queued_invocations(engine: &Arc<engine::InMemoryEngine>, name: &str) -> usize
 }
 
 /// The unqualified ARN a function of `name` carries.
-fn function_arn(name: &str) -> String {
+pub(crate) fn function_arn(name: &str) -> String {
     format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}")
 }
 
 /// The ARN of `version` of the function `name`, as the model's `NameSpacedFunctionArn`
 /// pattern spells it.
-fn versioned_arn(name: &str, version: &str) -> String {
+pub(crate) fn versioned_arn(name: &str, version: &str) -> String {
     if version == VERSION_LATEST {
         function_arn(name)
     } else {
@@ -177,7 +181,7 @@ fn versioned_arn(name: &str, version: &str) -> String {
 
 /// Whether `name` satisfies the model's `DurableExecutionName` pattern
 /// (`^[a-zA-Z0-9-_]+$`) and its length bounds.
-fn is_execution_name(name: &str) -> bool {
+pub(crate) fn is_execution_name(name: &str) -> bool {
     (NAME_MIN..=NAME_MAX).contains(&name.chars().count())
         && name
             .bytes()
