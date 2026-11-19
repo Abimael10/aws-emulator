@@ -117,7 +117,10 @@ use crate::ops::put_integration::{APIGATEWAY_VENDOR, PATH_FORM_PREFIX};
 
 /// The subdomain field that names AWS Lambda, which is the service whose function-invoking
 /// action this module performs.
-const LAMBDA_SUBDOMAIN: &str = "lambda";
+///
+/// `pub(super)` because the NON-PROXY integration to that same action is named by the same
+/// subdomain ([`super::aws_integration`]): one spelling, read rather than written twice.
+pub(super) const LAMBDA_SUBDOMAIN: &str = "lambda";
 
 /// The segment of that path that the function's own name or ARN follows.
 const FUNCTIONS_SEGMENT: &str = "/functions/";
@@ -132,7 +135,10 @@ const SERVICE_PRINCIPAL: &str = "apigateway.amazonaws.com";
 
 /// The IAM action an invocation of a function performs, which is not the operation's own
 /// name: `Invoke` "requires permission for the `lambda:InvokeFunction` action".
-const INVOKE_FUNCTION_ACTION: &str = "lambda:InvokeFunction";
+///
+/// `pub(super)` because a NON-PROXY integration's invocation of a function is authorized by
+/// the same action ([`super::aws_integration`]).
+pub(super) const INVOKE_FUNCTION_ACTION: &str = "lambda:InvokeFunction";
 
 /// The condition key a grant narrowed to ONE invoking resource names the source by, which
 /// for an api's method is that method's `execute-api` ARN.
@@ -232,7 +238,11 @@ const MAX_PROXY_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// waiting and answers through the api's own `INTEGRATION_TIMEOUT` gateway response, which
 /// is what keeps a request to a deployed stage bounded whatever the function does with its
 /// own time.
-fn waited_for(integration: &GetIntegrationOutput) -> Duration {
+///
+/// `pub(super)` because a NON-PROXY integration's invocation of a function waits for the same
+/// stored number ([`super::aws_integration`]): one reading of that member, so the two
+/// integration types cannot disagree about how long a run is given.
+pub(super) fn waited_for(integration: &GetIntegrationOutput) -> Duration {
     let stored = integration.timeout_in_millis;
     let millis = if (crate::ops::put_integration::MIN_TIMEOUT_IN_MILLIS
         ..=crate::ops::put_integration::MAX_TIMEOUT_IN_MILLIS)
@@ -365,10 +375,22 @@ pub(super) fn invoked_function(uri: &str) -> Option<(&str, &str)> {
     if !fields.next()?.eq_ignore_ascii_case(LAMBDA_SUBDOMAIN) {
         return None;
     }
-    let path = fields.next()?.strip_prefix(PATH_FORM_PREFIX)?;
+    let function = invoked_function_path(fields.next()?)?;
+    Some((region, function))
+}
+
+/// The function the RESOURCE field of such a `uri` names, which is Lambda's own REST path for
+/// a synchronous invocation: `path/{version}/functions/{function}/invocations`. `None` for a
+/// resource that is not that path, which names no function to invoke.
+///
+/// `pub(super)` because the NON-PROXY integration to the same action names its function in the
+/// same path, read after that resource's `{placeholder}`s have been resolved against the
+/// request ([`super::aws_integration`]) — so the two types read ONE path form.
+pub(super) fn invoked_function_path(resource: &str) -> Option<&str> {
+    let path = resource.strip_prefix(PATH_FORM_PREFIX)?;
     let invoked = path.strip_suffix(INVOCATIONS_SUFFIX)?;
     let (_api_version, function) = invoked.split_once(FUNCTIONS_SEGMENT)?;
-    (!function.is_empty()).then_some((region, function))
+    (!function.is_empty()).then_some(function)
 }
 
 /// The method response this call earns: the function's policy decides whether the

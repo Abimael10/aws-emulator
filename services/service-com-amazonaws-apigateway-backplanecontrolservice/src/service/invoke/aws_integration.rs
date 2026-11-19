@@ -30,7 +30,12 @@
 //! * AMAZON SNS, whose actions the `action` form names and whose parameters the integration
 //!   request then carries as its own query api's wire form does ([`sns`]) — the `path` form
 //!   of a `uri` naming it addresses that api's root, which is where every action of it is
-//!   reached.
+//!   reached;
+//! * AWS LAMBDA, whose function-invoking action — the one `IntegrationType` names in the same
+//!   sentence as this type — the `path` form addresses as that data plane's own path, and
+//!   whose event is the integration request ([`lambda`]). That is the NON-PROXY integration to
+//!   a function: the proxy type ([`super::lambda_proxy`]) invokes the same action with the
+//!   whole method request passed through instead.
 //!
 //! The call is made THROUGH THE EMULATOR this service is running within, over the
 //! in-process transport `OperationContext::callback` hands a handler: nothing is invented
@@ -85,7 +90,9 @@
 //! response based on the response from the back end … If the back end is an AWS Lambda
 //! function, the AWS Lambda function error header is matched. For all other HTTP and AWS
 //! back ends, the HTTP status code is matched." So the pattern is matched against the
-//! status the service answered with, the integration response with no pattern is the
+//! status the service answered with — and, for the one back end that sentence singles out,
+//! against the error a Lambda run reported instead ([`lambda`]) — the integration response
+//! with no pattern is the
 //! fallback ([`super::default_integration_response`]), and the `statusCode` of the one
 //! selected is the status the CALLER sees. Its response template renders the body when it
 //! declares one, read off what the backend answered; with no template the backend's own
@@ -116,6 +123,7 @@ use super::{
 mod dynamodb;
 mod json_rpc;
 mod kinesis;
+mod lambda;
 mod query_form;
 mod sns;
 mod sqs;
@@ -418,6 +426,9 @@ fn addressed_call(
     if let Some(topic) = sns::addressed_topic(integration, default_region, call) {
         return Some(topic.map(ServiceCall::Topic));
     }
+    if let Some(function) = lambda::addressed(integration, default_region, call) {
+        return Some(function.map(ServiceCall::Function));
+    }
     None
 }
 
@@ -438,6 +449,9 @@ enum ServiceCall {
     JsonRpc(json_rpc::Call),
     /// An Amazon SNS topic action.
     Topic(sns::TopicCall),
+    /// One invocation of an AWS Lambda function, named by the `path` form of the `uri`
+    /// ([`lambda`]).
+    Function(lambda::Call),
 }
 
 /// What an Amazon S3 integration `uri` addresses: the bucket itself, or an object in it.
@@ -456,6 +470,7 @@ impl ServiceCall {
             Self::Queue(queue) => queue.region(),
             Self::JsonRpc(call) => call.region(),
             Self::Topic(topic) => topic.region(),
+            Self::Function(function) => function.region(),
         }
     }
 
@@ -471,6 +486,7 @@ impl ServiceCall {
             Self::Queue(queue) => queue.iam_action().to_string(),
             Self::JsonRpc(call) => call.iam_action(),
             Self::Topic(topic) => topic.iam_action(),
+            Self::Function(function) => function.iam_action().to_string(),
         }
     }
 
@@ -483,6 +499,7 @@ impl ServiceCall {
             Self::Queue(queue) => queue.queue_arn(),
             Self::JsonRpc(call) => call.resource_arn(),
             Self::Topic(topic) => topic.topic_arn(),
+            Self::Function(function) => function.function_arn(),
         }
     }
 
@@ -507,6 +524,7 @@ impl ServiceCall {
             Self::Queue(queue) => queue.sent(),
             Self::JsonRpc(call) => call.sent().to_vec(),
             Self::Topic(topic) => topic.sent(),
+            Self::Function(function) => function.sent().to_vec(),
         }
     }
 
@@ -539,6 +557,7 @@ impl ServiceCall {
             Self::Queue(queue) => sqs::access_denied(queue),
             Self::JsonRpc(call) => json_rpc::access_denied(call, principal),
             Self::Topic(topic) => sns::access_denied(topic, principal),
+            Self::Function(function) => lambda::access_denied(function, principal),
         }
     }
 
@@ -547,13 +566,43 @@ impl ServiceCall {
         &self,
         ctx: &OperationContext<'_>,
         call: &MethodRequest,
-    ) -> Result<Answered, UnservedIntegration> {
+    ) -> Result<Backend, UnservedIntegration> {
         match self {
-            Self::Object(object) => answered_by_s3(ctx, object, call).await,
-            Self::Bucket(bucket) => answered_by_s3_bucket(ctx, bucket).await,
-            Self::Queue(queue) => sqs::answered(ctx, queue, call).await,
-            Self::JsonRpc(json) => json_rpc::answered(ctx, json).await,
-            Self::Topic(topic) => sns::answered(ctx, topic).await,
+            Self::Object(object) => answered_by_s3(ctx, object, call).await.map(Backend::of),
+            Self::Bucket(bucket) => answered_by_s3_bucket(ctx, bucket).await.map(Backend::of),
+            Self::Queue(queue) => sqs::answered(ctx, queue, call).await.map(Backend::of),
+            Self::JsonRpc(json) => json_rpc::answered(ctx, json).await.map(Backend::of),
+            Self::Topic(topic) => sns::answered(ctx, topic).await.map(Backend::of),
+            // The one backend whose answer may be a run that ERRORED, which is not mapped by
+            // the status it carries ([`Backend::function_error`]).
+            Self::Function(function) => lambda::answered(ctx, function, call).await,
+        }
+    }
+}
+
+/// What a backend answered one integration request, beside the one signal an answer of it may
+/// carry that decides the mapping INSTEAD of its status.
+///
+/// Every service this module calls answers with a status, which is what
+/// `IntegrationResponse$selectionPattern` matches — except AWS Lambda, whose run may have
+/// ERRORED: "if the back end is an AWS Lambda function, the AWS Lambda function error header
+/// is matched". So what a call hands the mapping step is the answer AND, for that one class of
+/// answer, the signal the pattern is matched against.
+#[derive(Debug)]
+struct Backend {
+    answered: Answered,
+    /// The AWS Lambda function error the answer reported, or `None` for every answer whose
+    /// mapping is the status it carries.
+    function_error: Option<String>,
+}
+
+impl Backend {
+    /// An answer the integration responses map by the STATUS it carries, which is every
+    /// backend answer but a Lambda run that errored.
+    fn of(answered: Answered) -> Self {
+        Self {
+            answered,
+            function_error: None,
         }
     }
 }
@@ -569,23 +618,29 @@ async fn served(
     call: &MethodRequest,
     target: &ServiceCall,
 ) -> Result<Served, UnservedIntegration> {
-    let answered = match authorization(ctx, integration, target).await {
+    let backend = match authorization(ctx, integration, target).await {
         Authorization::Unassumable(reason) => return Err(unanswered(&reason)),
-        Authorization::Withheld => {
-            target.access_denied(integration.credentials.as_deref().unwrap_or_default())
-        }
+        Authorization::Withheld => Backend::of(
+            target.access_denied(integration.credentials.as_deref().unwrap_or_default()),
+        ),
         Authorization::Admitted => target.answered(ctx, call).await?,
     };
+    let answered = backend.answered;
     // The STATUS the service answered is what `IntegrationResponse$selectionPattern` is
     // matched against, so it travels with the answer; the headers the method response
-    // carries are the integration response's own mapping rather than the service's.
+    // carries are the integration response's own mapping rather than the service's. The one
+    // answer matched against something else is a Lambda run that errored, whose own signal
+    // travels instead ([`Backend::function_error`]).
     Ok(Served {
         exchanged: super::stage_logs::Exchanged {
             sent: target.sent(call),
             received: answered.body.clone(),
         },
         answer: IntegrationAnswer {
-            mapping: AnswerMapping::Backend(answered.status),
+            mapping: match backend.function_error {
+                Some(error) => AnswerMapping::FunctionError(error),
+                None => AnswerMapping::Backend(answered.status),
+            },
             content_type: answered.content_type,
             payload: Some(answered.body),
             headers: ::std::collections::BTreeMap::new(),
@@ -1194,8 +1249,22 @@ pub(super) fn selected_response(
     integration: &GetIntegrationOutput,
     status: u16,
 ) -> Option<&GetIntegrationResponseOutput> {
+    selected_matching(integration, &status.to_string())
+}
+
+/// The integration response whose `selectionPattern` matches `subject`, and otherwise the one
+/// that declares no pattern — the api's DEFAULT.
+///
+/// The SUBJECT is what the matched pattern is matched against, which is the backend's status
+/// for every answer but one: "if the back end is an AWS Lambda function, the AWS Lambda
+/// function error header is matched. For all other HTTP and AWS back ends, the HTTP status
+/// code is matched" (`IntegrationResponse$selectionPattern`). One walk of the responses for
+/// both, so the two subjects cannot be matched by different rules.
+pub(super) fn selected_matching<'a>(
+    integration: &'a GetIntegrationOutput,
+    subject: &str,
+) -> Option<&'a GetIntegrationResponseOutput> {
     let responses = integration.integration_responses.as_ref()?;
-    let answered = status.to_string();
     let mut ordered: Vec<&GetIntegrationResponseOutput> = responses.values().collect();
     ordered.sort_by(|left, right| left.status_code.cmp(&right.status_code));
     ordered
@@ -1205,13 +1274,13 @@ pub(super) fn selected_response(
                 .selection_pattern
                 .as_deref()
                 .filter(|pattern| !pattern.is_empty())
-                .is_some_and(|pattern| pattern_matches(pattern, &answered))
+                .is_some_and(|pattern| pattern_matches(pattern, subject))
         })
         .or_else(|| default_integration_response(integration))
 }
 
-/// Whether the `selectionPattern` `pattern` matches `value`, which is the backend status
-/// for an AWS integration.
+/// Whether the `selectionPattern` `pattern` matches `value`, which is the backend status for
+/// an AWS integration — or the function error for a Lambda run that errored.
 ///
 /// The pattern is a regular expression a CONTROL-PLANE call stored, not one a request
 /// carries, and the subject is the three characters of a status code: it is matched WHOLE,

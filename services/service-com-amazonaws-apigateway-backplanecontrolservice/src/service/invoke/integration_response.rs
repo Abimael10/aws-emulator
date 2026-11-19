@@ -10,11 +10,12 @@
 //! ITS own `$context` and parameters. Anything the mapping derives from the request being
 //! served therefore names that request, on a cache hit as on a miss.
 //!
-//! Three kinds of answer reach this, and [`AnswerMapping`] says which an entry holds: a
-//! BACKEND answer, whose `selectionPattern` picks the integration response that maps it; a
-//! `MOCK`'s own rendered integration request, whose `statusCode` names that response; and
-//! an answer nothing maps — a proxy integration's response, and the response of an endpoint
-//! a request was passed on to — which IS the method response.
+//! Four kinds of answer reach this, and [`AnswerMapping`] says which an entry holds: a
+//! BACKEND answer, whose `selectionPattern` picks the integration response that maps it; an
+//! AWS Lambda run that ERRORED, whose own error signal that pattern is matched against
+//! instead; a `MOCK`'s own rendered integration request, whose `statusCode` names that
+//! response; and an answer nothing maps — a proxy integration's response, and the response of
+//! an endpoint a request was passed on to — which IS the method response.
 //!
 //! What the integration response that maps an answer may say about the method response is the
 //! status it is keyed by, the headers its `responseParameters` map and the body its
@@ -55,6 +56,23 @@ pub fn mapped(
                         "the integration has no integration response for the {status} the \
                          backend answered, so the call maps to no method response"
                     ),
+                });
+            };
+            rendered(method, selected, call, answer, Untemplated::TheAnswer)
+        }
+        AnswerMapping::FunctionError(error) => {
+            let integration = mapping_integration(method)?;
+            // The subject the pattern is matched against is the function error itself, not a
+            // status: that is what `IntegrationResponse$selectionPattern` says for a Lambda
+            // back end. An error no pattern selects maps to the api's DEFAULT integration
+            // response, which is the catch-all for every answer no pattern selects.
+            let Some(selected) = aws_integration::selected_matching(integration, error) else {
+                return Err(UnservedIntegration {
+                    refusal: API_CONFIGURATION_ERROR,
+                    reason: "the integration has no integration response for the function \
+                             error the backend answered, so the call maps to no method \
+                             response"
+                        .to_string(),
                 });
             };
             rendered(method, selected, call, answer, Untemplated::TheAnswer)

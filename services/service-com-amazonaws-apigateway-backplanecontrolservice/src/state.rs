@@ -958,6 +958,14 @@ pub enum AnswerMapping {
     /// `IntegrationResponse$selectionPattern` selects — "the regular expression (regex)
     /// used to match the HTTP status code of the backend response".
     Backend(u16),
+    /// An AWS Lambda backend answered, and its RUN ERRORED — the one backend answer whose
+    /// mapping is not the status it carries: "if the back end is an AWS Lambda function, the
+    /// AWS Lambda function error header is matched" (`IntegrationResponse$selectionPattern`),
+    /// so the integration response that maps it is the one whose pattern matches this signal
+    /// (`InvocationResponse$FunctionError`, "if present, indicates that an error occurred
+    /// during function execution"), and otherwise the api's default response. The answer's own
+    /// payload — the error document the run produced — is what a response template then reads.
+    FunctionError(String),
     /// A `MOCK`, which has no backend: the status its rendered integration request named is
     /// the integration response the call maps to, and `None` where it named none.
     Mock(Option<String>),
