@@ -209,10 +209,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "Exactly match" compares the mailbox the value names, which is what
                 // the identity table is keyed by: a display-name form and a differently
                 // cased domain name the same mailbox.
+                //
+                // The refusal itself is worded the way the service answers it — the
+                // fixed text `FromAddress <` + `> must match the email identity <` +
+                // `>.`, with the address the request spelled and the identity it
+                // targeted as its variable parts — which is NOT the documentation's
+                // phrasing of the rule above: the sentence a client reads carries no
+                // "exactly".
                 if crate::state::identity_key(&address) != key {
                     return Err(bad_request(format!(
-                        "FromAddress <{address}> must exactly match the email identity \
-                         <{identity}>."
+                        "FromAddress <{address}> must match the email identity <{identity}>."
                     )));
                 }
                 address

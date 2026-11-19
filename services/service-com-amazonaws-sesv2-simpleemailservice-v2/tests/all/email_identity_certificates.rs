@@ -565,7 +565,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             from_address: Some("other@example.com"),
             status: 400,
             code: "BadRequestException",
-            message: "FromAddress <other@example.com> must exactly match the email identity \
+            message: "FromAddress <other@example.com> must match the email identity \
                       <signer@example.com>."
                 .to_string(),
         },
@@ -1064,6 +1064,173 @@ async fn a_certificate_walk_visits_every_association_exactly_once() {
             "case {case:?}: expected the walk to enumerate associations in a stable order, \
              visited {seen:?}"
         );
+    }
+}
+
+/// One row of the `FromAddress`-against-an-address-identity table: the identity to
+/// create, the `FromAddress` to associate against it, and whether that value names the
+/// identity's mailbox.
+struct FromAddressCase {
+    case: &'static str,
+    identity: &'static str,
+    from_address: &'static str,
+    names_the_identity: bool,
+}
+
+/// The forms a `FromAddress` on an ADDRESS identity can take, spanning what "names the
+/// same mailbox" generalises over: the local part's spelling (which belongs to the
+/// receiving mailbox, so its case counts), the domain's spelling (which DNS compares
+/// without regard to case), the display-name wrapper RFC 5322 allows around an
+/// addr-spec, the domain the address sits in (including a subdomain of the identity's,
+/// which is a different mailbox), and a value that is no address at all.
+fn from_address_cases() -> Vec<FromAddressCase> {
+    vec![
+        FromAddressCase {
+            case: "the identity itself",
+            identity: "signer@example.com",
+            from_address: "signer@example.com",
+            names_the_identity: true,
+        },
+        FromAddressCase {
+            case: "the identity with its domain cased differently",
+            identity: "signer@example.com",
+            from_address: "signer@EXAMPLE.COM",
+            names_the_identity: true,
+        },
+        FromAddressCase {
+            case: "the identity in display-name form",
+            identity: "signer@example.com",
+            from_address: "Signer Name <signer@example.com>",
+            names_the_identity: true,
+        },
+        FromAddressCase {
+            case: "another mailbox in the identity's domain",
+            identity: "signer@example.com",
+            from_address: "other@example.com",
+            names_the_identity: false,
+        },
+        FromAddressCase {
+            case: "the identity's local part with its case changed",
+            identity: "signer@example.com",
+            from_address: "Signer@example.com",
+            names_the_identity: false,
+        },
+        FromAddressCase {
+            case: "the identity's local part in another domain",
+            identity: "signer@example.com",
+            from_address: "signer@other.example.org",
+            names_the_identity: false,
+        },
+        FromAddressCase {
+            case: "a subdomain of the identity's domain",
+            identity: "signer@example.com",
+            from_address: "signer@mail.example.com",
+            names_the_identity: false,
+        },
+        FromAddressCase {
+            case: "another mailbox in display-name form",
+            identity: "signer@example.com",
+            from_address: "Someone Else <other@example.com>",
+            names_the_identity: false,
+        },
+        FromAddressCase {
+            case: "a value that is not an address",
+            identity: "signer@example.com",
+            from_address: "example.com",
+            names_the_identity: false,
+        },
+        FromAddressCase {
+            case: "another identity of the account",
+            identity: "Dotted.Signer@mail.example.com",
+            from_address: "signer@example.com",
+            names_the_identity: false,
+        },
+        FromAddressCase {
+            case: "an identity in a subdomain, named as itself",
+            identity: "Dotted.Signer@mail.example.com",
+            from_address: "Dotted.Signer@mail.example.com",
+            names_the_identity: true,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_from_address_outside_an_address_identity_is_refused_in_the_services_wording() {
+    let arn = certificate_arn("44444444-4444-4444-4444-444444444444");
+    for case in from_address_cases() {
+        let FromAddressCase {
+            case,
+            identity,
+            from_address,
+            names_the_identity,
+        } = case;
+        let ses = Ses::new();
+        for created in ["signer@example.com", "Dotted.Signer@mail.example.com"] {
+            let reply = ses.create_identity(created).await;
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: expected {created:?} to be created, got {} {:?}",
+                reply.status, reply.body
+            );
+        }
+
+        let reply = ses
+            .associate(json!({
+                "EmailIdentity": identity,
+                "FromAddress": from_address,
+                "CertificateArn": arn,
+            }))
+            .await;
+
+        if names_the_identity {
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: expected a FromAddress naming the identity's mailbox to be \
+                 accepted, got {} {:?}",
+                reply.status, reply.body
+            );
+            continue;
+        }
+
+        assert_eq!(
+            reply.status, 400,
+            "case {case:?}: expected HTTP 400, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {:?} ({:?})",
+            reply.error_code(),
+            reply.message()
+        );
+        // The sentence the service answers: its fixed text with the address the request
+        // spelled and the identity it targeted, both as supplied, in its angle brackets.
+        let expected =
+            format!("FromAddress <{from_address}> must match the email identity <{identity}>.");
+        assert_eq!(
+            reply.message(),
+            expected,
+            "case {case:?}: expected the refusal message {expected:?}, got {:?}",
+            reply.message()
+        );
+
+        // A refused call creates nothing: neither the address it named nor the identity
+        // it targeted holds an association afterwards.
+        for listed in [identity, from_address] {
+            let listing = ses
+                .list_certificates(json!({ "EmailIdentity": listed }))
+                .await;
+            if listing.status != 200 {
+                continue;
+            }
+            assert!(
+                listing.certificates().is_empty(),
+                "case {case:?}: expected the refused call to associate nothing with \
+                 {listed:?}, got {:?}",
+                listing.body
+            );
+        }
     }
 }
 
