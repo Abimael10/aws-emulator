@@ -56,7 +56,12 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
 /// The Region every request of this suite is signed for, which is the Region the Lambda
 /// harness addresses and therefore the one the function's own invocation runs in.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)` with the setup helpers below, which the sibling suite that drives the
+/// GENERATION half of the same chain
+/// (`crate::handler_generates_from_an_aoss_backed_knowledge_base`) stands its knowledge base
+/// up with rather than copying them.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The module and attribute the deployment package below carries its handler as.
 const HANDLER: &str = "lambda_function.lambda_handler";
@@ -111,21 +116,21 @@ const KB_ROLE: &str =
 
 /// The execution role the function runs as, and the function itself.
 const FUNCTION_ROLE: &str = "kb-fn-retriever-role";
-const FUNCTION: &str = "kb-fn-retriever";
+pub(crate) const FUNCTION: &str = "kb-fn-retriever";
 
 /// The IAM action a knowledge-base retrieval is decided against, as a policy statement spells
 /// it (`bedrock:<operation>`), and the operation it names.
 const RETRIEVE_ACTION: &str = "bedrock:Retrieve";
 
 /// The error code and HTTP status of each refusal class a caller tells apart.
-const ACCESS_DENIED: &str = "AccessDeniedException";
-const ACCESS_DENIED_STATUS: i64 = 403;
-const NOT_FOUND: &str = "ResourceNotFoundException";
-const NOT_FOUND_STATUS: i64 = 404;
+pub(crate) const ACCESS_DENIED: &str = "AccessDeniedException";
+pub(crate) const ACCESS_DENIED_STATUS: i64 = 403;
+pub(crate) const NOT_FOUND: &str = "ResourceNotFoundException";
+pub(crate) const NOT_FOUND_STATUS: i64 = 404;
 
 /// A well-formed knowledge-base identifier nothing holds (`KnowledgeBaseIdentifier`, pattern
 /// `^[0-9a-zA-Z]{10}$`).
-const ABSENT_KNOWLEDGE_BASE: &str = "ZZZZZZZZZZ";
+pub(crate) const ABSENT_KNOWLEDGE_BASE: &str = "ZZZZZZZZZZ";
 
 /// How long one invocation is given, as the function's own `Timeout`: well past what a run
 /// needs on any host, because what is under test is the answer the handler gets and not how
@@ -140,7 +145,7 @@ const LOOK: Duration = Duration::from_millis(50);
 
 /// The documents the knowledge base ingests: an id and the bytes it carries. The bytes differ
 /// in their encoding width, which is what the retrieval must carry through unchanged.
-const DOCUMENTS: &[(&str, &str)] = &[
+pub(crate) const DOCUMENTS: &[(&str, &str)] = &[
     ("doc-ascii", "escalation runbook: restart the ingest worker"),
     ("doc-emoji", "launch checklist \u{1f680} stage two \u{1f6a8}"),
     (
@@ -193,7 +198,7 @@ def lambda_handler(event, context):
 /// ONE shared engine, as `core/router/src/lib.rs` mounts them: the handler's SDK call is
 /// dispatched back into this same router and signed as the session of its own execution role,
 /// so the service that answers it is the service this suite set up.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = router_on(&engine);
     router.register_service(
@@ -380,7 +385,7 @@ fn text(document: &Value, path: &str) -> String {
 }
 
 /// One identity policy document with the statements `statements` names.
-fn policy(statements: Value) -> String {
+pub(crate) fn policy(statements: Value) -> String {
     json!({ "Version": "2012-10-17", "Statement": statements }).to_string()
 }
 
@@ -391,7 +396,7 @@ fn allow_retrieval() -> String {
 
 /// The grant of a role whose policy names no Bedrock action at all — the position a role
 /// nobody extended is in.
-fn logs_only() -> String {
+pub(crate) fn logs_only() -> String {
     policy(json!([{
         "Effect": "Allow",
         "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
@@ -410,7 +415,7 @@ fn allow_and_deny_retrieval() -> String {
 
 /// The identity policy in force on the execution role from now on, so a row is about the
 /// grant in force when the handler calls rather than the one in force when the role was made.
-async fn role_policy(router: &MultiServiceRouter, what: &str, document: &str) {
+pub(crate) async fn role_policy(router: &MultiServiceRouter, what: &str, document: &str) {
     iam(
         router,
         what,
@@ -428,7 +433,7 @@ async fn role_policy(router: &MultiServiceRouter, what: &str, document: &str) {
 /// `arn:aws:sts::<account>:assumed-role/<role name>/<function name>`, the identity AWS reports
 /// for a function's calls — built here from the role and the function rather than read off the
 /// crate under test.
-fn session_principal() -> String {
+pub(crate) fn session_principal() -> String {
     format!(
         "arn:aws:sts::{}:assumed-role/{FUNCTION_ROLE}/{FUNCTION}",
         engine::emulator_account_id()
@@ -437,7 +442,7 @@ fn session_principal() -> String {
 
 /// The ARN a retrieval is decided on, which an identity-based policy for `bedrock:Retrieve`
 /// names.
-fn knowledge_base_arn(knowledge_base_id: &str) -> String {
+pub(crate) fn knowledge_base_arn(knowledge_base_id: &str) -> String {
     format!(
         "arn:aws:bedrock:{REGION}:{}:knowledge-base/{knowledge_base_id}",
         engine::emulator_account_id()
@@ -512,7 +517,7 @@ fn inline_byte_document(id: &str, bytes: &str) -> Value {
 /// The `data` access policy names the knowledge base's role, which is the principal the
 /// knowledge-base create is resolved for, AND the function's execution role, as AWS's
 /// "Create a vector index in Amazon OpenSearch Service" has a caller grant them.
-async fn published_collection(router: &MultiServiceRouter) -> (String, String) {
+pub(crate) async fn published_collection(router: &MultiServiceRouter) -> (String, String) {
     // A collection cannot be created without an `encryption` policy covering its name...
     aoss_ok(
         router,
@@ -614,7 +619,10 @@ async fn published_collection(router: &MultiServiceRouter) -> (String, String) {
 /// — no RPC target, at the root of the address the collection published — so it must be
 /// SERVED by the collection's REST data plane rather than answered by an RPC front door that
 /// routes on a header this request does not carry.
-async fn vector_index_at_the_published_endpoint(router: &MultiServiceRouter, endpoint: &str) {
+pub(crate) async fn vector_index_at_the_published_endpoint(
+    router: &MultiServiceRouter,
+    endpoint: &str,
+) {
     let body = knn_index_body();
     let (status, created) =
         collection_rest(router, endpoint, "PUT", &format!("/{INDEX}"), Some(&body)).await;
@@ -651,7 +659,10 @@ async fn vector_index_at_the_published_endpoint(router: &MultiServiceRouter, end
 
 /// Create the knowledge base over that index, push [`DOCUMENTS`] into a custom data source of
 /// it, and answer the knowledge base's id once every document reports `INDEXED`.
-async fn ingested_knowledge_base(router: &MultiServiceRouter, collection_arn: &str) -> String {
+pub(crate) async fn ingested_knowledge_base(
+    router: &MultiServiceRouter,
+    collection_arn: &str,
+) -> String {
     let (status, created) = bedrock(
         router,
         "PUT",
@@ -782,8 +793,9 @@ async fn ingested_knowledge_base(router: &MultiServiceRouter, collection_arn: &s
 }
 
 /// Create the execution role, trusted by Lambda, and the `python3.12` function that runs
-/// [`HANDLER_SOURCE`] as it.
-async fn deployed_function(router: &MultiServiceRouter) {
+/// `handler_source` as it — [`HANDLER_SOURCE`] for this suite, and its own handler for the
+/// sibling suite that drives the generation half of the chain.
+pub(crate) async fn deployed_function(router: &MultiServiceRouter, handler_source: &str) {
     let trust = json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -816,7 +828,7 @@ async fn deployed_function(router: &MultiServiceRouter) {
             "Timeout": FUNCTION_TIMEOUT,
             "Code": {
                 "ZipFile": base64::engine::general_purpose::STANDARD
-                    .encode(package(&[("lambda_function.py", HANDLER_SOURCE)])),
+                    .encode(package(&[("lambda_function.py", handler_source)])),
             },
         }),
     )
@@ -866,7 +878,7 @@ struct Row {
 }
 
 /// The bytes the document `id` was ingested with.
-fn ingested(id: &str) -> &'static str {
+pub(crate) fn ingested(id: &str) -> &'static str {
     DOCUMENTS
         .iter()
         .find(|(document, _)| *document == id)
@@ -956,7 +968,7 @@ async fn a_handler_retrieves_the_knowledge_base_backed_by_its_collections_index(
     let (endpoint, collection_arn) = published_collection(&router).await;
     vector_index_at_the_published_endpoint(&router, &endpoint).await;
     let knowledge_base_id = ingested_knowledge_base(&router, &collection_arn).await;
-    deployed_function(&router).await;
+    deployed_function(&router, HANDLER_SOURCE).await;
 
     for row in rows() {
         let case = row.case;
