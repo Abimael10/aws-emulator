@@ -28,6 +28,10 @@
 //! Every row is read back through `DescribeStep` and `ListSteps`, and its event off the
 //! queue a rule delivered it to, so nothing here is evidence of anything but the persisted
 //! state and the real publication.
+//!
+//! The rows also span the two operations that submit a step — `AddJobFlowSteps` and the
+//! launch's own `RunJobFlow$Steps` — because the state a step settles in follows from its
+//! command whichever of them carried it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -222,24 +226,36 @@ impl Pairing {
     /// A cluster that stays up when it has no steps to run, with `concurrency` steps
     /// running at a time, waited for until it is up the way a client waits.
     async fn live_cluster(&self, name: &str, concurrency: i32) -> String {
-        let out = self
-            .emr(
-                "RunJobFlow",
-                json!({
-                    "Name": name,
-                    "ReleaseLabel": "emr-6.15.0",
-                    "JobFlowRole": INSTANCE_PROFILE,
-                    "ServiceRole": SERVICE_ROLE,
-                    "StepConcurrencyLevel": concurrency,
-                    "Instances": {
-                        "InstanceCount": 2,
-                        "MasterInstanceType": "m5.xlarge",
-                        "SlaveInstanceType": "m5.xlarge",
-                        "KeepJobFlowAliveWhenNoSteps": true,
-                    },
-                }),
-            )
-            .await;
+        self.live_cluster_with_steps(name, concurrency, Vec::new())
+            .await
+    }
+
+    /// The same cluster, launched carrying `steps` in its own `RunJobFlow` request ("a list
+    /// of steps to run", `RunJobFlow$Steps`) — the OTHER operation that submits steps to a
+    /// cluster.
+    async fn live_cluster_with_steps(
+        &self,
+        name: &str,
+        concurrency: i32,
+        steps: Vec<Value>,
+    ) -> String {
+        let mut request = json!({
+            "Name": name,
+            "ReleaseLabel": "emr-6.15.0",
+            "JobFlowRole": INSTANCE_PROFILE,
+            "ServiceRole": SERVICE_ROLE,
+            "StepConcurrencyLevel": concurrency,
+            "Instances": {
+                "InstanceCount": 2,
+                "MasterInstanceType": "m5.xlarge",
+                "SlaveInstanceType": "m5.xlarge",
+                "KeepJobFlowAliveWhenNoSteps": true,
+            },
+        });
+        if !steps.is_empty() {
+            request["Steps"] = Value::Array(steps);
+        }
+        let out = self.emr("RunJobFlow", request).await;
         let cluster_id = out["JobFlowId"]
             .as_str()
             .unwrap_or_else(|| panic!("RunJobFlow must answer a JobFlowId, got {out}"))
@@ -726,4 +742,123 @@ async fn a_step_transition_is_published_once_however_often_it_is_read() {
         "case {case:?}: the event names the step, got {:?}",
         delivered[0]
     );
+}
+
+/// THE SAME RULE through the OTHER operation that submits steps: a step carried by the
+/// launch itself ("a list of steps to run", `RunJobFlow$Steps`) settles in the status its
+/// own command exited with, exactly as one added afterwards does.
+///
+/// The whole table runs on one cluster whose steps were told to `CONTINUE` past a failure,
+/// so each row's outcome is its own command's and not its neighbours': a row surrounded by
+/// failures still completes, and a row surrounded by completions still fails. A completed
+/// step reports no failure at all — there is nothing to report — and a failed one names the
+/// status its command exited with. And a settled step stays settled: reading it again
+/// reports the same status, timeline included.
+#[tokio::test]
+async fn a_step_submitted_with_the_launch_settles_on_its_own_commands_status() {
+    let pairing = Pairing::new();
+    let table = rows();
+    // A slot per row, so every row's command is answered on its own account rather than
+    // waiting behind the row in front of it; the sequencing rule is another suite's subject.
+    let concurrency = i32::try_from(table.len()).unwrap_or(1);
+    let cluster_id = pairing
+        .live_cluster_with_steps(
+            "launched command steps",
+            concurrency,
+            table
+                .iter()
+                .map(|row| command_step(row.name, row.args.clone()))
+                .collect(),
+        )
+        .await;
+
+    // `RunJobFlow` answers a cluster id and no step ids, so each row's step is the one the
+    // cluster lists under that row's own name.
+    let listed = pairing
+        .emr("ListSteps", json!({ "ClusterId": &cluster_id }))
+        .await;
+    let summaries = at(&listed, &["Steps"])
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        summaries.len(),
+        table.len(),
+        "the launch must persist one step per submitted StepConfig, got {listed}"
+    );
+
+    for row in &table {
+        let case = row.case;
+        let step_id = summaries
+            .iter()
+            .find(|summary| summary["Name"].as_str() == Some(row.name))
+            .and_then(|summary| summary["Id"].as_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: a step named {:?} must be listed, got {listed}",
+                    row.name
+                )
+            })
+            .to_string();
+        let step = pairing
+            .await_terminal_step(case, &cluster_id, &step_id)
+            .await;
+        let state = at(&step, &["Status", "State"]).as_str();
+        assert_eq!(
+            state,
+            Some(row.state),
+            "case {case:?}: expected {}, got {state:?} in {step}",
+            row.state
+        );
+        assert_eq!(
+            step["ActionOnFailure"].as_str(),
+            Some("CONTINUE"),
+            "case {case:?}: the step reports what it was submitted with, got {step}"
+        );
+        for member in ["CreationDateTime", "StartDateTime", "EndDateTime"] {
+            assert!(
+                at(&step, &["Status", "Timeline", member]).as_f64().is_some(),
+                "case {case:?}: a step that ran reports its {member}, got {step}"
+            );
+        }
+        if row.state == "COMPLETED" {
+            // A step whose command exited zero did not fail, so neither member a failure is
+            // reported in carries one: there is no reason for the state change and no
+            // failure to detail.
+            assert!(
+                at(&step, &["Status", "FailureDetails"]).is_null(),
+                "case {case:?}: a completed step reports no failure, got {step}"
+            );
+            assert!(
+                at(&step, &["Status", "StateChangeReason", "Message"]).is_null(),
+                "case {case:?}: a completed step reports no reason for its state, got {step}"
+            );
+        } else {
+            let message = at(&step, &["Status", "FailureDetails", "Message"])
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                at(&step, &["Status", "FailureDetails", "Reason"])
+                    .as_str()
+                    .is_some_and(|reason| !reason.is_empty())
+                    && !message.is_empty(),
+                "case {case:?}: a failed step says why it failed, got {step}"
+            );
+            if let Some(status) = row.status {
+                assert!(
+                    message.contains(&status.to_string()),
+                    "case {case:?}: the failure names the status {status} the command exited \
+                     with, got {message:?}"
+                );
+            }
+        }
+        // Reading a settled step changes nothing about it: the same status comes back.
+        let again = pairing.describe_step(&cluster_id, &step_id).await;
+        assert_eq!(
+            again["Status"], step["Status"],
+            "case {case:?}: a settled step reports the same status when read again, got \
+             {again}"
+        );
+    }
 }
