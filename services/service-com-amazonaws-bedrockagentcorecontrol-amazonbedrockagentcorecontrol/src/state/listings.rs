@@ -9,7 +9,7 @@
 //! disagree about a resource's status, name or instants.
 
 use super::*;
-use crate::ops::types::{BrowserSummary, ConfigurationBundleSummary};
+use crate::ops::types::{BrowserSummary, ConfigurationBundleSummary, MemorySummary};
 
 /// `ResourceType` values, which a listing filters on: the resources the
 /// SERVICE provides in every account, and the ones this account created. The
@@ -55,6 +55,27 @@ impl ConfigurationBundleRecord {
                 .last()
                 .and_then(|version| version.description.clone()),
             created_at: Some(timestamp(self.created_at)),
+        }
+    }
+}
+
+impl MemoryRecord {
+    /// This memory as `ListMemories` reports it: the members `MemorySummary`
+    /// declares, every one of them off the same record [`MemoryRecord::memory`]
+    /// renders, so the listing and a read report one memory alike — the status
+    /// included, which is the clock's and so is computed at `now` rather than
+    /// frozen into the record.
+    pub fn summary(&self, now: SystemTime) -> MemorySummary {
+        MemorySummary {
+            arn: Some(self.arn.clone()),
+            id: Some(self.id.clone()),
+            status: Some(self.status_at(now).to_string()),
+            created_at: timestamp(self.created_at),
+            updated_at: timestamp(self.updated_at),
+            // Set only on a memory another resource manages, which no operation
+            // of this service creates — exactly as the read of the memory
+            // reports it.
+            managed_by_resource_arn: None,
         }
     }
 }
