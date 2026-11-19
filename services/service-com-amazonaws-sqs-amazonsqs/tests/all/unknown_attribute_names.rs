@@ -16,12 +16,12 @@
 //! covers every way of being outside it, and why a client classifying a refusal by its
 //! message is not told that an attribute exists-but-is-read-only.
 //!
-//! The attribute only a create may supply is inside this rule for the queue that does not
-//! HAVE it and outside it for the queue that does: a standard queue carries no attribute
-//! saying it is FIFO, so a name refusal covers it there, while a FIFO queue carries and
-//! reports it, so a later call naming it is refused for the change it asks for —
-//! [`super::queue_type_immutability`] owns that half of the rule, and the rows here assert
-//! which of the two each kind of queue draws.
+//! The attribute only a create may supply is inside this rule for every call that is not the
+//! create: the set of attributes an operation takes is published with that operation, and
+//! `SetQueueAttributes` does not publish that one — so it is a name that call does not have
+//! whether or not the queue it addresses carries and reports it.
+//! [`super::queue_type_immutability`] asserts that half of the rule in full, over every value
+//! and both kinds of queue; the rows here drive it beside every other name.
 //!
 //! The table spans the class the rule generalises over rather than one example: every name
 //! the model's `QueueAttributeName` enum declares is driven against a standard queue and a
@@ -97,20 +97,10 @@ const REPORTED_ONLY_NAMES: &[&str] = &[
 /// The refusal class every unacceptable attribute NAME carries.
 const INVALID_ATTRIBUTE_NAME: &str = "InvalidAttributeName";
 
-/// The refusal class an attribute the queue the call addresses HAS but no later call may
-/// CHANGE carries instead — the sibling class, held apart here by the kind of queue and
-/// asserted in full by [`super::queue_type_immutability`].
-const INVALID_ATTRIBUTE_VALUE: &str = "InvalidAttributeValue";
-
 /// The one sentence Amazon SQS refuses an unacceptable attribute name with, spelled out here
 /// rather than imported.
 fn unknown_attribute_message(name: &str) -> String {
     format!("Unknown Attribute {name}.")
-}
-
-/// The one sentence it refuses a change to the queue's type with, spelled out the same way.
-fn not_modifiable_message(name: &str) -> String {
-    format!("Invalid value for the parameter {name}. Reason: Modifying queue type is not supported.")
 }
 
 /// The `message` member of a refusal, as awsJson renders it.
@@ -168,10 +158,9 @@ fn settable_on(name: &str, fifo: bool) -> bool {
     true
 }
 
-/// `SetQueueAttributes` answers every name the queue it addresses does not have with the one
-/// unknown-attribute sentence, on a standard queue and on a FIFO queue, and leaves the queue
-/// untouched — the create-only attribute being refused as a name on the queue that does not
-/// carry it and for the change it asks for on the queue that does.
+/// `SetQueueAttributes` answers every name it does not take for the queue it addresses with
+/// the one unknown-attribute sentence, on a standard queue and on a FIFO queue, and leaves
+/// the queue untouched — the create-only attribute among them, on either kind of queue.
 #[tokio::test]
 async fn set_queue_attributes_refuses_every_name_it_cannot_accept_as_an_unknown_attribute() {
     for fifo in [false, true] {
@@ -208,16 +197,11 @@ async fn set_queue_attributes_refuses_every_name_it_cannot_accept_as_an_unknown_
                 );
                 continue;
             }
-            // The create-only attribute is one a FIFO queue HAS, so there a call that may
-            // not change it is refused for the change its value asks for rather than as a
-            // name; a standard queue does not carry it at all, so there it is a name like
-            // any other the queue does not have. The two classes are held apart here and the
-            // rule behind the second is asserted in full by the sibling suite.
-            let expected = if *name == CREATE_ONLY_NAME && fifo {
-                (400, INVALID_ATTRIBUTE_VALUE, not_modifiable_message(name))
-            } else {
-                (400, INVALID_ATTRIBUTE_NAME, unknown_attribute_message(name))
-            };
+            // Every way of being outside the set this call takes draws the one sentence: a
+            // name declared nowhere, the selector standing for every attribute, one the
+            // service only reports, one belonging to the other kind of queue, and the one
+            // only a create may supply — the last on a FIFO queue too, which reports it.
+            let expected = (400, INVALID_ATTRIBUTE_NAME, unknown_attribute_message(name));
             assert_eq!(
                 (status, error_code(&parsed).as_str(), message_of(&parsed)),
                 expected,
