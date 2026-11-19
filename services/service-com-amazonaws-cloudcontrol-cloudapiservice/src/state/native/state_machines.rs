@@ -28,8 +28,9 @@
 //!   picks, the same way a template that declares none leaves the name to CloudFormation;
 //! * `Definition` and `DefinitionString`, the two forms the schema carries the Amazon States
 //!   Language definition in — `Definition` as the JSON object a template writes inline
-//!   (write-only, so a read reports the definition as `DefinitionString`), and a model
-//!   carrying both asks for the one it WROTE;
+//!   (one of this type's `writeOnlyProperties`, which
+//!   [`crate::state::write_only_properties`] holds, so a read reports the definition as
+//!   `DefinitionString`), and a model carrying both asks for the one it WROTE;
 //! * `RoleArn`, the IAM role the state machine runs as;
 //! * `StateMachineType`, create-only, which the owning service settles when the state
 //!   machine is created;

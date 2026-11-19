@@ -2164,6 +2164,19 @@ const WRITE_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
         "AWS::SSM::Parameter",
         &["AllowedPattern", "Description", "Policies", "Tier"],
     ),
+    // `AWS::StepFunctions::StateMachine`: the three forms a request STATES the Amazon States
+    // Language definition in beside `DefinitionString` — the definition as the JSON object a
+    // template writes inline, the S3 object holding one, and the placeholder values filled
+    // into it — none of which `states:DescribeStateMachine`, the call the type's read handler
+    // reads a state machine with, reports: it answers the definition as `DefinitionString`.
+    (
+        "AWS::StepFunctions::StateMachine",
+        &[
+            "Definition",
+            "DefinitionS3Location",
+            "DefinitionSubstitutions",
+        ],
+    ),
 ];
 
 /// The properties of `type_name` a patch may only `add`: the type's declared

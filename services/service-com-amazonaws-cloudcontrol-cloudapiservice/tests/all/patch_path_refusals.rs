@@ -19,6 +19,12 @@
 //! The rows differ along what the rules generalise over: the patch operation, the depth and
 //! form of the pointer, which of the document's operations breaks the rule, which property
 //! is named, and which resource type owns the resource.
+//!
+//! The write-only rule is held over TWO types, because the properties it bears on are each
+//! type's schema's own: `AWS::SSM::Parameter`, whose write-only properties are configuration
+//! a parameter carries, and `AWS::StepFunctions::StateMachine`, whose write-only `Definition`
+//! is the workflow itself — so a type's write-only properties are catalogued from its schema
+//! rather than the rule holding for one type.
 
 use serde_json::{json, Value};
 
@@ -38,6 +44,23 @@ const GROUP: &str = "AWS::Logs::LogGroup";
 
 /// A parameter type, the one whose schema declares write-only properties.
 const PARAMETER: &str = "AWS::SSM::Parameter";
+
+/// A state machine type, whose schema declares the definition a request SETS write-only:
+/// the workflow the owning service runs is reported under another property, so the model a
+/// patch is applied to carries nothing at that pointer.
+const STATE_MACHINE: &str = "AWS::StepFunctions::StateMachine";
+
+/// The write-only properties of that type, in the order its schema declares them.
+///
+/// Catalog source: the `writeOnlyProperties` of the `AWS::StepFunctions::StateMachine`
+/// resource provider schema — the three forms a request states the Amazon States Language
+/// definition in beside `DefinitionString`, none of which `states:DescribeStateMachine`
+/// reports.
+const STATE_MACHINE_WRITE_ONLY: [&str; 3] = [
+    "Definition",
+    "DefinitionS3Location",
+    "DefinitionSubstitutions",
+];
 
 /// One row of the absent-pointer table: what it is about, the type that owns the resource,
 /// the patch document, and the operation and path the refusal must name.
@@ -400,5 +423,234 @@ async fn a_write_only_property_is_refused_every_operation_but_add() {
         model.get("Value"),
         Some(&json!("v2")),
         "expected the patched value to be read back, got {model:?}"
+    );
+}
+
+/// One Amazon States Language definition, as the schema's `Definition` object carries it.
+fn definition(version: u64) -> Value {
+    json!({
+        "Comment": format!("v{version}"),
+        "StartAt": "P",
+        "States": { "P": { "Type": "Pass", "Result": { "version": version }, "End": true } },
+    })
+}
+
+/// What the OWNING service holds for the state machine `identifier`: the definition it runs
+/// and the revision it is at, which is where a refused patch has to leave them.
+async fn described(emulator: &Emulator, identifier: &str) -> (String, String) {
+    let read = emulator
+        .sfn_ok(
+            "DescribeStateMachine",
+            json!({ "stateMachineArn": identifier }),
+        )
+        .await;
+    (text(&read, "definition"), text(&read, "revisionId"))
+}
+
+/// One row of the state machine's write-only table: what it is about, the patch document,
+/// and the pointers the refusal must name.
+struct WriteOnly {
+    /// What this row is about.
+    case: &'static str,
+    /// The patch document the request carries.
+    patch: Value,
+    /// The pointers the refusal lists, in the order the schema declares the properties.
+    pointers: &'static str,
+}
+
+#[tokio::test]
+async fn a_write_only_definition_is_refused_every_operation_but_add() {
+    // The list the gate judges a document by is the schema's own, so the cases below hold
+    // the service to the resource type's schema rather than to a catalogue of its own.
+    let catalogued =
+        service_com_amazonaws_cloudcontrol_cloudapiservice::state::write_only_properties(
+            STATE_MACHINE,
+        );
+    assert_eq!(
+        catalogued, STATE_MACHINE_WRITE_ONLY,
+        "expected the schema's writeOnlyProperties {STATE_MACHINE_WRITE_ONLY:?}, got \
+         {catalogued:?}"
+    );
+
+    let emulator = Emulator::with_step_functions();
+    let role_arn = engine::emulator_arn("iam", "", "role/states-execution");
+    let created = definition(1);
+    let identifier = emulator
+        .provision(
+            STATE_MACHINE,
+            &json!({
+                "StateMachineName": "write-only-definition",
+                "RoleArn": role_arn,
+                "Definition": created,
+                "StateMachineType": "STANDARD",
+            }),
+        )
+        .await;
+    // What the owning service holds before any patch is sent: the definition the create
+    // carried and the revision it is at, neither of which a refused patch may move.
+    let before_native = described(&emulator, &identifier).await;
+    assert_eq!(
+        before_native.0,
+        created.to_string(),
+        "the created definition must be the one Step Functions holds, got {before_native:?}"
+    );
+
+    // The rows differ along the operation that names the property, the DEPTH of the pointer,
+    // which write-only property of the type is named, and how many of them one document
+    // names — which the diagnostic lists together, in the schema's order.
+    let rows = [
+        WriteOnly {
+            case: "replacing the write-only definition the model does not carry",
+            patch: json!([{ "op": "replace", "path": "/Definition", "value": definition(2) }]),
+            pointers: "/Definition",
+        },
+        WriteOnly {
+            case: "replacing a member INSIDE it, which is the same property",
+            patch: json!([{ "op": "replace", "path": "/Definition/StartAt", "value": "Q" }]),
+            pointers: "/Definition",
+        },
+        WriteOnly {
+            case: "removing it",
+            patch: json!([{ "op": "remove", "path": "/Definition" }]),
+            pointers: "/Definition",
+        },
+        WriteOnly {
+            case: "moving the reported definition into it",
+            patch: json!([
+                { "op": "move", "from": "/DefinitionString", "path": "/Definition" },
+            ]),
+            pointers: "/Definition",
+        },
+        WriteOnly {
+            case: "copying the reported definition into it",
+            patch: json!([
+                { "op": "copy", "from": "/DefinitionString", "path": "/Definition" },
+            ]),
+            pointers: "/Definition",
+        },
+        WriteOnly {
+            case: "replacing another write-only property of the same type",
+            patch: json!([
+                { "op": "replace", "path": "/DefinitionSubstitutions", "value": { "K": "v" } },
+            ]),
+            pointers: "/DefinitionSubstitutions",
+        },
+        WriteOnly {
+            case: "a document whose SECOND operation names a write-only property",
+            patch: json!([
+                { "op": "add", "path": "/Tags", "value": [{ "Key": "team", "Value": "ops" }] },
+                { "op": "remove", "path": "/DefinitionS3Location" },
+            ]),
+            pointers: "/DefinitionS3Location",
+        },
+        WriteOnly {
+            case: "naming two write-only properties at once",
+            patch: json!([
+                { "op": "remove", "path": "/DefinitionS3Location" },
+                { "op": "replace", "path": "/Definition", "value": definition(3) },
+            ]),
+            pointers: "/Definition, /DefinitionS3Location",
+        },
+    ];
+
+    for row in rows {
+        let before = emulator.properties(STATE_MACHINE, &identifier).await;
+        let (status, body) = emulator
+            .update(STATE_MACHINE, &identifier, &row.patch, None)
+            .await;
+        let case = row.case;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body:?}"
+        );
+        assert!(
+            code(&body).contains("ValidationException"),
+            "case {case:?}: expected ValidationException, got {:?}",
+            code(&body)
+        );
+        assert_eq!(
+            message(&body),
+            format!(
+                "Invalid patch update: writeOnlyProperties [{}] can only be updated using \
+                 'add' operation",
+                row.pointers
+            ),
+            "case {case:?}: unexpected wording, got {:?}",
+            message(&body)
+        );
+        let after = emulator.properties(STATE_MACHINE, &identifier).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused patch must change nothing, got {after:?}"
+        );
+        let after_native = described(&emulator, &identifier).await;
+        assert_eq!(
+            after_native, before_native,
+            "case {case:?}: the owning service must still report the definition and the \
+             revision it held, got {after_native:?}"
+        );
+    }
+
+    // `add` is the one operation that SETS a write-only property, and what it sets is what
+    // the owning service then runs — read back through its own API and through `GetResource`,
+    // which reports the definition under the property a read answers with.
+    let wanted = definition(4);
+    let settled = emulator
+        .update_and_settle(
+            STATE_MACHINE,
+            &identifier,
+            &json!([{ "op": "add", "path": "/Definition", "value": wanted }]),
+        )
+        .await;
+    assert_eq!(
+        text(&settled, "OperationStatus"),
+        STATUS_SUCCESS,
+        "an add of the write-only definition must succeed, got {settled:?}"
+    );
+    let added_native = described(&emulator, &identifier).await;
+    assert_eq!(
+        added_native.0,
+        wanted.to_string(),
+        "the added definition must be the one Step Functions then holds, got {added_native:?}"
+    );
+    let model = emulator.properties(STATE_MACHINE, &identifier).await;
+    assert_eq!(
+        model.get("DefinitionString"),
+        Some(&json!(wanted.to_string())),
+        "the model must report the added definition as DefinitionString, got {model:?}"
+    );
+    assert_eq!(
+        model.get("Definition"),
+        None,
+        "a write-only property is part of no model this service reports, got {model:?}"
+    );
+
+    // A property of the SAME type the schema does not declare write-only is replaced as
+    // usual, so the refusals above are about the schema's list rather than about the type or
+    // about patching a definition at all.
+    let replaced = definition(5);
+    let settled = emulator
+        .update_and_settle(
+            STATE_MACHINE,
+            &identifier,
+            &json!([{
+                "op": "replace",
+                "path": "/DefinitionString",
+                "value": replaced.to_string(),
+            }]),
+        )
+        .await;
+    assert_eq!(
+        text(&settled, "OperationStatus"),
+        STATUS_SUCCESS,
+        "replacing a property the schema does not declare write-only must succeed, got \
+         {settled:?}"
+    );
+    let replaced_native = described(&emulator, &identifier).await;
+    assert_eq!(
+        replaced_native.0,
+        replaced.to_string(),
+        "the replaced definition must be the one Step Functions then holds, got \
+         {replaced_native:?}"
     );
 }
