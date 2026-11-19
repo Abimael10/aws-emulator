@@ -21,7 +21,12 @@
 //!
 //! * `LAMBDA` — the `Content` names a function, invoked synchronously with the candidate
 //!   configuration; a function that answers an error has found the content non-compliant,
-//!   which is the verdict that refuses the call. The invocation goes through the one Lambda
+//!   which is the verdict that refuses the call. The refusal RELAYS that invocation's own
+//!   result — the `FunctionError` it signalled, the `LogResult` it carried and the response
+//!   payload, which for a run that raised is the error document the function's runtime wrote
+//!   (`super::extension_actions::Failure::invocation_result`) — because the verdict is the
+//!   function's, not this service's: a caller reads the error its own validator reported.
+//!   The invocation goes through the one Lambda
 //!   seam this crate has ([`super::extension_actions::invoke_function`]), over the
 //!   in-process callback, so the function invoked is the one the emulator's own Lambda
 //!   service holds and no socket leaves the machine. It is bounded by
@@ -141,6 +146,14 @@ const MAX_EVALUATION_PAIRS: usize = 50_000_000;
 /// with what a client needs to read; the `Message` member carries the head of it.
 const MAX_DETAIL_CHARS: usize = 1024;
 
+/// The longest RELAYED invocation result a refusal carries, in characters.
+///
+/// A relayed result is the invocation's own answer, so it is carried as that answer reads
+/// rather than summarised; this bounds only how much of it one `Message` carries, because
+/// what a function's error document holds grows with the handler's own traceback. Wider
+/// than [`MAX_DETAIL_CHARS`]: the whole of the document is the verdict a caller reads.
+const MAX_RELAYED_RESULT_CHARS: usize = 4096;
+
 /// The configuration version a profile's validators are run against: what each validator
 /// is handed, and what the refusal of a non-compliant one names.
 #[derive(Debug, Clone, Copy)]
@@ -212,9 +225,17 @@ async fn lambda_rejection(
         // RETURNED is not read — a validator reports a verdict, it does not rewrite the
         // configuration.
         Ok(Ok(_)) => None,
-        Ok(Err(failure)) if failure.refuses_the_call() => {
-            Some(rejection_message(candidate, LAMBDA, &lambda_detail(function, &failure)))
-        }
+        Ok(Err(failure)) if failure.refuses_the_call() => Some(match &failure.invocation_result {
+            // The function RAN and answered an error: that answer IS the verdict, so the
+            // refusal relays the invocation's own result rather than restating it in a
+            // sentence of this service's — a caller reads the error its own validator
+            // reported, down to the error document the function's runtime wrote.
+            Some(result) => relayed(result),
+            // The invocation failed without a run of the function's own answering
+            // anything, so there is no result to relay and the refusal is this service's
+            // own account of the validator that did not pass.
+            None => rejection_message(candidate, LAMBDA, &lambda_detail(function, &failure)),
+        }),
         // The invocation did not happen at all; see this module's own documentation.
         Ok(Err(_)) => None,
         // The invocation happened and did not answer in time, which is an invocation that
@@ -594,9 +615,23 @@ fn schema_violation_message(schema_document: &str, finding: &str, node: &str) ->
 /// `detail` as a refusal carries it: on one line, because the `Message` member carries one
 /// text, and no longer than [`MAX_DETAIL_CHARS`].
 fn summarised(detail: &str) -> String {
-    let flattened = detail.split_whitespace().collect::<Vec<&str>>().join(" ");
-    match flattened.char_indices().nth(MAX_DETAIL_CHARS) {
-        Some((end, _)) => format!("{}\u{2026}", &flattened[..end]),
-        None => flattened,
+    head(
+        &detail.split_whitespace().collect::<Vec<&str>>().join(" "),
+        MAX_DETAIL_CHARS,
+    )
+}
+
+/// `result` as a refusal RELAYING it carries it: exactly as the invocation answered it, so
+/// nothing of the document the function's runtime wrote is rewritten — bounded only in
+/// length, by [`MAX_RELAYED_RESULT_CHARS`].
+fn relayed(result: &str) -> String {
+    head(result, MAX_RELAYED_RESULT_CHARS)
+}
+
+/// `text`'s first `limit` characters, ending in an ellipsis when there were more.
+fn head(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}\u{2026}", &text[..end]),
+        None => text.to_string(),
     }
 }

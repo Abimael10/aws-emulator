@@ -75,6 +75,9 @@ service-com-amazonaws-ssm-amazonssm = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` file, so a new suite is picked up by
+# adding the file.
+automod = { workspace = true }
 # `tokio::time` drives the tests' wait past an action point's due instant.
 tokio = { workspace = true, features = ["time"] }
 # Percent-encoding for the `awsQuery` form body an IAM request travels in: the monitor

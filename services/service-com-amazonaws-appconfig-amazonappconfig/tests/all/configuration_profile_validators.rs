@@ -155,7 +155,10 @@ pub(crate) fn validator(validator_type: &str, content: &str) -> Value {
 }
 
 /// A hosted configuration profile carrying `validators`. Answers its minted id.
-async fn given_profile(
+///
+/// `pub(crate)` because every suite whose fixture is a profile with validators creates one
+/// this way.
+pub(crate) async fn given_profile(
     router: &MultiServiceRouter,
     application: &str,
     name: &str,
@@ -185,7 +188,9 @@ async fn given_profile(
 /// Asserted to be accepted: `CreateHostedConfigurationVersion` stores the bytes it is
 /// given, so a version a validator would reject is stored verbatim and only the calls that
 /// put it into service are gated.
-async fn given_version(
+///
+/// `pub(crate)` for the same reason [`given_profile`] is.
+pub(crate) async fn given_version(
     router: &MultiServiceRouter,
     application: &str,
     profile: &str,
@@ -218,7 +223,9 @@ async fn given_version(
 
 /// A deployment strategy with nothing to wait for, so one environment can take a second
 /// deployment without the first still being in flight. Answers its id.
-async fn given_strategy(router: &MultiServiceRouter, name: &str) -> String {
+///
+/// `pub(crate)` for the same reason [`given_profile`] is.
+pub(crate) async fn given_strategy(router: &MultiServiceRouter, name: &str) -> String {
     let created = json_call(
         router,
         "POST",
@@ -246,7 +253,9 @@ async fn given_strategy(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 /// `StartDeployment` of one configuration version.
-async fn start_deployment(
+///
+/// `pub(crate)` for the same reason [`given_profile`] is.
+pub(crate) async fn start_deployment(
     router: &MultiServiceRouter,
     application: &str,
     environment: &str,
@@ -268,7 +277,9 @@ async fn start_deployment(
 }
 
 /// The deployment numbers one environment's history holds.
-async fn deployment_numbers(
+///
+/// `pub(crate)` for the same reason [`given_profile`] is.
+pub(crate) async fn deployment_numbers(
     router: &MultiServiceRouter,
     application: &str,
     environment: &str,
@@ -290,7 +301,9 @@ async fn deployment_numbers(
 }
 
 /// `ValidateConfiguration` of one configuration version.
-async fn validate_configuration(
+///
+/// `pub(crate)` for the same reason [`given_profile`] is.
+pub(crate) async fn validate_configuration(
     router: &MultiServiceRouter,
     application: &str,
     profile: &str,

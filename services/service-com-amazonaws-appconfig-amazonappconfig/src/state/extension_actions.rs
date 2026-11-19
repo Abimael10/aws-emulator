@@ -514,6 +514,15 @@ pub struct Failure {
     pub detail: String,
     /// The Lambda request id of the invocation, when its answer carried one.
     pub request_id: Option<String>,
+    /// What the INVOCATION ITSELF answered, as Lambda reports the result of a run that
+    /// failed ([`invocation_result`]).
+    ///
+    /// `Some` only for a function that RAN and reported an error, because that is the only
+    /// failure a run produced a result for: a call that could not be made at all answers no
+    /// payload. It is what a refusal relaying the FUNCTION's own verdict carries
+    /// ([`super::validators`]), as against the sentence this service writes about an
+    /// extension's action that failed ([`ActionTarget::refusal_message`]).
+    pub invocation_result: Option<String>,
 }
 
 /// The wire error code an emulated service answers for an operation nobody has
@@ -550,6 +559,8 @@ impl Failure {
                 None => code.to_string(),
             },
             request_id,
+            // Nothing ran for this failure, so there is no invocation result to relay.
+            invocation_result: None,
         }
     }
 
@@ -615,6 +626,7 @@ pub async fn invoke(
                 target.uri
             ),
             request_id: None,
+            invocation_result: None,
         });
     };
     let region = ::service_common::arn::region_of(&target.uri, kind.vendor())
@@ -628,6 +640,7 @@ pub async fn invoke(
                     code: "InvalidActionUri".to_string(),
                     detail: format!("the action URI {} names no queue", target.uri),
                     request_id: None,
+                    invocation_result: None,
                 });
             };
             answered_nothing(
@@ -691,21 +704,28 @@ pub(crate) async fn invoke_function(
         Err(error) => return Err(failure_of(&error)),
     };
     let request_id = ::aws_types::request_id::RequestId::request_id(&output).map(str::to_string);
+    let payload = output
+        .payload()
+        .map(|payload| payload.as_ref().to_vec())
+        .unwrap_or_default();
     // "FunctionError: if present, indicates that an error occurred during function
     // execution. Details about the error are included in the response payload" — the
     // value is the error's handling (`Handled`, `Unhandled`), which is what AppConfig
-    // reports as the reason the extension's action failed.
+    // reports as the reason the extension's action failed, and the payload holds the detail
+    // the run itself reported, which is what a refusal relaying the function's own verdict
+    // carries.
     if let Some(function_error) = output.function_error() {
         return Err(Failure {
             code: function_error.to_string(),
             detail: format!("{function_error} error"),
             request_id,
+            invocation_result: Some(invocation_result(
+                function_error,
+                output.log_result(),
+                &payload,
+            )),
         });
     }
-    let payload = output
-        .payload()
-        .map(|payload| payload.as_ref().to_vec())
-        .unwrap_or_default();
     if payload.is_empty() {
         return Ok(None);
     }
@@ -713,6 +733,27 @@ pub(crate) async fn invoke_function(
     // every directive and every replacement this service reads is a member of a JSON
     // object.
     Ok(::serde_json::from_slice::<Value>(&payload).ok())
+}
+
+/// How a member the answer to a synchronous invocation does not carry reads where that
+/// answer is relayed: the JSON rendering of an absent value, which is what an `Invoke`
+/// answer that was asked for no log tail carries in place of a `LogResult`.
+const ABSENT_MEMBER: &str = "null";
+
+/// The result of one synchronous invocation, as Lambda's own answer reports a run that
+/// reported an error: the `FunctionError` it signalled, the `LogResult` it carried and the
+/// response payload — for a run that raised, the error document the function's runtime
+/// wrote.
+///
+/// This is the relay of the invocation's OWN answer, so each of the three is rendered as
+/// that answer carries it and nothing is summarised into a sentence: a caller reading it
+/// sees the error its own function reported.
+fn invocation_result(function_error: &str, log_result: Option<&str>, payload: &[u8]) -> String {
+    format!(
+        "Function Error: {function_error}, Log Result: {}, Payload: {}",
+        log_result.unwrap_or(ABSENT_MEMBER),
+        String::from_utf8_lossy(payload)
+    )
 }
 
 /// What an invocation of a target kind that cannot answer amounts to: the send either
@@ -1463,6 +1504,11 @@ mod tests {
                     code: "Unhandled".to_string(),
                     detail: "Unhandled error".to_string(),
                     request_id: Some("a-request-id".to_string()),
+                    invocation_result: Some(invocation_result(
+                        "Unhandled",
+                        None,
+                        br#"{"errorMessage": "no"}"#,
+                    )),
                 },
                 "Error invoking extension release-gate: Unhandled error, Lambda Request ID: \
                  a-request-id",
@@ -1473,6 +1519,7 @@ mod tests {
                     code: "ResourceNotFoundException".to_string(),
                     detail: "ResourceNotFoundException: Function not found".to_string(),
                     request_id: None,
+                    invocation_result: None,
                 },
                 "Error invoking extension release-gate: ResourceNotFoundException: Function \
                  not found",
