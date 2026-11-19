@@ -21,10 +21,21 @@
 //!    where the page stopped, `StartingBlockIndex` starts the listing at an index (and is
 //!    ignored when a `NextToken` is given), and a token this service did not issue is
 //!    refused.
-//! 4. `FirstSnapshotId` is optional: a comparison against no snapshot has nothing to leave
-//!    out, so every block the named snapshot holds is reported, each with no
-//!    `FirstBlockToken` — "this value is absent if the first snapshot does not have the
-//!    changed block that is on the second snapshot" (`ChangedBlock`).
+//! 4. A COMPARISON IS OF TWO SNAPSHOTS: "The FirstSnapshotID parameter must be specified
+//!    with a SecondSnapshotId parameter; otherwise, an error occurs" (`FirstSnapshotId`), so
+//!    a request that names no first snapshot is refused with the modelled
+//!    `ValidationException` carrying the `INVALID_SNAPSHOT_ID` reason and a sentence naming
+//!    that member's role. A first snapshot that holds no block is a BASELINE holding
+//!    nothing, which is a comparison: every block the second snapshot holds is reported,
+//!    each with no `FirstBlockToken` — "this value is absent if the first snapshot does not
+//!    have the changed block that is on the second snapshot" (`ChangedBlock`).
+//! 5. THE SNAPSHOT THE URI NAMES MUST HOLD CONTENT: one that holds no block at all has
+//!    nothing for the comparison to report, so it is refused with the same
+//!    `INVALID_SNAPSHOT_ID` validation, worded with the snapshot's own id.
+//! 6. THE TOKEN MEMBERS BELONG TO THE TOKENS: a page that reports changed blocks hands out
+//!    block tokens and reports the instant they expire together with the geometry of the
+//!    blocks it reported; a page that reports no changed block hands out no token and omits
+//!    `ExpiryTime`, `VolumeSize` and `BlockSize` altogether.
 //!
 //! Each table row is a distinct input along what the rules generalise over — how the two
 //! snapshots are related (parent/child, two generations, two siblings, a snapshot against
@@ -50,6 +61,20 @@ const NOT_FOUND_STATUS: u16 = 404;
 /// the store is held under, for the not-found half of rule 2.
 const UNKNOWN_SNAPSHOT_ID: &str = "snap-0123456789abcdef0";
 
+/// The error type the modelled `ValidationException` is dispatched on, as the
+/// `x-amzn-errortype` header carries it.
+const VALIDATION_ERROR_TYPE: &str = "ValidationException";
+
+/// The fixed sentence the refusal of a request that names no first snapshot carries: it
+/// names that member's role in the comparison and no id (rule 4).
+const MISSING_FIRST_SNAPSHOT_MESSAGE: &str = "First snapshot should not be empty or null";
+
+/// The sentence the refusal of an empty snapshot the URI NAMES carries: fixed text around
+/// the one variable part, the snapshot id the request spelled (rule 5).
+fn empty_snapshot_message(snapshot_id: &str) -> String {
+    format!("Snapshot ({snapshot_id}) is empty")
+}
+
 /// `ListChangedBlocks` of `second_snapshot_id` with `query` appended to the URI.
 async fn list_changed_blocks(
     router: &MultiServiceRouter,
@@ -68,18 +93,13 @@ async fn list_changed_blocks(
 async fn compared(
     router: &MultiServiceRouter,
     case: &str,
-    first: Option<&str>,
+    first: &str,
     second: &str,
     extra: &str,
 ) -> Reply {
-    let mut query = match first {
-        Some(first) => format!("firstSnapshotId={first}"),
-        None => String::new(),
-    };
+    let mut query = format!("firstSnapshotId={first}");
     if !extra.is_empty() {
-        if !query.is_empty() {
-            query.push('&');
-        }
+        query.push('&');
         query.push_str(extra);
     }
     let reply = list_changed_blocks(router, second, &query).await;
@@ -129,6 +149,46 @@ fn reported(reply: &Reply) -> Vec<Changed> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// RULE 6, asserted on one answer: `ExpiryTime`, `VolumeSize` and `BlockSize` are reported
+/// exactly where the page handed out block tokens, and `ChangedBlocks` is always reported.
+///
+/// `volume_size` is the size the snapshots under comparison were declared with, which is
+/// what a page that reports blocks must report.
+fn assert_token_members(case: &str, reply: &Reply, hands_out_tokens: bool, volume_size: i64) {
+    let answer = reply.json();
+    assert!(
+        answer.get("ChangedBlocks").is_some(),
+        "case {case:?}: every answer must report ChangedBlocks, got {answer}"
+    );
+    if hands_out_tokens {
+        assert_eq!(
+            answer.get("BlockSize").and_then(serde_json::Value::as_i64),
+            Some(i64::from(BLOCK_SIZE)),
+            "case {case:?}: a page that handed out block tokens must report the block size, \
+             got {answer}"
+        );
+        assert_eq!(
+            answer.get("VolumeSize").and_then(serde_json::Value::as_i64),
+            Some(volume_size),
+            "case {case:?}: a page that handed out block tokens must report the volume size, \
+             got {answer}"
+        );
+        assert!(
+            answer.get("ExpiryTime").is_some(),
+            "case {case:?}: a page that handed out block tokens must report when they expire, \
+             got {answer}"
+        );
+    } else {
+        for member in ["ExpiryTime", "VolumeSize", "BlockSize"] {
+            assert!(
+                answer.get(member).is_none(),
+                "case {case:?}: a page that handed out no block token must omit {member}, got \
+                 {answer}"
+            );
+        }
+    }
 }
 
 /// Start a snapshot (of `parent`, where the row has one), write `blocks` into it as
@@ -199,16 +259,22 @@ pub(crate) async fn sealed_snapshot(
 /// One row of the comparison table: the case, which snapshot of the lineage is the first
 /// side, which is the second, and the `(block index, the first side holds it, the second
 /// side holds it)` rows the comparison must report.
-type ComparisonRow = (&'static str, Option<Side>, Side, Vec<(i32, bool, bool)>);
+type ComparisonRow = (&'static str, Side, Side, Vec<(i32, bool, bool)>);
 
 /// One row of the inheritance table: the case, the declared volume size, and the blocks the
 /// parent holds as `(block index, byte seed)` pairs.
 type InheritanceRow = (&'static str, i64, Vec<(i32, u8)>);
 
+/// One row of the token-member table: the case, the first side, the second side, the query
+/// the request carries, the volume size both sides were declared with, and the changed
+/// indexes the page must report.
+type TokenMemberRow<'a> = (&'a str, &'a str, &'a str, &'a str, i64, Vec<i32>);
+
 /// Which snapshot of the lineage a row compares, so a row can name one the row before it
 /// built.
 #[derive(Debug, Clone, Copy)]
 enum Side {
+    Base,
     Parent,
     Child,
     Grandchild,
@@ -217,28 +283,31 @@ enum Side {
 
 /// RULE 1 and RULE 4: the reported blocks are exactly the indexes the two snapshots do not
 /// hold the same bytes at, ascending, each side's token present only where that side holds
-/// the block — and a comparison against NO first snapshot reports every block the named
-/// snapshot holds.
+/// the block — and a comparison against a first snapshot that holds NOTHING reports every
+/// block the named snapshot holds.
 ///
-/// One lineage is built once — a parent, a child of it, a grandchild of the child and a
-/// second child (sibling) of the parent — and the rows compare different pairs of it: a
-/// child that only added a block, a child that overwrote one with other bytes, a child that
-/// changed nothing, two generations apart, two siblings, a snapshot against itself, and the
-/// same pair with the two sides swapped.
+/// One lineage is built once — an empty base, a parent taken from it, a child of the parent,
+/// a grandchild of the child and a second child (sibling) of the parent — and the rows
+/// compare different pairs of it: a child that only added a block, a child that overwrote
+/// one with other bytes, a child that changed nothing, two generations apart, two siblings,
+/// a snapshot against itself, the same pair with the two sides swapped, and a snapshot
+/// against the empty base.
 #[tokio::test]
 async fn the_reported_blocks_are_the_indexes_whose_content_differs() {
     let router = router();
     let case = "the lineage under comparison";
 
-    // The parent holds blocks 0 and 1. The child inherits both, overwrites 1 with other
-    // bytes and adds 2. The grandchild inherits all three and adds 3. The sibling inherits
-    // the parent's two and adds 4.
-    let parent = sealed_snapshot(&router, case, 1, None, &[(0, 10), (1, 11)]).await;
+    // The base holds nothing. The parent, taken from it, holds blocks 0 and 1. The child
+    // inherits both, overwrites 1 with other bytes and adds 2. The grandchild inherits all
+    // three and adds 3. The sibling inherits the parent's two and adds 4.
+    let base = sealed_snapshot(&router, case, 1, None, &[]).await;
+    let parent = sealed_snapshot(&router, case, 1, Some(&base), &[(0, 10), (1, 11)]).await;
     let child = sealed_snapshot(&router, case, 1, Some(&parent), &[(1, 21), (2, 22)]).await;
     let grandchild = sealed_snapshot(&router, case, 1, Some(&child), &[(3, 33)]).await;
     let sibling = sealed_snapshot(&router, case, 1, Some(&parent), &[(4, 44)]).await;
 
     let id = |side: Side| match side {
+        Side::Base => base.clone(),
         Side::Parent => parent.clone(),
         Side::Child => child.clone(),
         Side::Grandchild => grandchild.clone(),
@@ -250,58 +319,53 @@ async fn the_reported_blocks_are_the_indexes_whose_content_differs() {
     let rows: Vec<ComparisonRow> = vec![
         (
             "a child that overwrote one block and added another",
-            Some(Side::Parent),
+            Side::Parent,
             Side::Child,
             vec![(1, true, true), (2, false, true)],
         ),
         (
             "the same pair with the two sides swapped",
-            Some(Side::Child),
+            Side::Child,
             Side::Parent,
             vec![(1, true, true), (2, true, false)],
         ),
         (
             "two generations apart",
-            Some(Side::Parent),
+            Side::Parent,
             Side::Grandchild,
             vec![(1, true, true), (2, false, true), (3, false, true)],
         ),
         (
             "a child that changed nothing its parent did not hold",
-            Some(Side::Child),
+            Side::Child,
             Side::Grandchild,
             vec![(3, false, true)],
         ),
         (
             "two siblings of one parent",
-            Some(Side::Sibling),
+            Side::Sibling,
             Side::Child,
             vec![(1, true, true), (2, false, true), (4, true, false)],
         ),
+        ("a snapshot against itself", Side::Child, Side::Child, Vec::new()),
         (
-            "a snapshot against itself",
-            Some(Side::Child),
-            Side::Child,
-            Vec::new(),
-        ),
-        (
-            "no first snapshot at all: every block the named snapshot holds",
-            None,
+            "an empty baseline: every block the named snapshot holds",
+            Side::Base,
             Side::Child,
             vec![(0, false, true), (1, false, true), (2, false, true)],
         ),
         (
-            "no first snapshot and a snapshot holding one block",
-            None,
+            "an empty baseline and a snapshot holding another block",
+            Side::Base,
             Side::Sibling,
             vec![(0, false, true), (1, false, true), (4, false, true)],
         ),
     ];
 
     for (case, first, second, expected) in rows {
-        let first_id = first.map(id);
+        let first_id = id(first);
         let second_id = id(second);
-        let reply = compared(&router, case, first_id.as_deref(), &second_id, "").await;
+        let reply = compared(&router, case, &first_id, &second_id, "").await;
         let blocks = reported(&reply);
 
         let indexes: Vec<i32> = blocks.iter().map(|block| block.block_index).collect();
@@ -327,7 +391,7 @@ async fn the_reported_blocks_are_the_indexes_whose_content_differs() {
             );
             // The two sides are distinct snapshots, so one index never reports one token
             // twice: each side hands out its own.
-            if *first_holds && *second_holds && first_id.as_deref() != Some(second_id.as_str()) {
+            if *first_holds && *second_holds && first_id != second_id {
                 assert_ne!(
                     block.first_block_token, block.second_block_token,
                     "case {case:?}: block {index} must report each side's own token, got \
@@ -336,22 +400,10 @@ async fn the_reported_blocks_are_the_indexes_whose_content_differs() {
             }
         }
 
-        // The members read off the snapshot the request named, every time.
+        // The members that describe the block tokens a page handed out are reported only
+        // where the page handed any out (rule 6).
         let answer = reply.json();
-        assert_eq!(
-            answer.get("BlockSize").and_then(serde_json::Value::as_i64),
-            Some(i64::from(BLOCK_SIZE)),
-            "case {case:?}: the answer must report the snapshot's block size, got {answer}"
-        );
-        assert_eq!(
-            answer.get("VolumeSize").and_then(serde_json::Value::as_i64),
-            Some(1),
-            "case {case:?}: the answer must report the snapshot's volume size, got {answer}"
-        );
-        assert!(
-            answer.get("ExpiryTime").is_some(),
-            "case {case:?}: the answer must report when the block tokens expire, got {answer}"
-        );
+        assert_token_members(case, &reply, !blocks.is_empty(), 1);
         assert!(
             answer.get("NextToken").is_none(),
             "case {case:?}: a page that reported every changed block must carry no NextToken, \
@@ -370,9 +422,11 @@ async fn the_reported_blocks_are_the_indexes_whose_content_differs() {
 async fn a_snapshot_that_inherited_everything_reports_no_changed_block() {
     let router = router();
 
-    // (case, volume size, the parent's blocks).
+    // (case, volume size, the parent's blocks). Every parent holds at least one block, and
+    // the empty BASE each lineage starts from is the baseline the second half compares
+    // against: a snapshot the URI names that holds no block is refused (rule 5, covered by
+    // `a_comparison_needs_a_first_snapshot_and_a_second_that_holds_content`).
     let rows: Vec<InheritanceRow> = vec![
-        ("an empty parent", 1, Vec::new()),
         ("one block at index 0", 1, vec![(0, 1)]),
         (
             "three blocks spread across a larger volume",
@@ -383,10 +437,11 @@ async fn a_snapshot_that_inherited_everything_reports_no_changed_block() {
     ];
 
     for (case, volume_size, blocks) in rows {
-        let parent = sealed_snapshot(&router, case, volume_size, None, &blocks).await;
+        let base = sealed_snapshot(&router, case, volume_size, None, &[]).await;
+        let parent = sealed_snapshot(&router, case, volume_size, Some(&base), &blocks).await;
         let child = sealed_snapshot(&router, case, volume_size, Some(&parent), &[]).await;
 
-        let reply = compared(&router, case, Some(&parent), &child, "").await;
+        let reply = compared(&router, case, &parent, &child, "").await;
         assert_eq!(
             reported(&reply),
             Vec::new(),
@@ -395,9 +450,9 @@ async fn a_snapshot_that_inherited_everything_reports_no_changed_block() {
             reply.json()
         );
 
-        // … while the same child compared against NO first snapshot reports every block it
+        // … while the same child compared against the EMPTY base reports every block it
         // inherited (rule 4), which is what tells "nothing changed" from "nothing is there".
-        let listed = compared(&router, case, None, &child, "maxResults=10000").await;
+        let listed = compared(&router, case, &base, &child, "maxResults=10000").await;
         let indexes: Vec<i32> = reported(&listed)
             .iter()
             .map(|block| block.block_index)
@@ -406,7 +461,7 @@ async fn a_snapshot_that_inherited_everything_reports_no_changed_block() {
         expected.sort_unstable();
         assert_eq!(
             indexes, expected,
-            "case {case:?}: compared against no snapshot, every inherited block must be \
+            "case {case:?}: compared against the empty base, every inherited block must be \
              reported, got {}",
             listed.json()
         );
@@ -587,7 +642,7 @@ async fn paging_walks_the_changed_blocks_in_index_order() {
             if let Some(token) = &token {
                 query.push_str(&format!("&pageToken={token}"));
             }
-            let reply = compared(&router, case, Some(&empty_parent), &filled_child, &query).await;
+            let reply = compared(&router, case, &empty_parent, &filled_child, &query).await;
             let page = reported(&reply);
             assert!(
                 page.len() <= usize::try_from(page_size).expect("a page size that fits a usize"),
@@ -651,7 +706,7 @@ async fn paging_walks_the_changed_blocks_in_index_order() {
         let reply = compared(
             &router,
             case,
-            Some(&parent),
+            &parent,
             &child,
             &format!("startingBlockIndex={starting_index}"),
         )
@@ -704,5 +759,220 @@ async fn paging_walks_the_changed_blocks_in_index_order() {
             "case {case:?}: expected the page-token refusal, got {}",
             reply.json()
         );
+    }
+}
+
+/// RULES 4 and 5: a comparison names TWO snapshots and reports the content of the one the
+/// URI names, so a request that names no first snapshot, and one whose second snapshot holds
+/// no block, are both refused with the `INVALID_SNAPSHOT_ID` validation — never answered as
+/// a comparison that found nothing.
+///
+/// The rows differ along which requirement the request fails and how (the member absent,
+/// against a second side holding blocks and against one holding none; a snapshot that was
+/// started from no parent and written to never, and one taken from such a parent so it
+/// inherited nothing), along the declared volume size and along what the other side holds —
+/// so no row is the specification. The two refusals are told apart by their message: the
+/// missing first side by that member's role, the snapshot the URI names by its id.
+#[tokio::test]
+async fn a_comparison_needs_a_first_snapshot_and_a_second_that_holds_content() {
+    let router = router();
+    let case = "the lineages under comparison";
+
+    // A snapshot nothing was ever written into, a child of it that wrote nothing either (so
+    // it inherited nothing and holds nothing), and a child of it that did write.
+    let empty = sealed_snapshot(&router, case, 1, None, &[]).await;
+    let empty_child = sealed_snapshot(&router, case, 1, Some(&empty), &[]).await;
+    let filled_child = sealed_snapshot(&router, case, 1, Some(&empty), &[(0, 9), (3, 10)]).await;
+    // The same shape over a larger volume, with the written blocks at high indexes.
+    let bigger_empty = sealed_snapshot(&router, case, 4, None, &[]).await;
+    let bigger_filled_child =
+        sealed_snapshot(&router, case, 4, Some(&bigger_empty), &[(2048, 11), (8191, 12)]).await;
+
+    // (case, the `firstSnapshotId` the request carries, the second side, the message the
+    // refusal must carry).
+    let rows: Vec<(&str, Option<&str>, &str, String)> = vec![
+        (
+            "no first snapshot is named at all",
+            None,
+            filled_child.as_str(),
+            MISSING_FIRST_SNAPSHOT_MESSAGE.to_string(),
+        ),
+        (
+            "no first snapshot is named and the second holds nothing either",
+            None,
+            empty.as_str(),
+            MISSING_FIRST_SNAPSHOT_MESSAGE.to_string(),
+        ),
+        (
+            "no first snapshot is named and the second is of a larger volume",
+            None,
+            bigger_filled_child.as_str(),
+            MISSING_FIRST_SNAPSHOT_MESSAGE.to_string(),
+        ),
+        (
+            "the snapshot the URI names holds no block",
+            Some(filled_child.as_str()),
+            empty.as_str(),
+            empty_snapshot_message(&empty),
+        ),
+        (
+            "the snapshot the URI names inherited nothing from an empty parent",
+            Some(empty.as_str()),
+            empty_child.as_str(),
+            empty_snapshot_message(&empty_child),
+        ),
+        (
+            "the empty snapshot the URI names is of a larger volume",
+            Some(bigger_filled_child.as_str()),
+            bigger_empty.as_str(),
+            empty_snapshot_message(&bigger_empty),
+        ),
+    ];
+
+    for (case, first, second, message) in rows {
+        let query = match first {
+            Some(first) => format!("firstSnapshotId={first}"),
+            None => String::new(),
+        };
+        let reply = list_changed_blocks(&router, second, &query).await;
+        assert_eq!(
+            reply.status,
+            VALIDATION_STATUS,
+            "case {case:?}: expected HTTP {VALIDATION_STATUS}, got {} with body {}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+        assert!(
+            reply.header("x-amzn-errortype").contains(VALIDATION_ERROR_TYPE),
+            "case {case:?}: expected the x-amzn-errortype header to name \
+             {VALIDATION_ERROR_TYPE}, got {:?}",
+            reply.header("x-amzn-errortype")
+        );
+        assert_eq!(
+            member(&reply, "Reason"),
+            "INVALID_SNAPSHOT_ID",
+            "case {case:?}: expected the INVALID_SNAPSHOT_ID reason, got {}",
+            reply.json()
+        );
+        assert_eq!(
+            member(&reply, "Message"),
+            message,
+            "case {case:?}: expected the refusal wording for this request, got {}",
+            reply.json()
+        );
+        assert!(
+            reply.json().get("ChangedBlocks").is_none(),
+            "case {case:?}: a refused comparison must report no changed blocks, got {}",
+            reply.json()
+        );
+        // The fixed missing-first-snapshot sentence names the member's ROLE, so that refusal
+        // carries no snapshot id at all.
+        if message.as_str() == MISSING_FIRST_SNAPSHOT_MESSAGE {
+            assert!(
+                !member(&reply, "Message").contains("snap-"),
+                "case {case:?}: the missing-first-snapshot refusal must name no snapshot id, \
+                 got {}",
+                reply.json()
+            );
+        }
+    }
+}
+
+/// RULE 6: the token members belong to the tokens — a page that reports no changed block
+/// hands out no block token, so it omits `ExpiryTime`, `VolumeSize` and `BlockSize`, while a
+/// page that reports changed blocks carries all three.
+///
+/// The rows differ along WHY the page reports nothing (a snapshot compared against itself, a
+/// child that wrote nothing of its own, a listing starting past every changed index), along
+/// the declared volume size and the indexes involved, and include pages that DO report
+/// blocks — so the rule is asserted in both directions rather than on one shape of answer.
+#[tokio::test]
+async fn a_page_with_no_changed_block_omits_the_token_members() {
+    let router = router();
+    let case = "the compared lineage";
+
+    // One lineage over a 1 GiB volume: the parent holds two blocks, the child inherits both,
+    // overwrites one and adds one (so indexes 5 and 9 differ), and the grandchild writes
+    // nothing of its own.
+    let parent = sealed_snapshot(&router, case, 1, None, &[(0, 1), (5, 2)]).await;
+    let child = sealed_snapshot(&router, case, 1, Some(&parent), &[(5, 3), (9, 4)]).await;
+    let grandchild = sealed_snapshot(&router, case, 1, Some(&child), &[]).await;
+    // A second lineage over a 4 GiB volume, with its one changed block at a high index.
+    let wide_parent = sealed_snapshot(&router, case, 4, None, &[(2048, 5)]).await;
+    let wide_child = sealed_snapshot(&router, case, 4, Some(&wide_parent), &[(6000, 6)]).await;
+
+    // (case, the first side, the second side, the query, the volume size, the indexes the
+    // page must report).
+    let rows: Vec<TokenMemberRow<'_>> = vec![
+        (
+            "a snapshot compared against itself",
+            child.as_str(),
+            child.as_str(),
+            "",
+            1,
+            Vec::new(),
+        ),
+        (
+            "a child that wrote nothing of its own",
+            child.as_str(),
+            grandchild.as_str(),
+            "",
+            1,
+            Vec::new(),
+        ),
+        (
+            "a listing starting past every changed index",
+            parent.as_str(),
+            child.as_str(),
+            "startingBlockIndex=10",
+            1,
+            Vec::new(),
+        ),
+        (
+            "a listing starting past the one changed index of a larger volume",
+            wide_parent.as_str(),
+            wide_child.as_str(),
+            "startingBlockIndex=6001",
+            4,
+            Vec::new(),
+        ),
+        (
+            "a page that reports every changed block",
+            parent.as_str(),
+            child.as_str(),
+            "",
+            1,
+            vec![5, 9],
+        ),
+        (
+            "a page that reports the last changed block",
+            parent.as_str(),
+            child.as_str(),
+            "startingBlockIndex=9",
+            1,
+            vec![9],
+        ),
+        (
+            "a page of the larger volume that reports its changed block",
+            wide_parent.as_str(),
+            wide_child.as_str(),
+            "startingBlockIndex=2048",
+            4,
+            vec![6000],
+        ),
+    ];
+
+    for (case, first, second, query, volume_size, expected) in rows {
+        let reply = compared(&router, case, first, second, query).await;
+        let indexes: Vec<i32> = reported(&reply)
+            .iter()
+            .map(|block| block.block_index)
+            .collect();
+        assert_eq!(
+            indexes, expected,
+            "case {case:?}: expected the changed indexes {expected:?}, got {}",
+            reply.json()
+        );
+        assert_token_members(case, &reply, !expected.is_empty(), volume_size);
     }
 }

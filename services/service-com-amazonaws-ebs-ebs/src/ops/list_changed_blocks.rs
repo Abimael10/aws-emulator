@@ -104,9 +104,9 @@ use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use crate::state::{
-    decode_page_token, encode_page_token, is_well_formed_snapshot_id,
+    decode_page_token, empty_snapshot_message, encode_page_token, is_well_formed_snapshot_id,
     malformed_snapshot_id_message, snapshot_not_found_message, unrelated_snapshots_message,
-    Snapshot,
+    Snapshot, MISSING_FIRST_SNAPSHOT_MESSAGE,
 };
 
 /// The page size used when the request names no `MaxResults`.
@@ -218,29 +218,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // records: a snapshot still being written has no final set of blocks to compare.
         let second = resolve(&store, "secondSnapshotId", &input.second_snapshot_id)?;
 
-        // `FirstSnapshotId` is optional on the wire ("The FirstSnapshotID parameter must
-        // be specified with a SecondSnapshotId parameter", which the required
-        // `@httpLabel` second id already guarantees), and a comparison against NO
-        // snapshot has nothing to leave out: every block the second snapshot holds
-        // differs from a lineage that holds none, so each is reported with no
-        // `FirstBlockToken` — "this value is absent if the first snapshot does not have
-        // the changed block that is on the second snapshot" (`ChangedBlock`).
-        let first = match input.first_snapshot_id.as_deref() {
-            Some(first_snapshot_id) => Some(resolve(&store, "firstSnapshotId", first_snapshot_id)?),
-            None => None,
+        // "The FirstSnapshotID parameter must be specified with a SecondSnapshotId
+        // parameter; otherwise, an error occurs" (`FirstSnapshotId`): a comparison is OF
+        // TWO snapshots, so a request that names no first side names nothing to compare
+        // against. The model leaves the member optional on the wire — the service is what
+        // requires it — so the refusal is this operation's own, naming the member's ROLE in
+        // the comparison rather than echoing an id it was not given. A value that IS carried
+        // but satisfies neither the member's `@length` nor its `@pattern` never reaches
+        // here: the request boundary refuses it against the model's own constraints.
+        let Some(first_snapshot_id) = input.first_snapshot_id.as_deref() else {
+            return Err(validation(
+                "INVALID_SNAPSHOT_ID",
+                MISSING_FIRST_SNAPSHOT_MESSAGE.to_string(),
+            ));
         };
+        let first = resolve(&store, "firstSnapshotId", first_snapshot_id)?;
+
+        // A comparison is of the CONTENT of the snapshot the URI names, so one that holds
+        // no block at all gives it nothing to report: the comparison is refused as a bad
+        // snapshot id (`INVALID_SNAPSHOT_ID`) naming that snapshot, rather than answered
+        // as a diff that found nothing — which would say the two snapshots agree
+        // everywhere. A first side that holds no block is a BASELINE holding nothing,
+        // which has a diff: every block the second snapshot holds.
+        if second.holds_no_block() {
+            return Err(validation(
+                "INVALID_SNAPSHOT_ID",
+                empty_snapshot_message(&input.second_snapshot_id),
+            ));
+        }
 
         // "Returns information about the blocks that are different between two Amazon
         // Elastic Block Store snapshots OF THE SAME VOLUME/SNAPSHOT LINEAGE": two
         // snapshots that share no ancestor cannot be compared at all, which is the
         // modelled `UNRELATED_SNAPSHOTS` reason.
-        if let Some(first_snapshot_id) = input.first_snapshot_id.as_deref() {
-            if !store.snapshots_share_lineage(first_snapshot_id, &input.second_snapshot_id) {
-                return Err(validation(
-                    "UNRELATED_SNAPSHOTS",
-                    unrelated_snapshots_message(first_snapshot_id, &input.second_snapshot_id),
-                ));
-            }
+        if !store.snapshots_share_lineage(first_snapshot_id, &input.second_snapshot_id) {
+            return Err(validation(
+                "UNRELATED_SNAPSHOTS",
+                unrelated_snapshots_message(first_snapshot_id, &input.second_snapshot_id),
+            ));
         }
 
         // The comparison itself: a block index is CHANGED when the two snapshots do not
@@ -248,13 +263,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // hold one and the stored checksums of their bytes differ. Each side's token is
         // the one that side hands out for that index, so a caller can read either
         // version back through `GetSnapshotBlock`; the side that holds no block at the
-        // index reports no token for it.
+        // index reports no token for it — "this value is absent if the first snapshot does
+        // not have the changed block that is on the second snapshot" (`ChangedBlock`).
         let changed: Vec<ChangedBlock> = changed_indexes(first, second)
             .into_iter()
             .map(|block_index| ChangedBlock {
                 block_index: Some(block_index),
                 first_block_token: first
-                    .and_then(|snapshot| snapshot.blocks.get(&block_index))
+                    .blocks
+                    .get(&block_index)
                     .map(|entry| entry.block_token.clone()),
                 second_block_token: second
                     .blocks
@@ -310,21 +327,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         });
 
+        // Whether this page hands out any block token at all. A changed index is one at
+        // least one side holds a block at, so a page carrying changed blocks always
+        // carries tokens, and a page carrying none carries none.
+        let hands_out_block_tokens = !page.is_empty();
+
         Ok(ListChangedBlocksOutput {
             changed_blocks: Some(page),
             // "The time when the `BlockToken` expires": the tokens this answer hands out
             // are of BOTH snapshots, so the one instant it reports is the earliest at
-            // which any of them stops resolving.
-            expiry_time: Some(::aws_smithy_types::DateTime::from(
-                first.map_or(second.expiry_time, |snapshot| {
-                    snapshot.expiry_time.min(second.expiry_time)
-                }),
-            )),
+            // which any of them stops resolving. An answer that hands out no token has no
+            // such instant to report, so the member is OMITTED rather than filled with the
+            // expiry of tokens nobody was given — as are the geometry members below, which
+            // describe the blocks a page reported.
+            expiry_time: hands_out_block_tokens.then(|| {
+                ::aws_smithy_types::DateTime::from(first.expiry_time.min(second.expiry_time))
+            }),
             // The size of the volume and of the blocks the comparison is of, read off the
             // snapshot the request named: a snapshot taken from a parent is of that
             // parent's volume, so the two sides agree on both.
-            volume_size: Some(second.volume_size),
-            block_size: Some(second.block_size),
+            volume_size: hands_out_block_tokens.then_some(second.volume_size),
+            block_size: hands_out_block_tokens.then_some(second.block_size),
             next_token,
         })
     }
@@ -362,19 +385,14 @@ fn resolve<'store>(
 ///
 /// The union of the two block maps, minus the indexes both hold the same bytes at —
 /// compared through the checksum each entry stores for its own bytes, which is a digest of
-/// exactly those bytes. `first` being absent compares the second snapshot against a
-/// lineage holding no block, so every index it holds is changed.
-fn changed_indexes(first: Option<&Snapshot>, second: &Snapshot) -> Vec<i32> {
+/// exactly those bytes.
+fn changed_indexes(first: &Snapshot, second: &Snapshot) -> Vec<i32> {
     let mut indexes: BTreeSet<i32> = second.blocks.keys().copied().collect();
-    if let Some(first) = first {
-        indexes.extend(first.blocks.keys().copied());
-    }
+    indexes.extend(first.blocks.keys().copied());
     indexes
         .into_iter()
         .filter(|block_index| {
-            let second_block = second.blocks.get(block_index);
-            let first_block = first.and_then(|snapshot| snapshot.blocks.get(block_index));
-            match (first_block, second_block) {
+            match (first.blocks.get(block_index), second.blocks.get(block_index)) {
                 (Some(first_block), Some(second_block)) => {
                     first_block.checksum != second_block.checksum
                 }

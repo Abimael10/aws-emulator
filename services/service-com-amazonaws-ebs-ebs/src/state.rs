@@ -290,6 +290,18 @@ impl Snapshot {
     pub fn is_readable(&self) -> bool {
         self.status == SnapshotStatus::Completed
     }
+
+    /// Whether this snapshot holds NO block, at any index: there is no content in it to
+    /// read or to compare.
+    ///
+    /// Content, not authorship: a snapshot taken from a parent starts life holding every
+    /// block of that parent ([`BlockEntry::written`] is what records which of them this
+    /// snapshot's own producer wrote), and those inherited blocks are as readable through
+    /// it as blocks it wrote itself, so they are content it holds. Only a snapshot that
+    /// came from no parent and had nothing put into it holds none.
+    pub fn holds_no_block(&self) -> bool {
+        self.blocks.is_empty()
+    }
 }
 
 /// What a `ClientToken` remembers, so a repeat of the SAME request replays the original
@@ -667,6 +679,26 @@ pub fn block_index_beyond_volume_message(block_index: i32) -> String {
 pub fn unrelated_snapshots_message(first_snapshot_id: &str, second_snapshot_id: &str) -> String {
     format!("The snapshot {first_snapshot_id} and {second_snapshot_id} are not related.")
 }
+
+/// The message `ListChangedBlocks` answers with when the snapshot the URI names holds no
+/// block at all, so there is no content for the comparison to report.
+///
+/// A request-derived template naming ONE value, the snapshot id as the request spelled it:
+/// `Snapshot (<snapshotId>) is empty`. Nothing else of the request or of the stored
+/// snapshot appears in it.
+pub fn empty_snapshot_message(snapshot_id: &str) -> String {
+    format!("Snapshot ({snapshot_id}) is empty")
+}
+
+/// The message `ListChangedBlocks` answers with when the request names no first snapshot to
+/// compare against: the member is absent. A value that IS carried but satisfies neither the
+/// member's `@length` nor its `@pattern` is refused at the request boundary instead, against
+/// the model's own constraints.
+///
+/// FIXED and request-independent: the sentence names the member's ROLE in the comparison
+/// and echoes nothing of the request, which is what tells it from the refusal of a snapshot
+/// that resolves but holds no block ([`empty_snapshot_message`], which names that snapshot).
+pub const MISSING_FIRST_SNAPSHOT_MESSAGE: &str = "First snapshot should not be empty or null";
 
 /// The message `PutSnapshotBlock` answers with when the snapshot the write names has
 /// already been sealed: "You cannot write new blocks to a snapshot after it has been
