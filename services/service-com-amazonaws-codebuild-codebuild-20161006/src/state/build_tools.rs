@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The TOOLS a CodeBuild build environment provides beyond its shell's own utilities: the
-//! AWS CLI and the Docker CLI, performing the calls a buildspec's commands really make.
+//! AWS CLI and the Docker CLI, performing the calls a buildspec's commands really make, and
+//! the Docker daemon they are served by.
 //!
 //! # The rule this module implements
 //!
@@ -25,7 +26,9 @@
 //!   push uploads that image's blobs and manifest to the registry through the layer-upload
 //!   and `PutImage` calls a registry client makes — so the repository really holds the image
 //!   once the command has run, and a later `DescribeImages` of it reports exactly what was
-//!   pushed.
+//!   pushed;
+//! * [`docker_daemon`] answers the command a container build starts the daemon those Docker
+//!   commands are served by with, which a build environment runs only in privileged mode.
 //!
 //! Every other program name, and every form of these programs that is not performed, is
 //! answered as a command the environment has no program for, which is the closed failure the
@@ -83,6 +86,8 @@ mod aws_cli;
 pub mod container_image;
 /// The Docker CLI, as a build's commands invoke it.
 mod docker_cli;
+/// The Docker daemon the managed image carries, as a build's commands start it.
+mod docker_daemon;
 /// What a Dockerfile declares about the image built from it.
 pub mod dockerfile;
 
@@ -240,6 +245,10 @@ pub struct BuildTools {
     /// against — `None` for a build whose record names none, which is a build nothing is
     /// known about the permissions of.
     role_arn: Option<String>,
+    /// Whether the build environment was started in PRIVILEGED mode, which is what decides
+    /// whether this build may run the container daemon at all
+    /// ([`docker_daemon`]) — read off the build's own record.
+    privileged: bool,
     /// The principal a refusal names: the session CodeBuild assumes the service role in for
     /// this build.
     principal: String,
@@ -252,8 +261,9 @@ pub struct BuildTools {
 }
 
 impl BuildTools {
-    /// The tools the build `build_id`'s environment carries, running as `role_arn` and
-    /// keeping what they write on standard error in `diagnostics` — `None` where there is no
+    /// The tools the build `build_id`'s environment carries, running as `role_arn`, in an
+    /// environment `privileged` says may run the container daemon, and keeping what they
+    /// write on standard error in `diagnostics` — `None` where there is no
     /// async runtime to drive a call on, in which case the environment provides neither tool
     /// and the build reports their commands as ones it could not run.
     #[must_use]
@@ -261,6 +271,7 @@ impl BuildTools {
         callback: &EmbeddedEmulator,
         region: &str,
         role_arn: Option<&str>,
+        privileged: bool,
         build_id: &str,
         diagnostics: &ToolDiagnostics,
     ) -> Option<Self> {
@@ -273,6 +284,7 @@ impl BuildTools {
             runtime: ::tokio::runtime::Handle::try_current().ok()?,
             region: region.to_string(),
             role_arn: role_arn.map(str::to_string),
+            privileged,
             principal,
             deadline: Instant::now() + TOOL_CALL_BUDGET,
             diagnostics: diagnostics.clone(),
@@ -294,6 +306,7 @@ impl BuildTools {
             docker_cli::DOCKER_PROGRAM => {
                 docker_cli::performed(self, arguments, standard_input, files)
             }
+            docker_daemon::DOCKER_DAEMON_PROGRAM => docker_daemon::performed(self, arguments),
             _ => None,
         }
     }

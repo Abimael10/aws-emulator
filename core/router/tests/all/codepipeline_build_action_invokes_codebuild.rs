@@ -224,6 +224,69 @@ impl Emulator {
         );
     }
 
+    /// Create a bucket and stage, at `key`, the ZIP archive a build can run on.
+    ///
+    /// The object a pipeline's source action delivers to a build IS an archive — "the input
+    /// artifact must be a ZIP file", which CodeBuild unpacks into the build's working tree
+    /// before the first command runs — so the suite stages one rather than bytes no build
+    /// could run on. It is written by a build of its own, whose `ZIP` artifacts are exactly
+    /// that one object, so nothing here writes an archive by hand.
+    fn staged_source(&self, case: &str, bucket: &str, key: &str, role_arn: &str, payload: &str) {
+        let (status, answer) = self.send("s3", "PUT", &format!("/{bucket}"), &[], Vec::new());
+        assert_eq!(
+            status,
+            200,
+            "case {case:?}: CreateBucket {bucket} must answer 200, got {status} with {:?}",
+            String::from_utf8_lossy(&answer)
+        );
+        let project = format!("stage-{bucket}");
+        self.cb_ok(
+            case,
+            "CreateProject",
+            &json!({
+                "name": project,
+                "serviceRole": role_arn,
+                "source": {
+                    "type": "NO_SOURCE",
+                    "buildspec": format!(
+                        "version: 0.2\nphases:\n  build:\n    commands:\n      \
+                         - \"printf '%s' '{payload}' > app.txt\"\nartifacts:\n  files:\n    \
+                         - app.txt\n"
+                    ),
+                },
+                "artifacts": {
+                    "type": "S3",
+                    "location": bucket,
+                    "name": key,
+                    "packaging": "ZIP",
+                },
+                "environment": {
+                    "type": "LINUX_CONTAINER",
+                    "image": "aws/codebuild/standard:7.0",
+                    "computeType": "BUILD_GENERAL1_SMALL",
+                },
+            }),
+        );
+        let started = self.cb_ok(case, "StartBuild", &json!({ "projectName": project }));
+        let id = started["build"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: StartBuild must mint a build, got {started}"))
+            .to_string();
+        let staged = settle(case, "the staged source archive", || {
+            let build = self.build(case, &id);
+            if build["buildComplete"] == Value::Bool(true) {
+                Ok(build)
+            } else {
+                Err(build.to_string())
+            }
+        });
+        assert_eq!(
+            staged["buildStatus"].as_str(),
+            Some("SUCCEEDED"),
+            "case {case:?}: the build that stages {key} must succeed, got {staged}"
+        );
+    }
+
     /// The builds CodeBuild holds for `project`, newest first.
     fn builds_of(&self, case: &str, project: &str) -> Vec<String> {
         let answer = self.cb_ok(
@@ -409,9 +472,15 @@ fn a_build_action_starts_a_build_of_its_project_and_settles_from_it() {
         let project = "cp-build-project";
         let pipeline = "cp-build-pipeline";
 
-        emulator.bucket_with_source(case, bucket, "source.zip", b"the source bytes");
         let pipeline_role = emulator.role("cp-build-pipeline-role", PIPELINE_TRUST);
         let project_role = emulator.role("cp-build-project-role", CODEBUILD_TRUST);
+        emulator.staged_source(
+            case,
+            bucket,
+            "source.zip",
+            &project_role,
+            "the source payload",
+        );
         emulator.cb_ok(
             case,
             "CreateProject",
@@ -628,7 +697,13 @@ fn a_build_actions_outcome_is_what_its_buildspecs_commands_answered() {
             let bucket = format!("cp-spec-bucket-{index}");
             let project = format!("cp-spec-project-{index}");
             let pipeline = format!("cp-spec-pipeline-{index}");
-            emulator.bucket_with_source(case, &bucket, "source.zip", b"the source bytes");
+            emulator.staged_source(
+                case,
+                &bucket,
+                "source.zip",
+                &project_role,
+                "the source payload",
+            );
             emulator.cb_ok(
                 case,
                 "CreateProject",

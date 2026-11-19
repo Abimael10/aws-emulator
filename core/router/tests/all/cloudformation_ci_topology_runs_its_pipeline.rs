@@ -181,6 +181,21 @@ async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &[u8]) 
     )
 }
 
+/// A .zip archive holding no entries: the 22-byte end-of-central-directory record — its
+/// signature, then the five counts, the directory's size and offset and a zero comment
+/// length, all zero — which is a complete archive a reader opens and finds empty.
+///
+/// The object a source action delivers to a build IS an archive, which CodeBuild unpacks
+/// into the build's working tree before the first command runs, and the buildspecs below
+/// write the files they read themselves — so the topology's source is an archive that holds
+/// nothing rather than bytes no build could unpack.
+const SOURCE_ARCHIVE: &[u8] = b"PK\x05\x06\
+\x00\x00\x00\x00\
+\x00\x00\x00\x00\
+\x00\x00\x00\x00\
+\x00\x00\x00\x00\
+\x00\x00";
+
 /// The versioned source bucket the pipeline's Source action reads, with one object at
 /// `source.zip` — the bucket a client creates before it deploys the topology.
 async fn source_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
@@ -204,7 +219,7 @@ async fn source_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
         router,
         "PUT",
         &format!("/{bucket}/source.zip"),
-        b"the source archive",
+        SOURCE_ARCHIVE,
     )
     .await;
     assert_eq!(

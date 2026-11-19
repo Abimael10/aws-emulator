@@ -161,6 +161,16 @@ async fn performed_commands(
         callback,
         region,
         claimed.build.service_role.as_deref(),
+        // Whether this build may run the container daemon at all, as its own environment
+        // records it: `ProjectEnvironment$privilegedMode` "enables running the Docker daemon
+        // inside a Docker container", and a build whose environment states nothing is one
+        // that was not given it.
+        claimed
+            .build
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.privileged_mode)
+            .unwrap_or(false),
         &claimed.id,
         &diagnostics,
     );

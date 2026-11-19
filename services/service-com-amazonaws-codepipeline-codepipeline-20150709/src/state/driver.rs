@@ -819,6 +819,9 @@ fn poll_action(
         stage,
         action: index,
         build_id,
+        // The locations the build was told to write when it was started, so the artifacts
+        // this action publishes are the objects that build really produced.
+        outputs: action.output_locations.clone(),
     })
 }
 
@@ -1342,7 +1345,38 @@ fn start_action(
                 return None;
             }
         };
+        // The artifacts the build is built FROM are the ones the earlier actions
+        // produced, at the locations they produced them at: the source of the type whose
+        // code "is specified in the source action of a pipeline in CodePipeline" IS that
+        // input artifact, so a declared input nothing produced means the action cannot
+        // run as declared.
+        let mut inputs = Vec::with_capacity(input_artifacts.len());
+        for name in &input_artifacts {
+            let Some(location) = produced.get(name).cloned() else {
+                fail_action(
+                    action,
+                    FAILURE_CONFIGURATION_ERROR,
+                    &format!("the input artifact {name} was not produced by an earlier action"),
+                    now,
+                );
+                return None;
+            };
+            inputs.push(location);
+        }
         action.claimed = Some(now);
+        let outputs: Vec<ArtifactRef> = output_artifacts
+            .iter()
+            .map(|name| ArtifactRef {
+                bucket: artifact_bucket.clone(),
+                key: artifact_key(&pipeline_name, name),
+                revision: None,
+                encryption: artifact_encryption_key.clone(),
+            })
+            .collect();
+        // The locations the build is told to write are kept on the RUN, because the step
+        // that settles the action is a later one: what it publishes has to be what this
+        // start handed over.
+        action.output_locations = outputs.clone();
         return Some(Job::CodeBuildStart {
             execution_id,
             stage,
@@ -1355,6 +1389,8 @@ fn start_action(
                 .clone()
                 .unwrap_or_else(|| declaration.role_arn.clone()),
             environment_overrides,
+            inputs,
+            outputs,
         });
     }
 
@@ -1515,7 +1551,10 @@ fn record_outcome(
             let produced = match job {
                 Job::S3Source { outputs, .. }
                 | Job::CodeCommitSource { outputs, .. }
-                | Job::EcrSource { outputs, .. } => outputs.as_slice(),
+                | Job::EcrSource { outputs, .. }
+                // A build action's artifacts are published by the step that SETTLED it,
+                // at the locations the build it followed was told to write.
+                | Job::CodeBuildPoll { outputs, .. } => outputs.as_slice(),
                 _ => &[],
             };
             for (name, location) in output_names.iter().zip(produced.iter()) {
@@ -1959,6 +1998,8 @@ async fn run_job(
             project_name,
             role_arn,
             environment_overrides,
+            inputs,
+            outputs,
             ..
         } => {
             build_action::run_codebuild_start(
@@ -1967,12 +2008,14 @@ async fn run_job(
                 project_name,
                 role_arn,
                 environment_overrides,
+                inputs,
+                outputs,
             )
             .await
         }
-        Job::CodeBuildPoll { build_id, .. } => {
-            build_action::run_codebuild_poll(callback, region, build_id).await
-        }
+        Job::CodeBuildPoll {
+            build_id, outputs, ..
+        } => build_action::run_codebuild_poll(callback, region, build_id, outputs).await,
     }
 }
 

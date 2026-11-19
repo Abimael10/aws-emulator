@@ -359,7 +359,15 @@ async fn a_build_action_starts_no_build_its_role_may_not_start() {
         "the artifact bucket must be created"
     );
     assert_eq!(
-        s3(&router, "PUT", &format!("/{BUCKET}/source.zip"), b"source").await,
+        s3(
+            &router,
+            "PUT",
+            &format!("/{BUCKET}/source.zip"),
+            // The object a source action delivers to a build is the ARCHIVE the build
+            // unpacks into its working tree, so the fixture is one.
+            &crate::execution_engine::zip_of(&[("app.txt", b"source")]),
+        )
+        .await,
         200,
         "the source object must be put"
     );

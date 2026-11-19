@@ -14,21 +14,63 @@
 //! falls due, and only a build CodeBuild reports COMPLETE settles the action — succeeded
 //! when the build succeeded, failed with the state the build ended in otherwise.
 //!
+//! # The artifacts the action and the build exchange
+//!
+//! Such a project's own source states no location: `ProjectSource$location` "should not be
+//! specified" for that source type because "CodePipeline uses the settings in a pipeline's
+//! source action instead of this value". So the build is built FROM the action's input
+//! artifact and puts what it produces at the location the action's OUTPUT artifact occupies
+//! in the pipeline's artifact store, and the start is what hands both over: the input
+//! artifact's object as the build's `sourceVersion`, and the output artifact's object as the
+//! destination its artifacts are uploaded to. A build whose action declares no input
+//! artifact is built from nothing, and one whose action declares no output artifact uploads
+//! nothing — neither is invented here.
+//!
 //! The build is reached through the framework's in-process callback, so an action can only
 //! report a build that service really holds: a project nothing created is a declaration the
 //! pipeline cannot run, which the action's own `ConfigurationError` failure reports.
 
-use super::super::execution::JobOutcome;
+use super::super::execution::{ArtifactRef, JobOutcome};
 use super::{service_error_detail, FAILURE_CONFIGURATION_ERROR, FAILURE_JOB_FAILED};
 
 /// The `StatusType` a build that ran to success reports (`Build$buildStatus`).
 const BUILD_SUCCEEDED: &str = "SUCCEEDED";
+
+/// The `ArtifactsType` of a destination whose objects go into a bucket of the account's
+/// object store: "S3: The build project stores build output in Amazon S3"
+/// (`ProjectArtifacts$type`). The pipeline's artifact store IS such a bucket, so the
+/// destination a build action hands the build is one of that type, at the key the output
+/// artifact occupies.
+const ARTIFACTS_TYPE_S3: &str = "S3";
+
+/// The `ArtifactNamespace` that puts nothing of its own into the artifact's key: "NONE: Do
+/// not include the build ID". The key is the one this execution assigned the output
+/// artifact, so nothing else may be composed into it.
+const ARTIFACTS_NAMESPACE_NONE: &str = "NONE";
+
+/// The `ArtifactPackaging` that puts the whole output into ONE object: "ZIP: CodeBuild
+/// creates in the output bucket a ZIP file that contains the build output." One artifact of
+/// a pipeline is one object, which the actions after it read as the archive it is.
+const ARTIFACTS_PACKAGING_ZIP: &str = "ZIP";
+
+/// The S3 ARN of the object `location` holds, which is how an artifact object is ADDRESSED:
+/// the form a build reports its own artifacts' location in, and the form the input artifact
+/// is handed to a build as.
+fn object_arn(location: &ArtifactRef) -> String {
+    format!("arn:aws:s3:::{}/{}", location.bucket, location.key)
+}
 
 /// Start a build of `project_name`, and report the action as running that build.
 ///
 /// The environment variables the action's configuration declares are the build's own
 /// overrides — "a set of environment variables" the action passes to the project — so they
 /// travel with the start rather than being applied to the project itself.
+///
+/// So do the action's ARTIFACTS: the first of `inputs` is the object the build is built
+/// from, handed over as the build's `sourceVersion`, and the first of `outputs` is where
+/// the build's own output goes, handed over as the destination its artifacts are uploaded
+/// to. This action type binds one of each, so a location past the first is not passed as a
+/// second source or a second destination.
 ///
 /// The start is made UNDER `role_arn` — the role this action is performed as — so it is
 /// authorized against the permissions in force on that role BEFORE anything is started: a
@@ -40,6 +82,8 @@ pub(super) async fn run_codebuild_start(
     project_name: &str,
     role_arn: &str,
     environment_overrides: &super::super::execution::EnvironmentOverrides,
+    inputs: &[ArtifactRef],
+    outputs: &[ArtifactRef],
 ) -> JobOutcome {
     if let Some(denial) = start_build_denial(callback, region, role_arn, project_name).await {
         return JobOutcome::Failed {
@@ -52,6 +96,45 @@ pub(super) async fn run_codebuild_start(
     }
     let codebuild = codebuild_client(callback, region);
     let mut started = codebuild.start_build().project_name(project_name);
+    if let Some(input) = inputs.first() {
+        // What the build is built from: the artifact object the earlier action produced.
+        started = started.source_version(object_arn(input));
+    }
+    if let Some(output) = outputs.first() {
+        // Where the build's output goes: the object this execution assigned the action's
+        // output artifact, as one archive at exactly that key.
+        let (path, name) = match output.key.rsplit_once('/') {
+            Some((path, name)) => (path.to_string(), name.to_string()),
+            None => (String::new(), output.key.clone()),
+        };
+        match ::aws_sdk_codebuild::types::ProjectArtifacts::builder()
+            .r#type(::aws_sdk_codebuild::types::ArtifactsType::from(
+                ARTIFACTS_TYPE_S3,
+            ))
+            .location(&output.bucket)
+            .path(path)
+            .name(name)
+            .namespace_type(::aws_sdk_codebuild::types::ArtifactNamespace::from(
+                ARTIFACTS_NAMESPACE_NONE,
+            ))
+            .packaging(::aws_sdk_codebuild::types::ArtifactPackaging::from(
+                ARTIFACTS_PACKAGING_ZIP,
+            ))
+            .build()
+        {
+            Ok(destination) => started = started.artifacts_override(destination),
+            Err(err) => {
+                return JobOutcome::Failed {
+                    code: FAILURE_CONFIGURATION_ERROR.to_string(),
+                    message: format!(
+                        "the output artifact of this action cannot be passed to the \
+                         project {project_name} as a build destination: {err}"
+                    ),
+                    external_id: None,
+                }
+            }
+        }
+    }
     for (name, value, kind) in environment_overrides {
         let mut variable = ::aws_sdk_codebuild::types::EnvironmentVariable::builder()
             .name(name)
@@ -123,10 +206,15 @@ pub(super) async fn run_codebuild_start(
 /// this action is still waiting for: the action stays running and the read falls due again.
 /// A complete build settles the action with the state it ended in, which is the wording
 /// CodePipeline reports for a build action that did not succeed.
+///
+/// `outputs` are the locations the build was told to upload to: a succeeded build that
+/// reports no artifacts put nothing there, so the action does not publish an artifact
+/// nothing wrote.
 pub(super) async fn run_codebuild_poll(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     build_id: &str,
+    outputs: &[ArtifactRef],
 ) -> JobOutcome {
     let codebuild = codebuild_client(callback, region);
     let read = codebuild.batch_get_builds().ids(build_id).send().await;
@@ -168,6 +256,28 @@ pub(super) async fn run_codebuild_poll(
             message: format!("Build terminated with state: {status}"),
             external_id: Some(build_id.to_string()),
         };
+    }
+    // The object the action publishes as its output artifact is the one the build
+    // UPLOADED: `BuildArtifacts$location` is "the location of the artifact", so a build
+    // that reports none uploaded none, and the action must not publish an artifact for a
+    // later action to read where nothing was written.
+    let uploaded = build
+        .artifacts
+        .as_ref()
+        .and_then(|artifacts| artifacts.location.as_deref())
+        .unwrap_or_default();
+    if let Some(output) = outputs.first() {
+        let expected = object_arn(output);
+        if uploaded != expected {
+            return JobOutcome::Failed {
+                code: FAILURE_JOB_FAILED.to_string(),
+                message: format!(
+                    "the build {build_id} this action started did not put its output \
+                     artifact at {expected}"
+                ),
+                external_id: Some(build_id.to_string()),
+            };
+        }
     }
     JobOutcome::Done {
         summary: format!("Build {build_id} succeeded"),

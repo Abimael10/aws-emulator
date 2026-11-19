@@ -3270,6 +3270,13 @@ impl ActionExecutionRecord {
                 // to the action's input, so an action that declares none reports it EMPTY
                 // rather than absent — a caller may iterate it without first telling an
                 // action with no input artifacts from a missing member.
+                //
+                // WHERE each one is, is what the execution recorded for it: an input
+                // artifact is the object an earlier action of this execution produced, so
+                // the detail names that object — the same location the consuming action
+                // was handed. One this execution has not produced (an action that has not
+                // run, or one whose producer failed) has none to name, and the detail then
+                // carries the artifact's name alone rather than a location nothing wrote.
                 input_artifacts: Some(
                     action
                         .input_artifacts
@@ -3278,7 +3285,12 @@ impl ActionExecutionRecord {
                         .iter()
                         .map(|artifact| ArtifactDetail {
                             name: Some(artifact.name.clone()),
-                            s3location: None,
+                            s3location: execution.artifacts.get(&artifact.name).map(
+                                |location| S3Location {
+                                    bucket: Some(location.bucket.clone()),
+                                    key: Some(location.key.clone()),
+                                },
+                            ),
                         })
                         .collect(),
                 ),

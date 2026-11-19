@@ -347,6 +347,15 @@ pub struct ActionRun {
     /// resolve `#{namespace.key}` references (`super::PipelineExecutionRecord::variables_map`)
     /// — so an action that declares none still published what it published.
     pub output_variables: BTreeMap<String, String>,
+    /// The artifact-store locations this run was given for the artifacts it PRODUCES,
+    /// in the order the declaration names them — empty for an action that declares none,
+    /// and for one whose work finishes inside the call that started it.
+    ///
+    /// An action whose work runs in ANOTHER service is handed those locations when its
+    /// run is started, and is settled by a later step ([`Job::CodeBuildPoll`]): the
+    /// locations are kept on the run so the step that settles it records the very
+    /// locations the work was told to write, rather than fresh ones nothing wrote to.
+    pub output_locations: Vec<ArtifactRef>,
 }
 
 impl ActionRun {
@@ -636,6 +645,8 @@ fn plan_action(action: &ActionDeclaration, now: SystemTime) -> ActionRun {
         external_run: None,
         percent_complete: None,
         output_variables: BTreeMap::new(),
+        // Nothing has been given a location to write in a plan that has not run.
+        output_locations: Vec::new(),
     }
 }
 
@@ -1025,6 +1036,15 @@ pub enum Job {
         /// The environment variables the action's configuration overrides the project's
         /// with ([`EnvironmentOverrides`]).
         environment_overrides: EnvironmentOverrides,
+        /// The artifacts the build is built FROM: the locations the earlier actions
+        /// produced this action's declared input artifacts at, in declaration order.
+        /// Empty for an action that declares none, which is a build with no input of its
+        /// own.
+        inputs: Vec<ArtifactRef>,
+        /// Where the build PUTS what it produces: the locations this execution assigns
+        /// the action's declared output artifacts in the artifact store. Empty for an
+        /// action that declares none, which is a build that uploads nothing.
+        outputs: Vec<ArtifactRef>,
     },
     /// The same action's next step: read the build it started, and settle the action
     /// once that build has reached a terminal status.
@@ -1037,6 +1057,11 @@ pub enum Job {
         action: usize,
         /// The build the action is waiting for.
         build_id: String,
+        /// The locations that build was given for the action's output artifacts, as the
+        /// start recorded them ([`super::execution::ActionRun::output_locations`]) — so
+        /// the artifacts the settled action publishes are the objects the build was told
+        /// to write.
+        outputs: Vec<ArtifactRef>,
     },
 }
 
@@ -1060,6 +1085,9 @@ impl Job {
                 .iter()
                 .find_map(|(_, output)| output.encryption.as_deref()),
             Self::S3Deploy { encryption_key, .. } => encryption_key.as_deref(),
+            // A build's output artifact is written by the build service itself, under
+            // the destination the start hands it, so no object is written from here and
+            // no data key is taken for one.
             Self::CodeBuildStart { .. } | Self::CodeBuildPoll { .. } => None,
         }
     }

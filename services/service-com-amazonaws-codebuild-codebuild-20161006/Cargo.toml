@@ -98,6 +98,8 @@ roxmltree = "0.20"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares tests/all/main.rs's suite modules, one per tests/all/<name>.rs.
+automod = { workspace = true }
 # The settle test has to let real time pass; the timer is enabled for the test
 # targets only, so the production dependency does not carry it.
 tokio = { workspace = true, features = ["time"] }
