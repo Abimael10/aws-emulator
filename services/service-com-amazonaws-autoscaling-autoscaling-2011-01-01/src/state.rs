@@ -22,8 +22,10 @@
 //!   cooldown to elapse before it is applied (`HonorCooldown`);
 //! * a running instance refresh replaces one instance of its group per
 //!   [`INSTANCE_REFRESH_REPLACEMENT`], waits the warmup it runs under after each
-//!   replacement comes into service ([`StoredInstanceRefresh::instance_warmup`]) and
-//!   succeeds once it has replaced them all ([`StoredInstanceRefresh`]);
+//!   replacement comes into service ([`StoredInstanceRefresh::instance_warmup`]) and,
+//!   once it has replaced them all, waits the bake time it runs under — reported
+//!   `Baking` while it does ([`StoredInstanceRefresh::bake_time`]) — before it succeeds
+//!   ([`StoredInstanceRefresh`]);
 //! * a refresh a caller cancelled is reported `Cancelling` and becomes `Cancelled`
 //!   ([`INSTANCE_REFRESH_CANCELLATION`]);
 //! * a refresh a caller rolled back replaces its OWN replacements back, one per
@@ -400,6 +402,9 @@ pub const REFRESH_PENDING: &str = "Pending";
 pub const REFRESH_IN_PROGRESS: &str = "InProgress";
 /// A refresh that replaced every instance it set out to replace.
 pub const REFRESH_SUCCESSFUL: &str = "Successful";
+/// A refresh that has finished updating instances and is waiting out the bake time it
+/// runs under before it is complete.
+pub const REFRESH_BAKING: &str = "Baking";
 /// A refresh that could not finish.
 pub const REFRESH_FAILED: &str = "Failed";
 /// A refresh whose cancellation has been asked for and has not completed.
@@ -1370,7 +1375,19 @@ impl StoredInstanceRefresh {
     /// the group's ACTIVE refresh: a group may have only one at a time, and one whose
     /// cancellation has not completed still holds its group.
     pub fn is_active(&self) -> bool {
-        self.is_in_progress() || self.status == REFRESH_CANCELLING || self.is_rolling_back()
+        self.is_in_progress()
+            || self.is_baking()
+            || self.status == REFRESH_CANCELLING
+            || self.is_rolling_back()
+    }
+
+    /// Whether this refresh is BAKING: it has finished updating instances and is waiting
+    /// out the bake time it runs under, which is not a terminal status —
+    /// "`Baking` - Waiting the specified bake time after an instance refresh has finished
+    /// updating instances" (`smithy_query(query="doc",shape="InstanceRefresh",
+    /// member="Status")`).
+    pub fn is_baking(&self) -> bool {
+        self.status == REFRESH_BAKING
     }
 
     /// Whether this refresh is BEING ROLLED BACK: the status that means its own
@@ -1384,13 +1401,15 @@ impl StoredInstanceRefresh {
     /// instance refresh OR ROLLBACK that is in progress"
     /// (`smithy_query(query="operation",operation="CancelInstanceRefresh")`), so the
     /// replacements a rollback is part way through are stopped by the same call that
-    /// stops a refresh's own.
+    /// stops a refresh's own — and so is the wait a refresh that has finished replacing
+    /// is still owed, which the sentence a group with nothing to cancel is refused with
+    /// names beside the rest.
     pub fn is_cancellable(&self) -> bool {
-        self.is_in_progress() || self.is_rolling_back()
+        self.is_in_progress() || self.is_baking() || self.is_rolling_back()
     }
 
     /// Whether this refresh is IN PROGRESS: the statuses that mean it is still
-    /// replacing instances, which is what a cancellation acts on.
+    /// replacing instances.
     pub fn is_in_progress(&self) -> bool {
         self.status == REFRESH_PENDING || self.status == REFRESH_IN_PROGRESS
     }
@@ -1412,6 +1431,26 @@ impl StoredInstanceRefresh {
             .preferences
             .as_ref()
             .and_then(|preferences| preferences.instance_warmup)
+            .unwrap_or(0)
+            .max(0);
+        Duration::from_secs(u64::from(seconds.unsigned_abs()))
+    }
+
+    /// How long this refresh waits, once it has finished updating instances, before it is
+    /// complete.
+    ///
+    /// "The amount of time, in seconds, to wait at the end of an instance refresh before
+    /// the instance refresh is considered complete"
+    /// (`smithy_query(query="doc",shape="RefreshPreferences",member="BakeTime")`), so the
+    /// wait is the `BakeTime` the request stated, in the seconds it stated it in: a
+    /// documented wait keeps the value the caller asked for. A refresh that stated none,
+    /// or stated none to wait, bakes for nothing and is complete as soon as it has
+    /// replaced every instance it set out to.
+    pub fn bake_time(&self) -> Duration {
+        let seconds = self
+            .preferences
+            .as_ref()
+            .and_then(|preferences| preferences.bake_time)
             .unwrap_or(0)
             .max(0);
         Duration::from_secs(u64::from(seconds.unsigned_abs()))
@@ -1691,8 +1730,12 @@ impl AutoScalingState {
         if let Some(reason) = self.group_rollback_refusal_reason(engine, group_name) {
             return Err(RollbackRefusal::Irreversible(reason));
         }
+        // The refresh a rollback acts on: one still replacing instances, or one waiting
+        // out the bake time it runs under — the two statuses the sentence this operation
+        // refuses a group with nothing to roll back with names.
         let Some(index) = self.instance_refreshes.iter().position(|refresh| {
-            refresh.auto_scaling_group_name == group_name && refresh.is_in_progress()
+            refresh.auto_scaling_group_name == group_name
+                && (refresh.is_in_progress() || refresh.is_baking())
         }) else {
             return Err(RollbackRefusal::NoneInProgress);
         };
@@ -2633,8 +2676,9 @@ impl AutoScalingState {
     /// refresh nobody has read for a while catches up over the steps it was owed,
     /// each anchored at the instant it came due rather than at the instant somebody
     /// looked. The loop therefore terminates: every pass either retires a pending
-    /// replacement or brings a refresh to a terminal status, which clears its due
-    /// instant.
+    /// replacement, moves a refresh that has replaced them all into the wait it owes at
+    /// the end — which comes due strictly later — or brings a refresh to a terminal
+    /// status, which clears its due instant.
     pub fn advance_instance_refreshes<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
@@ -2662,8 +2706,9 @@ impl AutoScalingState {
     }
 
     /// Retire the one step the refresh at `index` owes at `due`: complete its
-    /// cancellation, replace its next instance — or, while it is being rolled back,
-    /// replace one of its own replacements back — or, with none left, finish it.
+    /// cancellation, replace its next instance, start or end the wait it owes at the end
+    /// — or, while it is being rolled back, replace one of its own replacements back —
+    /// or, with none left and nothing left to wait, finish it.
     fn advance_one_instance_refresh<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
@@ -2679,6 +2724,8 @@ impl AutoScalingState {
         let next_instance_id = refresh.pending_instance_ids.first().cloned();
         let cancelling = refresh.status == REFRESH_CANCELLING;
         let rolling_back = refresh.is_rolling_back();
+        let baking = refresh.is_baking();
+        let bake_time = refresh.bake_time();
 
         // A cancellation replaces nothing further and rolls nothing back, so the only
         // step a refresh being cancelled owes is the end of that cancellation — which
@@ -2727,6 +2774,22 @@ impl AutoScalingState {
                     refresh.percentage_complete = 0;
                     refresh.end_time = Some(due);
                     refresh.next_step_due = None;
+                }
+                return;
+            }
+            // "Baking - Waiting the specified bake time after an instance refresh has
+            // finished updating instances" (smithy_query(query="doc",
+            // shape="InstanceRefresh",member="Status")), so a refresh that has replaced
+            // every instance it set out to is NOT complete while the wait it runs under is
+            // still owed ([`StoredInstanceRefresh::bake_time`]): it reports every instance
+            // updated and bakes, and the end of that wait is what completes it. A refresh
+            // asked to wait nothing has nothing to wait and finishes here.
+            if !baking && !bake_time.is_zero() {
+                if let Some(refresh) = self.instance_refreshes.get_mut(index) {
+                    refresh.status = REFRESH_BAKING.to_string();
+                    refresh.percentage_complete = 100;
+                    refresh.instances_to_update = 0;
+                    refresh.next_step_due = Some(due + bake_time);
                 }
                 return;
             }

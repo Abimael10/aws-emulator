@@ -30,6 +30,15 @@ use crate::support::{
     json_rpc, new_engine, query, router_with, tag_value, tag_values, xml_unescape,
 };
 
+/// The PHASES a refresh moves through before it is complete — that it is created running,
+/// that it bakes where the request asked it to wait at the end, and that it is cancellable
+/// in each of them — in its own file beside this one, this suite's sibling concern.
+/// `tests/all.rs` declares one module per suite FILE, and this is that file's module; the
+/// `#[path]` points it into this suite's own directory, as that file's own declaration
+/// points into `tests/all/`.
+#[path = "instance_refresh_lifecycle/refresh_phases.rs"]
+mod refresh_phases;
+
 /// The launch template the groups in this suite launch from.
 const LAUNCH_TEMPLATE: &str = "lt-refresh";
 

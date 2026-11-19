@@ -4,7 +4,8 @@
 //!
 //! Starts an instance refresh on an Auto Scaling group: the refresh is stored under a
 //! unique id, and the clock replaces the group's instances one at a time until it has
-//! replaced every instance it set out to ([`crate::state::StoredInstanceRefresh`]).
+//! replaced every instance it set out to, then waits out the bake time it runs under
+//! ([`crate::state::StoredInstanceRefresh`]).
 //! Each replacement launches and terminates the account's own Amazon EC2 instances
 //! through the group's single launch path, so the ids the group reports while a
 //! refresh runs are ids Amazon EC2 resolves. A group may have only one active refresh
