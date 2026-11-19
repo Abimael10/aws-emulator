@@ -16,8 +16,8 @@
 //!
 //! The recorded requests that filed the issue — one malformed model schema, one repeated
 //! stage name, one `HTTP_PROXY` integration asking for payload format 2.0, one `MOCK`
-//! integration on an HTTP api, one route patched to `JWT` with no authorizer — are ONE
-//! row each.
+//! integration on an HTTP api, one route patched to `JWT` with no authorizer, one routing
+//! rule whose condition names no match clause — are ONE row each.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
@@ -26,7 +26,7 @@ use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::api_lifecycle::{as_str, call, emulator, error_code};
+use crate::api_lifecycle::{as_str, call, emulator, error_code, REGION};
 
 /// AWS's sentence for a `Schema` that is no schema document: the result of validating
 /// the model, carrying its one error and no warnings.
@@ -40,6 +40,20 @@ const STAGE_ALREADY_EXISTS: &str = "Stage already exists";
 /// names the types that api MAY be associated with.
 const PROXY_INTEGRATIONS_ONLY: &str = "Currently, an API with a protocol type of HTTP \
      may only be associated with proxy integrations (AWS_PROXY, HTTP_PROXY)";
+
+/// AWS's sentence for a `Conditions` entry of a routing rule that does not name exactly
+/// one of the two match clauses a `RoutingRuleCondition` offers.
+///
+/// The whole sentence is fixed text: it names the two alternatives in their WIRE spelling
+/// (`RoutingRuleCondition$MatchBasePaths` carries `jsonName` `matchBasePaths` and
+/// `$MatchHeaders` carries `matchHeaders`,
+/// `smithy_query(query="shape", shape="RoutingRuleCondition")`) and carries neither a list
+/// index nor any value the request sent.
+const ROUTING_RULE_CONDITIONS_EXCLUSIVE: &str = "Invalid conditions for RoutingRule. \
+     Each condition can only be either matchBasePaths or matchHeaders.";
+
+/// The stage a routing rule's `InvokeApi` action names in this suite.
+const ROUTING_RULE_STAGE: &str = "dev";
 
 /// AWS's sentence for a route whose `AuthorizationType` is `JWT` and whose authorizer
 /// reference is not a valid one.
@@ -666,4 +680,251 @@ async fn a_route_with_no_valid_authorizer_reference_is_refused_with_the_sentence
         authorizer_id,
         "expected the patched route to name the authorizer, got {updated}"
     );
+}
+
+/// Create one custom domain name — the resource a routing rule is created under.
+async fn create_domain_name(emulator: &MultiServiceRouter, domain: &str) {
+    let (status, body) = call(
+        emulator,
+        "POST",
+        "/v2/domainnames",
+        Some(json!({
+            "domainName": domain,
+            // "AWS Certificate Manager is the only supported source"
+            // (`DomainNameConfiguration$CertificateArn`).
+            "domainNameConfigurations": [{
+                "certificateArn": engine::emulator_arn(
+                    "acm",
+                    REGION,
+                    &format!("certificate/{domain}"),
+                ),
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "seeding domain name {domain:?}: expected 201 from CreateDomainName, \
+         got {status} {body}"
+    );
+}
+
+/// Create one stage of `api_id`, the stage a routing rule's action invokes.
+async fn create_stage(emulator: &MultiServiceRouter, api_id: &str, stage_name: &str) {
+    let (status, body) = call(
+        emulator,
+        "POST",
+        &format!("/v2/apis/{api_id}/stages"),
+        Some(json!({ "stageName": stage_name })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "seeding stage {stage_name:?}: expected 201 from CreateStage, got {status} {body}"
+    );
+}
+
+/// One row of the routing-rule condition table: the `Conditions` list a writer is sent,
+/// and the `Priority` it asks for.
+struct ConditionRow {
+    case: &'static str,
+    priority: i64,
+    conditions: Value,
+}
+
+/// The rules a listing reports for one domain name.
+fn listed_rules(body: &Value) -> Vec<Value> {
+    body["routingRules"].as_array().cloned().unwrap_or_default()
+}
+
+/// A `Conditions` entry that names neither or both of the two match clauses is refused
+/// with ONE sentence by EVERY writer of a routing rule, and nothing is written.
+///
+/// The rows span what the rule generalises over: which clauses the offending entry names
+/// (neither, both), WHERE it sits in the list (the only entry, the first of two, the last
+/// of two, the middle of three) and the `Priority` the request asks for — so a sentence
+/// that carried the entry's index, or any other value from the request, would differ
+/// between rows. Both writers of the resource are driven, because the sentence belongs to
+/// the requirement and not to one operation.
+#[tokio::test]
+async fn a_routing_rule_condition_naming_no_single_match_clause_is_refused_with_one_sentence() {
+    let emulator = emulator();
+    let domain = "conditions.example.com";
+    create_domain_name(&emulator, domain).await;
+    let api_id = create_api(&emulator, "the routed api", "routing-rule-text", "HTTP").await;
+    create_stage(&emulator, &api_id, ROUTING_RULE_STAGE).await;
+
+    let action = json!({ "invokeApi": { "apiId": api_id, "stage": ROUTING_RULE_STAGE } });
+    let base_paths = json!({ "matchBasePaths": { "anyOf": ["orders"] } });
+    let headers = json!({
+        "matchHeaders": { "anyOf": [{ "header": "x-tenant", "valueGlob": "acme-*" }] }
+    });
+    let both = json!({
+        "matchBasePaths": { "anyOf": ["orders"] },
+        "matchHeaders": { "anyOf": [{ "header": "x-tenant", "valueGlob": "acme-*" }] }
+    });
+
+    let rules_uri = format!("/v2/domainnames/{domain}/routingrules");
+
+    // One rule that IS evaluable, so every refusal below can be shown to have changed
+    // nothing a later reader sees.
+    let seeded_priority = 999;
+    let (status, seeded) = call(
+        &emulator,
+        "POST",
+        &rules_uri,
+        Some(json!({
+            "priority": seeded_priority,
+            "actions": [action.clone()],
+            "conditions": [base_paths.clone()]
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "seeding a rule: expected 201 from CreateRoutingRule, got {status} {seeded}"
+    );
+    let routing_rule_id = as_str(&seeded, "routingRuleId");
+    let rule_uri = format!("{rules_uri}/{routing_rule_id}");
+
+    let rows = [
+        ConditionRow {
+            case: "the only entry, naming neither clause",
+            priority: 1,
+            conditions: json!([{}]),
+        },
+        ConditionRow {
+            case: "the only entry, naming both clauses",
+            priority: 100,
+            conditions: json!([both.clone()]),
+        },
+        ConditionRow {
+            case: "the FIRST of two entries, naming neither clause",
+            priority: 1_000_000,
+            conditions: json!([{}, base_paths.clone()]),
+        },
+        ConditionRow {
+            case: "the LAST of two entries, naming neither clause",
+            priority: 500,
+            conditions: json!([base_paths.clone(), {}]),
+        },
+        ConditionRow {
+            case: "the MIDDLE of three entries, naming both clauses",
+            priority: 7,
+            conditions: json!([headers.clone(), both.clone(), base_paths.clone()]),
+        },
+    ];
+
+    for row in &rows {
+        let request = json!({
+            "priority": row.priority,
+            "actions": [action.clone()],
+            "conditions": row.conditions
+        });
+
+        // The create leg.
+        let answer = call(&emulator, "POST", &rules_uri, Some(request.clone())).await;
+        assert_refusal(
+            row.case,
+            400,
+            "BadRequestException",
+            ROUTING_RULE_CONDITIONS_EXCLUSIVE,
+            &answer,
+        );
+        let message = as_str(&answer.1, "message");
+        // The sentence states the requirement: it offers no per-entry diagnostic, so a
+        // client cannot be built to parse an index out of it.
+        assert!(
+            !message.contains('['),
+            "case {:?}: the sentence must carry no list index, got {message:?}",
+            row.case
+        );
+
+        // The update leg: the same requirement, worded the same way, and the stored rule
+        // is left as it was.
+        let answer = call(&emulator, "PUT", &rule_uri, Some(request)).await;
+        assert_refusal(
+            row.case,
+            400,
+            "BadRequestException",
+            ROUTING_RULE_CONDITIONS_EXCLUSIVE,
+            &answer,
+        );
+
+        // Nothing the refusals asked for reached the store: the domain name still holds
+        // the seeded rule alone, under the priority and conditions it was created with.
+        let (status, listing) = call(&emulator, "GET", &rules_uri, None).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected 200 from ListRoutingRules, got {status} {listing}",
+            row.case
+        );
+        let rules = listed_rules(&listing);
+        assert_eq!(
+            rules.len(),
+            1,
+            "case {:?}: expected the refused writes to persist nothing, got {listing}",
+            row.case
+        );
+        assert_eq!(
+            rules[0]["priority"].as_i64(),
+            Some(seeded_priority),
+            "case {:?}: expected the stored rule to keep its priority, got {listing}",
+            row.case
+        );
+        assert_eq!(
+            rules[0]["conditions"], seeded["conditions"],
+            "case {:?}: expected the stored rule to keep its conditions, got {listing}",
+            row.case
+        );
+    }
+
+    // The positive control: an entry naming EXACTLY ONE clause is accepted by both
+    // writers, so the sentence is about those entries and not about every condition.
+    for (case, priority, condition) in [
+        ("base paths", 11, &base_paths),
+        ("headers", 12, &headers),
+    ] {
+        let (status, created) = call(
+            &emulator,
+            "POST",
+            &rules_uri,
+            Some(json!({
+                "priority": priority,
+                "actions": [action.clone()],
+                "conditions": [condition]
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected 201 from CreateRoutingRule, got {status} {created}"
+        );
+        assert_eq!(
+            created["conditions"],
+            json!([condition]),
+            "case {case:?}: expected the accepted rule to report its condition, got {created}"
+        );
+
+        let (status, updated) = call(
+            &emulator,
+            "PUT",
+            &rule_uri,
+            Some(json!({
+                "priority": seeded_priority,
+                "actions": [action.clone()],
+                "conditions": [condition]
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from PutRoutingRule, got {status} {updated}"
+        );
+        assert_eq!(
+            updated["conditions"],
+            json!([condition]),
+            "case {case:?}: expected the rewritten rule to report its condition, got {updated}"
+        );
+    }
 }

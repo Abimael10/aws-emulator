@@ -225,7 +225,7 @@ async fn a_domain_name_the_account_already_holds_is_refused_as_a_bad_request() {
             "domainName": name,
             "domainNameConfigurations": [{ "certificateArn": certificate_arn("first") }]
         });
-        accepted(
+        let first = accepted(
             &emulator,
             &name,
             "POST",
@@ -277,7 +277,37 @@ async fn a_domain_name_the_account_already_holds_is_refused_as_a_bad_request() {
             "case {name:?}: expected the refused create to leave the stored record, got \
              {read}"
         );
+        // Including the resource's OWN identifier: the name still answers for the
+        // domain name the FIRST create minted, so a client holding that ARN is not
+        // pointed at a resource the refused request would have replaced.
+        assert_eq!(
+            as_str(&read, "domainNameArn"),
+            as_str(&first, "domainNameArn"),
+            "case {name:?}: expected the refused create to leave the domain name's own \
+             identifier, got {read}"
+        );
     }
+
+    // The refusal is about the names the account HOLDS and nothing wider: a name it does
+    // not hold is still created after every refusal above.
+    let unrelated = "free.example.com";
+    let created = accepted(
+        &emulator,
+        unrelated,
+        "POST",
+        "/v2/domainnames",
+        Some(json!({
+            "domainName": unrelated,
+            "domainNameConfigurations": [{ "certificateArn": certificate_arn("first") }]
+        })),
+        201,
+    )
+    .await;
+    assert_eq!(
+        as_str(&created, "domainName"),
+        unrelated,
+        "case {unrelated:?}: expected an unrelated name to still be creatable, got {created}"
+    );
 }
 
 /// RULE: a second `CreateModel` under a name the api already holds is `ConflictException`
