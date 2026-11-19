@@ -40,12 +40,16 @@ const AVAILABLE: &str = SCHEMA_VERSION_STATUS_AVAILABLE;
 const FAILURE: &str = SCHEMA_VERSION_STATUS_FAILURE;
 
 /// The Avro record the chains below start from: one required field.
-const BASE: &str = r#"{"type":"record","name":"User","fields":[{"name":"id","type":"string"}]}"#;
+///
+/// This and the four evolutions of it below are shared with
+/// [`crate::failed_schema_version_history`], which drives the same differences through the
+/// reads a failed version stays visible in.
+pub const BASE: &str = r#"{"type":"record","name":"User","fields":[{"name":"id","type":"string"}]}"#;
 
 /// The base with a field ADDED that carries a default: a reader using it reads data written
 /// with the base (the default fills the field in), and a reader of the base ignores the
 /// field. Compatible in both directions.
-const ADD_OPTIONAL: &str = concat!(
+pub const ADD_OPTIONAL: &str = concat!(
     r#"{"type":"record","name":"User","fields":[{"name":"id","type":"string"},"#,
     r#"{"name":"email","type":["null","string"],"default":null}]}"#
 );
@@ -53,7 +57,7 @@ const ADD_OPTIONAL: &str = concat!(
 /// The base with a field ADDED that carries no default: a reader using it cannot read data
 /// written with the base, while a reader of the base ignores the field. Backward
 /// incompatible, forward compatible.
-const ADD_REQUIRED: &str = concat!(
+pub const ADD_REQUIRED: &str = concat!(
     r#"{"type":"record","name":"User","fields":[{"name":"id","type":"string"},"#,
     r#"{"name":"email","type":"string"}]}"#
 );
@@ -62,12 +66,12 @@ const ADD_REQUIRED: &str = concat!(
 /// reader using it reads data written with the base (it ignores the dropped field), while a
 /// reader of the base cannot read data written with it. Forward incompatible, backward
 /// compatible.
-const DROP_FIELD: &str =
+pub const DROP_FIELD: &str =
     r#"{"type":"record","name":"User","fields":[{"name":"seq","type":"long","default":0}]}"#;
 
 /// The base's field with its TYPE changed to one Avro promotes neither way: incompatible in
 /// both directions.
-const CHANGE_TYPE: &str = r#"{"type":"record","name":"User","fields":[{"name":"id","type":"int"}]}"#;
+pub const CHANGE_TYPE: &str = r#"{"type":"record","name":"User","fields":[{"name":"id","type":"int"}]}"#;
 
 /// How a registered definition can differ from the version held, and what each difference
 /// means for a reader of one reading the other's data.
