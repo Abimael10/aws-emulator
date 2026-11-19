@@ -12,8 +12,8 @@
 //!
 //! * locale resolution ([`resolve_requested_locale`], [`Localized`]), per the `Locale`
 //!   shape's documentation;
-//! * the opaque pagination cursor the four `@paginated` operations share
-//!   ([`encode_page_token`], [`decode_page_token`], [`page`]);
+//! * the opaque pagination cursor the `@paginated` operations share
+//!   ([`page_cursor`]: [`encode_page_token`], [`decode_page_token`], [`page`]);
 //! * the projections from stored records onto wire shapes
 //!   ([`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::listing_summary`],
 //!   [`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::purchase_options`]);
@@ -32,6 +32,12 @@ mod taxonomy_rows;
 /// Where this emulator serves the buyer-facing pages a SaaS fulfillment option's record
 /// names, and the addresses it announces them at.
 mod saas_fulfillment;
+
+/// The sealed continuation token every `@paginated` read of this service hands out, and
+/// the key this store seals one under.
+mod page_cursor;
+
+pub use page_cursor::{decode_page_token, encode_page_token, page, PageCursorKey};
 
 pub use saas_fulfillment::{
     announced_page_base, saas_page_not_found_page, saas_page_path, saas_page_route, saas_page_url,
@@ -633,6 +639,13 @@ pub struct ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
     pub offer_sets: BTreeMap<String, OfferSet>,
     /// The terms attached to each offer, in the order `GetOfferTerms` pages over them.
     pub offer_terms: BTreeMap<String, Vec<OfferTerm>>,
+    /// The secret this store seals its pagination cursors under, drawn from the system's
+    /// randomness when the store is created and never reported ([`PageCursorKey`], whose
+    /// own `Debug` renders nothing of it, so this struct's does not either).
+    ///
+    /// Read by value — the key is `Copy` — so a paginated read can take it off the store
+    /// and go on borrowing the records it is about to report in the same call.
+    pub page_cursors: PageCursorKey,
 }
 
 impl Default for ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
@@ -1220,57 +1233,6 @@ pub fn canonical_locale(tag: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|supported| supported.eq_ignore_ascii_case(tag))
-}
-
-/// Encode an opaque page cursor: base64 of `<offset>:<query identity>`.
-///
-/// Base64's standard alphabet is exactly the `NextToken` pattern `^[a-zA-Z0-9+/=]+$`.
-/// Carrying the query identity is what lets [`decode_page_token`] refuse a token minted
-/// for a different query instead of silently answering from the wrong result set.
-pub fn encode_page_token(query_identity: &str, offset: usize) -> String {
-    ::aws_smithy_types::base64::encode(format!("{offset}:{query_identity}"))
-}
-
-/// Decode a cursor minted by [`encode_page_token`] for the same query.
-///
-/// The `Err` is the refusal message: a token the service did not mint, or one minted for
-/// another query, is bad input rather than a reason to silently restart at page 1.
-pub fn decode_page_token(token: &str, query_identity: &str) -> Result<usize, String> {
-    const MALFORMED: &str = "nextToken is not a pagination token issued by this service";
-    let decoded = ::aws_smithy_types::base64::decode(token).map_err(|_| MALFORMED.to_string())?;
-    let decoded = String::from_utf8(decoded).map_err(|_| MALFORMED.to_string())?;
-    let (offset, identity) = decoded.split_once(':').ok_or_else(|| MALFORMED.to_string())?;
-    let offset: usize = offset.parse().map_err(|_| MALFORMED.to_string())?;
-    if identity != query_identity {
-        return Err(
-            "nextToken was issued for a different request; page the same request or omit nextToken"
-                .to_string(),
-        );
-    }
-    Ok(offset)
-}
-
-/// One page of `items` plus the token for the next one, or the refusal message for a
-/// `nextToken` this service did not mint for this query.
-pub fn page<'a, T>(
-    items: &'a [T],
-    next_token: Option<&str>,
-    query_identity: &str,
-    max_results: i32,
-) -> Result<(&'a [T], Option<String>), String> {
-    let offset = match next_token {
-        Some(token) if !token.is_empty() => decode_page_token(token, query_identity)?,
-        _ => 0,
-    };
-    if offset > items.len() {
-        return Err(
-            "nextToken refers to a position beyond the end of the result set".to_string(),
-        );
-    }
-    let page_size = usize::try_from(max_results).unwrap_or(1).max(1);
-    let end = offset.saturating_add(page_size).min(items.len());
-    let token = (end < items.len()).then(|| encode_page_token(query_identity, end));
-    Ok((&items[offset..end], token))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -2565,6 +2527,8 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
         offers: BTreeMap::new(),
         offer_sets: BTreeMap::new(),
         offer_terms: BTreeMap::new(),
+        // One key per store, from the system's randomness: see `PageCursorKey`.
+        page_cursors: PageCursorKey::new(),
     };
 
     // ---- l-0001-analytics ------------------------------------------------

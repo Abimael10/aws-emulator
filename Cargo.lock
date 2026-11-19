@@ -16870,6 +16870,7 @@ dependencies = [
 name = "service-com-amazonaws-marketplacediscovery-awsmarketplacediscovery"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -16884,6 +16885,7 @@ dependencies = [
  "hex",
  "html-escape",
  "http",
+ "ring",
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",

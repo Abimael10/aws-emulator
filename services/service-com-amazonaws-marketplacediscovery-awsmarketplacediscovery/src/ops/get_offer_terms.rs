@@ -201,6 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let locale = offer.content_locale(preferred);
         let identity = format!("GetOfferTerms/{locale}/{}", offer.offer_id);
         let (page, next_token) = crate::state::page(
+            &state.page_cursors,
             terms,
             input.next_token.as_deref(),
             &identity,

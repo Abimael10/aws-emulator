@@ -214,6 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let identity = query_identity(locale, &product.product_id);
         let (page, next_token) = crate::state::page(
+            &state.page_cursors,
             &options,
             input.next_token.as_deref(),
             &identity,

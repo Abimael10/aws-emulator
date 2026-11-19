@@ -243,6 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let total_results = i64::try_from(matches.len()).unwrap_or(i64::MAX);
         let identity = query_identity(locale, &search_text, &filters, &input.sort_by, &input.sort_order);
         let (page, next_token) = crate::state::page(
+            &state.page_cursors,
             &matches,
             input.next_token.as_deref(),
             &identity,

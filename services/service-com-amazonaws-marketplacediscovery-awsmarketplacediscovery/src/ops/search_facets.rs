@@ -206,6 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let identity = query_identity(locale, &search_text, &filters, &facet_types);
         let (page, next_token) = crate::state::page(
+            &state.page_cursors,
             &facet_types,
             input.next_token.as_deref(),
             &identity,
