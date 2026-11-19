@@ -1,23 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end coverage of ONE rule: every response that projects a
-//! `HostedZone` serialises the modelled `Features` container for it.
+//! End-to-end coverage of ONE rule: what a response that projects a
+//! `HostedZone` serialises for the optional `Features` member.
 //!
-//! The rule under test: `HostedZone$Features` is part of the shape Route 53
-//! projects, so every operation answering with a hosted zone carries the
-//! container, and the container reports one child per feature status that zone
-//! HOLDS, read from the zone's own state. What counts as held depends on the
-//! projection: a SINGLE-zone projection (the create, the read, the comment
-//! update) echoes the features CONFIGURED on the zone — the public-DNS fallback
-//! status on a zone the feature applies to, which is a zone answered on the
-//! public internet and so never a private one, plus `AcceleratedRecoveryStatus`
-//! once an accepted `UpdateHostedZoneFeatures` has configured one — while an
-//! account-wide LISTING reports each listed zone's feature POSTURE, so every
-//! zone it lists carries the fallback status, private ones included. A client
-//! deserialising `HostedZone` into a strict shape therefore always finds the
-//! member, a feature a zone holds is never reported as an empty container, and
-//! a zone holding no feature status reports the container empty rather than
-//! inventing one.
+//! The rule under test: `HostedZone$Features` is the OPTIONAL member carrying
+//! the zone's features configuration, and a member the service has no value for
+//! is not serialised at all — never as an empty container. What counts as a
+//! value depends on the projection: a SINGLE-zone projection (the create, the
+//! read, the comment update) reports the member only for a zone that HAS a
+//! features configuration, which is a zone an accepted
+//! `UpdateHostedZoneFeatures` has configured, and then reports the statuses that
+//! zone holds — its accelerated-recovery status plus the public-DNS fallback
+//! status of a zone the feature applies to, which is a zone answered on the
+//! public internet and so never a private one — while an account-wide LISTING
+//! reports each listed zone's feature POSTURE, so every zone it lists carries
+//! the fallback status, private ones included. A client therefore tells "this
+//! zone reports no features configuration" from "features exist" by the
+//! presence of the member, and a feature a zone holds is never reported as an
+//! empty container.
 //!
 //! One zone read by one operation is ONE row of that class, so the tables below
 //! span it: zones differing in label count, in public/private, in whether they
@@ -43,7 +43,8 @@ use std::time::{Duration, Instant};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_route53_awsdnsv20130401::state::{
-    ACCELERATED_RECOVERY_ENABLED, ACCELERATED_RECOVERY_ENABLING,
+    ACCELERATED_RECOVERY_DISABLED, ACCELERATED_RECOVERY_DISABLING, ACCELERATED_RECOVERY_ENABLED,
+    ACCELERATED_RECOVERY_ENABLING,
 };
 
 use crate::hosted_zone_records::{call, create_zone_body, escape_xml, Reply};
@@ -272,6 +273,18 @@ struct Held {
     accelerated: Option<&'static str>,
 }
 
+/// Assert a reply opens NO `Features` container at all: the optional member a
+/// zone has no value for is left out, not serialised empty.
+fn assert_no_features(case: &str, reply: &Reply) {
+    let blocks = features_blocks(&reply.body);
+    assert!(
+        blocks.is_empty(),
+        "case {case:?}: a zone with no features configuration must not serialise the optional \
+         Features member, got {blocks:?}; body {}",
+        reply.body
+    );
+}
+
 /// Assert one zone's `Features` container is a STRUCTURE carrying THAT zone's
 /// statuses: the ones it holds as children, each a modelled member, and — the
 /// divergence this file exists for — never the empty element for a zone that
@@ -393,15 +406,13 @@ fn zone_rows() -> [ZoneRow; 6] {
 }
 
 #[tokio::test]
-async fn every_hosted_zone_projection_carries_the_features_container() {
-    // The rule: the `Features` container is serialised for every projected
-    // hosted zone, carrying the status of each feature the zone holds — on a
-    // single-zone projection, for a public zone nothing has configured, the
-    // public-DNS fallback status alone, and for a private one, which that
-    // feature does not apply to, nothing. The rows span the zones; each one is
-    // asserted on the create, the single read and the comment update, and the
-    // listings, which report each zone's posture, are asserted over all of them
-    // at once.
+async fn a_zone_with_no_features_configuration_omits_the_features_member() {
+    // The rule: the optional `Features` member is serialised only where the
+    // service has a value for it, so a single-zone projection of a zone no
+    // features update has configured leaves the member out entirely — not an
+    // empty container. The rows span the zones; each one is asserted on the
+    // create, the single read and the comment update, and the listings, which
+    // report each zone's posture, are asserted over all of them at once.
     let router = router();
     let rows = zone_rows();
     let mut ids = Vec::new();
@@ -419,8 +430,9 @@ async fn every_hosted_zone_projection_carries_the_features_container() {
             "case {:?}: expected 201 from CreateHostedZone, got {} with body {}",
             row.case, created.status, created.body
         );
-        let blocks = features_of(row.case, &created, 1);
-        assert_features(row.case, blocks[0], None, row.expected_fallback());
+        // A zone is created with no features configuration whatever its
+        // config block says, so no projection of it opens the container.
+        assert_no_features(row.case, &created);
 
         let zone_id = bare_zone_id(&created);
         let read = get_zone(&router, &zone_id).await;
@@ -429,13 +441,7 @@ async fn every_hosted_zone_projection_carries_the_features_container() {
             "case {:?}: expected 200 from GetHostedZone, got {} with body {}",
             row.case, read.status, read.body
         );
-        let read_blocks = features_of(row.case, &read, 1);
-        assert_eq!(
-            read_blocks, blocks,
-            "case {:?}: GetHostedZone must report the Features the create did, got {:?} \
-             after {:?}; body {}",
-            row.case, read_blocks, blocks, read.body
-        );
+        assert_no_features(row.case, &read);
 
         let updated = update_comment(&router, &zone_id, "a later comment").await;
         assert_eq!(
@@ -443,8 +449,7 @@ async fn every_hosted_zone_projection_carries_the_features_container() {
             "case {:?}: expected 200 from UpdateHostedZoneComment, got {} with body {}",
             row.case, updated.status, updated.body
         );
-        let updated_blocks = features_of(row.case, &updated, 1);
-        assert_features(row.case, updated_blocks[0], None, row.expected_fallback());
+        assert_no_features(row.case, &updated);
 
         ids.push(zone_id);
     }
@@ -501,9 +506,10 @@ async fn every_hosted_zone_projection_carries_the_features_container() {
 async fn the_features_container_reports_the_configured_feature_on_every_projection() {
     // The rule's other half: the container is the zone's own state, so once an
     // accepted update has configured a zone, EVERY projection of that zone
-    // reports the status in the same always-present container — while the zones
-    // beside it report only the fallback status. The rows are the public zones of
-    // the table above, which are the zones accelerated recovery applies to.
+    // opens the container and reports the status in it — while the zones beside
+    // it, which have no features configuration, open none at all. The rows are
+    // the public zones of the table above, which are the zones accelerated
+    // recovery applies to.
     let router = router();
     let rows = zone_rows();
     let mut configured = Vec::new();
@@ -552,12 +558,11 @@ async fn the_features_container_reports_the_configured_feature_on_every_projecti
         );
     }
 
-    // A zone nobody configured still carries the container, with the statuses
-    // the zone holds and nothing else in it — for these private zones, none.
+    // A zone nobody configured has no features configuration to report, so its
+    // single-zone read opens no container at all.
     for (case, zone_id) in &untouched {
         let read = get_zone(&router, zone_id).await;
-        let blocks = features_of(case, &read, 1);
-        assert_features(case, blocks[0], None, None);
+        assert_no_features(case, &read);
     }
 
     // And the listing projects both kinds: one container per zone, carrying the
@@ -626,17 +631,179 @@ fn fallback_status(block: &str) -> Option<String> {
     element_text(block, PUBLIC_DNS_FALLBACK_STATUS)
 }
 
+/// Look at one zone until its `Features` container reports `want` for
+/// `AcceleratedRecoveryStatus`, or [`SETTLE_DEADLINE`] passes, and hand back
+/// what the last read reported with that read's body for the message.
+///
+/// Waits for the CONDITION rather than for a span, so a loaded or a fast host
+/// only changes how often it looks.
+async fn poll_until_status(
+    router: &MultiServiceRouter,
+    zone_id: &str,
+    want: &str,
+) -> (Option<String>, String) {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let read = get_zone(router, zone_id).await;
+        let status = features_blocks(&read.body)
+            .first()
+            .and_then(|block| element_text(block, "AcceleratedRecoveryStatus"));
+        if status.as_deref() == Some(want) || Instant::now() >= deadline {
+            return (status, read.body);
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
+/// One state a zone's features configuration can be in: the settings an accepted
+/// update asks for to reach it, whether the last one is waited out, and what a
+/// projection then has to report.
+struct FeatureState {
+    case: &'static str,
+    /// The settings to ask `UpdateHostedZoneFeatures` for, in order.
+    updates: &'static [bool],
+    /// The `AcceleratedRecoveryStatus` to wait for before asserting, for a state
+    /// the zone only reaches once the propagation span is up.
+    settled: Option<&'static str>,
+    /// The status the `Features` container must report, and `None` for a state
+    /// with no features configuration at all — where the optional member is not
+    /// serialised.
+    expected: Option<&'static str>,
+}
+
+/// Every state of the one feature this API version configures, from the state a
+/// zone is created in to both settled settings and both moving ones.
+fn feature_states() -> [FeatureState; 5] {
+    [
+        FeatureState {
+            case: "no features configuration at all",
+            updates: &[],
+            settled: None,
+            expected: None,
+        },
+        FeatureState {
+            case: "an accepted enable, still moving",
+            updates: &[true],
+            settled: None,
+            expected: Some(ACCELERATED_RECOVERY_ENABLING),
+        },
+        FeatureState {
+            case: "an accepted enable, settled",
+            updates: &[true],
+            settled: Some(ACCELERATED_RECOVERY_ENABLED),
+            expected: Some(ACCELERATED_RECOVERY_ENABLED),
+        },
+        FeatureState {
+            case: "an accepted disable, still moving",
+            updates: &[true, false],
+            settled: None,
+            expected: Some(ACCELERATED_RECOVERY_DISABLING),
+        },
+        FeatureState {
+            case: "an accepted disable, settled",
+            updates: &[true, false],
+            settled: Some(ACCELERATED_RECOVERY_DISABLED),
+            expected: Some(ACCELERATED_RECOVERY_DISABLED),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn the_features_member_is_serialised_exactly_when_the_zone_has_a_features_configuration() {
+    // The rule along the axis it generalises over: the optional `Features`
+    // member is serialised by a single-zone projection exactly when the zone HAS
+    // a features configuration — which an accepted `UpdateHostedZoneFeatures` is
+    // what gives it — and is left out entirely otherwise, never opened as an
+    // empty container. The rows cross every zone of the table (label count,
+    // public/private, commented or not) with every state the configuration can
+    // be in: none at all, both settings while they are still moving and both
+    // once they have settled. A private zone cannot have the feature configured,
+    // so for it every row is the no-configuration row and the update is refused.
+    let router = router();
+    for (row_index, row) in zone_rows().iter().enumerate() {
+        for (state_index, state) in feature_states().iter().enumerate() {
+            let case = format!("{} with {}", row.case, state.case);
+            // One zone per cell, named with its own label, so no cell can read
+            // the configuration another one left.
+            let created = create_zone(
+                &router,
+                &format!("s{row_index}x{state_index}.{}", row.name.trim_end_matches('.')),
+                &format!("features-state-{row_index}-{state_index}"),
+                row.extra,
+            )
+            .await;
+            assert_eq!(
+                created.status, 201,
+                "case {case:?}: expected 201 from CreateHostedZone, got {} with body {}",
+                created.status, created.body
+            );
+            let zone_id = bare_zone_id(&created);
+
+            for enable in state.updates {
+                let reply = update_features(&router, &zone_id, *enable).await;
+                let expected_status = if row.private { 400 } else { 200 };
+                assert_eq!(
+                    reply.status, expected_status,
+                    "case {case:?}: expected {expected_status} from \
+                     UpdateHostedZoneFeatures(enable={enable}), got {} with body {}",
+                    reply.status, reply.body
+                );
+                // The update answers with no hosted zone, so it opens no
+                // container of its own either way.
+                assert_no_features(&case, &reply);
+            }
+
+            // A private zone's update was refused, so it is still a zone with no
+            // features configuration whatever the row asked for.
+            let expected = if row.private { None } else { state.expected };
+            if let (false, Some(want)) = (row.private, state.settled) {
+                let (status, body) = poll_until_status(&router, &zone_id, want).await;
+                assert_eq!(
+                    status.as_deref(),
+                    Some(want),
+                    "case {case:?}: the zone must reach {want}, got {status:?}; body {body}"
+                );
+            }
+
+            // Every single-zone projection of that zone agrees, because they
+            // project the same zone.
+            for (reader, reply) in [
+                ("GetHostedZone", get_zone(&router, &zone_id).await),
+                (
+                    "UpdateHostedZoneComment",
+                    update_comment(&router, &zone_id, "a later comment").await,
+                ),
+            ] {
+                let case = format!("{case} read by {reader}");
+                match expected {
+                    None => assert_no_features(&case, &reply),
+                    Some(status) => {
+                        let blocks = features_of(&case, &reply, 1);
+                        assert_features(
+                            &case,
+                            blocks[0],
+                            Some(status),
+                            row.expected_fallback(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn every_hosted_zone_projection_reports_the_zones_public_dns_fallback_status() {
-    // The other half of the container rule, and the one an empty `<Features/>`
-    // breaks: a feature status a zone HOLDS is reported as a child of the
-    // container by every projection of that zone, with the value read off the
-    // zone's own state. On a single-zone projection a zone holds the public-DNS
-    // fallback status only where the feature applies — a zone answered on the
-    // public internet — so every public row of the table reports it on the
-    // create, the single read and the comment update while every private row
-    // reports nothing, and all of them agree; both listings report each listed
-    // zone's posture, so there every row reports it.
+    // The other half of the rule, and the one an empty `<Features/>` breaks: a
+    // feature status a zone HOLDS is reported as a child of the container by
+    // every projection that opens one, with the value read off the zone's own
+    // state. On a single-zone projection the container is opened only for a zone
+    // with a features configuration, and it then carries the public-DNS fallback
+    // status where the feature applies — a zone answered on the public internet —
+    // so every public row of the table reports it on the configured read while
+    // every private row, which cannot be configured, reports no container at
+    // all; both listings report each listed zone's posture, so there every row
+    // reports it.
     let router = router();
     let rows = zone_rows();
     let mut ids = Vec::new();
@@ -654,18 +821,22 @@ async fn every_hosted_zone_projection_reports_the_zones_public_dns_fallback_stat
             "case {:?}: expected 201 from CreateHostedZone, got {} with body {}",
             row.case, created.status, created.body
         );
-        let reported = fallback_status(features_of(row.case, &created, 1)[0]);
-        assert_eq!(
-            reported.as_deref(),
-            row.expected_fallback(),
-            "case {:?}: expected {PUBLIC_DNS_FALLBACK_STATUS} {:?} on the create, got \
-             {reported:?}; body {}",
-            row.case,
-            row.expected_fallback(),
-            created.body
-        );
 
         let zone_id = bare_zone_id(&created);
+        // Configuring the one feature this API version can configure is what
+        // gives the zone a features configuration to report; it is refused for a
+        // private zone, which therefore keeps reporting no container.
+        let configured = update_features(&router, &zone_id, true).await;
+        assert_eq!(
+            configured.status,
+            if row.private { 400 } else { 200 },
+            "case {:?}: expected {} from UpdateHostedZoneFeatures, got {} with body {}",
+            row.case,
+            if row.private { 400 } else { 200 },
+            configured.status,
+            configured.body
+        );
+
         for (reader, reply) in [
             ("GetHostedZone", get_zone(&router, &zone_id).await),
             (
@@ -674,11 +845,17 @@ async fn every_hosted_zone_projection_reports_the_zones_public_dns_fallback_stat
             ),
         ] {
             let case = format!("{} read by {reader}", row.case);
+            if row.private {
+                assert_no_features(&case, &reply);
+                continue;
+            }
             let seen = fallback_status(features_of(&case, &reply, 1)[0]);
             assert_eq!(
-                seen, reported,
-                "case {case:?}: every projection of one zone must report the same \
-                 {PUBLIC_DNS_FALLBACK_STATUS}, got {seen:?} after {reported:?}; body {}",
+                seen.as_deref(),
+                row.expected_fallback(),
+                "case {case:?}: a configured zone's container must report \
+                 {PUBLIC_DNS_FALLBACK_STATUS} {:?}, got {seen:?}; body {}",
+                row.expected_fallback(),
                 reply.body
             );
         }
@@ -719,12 +896,6 @@ async fn every_hosted_zone_projection_reports_the_zones_public_dns_fallback_stat
         .first()
         .expect("the table creates at least one zone")
         .clone();
-    let updated = update_features(&router, &public, true).await;
-    assert_eq!(
-        updated.status, 200,
-        "expected 200 from UpdateHostedZoneFeatures, got {} with body {}",
-        updated.status, updated.body
-    );
     let (accelerated, body) = settled_status(&router, &public).await;
     assert!(
         accelerated.is_some(),

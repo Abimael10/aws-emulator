@@ -1000,8 +1000,9 @@ impl StoredZone {
             // reports none.
             linked_service: linked_service::of_zone(self),
             // Read off the zone, so what the last accepted features update left
-            // is what every hosted-zone read reports.
-            features: Some(self.to_hosted_zone_features()),
+            // is what every hosted-zone read reports — and NOTHING at all for a
+            // zone no features update has configured.
+            features: self.to_hosted_zone_features(),
         }
     }
 
@@ -1013,8 +1014,8 @@ impl StoredZone {
     /// one's feature POSTURE — the status of every feature the zone has,
     /// including a feature that is merely off and one nobody has configured —
     /// while a single-zone projection (the create, the read, the comment update)
-    /// echoes only the features CONFIGURED on the zone. So a zone the
-    /// public-DNS fallback feature has never been enabled on reports that
+    /// reports only a features CONFIGURATION the zone actually has. So a zone
+    /// the public-DNS fallback feature has never been enabled on reports that
     /// feature's off status in the listing, whether the zone is public or
     /// private, and the statuses a listing reports are still read off the zone
     /// itself rather than fixed per operation.
@@ -1030,42 +1031,54 @@ impl StoredZone {
     /// having been configured — see [`StoredZone::to_listed_hosted_zone`].
     pub fn to_listed_hosted_zone_features(&self) -> HostedZoneFeatures {
         HostedZoneFeatures {
+            accelerated_recovery_status: self.accelerated_recovery_status().map(str::to_string),
+            failure_reasons: None,
             // A state every zone HAS, on or off, so every listed zone reports
             // it: see [`StoredZone::public_dns_fallback_posture`].
             public_dns_fallback_status: Some(self.public_dns_fallback_posture().to_string()),
-            ..self.to_hosted_zone_features()
         }
     }
 
     /// The `Features` a SINGLE-zone projection — the create, the read, the
-    /// comment update — reports for this zone.
+    /// comment update — reports for this zone, and `None` for a zone that has
+    /// no features configuration to report.
     ///
-    /// The container itself is ALWAYS reported — Route 53 projects the
-    /// `Features` structure on every hosted zone it answers with — so a client
-    /// deserialising `HostedZone` into a strict shape always finds the member,
-    /// and "no feature configured" is distinguishable from "not reported". Its
-    /// MEMBERS are what the zone's state decides, one child per feature status
-    /// the zone HOLDS: the public-DNS fallback status on a zone the feature
-    /// applies to (see [`StoredZone::public_dns_fallback_status`]), while
-    /// `AcceleratedRecoveryStatus` has no status until
-    /// `UpdateHostedZoneFeatures` has configured the zone and `FailureReasons`
-    /// stays absent because no features change this store accepts fails. A zone
-    /// holding neither therefore reports the container empty. What an
-    /// account-wide listing reports instead is
+    /// `HostedZone$Features` is the OPTIONAL member carrying "the features
+    /// configuration for the hosted zone", and an optional member the service
+    /// has no value for is not serialised at all — the rule the sibling
+    /// `HostedZone$Config` documentation states for a config that was never
+    /// supplied. A zone has a features configuration once a features update has
+    /// been accepted on it (`UpdateHostedZoneFeatures`, the one operation that
+    /// configures a feature); until then there is no configuration to report, so
+    /// the member stays absent rather than opening an empty container. The
+    /// MEMBERS of a configuration the zone does have are what the zone's state
+    /// decides: the accelerated-recovery status it is in or moving to, the
+    /// public-DNS fallback status of a zone the feature applies to (see
+    /// [`StoredZone::public_dns_fallback_status`]), and no `FailureReasons`
+    /// because no features change this store accepts fails. What an account-wide
+    /// listing reports instead is
     /// [`StoredZone::to_listed_hosted_zone_features`].
-    pub fn to_hosted_zone_features(&self) -> HostedZoneFeatures {
-        HostedZoneFeatures {
-            accelerated_recovery_status: self
-                .accelerated_recovery
-                .as_ref()
-                .map(|feature| feature.status().to_string()),
+    pub fn to_hosted_zone_features(&self) -> Option<HostedZoneFeatures> {
+        let accelerated_recovery_status = self.accelerated_recovery_status()?;
+        Some(HostedZoneFeatures {
+            accelerated_recovery_status: Some(accelerated_recovery_status.to_string()),
             failure_reasons: None,
             // Reported only where the feature applies: see
             // [`StoredZone::public_dns_fallback_status`].
-            public_dns_fallback_status: self
-                .public_dns_fallback_status()
-                .map(str::to_string),
-        }
+            public_dns_fallback_status: self.public_dns_fallback_status().map(str::to_string),
+        })
+    }
+
+    /// The `AcceleratedRecoveryStatus` this zone has, and `None` for a zone no
+    /// features update has configured the feature on.
+    ///
+    /// Derived from the setting the last accepted update left and the clock (see
+    /// [`AcceleratedRecovery::status`]), so a zone still moving to its setting
+    /// reports the moving status without anyone advancing it.
+    pub fn accelerated_recovery_status(&self) -> Option<&'static str> {
+        self.accelerated_recovery
+            .as_ref()
+            .map(AcceleratedRecovery::status)
     }
 
     /// The public-DNS fallback status a SINGLE-zone projection reports for this
