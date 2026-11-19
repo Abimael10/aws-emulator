@@ -316,6 +316,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // pass materialised, so a task that has just reached `STOPPED` is already out of
         // the count its replacement is weighed against.
         self.maintain_service_task_counts(now);
+        // And the same work for a service whose tasks come from a TASK SET: the count each
+        // task set wants follows the service's `desiredCount`, so a task set that is short
+        // of it has the shortfall placed by this pass too
+        // ([`super::controller_task_sets`]).
+        self.maintain_task_set_counts(now);
         // The daemon scheduler's own steady-state work: "Amazon ECS deploys exactly one
         // daemon task on each container instance of the specified capacity providers. When a
         // container instance registers with the cluster, Amazon ECS automatically starts

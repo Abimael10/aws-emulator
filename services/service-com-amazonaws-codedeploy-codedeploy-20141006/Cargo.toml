@@ -69,6 +69,15 @@ aws-sdk-sns = { version = "1", default-features = false }
 # `DescribeServices` through the in-process callback before the group is stored
 # (`state::ecs_services`); `default-features = false` for the reason above.
 aws-sdk-ecs = { version = "1", default-features = false }
+# An Amazon ECS deployment INSTALLS a replacement task set in the service its group
+# targets and then reroutes the production traffic onto it. The task sets are Amazon
+# ECS's own resources and the listeners Elastic Load Balancing v2's, so each write is
+# made in the store of the service that owns it through the shared engine — the very
+# records `CreateTaskSet`, `DescribeTaskSets` and `DescribeListeners` read — which
+# needs the owning services' state TYPES (`state::ecs_blue_green`). No cycle: neither
+# crate depends on this one.
+service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = true }
+service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -91,11 +100,6 @@ percent-encoding = "2.3"
 # both are mounted beside CodeDeploy on one engine by the shared test harness.
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
-# A deployment group's `ecsServices` are resolved against Amazon ECS, so the suite
-# about that resolution mounts that service beside CodeDeploy on one engine and
-# creates the cluster, the task definition and the service through its own front
-# door.
-service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = true }
 
 [lints]
 workspace = true

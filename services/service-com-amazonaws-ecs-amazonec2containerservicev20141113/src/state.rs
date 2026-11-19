@@ -431,6 +431,12 @@ pub use unhealthy_task_replacement::*;
 /// and the standalone task that earns none.
 mod service_steady_state;
 
+/// The task sets of a service a controller other than the ECS scheduler deploys through:
+/// the original application task set Amazon ECS creates for a CodeDeploy-controlled
+/// service, and the replacement one a controller adds to it.
+mod controller_task_sets;
+pub use controller_task_sets::*;
+
 /// The two bounds a ROLLING UPDATE is held to: the ceiling the replacements it starts are
 /// allowed under, and the floor the tasks they replace are stopped down to.
 mod rolling_update;

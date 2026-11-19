@@ -2,16 +2,23 @@
 
 //! What a revision's AppSpec DECLARES a deployment deploys.
 //!
-//! A deployment of the `Lambda` compute platform deploys a revision that IS the
-//! AppSpec file — "the content includes a Lambda function name, the alias for its
-//! original version, and the alias for its replacement version. The deployment
-//! shifts traffic from the original version of the Lambda function to the
-//! replacement version"
+//! A deployment of the `Lambda` or the `ECS` compute platform deploys a revision that
+//! IS the AppSpec file: "For an Lambda deployment, the content includes a Lambda
+//! function name, the alias for its original version, and the alias for its
+//! replacement version. The deployment shifts traffic from the original version of
+//! the Lambda function to the replacement version. … For an Amazon ECS deployment,
+//! the content includes the task name, information about the load balancer that
+//! serves traffic to the container, and more"
 //! (`smithy_query(query="shape",shape="AppSpecContent")`). This module is the one
-//! place that document is READ: what it declares is resolved once, when the
-//! deployment is recorded, so no later request re-parses caller-supplied content.
-//! Carrying the declared shift out is [`super::lambda_traffic_shift`]'s, and the
-//! increments it is carried out in are [`super::traffic_shift`]'s.
+//! place that document is READ, for both of them: what it declares is resolved once,
+//! when the deployment is recorded, so no later request re-parses caller-supplied
+//! content. One traversal reads it ([`declaration_in_app_spec`]) and one leaf reader
+//! per platform says what a declaration of it means — the Lambda traffic shift
+//! ([`LambdaTrafficShift`]) and the Amazon ECS replacement task set
+//! ([`EcsTaskSetDeclaration`]). Carrying the declared shift out is
+//! [`super::lambda_traffic_shift`]'s, the Amazon ECS deployment's steps are
+//! [`super::ecs_blue_green`]'s, and the increments either is carried out in are
+//! [`super::traffic_shift`]'s.
 //!
 //! The document is YAML or JSON (YAML 1.2 is a superset of JSON, so one parser
 //! reads both), and it is caller-supplied, so it is read through a maintained YAML
@@ -45,6 +52,43 @@ const ALIAS_PROPERTY: &str = "Alias";
 const CURRENT_VERSION_PROPERTY: &str = "CurrentVersion";
 /// The property naming the version the alias invokes after the deployment.
 const TARGET_VERSION_PROPERTY: &str = "TargetVersion";
+/// The `ComputePlatform` whose deployments replace an Amazon ECS service's task set
+/// (`crate::ops::types::COMPUTE_PLATFORM_VALUES`: ECS | Lambda | Server).
+pub const COMPUTE_PLATFORM_ECS: &str = "ECS";
+/// The resource type of the Amazon ECS service an Amazon ECS AppSpec deploys, which
+/// is the only declaration that describes a replacement task set.
+const ECS_SERVICE_RESOURCE_TYPE: &str = "AWS::ECS::Service";
+/// The property naming the revision the replacement task set runs.
+const TASK_DEFINITION_PROPERTY: &str = "TaskDefinition";
+/// The property carrying "information about the load balancer that serves traffic to
+/// the container", whose two members name that container and its port.
+const LOAD_BALANCER_INFO_PROPERTY: &str = "LoadBalancerInfo";
+/// See [`LOAD_BALANCER_INFO_PROPERTY`].
+const CONTAINER_NAME_PROPERTY: &str = "ContainerName";
+/// See [`LOAD_BALANCER_INFO_PROPERTY`].
+const CONTAINER_PORT_PROPERTY: &str = "ContainerPort";
+/// The property naming the Fargate platform version the replacement runs on.
+const PLATFORM_VERSION_PROPERTY: &str = "PlatformVersion";
+/// The property carrying the networking the replacement task set is placed with, and
+/// the one member of it that describes an `awsvpc` placement.
+const NETWORK_CONFIGURATION_PROPERTY: &str = "NetworkConfiguration";
+/// See [`NETWORK_CONFIGURATION_PROPERTY`].
+const AWSVPC_CONFIGURATION_PROPERTY: &str = "AwsvpcConfiguration";
+/// The members of that placement: the subnets its interfaces are created in, the
+/// security groups governing them, and whether it takes a public address.
+const SUBNETS_PROPERTY: &str = "Subnets";
+/// See [`SUBNETS_PROPERTY`].
+const SECURITY_GROUPS_PROPERTY: &str = "SecurityGroups";
+/// See [`SUBNETS_PROPERTY`].
+const ASSIGN_PUBLIC_IP_PROPERTY: &str = "AssignPublicIp";
+/// How many entries one list-valued AppSpec property is read from.
+///
+/// The content is caller-supplied and the document states no length, so this is
+/// EMULATOR-CHOSEN, well above the handful of subnets and security groups an
+/// `awsvpc` placement names (the ceiling of the Amazon VPC quota on security groups
+/// per network interface is 16, and a placement names one subnet per Availability
+/// Zone).
+const MAX_DECLARED_LIST_ENTRIES: usize = 16;
 /// The AppSpec mapping holding the lifecycle event hooks a deployment runs:
 /// "A deployment lifecycle hook is specified in the hooks section of the AppSpec
 /// file"
@@ -179,13 +223,97 @@ pub fn revision_content(revision: &RevisionLocation) -> Option<&str> {
 /// standing a deployment up for every row.
 #[must_use]
 pub fn declared_in_app_spec(content: &str) -> Option<LambdaTrafficShift> {
+    declaration_in_app_spec(content, LAMBDA_FUNCTION_RESOURCE_TYPE, lambda_shift_of)
+}
+
+/// The declaration of `resource_type` an AppSpec document carries, as `properties`
+/// reads it, or `None` for content that carries none — including content that is no
+/// YAML (or JSON, which YAML 1.2 is a superset of) document at all, and content
+/// outside the bounds this emulator parses one within.
+///
+/// The ONE traversal of an AppSpec, for every platform that declares something in
+/// one: the bounds, the `Resources` section written as a sequence or as a mapping,
+/// the entry that names its resource or IS the resource's body, and the `Type` that
+/// must be the resource kind asked for. What a declaration of that kind MEANS is the
+/// leaf reader's — [`lambda_shift_of`], [`ecs_task_set_of`] — so neither platform
+/// carries a copy of the walk.
+fn declaration_in_app_spec<T>(
+    content: &str,
+    resource_type: &str,
+    properties: impl Fn(&Yaml) -> Option<T> + Copy,
+) -> Option<T> {
     if !within_bounds(content) || !parses_within_depth(content) {
         return None;
     }
     ::yaml_rust2::YamlLoader::load_from_str(content)
         .ok()?
         .iter()
-        .find_map(declared_in_document)
+        .find_map(|document| declaration_in_document(document, resource_type, properties))
+}
+
+/// The declaration one document's `Resources` section carries: the first entry that
+/// describes a resource of `resource_type`.
+fn declaration_in_document<T>(
+    document: &Yaml,
+    resource_type: &str,
+    properties: impl Fn(&Yaml) -> Option<T> + Copy,
+) -> Option<T> {
+    let resources = mapping_get(document, RESOURCES_KEY)?;
+    match resources {
+        Yaml::Array(declarations) => declarations
+            .iter()
+            .find_map(|declaration| declaration_in_entry(declaration, resource_type, properties)),
+        mapping => declaration_in_entry(mapping, resource_type, properties),
+    }
+}
+
+/// The declaration one `Resources` entry carries.
+///
+/// An AppSpec names the resource it deploys, so an entry is a mapping from that
+/// logical name to the resource's own body; an entry that IS the body carries the
+/// `Properties` mapping itself, and is read the same way.
+fn declaration_in_entry<T>(
+    entry: &Yaml,
+    resource_type: &str,
+    properties: impl Fn(&Yaml) -> Option<T> + Copy,
+) -> Option<T> {
+    let Yaml::Hash(named) = entry else {
+        return None;
+    };
+    named
+        .iter()
+        .map(|(_, body)| body)
+        .chain(::std::iter::once(entry))
+        .find_map(|body| declaration_in_body(body, resource_type, properties))
+}
+
+/// The declaration one resource body carries: its `Properties`, when the body is a
+/// resource of `resource_type` at all.
+///
+/// The resource's `Type` is REQUIRED to be that kind: a body that states another type
+/// declares nothing about this platform's deployment, and a body that states no type
+/// is no resource declaration this emulator reads one out of.
+fn declaration_in_body<T>(
+    body: &Yaml,
+    resource_type: &str,
+    properties: impl Fn(&Yaml) -> Option<T>,
+) -> Option<T> {
+    if mapping_get(body, TYPE_KEY)
+        .and_then(scalar)
+        .is_none_or(|declared| declared.trim() != resource_type)
+    {
+        return None;
+    }
+    properties(mapping_get(body, PROPERTIES_KEY)?)
+}
+
+/// One property of a declaration as the text it carries, or `None` where it states
+/// none.
+fn property(properties: &Yaml, name: &str) -> Option<String> {
+    mapping_get(properties, name)
+        .and_then(scalar)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// One lifecycle event hook a revision's AppSpec declares: the lifecycle event,
@@ -327,58 +455,117 @@ fn parses_within_depth(content: &str) -> bool {
     parsed.is_ok() && !guard.saw_alias && guard.deepest <= MAX_APP_SPEC_DEPTH
 }
 
-/// The traffic shift one AppSpec document declares: the first `Resources` entry
-/// that describes a Lambda function.
-fn declared_in_document(document: &Yaml) -> Option<LambdaTrafficShift> {
-    let resources = mapping_get(document, RESOURCES_KEY)?;
-    match resources {
-        Yaml::Array(declarations) => declarations.iter().find_map(declared_in_declaration),
-        mapping => declared_in_declaration(mapping),
-    }
-}
-
-/// The traffic shift one `Resources` entry declares.
-///
-/// An AppSpec names the resource it deploys, so an entry is a mapping from that
-/// logical name to the resource's own body; an entry that IS the body carries the
-/// `Properties` mapping itself, and is read the same way.
-fn declared_in_declaration(declaration: &Yaml) -> Option<LambdaTrafficShift> {
-    let Yaml::Hash(named) = declaration else {
-        return None;
-    };
-    named
-        .iter()
-        .map(|(_, body)| body)
-        .chain(::std::iter::once(declaration))
-        .find_map(declared_in_body)
-}
-
-/// The traffic shift one resource body declares: its `Properties`, when the body
-/// is a Lambda function at all.
-///
-/// The resource's `Type` is REQUIRED to be the Lambda function one: a body that
-/// states another type describes no version shift, and a body that states no type
-/// is no resource declaration this emulator reads a shift out of.
-fn declared_in_body(body: &Yaml) -> Option<LambdaTrafficShift> {
-    if mapping_get(body, TYPE_KEY)
-        .and_then(scalar)
-        .is_none_or(|declared| declared.trim() != LAMBDA_FUNCTION_RESOURCE_TYPE)
-    {
-        return None;
-    }
-    let properties = mapping_get(body, PROPERTIES_KEY)?;
-    let property = |name: &str| {
-        mapping_get(properties, name)
-            .and_then(scalar)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    };
+/// The traffic shift one Lambda function declaration's `Properties` describe: the
+/// leaf reader of the walk above, for the `Lambda` compute platform.
+fn lambda_shift_of(properties: &Yaml) -> Option<LambdaTrafficShift> {
     Some(LambdaTrafficShift {
-        function_name: property(NAME_PROPERTY)?,
-        alias_name: property(ALIAS_PROPERTY)?,
-        current_version: property(CURRENT_VERSION_PROPERTY),
-        target_version: property(TARGET_VERSION_PROPERTY)?,
+        function_name: property(properties, NAME_PROPERTY)?,
+        alias_name: property(properties, ALIAS_PROPERTY)?,
+        current_version: property(properties, CURRENT_VERSION_PROPERTY),
+        target_version: property(properties, TARGET_VERSION_PROPERTY)?,
     })
+}
+
+/// What one Amazon ECS deployment replaces its service's task set WITH, as its
+/// revision's AppSpec declares it.
+///
+/// "For an Amazon ECS deployment, the content includes the task name, information
+/// about the load balancer that serves traffic to the container, and more"
+/// (`smithy_query(query="shape",shape="AppSpecContent")`), so the replacement task
+/// set's own configuration is read out of the document — once, when the deployment
+/// is recorded, exactly as a Lambda deployment's shift is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EcsTaskSetDeclaration {
+    /// The revision the replacement task set runs: the `TaskDefinition` property,
+    /// as the document gives it (an ARN, a `family:revision` or a family).
+    pub task_definition: String,
+    /// The container the load balancer serves traffic to, and the port on it:
+    /// `LoadBalancerInfo`'s `ContainerName` and `ContainerPort`.
+    pub container_name: Option<String>,
+    /// See [`Self::container_name`].
+    pub container_port: Option<i32>,
+    /// The Fargate platform version the declaration asks for, when it states one.
+    pub platform_version: Option<String>,
+    /// The subnets, security groups and public-address setting the declaration's
+    /// `NetworkConfiguration.AwsvpcConfiguration` names, when it states one; empty
+    /// and `None` where it does not, which leaves the task set on the service's own
+    /// networking.
+    pub subnets: Vec<String>,
+    /// See [`Self::subnets`].
+    pub security_groups: Vec<String>,
+    /// See [`Self::subnets`].
+    pub assign_public_ip: Option<String>,
+}
+
+/// The replacement task set `revision` declares, read out of the content it
+/// carries; the Amazon ECS counterpart of [`declared_in_revision`], and `None` for
+/// a revision that keeps its AppSpec where this emulator does not read it.
+///
+/// Whether a deployment PERFORMS what it declares is the compute platform's
+/// question, answered where the Amazon ECS deployment is resolved
+/// ([`super::ecs_blue_green::declared`]), so the gate is spelled once.
+#[must_use]
+pub fn declared_ecs_task_set_in_revision(
+    revision: &RevisionLocation,
+) -> Option<EcsTaskSetDeclaration> {
+    declared_ecs_task_set_in_app_spec(revision_content(revision)?)
+}
+
+/// The replacement task set an AppSpec document declares, under the same bounds
+/// [`declared_in_app_spec`] reads a Lambda one within, and through the same
+/// traversal ([`declaration_in_app_spec`]).
+///
+/// Public so a test can hold the reading of a document to this rule without
+/// standing a deployment up for every row.
+#[must_use]
+pub fn declared_ecs_task_set_in_app_spec(content: &str) -> Option<EcsTaskSetDeclaration> {
+    declaration_in_app_spec(content, ECS_SERVICE_RESOURCE_TYPE, ecs_task_set_of)
+}
+
+/// The replacement task set one Amazon ECS service declaration's `Properties`
+/// describe: the leaf reader of that traversal, for the `ECS` compute platform.
+///
+/// The `TaskDefinition` is required, since a replacement task set with no revision
+/// to run is no declaration at all.
+fn ecs_task_set_of(properties: &Yaml) -> Option<EcsTaskSetDeclaration> {
+    let load_balancer_info = mapping_get(properties, LOAD_BALANCER_INFO_PROPERTY);
+    let awsvpc = mapping_get(properties, NETWORK_CONFIGURATION_PROPERTY)
+        .and_then(|configuration| mapping_get(configuration, AWSVPC_CONFIGURATION_PROPERTY));
+    Some(EcsTaskSetDeclaration {
+        task_definition: property(properties, TASK_DEFINITION_PROPERTY)?,
+        container_name: load_balancer_info
+            .and_then(|info| property(info, CONTAINER_NAME_PROPERTY)),
+        container_port: load_balancer_info
+            .and_then(|info| property(info, CONTAINER_PORT_PROPERTY))
+            .and_then(|port| port.parse().ok()),
+        platform_version: property(properties, PLATFORM_VERSION_PROPERTY),
+        subnets: awsvpc
+            .map(|awsvpc| text_list(awsvpc, SUBNETS_PROPERTY))
+            .unwrap_or_default(),
+        security_groups: awsvpc
+            .map(|awsvpc| text_list(awsvpc, SECURITY_GROUPS_PROPERTY))
+            .unwrap_or_default(),
+        assign_public_ip: awsvpc.and_then(|awsvpc| property(awsvpc, ASSIGN_PUBLIC_IP_PROPERTY)),
+    })
+}
+
+/// One list-valued AppSpec property as the texts it carries, bounded by
+/// [`MAX_DECLARED_LIST_ENTRIES`]; a property that is one scalar is the one-entry
+/// list it describes.
+fn text_list(node: &Yaml, key: &str) -> Vec<String> {
+    let Some(value) = mapping_get(node, key) else {
+        return Vec::new();
+    };
+    let entries: Vec<String> = match value {
+        Yaml::Array(entries) => entries.iter().filter_map(scalar).collect(),
+        single => scalar(single).into_iter().collect(),
+    };
+    entries
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .take(MAX_DECLARED_LIST_ENTRIES)
+        .collect()
 }
 
 /// One key of a YAML mapping; `None` for a node that is no mapping, and for a
@@ -822,5 +1009,145 @@ mod tests {
                 "case {case:?}: expected the declared hooks {expected:?}, got {read:?}"
             );
         }
+    }
+
+    /// RULE: "For an Amazon ECS deployment, the content includes the task name,
+    /// information about the load balancer that serves traffic to the container, and
+    /// more" — so an `AWS::ECS::Service` declaration is what names the revision the
+    /// replacement task set runs, the container the load balancer serves and the
+    /// networking it is placed with, in any of the forms an AppSpec is written in.
+    #[test]
+    fn the_app_spec_declares_the_replacement_task_set() {
+        let declared = |task_definition: &str| EcsTaskSetDeclaration {
+            task_definition: task_definition.to_string(),
+            container_name: Some("web".to_string()),
+            container_port: Some(80),
+            ..EcsTaskSetDeclaration::default()
+        };
+        let yaml = "version: 0.0\n\
+                    Resources:\n\
+                    \x20 - TargetService:\n\
+                    \x20     Type: AWS::ECS::Service\n\
+                    \x20     Properties:\n\
+                    \x20       TaskDefinition: \"web:2\"\n\
+                    \x20       LoadBalancerInfo:\n\
+                    \x20         ContainerName: web\n\
+                    \x20         ContainerPort: 80\n";
+        let json = r#"{"version": 0.0, "Resources": [{"TargetService": {
+            "Type": "AWS::ECS::Service",
+            "Properties": {"TaskDefinition": "web:2",
+                           "LoadBalancerInfo": {"ContainerName": "web",
+                                                "ContainerPort": "80"}}}}]}"#;
+        let mapping = "version: 0.0\n\
+                       Resources:\n\
+                       \x20 TargetService:\n\
+                       \x20   Type: AWS::ECS::Service\n\
+                       \x20   Properties:\n\
+                       \x20     TaskDefinition: arn:aws:ecs:us-east-1:1234:task-definition/web:7\n\
+                       \x20     LoadBalancerInfo:\n\
+                       \x20       ContainerName: web\n\
+                       \x20       ContainerPort: 80\n";
+        let placed = "version: 0.0\n\
+                      Resources:\n\
+                      \x20 - TargetService:\n\
+                      \x20     Type: AWS::ECS::Service\n\
+                      \x20     Properties:\n\
+                      \x20       TaskDefinition: \"web:2\"\n\
+                      \x20       PlatformVersion: 1.4.0\n\
+                      \x20       NetworkConfiguration:\n\
+                      \x20         AwsvpcConfiguration:\n\
+                      \x20           Subnets: [\"subnet-a\", \"subnet-b\"]\n\
+                      \x20           SecurityGroups: [\"sg-a\"]\n\
+                      \x20           AssignPublicIp: ENABLED\n";
+        let no_revision = "version: 0.0\n\
+                           Resources:\n\
+                           \x20 - TargetService:\n\
+                           \x20     Type: AWS::ECS::Service\n\
+                           \x20     Properties:\n\
+                           \x20       LoadBalancerInfo:\n\
+                           \x20         ContainerName: web\n";
+        let lambda = "version: 0.0\n\
+                      Resources:\n\
+                      \x20 - handler:\n\
+                      \x20     Type: AWS::Lambda::Function\n\
+                      \x20     Properties:\n\
+                      \x20       Name: handler\n\
+                      \x20       Alias: live\n\
+                      \x20       TargetVersion: \"2\"\n";
+        let cases: &[(&str, &str, Option<EcsTaskSetDeclaration>)] = &[
+            ("a YAML AppSpec", yaml, Some(declared("web:2"))),
+            (
+                "a JSON AppSpec whose container port is text",
+                json,
+                Some(declared("web:2")),
+            ),
+            (
+                "a YAML AppSpec whose Resources is a mapping, naming the revision by ARN",
+                mapping,
+                Some(declared(
+                    "arn:aws:ecs:us-east-1:1234:task-definition/web:7",
+                )),
+            ),
+            (
+                "a declaration that states the platform version and the networking",
+                placed,
+                Some(EcsTaskSetDeclaration {
+                    task_definition: "web:2".to_string(),
+                    platform_version: Some("1.4.0".to_string()),
+                    subnets: vec!["subnet-a".to_string(), "subnet-b".to_string()],
+                    security_groups: vec!["sg-a".to_string()],
+                    assign_public_ip: Some("ENABLED".to_string()),
+                    ..EcsTaskSetDeclaration::default()
+                }),
+            ),
+            (
+                "a declaration with no revision to run",
+                no_revision,
+                None,
+            ),
+            ("an AppSpec of another compute platform", lambda, None),
+            ("an AppSpec that declares no resource", "version: 0.0", None),
+            ("content that is no document at all", "\tnot: yaml\n", None),
+            ("empty content", "", None),
+        ];
+        for (case, content, expected) in cases {
+            let read = declared_ecs_task_set_in_app_spec(content);
+            assert_eq!(
+                read.as_ref(),
+                expected.as_ref(),
+                "case {case:?}: expected the declared task set {expected:?}, got {read:?}"
+            );
+        }
+    }
+
+    /// RULE: a list-valued property is read as the entries it carries, bounded by
+    /// [`MAX_DECLARED_LIST_ENTRIES`] — so a document naming more subnets than one
+    /// deployment reads has the first of them read and no more.
+    #[test]
+    fn a_declared_list_is_read_up_to_the_bound() {
+        let subnets: Vec<String> = (0..MAX_DECLARED_LIST_ENTRIES + 4)
+            .map(|index| format!("\"subnet-{index}\""))
+            .collect();
+        let content = format!(
+            "version: 0.0\n\
+             Resources:\n\
+             \x20 - TargetService:\n\
+             \x20     Type: AWS::ECS::Service\n\
+             \x20     Properties:\n\
+             \x20       TaskDefinition: \"web:2\"\n\
+             \x20       NetworkConfiguration:\n\
+             \x20         AwsvpcConfiguration:\n\
+             \x20           Subnets: [{}]\n",
+            subnets.join(", ")
+        );
+        let read = declared_ecs_task_set_in_app_spec(&content)
+            .expect("the declaration names a revision to run");
+        assert_eq!(
+            read.subnets.len(),
+            MAX_DECLARED_LIST_ENTRIES,
+            "case \"more subnets than one deployment reads\": expected the bound \
+             {MAX_DECLARED_LIST_ENTRIES}, got {:?}",
+            read.subnets
+        );
     }
 }

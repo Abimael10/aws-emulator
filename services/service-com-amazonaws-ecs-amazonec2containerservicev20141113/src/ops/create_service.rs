@@ -1263,6 +1263,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
+        // And for a CodeDeploy-controlled service, the ORIGINAL application task set the
+        // controller reroutes traffic away from is one Amazon ECS creates itself, out of
+        // the service's own configuration — so such a service reaches the count it was
+        // created with without a `CreateTaskSet` call
+        // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::place_original_task_set`]).
+        if guard.place_original_task_set(&key, &region, now).is_err() {
+            guard.services.remove(&key);
+            return Err(CreateServiceErrorModeled::ClientException(ClientException {
+                message: Some(format!(
+                    "this emulator holds at most {} tasks; stop some before placing \
+                     a service of {desired_count} tasks",
+                    crate::state::MAX_TASKS
+                )),
+            })
+            .into());
+        }
 
         // The rollout this create started is a SERVICE DEPLOYMENT of its own
         // (`ListServiceDeployments`: "A service deployment happens when you release a

@@ -222,6 +222,24 @@ pub fn record_rollback(
                     .and_then(|application| application.deployment_groups.get(group_name))
             })
             .map_or((false, 0), termination_wait);
+        // The Amazon ECS blue/green deployment the rollback IS, read the same way: it
+        // installs the task set the revision it redeploys declares and moves the
+        // production traffic onto that one, rather than undoing anything.
+        let ecs_blue_green = deployment_group_name
+            .as_deref()
+            .and_then(|group_name| {
+                state
+                    .applications
+                    .get(&application_name)
+                    .and_then(|application| application.deployment_groups.get(group_name))
+            })
+            .and_then(|group| {
+                super::ecs_blue_green::declared(
+                    &compute_platform,
+                    group,
+                    super::appspec::declared_ecs_task_set_in_revision(&revision),
+                )
+            });
         // The traffic shift the rollback performs is the one the revision it
         // redeploys describes, read exactly as a client's own deployment of that
         // revision reads it: a rollback moves the alias back by re-pointing it,
@@ -296,6 +314,13 @@ pub fn record_rollback(
             // The rollback is a deployment of its own, so its own lifecycle
             // events are published as it reaches them.
             published_trigger_events: Vec::new(),
+            ecs_blue_green,
+            // The rollback installs a replacement task set of its own, so it has
+            // replaced nothing yet.
+            ecs_replacement_task_set: None,
+            ecs_original_target_group: None,
+            ecs_replacement_target_group: None,
+            ecs_original_task_set: None,
         });
     }
 

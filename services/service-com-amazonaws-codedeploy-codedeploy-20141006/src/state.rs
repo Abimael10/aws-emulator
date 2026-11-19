@@ -47,6 +47,11 @@ pub mod traffic_shift;
 /// that could not carry it out is failed.
 pub mod lambda_traffic_shift;
 
+/// The Amazon ECS BLUE/GREEN deployment: the replacement task set it installs in
+/// the service the group targets, and the production traffic route it then moves
+/// onto it.
+pub mod ecs_blue_green;
+
 /// The in-process task that drives a deployment in flight while nobody is calling
 /// this service.
 pub mod deployment_clock;
@@ -1592,7 +1597,10 @@ pub struct Deployment {
     pub awaits_alias_restore: bool,
     /// How far that shift has got, which is also what keeps the clock from
     /// settling a deployment whose shift has not happened yet; see
-    /// [`lambda_traffic_shift::TrafficShiftProgress`].
+    /// [`lambda_traffic_shift::TrafficShiftProgress`]. An Amazon ECS deployment's
+    /// own steps are tracked through the same member
+    /// ([`ecs_blue_green::apply_due_steps`]): its production traffic route is what
+    /// moves instead of an alias.
     pub traffic_shift: lambda_traffic_shift::TrafficShiftProgress,
     /// The increments that shift is carried out in, in the order they fall due:
     /// what the deployment's resolved `trafficRoutingConfig` describes (see
@@ -1610,6 +1618,25 @@ pub struct Deployment {
     /// run over the record; see
     /// [`ComAmazonawsCodedeployCodedeploy20141006State::queue_due_trigger_notifications`].
     pub published_trigger_events: Vec<&'static str>,
+    /// The Amazon ECS blue/green deployment this deployment IS, read ONCE out of
+    /// its group and its revision when it was recorded; `None` for a deployment of
+    /// any other compute platform, and for one whose group or revision describes
+    /// none (see [`ecs_blue_green::declared`]).
+    pub ecs_blue_green: Option<ecs_blue_green::EcsDeployment>,
+    /// The replacement task set it installed in that service, once it has: the id
+    /// Amazon ECS minted for it.
+    pub ecs_replacement_task_set: Option<String>,
+    /// The two target groups of its group's pair, as that install decided them: the one the
+    /// production route was on when the replacement was installed, and the one the
+    /// replacement serves through, which every increment of this deployment then moves the
+    /// traffic from and to (see [`ecs_blue_green::resolve_traffic_route`]).
+    pub ecs_original_target_group: Option<String>,
+    /// See [`Self::ecs_original_target_group`].
+    pub ecs_replacement_target_group: Option<String>,
+    /// The task set that was serving the service's production traffic when the
+    /// replacement was installed, until the deployment has terminated it ("The
+    /// original task set is terminated after a successful deployment").
+    pub ecs_original_task_set: Option<String>,
 }
 
 /// The result a validation function reported for one of a deployment's
@@ -2369,6 +2396,11 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                 // pass settles it.
                 && deployment.traffic_shift
                     != lambda_traffic_shift::TrafficShiftProgress::InFlight
+                // Nor is an Amazon ECS deployment that has not finished replacing
+                // the service's task set: its outcome follows the replacement task
+                // set serving the production traffic and the original one being
+                // taken away (see `ecs_blue_green::apply_due_steps`).
+                && !ecs_blue_green::blocks_completion(deployment)
                 // Nor is a deployment whose lifecycle event hooks have not all
                 // reported `Succeeded`: the result of a validation function is
                 // what the lifecycle event it validates completed with, so a
@@ -4567,6 +4599,13 @@ pub fn with_state<Eng: Send + Sync + 'static, R>(
     // given a successful outcome before the increments its revision and its
     // configuration described have happened.
     lambda_traffic_shift::apply_due_shifts(engine, now);
+    // The Amazon ECS deployment's own steps are carried out in the stores of the
+    // services that own the resources — the task sets in Amazon ECS, the production
+    // traffic route in Elastic Load Balancing v2 — with this store unlocked for the
+    // same reason, and in the same place in the pass: a deployment the alarms
+    // stopped moves no traffic, and none reaches a successful outcome before the
+    // replacement task set it described is serving that traffic.
+    ecs_blue_green::apply_due_steps(engine, now);
     let mut guard = state.lock();
     guard.ensure_seeded(now);
     guard.advance_clock(now);

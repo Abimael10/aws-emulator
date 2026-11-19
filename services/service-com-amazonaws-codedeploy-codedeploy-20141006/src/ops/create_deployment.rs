@@ -356,6 +356,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let declared_shift = requested_revision
             .as_ref()
             .and_then(crate::state::lambda_traffic_shift::declared_in_revision);
+        // And the REPLACEMENT TASK SET it declares, read here for the same reason:
+        // an Amazon ECS deployment's revision is the AppSpec too, and what it
+        // declares is the task set the deployment installs. Whether the deployment
+        // performs it is decided inside, by the application's compute platform.
+        let declared_task_set = requested_revision
+            .as_ref()
+            .and_then(crate::state::appspec::declared_ecs_task_set_in_revision);
 
         // Whether this deployment's revision keeps its AppSpec in an S3 object,
         // which the deployment fetches once it starts. Read here, before the store
@@ -384,6 +391,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             };
             let compute_platform = application.compute_platform.clone();
+            // The Amazon ECS blue/green deployment this deployment IS: the service
+            // the group targets, the task set its revision declares, and the pair of
+            // target groups and the listeners its traffic moves between.
+            let ecs_blue_green = crate::state::ecs_blue_green::declared(
+                &compute_platform,
+                group,
+                declared_task_set,
+            );
             let group_config = group.deployment_config_name.clone();
             let group_style = group.deployment_style.clone();
             let group_id = group.deployment_group_id.clone();
@@ -600,6 +615,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the clock owes it its start and then its outcome, and each is
                 // published as it is reached.
                 published_trigger_events: Vec::new(),
+                ecs_blue_green,
+                // Nothing has been installed or replaced yet: the clock owes the
+                // replacement task set, then the traffic that moves onto it, then
+                // the original task set's own deletion.
+                ecs_replacement_task_set: None,
+                ecs_original_target_group: None,
+                ecs_replacement_target_group: None,
+                ecs_original_task_set: None,
             });
             // Deploying a revision is also how CodeDeploy learns it: the
             // application's registry records this use, registering the revision
