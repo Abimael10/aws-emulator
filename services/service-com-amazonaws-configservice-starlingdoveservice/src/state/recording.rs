@@ -767,7 +767,6 @@ pub async fn run_due_recording_pass<Eng: Send + Sync + 'static>(
     let Some(resource_types) = state.lock().take_due_recording_pass(now) else {
         return;
     };
-
     let mut observed: Vec<(&'static str, Vec<DiscoveredResourceEntry>)> = Vec::new();
     for resource_type in resource_types {
         // Only a type whose resources were actually READ is recorded: a read that

@@ -480,16 +480,6 @@ impl ConfigRuleEntry {
         })
     }
 
-    /// Whether `DescribeConfigRuleEvaluationStatus` reports a status for this rule.
-    ///
-    /// Config reports one for its managed rules and for Custom Policy rules only
-    /// (`ConfigRuleEvaluationStatus`: "Status information for your Config Managed
-    /// rules and Config Custom Policy rules. … This operation does not return status
-    /// information about Config Custom Lambda rules.").
-    pub fn reports_evaluation_status(&self) -> bool {
-        self.source.owner != OWNER_CUSTOM_LAMBDA
-    }
-
     /// The modelled `ConfigRuleEvaluationStatus` as a READ reports it.
     ///
     /// `FirstActivatedTime` is when this rule was written, which is when Config

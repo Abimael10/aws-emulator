@@ -92,9 +92,9 @@ fn instant(status: &Value, member: &str) -> Option<f64> {
 
 #[tokio::test]
 async fn a_status_carries_the_identity_and_activation_time_the_write_persisted() {
-    // Rows differ along the rule's source owner — the one class Config publishes no
-    // status for is the Custom Lambda rule — and along how many rules the account
-    // holds.
+    // Rows differ along the rule's source owner — a status is reported for a rule of
+    // every owner, because Config invokes a rule of every owner — and along how many
+    // rules the account holds.
     struct Case {
         name: &'static str,
         rules: &'static [(&'static str, &'static str)],
@@ -118,9 +118,9 @@ async fn a_status_carries_the_identity_and_activation_time_the_write_persisted()
             reported: &["managed", "policy"],
         },
         Case {
-            name: "a Custom Lambda rule carries no status",
+            name: "a Custom Lambda rule carries the status of the invocation Config made",
             rules: &[("lambda", OWNER_CUSTOM_LAMBDA)],
-            reported: &[],
+            reported: &["lambda"],
         },
         Case {
             name: "one rule of every owner",
@@ -129,7 +129,7 @@ async fn a_status_carries_the_identity_and_activation_time_the_write_persisted()
                 ("lambda", OWNER_CUSTOM_LAMBDA),
                 ("policy", OWNER_CUSTOM_POLICY),
             ],
-            reported: &["managed", "policy"],
+            reported: &["lambda", "managed", "policy"],
         },
     ];
 
@@ -341,7 +341,11 @@ async fn requested_names_select_statuses_and_an_unknown_name_is_refused() {
     // Rows differ along which names the request carries: none, one, several, a name no
     // rule carries, and a known name beside an unknown one.
     let cases: [(&str, Value, Option<&[&str]>); 6] = [
-        ("no names at all", json!({}), Some(&["a-rule", "b-rule", "c-rule"])),
+        (
+            "no names at all",
+            json!({}),
+            Some(&["a-rule", "b-rule", "c-rule", "lambda-rule"]),
+        ),
         (
             "one name",
             json!({ "ConfigRuleNames": ["b-rule"] }),
@@ -355,7 +359,7 @@ async fn requested_names_select_statuses_and_an_unknown_name_is_refused() {
         (
             "a name that names a Custom Lambda rule",
             json!({ "ConfigRuleNames": ["lambda-rule"] }),
-            Some(&[]),
+            Some(&["lambda-rule"]),
         ),
         (
             "a name no rule carries",

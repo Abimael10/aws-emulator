@@ -549,7 +549,8 @@ pub fn snapshot_document(snapshot_id: &str, items: &[ConfigurationItem]) -> ::se
 
 /// One configuration item as a DELIVERED snapshot spells it, which is also how the
 /// configuration-item change notification a delivery channel streams spells it
-/// ([`super::change_notification`]).
+/// ([`super::change_notification`]) and how the invoking event a change-triggered rule's
+/// evaluator is handed carries it ([`super::custom_lambda_rule`]).
 ///
 /// The item is the one the API reports ([`super::configuration_item_document`], which
 /// spells every member as the model does), with the four members a delivered file spells
@@ -557,6 +558,14 @@ pub fn snapshot_document(snapshot_id: &str, items: &[ConfigurationItem]) -> ::se
 /// `configurationStateMd5Hash` (AWS Config Developer Guide, *Example configuration
 /// snapshot*). Rendering the file from the API projection is what keeps the two from
 /// drifting: a member the item does not carry is absent from both.
+///
+/// The item's COLLECTION members are always there, empty where the resource has nothing
+/// under them: a delivered item carries `tags`, `supplementaryConfiguration`,
+/// `relatedEvents` and `relationships` (the same guide's example items), and a reader of
+/// such an item — an evaluator Config invokes with it — reads the entries it holds without
+/// first asking whether the member is there. An empty collection is a VALUE: it says the
+/// resource has no tag, no supplementary block and no observed link, which is not the same
+/// as a member a reader has to treat as missing.
 pub fn delivered_configuration_item(item: &ConfigurationItem) -> ::serde_json::Value {
     let mut rendered = super::configuration_item_document(item);
     for (api_member, file_member) in [
@@ -571,6 +580,16 @@ pub fn delivered_configuration_item(item: &ConfigurationItem) -> ::serde_json::V
         if let Some(document) = rendered.as_object_mut() {
             document.remove(api_member);
             document.insert(file_member.to_string(), value);
+        }
+    }
+    if let Some(document) = rendered.as_object_mut() {
+        for (member, empty) in [
+            ("tags", ::serde_json::json!({})),
+            ("supplementaryConfiguration", ::serde_json::json!({})),
+            ("relatedEvents", ::serde_json::json!([])),
+            ("relationships", ::serde_json::json!([])),
+        ] {
+            document.entry(member).or_insert(empty);
         }
     }
     rendered

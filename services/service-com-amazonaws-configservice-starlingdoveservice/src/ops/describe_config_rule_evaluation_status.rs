@@ -243,11 +243,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !names.is_empty() && !names.iter().any(|requested| requested == name) {
                 continue;
             }
-            // Config publishes no status for a Custom Lambda rule. Naming one is not a
-            // failure — the rule exists — it simply has no status to report.
-            if !rule.reports_evaluation_status() {
-                continue;
-            }
+            // A status is reported for EVERY rule the account holds, whatever owns it. The
+            // status is the record of Config's own side of an evaluation — when it last
+            // invoked the rule and when that pass finished — and Config invokes a rule of
+            // every owner: it evaluates its managed and Custom Policy rules itself, and
+            // invokes the function a Custom Lambda rule names as its evaluator, so the
+            // invocation it made for such a rule is reported here as well.
             if page.len() == page_size {
                 next_token = Some(crate::state::encode_page_token(name));
                 break;

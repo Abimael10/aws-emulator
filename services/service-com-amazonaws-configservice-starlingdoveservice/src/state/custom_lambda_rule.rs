@@ -13,6 +13,8 @@
 //!
 //! An invocation is OWED for the evaluation pass Config invoked — the pass a write of the
 //! rule starts ("when you create a rule, Config evaluates your resources against the rule
+//! An invocation is OWED for the evaluation pass Config invoked — the pass a write of the
+//! rule starts ("when you create a rule, Config evaluates your resources against the rule
 //! automatically", `PutConfigRule`) and the pass `StartConfigRulesEvaluation` asks for
 //! ("re-runs an evaluation against the last known state of your resources") — and it is
 //! owed until it is MADE: the pass's own token is the record of whether its evaluator has
@@ -273,6 +275,11 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
         };
 
         let account_id = ::emulator_server::emulator_account_id();
+        // The role Config ASSUMED to make this invocation, which is the role the account's
+        // customer managed configuration recorder runs as — the one a rule's evaluator is
+        // handed as its `executionRoleArn`. An account holding no such recorder names no
+        // role, and the member is then left out rather than carried empty.
+        let execution_role_arn = self.customer_managed_recorder_role_arn();
         let mut invocations = Vec::new();
         for rule in self.config_rules.values_mut() {
             if rule.state != CONFIG_RULE_STATE_ACTIVE || !rule.owes_evaluator_invocation() {
@@ -353,7 +360,13 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
                     result_token: result_token.clone(),
                     subject,
                     follows,
-                    event: invocation_event(rule, &invoking_event, &result_token, account_id),
+                    event: invocation_event(
+                        rule,
+                        &invoking_event,
+                        &result_token,
+                        account_id,
+                        execution_role_arn.as_deref(),
+                    ),
                 });
             }
             if let Some(handed_through) = handed_through {
@@ -457,16 +470,24 @@ fn scheduled_notification(account_id: &str, now: SystemTime) -> ::serde_json::Va
 /// `resultToken` is the token the delivery comes back on. `eventLeftScope` is "whether the
 /// Amazon Web Services resource to be evaluated has been removed from the rule's scope",
 /// which is false for every invocation Config makes here: the items an invocation carries
-/// are the ones the inventory holds.
+/// are the ones the inventory holds. `executionRoleArn` is the role Config assumed to make
+/// the invocation.
+///
+/// A member Config has NO value for is LEFT OUT of the event rather than carried as a JSON
+/// null: `ruleParameters` is "if present, the parameters the rule was defined with", so a
+/// rule declaring none hands its evaluator an event with no such member — which is what a
+/// handler reading it as the string it is (`json.loads(event.get("ruleParameters", "{}"))`)
+/// depends on, since a null is neither that string nor absent. The same holds for the
+/// execution role of an account whose recorder names none.
 fn invocation_event(
     rule: &ConfigRuleEntry,
     invoking_event: &::serde_json::Value,
     result_token: &str,
     account_id: &str,
+    execution_role_arn: Option<&str>,
 ) -> ::serde_json::Value {
-    ::serde_json::json!({
+    let mut event = ::serde_json::json!({
         "invokingEvent": invoking_event.to_string(),
-        "ruleParameters": rule.input_parameters.clone(),
         "resultToken": result_token,
         "eventLeftScope": false,
         "configRuleArn": rule.arn.clone(),
@@ -474,7 +495,29 @@ fn invocation_event(
         "configRuleId": rule.id.clone(),
         "accountId": account_id,
         "version": INVOCATION_EVENT_VERSION,
-    })
+    });
+    let Some(members) = event.as_object_mut() else {
+        return event;
+    };
+    // The parameters the rule was defined with, as the JSON-encoded string they travel as;
+    // a rule that declares none carries no such member.
+    if let Some(parameters) = rule
+        .input_parameters
+        .as_deref()
+        .filter(|parameters| !parameters.is_empty())
+    {
+        members.insert(
+            "ruleParameters".to_string(),
+            ::serde_json::Value::String(parameters.to_string()),
+        );
+    }
+    if let Some(role) = execution_role_arn.filter(|role| !role.is_empty()) {
+        members.insert(
+            "executionRoleArn".to_string(),
+            ::serde_json::Value::String(role.to_string()),
+        );
+    }
+    event
 }
 
 /// Invoke the evaluators this account owes an invocation of, as of now.
