@@ -20,8 +20,9 @@
 //! * the `securityDetails` gate of `CreateDataflowEndpointGroup` answers one sentence
 //!   whichever item of `endpointDetails` omitted the member;
 //! * `GetDataflowEndpointGroup` answers one sentence for a group id that was deleted and
-//!   for one that never existed, while the DELETE of such a group names the id it could not
-//!   find;
+//!   for one that never existed, while the DELETE of such a group names the id ITS OWN
+//!   request carried — over a store that still holds other groups, and over the same
+//!   `@idempotent` delete repeated;
 //! * `DeleteMissionProfile` names the `{missionProfileId}` it could not find;
 //! * every operation that resolves a ground station by name answers one sentence, over
 //!   names differing in length, case and spelling.
@@ -50,6 +51,10 @@ use crate::scheduling_loop::{
 /// for the whole run.
 const CONTACT_START: i64 = 2_100_000_000;
 const CONTACT_SECONDS: i64 = 600;
+
+/// How many times a delete of a resource that is not there is repeated, so a refusal's text
+/// is asserted over a REPEAT of the same `@idempotent` call and not only its first issue.
+const DELETE_REPEATS: usize = 3;
 
 /// Read `reply` as a bad-parameter refusal of this service — `InvalidParameterException`,
 /// HTTP 431 — and answer its `message`.
@@ -338,19 +343,31 @@ async fn the_two_dataflow_endpoint_group_operations_answer_their_own_texts_for_a
 {
     let (router, _engine) = harness_with_engine();
 
-    // A group created and then deleted, so the rows cover a group that USED to exist as
-    // well as ids that never named one.
-    let created = create_group(
-        &router,
-        json!({"endpointDetails": [dataflow_endpoint("downlink-0", 55_888, true)]}),
-    )
-    .await;
-    assert_eq!(
-        created.status, 200,
-        "case the group to delete: expected CreateDataflowEndpointGroup 200, got {} {}",
-        created.status, created.body
-    );
-    let deleted_id = created.string("dataflowEndpointGroupId");
+    // Three groups, so every refusal below is composed while the store still holds group
+    // ids OTHER than the one the request names: the sentence's one slot is filled from the
+    // request's own path label, never from whatever the store happens to hold.
+    let mut live: Vec<String> = Vec::new();
+    for (name, port) in [
+        ("downlink-0", 55_888),
+        ("downlink-1", 55_889),
+        ("downlink-2", 55_890),
+    ] {
+        let created = create_group(
+            &router,
+            json!({"endpointDetails": [dataflow_endpoint(name, port, true)]}),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {name}: expected CreateDataflowEndpointGroup 200, got {} {}",
+            created.status, created.body
+        );
+        live.push(created.string("dataflowEndpointGroupId"));
+    }
+
+    // One of them is deleted here, so the rows cover a group that USED to exist as well as
+    // ids that never named one.
+    let deleted_id = live.remove(0);
     let removed = delete_group(&router, &deleted_id).await;
     assert_eq!(
         removed.status, 200,
@@ -378,22 +395,50 @@ async fn the_two_dataflow_endpoint_group_operations_answer_their_own_texts_for_a
 
         // The DELETE answers in the words of its own error class, naming the id its path
         // carried — the same composition every other delete of this service answers with.
-        let case = format!("DeleteDataflowEndpointGroup on {id}");
-        let deleted = not_found_message(&case, &delete_group(&router, id).await);
+        // The operation is `@idempotent` (`smithy_query(query="operation",
+        // operation="DeleteDataflowEndpointGroup")`), so the same delete repeated answers
+        // the same sentence rather than one built from the store as it stands by then.
+        for attempt in 1..=DELETE_REPEATS {
+            let case = format!("DeleteDataflowEndpointGroup on {id}, attempt {attempt}");
+            let deleted = not_found_message(&case, &delete_group(&router, id).await);
+            assert_eq!(
+                deleted,
+                format!("No Dataflow Endpoint Group found with id {id}"),
+                "case {case}: the delete's refusal is the fixed words around the id the path \
+                 carried, got {deleted:?}"
+            );
+            assert!(
+                !deleted.replace(id.as_str(), "").contains(engine::EMULATOR_ACCOUNT_ID),
+                "case {case}: outside the id slot nothing of the environment belongs in the \
+                 text, got {deleted:?}"
+            );
+            for held in &live {
+                assert!(
+                    !deleted.contains(held.as_str()),
+                    "case {case}: the slot carries the id the request asked for, not that of a \
+                     group the account still holds ({held}), got {deleted:?}"
+                );
+            }
+            assert_ne!(
+                deleted, read,
+                "case {case}: the read and the delete answer different texts"
+            );
+        }
+    }
+
+    // None of those refusals disturbed a group the account still holds.
+    for held in &live {
+        let read = get_group(&router, held).await;
         assert_eq!(
-            deleted,
-            format!("No Dataflow Endpoint Group found with id {id}"),
-            "case {case}: the delete's refusal is the fixed words around the id the path \
-             carried, got {deleted:?}"
+            read.status, 200,
+            "case {held}: the group must still read back after the refusals, got {} {}",
+            read.status, read.body
         );
-        assert!(
-            !deleted.replace(id.as_str(), "").contains(engine::EMULATOR_ACCOUNT_ID),
-            "case {case}: outside the id slot nothing of the environment belongs in the \
-             text, got {deleted:?}"
-        );
-        assert_ne!(
-            deleted, read,
-            "case {case}: the read and the delete answer different texts"
+        assert_eq!(
+            read.string("dataflowEndpointGroupId"),
+            *held,
+            "case {held}: wrong group read back, got {}",
+            read.body
         );
     }
 }
