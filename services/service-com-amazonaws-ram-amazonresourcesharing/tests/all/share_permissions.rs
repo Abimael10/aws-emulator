@@ -56,6 +56,13 @@ const COIP_POOL: &str = "arn:aws:ec2:us-west-2:000000000000:coip-pool/ipv4pool-c
 /// all (`Resource$type`) — a Glue data catalog, one of the resource types this service
 /// can share (`RESOURCE_TYPES`).
 const TYPELESS_RESOURCE: &str = "arn:aws:glue:us-west-2:000000000000:catalog";
+/// A private certificate authority: the one resource type the AWS managed catalog
+/// publishes a whole FAMILY of permissions for, only one of which is its default.
+const CERTIFICATE_AUTHORITY: &str =
+    "arn:aws:acm-pca:us-west-2:000000000000:certificate-authority/0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9";
+/// A Glue table: a resource type the shares below do NOT share, so a permission for it
+/// governs no resource of theirs.
+const GLUE_TABLE: &str = "arn:aws:glue:us-west-2:000000000000:table/analytics/events";
 
 async fn list_permissions(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "POST", "/listresourcesharepermissions", Some(body)).await
@@ -774,4 +781,413 @@ async fn one_resource_type_name_matches_itself_and_no_other() {
              {found_either_way:?}"
         );
     }
+}
+
+// --- Where a reported `status` comes from -----------------------------------------
+//
+// The rule the rows below pin: read through a RESOURCE SHARE, a managed permission's
+// `status` reports where that permission's attachment TO THAT SHARE has got to — a
+// permission currently attached to it is associated with it — while a read of the same
+// permission in its own right (`GetPermission`, `ListPermissions`,
+// `ListPermissionVersions`) reports the permission VERSION's own attachability. The two
+// reads answer different questions about the same permission, so the value one reports
+// is not the value the other does.
+//
+// So the rows vary along what the rule generalises over:
+//
+// * HOW the permission came to govern the share: derived from the default of a resource
+//   type the share shares, named by the create request, or attached afterwards by
+//   `AssociateResourceSharePermission`;
+// * WHICH permission it is: an AWS managed resource-type default, an AWS managed
+//   permission that is NOT its resource type's default, and a customer managed one a
+//   create minted;
+// * WHICH resource type governs the derivation, including one whose service code carries
+//   a hyphen, and one the share does not share at all;
+// * WHICH permission-scoped read answers for the version: each of the three.
+
+/// The `status` on the wire for a managed permission currently ATTACHED to the share
+/// being read, spelled as the value itself rather than as the constant the handler
+/// carries, so this suite pins the wire and not the implementation.
+const ATTACHED_TO_THE_SHARE: &str = "ASSOCIATED";
+/// The `status` on the wire for a permission VERSION read in its own right: one that
+/// can be attached to a share (`PermissionStatus`).
+const ATTACHABLE_TO_A_SHARE: &str = "ATTACHABLE";
+
+async fn get_permission(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/getpermission", Some(body)).await
+}
+
+/// `ListPermissions`: the permissions this account can attach, which is the read that
+/// describes a permission in its own right rather than through a share.
+async fn list_catalog_permissions(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/listpermissions", Some(body)).await
+}
+
+async fn list_permission_versions(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/listpermissionversions", Some(body)).await
+}
+
+async fn attach_permission(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        "/associateresourcesharepermission",
+        Some(body),
+    )
+    .await
+}
+
+async fn detach_permission(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        "/disassociateresourcesharepermission",
+        Some(body),
+    )
+    .await
+}
+
+/// Mint a customer managed permission for `resource_type`, and answer the ARN the
+/// create reported for it, so the rows below name the permission the store really
+/// holds rather than one rebuilt here.
+async fn minted_permission(
+    router: &MultiServiceRouter,
+    name: &'static str,
+    resource_type: &str,
+    action: &str,
+) -> String {
+    let (status, minted) = create_permission(
+        router,
+        &json!({
+            "name": name,
+            "resourceType": resource_type,
+            "policyTemplate": json!({"Effect": "ALLOW", "Action": [action]}).to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {name:?}: minting the permission expected 200, got {status} with {minted:?}"
+    );
+    let created = minted.get("permission").cloned().unwrap_or_else(|| {
+        panic!("case {name:?}: the create reported no permission, got {minted:?}")
+    });
+    field(name, &created, "arn")
+}
+
+/// Every permission one read of `share_arn` reported, each paired with its ARN.
+async fn share_permissions_with_arns(
+    router: &MultiServiceRouter,
+    case: &str,
+    share_arn: &str,
+) -> Vec<(String, Value)> {
+    let (status, listed) = list_permissions(router, &json!({"resourceShareArn": share_arn})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with {listed:?}"
+    );
+    assert_eq!(
+        next_token_of(&listed),
+        None,
+        "case {case:?}: a page that holds every permission carries no nextToken, got {listed:?}"
+    );
+    permissions_of(case, &listed)
+        .into_iter()
+        .map(|permission| (field(case, &permission, "arn"), permission))
+        .collect()
+}
+
+/// One row of the status-source table.
+struct StatusSourceCase {
+    case: &'static str,
+    /// The resources the share is created with.
+    resource_arns: Vec<&'static str>,
+    /// The permissions the create request names.
+    permission_arns: Vec<String>,
+    /// A permission attached after the create, replacing whatever governs its type.
+    attached_after: Option<String>,
+    /// The permission this row reads through both kinds of read.
+    examined: String,
+}
+
+#[tokio::test]
+async fn a_share_read_reports_the_attachment_and_a_permission_read_reports_the_version() {
+    let router = emulator();
+
+    // Two customer managed permissions, minted through the API so the rows name
+    // permissions this store really holds.
+    let project_permission = minted_permission(
+        &router,
+        "ProjectReaderForStatusSource",
+        "codebuild:Project",
+        "codebuild:BatchGetProjects",
+    )
+    .await;
+    let table_permission = minted_permission(
+        &router,
+        "TableReaderForStatusSource",
+        "glue:Table",
+        "glue:GetTable",
+    )
+    .await;
+
+    let cases = [
+        StatusSourceCase {
+            case: "the derived default of a managed prefix list",
+            resource_arns: vec![PREFIX_LIST],
+            permission_arns: Vec::new(),
+            attached_after: None,
+            examined: managed("AWSRAMDefaultPermissionPrefixList"),
+        },
+        StatusSourceCase {
+            case: "the derived default of a Glue database",
+            resource_arns: vec![GLUE_DATABASE],
+            permission_arns: Vec::new(),
+            attached_after: None,
+            examined: managed("AWSRAMDefaultPermissionGlueDatabase"),
+        },
+        StatusSourceCase {
+            // A resource type whose service code carries a hyphen.
+            case: "the derived default of a license configuration",
+            resource_arns: vec![LICENSE_CONFIGURATION],
+            permission_arns: Vec::new(),
+            attached_after: None,
+            examined: managed("AWSRAMDefaultPermissionLicenseConfiguration"),
+        },
+        StatusSourceCase {
+            case: "an AWS managed default the create named itself",
+            resource_arns: vec![TRANSIT_GATEWAY],
+            permission_arns: vec![managed("AWSRAMDefaultPermissionTransitGateway")],
+            attached_after: None,
+            examined: managed("AWSRAMDefaultPermissionTransitGateway"),
+        },
+        StatusSourceCase {
+            // An AWS managed permission that is not its resource type's default: the
+            // status a share reports does not follow from the default flag either.
+            case: "an AWS managed permission that is not its resource type's default",
+            resource_arns: vec![CERTIFICATE_AUTHORITY],
+            permission_arns: vec![managed(
+                "AWSRAMBlankEndEntityCertificateAPIPassthroughIssuanceCertificateAuthority",
+            )],
+            attached_after: None,
+            examined: managed(
+                "AWSRAMBlankEndEntityCertificateAPIPassthroughIssuanceCertificateAuthority",
+            ),
+        },
+        StatusSourceCase {
+            case: "a customer managed permission the create named",
+            resource_arns: vec![CODEBUILD_PROJECT],
+            permission_arns: vec![project_permission.clone()],
+            attached_after: None,
+            examined: project_permission.clone(),
+        },
+        StatusSourceCase {
+            case: "a customer managed permission attached after the create",
+            resource_arns: vec![CODEBUILD_PROJECT],
+            permission_arns: Vec::new(),
+            attached_after: Some(project_permission.clone()),
+            examined: project_permission.clone(),
+        },
+        StatusSourceCase {
+            // A permission for a resource type the share shares nothing of is attached
+            // to it all the same, so it too is read as associated with it.
+            case: "a permission for a resource type the share does not share",
+            resource_arns: vec![PREFIX_LIST],
+            permission_arns: vec![table_permission.clone()],
+            attached_after: None,
+            examined: table_permission.clone(),
+        },
+    ];
+
+    for (row, case) in cases.iter().enumerate() {
+        let StatusSourceCase {
+            case: name,
+            resource_arns,
+            permission_arns,
+            attached_after,
+            examined,
+        } = case;
+        let mut request = json!({
+            "name": format!("status-source-share-{row}"),
+            "resourceArns": resource_arns,
+        });
+        if !permission_arns.is_empty() {
+            request["permissionArns"] = json!(permission_arns);
+        }
+        let share_arn = share_with(&router, name, &request).await;
+        if let Some(attached) = attached_after {
+            let (status, attached_body) = attach_permission(
+                &router,
+                &json!({
+                    "resourceShareArn": share_arn,
+                    "permissionArn": attached,
+                    // The share already carries the derived default of its resource
+                    // type, and a share holds one permission per resource type.
+                    "replace": true,
+                }),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {name:?}: attaching {attached:?} expected 200, got {status} with \
+                 {attached_body:?}"
+            );
+        }
+
+        let reported = share_permissions_with_arns(&router, name, &share_arn).await;
+        let listed: Vec<&str> = reported.iter().map(|(arn, _)| arn.as_str()).collect();
+        let permission = reported
+            .iter()
+            .find(|(arn, _)| arn == examined)
+            .map(|(_, permission)| permission.clone())
+            .unwrap_or_else(|| {
+                panic!("case {name:?}: {examined:?} is not among the share's permissions {listed:?}")
+            });
+
+        // Every permission the share reports is one attached to it, so every one of them
+        // reports its attachment to the share.
+        for (arn, each) in &reported {
+            assert_eq!(
+                field(name, each, "status"),
+                ATTACHED_TO_THE_SHARE,
+                "case {name:?}: {arn:?} is attached to the share, so a read through the \
+                 share reports that attachment, got {each:?}"
+            );
+        }
+
+        // The same permission read in its own right reports the version's attachability.
+        let (status, detail) = get_permission(&router, &json!({"permissionArn": examined})).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: reading {examined:?} expected 200, got {status} with {detail:?}"
+        );
+        let own = detail.get("permission").cloned().unwrap_or_else(|| {
+            panic!("case {name:?}: the read of {examined:?} reported no permission, got {detail:?}")
+        });
+        assert_eq!(
+            field(name, &own, "status"),
+            ATTACHABLE_TO_A_SHARE,
+            "case {name:?}: a read of the permission itself reports the version's own \
+             attachability, got {own:?}"
+        );
+        assert_ne!(
+            field(name, &permission, "status"),
+            field(name, &own, "status"),
+            "case {name:?}: the share read must not project the version's status, got \
+             {permission:?} and {own:?}"
+        );
+
+        // And so does every version of it, and the entry the catalog read reports for it.
+        let (status, versions) =
+            list_permission_versions(&router, &json!({"permissionArn": examined})).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: listing the versions of {examined:?} expected 200, got {status} \
+             with {versions:?}"
+        );
+        for version in permissions_of(name, &versions) {
+            assert_eq!(
+                field(name, &version, "status"),
+                ATTACHABLE_TO_A_SHARE,
+                "case {name:?}: a version of {examined:?} reports its own attachability, got \
+                 {version:?}"
+            );
+        }
+
+        // `maxResults` is modelled 1..500 and the catalog is smaller than that, so one
+        // page holds every permission this account can attach.
+        let (status, catalog) = list_catalog_permissions(&router, &json!({"maxResults": 500})).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: listing every permission expected 200, got {status} with {catalog:?}"
+        );
+        let entry = permissions_of(name, &catalog)
+            .into_iter()
+            .find(|entry| field(name, entry, "arn") == *examined)
+            .unwrap_or_else(|| {
+                panic!("case {name:?}: {examined:?} is not among the permissions listed")
+            });
+        assert_eq!(
+            field(name, &entry, "status"),
+            ATTACHABLE_TO_A_SHARE,
+            "case {name:?}: the catalog read reports the version's own attachability, got \
+             {entry:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_permission_removed_from_a_share_leaves_its_set_and_stays_attachable_itself() {
+    let router = emulator();
+    let case = "remove a permission the share shares no resources of";
+    // A permission for a resource type this share shares nothing of, so nothing holds
+    // its removal back.
+    let table_permission = minted_permission(
+        &router,
+        "TableReaderForRemoval",
+        "glue:Table",
+        "glue:GetTable",
+    )
+    .await;
+    let share_arn = share_with(
+        &router,
+        case,
+        &json!({
+            "name": "status-source-removal-share",
+            "resourceArns": [PREFIX_LIST, GLUE_TABLE],
+            "permissionArns": [table_permission.clone()],
+        }),
+    )
+    .await;
+
+    let before = share_permissions_with_arns(&router, case, &share_arn).await;
+    let listed: Vec<&str> = before.iter().map(|(arn, _)| arn.as_str()).collect();
+    assert!(
+        listed.contains(&table_permission.as_str()),
+        "case {case:?}: the share starts governed by the permission it named, got {listed:?}"
+    );
+
+    // Nothing of that resource type is shared any more, so the permission may be removed.
+    let (status, removed) = disassociate(
+        &router,
+        &json!({"resourceShareArn": share_arn, "resourceArns": [GLUE_TABLE]}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: removing the shared table expected 200, got {status} with {removed:?}"
+    );
+    let (status, removed) = detach_permission(
+        &router,
+        &json!({"resourceShareArn": share_arn, "permissionArn": table_permission}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: removing {table_permission:?} expected 200, got {status} with {removed:?}"
+    );
+
+    let after = share_permissions_with_arns(&router, case, &share_arn).await;
+    let listed: Vec<&str> = after.iter().map(|(arn, _)| arn.as_str()).collect();
+    assert!(
+        !listed.contains(&table_permission.as_str()),
+        "case {case:?}: a removed permission is no longer one of the share's, got {listed:?}"
+    );
+
+    // The permission itself is untouched by the removal: read in its own right it is
+    // still a version that can be attached to a share.
+    let (status, detail) =
+        get_permission(&router, &json!({"permissionArn": table_permission})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: reading {table_permission:?} expected 200, got {status} with {detail:?}"
+    );
+    let own = detail.get("permission").cloned().unwrap_or_else(|| {
+        panic!("case {case:?}: the read reported no permission, got {detail:?}")
+    });
+    assert_eq!(
+        field(case, &own, "status"),
+        ATTACHABLE_TO_A_SHARE,
+        "case {case:?}: a permission a share no longer holds is still attachable, got {own:?}"
+    );
 }
