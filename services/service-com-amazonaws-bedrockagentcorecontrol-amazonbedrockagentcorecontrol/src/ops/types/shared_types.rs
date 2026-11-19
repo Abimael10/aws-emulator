@@ -795,7 +795,15 @@ pub struct RateConfig {
     pub period: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#GatewayRateLimitDetail")]
+/// `GatewayRateLimitDetail`, the row every list- and batch-shaped rate-limit response
+/// carries. Its schema and codec come from [`agentcore_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `createdAt` and `updatedAt` target
+/// `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="GatewayRateLimitDetail")`), and the derive does not
+/// put that trait on a member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GatewayRateLimitDetail {
     pub rate_limit_id: String,
@@ -807,6 +815,36 @@ pub struct GatewayRateLimitDetail {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+agentcore_schema_and_codec!(
+    GatewayRateLimitDetail,
+    GATEWAY_RATE_LIMIT_DETAIL_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#GatewayRateLimitDetail",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "GatewayRateLimitDetail",
+    (M_RATE_LIMIT_ID, rate_limit_id, "rateLimitId", 0, req, string),
+    (
+        M_GATEWAY_IDENTIFIER,
+        gateway_identifier,
+        "gatewayIdentifier",
+        1,
+        req,
+        string
+    ),
+    (M_DESCRIPTION, description, "description", 2, opt, string),
+    (
+        M_DIMENSION_KEYS,
+        dimension_keys,
+        "dimensionKeys",
+        3,
+        req,
+        list_of_string
+    ),
+    (M_ENTRIES, entries, "entries", 4, req, list_of_struct(LimitEntry)),
+    (M_STATUS, status, "status", 5, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 6, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 7, req, date_time),
+);
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.bedrockagentcorecontrol#GatewayProtocolConfiguration")]
 #[allow(clippy::large_enum_variant)]

@@ -84,3 +84,36 @@ Cause 6 (acc-gateway-rate-limit-batch-and-update#task#10) GetGatewayRateLimit 20
 1. Replay bedrock-agentcore-control-policy-engine-lifecycle steps setup#1 and task#2: inspect createdAt/updatedAt in the CreatePolicyEngine and GetPolicyEngine bodies - they are JSON numbers, not ISO-8601 strings.
 2. Replay bedrock-agentcore-control-policy-error-paths steps task#3 and task#4 for CreatePolicy/GetPolicy - same numeric encoding.
 3. Replay acc-gateway-rate-limit-batch-and-update steps task#9 and task#10: BatchPutGatewayRateLimits returns status CREATING, and the following GetGatewayRateLimit still reports CREATING instead of ACTIVE, with numeric timestamps.
+
+## Resolution
+
+All six causes are fixed.
+
+Causes 1-4 (CreatePolicyEngine, GetPolicyEngine, CreatePolicy, GetPolicy) were already
+resolved by earlier work on the same rule: those four response shapes get their schema and
+codec from `agentcore_schema_and_codec!`, which attaches
+`@timestampFormat("date-time")` to each `DateTimestamp` member schema. The three policy
+fixtures of this issue replay clean.
+
+Causes 5 and 6 are fixed in two parts, both applied to the whole gateway rate-limit family
+rather than to the two cited steps:
+
+* Wire form: `GatewayRateLimitDetail` (the row the batch and list responses carry) and the
+  `GetGatewayRateLimit`, `CreateGatewayRateLimit` and `UpdateGatewayRateLimit` response
+  shapes now carry hand-written member schemas with the date-time format, so every
+  `createdAt`/`updatedAt` of the family is an RFC 3339 string.
+* Status: the batch write is the one write this service applies ATOMICALLY ("Atomically
+  creates or updates multiple rate limits for a gateway … If the operation fails, the
+  service applies no changes"), so the set it stores is the set already in force: each
+  entry is stored settled and reported `ACTIVE` from the write on, and every later read
+  reports `ACTIVE`. The asynchronous single create and update keep their transient
+  `CREATING`/`UPDATING` and the clock-owed transition into `ACTIVE`, which is what their own
+  recorded responses report.
+
+Pinned by `tests/all/gateway_rate_limit_wire_shape.rs`.
+
+Still diverging in `acc-gateway-rate-limit-batch-and-update`, on causes this issue does not
+own: `CreateGateway`'s `$.gatewayUrl`
+(`20261102T055559Z-bedrock-agentcore-control-creategateway-and-getgateway-gateway-representation-diverges-gatewayurl-carries.md`)
+and `UpdateGatewayRateLimit`'s 404 message
+(`20261118T191327Z-bedrock-agentcore-control-5-net-new-causes-in.md`).

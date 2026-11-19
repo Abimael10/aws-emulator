@@ -27,9 +27,11 @@ pub const GATEWAY_RATE_LIMIT_STATUS_CREATING: &str = "CREATING";
 pub const GATEWAY_RATE_LIMIT_STATUS_UPDATING: &str = "UPDATING";
 pub const GATEWAY_RATE_LIMIT_STATUS_ACTIVE: &str = "ACTIVE";
 
-/// How long a freshly written rate limit stays in its transient status
-/// (`CREATING` for one this write added, `UPDATING` for one it replaced) before
-/// the clock owes it `ACTIVE`.
+/// How long a rate limit one asynchronous write accepted stays in its transient
+/// status (`CREATING` for one a create added, `UPDATING` for one an update
+/// replaced) before the clock owes it `ACTIVE`.
+///
+/// The atomic batch write waits out no span at all: see [`GatewayRateLimitRecord::stored`].
 ///
 /// A rate limit is a child of the gateway that enforces it, so it settles on the
 /// same span the gateway family uses ([`super::GATEWAY_SETTLE_DELAY`]): one
@@ -97,28 +99,40 @@ impl GatewayRateLimitRecord {
     /// resolved for it.
     ///
     /// `replacing` is the rate limit that id already named, if any: an upsert
-    /// keeps the instant that limit was first created and reports `UPDATING`,
-    /// while an id nothing held is created at `now` and reports `CREATING`.
+    /// keeps the instant that limit was first created, while an id nothing held
+    /// is created at `now`.
+    ///
+    /// The set is written ATOMICALLY — "Atomically creates or updates multiple
+    /// rate limits for a gateway … If the operation fails, the service applies no
+    /// changes" (`smithy_query doc shape=BatchPutGatewayRateLimits`) — so the set
+    /// this stores is the set already in force: every entry of it is reported in
+    /// the terminal `ACTIVE` from the instant of the write, with no transition
+    /// left for the clock to owe it. A caller that waits for `ACTIVE` before
+    /// sending traffic is served by the batch write itself.
     pub fn stored(
         rate_limit_id: String,
         submitted: BatchPutLimitEntry,
         replacing: Option<&Self>,
         now: SystemTime,
     ) -> Self {
-        Self::written(
+        Self::recorded(
             rate_limit_id,
             submitted.description,
             submitted.dimension_keys,
             submitted.entries,
             replacing,
             now,
+            // Nothing is owed: the status is the terminal one from this instant on.
+            (GATEWAY_RATE_LIMIT_STATUS_ACTIVE.to_string(), now),
         )
     }
 
-    /// The same record, from the members a write carries rather than from the
-    /// batch write's own entry shape: the single create submits one rate limit
-    /// member by member, the batch write submits a list of them, and both store
-    /// it here so neither can date or status a rate limit differently.
+    /// The record one ASYNCHRONOUS write stores, from the members that write
+    /// carries rather than from the batch write's own entry shape: the single
+    /// create submits one rate limit member by member and the update rewrites
+    /// one, and both report the transient status the clock owes a transition out
+    /// of — `CREATING` for an id nothing held, `UPDATING` for one being
+    /// replaced — until [`GATEWAY_RATE_LIMIT_SETTLE_DELAY`] passes.
     pub fn written(
         rate_limit_id: String,
         description: Option<String>,
@@ -127,6 +141,36 @@ impl GatewayRateLimitRecord {
         replacing: Option<&Self>,
         now: SystemTime,
     ) -> Self {
+        let transient_status = if replacing.is_some() {
+            GATEWAY_RATE_LIMIT_STATUS_UPDATING.to_string()
+        } else {
+            GATEWAY_RATE_LIMIT_STATUS_CREATING.to_string()
+        };
+        Self::recorded(
+            rate_limit_id,
+            description,
+            dimension_keys,
+            entries,
+            replacing,
+            now,
+            (transient_status, now + GATEWAY_RATE_LIMIT_SETTLE_DELAY),
+        )
+    }
+
+    /// The one place a rate limit's record is built: what the caller submitted,
+    /// and `reports` — the status it reports until the instant beside it, from
+    /// which the terminal `ACTIVE` is reported instead. Every write goes through
+    /// here, so none of them can date a rate limit differently.
+    fn recorded(
+        rate_limit_id: String,
+        description: Option<String>,
+        dimension_keys: Vec<String>,
+        entries: Vec<LimitEntry>,
+        replacing: Option<&Self>,
+        now: SystemTime,
+        reports: (String, SystemTime),
+    ) -> Self {
+        let (transient_status, settles_at) = reports;
         Self {
             rate_limit_id,
             description,
@@ -134,13 +178,9 @@ impl GatewayRateLimitRecord {
             entries,
             created_at: replacing.map_or(now, |previous| previous.created_at),
             updated_at: now,
-            transient_status: if replacing.is_some() {
-                GATEWAY_RATE_LIMIT_STATUS_UPDATING.to_string()
-            } else {
-                GATEWAY_RATE_LIMIT_STATUS_CREATING.to_string()
-            },
+            transient_status,
             settled_status: GATEWAY_RATE_LIMIT_STATUS_ACTIVE.to_string(),
-            settles_at: now + GATEWAY_RATE_LIMIT_SETTLE_DELAY,
+            settles_at,
         }
     }
 

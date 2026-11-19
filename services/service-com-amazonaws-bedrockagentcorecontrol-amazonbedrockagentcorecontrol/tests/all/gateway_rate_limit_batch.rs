@@ -14,9 +14,9 @@
 //! replaces all existing rate limits in a single request" — upserting an entry whose
 //! `rateLimitId` an existing limit already holds, minting an id for an entry that carries
 //! none, and dropping every limit the submitted list leaves out, so the stored set is
-//! always exactly one submitted list and never a merge of two. Each written limit reports
-//! `CREATING` (or `UPDATING` for an upsert) until the clock owes it `ACTIVE`, and reads
-//! back through `GetGatewayRateLimit` exactly as it was submitted.
+//! always exactly one submitted list and never a merge of two. The write is atomic, so each
+//! limit of the resulting set is reported in the terminal `ACTIVE` at once, and reads back
+//! through `GetGatewayRateLimit` exactly as it was submitted.
 //!
 //! The rows differ along what the rule generalises over: how many entries one batch
 //! carries, whether each entry names its own `rateLimitId` or is minted one, which
@@ -24,7 +24,7 @@
 //! metrics each configures.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -38,9 +38,13 @@ const REGION: &str = "us-east-1";
 /// A role ARN inside `RoleArn`'s pattern `^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/GatewayRole";
 
-/// The settle span `src/state.rs` gives the gateway family's clock-owed transitions, plus
-/// slack, so a row can wait the clock out.
-const PAST_SETTLE: Duration = Duration::from_millis(900);
+/// How long a test waits for a clock-owed transition before failing. Far longer than the
+/// span `src/state.rs` gives the gateway family, so a loaded or slow host cannot fail a
+/// test: a test waits for the CONDITION it needs, never for a fixed time.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a test waits between two looks at the same resource.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -125,6 +129,30 @@ async fn get_rate_limit(router: &MultiServiceRouter, gateway: &str, rate_limit: 
     .await
 }
 
+/// Look again at the gateway until it reports `wanted`, which is what a caller polling the
+/// status field does. The deadline only catches a gateway that never settles at all.
+async fn poll_until_gateway_status(
+    router: &MultiServiceRouter,
+    gateway: &str,
+    wanted: &str,
+    case: &str,
+) {
+    let started = Instant::now();
+    loop {
+        let read = send(router, "GET", &format!("/gateways/{gateway}/"), None).await;
+        if read.status == 200 && text(&read.body, "status") == wanted {
+            return;
+        }
+        assert!(
+            started.elapsed() < SETTLE_DEADLINE,
+            "case {case:?}: the gateway never reached {wanted}, last answer {} ({})",
+            read.status,
+            read.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Create a gateway and hand back its `gatewayId`, waited out to `READY` — a gateway
 /// enforces a rate limit only from the terminal status it settles into.
 async fn settled_gateway(router: &MultiServiceRouter, name: &str) -> String {
@@ -141,7 +169,7 @@ async fn settled_gateway(router: &MultiServiceRouter, name: &str) -> String {
         created.status, created.body
     );
     let gateway_id = text(&created.body, "gatewayId");
-    tokio::time::sleep(PAST_SETTLE).await;
+    poll_until_gateway_status(router, &gateway_id, "READY", "the gateway settles").await;
     gateway_id
 }
 
@@ -354,9 +382,9 @@ async fn a_batch_write_stores_exactly_the_submitted_set() {
             );
             assert_eq!(
                 text(entry, "status"),
-                "CREATING",
-                "case {case:?}: entry {index} is CREATING until the clock owes it ACTIVE, got \
-                 {entry}"
+                "ACTIVE",
+                "case {case:?}: the batch applies its set atomically, so entry {index} is ACTIVE \
+                 at once, got {entry}"
             );
             assert_eq!(
                 entry.get("dimensionKeys"),
@@ -395,15 +423,14 @@ async fn a_batch_write_stores_exactly_the_submitted_set() {
             );
         }
 
-        // The clock owes every written limit its ACTIVE, and nothing but the clock moves
-        // it there.
-        tokio::time::sleep(PAST_SETTLE).await;
+        // The status the atomic write settled does not move: a later read reports the same
+        // ACTIVE, so a caller polling before sending traffic is served.
         for entry in &reported {
             let settled = get_rate_limit(&router, &gateway_id, &text(entry, "rateLimitId")).await;
             assert_eq!(
                 (settled.status, text(&settled.body, "status").as_str()),
                 (200, "ACTIVE"),
-                "case {case:?}: once the span passes the limit is ACTIVE, got {} {} ({})",
+                "case {case:?}: the written limit stays ACTIVE, got {} {} ({})",
                 settled.status,
                 text(&settled.body, "status"),
                 settled.body
@@ -413,8 +440,8 @@ async fn a_batch_write_stores_exactly_the_submitted_set() {
 }
 
 /// A second batch REPLACES the set: the entry it keeps is upserted onto the limit that id
-/// already named — same creation instant, status `UPDATING` — and every limit the second
-/// list leaves out is gone.
+/// already named — same creation instant, reported `ACTIVE` by the atomic write — and every
+/// limit the second list leaves out is gone.
 #[tokio::test]
 async fn a_second_batch_replaces_the_set_rather_than_merging_into_it() {
     let router = router();
@@ -486,8 +513,8 @@ async fn a_second_batch_replaces_the_set_rather_than_merging_into_it() {
     let upserted = get_rate_limit(&router, &gateway_id, "kept").await;
     assert_eq!(
         (upserted.status, text(&upserted.body, "status").as_str()),
-        (200, "UPDATING"),
-        "the upserted limit reports UPDATING, got {} {} ({})",
+        (200, "ACTIVE"),
+        "the upserted limit is ACTIVE at once, got {} {} ({})",
         upserted.status,
         text(&upserted.body, "status"),
         upserted.body
@@ -658,7 +685,7 @@ async fn the_batch_resolves_its_gateway_first() {
     );
 
     // A gateway on its way out takes no further configuration.
-    tokio::time::sleep(PAST_SETTLE).await;
+    poll_until_gateway_status(&router, &gateway_id, "READY", "the gateway settles").await;
     let deleted = send(&router, "DELETE", &format!("/gateways/{gateway_id}/"), None).await;
     assert_eq!(
         deleted.status, 202,
