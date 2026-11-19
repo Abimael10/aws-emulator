@@ -861,6 +861,7 @@ fn initialize(
         return Ok(Initialized::Answered(read_completion(
             &answered,
             bounds.response_bytes,
+            Phase::Initialization,
         )));
     }
     Ok(Initialized::Ready(entries))
@@ -897,13 +898,22 @@ fn served(
     reused: bool,
 ) -> PyResult<Completion> {
     prepared.environ.install(vm, environment, reused)?;
+    if reused {
+        bounds.measure_memory_from_here();
+    }
+    // Binding the invocation is the runtime's own work on RECEIVING one: it unmarshals the
+    // payload the caller sent and builds the context object out of this invocation's own
+    // members ([`super::bootstrap`]), neither of which is the handler's run — so both happen
+    // before the invoke phase is begun below and the handler is told it has its whole
+    // `Timeout` left when it is entered.
     let bound = prepared.bind.call((vm.ctx.new_str(input.to_owned()),), vm)?;
     let bound: String = bound.try_into_value(vm)?;
     if !bound.is_empty() {
-        return Ok(read_completion(&bound, bounds.response_bytes));
-    }
-    if reused {
-        bounds.measure_memory_from_here();
+        return Ok(read_completion(
+            &bound,
+            bounds.response_bytes,
+            Phase::Invocation,
+        ));
     }
     // The INVOKE phase begins HERE, which is the handler's own run: from this instant the
     // deadline is the function's `Timeout`, and the instant it falls at is what the handler
@@ -911,7 +921,11 @@ fn served(
     let deadline_epoch_ms = bounds.start();
     let answered = prepared.invoke.call((vm.ctx.new_int(deadline_epoch_ms),), vm)?;
     let text: String = answered.try_into_value(vm)?;
-    Ok(read_completion(&text, bounds.response_bytes))
+    Ok(read_completion(
+        &text,
+        bounds.response_bytes,
+        Phase::Invocation,
+    ))
 }
 
 /// How often the host's own watch samples a run's deadline.
@@ -1152,6 +1166,13 @@ impl EnvironmentSinks {
     /// guest code wrote itself, is not left for this one to read, and the variable AWS
     /// documents as changing with each invocation (the X-Ray trace header) is this
     /// invocation's.
+    ///
+    /// Every step is CHECKED, because this emptying is the whole of what keeps one
+    /// invocation's environment out of the next one's reach: `os.environ` is a mapping of a
+    /// guest-reachable class, so a clear or a write that raised would leave the invocation
+    /// about to be served reading what the invocation before it left there. An environment
+    /// whose sinks cannot be emptied and written serves no invocation at all — the failure is
+    /// answered to the caller and the environment is not kept ([`super::warm_pool`]).
     fn install(
         &self,
         vm: &VirtualMachine,
@@ -1161,8 +1182,8 @@ impl EnvironmentSinks {
         self.held(vm, "posix", &self.posix)?;
         self.held(vm, "os", &self.system)?;
         if replacing {
-            let _ = vm.call_method(&self.posix, "clear", ());
-            let _ = vm.call_method(&self.system, "clear", ());
+            self.emptied(vm, "posix", &self.posix)?;
+            self.emptied(vm, "os", &self.system)?;
         }
         for (name, value) in variables {
             let key: PyObjectRef = vm.ctx.new_bytes(name.as_bytes().to_vec()).into();
@@ -1170,9 +1191,41 @@ impl EnvironmentSinks {
             self.posix.set_item(&*key, held, vm)?;
             let key: PyObjectRef = vm.ctx.new_str(name.clone()).into();
             let held: PyObjectRef = vm.ctx.new_str(value.clone()).into();
-            let _ = self.system.set_item(&*key, held, vm);
+            self.system.set_item(&*key, held, vm)?;
         }
         Ok(())
+    }
+
+    /// Empty `mapping`, which is `<module>.environ`, and confirm it IS empty.
+    ///
+    /// The call and the reading are both the host's: a mapping whose `clear` raised, and one
+    /// that answered and left entries behind, are the same thing here — a sink still holding
+    /// the variables of the invocation served before this one. Either refuses the run, in the
+    /// shape [`installed_refusal`] confirms a containment patch in, and the refusal states
+    /// what the mapping raised ([`formatted_exception`]) so the containment failure can be
+    /// read rather than guessed at.
+    fn emptied(
+        &self,
+        vm: &VirtualMachine,
+        module: &'static str,
+        mapping: &PyObjectRef,
+    ) -> PyResult<()> {
+        let refused = |vm: &VirtualMachine, why: String| {
+            vm.new_runtime_error(format!(
+                "the environment mapping this emulator holds for {module}.environ could not be \
+                 emptied ({why}), so no further invocation is served in this execution \
+                 environment"
+            ))
+        };
+        vm.call_method(mapping, "clear", ())
+            .map_err(|raised| refused(vm, formatted_exception(vm, &raised)))?;
+        let left = mapping
+            .length(vm)
+            .map_err(|raised| refused(vm, formatted_exception(vm, &raised)))?;
+        if left == 0 {
+            return Ok(());
+        }
+        Err(refused(vm, format!("{left} variable(s) are still in it")))
     }
 
     /// Re-assert `<module>.environ` as the mapping the host captured and read it back: the
@@ -1341,8 +1394,25 @@ fn bounded_sleep(bounds: &Arc<Bounds>, seconds: f64) {
 /// time clamps it further.
 const MAX_GUEST_SLEEP_SECONDS: f64 = 3_600.0;
 
+/// Which PHASE of a run answered, which is what the failure of that answer belongs to: the
+/// INITIALIZATION of the execution environment, or the invocation being served in it.
+///
+/// The phase is the HOST's own reading — it is the host that calls one phase after the other
+/// ([`initialize`], [`served`]) — rather than anything read off the document the runtime
+/// answered with, because the class a failure carries says nothing about when it happened:
+/// the top-level code of a deployment package fails the initialization under whatever class
+/// it raised.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// The execution environment was still being built: the handler's module was being
+    /// imported and its entry point resolved.
+    Initialization,
+    /// An invocation was being served in a standing environment.
+    Invocation,
+}
+
 /// The runtime's answer, as this module reports it.
-fn read_completion(answered: &str, response_bytes: usize) -> Completion {
+fn read_completion(answered: &str, response_bytes: usize, phase: Phase) -> Completion {
     let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(answered) else {
         return Completion::Internal("the runtime answered with a document that is not JSON".into());
     };
@@ -1364,6 +1434,7 @@ fn read_completion(answered: &str, response_bytes: usize) -> Completion {
         Some("raised") => Completion::Raised {
             error_type: member("errorType"),
             error_message: member("errorMessage"),
+            initialization: phase == Phase::Initialization,
             stack_trace: document
                 .get("stackTrace")
                 .and_then(::serde_json::Value::as_array)
@@ -1401,11 +1472,6 @@ fn runtime_input(request: &Run<'_>) -> Result<String, String> {
         .iter()
         .map(|(name, value)| (name.clone(), ::serde_json::Value::String(value.clone())))
         .collect();
-    let client_context = match request.client_context {
-        Some(text) => ::serde_json::from_str::<::serde_json::Value>(text)
-            .unwrap_or(::serde_json::Value::Null),
-        None => ::serde_json::Value::Null,
-    };
     let document = ::serde_json::json!({
         "handler": request.handler,
         "modules": modules,
@@ -1416,7 +1482,7 @@ fn runtime_input(request: &Run<'_>) -> Result<String, String> {
         "event": request.event,
         "requestId": request.request_id,
         "invokedFunctionArn": request.invoked_function_arn,
-        "clientContext": client_context,
+        "clientContext": request.client_context,
         "tenantId": request.tenant_id,
     });
     ::serde_json::to_string(&document).map_err(|error| error.to_string())
@@ -1434,17 +1500,17 @@ fn invocation_input(request: &Run<'_>) -> Result<String, String> {
         .iter()
         .map(|(name, value)| (name.clone(), ::serde_json::Value::String(value.clone())))
         .collect();
-    let client_context = match request.client_context {
-        Some(text) => ::serde_json::from_str::<::serde_json::Value>(text)
-            .unwrap_or(::serde_json::Value::Null),
-        None => ::serde_json::Value::Null,
-    };
+    // The `ClientContext` travels as the TEXT the caller sent (decoded from its base64),
+    // because it is the RUNTIME that reads it: a managed runtime parses that document
+    // itself and refuses an invocation whose document it cannot parse
+    // ([`super::bootstrap`]), so a document this host parsed and dropped on a fault would
+    // hand the handler no client context where the runtime raises.
     let document = ::serde_json::json!({
         "environment": environment,
         "event": request.event,
         "requestId": request.request_id,
         "invokedFunctionArn": request.invoked_function_arn,
-        "clientContext": client_context,
+        "clientContext": request.client_context,
         "tenantId": request.tenant_id,
     });
     ::serde_json::to_string(&document).map_err(|error| error.to_string())
@@ -1492,6 +1558,15 @@ fn runtime_stdlib() -> ::serde_json::Map<String, ::serde_json::Value> {
 /// function, so the one it answers is read from `held` — the cell [`Prepared`] owns, which
 /// stays filled until the interpreter has been FINALIZED, because a guest `atexit` callback
 /// runs during finalization and its line events have to be traced too.
+///
+/// The stop the hook delivers is raised INSIDE the guest, which guest code may catch — so the
+/// hook ARMS THE TRACE SLOT AGAIN on its way out. An interpreter stops tracing once a trace
+/// function raises, so without that the stop this hook raises would be the last check of the
+/// run: a handler that swallows it would go on running the host's thread with its budget spent
+/// and nothing left to notice. Armed again, every event after the catch meets the latched stop
+/// again ([`Bounds::step`] answers the latch), so the run keeps being stopped for as long as it
+/// keeps running. The arming is itself guarded against re-entering the hook, so no event the
+/// arming call delivers can start a second one.
 fn install_trace_hook(
     vm: &VirtualMachine,
     session: &Arc<Session>,
@@ -1499,10 +1574,27 @@ fn install_trace_hook(
 ) -> PyResult<()> {
     let answered = ::std::rc::Rc::clone(held);
     let stepping = Arc::clone(session);
+    // The call that arms the interpreter's trace slot, held for the hook to use. Filled from
+    // the host below, before any guest code runs and before the name it was read off is taken
+    // away, so no guest can reach it through this cell either.
+    let arming: ::std::rc::Rc<::std::cell::RefCell<Option<PyObjectRef>>> =
+        ::std::rc::Rc::new(::std::cell::RefCell::new(None));
+    let armed = ::std::rc::Rc::clone(&arming);
+    let arming_now = ::std::rc::Rc::new(::std::cell::Cell::new(false));
     let hook = vm.new_function(
         "__lambda_trace",
         move |_args: FuncArgs, vm: &VirtualMachine| {
             if let Some(stop) = stepping.bounds().step() {
+                // The slot again, with this same hook, so a guest that catches what follows
+                // is traced — and stopped — at its next event too.
+                if !arming_now.replace(true) {
+                    let arm = armed.borrow().clone();
+                    let hook = answered.borrow().clone();
+                    if let (Some(arm), Some(hook)) = (arm, hook) {
+                        let _ = arm.call((hook,), vm);
+                    }
+                    arming_now.set(false);
+                }
                 return Err(vm.new_runtime_error(stop.reason().to_owned()));
             }
             // The local tracer for the frame this event belongs to is this same hook, so
@@ -1514,6 +1606,7 @@ fn install_trace_hook(
     let hook: PyObjectRef = hook.into();
     *held.borrow_mut() = Some(hook.clone());
     let setter = vm.sys_module.as_object().get_attr("settrace", vm)?;
+    *arming.borrow_mut() = Some(setter.clone());
     setter.call((hook,), vm)?;
     // With these gone, no guest call can reach the interpreter's trace slot at all: the
     // hook that spends the budget is the only one there will be for this run. Each name is
@@ -2801,6 +2894,7 @@ mod tests {
                     error_type: actual_type,
                     error_message,
                     stack_trace,
+                    ..
                 } => {
                     assert_eq!(
                         actual_type, error_type,

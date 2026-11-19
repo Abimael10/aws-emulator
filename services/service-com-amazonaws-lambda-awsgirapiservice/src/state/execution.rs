@@ -1151,22 +1151,38 @@ fn answered(
             error_type,
             error_message,
             stack_trace,
+            initialization,
         } => (
-            error_document(
-                error_message,
-                Some(error_type),
-                // A failure the runtime raised while it was still RESOLVING the handler
-                // belongs to no invocation: the execution environment is initialized
-                // before a request is bound to it, so the document names no request at
-                // all.
-                if raised_during_initialization(error_type) {
-                    ""
+            {
+                let document = error_document(
+                    error_message,
+                    Some(error_type),
+                    // A failure the runtime raised while it was still INITIALIZING the
+                    // execution environment belongs to no invocation: the environment is
+                    // initialized before a request is bound to it, so the document names no
+                    // request at all. The phase is the one the engine that drove it reported
+                    // ([`python`]) rather than a reading of the error's class, because an
+                    // initialization fails under whatever class the deployment package's own
+                    // top-level code raised; where an engine reports no phase, the classes
+                    // its runtime's initialization words itself name it
+                    // ([`INITIALIZATION_ERROR_TYPES`]).
+                    if *initialization || raised_during_initialization(error_type) {
+                        ""
+                    } else {
+                        request_id
+                    },
+                    stack_trace,
+                    engine,
+                );
+                // An error document larger than an invocation may answer with is refused for
+                // its SIZE, like any other response of that size: what the caller is
+                // answered is the response-size refusal rather than the oversize document.
+                if document.len() > budget.response_bytes {
+                    oversize_response_document(budget.response_bytes)
                 } else {
-                    request_id
-                },
-                stack_trace,
-                engine,
-            ),
+                    document
+                }
+            },
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
         // A run the sandbox ended at the function's own `Timeout` is reported as that
@@ -1200,13 +1216,7 @@ fn answered(
         // runtime that exited: the error names the response-size class and states the
         // quota the response passed.
         Completion::Stopped(Stop::Response) => (
-            sandbox_error_document(
-                &format!(
-                    "Response payload size exceeded maximum allowed payload size ({} bytes).",
-                    budget.response_bytes
-                ),
-                RESPONSE_SIZE_TOO_LARGE,
-            ),
+            oversize_response_document(budget.response_bytes),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
         Completion::Stopped(stop) => (
@@ -1292,18 +1302,21 @@ const RESPONSE_SIZE_TOO_LARGE: &str = "Function.ResponseSizeTooLarge";
 /// What AWS reports as the message of such a run when the sandbox ended it.
 const RUNTIME_KILLED: &str = "Runtime exited with error: signal: killed";
 
-/// The `errorType` classes a runtime reports for a failure of the INITIALIZATION phase:
-/// the phase in which it reads the configured handler name, imports the module that name
-/// resolves to, and finds the entry point on it. Each is raised by the runtime itself
-/// before it has an invocation in hand — `MalformedHandlerName` for a name it cannot
-/// split, `UserCodeSyntaxError` for a module that does not compile, `ImportModuleError`
-/// for one that does not import (including one whose own top-level code raised), and
-/// `HandlerNotFound` for a module that does not define the entry point — which is what
-/// makes a failure of any of them one no invocation is bound to.
+/// The `errorType` classes the NODE runtime reports for a failure of the INITIALIZATION
+/// phase: the phase in which it reads the configured handler name, loads the module that
+/// name resolves to, and finds the entry point on it. Each is raised by the runtime itself
+/// before it has an invocation in hand — `MalformedHandlerName` for a name it cannot split,
+/// `UserCodeSyntaxError` for a module that does not compile, `ImportModuleError` for one
+/// that does not load, and `HandlerNotFound` for a module that does not define the entry
+/// point — which is what makes a failure of any of them one no invocation is bound to.
 ///
-/// They are the classes BOTH runtimes report ([`python`], [`node`]); a class a handler's
-/// own exception carries can never be one of them, because an exception type name holds no
-/// `.`.
+/// It is a FALLBACK reading, for an engine that reports no phase of its own
+/// ([`node`]): where the engine states the phase it was in
+/// (`Completion::Raised { initialization }`, which [`python`] does), that statement decides,
+/// and this list is not consulted for it. Nothing is added here for the Python runtime's
+/// own initialization classes — a package whose top-level code raised fails under its OWN
+/// exception class, which no list of names can enumerate, and that is exactly why the phase
+/// is reported rather than inferred.
 const INITIALIZATION_ERROR_TYPES: &[&str] = &[
     "Runtime.MalformedHandlerName",
     "Runtime.UserCodeSyntaxError",
@@ -1426,6 +1439,21 @@ fn object_text(members: &[(&str, ::serde_json::Value)], separators: (&str, &str)
         })
         .collect();
     format!("{{{}}}", rendered.join(between))
+}
+
+/// The error payload an invocation whose answer was larger than one may be is refused with:
+/// the response-size class and the quota the answer passed, in bytes.
+///
+/// It is what the caller is answered whichever side produced that answer — the payload a
+/// handler returned, or the document the runtime wrote for an error it raised — because the
+/// quota is the RESPONSE's and Lambda states it the same way for both.
+fn oversize_response_document(response_bytes: usize) -> Vec<u8> {
+    sandbox_error_document(
+        &format!(
+            "Response payload size exceeded maximum allowed payload size ({response_bytes} bytes)."
+        ),
+        RESPONSE_SIZE_TOO_LARGE,
+    )
 }
 
 /// The error payload an invocation the SANDBOX ended answers with: the message and the
@@ -2385,6 +2413,9 @@ mod tests {
                         error_type: (*error_type).to_string(),
                         error_message: "the run did not answer".to_string(),
                         stack_trace: Vec::new(),
+                        // The row is about the error CLASS a runtime words itself, which is
+                        // what names the phase where the engine reports none.
+                        initialization: false,
                     },
                     log: String::new(),
                     log_records: Vec::new(),
@@ -2413,6 +2444,144 @@ mod tests {
                     actual, *expected,
                     "case {engine:?} reporting {error_type}: expected the request id \
                      {expected:?}, got {parsed}"
+                );
+            }
+        }
+    }
+
+    /// A failure the ENGINE reported as the INITIALIZATION's names no invocation whatever
+    /// class it carries: an initialization fails under whatever class the deployment
+    /// package's own top-level code raised, so the phase decides this and the class does
+    /// not. One row per class a package can fail its own import under, each read both ways
+    /// round — reported as the initialization's and as a run's.
+    #[test]
+    fn a_failure_the_engine_reported_as_the_initializations_names_no_invocation() {
+        let request_id = "11111111-2222-3333-4444-555555555555";
+        for error_type in ["LookupError", "SyntaxError", "ValueError", "RuntimeError"] {
+            for initialization in [true, false] {
+                let finished = Finished {
+                    completion: Completion::Raised {
+                        error_type: error_type.to_string(),
+                        error_message: "the package's own code raised".to_string(),
+                        stack_trace: Vec::new(),
+                        initialization,
+                    },
+                    log: String::new(),
+                    log_records: Vec::new(),
+                    init_records: Vec::new(),
+                    initialized: true,
+                    init_duration: None,
+                    log_stream: None,
+                    elapsed: Duration::ZERO,
+                    max_memory_bytes: None,
+                };
+                let invoked = answered(
+                    finished,
+                    request_id,
+                    &probe_invocation(),
+                    run_budget(3, MIN_MEMORY_SIZE_MB as i32),
+                    Engine::Python,
+                    SystemTime::UNIX_EPOCH,
+                    PROBE_LOG_STREAM,
+                );
+                let parsed: ::serde_json::Value = ::serde_json::from_slice(&invoked.payload)
+                    .expect("the error document is JSON");
+                let actual = parsed
+                    .get("requestId")
+                    .and_then(::serde_json::Value::as_str);
+                let expected = if initialization { "" } else { request_id };
+                assert_eq!(
+                    actual,
+                    Some(expected),
+                    "case {error_type} reported by the initialization: {initialization}: \
+                     expected the request id {expected:?}, got {parsed}"
+                );
+            }
+        }
+    }
+
+    /// An error document larger than an invocation may answer with is refused for its SIZE,
+    /// like any other response of that size: the caller reads the response-size class and
+    /// the quota instead of the oversize document, and a document of exactly the quota is
+    /// answered as the runtime wrote it.
+    ///
+    /// The rows are the sizes around that quota, measured on the document rather than on the
+    /// message: the overhead the document's own members add is taken from the document
+    /// builder itself, so the boundary is the real one.
+    #[test]
+    fn an_error_document_past_the_response_quota_is_answered_as_a_response_past_it() {
+        let request_id = "11111111-2222-3333-4444-555555555555";
+        let budget = run_budget(3, MIN_MEMORY_SIZE_MB as i32);
+        let quota = budget.response_bytes;
+        // What the document's own members cost, beside the message: the builder's own answer
+        // for an empty message.
+        let overhead = error_document("", Some("Oversize"), request_id, &[], Engine::Python).len();
+        for (case, message_bytes, oversize) in [
+            ("a document of exactly the quota", quota - overhead, false),
+            ("a document one byte past the quota", quota - overhead + 1, true),
+        ] {
+            // Characters no JSON writer escapes, so one character is one byte of the
+            // document.
+            let message = "x".repeat(message_bytes);
+            let finished = Finished {
+                completion: Completion::Raised {
+                    error_type: "Oversize".to_string(),
+                    error_message: message.clone(),
+                    stack_trace: Vec::new(),
+                    initialization: false,
+                },
+                log: String::new(),
+                log_records: Vec::new(),
+                init_records: Vec::new(),
+                initialized: true,
+                init_duration: None,
+                log_stream: None,
+                elapsed: Duration::ZERO,
+                max_memory_bytes: None,
+            };
+            let invoked = answered(
+                finished,
+                request_id,
+                &probe_invocation(),
+                budget,
+                Engine::Python,
+                SystemTime::UNIX_EPOCH,
+                PROBE_LOG_STREAM,
+            );
+            let parsed: ::serde_json::Value =
+                ::serde_json::from_slice(&invoked.payload).expect("the document is JSON");
+            let class = parsed
+                .get("errorType")
+                .and_then(::serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let reported = parsed
+                .get("errorMessage")
+                .and_then(::serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if oversize {
+                assert_eq!(
+                    (class.as_str(), reported.as_str()),
+                    (
+                        RESPONSE_SIZE_TOO_LARGE,
+                        format!(
+                            "Response payload size exceeded maximum allowed payload size \
+                             ({quota} bytes)."
+                        )
+                        .as_str()
+                    ),
+                    "case {case}: expected the response-size refusal, got {class} and {} \
+                     bytes of message",
+                    reported.len()
+                );
+            } else {
+                assert_eq!(
+                    (class.as_str(), reported.len(), invoked.payload.len()),
+                    ("Oversize", message_bytes, quota),
+                    "case {case}: expected the runtime's own document, got {class} and {} \
+                     bytes of document",
+                    invoked.payload.len()
                 );
             }
         }

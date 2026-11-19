@@ -23,6 +23,12 @@
 //! ([`REQUEST_BODY_PREFIX`]) and once for the payload in it ([`PAYLOAD_PREFIX`]) — and the
 //! clause for the position the parse ended at follows the sentence, with the payload's own
 //! source WITHHELD: an event is the caller's and none of it is echoed back.
+//!
+//! Two payloads are not that: a body carrying nothing but whitespace stopped on no character
+//! at all, so it is reported as holding no content ([`NO_CONTENT`]) and names no position;
+//! and a body whose FIRST value is complete carries JSON, so what follows that value is not
+//! refused here — the value reaches the runtime, which is where a payload with data after it
+//! fails to unmarshal.
 
 use ::service_common::json_parse_fault as fault;
 
@@ -32,15 +38,44 @@ const REQUEST_BODY_PREFIX: &str = "Could not parse request body into json";
 /// The inner prefix: the payload INSIDE that body is what could not be parsed.
 const PAYLOAD_PREFIX: &str = "Could not parse payload into json";
 
+/// What a payload holding no JSON content at all is refused with: a body that is there and
+/// carries nothing to read is reported as holding no content, with no position of its own —
+/// there is no character the parse stopped on, because there was no value to start.
+const NO_CONTENT: &str = "No payload content found";
+
 /// The message an invocation payload that is not JSON is refused with, or `None` when the
 /// payload IS JSON — and for an EMPTY payload, which is the documented no-event invocation
 /// rather than a body with nothing in it.
+///
+/// What is refused is a payload no JSON VALUE can be read out of. A payload that begins with
+/// a complete value and carries something after it is NOT refused here: the value reaches the
+/// RUNTIME, and it is the runtime that fails to unmarshal what follows it
+/// (`crate::state::execution::bootstrap`), so refusing it to the caller would answer a client
+/// with the error of a different layer.
 #[must_use]
 pub fn unparseable_payload_message(payload: &[u8]) -> Option<String> {
     if payload.is_empty() {
         return None;
     }
-    let error = ::serde_json::from_slice::<::serde_json::Value>(payload).err()?;
+    // The FIRST value of the payload, which is what decides whether the body carries JSON at
+    // all: a stream reader stops at the end of that value instead of requiring the payload to
+    // end there, and answers that there is no value at all for a body made of whitespace.
+    let read = ::serde_json::Deserializer::from_slice(payload)
+        .into_iter::<::serde_json::Value>()
+        .next();
+    let error = match read {
+        // A complete first value: the payload carries JSON, so it is handed on whatever
+        // follows it.
+        Some(Ok(_)) => return None,
+        Some(Err(error)) => error,
+        // No value at all, which is a body holding nothing but the whitespace JSON allows
+        // between its tokens: there is no character the parse stopped on to report.
+        None => {
+            return Some(format!(
+                "{REQUEST_BODY_PREFIX}: {PAYLOAD_PREFIX}: {NO_CONTENT}"
+            ))
+        }
+    };
     // The parse reads the payload as text; a byte sequence that is not text at all is no
     // JSON either, and the position it stopped at is stated over the text the reader saw.
     let payload = ::std::string::String::from_utf8_lossy(payload);
@@ -91,14 +126,14 @@ mod tests {
     use super::*;
 
     /// RULE: a payload that is not JSON is refused with the two prefixes, the fault the
-    /// parse stopped on and the position it stopped at — and a payload that IS JSON, or is
-    /// empty, is not refused at all.
+    /// parse stopped on and the position it stopped at — and a payload that IS JSON, is
+    /// empty, or carries a complete first value is not refused at all.
     ///
     /// The rows span what the rule generalises over: the class of fault (a bare word, a
     /// character no value starts with, a container left open, a string left open, a payload
     /// with no content), where in the payload the fault is (its first value, and inside an
-    /// object), and which LINE it is on, which the location clause carries beside the
-    /// column.
+    /// object), which LINE it is on, which the location clause carries beside the
+    /// column, and what follows a complete value (more JSON, or data that is none).
     #[test]
     fn a_payload_that_is_not_json_is_refused_with_the_fault_the_parse_stopped_on() {
         let redacted = fault::REDACTED_SOURCE;
@@ -109,6 +144,9 @@ mod tests {
             ("a bare number", b"12", None),
             ("a bare keyword", b"null", None),
             ("an empty payload", b"", None),
+            ("an object with trailing data", br#"{"k":1}xx"#, None),
+            ("an object with a second value after it", br#"{"k":1} {"k":2}"#, None),
+            ("a bare number with trailing data", b"12 nope", None),
             (
                 "a bare word",
                 b"not json",
@@ -178,10 +216,13 @@ mod tests {
             (
                 "whitespace and nothing else",
                 b"  \n ",
-                Some(format!(
-                    "Unexpected end-of-input: expected a value\n at [Source: {redacted}; \
-                     line: 2, column: 2]"
-                )),
+                Some(NO_CONTENT.to_string()),
+            ),
+            ("a single space", b" ", Some(NO_CONTENT.to_string())),
+            (
+                "a tab and a carriage return",
+                b"\t\r\n",
+                Some(NO_CONTENT.to_string()),
             ),
         ];
 

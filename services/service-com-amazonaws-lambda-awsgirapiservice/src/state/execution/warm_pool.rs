@@ -866,6 +866,7 @@ mod tests {
                     error_type: "ValueError".to_string(),
                     error_message: "boom".to_string(),
                     stack_trace: Vec::new(),
+                    initialization: false,
                 },
                 true,
             ),

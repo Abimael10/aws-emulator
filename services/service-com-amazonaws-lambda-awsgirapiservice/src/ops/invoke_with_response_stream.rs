@@ -385,7 +385,14 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             return Err(invalid_request_content(message));
         }
 
-        let function_arn = record.versioned_arn(&version);
+        // The ARN the handler is told it was invoked through: the one the CALL addressed,
+        // carrying exactly the qualifier the call named ($LATEST included) and unqualified
+        // only where the call named none (`crate::state::invoked_function_arn`).
+        let invoked_arn = crate::state::invoked_function_arn(
+            &record.arn,
+            crate::state::named_qualifier(&input.function_name, input.qualifier.as_deref())
+                .as_deref(),
+        );
         // `ExecutedVersion` is the version the qualifier resolves to for THIS invocation,
         // never the alias name the call addressed; an alias that splits its invocations
         // between two versions resolves per invocation (`crate::state::alias_routing`).
@@ -436,7 +443,7 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         let invocation = crate::state::Invocation {
             function_name: function_name.clone(),
             executed_version: executed_version.clone(),
-            invoked_function_arn: function_arn.clone(),
+            invoked_function_arn: invoked_arn.clone(),
             region: region.clone(),
             runtime: resolved_config.runtime.clone(),
             handler: resolved_config.handler.clone(),

@@ -1002,6 +1002,11 @@ fn read_completion(answered: &str, bounds: &Arc<Bounds>) -> Completion {
                 error_type,
                 error_message,
                 stack_trace: traced(&document),
+                // A node runtime reports its failures through this one answer channel
+                // whichever phase it was in, so the phase is not known here; the classes
+                // its initialization fails under are recognized by name instead
+                // ([`super::super::execution`]).
+                initialization: false,
             }
         }
         _ => Completion::Internal("the runtime answered with no outcome".into()),
@@ -2553,6 +2558,7 @@ mod tests {
                     error_type,
                     error_message,
                     stack_trace,
+                    ..
                 } => {
                     assert_eq!(
                         (error_type.as_str(), error_message.as_str()),

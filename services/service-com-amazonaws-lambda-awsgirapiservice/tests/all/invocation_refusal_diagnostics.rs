@@ -173,6 +173,10 @@ struct PayloadCase {
 /// character no value starts with, a word where a member NAME belongs, a container left
 /// open, a payload that is only whitespace), where in the payload the fault is (its first
 /// value, and a member's value), which LINE it is on, and the payloads that are JSON.
+///
+/// A payload whose FIRST value is complete is one of the latter whatever follows it: the
+/// value reaches the runtime, which is what refuses the rest
+/// (`crate::python_runtime_invocation_envelope`).
 fn payload_cases() -> Vec<PayloadCase> {
     let unrecognized = |word: &str, line: usize, column: usize| {
         Some(format!(
@@ -224,10 +228,9 @@ fn payload_cases() -> Vec<PayloadCase> {
         PayloadCase {
             case: "whitespace and nothing else",
             payload: b" ",
-            diagnostic: Some(format!(
-                "Unexpected end-of-input: expected a value\n at [Source: {WITHHELD_SOURCE}; \
-                 line: 1, column: 2]"
-            )),
+            // No value was read at all, so there is no character the parse stopped on: the
+            // refusal states that the payload carries no content, and names no position.
+            diagnostic: Some("No payload content found".to_string()),
         },
         // The payloads that ARE JSON: an object, an array and a bare literal are each a
         // document the parse reads whole, so none of them is refused.

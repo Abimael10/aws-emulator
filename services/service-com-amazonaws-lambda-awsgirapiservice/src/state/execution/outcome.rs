@@ -88,6 +88,18 @@ pub enum Completion {
         error_message: String,
         /// The handler's own stack, one formatted frame per entry.
         stack_trace: Vec<String>,
+        /// Whether the failure came while the execution environment was still being
+        /// INITIALIZED — the phase in which the runtime reads the configured handler name,
+        /// imports the module it names and resolves the entry point on it — rather than
+        /// from a run of the handler.
+        ///
+        /// It is the PHASE the failure happened in, reported by the engine that was driving
+        /// that phase, and not a reading of the error's class: an initialization fails under
+        /// whatever class the deployment package's own top-level code raised, so a class is
+        /// no answer to which phase a failure belongs to. What it decides is what the error
+        /// document says: an initialization belongs to no invocation, so its failure names
+        /// no request ([`super::super::execution`]).
+        initialization: bool,
     },
     /// The run was stopped by one of its bounds.
     Stopped(Stop),

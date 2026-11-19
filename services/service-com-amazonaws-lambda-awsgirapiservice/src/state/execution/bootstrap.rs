@@ -47,7 +47,9 @@
 //!   serves invocation after invocation, so what one invocation brings arrives here rather
 //!   than in the initialization above — and the logging handler is re-installed with this
 //!   invocation's request id, so every record a run leaves names the invocation that wrote
-//!   it.
+//!   it. The payload is unmarshalled and the context object built here too: both are the
+//!   runtime's own work on receiving an invocation, so neither is charged to the handler's
+//!   own run.
 //! * `__lambda_invoke` — the handler's own run, which the host calls next, having begun the
 //!   invoke phase itself and passing the instant the `Timeout` is up at. It answers a JSON
 //!   document carrying what the handler returned, or the error it raised.
@@ -617,6 +619,103 @@ class _LayerFinder:
         return None
 
 
+class CognitoIdentity:
+    """The IDENTITY the invocation was made with, as `context.identity`.
+
+    An object with both members present whether or not an identity was supplied, which is
+    the interface a handler reads them through: a handler of a function invoked without an
+    Amazon Cognito identity reads ``None`` off each member rather than having nothing to
+    read them off at all.
+    """
+
+    __slots__ = ("cognito_identity_id", "cognito_identity_pool_id")
+
+    def __init__(self):
+        self.cognito_identity_id = None
+        self.cognito_identity_pool_id = None
+
+
+class Client:
+    """The mobile CLIENT a client context names, as `context.client_context.client`."""
+
+    __slots__ = (
+        "installation_id",
+        "app_title",
+        "app_version_name",
+        "app_version_code",
+        "app_package_name",
+    )
+
+    def __init__(self):
+        for member in self.__slots__:
+            setattr(self, member, None)
+
+
+class ClientContext:
+    """The CLIENT CONTEXT the caller sent, as `context.client_context`.
+
+    The members are the three a client context document carries, read off that document by
+    name and ``None`` for one it does not carry — an OBJECT rather than the document
+    itself, because a handler reads `client_context.custom` rather than indexing a mapping.
+    """
+
+    __slots__ = ("custom", "env", "client")
+
+    def __init__(self):
+        for member in self.__slots__:
+            setattr(self, member, None)
+
+
+def _object_from(class_, document):
+    """One object of ``class_`` carrying what ``document`` holds for each of its members.
+
+    ``None`` for a document that is not there at all, which is what a handler reads when
+    the invocation carried none.
+    """
+
+    if document is None:
+        return None
+    built = class_()
+    for member in class_.__slots__:
+        setattr(built, member, document.get(member))
+    return built
+
+
+class _ContextFault(Exception):
+    """A failure of the CONTEXT itself, under the class the runtime reports it as.
+
+    Raised where a member of the invocation cannot be read — a client context that is not
+    JSON — so the invocation is refused with that class before the handler is called.
+    """
+
+    def __init__(self, error_type, error_message):
+        Exception.__init__(self, error_message)
+        self.error_type = error_type
+        self.error_message = error_message
+
+
+def _client_context(text):
+    """The client context object for the document ``text`` holds, or ``None`` for none.
+
+    The runtime PARSES the document the caller sent: an invocation carrying one that is not
+    JSON is refused under the runtime's own class for it, before the handler runs.
+    """
+
+    if not text:
+        return None
+    try:
+        document = json.loads(text)
+    except BaseException as error:
+        raise _ContextFault(
+            "Runtime.LambdaContextUnmarshalError",
+            "Unable to parse Client Context JSON: %s" % error,
+        )
+    built = _object_from(ClientContext, document)
+    if built is not None:
+        built.client = _object_from(Client, built.client)
+    return built
+
+
 class LambdaContext:
     """The context object the handler is called with.
 
@@ -624,6 +723,10 @@ class LambdaContext:
     runtime interface reads them from: the function's name, version, memory size and log
     destination are environment variables of the invocation. The host hands that
     environment in, so this runtime needs no operating-system module of its own.
+
+    The identity and the client context are OBJECTS exposing their own members
+    (`CognitoIdentity`, `ClientContext`), which is the interface a handler reads them
+    through.
     """
 
     def __init__(self, request, environment):
@@ -634,12 +737,24 @@ class LambdaContext:
         self.function_name = environment.get("AWS_LAMBDA_FUNCTION_NAME")
         self.function_version = environment.get("AWS_LAMBDA_FUNCTION_VERSION")
         self.memory_limit_in_mb = environment.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")
-        self.identity = None
-        self.client_context = request["clientContext"]
+        self.identity = CognitoIdentity()
+        self.client_context = _client_context(request["clientContext"])
         self.tenant_id = request["tenantId"]
         # When this invocation's own run is up, which the host answers when the invoke
-        # phase begins: the execution environment's initialization is not part of it.
-        self._deadline_epoch_ms = request["deadlineEpochMs"]
+        # phase begins: the execution environment's initialization is not part of it, and
+        # neither is the runtime's own work of binding this invocation, so the handler is
+        # told it has its whole configured timeout left when it is entered.
+        self._deadline_epoch_ms = 0
+
+    def bind_deadline(self, deadline_epoch_ms):
+        """Hand the context the instant this invocation's own run is up at.
+
+        Called once, by this runtime, as the handler's run is begun: the deadline is the
+        HOST's to decide, and until it is handed over the context reports no time left —
+        the invocation's own run has not started.
+        """
+
+        self._deadline_epoch_ms = deadline_epoch_ms
 
     def get_remaining_time_in_millis(self):
         return max(0, int(self._deadline_epoch_ms - time.time() * 1000.0))
@@ -776,6 +891,19 @@ def _bounded_sleep(seconds):
     return _host.sleep(float(seconds))
 
 
+def _built_in_modules():
+    """The modules the RUNTIME ITSELF is built with, under the names a handler would give
+    for them.
+
+    The interpreter reports the modules compiled into it (``sys.builtin_module_names``),
+    and the interpreter's own two are built in whether or not it lists them there: no file
+    supplies ``sys`` or ``builtins``, so a handler naming either names the interpreter's
+    module rather than anything of the deployment package.
+    """
+
+    return frozenset(sys.builtin_module_names) | {"builtins", "sys"}
+
+
 def _prepare(request, library):
     """The INIT phase: everything that has to happen before the handler can be called.
 
@@ -845,14 +973,39 @@ def _prepare(request, library):
             [],
         )
 
+    # A handler naming a module the interpreter itself is built with is refused before the
+    # import is attempted: such a name resolves to the runtime's own module rather than to
+    # anything of the deployment package, so the runtime reports the conflict instead of
+    # importing it.
+    if module_name.partition(".")[0] in _built_in_modules():
+        return _raised(
+            "Runtime.BuiltInModuleConflict",
+            "Cannot use built-in module %s as a handler module" % module_name,
+            [],
+        )
+
     try:
         module = importlib.import_module(module_name)
-    except BaseException as error:
+    except ImportError as error:
+        # A module that is not THERE, under the name the handler gave for it.
         return _raised(
             "Runtime.ImportModuleError",
             "Unable to import module '%s': %s" % (module_name, error),
             [],
         )
+    except SyntaxError as error:
+        # A module that is there and does not COMPILE, which is the package's own syntax
+        # rather than a missing module.
+        return _raised(
+            "Runtime.UserCodeSyntaxError",
+            "Syntax error in module '%s': %s" % (module_name, error),
+            [],
+        )
+    except BaseException as error:
+        # The module imported and its own top-level code raised: the failure is the
+        # package's own exception, so it is reported under that exception's class rather
+        # than as a module that could not be imported.
+        return _raised(type(error).__name__, str(error), [])
 
     try:
         entry = getattr(module, attribute)
@@ -873,20 +1026,22 @@ def _invoke(deadline_epoch_ms):
     """The INVOKE phase: the handler's own run, which is what the ``Timeout`` bounds.
 
     ``deadline_epoch_ms`` is when that ``Timeout`` is up at, as the host decided it when it
-    began this phase; it is what the context reports as the time remaining.
+    began this phase; it is what the context reports as the time remaining. Everything the
+    runtime itself had to do for this invocation — unmarshalling the payload, building the
+    context — is already done ([_bind]), so what this phase holds is the handler's own work
+    and the handler is entered with its whole timeout left.
     """
-    request = _PREPARED["request"]
     library = _PREPARED["library"]
     entry = _PREPARED["entry"]
-    request["deadlineEpochMs"] = deadline_epoch_ms
-
-    event_text = request["event"]
-    try:
-        event = json.loads(event_text) if event_text else {}
-    except ValueError as error:
-        return _raised("Runtime.InvalidEvent", str(error), [])
-
-    context = LambdaContext(request, request["environment"])
+    if "context" not in _PREPARED:
+        return _raised(
+            "Runtime.InternalError",
+            "the execution environment has no bound invocation to run",
+            [],
+        )
+    event = _PREPARED["event"]
+    context = _PREPARED["context"]
+    context.bind_deadline(deadline_epoch_ms)
 
     try:
         returned = entry(event, context)
@@ -947,6 +1102,11 @@ def _bind(request):
     invocation — is bound here rather than by the initialization. The logging handler is
     re-installed with this invocation's request id, so a record carries the invocation
     that wrote it and not the one that happened to initialize the environment.
+
+    The payload is UNMARSHALLED and the context object BUILT here as well, because both are
+    the runtime's own work on receiving an invocation rather than part of the handler's run:
+    a payload that is not the JSON an invocation carries fails as this runtime's unmarshal
+    error, and the handler itself is entered in the next phase with its whole timeout left.
     """
     prepared = _PREPARED.get("request")
     if prepared is None:
@@ -965,6 +1125,24 @@ def _bind(request):
         _configured_log_format(prepared.get("environment")),
         _configured_log_level(prepared.get("environment")),
     )
+    _PREPARED.pop("event", None)
+    _PREPARED.pop("context", None)
+
+    event_text = prepared["event"]
+    try:
+        event = json.loads(event_text) if event_text else {}
+    except BaseException as error:
+        return _raised(
+            "Runtime.UnmarshalError", "Unable to unmarshal input: %s" % error, []
+        )
+
+    try:
+        context = LambdaContext(prepared, prepared["environment"])
+    except _ContextFault as fault:
+        return _raised(fault.error_type, fault.error_message, [])
+
+    _PREPARED["event"] = event
+    _PREPARED["context"] = context
     return None
 
 

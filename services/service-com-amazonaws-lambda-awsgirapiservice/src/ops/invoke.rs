@@ -560,7 +560,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let executed_version = record
             .routed_version(&version)
             .unwrap_or_else(|| version.clone());
-        let function_arn = record.versioned_arn(&version);
+        // The ARN the handler is told it was invoked through: the one the CALL addressed,
+        // carrying exactly the qualifier the call named ($LATEST included) and unqualified
+        // only where the call named none (`crate::state::invoked_function_arn`) — so a call
+        // that named the unpublished version reads that name back rather than an ARN with no
+        // qualifier on it.
+        let invoked_arn = crate::state::invoked_function_arn(
+            &record.arn,
+            crate::state::named_qualifier(&input.function_name, input.qualifier.as_deref())
+                .as_deref(),
+        );
         // The configuration the invocation RESOLVED — a published version's frozen one, or
         // the unpublished version's — which is what the run is performed under. It is read
         // for the version this invocation resolved to, so the configuration the run happens
@@ -711,7 +720,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let invocation = crate::state::Invocation {
                     function_name: function_name.clone(),
                     executed_version: executed_version.clone(),
-                    invoked_function_arn: function_arn.clone(),
+                    invoked_function_arn: invoked_arn.clone(),
                     region: region.clone(),
                     runtime: resolved_config.runtime.clone(),
                     handler: resolved_config.handler.clone(),
@@ -891,7 +900,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let invocation = crate::state::Invocation {
             function_name: function_name.clone(),
             executed_version: executed_version.clone(),
-            invoked_function_arn: function_arn.clone(),
+            invoked_function_arn: invoked_arn.clone(),
             region: region.clone(),
             runtime: resolved_config.runtime.clone(),
             handler: resolved_config.handler.clone(),

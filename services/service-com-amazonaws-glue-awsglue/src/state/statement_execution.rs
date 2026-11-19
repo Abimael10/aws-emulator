@@ -586,6 +586,7 @@ fn read_outcome(finished: &python::Finished) -> StatementOutcome {
             error_type,
             error_message,
             stack_trace,
+            ..
         } => StatementOutcome::Errored {
             // The exception's own type and message, as the interpreter reported them, which is
             // the cell's own failure and not this emulator's words for it.

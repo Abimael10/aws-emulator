@@ -4348,6 +4348,29 @@ pub fn addressed_arn_of(
     ))
 }
 
+/// The ARN an invocation ADDRESSED, as `context.invoked_function_arn` reports it to the
+/// handler: the function's own ARN with exactly the qualifier the CALL named appended, and
+/// the unqualified ARN only for a call that named no qualifier at all.
+///
+/// `invoked_function_arn` is "the Amazon Resource Name (ARN) that's used to invoke the
+/// function" and "indicates if the invoker specified a version number or alias", so what the
+/// handler reads back is the identifier the caller invoked: a call that named a version
+/// number, an alias or the unpublished version by name reads that name back, and only a call
+/// that named nothing reads the unqualified ARN. It is therefore NOT [`qualified_arn`], which
+/// spells the unpublished version as the unqualified ARN wherever this service names the
+/// RESOURCE a version is.
+///
+/// `function_arn` is the function's unqualified ARN; `named_qualifier` is the qualifier the
+/// call carried, in the name or in `Qualifier`, and `None` where it carried neither — which
+/// is the one reading [`named_qualifier`] makes.
+#[must_use]
+pub fn invoked_function_arn(function_arn: &str, named_qualifier: Option<&str>) -> String {
+    match named_qualifier {
+        Some(qualifier) => format!("{function_arn}:{qualifier}"),
+        None => function_arn.to_string(),
+    }
+}
+
 /// The refusal a `FunctionName` that names a function of ANOTHER Region gets, or `None` when
 /// the reference names this endpoint's own Region or names no Region at all.
 ///

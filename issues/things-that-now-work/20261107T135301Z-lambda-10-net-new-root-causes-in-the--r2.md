@@ -58,6 +58,8 @@ Issue-Commit: 76f746b5965121353b22ae227b995a601e952faf
 
 # lambda: 10 net-new root causes in the managed execution environment (no sandbox filesystem, no environment reuse, MemorySize unenforced, wrong runtime identity, context/error-envelope shapes)
 
+> _Resolved for causes 6 (the context object's shape and its remaining-time clock), 7 (the error envelope's class and the invocation it names) and 9 (the payload hand-off) only. The replay keys of causes 1, 2, 3, 4, 5, 8 and 10 do NOT pass and are re-filed under `issues/things-that-do-not-work/20261119T000000Z-lambda-7-of-the-parent-reports-10-causes-remain-the-sandbox-filesystem-the-runtime-library-environment-reuse-memory-and-the-runtime-identity.md`, so they are not recorded as working._
+
 > _Note: this issue was identified against the code base at commit `76f746b5965121353b22ae227b995a601e952faf`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

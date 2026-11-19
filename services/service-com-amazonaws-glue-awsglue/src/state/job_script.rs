@@ -1373,6 +1373,9 @@ mod tests {
                     error_type: "ValueError".to_string(),
                     error_message: "the input partition is malformed".to_string(),
                     stack_trace: Vec::new(),
+                    // The script's own code raised, which is not the phase that stands an
+                    // interpreter up for it.
+                    initialization: false,
                 },
                 JOB_RUN_STATE_FAILED,
                 Some("ValueError: the input partition is malformed".to_string()),

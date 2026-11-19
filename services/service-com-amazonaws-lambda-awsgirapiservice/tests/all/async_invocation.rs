@@ -461,6 +461,10 @@ struct Refusal {
 /// not have, carrying a body that is not "the JSON that you want to provide to your
 /// Lambda function as input", carrying one byte past the published payload ceiling, and
 /// arriving while the function is still being provisioned.
+///
+/// A body whose FIRST value is complete is not among them: it carries JSON, so it is
+/// accepted and what follows that value is the runtime's to judge
+/// (`crate::python_runtime_invocation_envelope`).
 fn refusal_cases() -> Vec<Refusal> {
     vec![
         Refusal {
@@ -495,13 +499,6 @@ fn refusal_cases() -> Vec<Refusal> {
             case: "plain text",
             reference: "queued".to_string(),
             event: b"not json".to_vec(),
-            status: 400,
-            code: "InvalidRequestContentException",
-        },
-        Refusal {
-            case: "two JSON documents in one body",
-            reference: "queued".to_string(),
-            event: b"{} {}".to_vec(),
             status: 400,
             code: "InvalidRequestContentException",
         },
