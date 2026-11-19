@@ -160,7 +160,10 @@ fn s3_in(router: &MultiServiceRouter, region: &str) -> aws_sdk_s3::Client {
 }
 
 /// An IAM client over the same callback, for the roles the associations and the export name.
-fn iam(router: &MultiServiceRouter) -> aws_sdk_iam::Client {
+///
+/// `pub(crate)` so the sibling suite that puts a permissions boundary on one of these roles
+/// reaches IAM through this one client rather than building a second copy of it.
+pub(crate) fn iam(router: &MultiServiceRouter) -> aws_sdk_iam::Client {
     let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
     let config = aws_sdk_iam::Config::builder()
         .behavior_version(aws_sdk_iam::config::BehaviorVersion::latest())
