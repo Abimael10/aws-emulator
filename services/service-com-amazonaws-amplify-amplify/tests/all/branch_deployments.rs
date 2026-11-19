@@ -116,7 +116,15 @@ async fn stop_the_job(emulator: &Emulator, app_id: &str, branch: &str, job_id: &
 /// The pause between reads is a blocking one because this workspace's `tokio` carries no
 /// `time` feature, and a `#[tokio::test]` body owns its runtime thread for the duration
 /// of the case.
-async fn settled_status(emulator: &Emulator, app_id: &str, branch: &str, job_id: &str) -> String {
+///
+/// Shared with `manual_deployment_preconditions`, whose accepted start waits for the
+/// same condition, so the two suites cannot drift on what "settled" means.
+pub(crate) async fn settled_status(
+    emulator: &Emulator,
+    app_id: &str,
+    branch: &str,
+    job_id: &str,
+) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let job = get_job(emulator, app_id, branch, job_id).await;

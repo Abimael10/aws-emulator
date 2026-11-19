@@ -28,18 +28,42 @@
 //! 3. The `Branch` a `DeleteBranch` answers with reports the branch's job accounting as
 //!    it stands: no active job and `'0'` jobs for a branch every start on which was
 //!    refused, and the started job for a branch one did start.
+//! 4. The job a reservation creates reports the status a client polls a job nothing has
+//!    run through — `PENDING`, one of `JobStatus`'s modelled values
+//!    (`smithy_query(query="shape",shape="JobStatus")`) — and a `StartDeployment` the
+//!    service REFUSES leaves that status exactly as it stood, whatever the refusal is:
+//!    only a start the service ACCEPTS moves the job on, through the non-terminal status
+//!    its own answer carries to the terminal one the clock settles it to. Reading the
+//!    job, however often, moves nothing either.
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_amplify_amplify::ops::start_deployment::DEPLOYMENT_FILE_NOT_UPLOADED;
-use service_com_amazonaws_amplify_amplify::state::JOB_STATUS_PENDING;
+use service_com_amazonaws_amplify_amplify::ops::start_deployment::{
+    DEPLOYMENT_FILE_NOT_UPLOADED, NO_SOURCE_MESSAGE, PREFIX_WITHOUT_TRAILING_SEPARATOR,
+    ROOT_DOCUMENT,
+};
+use service_com_amazonaws_amplify_amplify::state::{
+    not_found_message, JOB_ENTITY, JOB_STATUS_PENDING, JOB_STATUS_SUCCEED,
+};
 
 use crate::app_branch_lifecycle::{list_member, string_member, Emulator, Reply};
+// The poll-to-terminal wait the sibling deployment suite already drives, so both suites
+// agree on what a settled job is rather than each holding its own loop.
+use crate::branch_deployments::settled_status;
 
 /// AWS's own sentence for a start whose deployment file never arrived, written out here
 /// so the wording is pinned by the test and not only by the constant under test.
 const EXPECTED_NOT_UPLOADED_MESSAGE: &str = "Deployment file has not been uploaded, \
      please make sure you uploaded the deployment file prior to invoke this api.";
+
+/// AWS's own sentence for a start that names neither a reservation nor a source,
+/// written out here for the same reason.
+const EXPECTED_NO_SOURCE_MESSAGE: &str = "Must specify jobId or sourceUrl for \
+     StartDeploymentRequest.";
+
+/// AWS's own sentence for a `BUCKET_PREFIX` source URL that does not name a folder,
+/// quotes around the separator included.
+const EXPECTED_PREFIX_SEPARATOR_MESSAGE: &str = "The s3 sourceUrl must end with '/'";
 
 /// `FileName`'s modelled maximum length (`smithy_query(query="shape",shape="FileMap")`:
 /// key `length 0..255`), so a request may name a file 255 characters long.
@@ -541,6 +565,360 @@ async fn a_deleted_branch_reports_the_jobs_it_actually_started() {
                 row.case
             ),
         }
+    }
+}
+
+/// `summary.status` of one job, read back through `GetJob` the way a polling client
+/// reads it.
+async fn job_status(emulator: &Emulator, app_id: &str, branch: &str, job_id: &str) -> String {
+    let job = get_job(emulator, app_id, branch, job_id).await;
+    assert_eq!(
+        job.status, 200,
+        "job {job_id:?} on {branch:?}: expected HTTP 200 from GetJob, got {job:?}"
+    );
+    let summary = job.member("job").get("summary").cloned().unwrap_or(Value::Null);
+    string_member(&summary, "status")
+}
+
+/// `summary.status` the branch's LISTING reports for one job, so the two readers of a
+/// job's status are held to the same answer.
+async fn listed_status(
+    emulator: &Emulator,
+    app_id: &str,
+    branch: &str,
+    job_id: &str,
+) -> Option<String> {
+    let listed = list_jobs(emulator, app_id, branch).await;
+    assert_eq!(
+        listed.status, 200,
+        "branch {branch:?}: expected HTTP 200 from ListJobs, got {listed:?}"
+    );
+    list_member(&listed.body, "jobSummaries")
+        .iter()
+        .find(|summary| string_member(summary, "jobId") == job_id)
+        .map(|summary| string_member(summary, "status"))
+}
+
+/// Does this branch report that it has started NO job?
+async fn has_started_no_job(emulator: &Emulator, app_id: &str, branch: &str) -> (String, bool) {
+    let record = emulator.get_branch(app_id, branch).await.member("branch");
+    (
+        string_member(&record, "totalNumberOfJobs"),
+        reports_no_active_job(&record),
+    )
+}
+
+/// One reservation form, with what has to be uploaded to the destinations it hands out
+/// for the deployment it starts to be a servable site.
+struct ReservedCase {
+    case: &'static str,
+    /// The `CreateDeployment` request that reserves it.
+    request: Value,
+    /// The files the request named, for the per-file form; EMPTY for the zipped form,
+    /// whose single destination takes an archive instead.
+    named_files: Vec<&'static str>,
+    /// The entries the archive carries, for the zipped form.
+    archive_entries: Vec<&'static str>,
+}
+
+/// The table for rule 4's reservations: one row per form a reservation can take, each
+/// carrying `ROOT_DOCUMENT` so the start that IS accepted has a site to publish.
+fn reserved_cases() -> Vec<ReservedCase> {
+    // `MD5Hash` is modelled `length 0..32` with no further constraint
+    // (`smithy_query(query="shape",shape="FileMap")`); nothing in this rule reads it.
+    let hash = "d41d8cd98f00b204e9800998ecf8427e";
+    vec![
+        ReservedCase {
+            case: "a zipped deployment",
+            request: json!({}),
+            named_files: Vec::new(),
+            archive_entries: vec![ROOT_DOCUMENT],
+        },
+        ReservedCase {
+            case: "a zipped deployment of several files",
+            request: json!({}),
+            named_files: Vec::new(),
+            archive_entries: vec![ROOT_DOCUMENT, "assets/app.js", "assets/styles/main.css"],
+        },
+        ReservedCase {
+            case: "one named file",
+            request: json!({ "fileMap": { ROOT_DOCUMENT: hash } }),
+            named_files: vec![ROOT_DOCUMENT],
+            archive_entries: Vec::new(),
+        },
+        ReservedCase {
+            case: "three named files under nested prefixes",
+            request: json!({ "fileMap": {
+                ROOT_DOCUMENT: hash,
+                "assets/app.js": hash,
+                "assets/styles/main.css": hash,
+            }}),
+            named_files: vec![ROOT_DOCUMENT, "assets/app.js", "assets/styles/main.css"],
+            archive_entries: Vec::new(),
+        },
+    ]
+}
+
+/// One `StartDeployment` the service refuses while a reservation is outstanding, and
+/// the refusal it takes.
+struct RefusedStart {
+    case: &'static str,
+    request: Value,
+    status: u16,
+    error_code: &'static str,
+    message: String,
+}
+
+/// The table for rule 4's refusals: one row per way a `StartDeployment` on this branch
+/// is refused while `job_id`'s reservation is outstanding and nothing has been uploaded
+/// to it. The reservation is untouched by every one of them, so the rows run in sequence
+/// against the same reservation — including the same refusal TWICE, because a refusal
+/// repeated has to answer and leave behind exactly what the first one did.
+fn refused_starts(job_id: &str) -> Vec<RefusedStart> {
+    // A job number this branch never handed out: the reservation's own number carries
+    // the branch's sequence, so anything far past it names nothing to start.
+    let unknown = (job_id.parse::<u64>().expect("a modelled jobId parses") + 1_000).to_string();
+    vec![
+        RefusedStart {
+            case: "the outstanding reservation, nothing uploaded",
+            request: json!({ "jobId": job_id }),
+            status: 400,
+            error_code: "BadRequestException",
+            message: EXPECTED_NOT_UPLOADED_MESSAGE.to_string(),
+        },
+        RefusedStart {
+            case: "the identical start, refused again",
+            request: json!({ "jobId": job_id }),
+            status: 400,
+            error_code: "BadRequestException",
+            message: EXPECTED_NOT_UPLOADED_MESSAGE.to_string(),
+        },
+        RefusedStart {
+            case: "the outstanding reservation named beside a source URL",
+            // `jobId` names the reservation to start, so it decides what is deployed and
+            // the same upload gate applies.
+            request: json!({ "jobId": job_id, "sourceUrl": "s3://amplify-source/site.zip" }),
+            status: 400,
+            error_code: "BadRequestException",
+            message: EXPECTED_NOT_UPLOADED_MESSAGE.to_string(),
+        },
+        RefusedStart {
+            case: "a jobId no reservation of this branch holds",
+            request: json!({ "jobId": unknown }),
+            status: 404,
+            error_code: "NotFoundException",
+            message: not_found_message(JOB_ENTITY, &unknown),
+        },
+        RefusedStart {
+            case: "neither a reservation nor a source",
+            request: json!({}),
+            status: 400,
+            error_code: "BadRequestException",
+            message: EXPECTED_NO_SOURCE_MESSAGE.to_string(),
+        },
+        RefusedStart {
+            case: "a BUCKET_PREFIX source URL that names an object",
+            request: json!({
+                "sourceUrl": "s3://amplify-source/site",
+                "sourceUrlType": "BUCKET_PREFIX",
+            }),
+            status: 400,
+            error_code: "BadRequestException",
+            message: EXPECTED_PREFIX_SEPARATOR_MESSAGE.to_string(),
+        },
+    ]
+}
+
+/// Rule 4: a reserved job is `PENDING`, every refused start leaves it `PENDING`, and the
+/// accepted start is what moves it on.
+#[tokio::test]
+async fn a_refused_start_leaves_the_reserved_job_in_the_status_it_was_reserved_in() {
+    // The two `JobStatus` values this rule turns on, and the two further refusal
+    // sentences its rows take, written out as AWS words them so what is pinned is the
+    // service's contract and not only whatever the crate's constants hold
+    // (`smithy_query(query="shape",shape="JobStatus")`: `CREATED | PENDING |
+    // PROVISIONING | RUNNING | FAILED | SUCCEED | CANCELLING | CANCELLED`).
+    assert_eq!(
+        (JOB_STATUS_PENDING, JOB_STATUS_SUCCEED),
+        ("PENDING", "SUCCEED"),
+        "the statuses this rule is about are the modelled JobStatus values"
+    );
+    assert_eq!(
+        (EXPECTED_NO_SOURCE_MESSAGE, EXPECTED_PREFIX_SEPARATOR_MESSAGE),
+        (NO_SOURCE_MESSAGE, PREFIX_WITHOUT_TRAILING_SEPARATOR),
+        "the refusals this service states must be AWS's sentences"
+    );
+    assert_eq!(
+        EXPECTED_NOT_UPLOADED_MESSAGE, DEPLOYMENT_FILE_NOT_UPLOADED,
+        "the refusal this service states must be AWS's sentence"
+    );
+
+    let emulator = Emulator::new();
+    let app_id = emulator.app_id_of_new_app("reserved-job-status").await;
+
+    for (index, row) in reserved_cases().into_iter().enumerate() {
+        // One row per BRANCH: a branch serializes its deployments, and what this rule is
+        // about is the status of ONE outstanding reservation.
+        let branch = format!("row-{index}");
+        branch_on(&emulator, &app_id, &branch).await;
+
+        let reserved = create_deployment(&emulator, &app_id, &branch, &row.request).await;
+        assert_eq!(
+            reserved.status, 200,
+            "case {:?}: expected HTTP 200 from CreateDeployment, got {reserved:?}",
+            row.case
+        );
+        let job_id = string_member(&reserved.body, "jobId");
+
+        // Reserved and not started: the status a client polls such a job through, and the
+        // same one from both readers of it.
+        let status = job_status(&emulator, &app_id, &branch, &job_id).await;
+        assert_eq!(
+            status, JOB_STATUS_PENDING,
+            "case {:?}: a reserved job nothing has started is {JOB_STATUS_PENDING}, \
+             got {status:?}",
+            row.case
+        );
+        let listed = listed_status(&emulator, &app_id, &branch, &job_id).await;
+        assert_eq!(
+            listed.as_deref(),
+            Some(JOB_STATUS_PENDING),
+            "case {:?}: the listing reports the reserved job the same way GetJob does, \
+             got {listed:?}",
+            row.case
+        );
+
+        for refusal in refused_starts(&job_id) {
+            let refused = start_deployment(&emulator, &app_id, &branch, &refusal.request).await;
+            assert_eq!(
+                refused.status, refusal.status,
+                "case {:?}/{:?}: expected HTTP {}, got {refused:?}",
+                row.case, refusal.case, refusal.status
+            );
+            assert_eq!(
+                refused.error_code.as_deref(),
+                Some(refusal.error_code),
+                "case {:?}/{:?}: expected the modelled {}, got {:?}",
+                row.case,
+                refusal.case,
+                refusal.error_code,
+                refused.error_code
+            );
+            assert_eq!(
+                refused.message().as_deref(),
+                Some(refusal.message.as_str()),
+                "case {:?}/{:?}: expected {:?}, got {:?}",
+                row.case,
+                refusal.case,
+                refusal.message,
+                refused.message()
+            );
+
+            // The refusal moved nothing: the reservation's job is in the status it was
+            // reserved in, from both readers, and READING it twice does not move it
+            // either.
+            for read in 1..=2 {
+                let status = job_status(&emulator, &app_id, &branch, &job_id).await;
+                assert_eq!(
+                    status, JOB_STATUS_PENDING,
+                    "case {:?}/{:?}: read {read} after the refusal must still be \
+                     {JOB_STATUS_PENDING}, got {status:?}",
+                    row.case, refusal.case
+                );
+            }
+            let listed = listed_status(&emulator, &app_id, &branch, &job_id).await;
+            assert_eq!(
+                listed.as_deref(),
+                Some(JOB_STATUS_PENDING),
+                "case {:?}/{:?}: the listing must still report the reserved job as \
+                 {JOB_STATUS_PENDING}, got {listed:?}",
+                row.case, refusal.case
+            );
+            let (total, no_active) = has_started_no_job(&emulator, &app_id, &branch).await;
+            assert_eq!(
+                total, "0",
+                "case {:?}/{:?}: a refused start is not a started job, got {total:?}",
+                row.case, refusal.case
+            );
+            assert!(
+                no_active,
+                "case {:?}/{:?}: a refused start leaves the branch no active job",
+                row.case, refusal.case
+            );
+        }
+
+        // The upload the gate asked for, to the destinations this reservation published.
+        if row.named_files.is_empty() {
+            let url = string_member(&reserved.body, "zipUploadUrl");
+            upload(
+                &emulator,
+                row.case,
+                &url,
+                &zip_of(row.archive_entries.as_slice()),
+            )
+            .await;
+        } else {
+            for name in &row.named_files {
+                let url = reserved
+                    .body
+                    .get("fileUploadUrls")
+                    .and_then(|urls| urls.get(*name))
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {:?}: the reservation published no destination for \
+                             {name:?}: {:?}",
+                            row.case, reserved.body
+                        )
+                    })
+                    .to_string();
+                upload(
+                    &emulator,
+                    row.case,
+                    &url,
+                    format!("the bytes of {name}").as_bytes(),
+                )
+                .await;
+            }
+        }
+
+        // Only the ACCEPTED start moves the job: its own answer carries the non-terminal
+        // status the deployment runs under, and the clock settles it to the terminal one.
+        let started =
+            start_deployment(&emulator, &app_id, &branch, &json!({ "jobId": job_id })).await;
+        assert_eq!(
+            started.status, 200,
+            "case {:?}: an uploaded reservation starts, got {started:?}",
+            row.case
+        );
+        let summary = started.member("jobSummary");
+        assert_eq!(
+            string_member(&summary, "jobId"),
+            job_id,
+            "case {:?}: the deployment runs under the id it reserved, got {summary:?}",
+            row.case
+        );
+        assert_eq!(
+            string_member(&summary, "status"),
+            JOB_STATUS_PENDING,
+            "case {:?}: a deployment just started is not finished yet, got {summary:?}",
+            row.case
+        );
+        let settled = settled_status(&emulator, &app_id, &branch, &job_id).await;
+        assert_eq!(
+            settled, JOB_STATUS_SUCCEED,
+            "case {:?}: the deployment of a site carrying {ROOT_DOCUMENT} succeeds, \
+             got {settled:?}",
+            row.case
+        );
+        let listed = listed_status(&emulator, &app_id, &branch, &job_id).await;
+        assert_eq!(
+            listed.as_deref(),
+            Some(JOB_STATUS_SUCCEED),
+            "case {:?}: the listing reports the settled job the same way GetJob does, \
+             got {listed:?}",
+            row.case
+        );
     }
 }
 
