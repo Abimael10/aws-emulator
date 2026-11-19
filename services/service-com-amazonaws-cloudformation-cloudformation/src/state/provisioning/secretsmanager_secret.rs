@@ -108,6 +108,20 @@ const REPLICA_REGIONS: &str = "ReplicaRegions";
 /// See [`REPLICA_REGIONS`].
 const ADD_REPLICA_REGIONS: &str = "AddReplicaRegions";
 
+/// `DescribeSecret`'s member reporting the Regions a secret is replicated to, and the member
+/// of each entry naming one — the Regions the removal has to take the replicas out of before
+/// the primary can be deleted ([`de_replicate`]).
+const REPLICATION_STATUS: &str = "ReplicationStatus";
+/// See [`REPLICATION_STATUS`].
+const REGION: &str = "Region";
+
+/// The call that takes a secret's replicas away, and its list of the Regions to take them
+/// out of: "You must first delete the replicas using RemoveRegionsFromReplication, and then
+/// delete the primary secret" (`DeleteSecret`, AWS Secrets Manager's own model).
+const REMOVE_REGIONS_FROM_REPLICATION: &str = "RemoveRegionsFromReplication";
+/// See [`REMOVE_REGIONS_FROM_REPLICATION`].
+const REMOVE_REPLICA_REGIONS: &str = "RemoveReplicaRegions";
+
 /// The member both writes stake the new version under, and how many characters this
 /// provider mints one with: the modelled `ClientRequestTokenType`'s own shortest length
 /// (32..64, `smithy_query(query="operation",operation="CreateSecret")`).
@@ -339,11 +353,20 @@ pub(super) async fn update(
 /// the secret is gone once that service has carried it out ([`removal`]). A secret it no
 /// longer holds is already in the state the delete asks for, judged on the CODE and never
 /// on a message.
+///
+/// A REPLICATED secret is taken out of every Region it reached first: "You can't delete a
+/// primary secret that is replicated to other Regions. You must first delete the replicas
+/// using RemoveRegionsFromReplication, and then delete the primary secret" (`DeleteSecret`),
+/// so the delete of one that still has replicas is refused by the owning service. The
+/// provider makes the call that order asks for ([`de_replicate`]) rather than failing the
+/// resource, because what a stack's deletion owes is the secret gone — in the Region the
+/// stack deployed it in and in each Region it was replicated to.
 pub(super) async fn delete(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
 ) -> Result<(), Refusal> {
+    de_replicate(ctx, region, &resource.physical_resource_id).await?;
     let request = serde_json::json!({
         "SecretId": resource.physical_resource_id,
         FORCE_DELETE_WITHOUT_RECOVERY: true,
@@ -353,6 +376,58 @@ pub(super) async fn delete(
         Err(refusal) if refusal.code == SECRET_NOT_FOUND => Ok(()),
         Err(refusal) => Err(refusal),
     }
+}
+
+/// Take the secret out of replication, so the primary's delete has no replica standing in
+/// its way — and so the Regions it was replicated to stop holding it, which is what the
+/// stack's deletion owes there too ("When you delete a replica, it is deleted immediately",
+/// `DeleteSecret`).
+///
+/// The Regions come from the owning service's OWN record of where the secret is replicated
+/// (`DescribeSecret$ReplicationStatus`), never from the declaration: a replica the
+/// declaration never named — one a later `ReplicateSecretToRegions` added — is still a
+/// replica the primary cannot be deleted under, and a Region the declaration named whose
+/// replica failed to be created is not one there is anything to remove from. A secret that
+/// service no longer holds has no replicas either, and the delete below is what answers for
+/// it.
+async fn de_replicate(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    secret_id: &str,
+) -> Result<(), Refusal> {
+    let read = serde_json::json!({ "SecretId": secret_id });
+    let answered = match call_secretsmanager(ctx, region, DESCRIBE_SECRET, &read).await {
+        Ok(answered) => answered,
+        Err(refusal) if refusal.code == SECRET_NOT_FOUND => return Ok(()),
+        Err(refusal) => return Err(refusal),
+    };
+    let replicated_to = replicated_regions(&answered);
+    if replicated_to.is_empty() {
+        return Ok(());
+    }
+    let request = serde_json::json!({
+        "SecretId": secret_id,
+        REMOVE_REPLICA_REGIONS: Value::Array(replicated_to),
+    });
+    call_secretsmanager(ctx, region, REMOVE_REGIONS_FROM_REPLICATION, &request).await?;
+    Ok(())
+}
+
+/// The Regions a `DescribeSecret` answer reports the secret replicated to, as the removal
+/// names them: each entry's own `Region`, and nothing for an answer that reports no
+/// replication at all.
+fn replicated_regions(answered: &Value) -> Vec<Value> {
+    answered
+        .get(REPLICATION_STATUS)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| stated(entry, REGION))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The secret's configuration as the owning service reports it, for drift detection:
@@ -839,5 +914,48 @@ mod tests {
             "case \"a declaration beside the propagated tags\": expected the declared and \
              stack keys plus CloudFormation's own record, got {rendered}"
         );
+    }
+
+    /// RULE: the Regions the removal takes the replicas out of are the ones the owning
+    /// service reports the secret replicated to, whatever status each replica is in, and no
+    /// Region at all for an answer that reports no replication.
+    #[test]
+    fn the_removal_names_every_region_the_service_reports() {
+        let rows: &[(&str, Value, &[&str])] = &[
+            (
+                "an answer reporting no replication",
+                serde_json::json!({"ARN": "arn:aws:secretsmanager:us-east-1:000000000000:secret:a-AbCdEf"}),
+                &[],
+            ),
+            (
+                "an answer reporting an empty replication list",
+                serde_json::json!({"ReplicationStatus": []}),
+                &[],
+            ),
+            (
+                "one replica",
+                serde_json::json!({"ReplicationStatus": [{"Region": "us-west-2", "Status": "InSync"}]}),
+                &["us-west-2"],
+            ),
+            (
+                "replicas in several statuses",
+                serde_json::json!({"ReplicationStatus": [
+                    {"Region": "us-west-2", "Status": "InSync"},
+                    {"Region": "eu-west-1", "Status": "InProgress"},
+                    {"Region": "ap-south-1", "Status": "Failed"}
+                ]}),
+                &["us-west-2", "eu-west-1", "ap-south-1"],
+            ),
+        ];
+        for (case, answered, expected) in rows {
+            let regions = replicated_regions(answered);
+            let named: Vec<String> = regions.iter().map(attribute_text).collect();
+            let actual: Vec<&str> = named.iter().map(String::as_str).collect();
+            assert_eq!(
+                actual.as_slice(),
+                *expected,
+                "case {case:?}: expected the Regions {expected:?}, got {actual:?}"
+            );
+        }
     }
 }

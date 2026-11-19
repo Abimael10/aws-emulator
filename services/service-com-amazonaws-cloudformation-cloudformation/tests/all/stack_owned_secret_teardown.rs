@@ -43,7 +43,10 @@ const SECRETSMANAGER_TARGET_PREFIX: &str = "secretsmanager";
 
 /// The error code Secrets Manager refuses a read of a secret it does not hold with
 /// (`ResourceNotFoundException`, that service's own modelled refusal).
-const SECRET_NOT_FOUND: &str = "ResourceNotFoundException";
+///
+/// `pub(crate)`: a sibling suite asserting the same refusal reads THIS name rather than
+/// carrying a second copy of it.
+pub(crate) const SECRET_NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// The error code Parameter Store refuses a read of a name it resolves no parameter for with
 /// (`ParameterNotFound`, Systems Manager's own modelled refusal of `GetParameter`).
@@ -187,7 +190,7 @@ fn arn_output(row: &Row) -> String {
 }
 
 /// Call one AWS Secrets Manager operation through the same router, signed for
-/// `secretsmanager` the way a client's SDK signs it: the status and the parsed answer.
+/// `secretsmanager` in the Region these suites deploy in: the status and the parsed answer.
 ///
 /// `pub(crate)`: `tests/all.rs` is this binary's crate root, so a sibling suite that reads
 /// the secret a stack created addresses that service through THIS call rather than carrying
@@ -197,10 +200,24 @@ pub(crate) async fn secretsmanager(
     operation: &str,
     request: &Value,
 ) -> (u16, Value) {
+    secretsmanager_in(router, REGION, operation, request).await
+}
+
+/// [`secretsmanager`], signed for `region` the way a client's SDK signs it.
+///
+/// Region-scoped, because a secret belongs to ONE Region: the credential scope of the
+/// request is what decides which Region's secrets it reads and writes, so a suite that
+/// addresses a REPLICA — a secret of its own Region — calls this one.
+pub(crate) async fn secretsmanager_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> (u16, Value) {
     let http_request = http::Request::builder()
         .method("POST")
-        .uri(format!("https://secretsmanager.{REGION}.amazonaws.com/"))
-        .header("host", format!("secretsmanager.{REGION}.amazonaws.com"))
+        .uri(format!("https://secretsmanager.{region}.amazonaws.com/"))
+        .header("host", format!("secretsmanager.{region}.amazonaws.com"))
         .header("content-type", "application/x-amz-json-1.1")
         .header(
             "x-amz-target",
@@ -209,7 +226,7 @@ pub(crate) async fn secretsmanager(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/secretsmanager/\
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/secretsmanager/\
                  aws4_request, SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
             ),
         )
@@ -239,7 +256,10 @@ pub(crate) fn error_code(case: &str, parsed: &Value) -> String {
 }
 
 /// A required string member of an answer.
-fn text(case: &str, parsed: &Value, pointer: &str) -> String {
+///
+/// `pub(crate)`: a sibling suite reading the same answers reads THIS accessor rather than
+/// carrying a second copy of it.
+pub(crate) fn text(case: &str, parsed: &Value, pointer: &str) -> String {
     parsed
         .pointer(pointer)
         .and_then(Value::as_str)
