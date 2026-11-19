@@ -84,6 +84,14 @@
 //! their rows on — each stated once, so no account-level and organization-level
 //! view of one resource can disagree.
 //!
+//! The four levels' READ of one stored recommendation lives here for the same
+//! reason: [`recommendation_summary`] is the projection all four recommendation
+//! views report — the single read and the listing, at the account level and at
+//! the organization level — and [`recommendation_detail`] is the second half a
+//! FULL recommendation shape adds to it, both read off either entry type through
+//! [`RecommendationReportable`], so no two views of one recommendation can
+//! disagree about a member they both declare.
+//!
 //! The two levels' LISTING of recommendations lives here for that same reason:
 //! [`RecommendationFilters`] is the `type` / `status` / `pillar` / `awsService`
 //! / `source` / `checkIdentifier` predicate and the two inclusive
@@ -106,7 +114,7 @@ use std::collections::BTreeMap;
 use crate::ops::types::{
     AccessDeniedException, ConflictException, OrganizationRecommendationResourceSummary,
     RecommendationCostOptimizingAggregates, RecommendationPillarSpecificAggregates,
-    RecommendationResourceSummary, RecommendationResourcesAggregates,
+    RecommendationResourceSummary, RecommendationResourcesAggregates, RecommendationSummary,
 };
 
 /// What this service answers a caller whose account's support plan does not
@@ -804,6 +812,205 @@ pub fn apply_lifecycle_update<Entry: LifecycleWritable>(
         (lifecycle_stage == LIFECYCLE_STAGE_RESOLVED).then_some(updated_at);
 }
 
+// ---------------------------------------------------------------------------
+// The recommendation views
+// ---------------------------------------------------------------------------
+
+/// The members of one stored recommendation that a recommendation VIEW reports,
+/// borrowed from the entry they live on: its identity and ARN, its
+/// classification members, the localizable text its `name`/`description` are
+/// copied from, and the instants and lifecycle members the views report.
+///
+/// Handed out by [`RecommendationReportable::reported`] so
+/// [`recommendation_summary`] and [`recommendation_detail`] project EITHER kind
+/// of stored recommendation without naming either one, exactly as
+/// [`RecommendationClassification`] lets one predicate select both and
+/// [`LifecycleMembers`] lets one write move both.
+pub struct ReportedRecommendation<'entry> {
+    pub id: &'entry str,
+    pub arn: &'entry str,
+    pub r#type: &'entry str,
+    pub status: &'entry str,
+    pub check_arn: Option<&'entry str>,
+    pub lifecycle_stage: &'entry Option<String>,
+    pub pillars: &'entry [String],
+    pub source: &'entry str,
+    pub aws_services: &'entry [String],
+    /// This recommendation's `name`/`description`, one copy per language — read
+    /// through [`TextCatalog::text`] with the language the request asked for.
+    pub text: &'entry TextCatalog,
+    pub created_at_millis: i64,
+    pub last_updated_at_millis: i64,
+    pub update_reason: &'entry Option<String>,
+    pub update_reason_code: &'entry Option<String>,
+    pub resolved_at_millis: &'entry Option<i64>,
+}
+
+/// A stored recommendation a recommendation view of this service reports: the
+/// account-level [`RecommendationEntry`] and the organization-level
+/// [`OrganizationRecommendationEntry`].
+///
+/// The two levels model the same recommendation twice over — a full shape and a
+/// summary each, whose member sets are the same names over the same targets —
+/// and the two entry types carry those members identically, so the four views
+/// apply ONE projection to two kinds of entry. This is the seam that lets that
+/// projection be stated once — by [`recommendation_summary`] and
+/// [`recommendation_detail`] — instead of once per operation, where a single
+/// read and a listing, or the account-level and the organization-level view,
+/// could drift apart on the same members.
+pub trait RecommendationReportable {
+    /// The members a recommendation view reports, borrowed.
+    fn reported(&self) -> ReportedRecommendation<'_>;
+}
+
+impl RecommendationReportable for RecommendationEntry {
+    fn reported(&self) -> ReportedRecommendation<'_> {
+        ReportedRecommendation {
+            id: &self.id,
+            arn: &self.arn,
+            r#type: &self.r#type,
+            status: &self.status,
+            check_arn: self.check_arn.as_deref(),
+            lifecycle_stage: &self.lifecycle_stage,
+            pillars: &self.pillars,
+            source: &self.source,
+            aws_services: &self.aws_services,
+            text: &self.text,
+            created_at_millis: self.created_at_millis,
+            last_updated_at_millis: self.last_updated_at_millis,
+            update_reason: &self.update_reason,
+            update_reason_code: &self.update_reason_code,
+            resolved_at_millis: &self.resolved_at_millis,
+        }
+    }
+}
+
+impl RecommendationReportable for OrganizationRecommendationEntry {
+    fn reported(&self) -> ReportedRecommendation<'_> {
+        ReportedRecommendation {
+            id: &self.id,
+            arn: &self.arn,
+            r#type: &self.r#type,
+            status: &self.status,
+            check_arn: self.check_arn.as_deref(),
+            lifecycle_stage: &self.lifecycle_stage,
+            pillars: &self.pillars,
+            source: &self.source,
+            aws_services: &self.aws_services,
+            text: &self.text,
+            created_at_millis: self.created_at_millis,
+            last_updated_at_millis: self.last_updated_at_millis,
+            update_reason: &self.update_reason,
+            update_reason_code: &self.update_reason_code,
+            resolved_at_millis: &self.resolved_at_millis,
+        }
+    }
+}
+
+/// The stored recommendation, as the modelled `RecommendationSummary`, with its
+/// `name` in the language the request asked for (`None` when it named none, and
+/// at a level that models no `language` at all).
+///
+/// This is the projection of a stored recommendation that ALL FOUR
+/// recommendation views report — the account-level single read and listing and
+/// the organization-level single read and listing — so it is stated here ONCE,
+/// as [`resource_summary`] states the one projection of a resource and
+/// [`apply_lifecycle_update`] the one lifecycle write of the two levels.
+/// `RecommendationSummary`'s member set is the shared one: every member of it is
+/// declared, under the same name and over the same target, on `Recommendation`,
+/// on `OrganizationRecommendation` and (all but `statusReason`) on
+/// `OrganizationRecommendationSummary`, so each of the other three views is this
+/// projection destructured by name, with the members its own shape adds layered
+/// on from [`recommendation_detail`]. Reporting the four views from one
+/// projection is what makes them unable to disagree about a recommendation,
+/// instead of agreeing only while four copies of the projection happen to be
+/// written identically.
+///
+/// `createdAt` goes through [`priority_created_at`] and `lifecycleStage` through
+/// [`priority_scoped`], which apply the scoping the model states for a member it
+/// sources from Trusted Advisor Priority; `lastUpdatedAt` carries no such
+/// scoping and is reported for either type. `statusReason` is absent: the store
+/// records no discrepancy in how a status was determined, and the member is
+/// optional.
+///
+/// `resourcesAggregates` and `pillarSpecificAggregates` are COUNTED from the
+/// recommendation's own resources by the caller — the aggregates of an
+/// account-level recommendation are its own resources', an organization
+/// recommendation's are its member accounts' — so they are passed in rather than
+/// read off the entry.
+pub fn recommendation_summary<Entry: RecommendationReportable>(
+    entry: &Entry,
+    resources_aggregates: RecommendationResourcesAggregates,
+    pillar_specific_aggregates: Option<RecommendationPillarSpecificAggregates>,
+    language: Option<&str>,
+) -> RecommendationSummary {
+    let reported = entry.reported();
+    RecommendationSummary {
+        id: reported.id.to_string(),
+        r#type: reported.r#type.to_string(),
+        check_arn: reported.check_arn.map(str::to_string),
+        status: reported.status.to_string(),
+        lifecycle_stage: priority_scoped(reported.r#type, reported.lifecycle_stage),
+        pillars: reported.pillars.to_vec(),
+        source: reported.source.to_string(),
+        aws_services: Some(reported.aws_services.to_vec()),
+        name: reported.text.text(language).name.clone(),
+        resources_aggregates,
+        pillar_specific_aggregates,
+        created_at: priority_created_at(reported.r#type, reported.created_at_millis),
+        last_updated_at: Some(date_time(reported.last_updated_at_millis)),
+        arn: reported.arn.to_string(),
+        status_reason: None,
+    }
+}
+
+/// The members the two FULL recommendation shapes model beyond the shared
+/// [`recommendation_summary`] projection — `Recommendation` and
+/// `OrganizationRecommendation` declare these seven identically — so a single
+/// read of a recommendation is that projection plus this one, at either level.
+pub struct RecommendationDetail {
+    pub description: String,
+    pub created_by: Option<String>,
+    pub updated_on_behalf_of: Option<String>,
+    pub updated_on_behalf_of_job_title: Option<String>,
+    pub update_reason: Option<String>,
+    pub update_reason_code: Option<String>,
+    pub resolved_at: Option<::aws_smithy_types::DateTime>,
+}
+
+/// The stored recommendation's members only a full recommendation shape reports,
+/// with its `description` in the language the request asked for — the second
+/// half of a single read, stated once for both levels.
+///
+/// `createdBy`, `updatedOnBehalfOf` and `updatedOnBehalfOfJobTitle` identify the
+/// Trusted Advisor Priority person (or the Technical Account Manager) who acted
+/// on the recommendation; the store holds no such actor, so those optional
+/// members stay absent rather than carrying an invented name.
+///
+/// The two reason members that describe a change of the lifecycle stage, and
+/// `resolvedAt`, are sourced from Priority as the stage itself is, so they go
+/// through [`priority_scoped`]: a recommendation the service produced
+/// automatically went through no Priority lifecycle and reports none of them.
+pub fn recommendation_detail<Entry: RecommendationReportable>(
+    entry: &Entry,
+    language: Option<&str>,
+) -> RecommendationDetail {
+    let reported = entry.reported();
+    RecommendationDetail {
+        description: reported.text.text(language).description.clone(),
+        created_by: None,
+        updated_on_behalf_of: None,
+        updated_on_behalf_of_job_title: None,
+        update_reason: priority_scoped(reported.r#type, reported.update_reason),
+        update_reason_code: priority_scoped(reported.r#type, reported.update_reason_code),
+        resolved_at: priority_scoped(reported.r#type, reported.resolved_at_millis).map(date_time),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The stored resource, and the views of it
+// ---------------------------------------------------------------------------
+
 /// One AWS resource a recommendation flagged.
 #[derive(Debug, Clone)]
 pub struct ResourceEntry {
@@ -828,10 +1035,6 @@ pub struct ResourceEntry {
     /// computed from it, and a non-cost resource contributes nothing.
     pub estimated_monthly_spend: Option<f64>,
 }
-
-// ---------------------------------------------------------------------------
-// The resource views
-// ---------------------------------------------------------------------------
 
 /// The stored resource, as the modelled `RecommendationResourceSummary`.
 ///

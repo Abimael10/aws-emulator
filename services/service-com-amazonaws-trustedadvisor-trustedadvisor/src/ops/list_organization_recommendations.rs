@@ -122,36 +122,60 @@ use crate::service::validation;
 /// The stored organization recommendation, as the modelled
 /// `OrganizationRecommendationSummary`.
 ///
-/// `createdAt` is reported through [`crate::state::priority_created_at`], the
-/// one place the scoping the model states for that member is applied; the store
-/// holds an organization recommendation only for a prioritized recommendation,
-/// so every organization summary carries one. `lifecycleStage`, which the model
-/// sources from Priority as well, goes through
-/// [`crate::state::priority_scoped`] for the same reason, so a summary and the
-/// single read of one organization recommendation agree on it.
+/// Every member of this shape comes from
+/// [`crate::state::recommendation_summary`], the ONE projection of a stored
+/// recommendation all four recommendation views of this service report, so this
+/// summary and the single read of one organization recommendation — and the
+/// account-level views of the same check's recommendation — cannot disagree. The
+/// rules it applies (the Priority scoping of `createdAt` and `lifecycleStage`
+/// and the language selection) are stated there rather than here;
+/// `statusReason`, the one member of the shared projection this shape does not
+/// model, is dropped.
 fn organization_recommendation_summary(
     entry: &crate::state::OrganizationRecommendationEntry,
     resources_aggregates: RecommendationResourcesAggregates,
     pillar_specific_aggregates: Option<RecommendationPillarSpecificAggregates>,
 ) -> OrganizationRecommendationSummary {
-    // This operation models no `language`, so the catalog's default copy is the
-    // one to report.
-    let text = entry.text.text(None);
-    OrganizationRecommendationSummary {
-        id: entry.id.clone(),
-        r#type: entry.r#type.clone(),
-        check_arn: entry.check_arn.clone(),
-        status: entry.status.clone(),
-        lifecycle_stage: crate::state::priority_scoped(&entry.r#type, &entry.lifecycle_stage),
-        pillars: entry.pillars.clone(),
-        source: entry.source.clone(),
-        aws_services: Some(entry.aws_services.clone()),
-        name: text.name.clone(),
+    // Destructured by NAME, so every shared member reaches this view as the
+    // projection computed it. This operation models no `language`, so the
+    // catalog's default copy is the one to report.
+    let RecommendationSummary {
+        id,
+        r#type,
+        check_arn,
+        status,
+        lifecycle_stage,
+        pillars,
+        source,
+        aws_services,
+        name,
         resources_aggregates,
         pillar_specific_aggregates,
-        created_at: crate::state::priority_created_at(&entry.r#type, entry.created_at_millis),
-        last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
-        arn: entry.arn.clone(),
+        created_at,
+        last_updated_at,
+        arn,
+        status_reason: _,
+    } = crate::state::recommendation_summary(
+        entry,
+        resources_aggregates,
+        pillar_specific_aggregates,
+        None,
+    );
+    OrganizationRecommendationSummary {
+        id,
+        r#type,
+        check_arn,
+        status,
+        lifecycle_stage,
+        pillars,
+        source,
+        aws_services,
+        name,
+        resources_aggregates,
+        pillar_specific_aggregates,
+        created_at,
+        last_updated_at,
+        arn,
     }
 }
 

@@ -122,52 +122,21 @@ use super::types::*;
 // operation — rather than spelled out again here.
 use crate::service::validation;
 
-/// The stored recommendation, as the modelled `RecommendationSummary`, with its
-/// `name` in the language the request asked for (`None` when it named none).
-///
-/// Which recommendations are reported is decided by
-/// [`crate::state::RecommendationFilters`], the one predicate this listing and
-/// the organization-level listing share.
-///
-/// `statusReason` is left absent: the store records no discrepancy in how a
-/// status was determined, and the member is optional.
-///
-/// `createdAt` is reported through [`crate::state::priority_created_at`], which
-/// applies the scoping the model states for it — present for a prioritized
-/// recommendation, absent for an automated one — so a summary and the single
-/// read of the same recommendation agree. `lifecycleStage`, which the model
-/// sources from Trusted Advisor Priority as well, goes through
-/// [`crate::state::priority_scoped`] for the same reason.
-///
-/// `pillarSpecificAggregates` is the same aggregate `GetRecommendation` reports
-/// — computed from the recommendation's own resources by
-/// [`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::pillar_aggregates_for`],
-/// so a single read and a listing agree — and is `None` only for a
-/// recommendation that optimizes no cost.
-fn recommendation_summary(
-    entry: &crate::state::RecommendationEntry,
-    resources_aggregates: RecommendationResourcesAggregates,
-    pillar_specific_aggregates: Option<RecommendationPillarSpecificAggregates>,
-    language: Option<&str>,
-) -> RecommendationSummary {
-    RecommendationSummary {
-        id: entry.id.clone(),
-        r#type: entry.r#type.clone(),
-        check_arn: entry.check_arn.clone(),
-        status: entry.status.clone(),
-        lifecycle_stage: crate::state::priority_scoped(&entry.r#type, &entry.lifecycle_stage),
-        pillars: entry.pillars.clone(),
-        source: entry.source.clone(),
-        aws_services: Some(entry.aws_services.clone()),
-        name: entry.text.text(language).name.clone(),
-        resources_aggregates,
-        pillar_specific_aggregates,
-        created_at: crate::state::priority_created_at(&entry.r#type, entry.created_at_millis),
-        last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
-        arn: entry.arn.clone(),
-        status_reason: None,
-    }
-}
+// The stored recommendation, as the modelled `RecommendationSummary`, with its
+// `name` in the language the request asked for: the SHARED projection — the one
+// all four recommendation views of this service report — so a summary and the
+// single read of the same recommendation agree on every member they both
+// declare, and so do the account-level and the organization-level views. The
+// rules it applies (the Priority scoping of `createdAt` and `lifecycleStage`,
+// the language selection, and the absent `statusReason`) are stated beside it in
+// `crate::state` rather than here, and `pillarSpecificAggregates` is the
+// aggregate `GetRecommendation` reports, counted from the recommendation's own
+// resources on every read.
+//
+// Which recommendations are reported is decided by
+// `crate::state::RecommendationFilters`, the one predicate this listing and the
+// organization-level listing share.
+use crate::state::recommendation_summary;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the

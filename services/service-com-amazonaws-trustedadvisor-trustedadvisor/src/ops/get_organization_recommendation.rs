@@ -86,50 +86,77 @@ use super::types::*;
 /// The stored organization recommendation, as the modelled
 /// `OrganizationRecommendation`.
 ///
-/// `createdBy`, `updatedOnBehalfOf` and `updatedOnBehalfOfJobTitle` identify the
-/// Trusted Advisor Priority person (or the Technical Account Manager) who acted
-/// on the recommendation; the store holds no such actor, so those optional
-/// members stay absent rather than carrying an invented name.
-///
-/// `createdAt` is reported through [`crate::state::priority_created_at`], the
-/// one place the scoping the model states for that member is applied; the store
-/// holds an organization recommendation only for a prioritized recommendation,
-/// so every one of them carries a creation instant. The lifecycle members the
-/// model sources from Priority too — `lifecycleStage`, the two reason members
-/// that describe the change of that stage, and `resolvedAt` — go through
-/// [`crate::state::priority_scoped`], which applies that same scoping, so this
-/// view and the account-level one answer for a recommendation's type alike.
+/// Every member this shape shares with `RecommendationSummary` comes from
+/// [`crate::state::recommendation_summary`], the ONE projection of a stored
+/// recommendation all four recommendation views of this service report — so this
+/// view and the account-level one answer for a recommendation alike — and the
+/// seven members only a full recommendation shape models come from
+/// [`crate::state::recommendation_detail`], the one the two single reads share.
+/// The rules those two apply (the Priority scoping of `createdAt` and of the
+/// lifecycle members, the language selection, and the members the store holds no
+/// value for) are stated there rather than here. `statusReason`, the one member
+/// of the shared projection this shape does not model, is dropped.
 fn organization_recommendation(
     entry: &crate::state::OrganizationRecommendationEntry,
     resources_aggregates: RecommendationResourcesAggregates,
     pillar_specific_aggregates: Option<RecommendationPillarSpecificAggregates>,
 ) -> OrganizationRecommendation {
-    // This operation models no `language`, so the catalog's default copy is the
-    // one to report.
-    let text = entry.text.text(None);
-    OrganizationRecommendation {
-        id: entry.id.clone(),
-        r#type: entry.r#type.clone(),
-        check_arn: entry.check_arn.clone(),
-        status: entry.status.clone(),
-        lifecycle_stage: crate::state::priority_scoped(&entry.r#type, &entry.lifecycle_stage),
-        pillars: entry.pillars.clone(),
-        source: entry.source.clone(),
-        aws_services: Some(entry.aws_services.clone()),
-        name: text.name.clone(),
+    // Destructured by NAME, so every shared member reaches this view as the
+    // projection computed it. This operation models no `language`, so the
+    // catalog's default copy is the one to report.
+    let RecommendationSummary {
+        id,
+        r#type,
+        check_arn,
+        status,
+        lifecycle_stage,
+        pillars,
+        source,
+        aws_services,
+        name,
         resources_aggregates,
         pillar_specific_aggregates,
-        created_at: crate::state::priority_created_at(&entry.r#type, entry.created_at_millis),
-        last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
-        arn: entry.arn.clone(),
-        description: text.description.clone(),
-        created_by: None,
-        updated_on_behalf_of: None,
-        updated_on_behalf_of_job_title: None,
-        update_reason: crate::state::priority_scoped(&entry.r#type, &entry.update_reason),
-        update_reason_code: crate::state::priority_scoped(&entry.r#type, &entry.update_reason_code),
-        resolved_at: crate::state::priority_scoped(&entry.r#type, &entry.resolved_at_millis)
-            .map(crate::state::date_time),
+        created_at,
+        last_updated_at,
+        arn,
+        status_reason: _,
+    } = crate::state::recommendation_summary(
+        entry,
+        resources_aggregates,
+        pillar_specific_aggregates,
+        None,
+    );
+    let crate::state::RecommendationDetail {
+        description,
+        created_by,
+        updated_on_behalf_of,
+        updated_on_behalf_of_job_title,
+        update_reason,
+        update_reason_code,
+        resolved_at,
+    } = crate::state::recommendation_detail(entry, None);
+    OrganizationRecommendation {
+        id,
+        r#type,
+        check_arn,
+        status,
+        lifecycle_stage,
+        pillars,
+        source,
+        aws_services,
+        name,
+        resources_aggregates,
+        pillar_specific_aggregates,
+        created_at,
+        last_updated_at,
+        arn,
+        description,
+        created_by,
+        updated_on_behalf_of,
+        updated_on_behalf_of_job_title,
+        update_reason,
+        update_reason_code,
+        resolved_at,
     }
 }
 
