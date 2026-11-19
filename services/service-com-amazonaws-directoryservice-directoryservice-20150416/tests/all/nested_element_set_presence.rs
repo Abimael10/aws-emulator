@@ -8,7 +8,8 @@
 //! not computed from persisted state cannot pass.
 //!
 //! The rule under test: a constraint a list's ELEMENTS break is one validation error stated
-//! at the LIST member, nesting the element shape's declared constraints inside
+//! at the LIST member, quoting the WHOLE list that member held and nesting the element
+//! shape's declared constraints inside
 //! `Member must satisfy constraint: [ … ]` — and that nested set closes with the requirement
 //! that the member not be null exactly where the model makes it one a request always
 //! carries: a member declared `@required`, and one carrying a `@default`, which a caller
@@ -33,9 +34,9 @@ const ABSENT_DIRECTORY_ID: &str = "d-0123456789";
 /// as the framework words an absent member.
 const ENTRY_PRESENT: &str = "Member must not be null";
 
-/// One row: the operation, a body with exactly ONE offending entry in ONE list, the member
-/// path the clause names, the entry it quotes, the element shape's declared constraints as
-/// the clause nests them, and whether the set closes with [`ENTRY_PRESENT`].
+/// One row: the operation, a body with at least one offending entry in ONE list, the member
+/// path the clause names, the WHOLE list it quotes, the element shape's declared constraints
+/// as the clause nests them, and whether the set closes with [`ENTRY_PRESENT`].
 struct NestedSetCase {
     case: &'static str,
     operation: &'static str,
@@ -64,14 +65,14 @@ fn nested_set_rows() -> Vec<NestedSetCase> {
             element_pattern: r"^d-[0-9a-f]{10}$",
             carried: false,
         },
-        // The same member with several offending entries: still ONE validation error, and
-        // still no presence requirement.
+        // The same member with several entries, two of which offend: still ONE validation
+        // error, quoting the whole list, and still no presence requirement.
         NestedSetCase {
             case: "two offending entries of that same filter",
             operation: "DescribeDirectories",
             body: json!({ "DirectoryIds": ["d-90000ff0a", "d-0000000000", "not-a-directory"] }),
             path: "directoryIds",
-            quoted: "d-90000ff0a, not-a-directory",
+            quoted: "d-90000ff0a, d-0000000000, not-a-directory",
             element_pattern: r"^d-[0-9a-f]{10}$",
             carried: false,
         },
@@ -102,7 +103,7 @@ fn nested_set_rows() -> Vec<NestedSetCase> {
                 },
             }),
             path: "vpcSettings.subnetIds",
-            quoted: "subnet-not-hex",
+            quoted: "subnet-0a1b2c3d, subnet-not-hex",
             element_pattern: r"^(subnet-[0-9a-f]{8}|subnet-[0-9a-f]{17})$",
             carried: true,
         },

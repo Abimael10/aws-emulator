@@ -11,8 +11,8 @@
 //!
 //! The rules under test, each over a TABLE rather than one recorded call:
 //!
-//! * a constraint broken by a list's ELEMENTS is stated once at the LIST member — the entries
-//!   of that member the constraint refused, the member's own path with no element position in
+//! * a constraint broken by a list's ELEMENTS is stated once at the LIST member — the WHOLE
+//!   list that member held in request order, the member's own path with no element position in
 //!   it, and the element shape's whole constraint set, closed by the requirement that an
 //!   entry be present at all, nested inside `Member must satisfy constraint: [ … ]`;
 //! * a directory and an account that are not shared are named UNQUOTED in the not-shared
@@ -53,6 +53,12 @@ const FOREIGN_REGION: &str = "eu-west-1";
 const MULTI_REGION_ENTERPRISE_ONLY: &str = "Multi-region replication is only supported for \
                                             AWS Managed Microsoft AD (Enterprise edition) \
                                             directories.";
+
+/// The FIXED sentence a `CreateAlias` on a directory that has not reached its serving stage
+/// is refused with (`state::ALIAS_REQUIRES_AN_ACTIVE_DIRECTORY`): the requirement the call
+/// broke, with neither the directory nor its stage interpolated into it.
+const ALIAS_NEEDS_AN_ACTIVE_DIRECTORY: &str =
+    "The directory must be active before an alias can be created for it.";
 
 /// The `Message` of a refusal body and the `RequestId` it reports.
 fn refusal(parsed: &Value, case: &str) -> (String, String) {
@@ -348,10 +354,10 @@ async fn the_multi_region_ladder_gates_on_the_edition_before_the_region() {
 }
 
 /// RULE: an alias is assigned to a directory that has reached its serving stage. Before
-/// that the call is refused with the modelled `InvalidParameterException` stating the stage
-/// the call needs, the directory keeps no alias, and the alias is not reserved either — so
-/// the IDENTICAL call succeeds once the same directory is in service, whichever create made
-/// it.
+/// that the call is refused with the modelled `InvalidParameterException` stating the FIXED
+/// sentence this precondition is worded in, the directory keeps no alias, and the alias is
+/// not reserved either — so the IDENTICAL call succeeds once the same directory is in
+/// service, whichever create made it.
 #[tokio::test]
 async fn an_alias_is_assigned_only_once_the_directory_is_serving() {
     let router = service();
@@ -402,18 +408,23 @@ async fn an_alias_is_assigned_only_once_the_directory_is_serving() {
             "case {case:?}: expected the modelled parameter refusal, got {parsed}"
         );
         let (message, request_id) = refusal(&parsed, case);
-        // The MESSAGE is not pinned to a literal here: the exact sentence AWS words for
-        // this error class is not stated by the model and is not in this issue's report, so
-        // what is asserted is what the refusal is built FROM — the directory the request
-        // named, the stage the call needs, and this service's own request-id envelope —
-        // rather than a sentence this implementation chose.
-        assert!(
-            message.contains(&directory_id)
-                && message.contains("Active")
-                && message.ends_with(&format!(" : RequestId: {request_id}")),
-            "case {case:?}: expected the refusal to name the directory from the request and \
-             the stage the call needs, got {message:?}"
+        // The sentence is FIXED text: the requirement the call broke and nothing read from
+        // the request or from the store, so the only variable part of the message is the
+        // request-id suffix this service closes every refusal with. A directory id or a
+        // stage name interpolated into it would make a template no client matching the
+        // service's own sentence can match.
+        assert_eq!(
+            message,
+            with_request_id(ALIAS_NEEDS_AN_ACTIVE_DIRECTORY, &request_id),
+            "case {case:?}: expected the fixed precondition sentence, got {message:?}"
         );
+        for interpolated in [directory_id.as_str(), "Requested", "Creating", "Created"] {
+            assert!(
+                !message.contains(interpolated),
+                "case {case:?}: expected the sentence to interpolate nothing, found \
+                 {interpolated:?} in {message:?}"
+            );
+        }
         // Whatever the sentence is, it is not the one this service states for an id that
         // resolves to NOTHING: this directory exists, and the read below finds it.
         assert!(
@@ -635,7 +646,7 @@ struct ElementCase {
     /// The member path the clause names: the LIST member, lowerCamel, with no element
     /// position in it.
     path: &'static str,
-    /// The entries of that member the constraint refused, as the clause quotes them.
+    /// The WHOLE list that member held, in request order, as the clause quotes it.
     quoted: &'static str,
     /// The element shape's whole declared constraint set, as the clause nests it.
     requirements: &'static str,
@@ -645,8 +656,8 @@ struct ElementCase {
 }
 
 /// The whole message a request breaking ONE list member's element constraint is refused
-/// with: the framework's envelope, the entries that member has to have fixed, and the element
-/// shape's set nested at the list member.
+/// with: the framework's envelope, the list that member held, and the element shape's set
+/// nested at the list member.
 ///
 /// `carried` says whether the nested set closes with the requirement that the MEMBER be
 /// there: it does for a member the model never leaves optional, and not for one a request
@@ -683,8 +694,8 @@ const SUBNET_ID_PATTERN: &str = r"^(subnet-[0-9a-f]{8}|subnet-[0-9a-f]{17})$";
 /// before any handler resolves it, so no directory has to exist for them.
 const SOME_DIRECTORY_ID: &str = "d-1dca5812e8";
 
-/// RULE: a constraint broken by a list's ELEMENTS is reported at the LIST member — the entries
-/// of that member the constraint refused, its own path with no `<position>.member` step, and
+/// RULE: a constraint broken by a list's ELEMENTS is reported at the LIST member — the WHOLE
+/// list that member held in request order, its own path with no `<position>.member` step, and
 /// the element shape's whole declared constraint set nested inside
 /// `Member must satisfy constraint: [ … ]` — so one list is ONE validation error however many
 /// of its entries offend, and a client reading the path is pointed at the member it submitted.
@@ -720,7 +731,7 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
                 "DnsIpAddrs": ["10.0.0.1", "not-an-address"],
             }),
             path: "dnsIpAddrs",
-            quoted: "not-an-address",
+            quoted: "10.0.0.1, not-an-address",
             requirements: IP_ADDR_PATTERN,
             carried: true,
         },
@@ -733,7 +744,7 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
                 "DnsIpAddrs": ["256.0.0.1", "10.0.0.2", "10.0.0"],
             }),
             path: "dnsIpAddrs",
-            quoted: "256.0.0.1, 10.0.0",
+            quoted: "256.0.0.1, 10.0.0.2, 10.0.0",
             requirements: IP_ADDR_PATTERN,
             carried: true,
         },
@@ -742,7 +753,7 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             operation: "DescribeDirectories",
             body: json!({ "DirectoryIds": ["d-0000000000", "not-a-directory"] }),
             path: "directoryIds",
-            quoted: "not-a-directory",
+            quoted: "d-0000000000, not-a-directory",
             requirements: DIRECTORY_ID_PATTERN,
             // `DescribeDirectoriesRequest$DirectoryIds` is a member the model leaves
             // optional — a listing may omit the filter altogether — so its clause states
@@ -783,7 +794,7 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
                 "TagKeys": ["env", "bad!key"],
             }),
             path: "tagKeys",
-            quoted: "bad!key",
+            quoted: "env, bad!key",
             // The element shape declares a `@length` as well as a `@pattern`, and the
             // clause states the WHOLE set rather than only the constraint that failed.
             requirements: "Member must have length less than or equal to 128, Member must \
@@ -806,7 +817,7 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
                 },
             }),
             path: "vpcSettings.subnetIds",
-            quoted: "subnet-not-hex",
+            quoted: "subnet-0a1b2c3d, subnet-not-hex",
             requirements: SUBNET_ID_PATTERN,
             // `DirectoryVpcSettings$SubnetIds` is `@required`.
             carried: true,
@@ -826,7 +837,7 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
                 },
             }),
             path: "connectSettings.customerDnsIps",
-            quoted: "999.1.1.1",
+            quoted: "10.0.0.10, 999.1.1.1",
             requirements: IP_ADDR_PATTERN,
             // `DirectoryConnectSettings$CustomerDnsIps` carries a `@default` of `[]`.
             carried: true,
@@ -932,4 +943,167 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
         "case \"a well-formed list\": expected the create to be served, got {status} with \
          {parsed}"
     );
+}
+
+/// One row of the submitted-list table: a list member, the entries the request sends it, and
+/// the body those entries are carried in.
+struct SubmittedListCase {
+    case: &'static str,
+    operation: &'static str,
+    /// The entries the request sends, IN REQUEST ORDER: whatever breaks the element shape's
+    /// constraint, the clause quotes exactly these, in this order.
+    entries: &'static [&'static str],
+    /// The member path the clause is stated at.
+    path: &'static str,
+    /// The whole request body, built around `entries`.
+    body: fn(&[&str]) -> Value,
+}
+
+/// RULE: the value a clause stated at a list member quotes is the WHOLE list that member
+/// held, rendered in request order — the member's own value, not the selection of it that
+/// happened to break the element shape's constraint.
+///
+/// Asserted over a table whose rows differ along everything the rule generalises over: how
+/// many entries the list carries (1, 2, 3, 4 and 5), WHERE the offending ones sit (first,
+/// middle, last, both ends, all of them), the element shape the entries are checked against,
+/// and whether the member is the input's own or one inside a structure the request nests.
+#[tokio::test]
+async fn the_clause_at_a_list_member_quotes_the_whole_submitted_list() {
+    let router = service();
+
+    // A well-formed `DirectoryId` (`^d-[0-9a-f]{10}$`) no create here mints: each row is
+    // decided before any handler resolves it.
+    let rows: Vec<SubmittedListCase> = vec![
+        SubmittedListCase {
+            case: "the only entry offends",
+            operation: "DescribeDirectories",
+            entries: &["not-a-directory"],
+            path: "directoryIds",
+            body: |entries| json!({ "DirectoryIds": entries }),
+        },
+        SubmittedListCase {
+            case: "the FIRST of two entries offends",
+            operation: "DescribeDirectories",
+            entries: &["not-a-directory", "d-0000000000"],
+            path: "directoryIds",
+            body: |entries| json!({ "DirectoryIds": entries }),
+        },
+        SubmittedListCase {
+            case: "the LAST of two entries offends",
+            operation: "DescribeDirectories",
+            entries: &["d-0000000000", "not-a-directory"],
+            path: "directoryIds",
+            body: |entries| json!({ "DirectoryIds": entries }),
+        },
+        SubmittedListCase {
+            case: "the MIDDLE of three entries offends",
+            operation: "DescribeDirectories",
+            entries: &["d-0000000000", "not-a-directory", "d-1111111111"],
+            path: "directoryIds",
+            body: |entries| json!({ "DirectoryIds": entries }),
+        },
+        SubmittedListCase {
+            case: "both ENDS of five entries offend",
+            operation: "DescribeDirectories",
+            entries: &[
+                "first-bad",
+                "d-0000000000",
+                "d-1111111111",
+                "d-2222222222",
+                "last-bad",
+            ],
+            path: "directoryIds",
+            body: |entries| json!({ "DirectoryIds": entries }),
+        },
+        SubmittedListCase {
+            case: "EVERY one of four entries offends",
+            operation: "DescribeDirectories",
+            entries: &["one", "two", "three", "four"],
+            path: "directoryIds",
+            body: |entries| json!({ "DirectoryIds": entries }),
+        },
+        // Another element shape, on a member of the input itself.
+        SubmittedListCase {
+            case: "an address block with no prefix length beside two that have one",
+            operation: "RemoveIpRoutes",
+            entries: &["198.51.100.0/24", "198.51.100.0", "203.0.113.0/24"],
+            path: "cidrIps",
+            body: |entries| {
+                json!({ "DirectoryId": SOME_DIRECTORY_ID, "CidrIps": entries })
+            },
+        },
+        // ...and two members INSIDE a structure the request nests, stated at their own
+        // dotted paths.
+        SubmittedListCase {
+            case: "a subnet id of the wrong form among three in a create's VPC settings",
+            operation: "CreateMicrosoftAD",
+            entries: &["subnet-0a1b2c3d", "subnet-not-hex", "subnet-1a2b3c4d"],
+            path: "vpcSettings.subnetIds",
+            body: |entries| {
+                json!({
+                    "Name": "wholelist.example.com",
+                    "Password": crate::directory_lifecycle::PASSWORD,
+                    "VpcSettings": { "VpcId": "vpc-0a1b2c3d", "SubnetIds": entries },
+                })
+            },
+        },
+        SubmittedListCase {
+            case: "the FIRST of an AD Connector's two DNS addresses is of the wrong form",
+            operation: "ConnectDirectory",
+            // `CustomerDnsIps` is `@length 2..2`
+            // (`smithy_query(query="shape",shape="CustomerDnsIps")`), so this row carries
+            // exactly two entries: a third would add the collection's own clause beside the
+            // element one.
+            entries: &["not-an-address", "10.0.0.11"],
+            path: "connectSettings.customerDnsIps",
+            body: |entries| {
+                json!({
+                    "Name": "wholelistconnected.example.com",
+                    "Password": crate::directory_lifecycle::PASSWORD,
+                    "Size": "Small",
+                    "ConnectSettings": {
+                        "VpcId": "vpc-0a1b2c3d",
+                        "SubnetIds": SERVABLE_SUBNETS,
+                        "CustomerDnsIps": entries,
+                        "CustomerUserName": "Admin",
+                    },
+                })
+            },
+        },
+    ];
+
+    for row in &rows {
+        let (status, parsed) = call(&router, row.operation, (row.body)(row.entries)).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected the element constraint to refuse the request, got {status} \
+             with {parsed}",
+            row.case
+        );
+        assert_eq!(
+            parsed["__type"],
+            json!("ValidationException"),
+            "case {:?}: expected the framework's constraint refusal, got {parsed}",
+            row.case
+        );
+        let message = parsed["message"].as_str().unwrap_or_default();
+        // ONE validation error, whatever the offending count: the clause is stated at the
+        // member, once.
+        assert!(
+            message.starts_with("1 validation error detected: "),
+            "case {:?}: expected one validation error for the one member, got {message:?}",
+            row.case
+        );
+        let quoted = format!(
+            "Value '[{}]' at '{}' failed to satisfy constraint: ",
+            row.entries.join(", "),
+            row.path
+        );
+        assert!(
+            message.contains(&quoted),
+            "case {:?}: expected the clause to quote the whole submitted list as \
+             {quoted:?}, got {message:?}",
+            row.case
+        );
+    }
 }

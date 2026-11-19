@@ -14,7 +14,10 @@
 //! The directory has to be SERVING for an alias to be assigned to it: a directory still
 //! being built by the transition its create owes is refused with the modelled
 //! `InvalidParameterException` and keeps no alias
-//! ([`crate::state::alias_stage_defect`]).
+//! ([`crate::state::alias_stage_defect`]), stated in the FIXED sentence Directory Service
+//! words that precondition in ([`crate::state::ALIAS_REQUIRES_AN_ACTIVE_DIRECTORY`]) —
+//! neither the directory nor its stage is interpolated into it, so the only variable part
+//! of the message is the request id every refusal of this service closes with.
 //!
 //! The `Alias` member's modelled `@pattern` is checked FIRST, before the directory is
 //! resolved, and a value outside it is the framework's `ValidationException` rather than
@@ -198,9 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(defect) = store
             .directories
             .get(&input.directory_id)
-            .and_then(|directory| {
-                crate::state::alias_stage_defect(&input.directory_id, &directory.stage)
-            })
+            .and_then(|directory| crate::state::alias_stage_defect(&directory.stage))
         {
             return Err(
                 CreateAliasErrorModeled::InvalidParameterException(crate::state::refusal(defect))

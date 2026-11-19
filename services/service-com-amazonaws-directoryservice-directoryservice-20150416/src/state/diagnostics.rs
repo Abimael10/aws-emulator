@@ -228,29 +228,36 @@ pub fn unsupported_in_stage(stage: &str) -> String {
 /// stage is a precondition of the call rather than the directory being unreachable.
 pub const ALIAS_SERVING_STAGES: [&str; 1] = [STAGE_ACTIVE];
 
+/// The sentence Directory Service states `CreateAlias`' stage precondition in: FIXED text,
+/// the requirement the call broke and nothing else.
+///
+/// Every part of it is the rule — nothing is read from the request or from the store, so
+/// neither the directory the request named nor the stage it is actually in appears. That is
+/// what makes this sentence the handle a client has on THIS precondition: it is the only
+/// thing that tells the wait-for-`Active`-and-retry refusal apart from the other
+/// `InvalidParameterException` the same operation answers (an alias the directory already
+/// carries, [`ALIAS_ALREADY_ASSIGNED`]), and a template with an id interpolated into it is
+/// one no such client can match. [`refusal`] appends the request id, the one variable part
+/// of the message.
+pub const ALIAS_REQUIRES_AN_ACTIVE_DIRECTORY: &str =
+    "The directory must be active before an alias can be created for it.";
+
 /// Why the directory in `stage` cannot be given an alias, or `None` when it can.
 ///
-/// The stage-gate family [`stage_defect`] words, as the conditional-forwarder mutations
-/// state it: the action `CreateAlias` performs, the directory the request named and the
-/// stages that action needs ([`ALIAS_SERVING_STAGES`]) — so the sentence states the
-/// condition that actually refused the call, and a caller is told to wait for the directory
-/// rather than to fix its request. It is NOT the directory-lookup sentence
-/// ([`no_such_directory`]): the directory the request named does exist, and this operation
-/// answers that one under its own `EntityDoesNotExistException` for an id that resolves to
-/// nothing.
-pub fn alias_stage_defect(directory_id: &str, stage: &str) -> Option<String> {
+/// Stated in the sentence Directory Service words for THIS precondition
+/// ([`ALIAS_REQUIRES_AN_ACTIVE_DIRECTORY`]) rather than in the stage-gate family's
+/// id-interpolating one ([`stage_defect`], which the conditional-forwarder mutations and the
+/// password reset state their own refusals in): a refusal carries the wording the operation
+/// that answers it words, and this operation's is fixed text. It is NOT the
+/// directory-lookup sentence ([`no_such_directory`]) either: the directory the request named
+/// does exist, and this operation answers that one under its own
+/// `EntityDoesNotExistException` for an id that resolves to nothing.
+pub fn alias_stage_defect(stage: &str) -> Option<String> {
     if ALIAS_SERVING_STAGES.contains(&stage) {
         return None;
     }
-    Some(stage_defect(
-        ALIAS_ACTION_CREATE,
-        directory_id,
-        &ALIAS_SERVING_STAGES,
-    ))
+    Some(ALIAS_REQUIRES_AN_ACTIVE_DIRECTORY.to_string())
 }
-
-/// The action `CreateAlias` states in that refusal, as its own name says it.
-pub(super) const ALIAS_ACTION_CREATE: &str = "create alias";
 
 /// The stages a password reset is served in: [`STAGE_ACTIVE`] alone.
 ///

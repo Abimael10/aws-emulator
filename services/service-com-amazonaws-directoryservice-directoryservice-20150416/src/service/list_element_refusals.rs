@@ -7,14 +7,14 @@
 //!
 //! The framework's constraint walk reports such a violation at the ELEMENT it found it on —
 //! `'<list>.<1-based position>.member'`, quoting that one element — because that is where the
-//! value is. Directory Service reports it at the list MEMBER: the subject is the entries of
-//! that member the element constraint refused, rendered the way a list renders and in the
-//! order the request sent them, and the requirement is the element shape's own constraint set
-//! nested inside `Member must satisfy constraint: [ … ]`. So a client that surfaces the
-//! failing member path to a user names the member it submitted, with the entries it has to
-//! fix, and a list with two offending entries is ONE validation error rather than two. A list
-//! inside a structure the request nests is named the same way, by the dotted path of the
-//! member that holds it (`vpcSettings.subnetIds`) and with no element position in it either.
+//! value is. Directory Service reports it at the list MEMBER: the subject is the WHOLE list
+//! that member held, rendered the way a list renders and in the order the request sent it,
+//! and the requirement is the element shape's own constraint set nested inside
+//! `Member must satisfy constraint: [ … ]`. So a client that surfaces the failing member path
+//! to a user names the member it submitted, with the list it submitted beside it, and a list
+//! with two offending entries is ONE validation error rather than two. A list inside a
+//! structure the request nests is named the same way, by the dotted path of the member that
+//! holds it (`vpcSettings.subnetIds`) and with no element position in it either.
 //!
 //! That is one rule about every list member of every operation, not about one filter, so it is
 //! applied here — once, over the violations the framework's own walk found — rather than in
@@ -25,20 +25,21 @@
 //! ([`::service_common::validation_message::aws_validation_refusal_over_elements_stating`]);
 //! what is this service's own is the ORDER its own validator lists an enum's value set in
 //! ([`super::stated_enum_values`] states the same order for a clause about a plain member),
-//! which entries the clause quotes ([`offending_entries`]), and that the nested set closes
+//! which list the clause quotes ([`quotable_lists`]), and that the nested set closes
 //! with the requirement that the MEMBER be carried where the model never leaves it optional
 //! ([`element_set_in_the_services_own_order`] over [`super::stated_element_sets`]).
 //!
-//! WHY THE ENTRIES AND NOT THE WHOLE LIST. The services that state this clause do not agree
-//! on its value half — `cloudformation`'s copy of this rule quotes the whole list as
-//! submitted — because the recordings each was written against do not settle it: a recorded
-//! refusal of a ONE-entry list reads the same either way. The recorded Directory Service
-//! refusal this module is built on is of a one-entry `DnsIpAddrs`, and the report it was
-//! filed from states that value as the OFFENDING entries, so that is what is implemented
-//! here and what `tests/all/refusal_classification_rules.rs` pins. A recording of a
-//! multi-entry ds list is what settles it; the dispatch half of this module is also the
-//! second copy of `cloudformation`'s, and both are for `services/common` to own once one
-//! recording decides the value half for all of them.
+//! WHY THE WHOLE LIST AND NOT THE OFFENDING ENTRIES. A recorded refusal of a ONE-entry list
+//! reads the same either way, which is why this module first stated the offending entries:
+//! the only ds recording it was written against was of a one-entry `DnsIpAddrs`. A recorded
+//! refusal of a create whose nested `vpcSettings.subnetIds` carried a well-formed subnet id
+//! BESIDE an ill-formed one settles it — the clause quotes both, in request order — so the
+//! value half is the member's own value rather than a selection from it, which is also what
+//! `cloudformation`'s copy of this rule states. That is one rule about every list member of
+//! every operation of this service, so a clause here quotes the list the request sent
+//! whatever member carried it and however many of its entries offend. The dispatch half of
+//! this module is still the second copy of `cloudformation`'s, and both are for
+//! `services/common` to own.
 //!
 //! ## Where it is applied
 //!
@@ -55,7 +56,7 @@ use std::collections::{HashMap, HashSet};
 use ::aws_smithy_runtime_api::http::Request as RtRequest;
 use ::aws_smithy_schema::Schema;
 use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
-use ::service_common::validation::list_of_element;
+use ::service_common::validation::{list_of_element, refusing_violations_with_lists};
 use ::service_common::validation_message::{
     aws_validation_refusal_over_elements_stating, element_constraint_set, element_set_requirement,
     requirement,
@@ -151,7 +152,9 @@ fn stated_from_request<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
 ) -> Option<(Vec<Violation>, Refused)> {
-    let violations = ::service_common::validation::refusing_violations::<O>(protocol, req);
+    // The violations AND the lists the request carried, out of ONE walk: the value half of a
+    // clause stated at a list member is that member's own value, which no violation carries.
+    let (violations, submitted) = refusing_violations_with_lists::<O>(protocol, req);
     // Only this class is reworded here. Everything else — an absent required member, a bound
     // on a plain member, a value outside an enum a plain member targets — keeps the answer it
     // has today, including this service's own enum-order wording.
@@ -161,7 +164,7 @@ fn stated_from_request<O: Operation>(
     {
         return None;
     }
-    let offending = offending_entries(&violations);
+    let quoted = quotable_lists(&violations, submitted);
     let restated: Vec<Violation> = super::in_stated_clause_order(&violations)
         .into_iter()
         .map(super::stated_violation)
@@ -173,9 +176,9 @@ fn stated_from_request<O: Operation>(
         // this module changes which MEMBER a clause is stated at and nothing about how any
         // requirement reads.
         |pattern| pattern.to_string(),
-        // The value a clause stated at a list member quotes: the entries of that member the
-        // element constraint refused, in the order the request sent them.
-        |collection| offending.get(collection).cloned(),
+        // The value a clause stated at a list member quotes: the whole list that member
+        // held, in the order the request sent it.
+        |collection| quoted.get(collection).cloned(),
         // ...and the requirement it nests, with an enum's value set in the order this service
         // lists it.
         |collection| element_set_in_the_services_own_order(O::INPUT_SCHEMA, collection),
@@ -191,49 +194,33 @@ fn stated_from_request<O: Operation>(
     ))
 }
 
-/// The entries of each list member that broke their element shape's constraints, rendered the
-/// way AWS quotes a list-valued member (`[<entry>, <entry>]`,
-/// [`::service_common::validation::rendered_list`]), keyed by the member path the clause is
-/// stated at.
+/// The list each clause may quote: `submitted`, the lists the request carried rendered the way
+/// AWS quotes a list-valued member (`[<entry>, <entry>]`,
+/// [`::service_common::validation::submitted_lists`]), minus every one this refusal is not
+/// allowed to report.
 ///
-/// The clause's value half is the OFFENDING entries rather than the whole list: it is what
-/// tells a caller which of its own entries to fix, and it is built from the violations the
-/// framework's own walk found — in the order it walked them, which is the order the request
-/// sent them — with the echoes already restored to the bytes the caller submitted.
+/// The clause's value half is the WHOLE submitted list, in the order the request sent it: it
+/// is the value that member held, which is what tells a caller which list it submitted and
+/// where in it the entries it has to fix sit. The collecting walk owns the rendering and every
+/// bound on it, and offers a list only when it collected that list in FULL, so a clause can
+/// never quote a list the caller did not send.
 ///
 /// A collection one of whose violations carries NO value (a `@sensitive` element, whose value
-/// the walk withholds) contributes nothing, so no clause can quote a value the refusal is not
-/// allowed to report; such a clause states the member alone. BOUNDED by the violation count
-/// the walk itself bounds ([`::service_common::validation::MAX_VIOLATIONS`]).
-fn offending_entries(violations: &[Violation]) -> HashMap<String, String> {
-    let mut entries: Vec<(String, Vec<String>)> = Vec::new();
-    let mut withheld: HashSet<String> = HashSet::new();
-    for violation in violations {
-        let Some(collection) = list_of_element(&violation.path) else {
-            continue;
-        };
-        let Some(value) = violation.value.clone() else {
-            withheld.insert(collection.to_string());
-            continue;
-        };
-        match entries
-            .iter_mut()
-            .find(|(held, _)| held.as_str() == collection)
-        {
-            Some((_, held)) => held.push(value),
-            None => entries.push((collection.to_string(), vec![value])),
-        }
-    }
-    entries
+/// the validating walk withholds) is dropped here, so no clause can quote a value the refusal
+/// is not allowed to report; such a clause states the member alone. BOUNDED by the violation
+/// count the walk itself bounds ([`::service_common::validation::MAX_VIOLATIONS`]).
+fn quotable_lists(
+    violations: &[Violation],
+    submitted: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let withheld: HashSet<&str> = violations
+        .iter()
+        .filter(|violation| violation.value.is_none())
+        .filter_map(|violation| list_of_element(&violation.path))
+        .collect();
+    submitted
         .into_iter()
-        .filter(|(collection, _)| !withheld.contains(collection))
-        .map(|(collection, held)| {
-            let shown: Vec<&str> = held.iter().map(String::as_str).collect();
-            (
-                collection,
-                ::service_common::validation::rendered_list(&shown),
-            )
-        })
+        .filter(|(collection, _)| !withheld.contains(collection.as_str()))
         .collect()
 }
 
