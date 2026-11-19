@@ -33,6 +33,14 @@
 //! algorithm the job names, which objective it asked for, whether a container program wrote
 //! the model directory, how many input objects and records a transform job is given, and which
 //! leg of a job's work authorization stops.
+//!
+//! Every wait here is a poll for the CONDITION, never a pause of a fixed length, and that
+//! holds for the conditions a case reaches THROUGH a status as well: the object a finished job
+//! left is looked for again until Amazon S3 serves it ([`object_bytes`], [`keys_until`])
+//! rather than taken as an instant consequence of the status just read, so a case is decided
+//! by what the service answered and never by how fast the host ran. The one deadline a wait is
+//! bounded by ([`look_again`]) is far longer than any span this state gives a job's work, so
+//! it bounds a BROKEN emulator and not the condition.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -48,11 +56,27 @@ const SERVICE_PRINCIPAL: &str = service_com_amazonaws_sagemaker_sagemaker::state
 /// How long a job is polled for the status it has to reach before a case fails, and how often.
 /// What the poll waits for is the CONDITION, re-read in a loop, so a loaded host cannot fail a
 /// case the clock would have served.
-const SETTLE_BUDGET: Duration = Duration::from_secs(120);
+pub(crate) const SETTLE_BUDGET: Duration = Duration::from_secs(120);
 const SETTLE_POLL: Duration = Duration::from_millis(25);
 
+/// Fail `case` unless there is still time to look again for `what`, then wait one poll
+/// interval before looking again.
+///
+/// The ONE place this suite bounds a wait. Every wait here is a poll for the CONDITION, so a
+/// loaded host takes more turns of this loop rather than reaching a different answer, and the
+/// deadline bounds a BROKEN emulator rather than the condition: it is far longer than any span
+/// this state gives a job's work. `last` is what the final look saw, so a case that really
+/// fails says what the service answered.
+pub(crate) async fn look_again(deadline: Instant, case: &str, what: &str, last: &str) {
+    assert!(
+        Instant::now() < deadline,
+        "case {case:?}: {what} did not hold within {SETTLE_BUDGET:?}; last saw {last}"
+    );
+    tokio::time::sleep(SETTLE_POLL).await;
+}
+
 /// The role every job below runs as.
-const ROLE: &str = "job-execution-role";
+pub(crate) const ROLE: &str = "job-execution-role";
 
 /// An ECR-shaped path for SageMaker's built-in gradient-boosted tree algorithm, whose
 /// repository is `sagemaker-xgboost` ("Docker registry paths and example code").
@@ -61,12 +85,12 @@ fn boosted_trees_image() -> String {
 }
 
 /// An ECR-shaped path for a container of the caller's own.
-fn own_image() -> String {
+pub(crate) fn own_image() -> String {
     format!("{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/my-trainer:1")
 }
 
 /// A policy document allowing `actions` on `resources`.
-fn allow(actions: Value, resources: Value) -> Value {
+pub(crate) fn allow(actions: Value, resources: Value) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{ "Effect": "Allow", "Action": actions, "Resource": resources }],
@@ -74,7 +98,7 @@ fn allow(actions: Value, resources: Value) -> Value {
 }
 
 /// Hold the job role in IAM with the Amazon S3 grant `grant`, and answer its ARN.
-async fn given_job_role(emulator: &Emulator, grant: &Value) -> String {
+pub(crate) async fn given_job_role(emulator: &Emulator, grant: &Value) -> String {
     let arn = emulator.given_role(ROLE, &trust_for(SERVICE_PRINCIPAL)).await;
     emulator.given_role_policy(ROLE, grant).await;
     arn
@@ -82,7 +106,7 @@ async fn given_job_role(emulator: &Emulator, grant: &Value) -> String {
 
 /// The grant a job needs over `bucket` to read its input, write its output and write its
 /// checkpoints.
-fn every_s3_action_on(bucket: &str) -> Value {
+pub(crate) fn every_s3_action_on(bucket: &str) -> Value {
     allow(
         json!(["s3:GetObject", "s3:PutObject", "s3:ListBucket"]),
         json!([
@@ -115,7 +139,7 @@ fn labelled_data(rows: usize) -> String {
 }
 
 /// The keys Amazon S3 lists under `prefix`, read through `ListObjectsV2`.
-async fn listed_keys(emulator: &Emulator, bucket: &str, prefix: &str) -> Vec<String> {
+pub(crate) async fn listed_keys(emulator: &Emulator, bucket: &str, prefix: &str) -> Vec<String> {
     let (status, body) = emulator
         .s3(
             "GET",
@@ -136,16 +160,64 @@ async fn listed_keys(emulator: &Emulator, bucket: &str, prefix: &str) -> Vec<Str
         .collect()
 }
 
-/// The bytes of one object, read through `GetObject`.
-async fn object_bytes(emulator: &Emulator, bucket: &str, key: &str) -> Vec<u8> {
-    let (status, body) = emulator.s3("GET", &format!("/{bucket}/{key}"), &[]).await;
-    assert_eq!(
-        status,
-        200,
-        "the object {bucket}/{key} must be served, got {status} {}",
-        String::from_utf8_lossy(&body)
-    );
-    body
+/// The bytes of one object, read through `GetObject` once Amazon S3 serves it.
+///
+/// What a case needs of a job that has finished is the OBJECT, so it looks again for THAT
+/// condition instead of taking a status that implies it as proof the object is already there.
+/// Whether it is, the first time a read reports the terminal status, is an ordering the
+/// emulator keeps (`state::publish_due_artifact` makes the publication the clock owes before
+/// the read it answers reports the stage); a case that ASSUMES that ordering rather than
+/// looking again turns any lag into a failure decided by how fast the host ran.
+pub(crate) async fn object_bytes(
+    emulator: &Emulator,
+    case: &str,
+    bucket: &str,
+    key: &str,
+) -> Vec<u8> {
+    let deadline = Instant::now() + SETTLE_BUDGET;
+    loop {
+        let (status, body) = emulator.s3("GET", &format!("/{bucket}/{key}"), &[]).await;
+        if status == 200 {
+            return body;
+        }
+        look_again(
+            deadline,
+            case,
+            &format!("Amazon S3 serves the object {bucket}/{key}"),
+            &format!("{status} {}", String::from_utf8_lossy(&body)),
+        )
+        .await;
+    }
+}
+
+/// Look again until the keys Amazon S3 lists under `prefix` are exactly `expected`, and answer
+/// what the listing that saw them held.
+///
+/// The set of objects a finished job left is a CONDITION, read the same way as every other one
+/// in this suite: `expected` is still asserted exactly by the caller, and what a loaded host
+/// changes is how many times this looks, never what it answers.
+pub(crate) async fn keys_until(
+    emulator: &Emulator,
+    case: &str,
+    bucket: &str,
+    prefix: &str,
+    expected: &[String],
+) -> Vec<String> {
+    let deadline = Instant::now() + SETTLE_BUDGET;
+    loop {
+        let mut held = listed_keys(emulator, bucket, prefix).await;
+        held.sort();
+        if held == expected {
+            return held;
+        }
+        look_again(
+            deadline,
+            case,
+            &format!("{bucket}/{prefix} holds exactly {expected:?}"),
+            &format!("{held:?}"),
+        )
+        .await;
+    }
 }
 
 /// The entries a `model.tar.gz` holds, as `(name, contents)`.
@@ -202,7 +274,7 @@ fn training_request(
 }
 
 /// One channel reading `s3://<bucket>/<prefix>`.
-fn channel(name: &str, bucket: &str, prefix: &str) -> Value {
+pub(crate) fn channel(name: &str, bucket: &str, prefix: &str) -> Value {
     json!({
         "ChannelName": name,
         "DataSource": {
@@ -271,11 +343,13 @@ async fn observed(emulator: &Emulator, case: &str, job: &str, bucket: &str) -> O
                 artifact_listable_by,
             };
         }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: the job never left InProgress; last read {read}"
-        );
-        tokio::time::sleep(SETTLE_POLL).await;
+        look_again(
+            deadline,
+            case,
+            "the job left InProgress",
+            &read.to_string(),
+        )
+        .await;
     }
 }
 
@@ -747,7 +821,7 @@ async fn the_artifact_and_the_metrics_come_from_the_job_that_produced_them() {
             .strip_prefix(&format!("s3://{bucket}/"))
             .unwrap_or_else(|| panic!("case {case:?}: the artifact URI names this bucket: {artifact}"))
             .to_string();
-        let entries = archive_entries(&object_bytes(&emulator, bucket, &key).await);
+        let entries = archive_entries(&object_bytes(&emulator, case, bucket, &key).await);
         let mut held: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
         held.sort_unstable();
         assert_eq!(
@@ -1001,11 +1075,13 @@ async fn a_batch_transform_job_scores_its_input_and_writes_one_out_object() {
             if str_field(&read, "TransformJobStatus") != "InProgress" {
                 break read;
             }
-            assert!(
-                Instant::now() < deadline,
-                "case {case:?}: the transform job never left InProgress; last read {read}"
-            );
-            tokio::time::sleep(SETTLE_POLL).await;
+            look_again(
+                deadline,
+                case,
+                "the transform job left InProgress",
+                &read.to_string(),
+            )
+            .await;
         };
         let status = str_field(&settled, "TransformJobStatus");
         let reason = settled
@@ -1044,8 +1120,6 @@ async fn a_batch_transform_job_scores_its_input_and_writes_one_out_object() {
             "case {case:?}: a completed job reports the span of its work, got {settled}"
         );
 
-        let mut written = listed_keys(&emulator, bucket, "scored/").await;
-        written.sort();
         let mut expected: Vec<String> = row
             .inputs
             .iter()
@@ -1055,13 +1129,18 @@ async fn a_batch_transform_job_scores_its_input_and_writes_one_out_object() {
             })
             .collect();
         expected.sort();
+        // The objects a finished job left are a CONDITION, looked for again until they are
+        // there rather than taken as an instant consequence of the status just read. The
+        // exactness of the set is what `keys_until` loops on, so the assertion below is the
+        // expectation stated once more where the rule is read.
+        let written = keys_until(&emulator, case, bucket, "scored/", &expected).await;
         assert_eq!(
             written, expected,
             "case {case:?}: expected one .out per input object, got {written:?}"
         );
         for ((key, body), out) in row.inputs.iter().zip(&expected) {
             let records = body.lines().filter(|line| !line.is_empty()).count();
-            let scored = String::from_utf8(object_bytes(&emulator, bucket, out).await)
+            let scored = String::from_utf8(object_bytes(&emulator, case, bucket, out).await)
                 .expect("the scored object is text");
             let predictions: Vec<&str> = scored.lines().filter(|line| !line.is_empty()).collect();
             assert_eq!(
@@ -1082,7 +1161,11 @@ async fn a_batch_transform_job_scores_its_input_and_writes_one_out_object() {
 
 /// Train a model over `bucket` and answer the artifact its run wrote, so a transform job has a
 /// model whose parameters a run of this emulator really measured.
-async fn given_trained_artifact(
+///
+/// What the caller then does with the answer is hand it to `CreateModel`, which REFUSES model
+/// data it cannot read — so this waits for the object itself to be served, not merely for the
+/// status that implies it.
+pub(crate) async fn given_trained_artifact(
     emulator: &Emulator,
     case: &str,
     bucket: &str,
@@ -1115,12 +1198,28 @@ async fn given_trained_artifact(
         "case {case:?}: the model the transform applies must be trained, got {}",
         seen.terminal
     );
-    str_field(
+    let artifact = str_field(
         seen.terminal
             .get("ModelArtifacts")
             .unwrap_or(&Value::Null),
         "S3ModelArtifacts",
-    )
+    );
+    served_artifact(emulator, case, bucket, artifact).await
+}
+
+/// The artifact URI `uri`, once Amazon S3 serves the object it names.
+///
+/// A job's artifact is published by whichever read or armed instant claims it first
+/// (`state::publish_due_artifact`), so what a caller needs before handing the URI on is the
+/// OBJECT: looked for again until it is served, under the one deadline this suite bounds a
+/// wait with.
+async fn served_artifact(emulator: &Emulator, case: &str, bucket: &str, uri: String) -> String {
+    let key = uri
+        .strip_prefix(&format!("s3://{bucket}/"))
+        .unwrap_or_else(|| panic!("case {case:?}: the artifact URI names this bucket: {uri}"))
+        .to_string();
+    object_bytes(emulator, case, bucket, &key).await;
+    uri
 }
 
 /// RULE: `CreateModel` refuses model data the execution role cannot read, with nothing stored,
