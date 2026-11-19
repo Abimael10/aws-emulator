@@ -78,7 +78,7 @@ fn invalid_blob_id(blob_id: &str) -> String {
 }
 
 /// `CommitDoesNotExistException`'s text for a commit SPECIFIER that resolved to no
-/// commit.
+/// commit on a comparison or a merge, which resolves two of them.
 fn commit_specifier_not_found(specifier: &str) -> String {
     format!(
         "AWS CodeCommit could not find the commit specifier {specifier}. Either the specifier \
@@ -322,6 +322,10 @@ async fn a_commit_specifier_that_resolves_to_nothing_names_the_specifier() {
     seeded(&router, repository, branch, "README.md", b"# demo\n").await;
 
     for (label, specifier) in rejected_specifiers() {
+        // Each row carries the text the operation words this code with: the three
+        // operations that resolve the ONE `commitSpecifier` of a content read take
+        // the content read's template, and the operations that resolve the two
+        // sides of a comparison or a merge take the specifier template.
         let requests: Vec<(&str, Value, String)> = vec![
             (
                 "GetFile",
@@ -884,5 +888,104 @@ async fn a_branch_name_already_taken_names_the_qualified_reference() {
             !message.contains(&tip),
             "case ({label}, {name:?}): the message must not name the commit id, got {message:?}"
         );
+    }
+}
+
+/// Each comparison and merge request that resolves `specifier` as ONE side and
+/// `branch` as the other: the operations whose input holds a side-named specifier
+/// member (`beforeCommitSpecifier`/`afterCommitSpecifier`,
+/// `sourceCommitSpecifier`/`destinationCommitSpecifier`) rather than the single
+/// `commitSpecifier` of a content read.
+fn two_sided_resolvers(
+    repository: &str,
+    branch: &str,
+    specifier: &str,
+) -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "GetDifferences",
+            json!({ "repositoryName": repository, "afterCommitSpecifier": specifier }),
+        ),
+        (
+            "GetDifferences",
+            json!({
+                "repositoryName": repository,
+                "beforeCommitSpecifier": specifier,
+                "afterCommitSpecifier": branch,
+            }),
+        ),
+        (
+            "GetMergeOptions",
+            json!({
+                "repositoryName": repository,
+                "sourceCommitSpecifier": specifier,
+                "destinationCommitSpecifier": branch,
+            }),
+        ),
+        (
+            "GetMergeCommit",
+            json!({
+                "repositoryName": repository,
+                "sourceCommitSpecifier": specifier,
+                "destinationCommitSpecifier": branch,
+            }),
+        ),
+        (
+            "GetMergeOptions",
+            json!({
+                "repositoryName": repository,
+                "sourceCommitSpecifier": branch,
+                "destinationCommitSpecifier": specifier,
+            }),
+        ),
+        (
+            "MergeBranchesByFastForward",
+            json!({
+                "repositoryName": repository,
+                "sourceCommitSpecifier": specifier,
+                "destinationCommitSpecifier": branch,
+            }),
+        ),
+    ]
+}
+
+/// Every operation that resolves a side-named specifier keeps the two-sentence
+/// specifier template, whichever side carried the specifier that resolved to
+/// nothing and whatever form it took — so the content read's shorter wording
+/// cannot spread to the other side of the rule.
+///
+/// The sibling tables above pin the content reads and contrast them with two of
+/// these calls; the rows here are the WHOLE set of side-named resolvers
+/// ([`two_sided_resolvers`], which the before side of a diff, a merge read and a
+/// merge that would write reach only here) against every specifier form
+/// `CommitName` documents.
+#[tokio::test]
+async fn every_two_sided_resolver_keeps_the_specifier_template() {
+    let router = emulator();
+    let repository = "two-sided-specifier-wording";
+    let branch = "main";
+    seeded(&router, repository, branch, "README.md", b"# demo\n").await;
+
+    for (label, specifier) in rejected_specifiers() {
+        let expected = commit_specifier_not_found(specifier);
+        for (operation, body) in two_sided_resolvers(repository, branch, specifier) {
+            let (code, message) =
+                error_with_message(&router, operation, &body, CLIENT_ERROR_STATUS).await;
+            assert_eq!(
+                code, "CommitDoesNotExistException",
+                "case ({operation}, {label}, {specifier:?}): expected code \
+                 CommitDoesNotExistException, got {code:?}"
+            );
+            assert_eq!(
+                message, expected,
+                "case ({operation}, {label}, {specifier:?}): expected message {expected:?}, got \
+                 {message:?}"
+            );
+            assert!(
+                !message.contains(repository),
+                "case ({operation}, {label}, {specifier:?}): the message must not name the \
+                 repository, got {message:?}"
+            );
+        }
     }
 }

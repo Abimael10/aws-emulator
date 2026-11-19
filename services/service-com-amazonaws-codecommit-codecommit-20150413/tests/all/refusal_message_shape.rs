@@ -5,8 +5,8 @@
 //! Two rules are under test here, both about the shape of a refusal rather than
 //! about which one is raised:
 //!
-//! 1. One error code is worded ONE way: a CONSTANT where the service's text names
-//!    nothing from the request (`ParentCommitIdOutdatedException`,
+//! 1. One error code is worded ONE way per KIND of call: a CONSTANT where the
+//!    service's text names nothing from the request (`ParentCommitIdOutdatedException`,
 //!    `ParentCommitIdRequiredException`, `NoChangeException`,
 //!    `SameFileContentException`, `BlobIdDoesNotExistException`), and a TEMPLATE
 //!    whose single slot is a named request value where it does — the resolved
@@ -82,7 +82,8 @@ fn blob_id_does_not_exist(blob_id: &str) -> String {
 
 /// `CommitDoesNotExistException`'s text for a member the model types `CommitName`
 /// — a commit SPECIFIER (a branch, a tag, `HEAD` or a full commit id) — that
-/// resolved to no commit. The one slot is that specifier.
+/// resolved to no commit on a COMPARISON or a MERGE, which resolves two of them.
+/// The one slot is that specifier.
 fn commit_specifier_not_found(specifier: &str) -> String {
     format!(
         "AWS CodeCommit could not find the commit specifier {specifier}. Either the specifier \
