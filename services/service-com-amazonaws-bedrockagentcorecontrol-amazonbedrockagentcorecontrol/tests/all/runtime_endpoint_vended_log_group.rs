@@ -157,6 +157,29 @@ impl Emulator {
             .await
     }
 
+    /// Read the runtime until it is GONE — the modelled 404 — or fail once the generous
+    /// deadline passes.
+    ///
+    /// `DeleteAgentRuntime` ACCEPTS the removal (202) and the runtime reports `DELETING`
+    /// until the span the clock owes it passes, so this looks again for the CONDITION
+    /// rather than waiting a fixed time: nothing here depends on how fast the host runs.
+    async fn get_runtime_until_gone(&self, case: &str, region: &str, runtime_id: &str) -> Answer {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let answer = self.get_runtime(region, runtime_id).await;
+            if answer.status == 404 {
+                return answer;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case {case:?}: the deleted runtime never went away, last answer {} and body {}",
+                answer.status,
+                answer.body
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// `DELETE /runtimes/{agentRuntimeId}/runtime-endpoints/{endpointName}/` — the route
     /// the model binds `DeleteAgentRuntimeEndpoint` to.
     async fn delete_endpoint(&self, region: &str, runtime_id: &str, name: &str) -> Answer {
@@ -739,7 +762,9 @@ async fn deleting_the_runtime_retains_the_vended_groups_and_their_events() {
             "case {case:?}: expected HTTP 202 from DeleteAgentRuntime, got {} and body {}",
             deleted_runtime.status, deleted_runtime.body
         );
-        let read = emulator.get_runtime(REGION, &runtime_id).await;
+        let read = emulator
+            .get_runtime_until_gone(case, REGION, &runtime_id)
+            .await;
         assert_eq!(
             (read.status, read.error_code()),
             (404, "ResourceNotFoundException".to_string()),

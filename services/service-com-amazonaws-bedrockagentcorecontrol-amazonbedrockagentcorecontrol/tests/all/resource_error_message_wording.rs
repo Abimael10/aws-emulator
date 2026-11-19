@@ -55,6 +55,12 @@ const REGION: &str = "us-east-1";
 /// row can wait the clock-owed transition out.
 const PAST_SETTLE: Duration = Duration::from_millis(900);
 
+/// How long a poll loop waits for a clock-owed removal before giving up, and how long it
+/// waits between two looks. Generous: the loop finishes as soon as the removal is due, and
+/// the deadline only catches a removal that never comes.
+const REMOVAL_DEADLINE: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// A role ARN inside `RoleArn`'s pattern `^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/AgentCoreRole";
 
@@ -609,6 +615,23 @@ async fn the_read_and_the_update_path_word_one_dead_runtime_differently() {
             "case {case:?}: setup DeleteAgentRuntime must succeed, got {} ({})",
             deleted.status, deleted.body
         );
+        // The delete is ACCEPTED, not yet carried out: the runtime reports `DELETING`
+        // until the span the clock owes it passes, and this rule is about the sentences a
+        // runtime that is GONE is reported missing in, so look again until it is.
+        let deadline = std::time::Instant::now() + REMOVAL_DEADLINE;
+        loop {
+            let probe = send(&router, "GET", &format!("/runtimes/{id}/"), None).await;
+            if probe.status == 404 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case {case:?}: the deleted runtime never went away, last answer {} ({})",
+                probe.status,
+                probe.body
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
 
         let read = send(&router, "GET", &format!("/runtimes/{id}/"), None).await;
         let expected_read = agent_not_found(&id, None);

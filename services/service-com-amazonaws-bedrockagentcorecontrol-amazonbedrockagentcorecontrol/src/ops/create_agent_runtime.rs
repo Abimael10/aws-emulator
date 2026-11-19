@@ -251,6 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // below, because a lock is not held across an await.
         let output = {
             let mut store = state.lock();
+            // A runtime whose deletion the clock has already made due is gone — with the
+            // name it reserved — before this create looks at the names in use.
+            store.expire_deleted_agent_runtimes(now);
 
             // Read again under the guard that WRITES: the guard above was dropped for
             // the call in between, so two requests carrying one token could both have
@@ -364,6 +367,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
                 tags: crate::state::sorted_map(input.tags),
                 workload_identity_details: output.workload_identity_details.clone(),
+                // Nobody has deleted this runtime, so the clock owes no removal.
+                removal_due_at: None,
             };
 
             store

@@ -291,7 +291,12 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
                 }
                 rows.push((
                     format!("{}/{:05}", record.agent_runtime_id, version.version),
-                    version.summary(&record.agent_runtime_arn, now),
+                    AgentRuntimeVersionSummary {
+                        // A runtime on its way out reports `DELETING` for every version it
+                        // still holds, the same status its own reads report.
+                        status: record.status_of(version, now).to_string(),
+                        ..version.summary(&record.agent_runtime_arn, now)
+                    },
                 ));
             }
         }

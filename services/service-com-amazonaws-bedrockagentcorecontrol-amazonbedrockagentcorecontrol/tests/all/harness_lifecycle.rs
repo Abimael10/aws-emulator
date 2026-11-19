@@ -124,8 +124,9 @@ fn at(body: &Value, pointer: &str) -> Value {
     body.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
-/// A `CreateHarness` body for `name`: the two `@required` members, the `model` this
-/// service has no default for, and whatever else the row configures.
+/// A `CreateHarness` body for `name`: the two `@required` members, a `model` (optional on
+/// the request — `tests/all/harness_optional_members.rs` pins what a create without one
+/// answers), and whatever else the row configures.
 fn harness_body(name: &str, extra: Value) -> Value {
     let mut body = json!({
         "harnessName": name,
@@ -221,12 +222,12 @@ async fn every_modelled_harness_route_reaches_its_own_operation() {
             error_type: "ResourceNotFoundException",
         },
         Route {
-            case: "UpdateHarness, scaffolded",
+            case: "UpdateHarness, implemented",
             method: "PATCH",
             uri: format!("/harnesses/{existing}"),
             body: Some(json!({"maxIterations": 4})),
-            status: 501,
-            error_type: "NotImplemented",
+            status: 200,
+            error_type: "",
         },
         Route {
             case: "ListHarnesses, scaffolded",
@@ -735,40 +736,6 @@ async fn a_replayed_client_token_answers_with_the_first_harness() {
         conflict.status,
         conflict.error_type,
         conflict.body
-    );
-}
-
-/// `Harness.model` is `@required` on every response while `CreateHarnessRequest.model` is
-/// optional, and this service has no default model to run a harness with, so a create that
-/// names none is refused with the operation's own modelled `ValidationException` naming
-/// the member — never served with an invented model id.
-#[tokio::test]
-async fn create_harness_refuses_a_request_that_names_no_model() {
-    let router = router();
-
-    let answer = send(
-        &router,
-        "POST",
-        "/harnesses",
-        Some(&json!({
-            "harnessName": "modellessHarness",
-            "executionRoleArn": ROLE_ARN,
-        })),
-    )
-    .await;
-    assert_eq!(
-        (answer.status, answer.error_type.as_str()),
-        (400, "ValidationException"),
-        "expected 400 ValidationException for a create that names no model, got {} {:?} with {}",
-        answer.status,
-        answer.error_type,
-        answer.body
-    );
-    assert_eq!(
-        at(&answer.body, "/fieldList/0/name"),
-        json!("model"),
-        "the modelled ValidationException names the member in its fieldList, got {}",
-        answer.body
     );
 }
 

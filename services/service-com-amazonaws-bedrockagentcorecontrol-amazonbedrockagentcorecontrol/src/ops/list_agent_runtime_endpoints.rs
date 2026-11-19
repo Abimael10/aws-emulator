@@ -166,7 +166,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let now = ::std::time::SystemTime::now();
-        let store = state.lock();
+        let mut store = state.lock();
+        // A runtime whose deletion the clock has already made due is gone, with its
+        // endpoints, before this listing reads.
+        store.expire_deleted_agent_runtimes(now);
 
         // The token is opaque on the wire: it carries the endpoint name the previous
         // page ended on, and the next page starts strictly after it.

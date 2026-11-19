@@ -532,6 +532,23 @@ async fn a_runtime_this_account_does_not_hold_is_an_empty_page() {
         "deleting the runtime must succeed for this suite to say anything, got {} with {}",
         removed.status, removed.body
     );
+    // The delete is ACCEPTED (202) and the runtime stays readable — endpoints and all —
+    // until the removal the clock owes it comes due, so this row waits for the removal
+    // ITSELF rather than for a fixed time: the probe below is about a runtime that is GONE.
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let read = send(&router, "GET", &format!("/runtimes/{deleted}/"), None).await;
+        if read.status == 404 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the deleted runtime never went away, last answer {} with {}",
+            read.status,
+            read.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 
     // Ids inside `AgentRuntimeId`'s pattern that name no runtime of this account: the
     // shortest the pattern admits, a prefix of digits and underscores, the 100-character

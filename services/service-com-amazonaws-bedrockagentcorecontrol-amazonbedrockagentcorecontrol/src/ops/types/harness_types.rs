@@ -44,7 +44,11 @@ pub struct Harness {
     pub execution_role_arn: String,
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
-    pub model: HarnessModelConfiguration,
+    /// The model the harness runs with, when one is configured. `CreateHarnessRequest`
+    /// and `UpdateHarnessRequest` both leave the member optional, and AWS publishes no
+    /// default model id for a harness created without one, so a harness configured with
+    /// no model reports none rather than one this emulator invented.
+    pub model: Option<HarnessModelConfiguration>,
     pub system_prompt: Vec<HarnessSystemContentBlock>,
     pub tools: Vec<HarnessTool>,
     pub skills: Vec<HarnessSkill>,
@@ -83,7 +87,7 @@ agentcore_schema_and_codec!(
     ),
     (M_CREATED_AT, created_at, "createdAt", 6, req, date_time),
     (M_UPDATED_AT, updated_at, "updatedAt", 7, req, date_time),
-    (M_MODEL, model, "model", 8, req, union_of(HarnessModelConfiguration)),
+    (M_MODEL, model, "model", 8, opt, union_of(HarnessModelConfiguration)),
     (
         M_SYSTEM_PROMPT,
         system_prompt,

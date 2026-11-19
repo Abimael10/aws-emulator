@@ -481,7 +481,7 @@ fn pre_handler<O: Operation, Eng: Send + Sync + 'static>(
     req: &RtRequest,
     ctx: &OperationContext<'_>,
 ) -> Option<PreHandler> {
-    if let Some(denial) = authorization::refusal(engine, ctx, O::NAME) {
+    if let Some(denial) = authorization::refusal(engine, ctx, O::NAME, O::INPUT_SCHEMA) {
         return Some(PreHandler::Denied(denial));
     }
     // And the account's own entitlement to the feature the request addresses, which the

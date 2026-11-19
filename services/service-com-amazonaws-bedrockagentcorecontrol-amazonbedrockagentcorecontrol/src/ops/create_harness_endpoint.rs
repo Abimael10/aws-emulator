@@ -240,6 +240,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             endpoint_name: input.endpoint_name.clone(),
             description: input.description,
             target_version: harness.version,
+            // Nothing is served behind the name until the endpoint finishes
+            // transitioning onto the version it points at.
+            live_version: None,
             created_at: now,
             updated_at: now,
             // A new endpoint is created, not ready: the transition to READY is owed by

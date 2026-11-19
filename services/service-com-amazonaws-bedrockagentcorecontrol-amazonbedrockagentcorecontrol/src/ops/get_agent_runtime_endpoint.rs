@@ -186,7 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let now = ::std::time::SystemTime::now();
-        let store = state.lock();
+        let mut store = state.lock();
+        // A runtime whose deletion the clock has already made due is gone, with its
+        // endpoints, before this read looks for one.
+        store.expire_deleted_agent_runtimes(now);
 
         // This route addresses ONE endpoint, by both of the identifiers it is named by,
         // so the lookup that fails is the endpoint's whichever half of the pair names

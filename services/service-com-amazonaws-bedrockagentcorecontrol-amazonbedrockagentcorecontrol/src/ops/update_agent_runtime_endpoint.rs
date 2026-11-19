@@ -197,6 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // A runtime whose deletion the clock has already made due is gone, with its
+        // endpoints, before this update looks for one.
+        store.expire_deleted_agent_runtimes(now);
 
         // A replayed request carrying the same `clientToken` answers with the endpoint
         // that token already changed, rather than starting a second shift. Decided

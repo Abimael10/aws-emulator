@@ -140,6 +140,29 @@ impl Emulator {
             .await
     }
 
+    /// Read the runtime until it is GONE — the modelled 404 — or fail once the generous
+    /// deadline passes.
+    ///
+    /// `DeleteAgentRuntime` ACCEPTS the removal (202) and the runtime reports `DELETING`
+    /// until the span the clock owes it passes, so this looks again for the CONDITION
+    /// rather than waiting a fixed time: nothing here depends on how fast the host runs.
+    async fn get_runtime_until_gone(&self, case: &str, region: &str, id: &str) -> Answer {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let answer = self.get_runtime(region, id).await;
+            if answer.status == 404 {
+                return answer;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case {case:?}: the deleted runtime never went away, last answer {} and body {}",
+                answer.status,
+                answer.body
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// One CloudWatch Logs call (`awsJson1_1`, `Logs_20140328.<Operation>`) signed for
     /// `region`. The credential scope names `logs`, which is what the router claims on.
     async fn logs(&self, region: &str, operation: &str, body: &Value) -> Answer {
@@ -452,6 +475,11 @@ async fn every_runtime_is_vended_its_own_group() {
         "case {case:?}: expected HTTP 202 from DeleteAgentRuntime, got {} and body {}",
         deleted.status, deleted.body
     );
+    // The delete is ACCEPTED, not yet carried out: the name it reserved is free again only
+    // once the removal the clock owes it comes due, so wait for the runtime to be GONE.
+    emulator
+        .get_runtime_until_gone(case, REGION, &deleted_id)
+        .await;
     let recreated = emulator
         .create_runtime(REGION, &create_request("agent", Artifact::Container))
         .await;
@@ -508,7 +536,7 @@ async fn deleting_the_runtime_retains_its_vended_log_group() {
             deleted.status, deleted.body
         );
         // The runtime is gone...
-        let read = emulator.get_runtime(row.region, &id).await;
+        let read = emulator.get_runtime_until_gone(case, row.region, &id).await;
         assert_eq!(
             (read.status, read.error_code()),
             (404, "ResourceNotFoundException".to_string()),

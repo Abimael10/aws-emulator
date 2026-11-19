@@ -33,6 +33,14 @@ const DEFAULT_LIFECYCLE: fn() -> Value =
 /// transition, plus slack, so a test can wait the clock out.
 const PAST_SETTLE: Duration = Duration::from_millis(900);
 
+/// How long a poll loop waits for a clock-owed change before giving up, and how long it
+/// waits between two looks.
+///
+/// The deadline is generous: a loop waits for the CONDITION it is about, so it finishes as
+/// soon as the change is due, and the deadline only catches a change that never comes.
+const REMOVAL_DEADLINE: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     // `default()` registers no authenticator, so the tests exercise routing and
@@ -101,6 +109,28 @@ async fn get_version(router: &MultiServiceRouter, id: &str, version: &str) -> (u
 
 async fn list(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
     send(router, "POST", &format!("/runtimes/{query}"), REGION, None).await
+}
+
+/// Read the runtime until it is gone — the modelled 404 — or fail once the generous
+/// deadline passes, and hand back that answer.
+///
+/// `DeleteAgentRuntime` ACCEPTS the removal (202): the runtime stays readable and reports
+/// `DELETING` until the span the clock owes it passes, so this looks AGAIN for the
+/// condition rather than waiting a fixed time, and nothing here depends on how fast the
+/// host runs.
+async fn get_until_gone(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+    let deadline = std::time::Instant::now() + REMOVAL_DEADLINE;
+    loop {
+        let (status, body) = get(router, id).await;
+        if status == 404 {
+            return (status, body);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the deleted runtime never went away, last answer {status} / {body}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// The error code `restJson1` puts in `__type` / `x-amzn-errortype`.
@@ -677,7 +707,8 @@ async fn delete_removes_the_runtime_or_just_the_named_version() {
         still_there["agentRuntimeVersion"]
     );
 
-    // Deleting without a version removes the runtime entirely.
+    // Deleting without a version puts the whole runtime on its way out: it reports
+    // DELETING at once and goes when the span the clock owes it passes.
     let (status, deleted) =
         send(&router, "DELETE", &format!("/runtimes/{id}/"), REGION, None).await;
     assert_eq!(status, 202, "expected 202 from DeleteAgentRuntime, got {status} / {deleted}");
@@ -687,7 +718,13 @@ async fn delete_removes_the_runtime_or_just_the_named_version() {
         "expected the deleted id to be reported, got {}",
         deleted["agentRuntimeId"]
     );
-    let (status, gone) = get(&router, &id).await;
+    let (status, deleting) = get(&router, &id).await;
+    assert_eq!(
+        (status, deleting["status"].clone()),
+        (200, json!("DELETING")),
+        "expected the runtime to still be readable as DELETING, got {status} / {deleting}"
+    );
+    let (status, gone) = get_until_gone(&router, &id).await;
     assert_eq!(status, 404, "expected the runtime to be gone, got {status} / {gone}");
     assert_eq!(
         error_code(&gone),
@@ -867,6 +904,9 @@ async fn a_client_token_record_does_not_outlive_the_runtime_it_named() {
     let (status, deleted) =
         send(&router, "DELETE", &format!("/runtimes/{id}/"), REGION, None).await;
     assert_eq!(status, 202, "expected the delete to be accepted, got {status} / {deleted}");
+    // The delete is accepted, not yet carried out: the token's record goes with the
+    // runtime, so the wait is for the removal the clock owes.
+    get_until_gone(&router, &id).await;
 
     // The token's record went with the runtime, so the same token now reads as
     // a fresh request rather than replaying a runtime that no longer exists.

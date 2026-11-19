@@ -195,7 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let now = ::std::time::SystemTime::now();
-        let store = state.lock();
+        let mut store = state.lock();
+        // A runtime whose deletion the clock has already made due is gone before this
+        // read looks for it; one still inside that window reports `DELETING`.
+        store.expire_deleted_agent_runtimes(now);
 
         // The lookup that fails is the agent's, so the refusal names the agent,
         // the account it was looked for in and the version that was asked for.
@@ -225,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_at: crate::state::timestamp(version.last_updated_at),
             role_arn: version.role_arn.clone(),
             network_configuration: version.network_configuration.clone(),
-            status: version.status_at(now).to_string(),
+            status: record.status_of(version, now).to_string(),
             lifecycle_configuration: version.lifecycle_configuration.clone(),
             failure_reason: version.failure_reason.clone(),
             description: version.description.clone(),

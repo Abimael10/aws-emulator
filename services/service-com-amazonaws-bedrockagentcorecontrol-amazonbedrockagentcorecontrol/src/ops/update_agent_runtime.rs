@@ -18,6 +18,13 @@
 //! role is resolved against IAM next and a role this service cannot assume is refused
 //! the same way.
 //!
+//! A runtime whose own deletion has already been accepted publishes nothing: the delete is
+//! asynchronous, so the runtime is still there and reporting `DELETING`, and a change asked
+//! of it in that window is refused with this operation's modelled `ConflictException` (409)
+//! naming the runtime — "busy, retry later", which is what the caller needs to tell from the
+//! `ResourceNotFoundException` (404) it gets once the removal is due
+//! ([`crate::state::agent_runtime_delete_in_flight`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -247,6 +254,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // A runtime whose deletion the clock has already made due is gone before this
+        // update looks for it.
+        store.expire_deleted_agent_runtimes(now);
 
         // Read again under the guard that WRITES: the guard above was dropped for
         // the call in between, so two requests carrying one token could both have
@@ -270,6 +280,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::agent_runtime_not_found_on_update(&input.agent_runtime_id),
                 )
             })?;
+
+        // A runtime whose own deletion has already been accepted is on its way out: the
+        // change is refused as the conflict it is — busy, not gone — and nothing is
+        // written, so the caller waits for the delete to finish rather than publishing a
+        // version onto a resource that is being removed.
+        if record.is_deleting() {
+            return Err(UpdateAgentRuntimeErrorModeled::ConflictException(
+                crate::state::agent_runtime_delete_in_flight(&record.agent_runtime_arn),
+            )
+            .into());
+        }
 
         // The versions one runtime accumulates are bounded, and so is the
         // version number the wire can carry, so repeated updates meet the

@@ -290,6 +290,33 @@ async fn read_until_ready(
     }
 }
 
+/// Read the runtime until it is gone — the modelled 404 — or fail once the generous
+/// deadline passes.
+///
+/// `DeleteAgentRuntime` ACCEPTS the removal (202) and the runtime reports `DELETING` until
+/// the span the clock owes it passes, so the row LOOKS AGAIN rather than waiting a fixed
+/// span: nothing here depends on how fast the host runs.
+async fn read_runtime_until_gone(
+    router: &MultiServiceRouter,
+    runtime_id: &str,
+    case: &str,
+) -> Answer {
+    let started = Instant::now();
+    loop {
+        let answer = send(router, "GET", &format!("/runtimes/{runtime_id}/"), None).await;
+        if answer.status == 404 {
+            return answer;
+        }
+        assert!(
+            started.elapsed() < SETTLE_DEADLINE,
+            "case {case:?}: the deleted runtime never went away, last answer {} with {}",
+            answer.status,
+            answer.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// One row of the tracking table: how many versions the runtime publishes past its first,
 /// and the endpoint a caller pins to the first version beside the managed one.
 struct Tracked {
@@ -571,7 +598,7 @@ async fn a_caller_created_endpoint_blocks_the_runtime_removal_and_the_managed_on
             removed.status,
             removed.body
         );
-        let read = send(&router, "GET", &format!("/runtimes/{runtime_id}/"), None).await;
+        let read = read_runtime_until_gone(&router, &runtime_id, case).await;
         assert_eq!(
             (read.status, error_code(&read.body)),
             (404, "ResourceNotFoundException".to_string()),

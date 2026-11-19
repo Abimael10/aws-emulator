@@ -205,6 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // because a lock is not held across an await.
         let output = {
             let mut store = state.lock();
+            // A runtime whose deletion the clock has already made due is gone before this
+            // create looks for the runtime to put an endpoint on.
+            store.expire_deleted_agent_runtimes(now);
 
             // A replayed request carrying the same `clientToken` answers with the
             // endpoint that token first produced, rather than adding a second one.

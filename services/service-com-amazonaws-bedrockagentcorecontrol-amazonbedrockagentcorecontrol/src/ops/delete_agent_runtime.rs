@@ -2,10 +2,16 @@
 
 //! @op DeleteAgentRuntime
 //!
-//! Removes a stored agent runtime from [`crate::state`] — one version when the
-//! `version` query names one, every version otherwise — so a later
-//! `GetAgentRuntime` answers `ResourceNotFoundException` and `ListAgentRuntimes`
-//! no longer reports it.
+//! ACCEPTS the deletion of a stored agent runtime and records it in [`crate::state`] — one
+//! version when the `version` query names one, the runtime as a whole otherwise. The
+//! operation answers 202 carrying `status`, so the deletion is asynchronous: the runtime
+//! reports `DELETING` at once and stays readable until the span the clock owes it passes,
+//! after which every read of it — `GetAgentRuntime` above all — resolves to the modelled
+//! `ResourceNotFoundException` and `ListAgentRuntimes` no longer reports it. A change asked
+//! of the runtime inside that window is this operation's sibling conflict rather than a
+//! not-found, which is how a caller tells "busy, retry later" from "gone, stop"
+//! ([`crate::state::agent_runtime_deletion`]). A version the runtime KEEPS is removed at
+//! once: only the runtime's own removal is owed to the clock.
 //!
 //! A removal of the RUNTIME is served only on a runtime that holds no endpoint a caller
 //! created: an endpoint is a stable address callers invoke, so it is torn down
@@ -173,7 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the agent runtime store is unavailable".to_string()),
             })
         })?;
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // A runtime whose earlier deletion the clock has already made due is gone
+        // before this call looks for it.
+        store.expire_deleted_agent_runtimes(now);
 
         // Built before the store is borrowed, so the refusal can be returned from
         // anywhere below without holding on to the request. The lookup that fails
@@ -218,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The version the request named, or every version the runtime holds.
+        // The version the request named, or the runtime as a whole.
         let deleted_version = match input.agent_runtime_version.as_deref() {
             Some(raw) => {
                 let requested = raw
@@ -228,26 +238,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(requested) = requested else {
                     return Err(not_found().into());
                 };
-                record.versions.remove(&requested);
-                record.resync_latest_version();
+                // A version the runtime keeps is gone at once: only the RUNTIME's own
+                // removal is asynchronous. The last version left is not removed on its
+                // own — a runtime holds no versions only by being gone, so what is being
+                // deleted is the runtime, and its versions stay readable with it until
+                // the clock owes the removal.
+                if !removes_the_runtime {
+                    record.versions.remove(&requested);
+                    record.resync_latest_version();
+                }
                 requested
             }
-            None => {
-                let latest = record.latest_version;
-                record.versions.clear();
-                latest
-            }
+            None => record.latest_version,
         };
-        let emptied = record.versions.is_empty();
-        let agent_runtime_name = record.agent_runtime_name.clone();
 
-        // Once no version is left the runtime itself is gone, and its name is
-        // free for the next CreateAgentRuntime. Its idempotency records go with
-        // it: they can never replay anything again.
-        if emptied {
-            store.agent_runtimes.remove(&input.agent_runtime_id);
-            store.runtime_names.remove(&agent_runtime_name);
-            store.forget_client_tokens_for(&input.agent_runtime_id);
+        // The deletion is ACCEPTED here (202) and the runtime reports `DELETING` from now
+        // on; the record — its name, its endpoints and the idempotency records naming it —
+        // is removed when the span the clock owes passes, so a caller that deletes and then
+        // reads sees `DELETING`, a change asked of the runtime in that window is refused the
+        // modelled conflict rather than reported missing, and only afterwards is every read
+        // the modelled 404.
+        if removes_the_runtime {
+            record.begin_deleting(now);
         }
 
         Ok(DeleteAgentRuntimeOutput {

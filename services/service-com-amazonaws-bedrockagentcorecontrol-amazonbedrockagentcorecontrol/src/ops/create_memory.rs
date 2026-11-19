@@ -204,6 +204,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             })?;
 
+        // A memory configured for stream delivery writes its records INTO the stream
+        // the configuration names, so that stream is resolved against the account's
+        // Kinesis before anything is written: a configuration naming a stream this
+        // account does not hold is refused with the operation's modelled validation
+        // error and no memory is created. Resolved before this service's own store is
+        // locked, because it reads another service's store.
+        if crate::state::stream_delivery_is_unreachable(
+            &*self.engine,
+            input.stream_delivery_resources.as_ref(),
+        ) {
+            return Err(CreateMemoryErrorModeled::ValidationException(
+                crate::state::stream_delivery_inaccessible(),
+            )
+            .into());
+        }
+
         let mut store = state.lock();
 
         // A replayed request carrying the same `clientToken` answers with the

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateHarnessEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateHarnessEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateHarnessEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Points a stored harness endpoint at another version of the harness it fronts, and
+//! records the change in [`crate::state`]: the endpoint reports `UPDATING` at once, serves
+//! the version it served before until the span the clock owes it passes, and reports the
+//! version it was pointed at from then on — which is exactly the difference the model
+//! documents between `liveVersion` and `targetVersion`.
+//!
+//! Each member the request names replaces the stored one; one it omits is "retained when
+//! not specified", as the model documents for both of them. An endpoint whose previous
+//! change is still in flight serves no second change: the request is refused with this
+//! operation's modelled `ConflictException` (409) and nothing is written
+//! ([`crate::state::harness_endpoint_status_conflict`]), so two concurrent updates cannot
+//! leave an endpoint pointing at a version neither of them meant.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +167,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateHarnessEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateHarnessEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateHarnessEndpoint"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateHarnessEndpointErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the harness store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the endpoint that
+        // token already changed, rather than starting a second shift. Decided BEFORE the
+        // status gate below: a retry of the request that started the shift is the same
+        // request, not a competing one.
+        if let Some((harness_id, endpoint_name)) =
+            store.replayed_harness_endpoint_result(Self::NAME, input.client_token.as_deref())
+        {
+            if let Some(harness) = store.harnesses.get(&harness_id) {
+                if let Some(endpoint) = harness.endpoints.get(&endpoint_name) {
+                    return Ok(UpdateHarnessEndpointOutput {
+                        endpoint: endpoint.endpoint(&harness_id, &harness.harness_name, now),
+                    });
+                }
+            }
+        }
+
+        // This route addresses ONE endpoint, by both of the identifiers it is named by, so
+        // the lookup that fails is the endpoint's whichever half of the pair names nothing:
+        // a harness this account does not hold and an endpoint name that harness does not
+        // carry are the same endpoint-level not-found.
+        let endpoint_not_found = || {
+            UpdateHarnessEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::harness_endpoint_not_found(&input.endpoint_name, &input.harness_id),
+            )
+        };
+        let harness = store
+            .harnesses
+            .get_mut(&input.harness_id)
+            .ok_or_else(endpoint_not_found)?;
+        let harness_name = harness.harness_name.clone();
+
+        // `targetVersion` names the harness version the endpoint serves invocations from, so
+        // it has to be a version the harness actually holds; one it does not is as absent as
+        // an unknown harness, which is how every read of this service resolves a version
+        // nothing was published for. Resolved BEFORE the endpoint's own in-flight state is
+        // gated on: what the request REFERENCES is not a question about the endpoint.
+        if !harness.holds_version(input.target_version.as_deref()) {
+            return Err(UpdateHarnessEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::harness_not_found(&input.harness_id),
+            )
+            .into());
+        }
+        let target_version = harness.version;
+        let harness_settles_at = harness.settles_at;
+
+        let endpoint = harness
+            .endpoints
+            .get_mut(&input.endpoint_name)
+            .ok_or_else(endpoint_not_found)?;
+
+        // A change already in flight on this endpoint has not finished, so a second one is
+        // the modelled conflict and nothing is written: the caller waits for the shift it
+        // asked for rather than racing another onto the same name.
+        let status = endpoint.status_at(now).to_string();
+        if status != crate::state::STATUS_READY {
+            return Err(UpdateHarnessEndpointErrorModeled::ConflictException(
+                crate::state::harness_endpoint_status_conflict(&input.endpoint_name, &status),
+            )
+            .into());
+        }
+
+        // The change is ACCEPTED here. A member the request names replaces the stored one; a
+        // member it omits is retained, so a request that names no `targetVersion` leaves the
+        // endpoint pointing where it pointed and starts no shift onto another version.
+        if let Some(description) = input.description {
+            endpoint.description = Some(description);
+        }
+        if input.target_version.is_some() && endpoint.target_version != target_version {
+            // The endpoint reports `UPDATING` and keeps serving the version it served until
+            // the span the clock owes it passes, after which it serves the version it was
+            // pointed at: what it serves until then is what a settled endpoint serves, the
+            // version it points at now.
+            endpoint.live_version = Some(endpoint.target_version);
+            endpoint.target_version = target_version;
+            endpoint.transient_status = crate::state::STATUS_UPDATING.to_string();
+            endpoint.settled_status = crate::state::STATUS_READY.to_string();
+            endpoint.settles_at =
+                harness_settles_at.max(now) + crate::state::HARNESS_ENDPOINT_SETTLE_DELAY;
+        }
+        endpoint.updated_at = now;
+        let output = UpdateHarnessEndpointOutput {
+            endpoint: endpoint.endpoint(&input.harness_id, &harness_name, now),
+        };
+
+        store.remember_harness_endpoint_client_token(
+            Self::NAME,
+            input.client_token,
+            &input.harness_id,
+            &input.endpoint_name,
+        );
+
+        Ok(output)
     }
 }

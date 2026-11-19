@@ -163,17 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `Harness.model` is `@required` on every response while the request's is optional,
-        // and this service has no default model to run a harness with, so a request that
-        // names none is refused with the operation's own modelled error rather than served
-        // with an invented model id.
-        let model = input.model.ok_or_else(|| {
-            CreateHarnessErrorModeled::ValidationException(crate::state::field_validation_failed(
-                crate::state::HARNESS_MODEL_MEMBER,
-                crate::state::HARNESS_MODEL_REQUIRED,
-            ))
-        })?;
-
         // One harness per name, so a repeated name is a conflict, not a second harness that
         // later reads cannot tell apart.
         if let Some(existing) = store.harness_names.get(&input.harness_name) {
@@ -214,7 +203,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             settled_status: crate::state::STATUS_READY.to_string(),
             settles_at: now + crate::state::HARNESS_SETTLE_DELAY,
             execution_role_arn: input.execution_role_arn,
-            model,
+            // Optional on the request: AWS requires only `harnessName` and
+            // `executionRoleArn`, so a harness created without a model holds none and
+            // reports none, rather than being refused for a member the model leaves
+            // optional or served an invented model id.
+            model: input.model,
             // Each of these is `@required` on the response and optional on the request, so
             // a harness configured without them reports the empty list the caller asked
             // for rather than omitting a member the wire requires.

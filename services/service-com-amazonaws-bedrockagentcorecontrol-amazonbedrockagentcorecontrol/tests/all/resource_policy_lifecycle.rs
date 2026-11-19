@@ -508,6 +508,28 @@ async fn a_deleted_resource_carries_no_policy() {
         status, 202,
         "the runtime the policy was attached to is deleted, got {status} ({deleted})"
     );
+    // The delete is ACCEPTED, not yet carried out: the runtime reports `DELETING` until
+    // the span the clock owes it passes, and its policy goes when the runtime does, so
+    // look again for the resource to be GONE rather than waiting a fixed time.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (status, _) = send(
+            &router,
+            "GET",
+            &format!("/runtimes/{runtime_id}/"),
+            REGION,
+            None,
+        )
+        .await;
+        if status == 404 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the deleted runtime never went away, last answer {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     for (case, status_and_answer) in [
         (

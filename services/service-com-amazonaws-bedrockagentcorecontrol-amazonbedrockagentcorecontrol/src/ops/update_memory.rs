@@ -495,6 +495,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // This update reads and writes the stores on the engine `self` holds; `ctx` carries
+        // request metadata this operation needs none of.
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateMemoryErrorModeled::ServiceException(ServiceException {
@@ -502,6 +504,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let now = ::std::time::SystemTime::now();
+
+        // A memory configured for stream delivery writes its records INTO the stream the
+        // configuration names, so that stream is resolved against the account's Kinesis
+        // before anything is written: a configuration naming a stream this account does
+        // not hold is refused with the operation's modelled validation error and the
+        // stored memory is left exactly as it was — the same gate `CreateMemory` applies
+        // to the configuration it stores. Resolved before this service's own store is
+        // locked, because it reads another service's store.
+        if crate::state::stream_delivery_is_unreachable(
+            &*self.engine,
+            input.stream_delivery_resources.as_ref(),
+        ) {
+            return Err(invalid(crate::state::stream_delivery_inaccessible()));
+        }
 
         let requested = input.memory_strategies.unwrap_or_default();
         let to_modify = requested.modify_memory_strategies.unwrap_or_default();

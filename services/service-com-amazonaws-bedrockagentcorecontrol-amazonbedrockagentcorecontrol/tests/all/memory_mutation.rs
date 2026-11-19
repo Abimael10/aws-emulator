@@ -26,6 +26,12 @@ const PAST_SETTLE: Duration = Duration::from_millis(900);
 /// The strategies one memory holds, from `state::MAX_STRATEGIES_PER_MEMORY`.
 const MAX_STRATEGIES_PER_MEMORY: usize = 100;
 
+/// How long a poll loop waits for a clock-owed transition before giving up, and how long it
+/// waits between two looks. Generous: the loop waits for the CONDITION, so it finishes as
+/// soon as the transition is due.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// The metadata keys one memory indexes: `IndexedKeysList` is `length 1..10`
 /// (`smithy_query shape=IndexedKeysList`).
 const MAX_INDEXED_KEYS: usize = 10;
@@ -33,8 +39,65 @@ const MAX_INDEXED_KEYS: usize = 10;
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::default();
-    router.register_service(EmulatedService::new(engine));
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    // The stream-delivery configurations the rows below carry name data streams of this
+    // account, and a memory's configuration is resolved against the Kinesis store of this
+    // same engine before it is written, so Kinesis is mounted beside the control plane —
+    // what the assembled emulator does — and the streams the rows name are created through
+    // its own front door by [`given_stream`].
+    router.register_service(
+        service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(engine),
+    );
     router
+}
+
+/// Read the memory until it reports `ACTIVE` — the transition the clock owes a create or an
+/// update — or fail once the generous deadline passes.
+///
+/// The loop looks for the CONDITION rather than waiting a fixed time, so nothing here
+/// depends on how fast the host runs; the deadline only catches a memory that never settles.
+async fn read_until_active(router: &MultiServiceRouter, case: &str, id: &str) {
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (status, body) = get_memory(router, id).await;
+        if status == 200 && text(&body["memory"], "status") == "ACTIVE" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the memory never reached ACTIVE, last answer {status} ({body})"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Create the data stream `name` through Kinesis's OWN front door (`awsJson1_1`,
+/// `Kinesis_20131202.CreateStream`), so a delivery configuration naming it resolves.
+async fn given_stream(router: &MultiServiceRouter, name: &str) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", "Kinesis_20131202.CreateStream")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/kinesis/aws4_request, \
+                 SignedHeaders=host;x-amz-target, Signature=abc"
+            ),
+        )
+        .body(Bytes::from(
+            json!({"StreamName": name, "ShardCount": 1}).to_string(),
+        ))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "setup: creating the data stream {name:?} must succeed, got {} with {}",
+        response.status().as_u16(),
+        String::from_utf8_lossy(response.body())
+    );
 }
 
 /// A SigV4 `Authorization` header for this service in `region`. It is what the router
@@ -161,10 +224,14 @@ fn strategy_by_name(memory: &Value, name: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// Create one memory per name, then wait the `CREATING` -> `ACTIVE` transition
-/// out ONCE, so the updates that follow address active memories. Answers the
-/// minted `memoryId`s in the order the names were given.
+/// Create one memory per name, then wait for each to report `ACTIVE`, so the updates
+/// that follow address active memories. Answers the minted `memoryId`s in the order the
+/// names were given.
 async fn created_and_settled(router: &MultiServiceRouter, names: &[String]) -> Vec<String> {
+    // The configuration every row carries names these two streams, and a delivery
+    // configuration is resolved against the account's Kinesis before the memory is written.
+    given_stream(router, "created").await;
+    given_stream(router, "updated").await;
     let mut ids = Vec::with_capacity(names.len());
     for name in names {
         let (status, created) = create_memory(router, &configured_memory_body(name)).await;
@@ -174,7 +241,11 @@ async fn created_and_settled(router: &MultiServiceRouter, names: &[String]) -> V
         );
         ids.push(text(&created["memory"], "id"));
     }
-    tokio::time::sleep(PAST_SETTLE).await;
+    // The transition is the clock's, so this looks again for it rather than waiting a fixed
+    // time.
+    for id in &ids {
+        read_until_active(router, "the memories the rows update", id).await;
+    }
     ids
 }
 
@@ -937,6 +1008,9 @@ async fn a_removal_is_reclaimed_on_its_own_deadline_under_later_updates() {
 async fn a_repeated_client_token_replays_the_update() {
     let router = router();
 
+    // The body's delivery configuration names this stream, which has to exist for the
+    // create to be served.
+    given_stream(&router, "created").await;
     let (status, created) =
         create_memory(&router, &configured_memory_body("idempotent")).await;
     assert_eq!(
@@ -944,7 +1018,7 @@ async fn a_repeated_client_token_replays_the_update() {
         "the memory the replay addresses is created, got {status} ({created})"
     );
     let id = text(&created["memory"], "id");
-    tokio::time::sleep(PAST_SETTLE).await;
+    read_until_active(&router, "the memory the replay addresses", &id).await;
 
     let mut body = json!({
         "description": "the first update",

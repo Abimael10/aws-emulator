@@ -33,6 +33,10 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # identity-based policy documents and permissions boundary in force on a principal —
 # what that authorization decision is taken from.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The account's Kinesis data streams: whether the stream a memory's
+# `streamDeliveryResources` names is one this account holds — resolved in-process out of
+# that service's own store on the shared engine (src/state/memory_stream_delivery.rs).
+service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 # Hashes the id-minting seed into an `agentRuntimeId` suffix (src/state.rs).
 sha2 = { workspace = true }
 # Resolves a gateway target's Lambda function against the emulator's own Lambda,

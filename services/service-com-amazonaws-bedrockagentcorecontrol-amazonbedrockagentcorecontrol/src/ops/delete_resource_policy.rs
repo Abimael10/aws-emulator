@@ -148,6 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this delete looks for it, and the policy it carried goes with it: both
         // removals were owed at this instant whether or not anybody called.
         store.expire_deleted_gateways_and_targets(now);
+        store.expire_deleted_agent_runtimes(now);
         store.drop_orphaned_resource_policies();
 
         // A policy is addressed through the resource that carries it, and which
