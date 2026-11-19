@@ -114,6 +114,11 @@
 //! shape of their own, and the read refuses an account that never set THEM with its own
 //! modelled error class (see [`v1_logging`]).
 //!
+//! Beside those options it holds the account's V2 LOGGING LEVELS — a map and not one
+//! record, because `SetV2LoggingLevel` and `ListV2LoggingLevels` each name a LOG TARGET:
+//! one level per target, keyed by the `targetType` + `targetName` pair that identifies
+//! one (see [`v2_logging_levels`]).
+//!
 //! It also holds the account's DEVICE DEFENDER AUDIT CONFIGURATION — one record, not a
 //! map, because `DescribeAccountAuditConfiguration` and
 //! `UpdateAccountAuditConfiguration` name no resource: there is one audit configuration
@@ -987,6 +992,17 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// reader refuses with the modelled `NotConfiguredException` instead of reporting
     /// options the account never configured.
     pub v2_logging_options: Option<V2LoggingOptions>,
+    /// The account's V2 LOGGING LEVELS — the per-target overrides `SetV2LoggingLevel`
+    /// records and `ListV2LoggingLevels` reports, keyed by the whole log target
+    /// (`targetType` + `targetName`) because that pair is what identifies one.
+    ///
+    /// A map and not one record, unlike
+    /// [`ComAmazonawsIotAwsiotserviceState::v2_logging_options`], because each of these
+    /// operations names a log target: an account holds one level per target it has set
+    /// one for. A caller grows this store, so it is bounded:
+    /// [`MAX_V2_LOGGING_LEVELS`] is the ceiling a set refuses past (see
+    /// [`v2_logging_levels`]).
+    pub v2_logging_levels: BTreeMap<LoggedTarget, String>,
     /// The account's v1 LOGGING OPTIONS — one record, not a map, because neither
     /// `SetLoggingOptions` nor `GetLoggingOptions` names a resource: there is one set of
     /// v1 logging options per account.
@@ -3318,6 +3334,15 @@ pub use v2_logging::{
 // `crate::state::<name>`.
 pub mod v1_logging;
 pub use v1_logging::{missing_logging_options_message, LoggingOptions};
+
+// What the account's V2 LOGGING LEVELS are — the per-target records `SetV2LoggingLevel`
+// writes and `ListV2LoggingLevels` reports — lives in `state/v2_logging_levels.rs`,
+// beside the account-wide options they override. Its names are re-exported here so a
+// handler reaches them as `crate::state::<name>`.
+pub mod v2_logging_levels;
+pub use v2_logging_levels::{
+    logged_target_rows, LoggedTarget, LOG_TARGET_TYPE_DEFAULT, MAX_V2_LOGGING_LEVELS,
+};
 
 // What the account's DEVICE DEFENDER AUDIT CONFIGURATION is — the checks it holds a
 // setting for, where its notifications go, and what every reader of it reports — lives

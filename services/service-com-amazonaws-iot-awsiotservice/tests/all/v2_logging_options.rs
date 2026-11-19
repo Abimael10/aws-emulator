@@ -29,6 +29,15 @@
 //! * an event type named twice is configured once, by the LAST configuration given
 //!   for it.
 
+/// The account's per-target V2 LOGGING LEVELS — `SetV2LoggingLevel`,
+/// `ListV2LoggingLevels` and `DeleteV2LoggingLevel` over the levels that OVERRIDE the
+/// options this suite covers, which is why it is a child of this suite rather than a
+/// second suite beside it. The `#[path]` is what keeps it one: this crate's
+/// `tests/all.rs` declares the suites directly under `tests/all/`, and a module of a
+/// `#[path]`-declared file resolves next to that file unless it says otherwise.
+#[path = "v2_logging_options/logging_levels.rs"]
+mod logging_levels;
+
 use std::sync::Arc;
 
 use bytes::Bytes;

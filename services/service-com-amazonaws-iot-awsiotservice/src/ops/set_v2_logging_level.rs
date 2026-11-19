@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetV2LoggingLevel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetV2LoggingLevel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetV2LoggingLevel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the logging level the request sets for ONE log target in this service's
+//! state ([`crate::state::LoggedTarget`]), where `ListV2LoggingLevels` reports it. The
+//! level is an override of the account's V2 logging options, so an account that has no
+//! options holds nothing to override and the set is refused with the modelled
+//! `NotConfiguredException`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +161,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetV2LoggingLevel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetV2LoggingLevelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetV2LoggingLevel"))
+        // The level is set for the target the request names, so no request metadata
+        // selects what is written.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SetV2LoggingLevelErrorModeled::InternalException(InternalException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // A log target is the PAIR `targetType` + `targetName`, and the name is "The
+        // name of the resource for which you are configuring logging"
+        // (`smithy_query(query="operation",operation="DeleteV2LoggingLevel")`, which
+        // declares it `@required`): every target type but the account's own DEFAULT one
+        // names a resource, so a request that sets a level for a named type without
+        // naming one identifies no target and is refused rather than recording a target
+        // no later call can name.
+        let target_type = input.log_target.target_type;
+        let target_name = input.log_target.target_name;
+        if target_type != crate::state::LOG_TARGET_TYPE_DEFAULT
+            && target_name.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(SetV2LoggingLevelErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "targetName is required for a log target of type {target_type}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // A per-target level OVERRIDES the account's V2 logging options, so an account
+        // that has never set them holds nothing to override: that is the modelled
+        // `NotConfiguredException` ("The resource is not configured", HTTP 404), in the
+        // same words the reader of those options refuses it with.
+        if store.v2_logging_options.is_none() {
+            return Err(SetV2LoggingLevelErrorModeled::NotConfiguredException(
+                NotConfiguredException {
+                    message: Some(crate::state::missing_v2_logging_options_message()),
+                },
+            )
+            .into());
+        }
+
+        let target = crate::state::LoggedTarget::of(LogTarget {
+            target_type,
+            target_name,
+        });
+
+        // The store is one a CALLER grows, a target at a time, so the number of targets
+        // an account can hold a level for is bounded. The ceiling is read only for a
+        // target the account holds NO level for: setting the level of a target it
+        // already holds replaces that record and adds none. `LimitExceededException`
+        // ("A limit has been exceeded", HTTP 410) is the modelled refusal for exactly
+        // this, never a 200 that records nothing.
+        if !store.v2_logging_levels.contains_key(&target)
+            && store.v2_logging_levels.len() >= crate::state::MAX_V2_LOGGING_LEVELS
+        {
+            return Err(SetV2LoggingLevelErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the maximum of {} logging levels is already reached",
+                        crate::state::MAX_V2_LOGGING_LEVELS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // One target holds ONE level: a set for a target already recorded carries the
+        // level that target now has, so the record is replaced and not added beside the
+        // old one. The value is the `logLevel` the request names — `@required`, and the
+        // boundary validator refuses a value outside the `LogLevel` catalog before this
+        // handler runs.
+        store.v2_logging_levels.insert(target, input.log_level);
+
+        // `SetV2LoggingLevel` targets `smithy.api#Unit`, so a successful set is an empty
+        // 200 and what it persisted is read back through `ListV2LoggingLevels`.
+        Ok(SetV2LoggingLevelOutput)
     }
 }

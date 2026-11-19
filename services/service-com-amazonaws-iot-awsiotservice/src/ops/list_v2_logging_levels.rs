@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListV2LoggingLevels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListV2LoggingLevels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListV2LoggingLevels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the per-target V2 logging levels this service HOLDS for the account — what
+//! `SetV2LoggingLevel` persisted ([`crate::state::LoggedTarget`]) — one page at a time,
+//! narrowed to the target type the request names when it names one.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +71,8 @@
 //! * `InvalidRequestException` (HTTP 400) — The request is not valid.
 //! * `NotConfiguredException` (HTTP 404) — The resource is not configured.
 //! * `ServiceUnavailableException` (HTTP 503) — The service is temporarily unavailable.
+
+use std::collections::BTreeMap;
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -151,18 +148,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListV2LoggingLevels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListV2LoggingLevelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListV2LoggingLevels"))
+        // `ctx` carries request metadata only; this listing needs none of it.
+        let _ = ctx;
+
+        // The continuation token is resolved BEFORE the store is reached: a request whose
+        // `nextToken` is not one THIS listing issued is refused whatever the store holds.
+        let scope = listing_scope(input.target_type.as_deref());
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token, &scope)?),
+            None => None,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListV2LoggingLevelsErrorModeled::InternalException(InternalException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // `maxResults` is modelled `range 1..250` and documents no default
+        // (`smithy_query(query="operation",operation="ListV2LoggingLevels")`), so a
+        // request naming none gets the largest page the model admits. The clamp is
+        // defensive rather than load-bearing: a value outside the range is refused
+        // before this handler runs.
+        let page_size = input
+            .max_results
+            .map_or(MAX_PAGE_SIZE as usize, |max| max.clamp(1, MAX_PAGE_SIZE) as usize);
+
+        // A pure read: the rows are built from a borrow of the store and nothing is
+        // written, so a later caller sees what this one saw.
+        let store = state.lock();
+
+        // The levels are overrides of the account's V2 logging options, so an account
+        // that has never set them has no logging configured at all: that is the modelled
+        // `NotConfiguredException` ("The resource is not configured", HTTP 404), in the
+        // same words the reader of those options refuses it with, and never an empty
+        // page that would read as "configured, with no override".
+        if store.v2_logging_options.is_none() {
+            return Err(ListV2LoggingLevelsErrorModeled::NotConfiguredException(
+                NotConfiguredException {
+                    message: Some(crate::state::missing_v2_logging_options_message()),
+                },
+            )
+            .into());
+        }
+
+        let rows =
+            crate::state::logged_target_rows(&store.v2_logging_levels, input.target_type.as_deref());
+
+        // One page of the listing, through the same paging every listing of this service
+        // pages its rows with: the marker names a POSITION in the listing's total order,
+        // so a page resumes where the last one ended.
+        let (positions, next_token) = crate::state::page_of(
+            rows.iter().map(|(position, _)| position.clone()).collect(),
+            &scope,
+            resume_after.as_deref(),
+            page_size,
+        );
+        let mut by_position: BTreeMap<String, LogTargetConfiguration> = rows.into_iter().collect();
+        let configurations: Vec<LogTargetConfiguration> = positions
+            .iter()
+            .filter_map(|position| by_position.remove(position))
+            .collect();
+
+        Ok(ListV2LoggingLevelsOutput {
+            // `LogTargetConfigurations` carries no length constraint, so an account that
+            // has set no level answers with an EMPTY list rather than an absent member:
+            // "no target has a level" is an answer, not a missing one.
+            log_target_configurations: Some(configurations),
+            next_token,
+        })
     }
+}
+
+/// `SkyfallMaxResults`'s modelled maximum (`range 1..250`), which is also the most
+/// configurations one page may carry.
+const MAX_PAGE_SIZE: i32 = 250;
+
+/// The LISTING a continuation token belongs to: the target type it walks, so a token
+/// issued for one type's listing cannot resume another's.
+fn listing_scope(target_type: Option<&str>) -> String {
+    format!("v2LoggingLevels/{}", target_type.unwrap_or("*"))
+}
+
+/// The position a `nextToken` resumes after, or `InvalidRequestException` (HTTP 400,
+/// "The request is not valid") when the token is not one this listing issued for THIS
+/// target type.
+///
+/// The decoding is the one every listing of this service shares
+/// ([`crate::state::decode_page_marker`]) and every step of it is fallible on purpose:
+/// the token is caller-supplied, so nothing read out of it may panic the handler.
+fn decode_next_token(token: &str, scope: &str) -> Result<String, ListV2LoggingLevelsError> {
+    crate::state::decode_page_marker(token, scope).ok_or_else(|| {
+        ListV2LoggingLevelsErrorModeled::InvalidRequestException(InvalidRequestException {
+            message: Some("nextToken is not a continuation token of this listing".to_string()),
+        })
+        .into()
+    })
 }
