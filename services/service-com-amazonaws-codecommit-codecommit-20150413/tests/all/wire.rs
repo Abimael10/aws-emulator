@@ -148,15 +148,33 @@ pub(crate) async fn call_as(
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
+    call_as_in_region(router, access_key_id, REGION, operation, body).await
+}
+
+/// [`call_as`], addressed to `region`'s endpoint of this service.
+///
+/// Which Region a handler serves a request for is the Region of the SigV4
+/// credential scope it was signed under, so a suite whose subject is a regional
+/// value — the Region segment of an ARN the service reports, the Region a key is
+/// held at — signs for the Region it means rather than building a second request
+/// of its own. [`call_as`] is this bound to [`REGION`], so there is still exactly
+/// one request builder.
+pub(crate) async fn call_as_in_region(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
-        .uri("https://codecommit.us-west-2.amazonaws.com/")
+        .uri(format!("https://codecommit.{region}.amazonaws.com/"))
         .header("content-type", "application/x-amz-json-1.1")
         .header("x-amz-target", format!("CodeCommit_20150413.{operation}"))
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/codecommit/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/codecommit/aws4_request, \
                  SignedHeaders=host;x-amz-target, Signature=0000"
             ),
         )
@@ -186,10 +204,22 @@ pub(crate) async fn ok_as(
     operation: &str,
     body: &Value,
 ) -> Value {
-    let (status, payload) = call_as(router, access_key_id, operation, body).await;
+    ok_as_in_region(router, access_key_id, REGION, operation, body).await
+}
+
+/// [`ok_as`], addressed to `region`'s endpoint ([`call_as_in_region`]).
+pub(crate) async fn ok_as_in_region(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
+    let (status, payload) = call_as_in_region(router, access_key_id, region, operation, body).await;
     assert_eq!(
         status, 200,
-        "operation {operation} as {access_key_id}: expected 200, got {status} with {payload}"
+        "operation {operation} as {access_key_id} in {region}: expected 200, got {status} with \
+         {payload}"
     );
     payload
 }

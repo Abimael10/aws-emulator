@@ -24,7 +24,16 @@
 //! both shapes KMS mints an id in, a key reached through its own alias, a request
 //! naming no key, and selectors KMS resolves nothing for — on the create path and
 //! on the rotation path alike.
+//!
+//! The READ path is its own subject here, because a client identifying the key an
+//! existing repository is protected by reads it from `GetRepository`: what a read
+//! reports is a key of the repository's own account and Region, in every Region a
+//! repository can be created in, each field of it recoverable by a client that
+//! parses the value; two repositories on two keys are told apart by it; and reading
+//! neither changes it nor gives KMS another key, however often and through whichever
+//! face it is asked.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -64,8 +73,19 @@ fn emulator() -> MultiServiceRouter {
 const KMS_CALLER: &str = "AKIDKMSSETUP";
 
 /// One KMS call, the way an SDK sends it: awsJson1_1 under KMS's own target prefix
-/// and signing name.
+/// and signing name, at the endpoint of the Region every suite signs for.
 async fn kms(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+    kms_in(router, REGION, operation, body).await
+}
+
+/// [`kms`], at `region`'s KMS endpoint: a KMS key is a regional resource, so which
+/// key an identifier names is asked of the Region that holds it.
+async fn kms_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -74,7 +94,7 @@ async fn kms(router: &MultiServiceRouter, operation: &str, body: &Value) -> Valu
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential={KMS_CALLER}/20260101/{REGION}/kms/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={KMS_CALLER}/20260101/{region}/kms/aws4_request, \
                  SignedHeaders=host;x-amz-target, Signature=0000"
             ),
         )
@@ -91,7 +111,7 @@ async fn kms(router: &MultiServiceRouter, operation: &str, body: &Value) -> Valu
     };
     assert_eq!(
         status, 200,
-        "KMS {operation}: expected 200, got {status} with {payload}"
+        "KMS {operation} in {region}: expected 200, got {status} with {payload}"
     );
     payload
 }
@@ -331,4 +351,231 @@ async fn every_selector_form_is_reported_as_the_key_it_names() {
             "case {selector:?}: every spelling of one key must report that key, got {reported:?}"
         );
     }
+}
+
+/// The fields a KMS key ARN carries — `arn:<partition>:kms:<region>:<account>:key/<key id>`
+/// — as the partition, the Region, the account and the key id, and `None` for a
+/// value that names no key. The read a client makes of what `kmsKeyId` reports:
+/// joining a repository to `kms:DescribeKey` or `kms:ListAliases` output by key,
+/// and recovering the key's account, Region and key id from the value itself.
+fn key_arn_fields(reported: &str) -> Option<(&str, &str, &str, &str)> {
+    let [prefix, partition, vendor, region, account, resource] =
+        reported.splitn(6, ':').collect::<Vec<_>>()[..]
+    else {
+        return None;
+    };
+    let key_id = resource.strip_prefix("key/")?;
+    (prefix == "arn" && vendor == "kms").then_some((partition, region, account, key_id))
+}
+
+/// The `kmsKeyId` of a `CreateRepository` naming no key of its own, signed for
+/// `region`'s endpoint — which is the Region the repository it creates lives in.
+async fn created_in(router: &MultiServiceRouter, region: &str, name: &str) -> String {
+    let created = crate::wire::ok_as_in_region(
+        router,
+        crate::wire::DEFAULT_ACCESS_KEY_ID,
+        region,
+        "CreateRepository",
+        &json!({ "repositoryName": name }),
+    )
+    .await;
+    string_at(&created, "/repositoryMetadata/kmsKeyId")
+}
+
+/// The `repositoryMetadata` a `GetRepository` at `region`'s endpoint reports —
+/// [`crate::harness::metadata_of`] for a suite that names the Region, over the same
+/// one request builder.
+async fn metadata_in(router: &MultiServiceRouter, region: &str, name: &str) -> Value {
+    let got = crate::wire::ok_as_in_region(
+        router,
+        crate::wire::DEFAULT_ACCESS_KEY_ID,
+        region,
+        "GetRepository",
+        &json!({ "repositoryName": name }),
+    )
+    .await;
+    got.get("repositoryMetadata")
+        .unwrap_or_else(|| panic!("no repositoryMetadata for {name:?} in {got}"))
+        .clone()
+}
+
+/// The key ARNs KMS holds at `region`'s endpoint, read through `kms:ListKeys` —
+/// the keys an audit that joins repositories to KMS by key would have to match.
+async fn kms_key_arns(router: &MultiServiceRouter, region: &str) -> BTreeSet<String> {
+    let listed = kms_in(router, region, "ListKeys", &json!({})).await;
+    listed
+        .get("Keys")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("no Keys in {listed}"))
+        .iter()
+        .map(|entry| string_at(entry, "/KeyArn"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_read_reports_a_key_of_the_repositorys_own_account_and_region() {
+    let router = emulator();
+
+    // Each row is the Region a repository is created in, which a request names by
+    // the credential scope it is signed under: a KMS key is a regional resource, so
+    // the managed key a repository created without a key of its own is encrypted
+    // under is a key of that repository's own Region.
+    let mut per_region: BTreeMap<&str, String> = BTreeMap::new();
+    for region in [REGION, "eu-west-1", "ap-southeast-2"] {
+        let name = format!("regional-{region}");
+        let reported = created_in(&router, region, &name).await;
+
+        // The read path reports the stored key, which is the subject here: a client
+        // identifying the key an EXISTING repository is protected by reads it from
+        // `GetRepository`.
+        let read_back = metadata_in(&router, region, &name).await;
+        assert_eq!(
+            read_back.get("kmsKeyId").and_then(Value::as_str),
+            Some(reported.as_str()),
+            "case {region:?}: GetRepository must report the repository's stored key, got \
+             {read_back}"
+        );
+
+        // And what it reports is a KEY, in the account and Region of the repository
+        // itself — so every field a client parses out of it is there.
+        let Some((partition, key_region, key_account, key_id)) = key_arn_fields(&reported) else {
+            panic!("case {region:?}: kmsKeyId must name a KMS key, got {reported:?}");
+        };
+        assert_eq!(
+            partition, "aws",
+            "case {region:?}: the key must be named in this partition, got {reported:?}"
+        );
+        assert_eq!(
+            key_region, region,
+            "case {region:?}: the key must be held in the repository's own Region, got {reported:?}"
+        );
+        assert_eq!(
+            key_account,
+            account(),
+            "case {region:?}: the key must be named in the repository's own account, got \
+             {reported:?}"
+        );
+        assert!(
+            is_uuid(key_id),
+            "case {region:?}: the key id must be an id KMS mints, got {reported:?}"
+        );
+
+        // The key is KMS's own rather than a value this service made up: that
+        // Region's KMS endpoint answers the same key for this service's predefined
+        // alias, as a key KMS itself manages.
+        let described = kms_in(
+            &router,
+            region,
+            "DescribeKey",
+            &json!({ "KeyId": DEFAULT_ENCRYPTION_KEY_ALIAS }),
+        )
+        .await;
+        assert_eq!(
+            string_at(&described, "/KeyMetadata/Arn"),
+            reported,
+            "case {region:?}: the repository's key must be the key KMS holds for \
+             {DEFAULT_ENCRYPTION_KEY_ALIAS} in that Region, got {described}"
+        );
+        assert_eq!(
+            described
+                .pointer("/KeyMetadata/KeyManager")
+                .and_then(Value::as_str),
+            Some("AWS"),
+            "case {region:?}: the key behind a predefined alias must be an Amazon Web Services \
+             managed key, got {described}"
+        );
+        per_region.insert(region, reported);
+    }
+
+    // Every Region's managed key is a key of its own, so two repositories in two
+    // Regions are not reported as encrypted under one key.
+    let distinct: BTreeSet<&String> = per_region.values().collect();
+    assert_eq!(
+        distinct.len(),
+        per_region.len(),
+        "each Region's managed key must be a key of that Region, got {per_region:?}"
+    );
+}
+
+#[tokio::test]
+async fn reads_report_one_stable_key_per_repository_and_mint_none() {
+    let router = emulator();
+    let (customer_id, customer_arn) = given_key(&router, false).await;
+
+    // Two repositories on two different keys: the managed key of this service, and
+    // a customer-managed key named by its key id.
+    let managed = created_with(&router, "read-managed", None).await;
+    let customer = created_with(&router, "read-customer", Some(&customer_id)).await;
+    assert_eq!(
+        customer, customer_arn,
+        "the repository named by a key id must report that key, got {customer:?}"
+    );
+    assert_ne!(
+        managed.as_str(), DEFAULT_ENCRYPTION_KEY_ALIAS,
+        "a repository created with no key must report the key the alias names, not the alias"
+    );
+    assert_ne!(
+        managed, customer,
+        "two repositories on different keys must be told apart by what each reports, got \
+         {managed:?} and {customer:?}"
+    );
+
+    // Every key reported is a key KMS holds, which is what makes the value joinable
+    // to KMS's own output at all.
+    let before = kms_key_arns(&router, REGION).await;
+    for (name, reported) in [("read-managed", &managed), ("read-customer", &customer)] {
+        assert!(
+            before.contains(reported),
+            "case {name:?}: the key reported must be one KMS holds, got {reported:?} against \
+             {before:?}"
+        );
+    }
+
+    // A read reports the same key however often it is asked, through either face,
+    // and mints nothing: the keys KMS holds after the reads are the keys it held
+    // before them.
+    for round in 0..3 {
+        for (name, expected) in [("read-managed", &managed), ("read-customer", &customer)] {
+            let read_back = metadata_of(&router, name).await;
+            assert_eq!(
+                read_back.get("kmsKeyId").and_then(Value::as_str),
+                Some(expected.as_str()),
+                "case {name:?} round {round}: every read must report the repository's own key, \
+                 got {read_back}"
+            );
+            let batch = ok(
+                &router,
+                "BatchGetRepositories",
+                &json!({ "repositoryNames": [name] }),
+            )
+            .await;
+            assert_eq!(
+                batch
+                    .pointer("/repositories/0/kmsKeyId")
+                    .and_then(Value::as_str),
+                Some(expected.as_str()),
+                "case {name:?} round {round}: the batch read must report the same key, got {batch}"
+            );
+        }
+    }
+    assert_eq!(
+        kms_key_arns(&router, REGION).await,
+        before,
+        "reading a repository must mint no KMS key"
+    );
+
+    // The key belongs to the repository rather than to the name it is addressed by,
+    // so a rename carries it over untouched.
+    ok(
+        &router,
+        "UpdateRepositoryName",
+        &json!({ "oldName": "read-managed", "newName": "read-renamed" }),
+    )
+    .await;
+    let renamed = metadata_of(&router, "read-renamed").await;
+    assert_eq!(
+        renamed.get("kmsKeyId").and_then(Value::as_str),
+        Some(managed.as_str()),
+        "a renamed repository must report the key it was created under, got {renamed}"
+    );
 }
