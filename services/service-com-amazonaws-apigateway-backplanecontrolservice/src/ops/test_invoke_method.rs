@@ -134,6 +134,7 @@ use crate::service::invoke::{
 };
 use crate::service::invoke::lambda_proxy::ProxyInputs;
 use crate::service::invoke::simulated_request;
+use crate::service::invoke::trace_context::{reported_header, TRACE_HEADER};
 use crate::service::mapping_template::TemplateInputs;
 
 /// The request this operation's execution log is a log of. A simulated invocation never
@@ -363,6 +364,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let content_type = headers.value(CONTENT_TYPE);
         let accepted = headers.value(ACCEPT);
+        // The trace context the simulated request named, which is the chain the answer's own
+        // tracing header reports ([`crate::service::invoke::trace_context::reported_header`]).
+        let supplied_trace = headers.value(TRACE_HEADER);
         log.line(format!("HTTP Method: {verb}, Resource Path: {resource_path}"));
         let (path, query) = simulated_request::split_query(input.path_with_query_string.as_deref());
         if let Some(path) = path {
@@ -516,17 +520,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 &call,
                                 &performed.answer,
                             )
-                            .map(|mapped| (mapped, performed.configuration_error))
+                            .map(|mapped| {
+                                (
+                                    mapped,
+                                    performed.configuration_error,
+                                    performed.exchanged_sizes(),
+                                )
+                            })
                         })
                         .map_err(Refused::Integration)
                 }
                 Err(unserved) => Err(Refused::Integration(unserved)),
             },
         };
-        let (status, body, headers) = match performed {
-            Ok((served, configuration_error)) => {
+        let (status, body, mut headers) = match performed {
+            Ok((served, configuration_error, exchanged)) => {
                 let mut headers = served.headers;
                 headers.insert(CONTENT_TYPE_HEADER.to_string(), vec![served.content_type]);
+                // The INTEGRATION REQUEST as the integration's own transformation made it,
+                // where the call crossed to a backend at all: the step between the method
+                // request and the backend's answer, which the stage's own execution log
+                // records at this very point ([`crate::service::invoke::stage_logs`]). The
+                // SIZE, not the bytes, for the reason the method request's own line gives.
+                if let Some((sent, _)) = exchanged {
+                    log.line(format!(
+                        "Endpoint request body after transformations: {sent} byte(s)"
+                    ));
+                }
                 // A backend answer API Gateway could not use is a configuration error of the
                 // integration, in the same sentence the stage's own execution log states it
                 // in ([`crate::service::invoke::stage_logs`]): the call WAS performed, so
@@ -536,6 +556,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "Execution failed due to configuration error: {reason}"
                     )),
                     None => log.line("Successfully completed execution".to_string()),
+                }
+                // And the BACKEND's own answer as it arrived, before this api's integration
+                // responses mapped it — the other half of the integration's phases, logged
+                // where the stage logs it.
+                if let Some((_, received)) = exchanged {
+                    log.line(format!(
+                        "Endpoint response body before transformations: {received} byte(s)"
+                    ));
                 }
                 (served.status, served.body, headers)
             }
@@ -578,6 +606,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (rendered.status, rendered.body, headers)
             }
         };
+        // The tracing header API Gateway attaches to every answer it serves: the trace
+        // context of THIS call — the chain it belongs to, the span of its own work and the
+        // decision in force — which is how a client correlates the answer it holds with the
+        // records of the work downstream of it. A SIMULATED call reaches no stage, so it
+        // reaches none that records a trace of its own: the decision is the caller's where
+        // the simulated request took one, and "not recorded" where it did not
+        // ([`reported_header`]).
+        headers.insert(
+            TRACE_HEADER.to_string(),
+            vec![reported_header(
+                supplied_trace.as_deref(),
+                false,
+                ::std::time::SystemTime::now(),
+            )],
+        );
         // The response headers with their VALUES, where the request-side line above logs
         // names only: a response header is rendered from the API's own records (a static
         // mapping a control-plane call stored), so no caller credential travels in one.

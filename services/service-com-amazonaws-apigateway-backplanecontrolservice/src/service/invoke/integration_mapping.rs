@@ -263,6 +263,20 @@ pub struct Performed {
 }
 
 impl Performed {
+    /// How many BYTES this call exchanged with the integration's backend: the integration
+    /// request as it was sent, and the backend's answer as it arrived. `None` for an
+    /// integration performed from the api's own records, which reaches no backend at all.
+    ///
+    /// The SIZES, not the payloads: a simulated invocation reports the integration request
+    /// and response phases of its execution log by their size, having no `dataTrace` setting
+    /// of a stage to gate the bytes themselves — the same line a stage writes with data
+    /// tracing off ([`super::stage_logs`]).
+    pub fn exchanged_sizes(&self) -> Option<(usize, usize)> {
+        self.exchanged
+            .as_ref()
+            .map(|exchanged| exchanged.sizes())
+    }
+
     /// An answer that is no configuration error and crossed no backend, which is what an
     /// integration performed from the api's own records produces ([`perform_integration`]).
     fn of(answer: IntegrationAnswer) -> Self {

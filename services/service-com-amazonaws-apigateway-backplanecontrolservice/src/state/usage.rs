@@ -412,8 +412,11 @@ pub const INVALID_USAGE_END_DATE: &str = "Invalid end date specified";
 
 /// The `BadRequestException` message for an interval whose end precedes its start: the
 /// days it covers are none at all, so there is no usage data it could report.
-pub const INVALID_USAGE_INTERVAL: &str =
-    "Invalid usage interval specified. The start date must not follow the end date";
+///
+/// WHOLLY FIXED text, as the recorded refusal of an inverted interval words it: it states
+/// the condition — the end of the interval must come after its start — and quotes neither
+/// date back.
+pub const INVALID_USAGE_INTERVAL: &str = "Usage end date must be after start date";
 
 /// The `BadRequestException` message for an interval wider than the window a report may
 /// cover; see [`MAX_USAGE_INTERVAL_DAYS`] for what bounds it.

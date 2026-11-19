@@ -148,7 +148,12 @@ fn assert_same_answer(case: &str, simulated: &Simulated, answered: &Invoked) {
         answered.body,
         simulated.simulated_body()
     );
-    let reported = simulated.headers();
+    // Every header the SIMULATION reports is the one the wire carried for it — except the
+    // tracing header, which names the CALL rather than the api's records: each call belongs
+    // to a chain of its own, so the two halves cannot report one value there. That the
+    // simulation reports it at all is
+    // `test_invoke_method::a_simulated_invocation_reports_the_tracing_header_of_its_own_call`.
+    let reported = simulated.mapped_headers();
     let reported = reported
         .as_object()
         .unwrap_or_else(|| panic!("case {case:?}: expected a headers object, got {reported:?}"));

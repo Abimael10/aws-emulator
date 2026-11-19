@@ -43,7 +43,39 @@ use super::lambda_proxy::ProxyInputs;
 
 /// The header a tracing header travels on, as X-Ray spells it — the spelling the next hop
 /// reads it back off ([`::service_common::xray_trace`]).
-pub(super) const TRACE_HEADER: &str = "X-Amzn-Trace-Id";
+///
+/// `pub(crate)` because the ANSWER reports it too: `TestInvokeMethod` reports the headers of
+/// the response it simulated, and this header is one of them ([`reported_header`]).
+pub(crate) const TRACE_HEADER: &str = "X-Amzn-Trace-Id";
+
+/// The tracing header API Gateway REPORTS on the answer it serves for a call whose own
+/// headers are `supplied`, served at `at`.
+///
+/// A client reads the trace of the call it just made off the answer, so what is named there is
+/// the TRACE CONTEXT OF THAT CALL — the very context the endpoint propagates onto the call it
+/// makes onward ([`propagated`]), which is why the two are built the same way:
+///
+/// * the CHAIN is the one the caller named, where it named one in X-Ray's own form, and one
+///   started for this call where it did not;
+/// * the PARENT is the span of this call's own work, which is the span the work the call
+///   reached hangs from;
+/// * the DECISION is the caller's where it took one, and otherwise this endpoint's —
+///   `recorded`, which for a SIMULATED call (one that reaches no stage, and so no stage that
+///   is tracing) is never.
+pub(crate) fn reported_header(supplied: Option<&str>, recorded: bool, at: SystemTime) -> String {
+    let root = supplied
+        .and_then(::service_common::xray_trace::continued_root)
+        .map(str::to_string)
+        .unwrap_or_else(|| ::service_common::xray_trace::mint_trace_id(at));
+    let sampled = supplied
+        .and_then(::service_common::xray_trace::sampling_decision)
+        .unwrap_or(recorded);
+    ::service_common::xray_trace::stamped_tracing_header(
+        &root,
+        &::service_common::xray_trace::mint_span_id(),
+        sampled,
+    )
+}
 
 /// The `origin` a segment a REST API stage recorded carries: the resource type of the stage,
 /// as X-Ray names an API Gateway stage.

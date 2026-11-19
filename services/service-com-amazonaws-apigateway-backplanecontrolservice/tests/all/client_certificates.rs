@@ -21,6 +21,9 @@
 //! * `description` is the one member a patch changes; a pointer naming a member the service
 //!   itself assigns is the modelled `BadRequestException` (400) and leaves the record as it
 //!   was;
+//! * `tags` — "the collection of tags" of the resource — is reported by EVERY rendering of a
+//!   `ClientCertificate`, as an empty object for a certificate that carries none, so member
+//!   presence is never decided by emptiness;
 //! * a `clientCertificateId` no stored certificate answers to is the modelled
 //!   `NotFoundException` (404) on every operation that takes one, and a delete a stage's
 //!   reference still stands in the way of is the modelled `BadRequestException` (400);
@@ -45,7 +48,7 @@ use crate::rest_api_lifecycle::{
     assert_failure, create_api, page_items, string_member, Answer, Gateway,
 };
 use crate::stage_lifecycle::create_deployed_stage;
-use crate::tag_reads_by_arn::{apigateway_arn, get_tags};
+use crate::tag_reads_by_arn::{apigateway_arn, encode_label, get_tags};
 
 /// `GenerateClientCertificate` with `request`, answering the whole response.
 async fn generate(gateway: &Gateway, request: Value) -> Answer {
@@ -99,6 +102,33 @@ async fn patch_certificate(
         operations,
     )
     .await
+}
+
+/// `TagResource` for `arn` with `tags`, addressed the way the sibling tagging suites address
+/// a resource: the ARN inside ONE path segment of `/tags/{resourceArn}`.
+async fn tag_certificate(gateway: &Gateway, arn: &str, tags: Value) -> Answer {
+    gateway
+        .call(
+            "PUT",
+            &format!("/tags/{}", encode_label(arn)),
+            Some(json!({ "tags": tags })),
+        )
+        .await
+}
+
+/// `UntagResource` for `arn`, naming `keys` in the `tagKeys` query.
+async fn untag_certificate(gateway: &Gateway, arn: &str, keys: &[&str]) -> Answer {
+    let query: Vec<String> = keys
+        .iter()
+        .map(|key| format!("tagKeys={}", encode_label(key)))
+        .collect();
+    gateway
+        .call(
+            "DELETE",
+            &format!("/tags/{}?{}", encode_label(arn), query.join("&")),
+            None,
+        )
+        .await
 }
 
 /// A client certificate generated with `request`, asserting the modelled 201 and answering
@@ -260,21 +290,31 @@ async fn a_generated_client_certificate_is_persisted_and_read_back_member_for_me
         materials.push(material);
 
         // Every member the request set is reported as it set it, and the members it did
-        // not set are absent — `description` and `tags` among them. An explicitly EMPTY
-        // description is the one value that is not echoed: API Gateway normalizes a
-        // description of no characters to an absent member, so the record reports none.
-        for member in ["description", "tags"] {
-            let expected = if request[member] == json!("") {
-                Value::Null
-            } else {
-                request[member].clone()
-            };
-            assert_eq!(
-                created[member], expected,
-                "case {case}: expected {member} {expected:?}, got {:?}",
-                created[member]
-            );
-        }
+        // not set are absent — `description` among them. An explicitly EMPTY description is
+        // the one value that is not echoed: API Gateway normalizes a description of no
+        // characters to an absent member, so the record reports none. `tags` is the one
+        // member that is reported whether or not the request set it: it is the resource's
+        // own collection of tags, so an untagged certificate reports an empty map (see
+        // [`the_tag_collection_of_a_client_certificate_is_always_reported`]).
+        let expected_description = if request["description"] == json!("") {
+            Value::Null
+        } else {
+            request["description"].clone()
+        };
+        assert_eq!(
+            created["description"], expected_description,
+            "case {case}: expected description {expected_description:?}, got {:?}",
+            created["description"]
+        );
+        let expected_tags = request
+            .get("tags")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        assert_eq!(
+            created["tags"], expected_tags,
+            "case {case}: expected tags {expected_tags:?}, got {:?}",
+            created["tags"]
+        );
 
         // The READ reports the same record, member for member: one stored certificate, not
         // a body synthesised per call.
@@ -867,6 +907,149 @@ async fn a_generated_certificate_carries_the_accounts_tag_collection_for_it() {
             answer.body["tags"], *expected,
             "case {case}: expected the generated certificate's tags {expected:?}, got {:?}",
             answer.body["tags"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_rendering_of_a_client_certificate_reports_its_tag_collection() {
+    // RULE: `tags` is "the collection of tags" OF the resource — a map a client enumerates
+    // or merges into — so EVERY rendering of a `ClientCertificate` reports the member, as an
+    // empty object for a certificate that carries no tags. Whether the member is present is a
+    // property of the representation and never of how many entries the collection holds, so a
+    // client can tell "no tags" from "not reported".
+    //
+    // Rows differ along how the collection came to hold what it holds and how many entries
+    // that is: a generate that set none, one that set an explicitly empty map, one and three
+    // tags, a collection a later `TagResource` filled, and one a later `UntagResource`
+    // emptied again.
+    struct Row {
+        case: &'static str,
+        request: Value,
+        /// Tags written through `TagResource` after the generate.
+        added: Value,
+        /// Tag keys taken away through `UntagResource` after that.
+        removed: &'static [&'static str],
+        expected: Value,
+    }
+    let rows: Vec<Row> = vec![
+        Row {
+            case: "a generate that set no tags at all",
+            request: json!({}),
+            added: json!({}),
+            removed: &[],
+            expected: json!({}),
+        },
+        Row {
+            case: "a generate that set an empty map",
+            request: json!({ "tags": {} }),
+            added: json!({}),
+            removed: &[],
+            expected: json!({}),
+        },
+        Row {
+            case: "one tag",
+            request: json!({ "tags": { "team": "api" } }),
+            added: json!({}),
+            removed: &[],
+            expected: json!({ "team": "api" }),
+        },
+        Row {
+            case: "three tags",
+            request: json!({
+                "tags": { "team": "api", "env": "test", "cost:center": "platform" },
+            }),
+            added: json!({}),
+            removed: &[],
+            expected: json!({ "team": "api", "env": "test", "cost:center": "platform" }),
+        },
+        Row {
+            case: "a collection a later tag write filled",
+            request: json!({}),
+            added: json!({ "owner": "platform" }),
+            removed: &[],
+            expected: json!({ "owner": "platform" }),
+        },
+        Row {
+            case: "a collection a later untag emptied again",
+            request: json!({ "tags": { "team": "api" } }),
+            added: json!({}),
+            removed: &["team"],
+            expected: json!({}),
+        },
+    ];
+
+    let gateway = Gateway::new();
+    for row in &rows {
+        let case = row.case;
+        let created = generated(&gateway, case, row.request.clone()).await;
+        let id = string_member(&created, "clientCertificateId", case);
+        let arn = apigateway_arn(&format!("/clientcertificates/{id}"));
+        if row.added.as_object().is_some_and(|added| !added.is_empty()) {
+            let written = tag_certificate(&gateway, &arn, row.added.clone()).await;
+            assert_eq!(
+                written.status, 204,
+                "case {case}: expected 204 from TagResource, got {} with {:?}",
+                written.status, written.body
+            );
+        }
+        for key in row.removed {
+            let taken = untag_certificate(&gateway, &arn, &[key]).await;
+            assert_eq!(
+                taken.status, 204,
+                "case {case}: expected 204 from UntagResource({key}), got {} with {:?}",
+                taken.status, taken.body
+            );
+        }
+
+        // Every operation that renders this record: the generate that minted it (for a row
+        // no tag write followed), its own read, the element of the account's collection, and
+        // the body an update answers with.
+        let read = get_certificate(&gateway, &id).await;
+        let listed = list_certificates(&gateway, "").await;
+        let element = page_items(&listed.body, case)
+            .into_iter()
+            .find(|item| item["clientCertificateId"] == json!(id))
+            .unwrap_or_else(|| panic!("case {case}: the collection must list {id}"));
+        let patched = patch_certificate(
+            &gateway,
+            &id,
+            vec![replace("/description", "described after the tag writes")],
+        )
+        .await;
+        assert_eq!(
+            patched.status, 200,
+            "case {case}: expected 200 from UpdateClientCertificate, got {} with {:?}",
+            patched.status, patched.body
+        );
+        let rendered: Vec<(&str, &Value)> = vec![
+            ("GetClientCertificate", &read.body),
+            ("GetClientCertificates", &element),
+            ("UpdateClientCertificate", &patched.body),
+        ];
+        for (operation, body) in rendered {
+            assert_eq!(
+                body["tags"], row.expected,
+                "case {case}: expected {operation} to report tags {:?}, got {:?}",
+                row.expected, body["tags"]
+            );
+        }
+        // The generate's own body reports the collection the request set, which is what the
+        // readings above report for every row no later tag write touched.
+        if row.added.as_object().is_some_and(serde_json::Map::is_empty) && row.removed.is_empty() {
+            assert_eq!(
+                created["tags"], row.expected,
+                "case {case}: expected GenerateClientCertificate to report tags {:?}, got {:?}",
+                row.expected, created["tags"]
+            );
+        }
+        // And the tag surface's own read of the same ARN reports the same collection, so one
+        // stored collection is reported one way whichever operation answers it.
+        let answer = get_tags(&gateway, &arn).await;
+        assert_eq!(
+            answer.body["tags"], row.expected,
+            "case {case}: expected GetTags to report tags {:?}, got {:?}",
+            row.expected, answer.body["tags"]
         );
     }
 }

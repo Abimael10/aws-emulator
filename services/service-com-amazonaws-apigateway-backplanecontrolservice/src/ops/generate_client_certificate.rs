@@ -87,8 +87,14 @@ use crate::state::ClientCertificateEntry;
 ///
 /// Every member comes off the record: the id it is keyed by, the description the caller set
 /// (absent while it has none), the certificate API Gateway issued for it, and the window
-/// that certificate is valid over. `tags` is absent while the certificate carries none, the
-/// way the sibling account resources of this service report a tag collection.
+/// that certificate is valid over.
+///
+/// `tags` is ALWAYS reported, empty when the certificate carries none: it is "the collection
+/// of tags" OF the resource, a map a client enumerates or merges into, so whether the member
+/// is present is a property of the representation and not of how many entries the collection
+/// holds — the same way the sibling resources of this service that own a tag collection
+/// report one (`ApiKey`, `RestApi`, `UsagePlan`, `DomainName`). A client can therefore tell
+/// "no tags" from "not reported".
 pub fn client_certificate_body(entry: &ClientCertificateEntry) -> GenerateClientCertificateOutput {
     GenerateClientCertificateOutput {
         client_certificate_id: Some(entry.id.clone()),
@@ -96,7 +102,13 @@ pub fn client_certificate_body(entry: &ClientCertificateEntry) -> GenerateClient
         pem_encoded_certificate: entry.pem_encoded_certificate.clone(),
         created_date: entry.created_date,
         expiration_date: entry.expiration_date,
-        tags: crate::state::stored_map(entry.tags.clone()),
+        tags: Some(
+            entry
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
     }
 }
 

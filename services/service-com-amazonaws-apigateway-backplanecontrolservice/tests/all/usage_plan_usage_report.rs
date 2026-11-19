@@ -835,3 +835,98 @@ async fn an_unresolvable_plan_key_or_interval_is_refused() {
         narrowed.body
     );
 }
+
+/// The sentence API Gateway refuses an INVERTED interval with, as the recorded refusal words
+/// it: wholly fixed text that states the condition and quotes neither date back.
+const INVERTED_USAGE_INTERVAL_SENTENCE: &str = "Usage end date must be after start date";
+
+#[tokio::test]
+async fn an_interval_whose_end_precedes_its_start_is_refused_with_the_services_sentence() {
+    // RULE: an interval whose `endDate` falls before its `startDate` covers no days, so the
+    // report is refused `400 BadRequestException` carrying the service's own fixed sentence
+    // for that condition — the same sentence whichever pair of dates names the inversion, and
+    // with no value of the request interpolated into it.
+    let gateway = Gateway::new();
+    let api = metered_api(&gateway, "usage-report-inverted-interval").await;
+    let case = "the plan every row reads";
+    let (key_id, _) = api_key(&gateway, case, 320).await;
+    let plan = metering_plan(
+        &gateway,
+        case,
+        Some(json!({ "limit": 10, "offset": 0, "period": "DAY" })),
+        &api,
+        ::std::slice::from_ref(&key_id),
+    )
+    .await;
+
+    // Rows differ along HOW FAR the interval is inverted and which calendar boundary it is
+    // inverted across: by one day, by a month, by a year, across the end of a month, across
+    // the end of a year, and across a leap day — plus a pair whose end precedes its start by
+    // the widest window a report may cover.
+    let today = today();
+    let widest = usize::try_from(MAX_USAGE_INTERVAL_DAYS).expect("the bound fits a usize");
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "inverted by one day, relative to the day usage is counted on",
+            date(plus(today, 1)),
+            date(today),
+        ),
+        ("inverted by one day", "2026-03-02".to_string(), "2026-03-01".to_string()),
+        ("inverted by a month", "2026-04-01".to_string(), "2026-03-01".to_string()),
+        ("inverted by a year", "2027-03-01".to_string(), "2026-03-01".to_string()),
+        (
+            "inverted across the end of a month",
+            "2026-04-01".to_string(),
+            "2026-03-31".to_string(),
+        ),
+        (
+            "inverted across the end of a year",
+            "2027-01-01".to_string(),
+            "2026-12-31".to_string(),
+        ),
+        (
+            "inverted across a leap day",
+            "2028-03-01".to_string(),
+            "2028-02-29".to_string(),
+        ),
+        (
+            "inverted by the widest window a report may cover",
+            date(plus(today, u64::try_from(widest).expect("the bound fits a u64"))),
+            date(today),
+        ),
+    ];
+    for (case, start, end) in &rows {
+        let refused = get_usage(&gateway, &plan, start, end, "").await;
+        assert_failure(&refused, 400, "BadRequestException", case);
+        assert_eq!(
+            refused.body["message"].as_str(),
+            Some(INVERTED_USAGE_INTERVAL_SENTENCE),
+            "case {case}: expected {INVERTED_USAGE_INTERVAL_SENTENCE:?}, got {:?}",
+            refused.body["message"]
+        );
+        // The sentence is the one the service states for the condition, so the constant the
+        // handler words it with is that same text.
+        assert_eq!(
+            INVALID_USAGE_INTERVAL, INVERTED_USAGE_INTERVAL_SENTENCE,
+            "case {case}: the interval sentence must be the recorded one, got \
+             {INVALID_USAGE_INTERVAL:?}"
+        );
+    }
+
+    // The CONTROL: an interval whose end is its start names ONE day and is served, so the
+    // rows above are refused for the inversion and not for the pair being narrow.
+    let yesterday = today
+        .checked_sub_days(Days::new(1))
+        .expect("a day inside the calendar");
+    for (case, day) in [
+        ("the same day twice", today),
+        ("the same earlier day twice", yesterday),
+    ] {
+        let served = get_usage(&gateway, &plan, &date(day), &date(day), "").await;
+        assert_eq!(
+            served.status, 200,
+            "case {case}: expected 200 for an interval of one day, got {} with {:?}",
+            served.status, served.body
+        );
+    }
+}

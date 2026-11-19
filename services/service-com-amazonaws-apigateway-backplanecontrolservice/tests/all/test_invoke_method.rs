@@ -18,6 +18,10 @@
 //! member the header travels in, the integration type, the verb the method was put under,
 //! and which identifier of the three is unresolvable.
 //!
+//! Beside the headers a method's records render, every answer reports the TRACE CONTEXT of
+//! the call it answered, under `X-Amzn-Trace-Id` in both header maps
+//! ([`a_simulated_invocation_reports_the_tracing_header_of_its_own_call`]).
+//!
 //! Every case drives the real wire path — a `restJson1` request through the multi-service
 //! router into the mounted service — through the crate's one wire-test harness
 //! ([`Gateway`]), so what is asserted is what a client sees.
@@ -37,6 +41,28 @@ const INTERNAL_SERVER_ERROR: &str = "Internal server error";
 /// The `GatewayResponseType` a call whose integration cannot be performed is answered
 /// through — the type a developer's `PutGatewayResponse` customization of it applies to.
 const API_CONFIGURATION_ERROR: &str = "API_CONFIGURATION_ERROR";
+
+/// The header API Gateway reports the trace context of the call it answered in, which every
+/// answer it serves carries.
+///
+/// `pub(crate)` so the sibling suites that assert on it name it once rather than spelling the
+/// header per suite.
+pub(crate) const TRACING_HEADER: &str = "X-Amzn-Trace-Id";
+
+/// `headers` with the entry under [`TRACING_HEADER`] left out, whichever of the two reported
+/// header maps it is.
+fn without_tracing_header(headers: &Value) -> Value {
+    match headers.as_object() {
+        Some(reported) => Value::Object(
+            reported
+                .iter()
+                .filter(|(name, _)| name.as_str() != TRACING_HEADER)
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        ),
+        None => headers.clone(),
+    }
+}
 
 /// One simulated invocation, as the operation reports it.
 ///
@@ -83,6 +109,43 @@ impl Simulated {
             .get("multiValueHeaders")
             .cloned()
             .unwrap_or(Value::Null)
+    }
+
+    /// The reported headers WITHOUT the endpoint's own tracing header: the headers the
+    /// METHOD's records render, which is what a case that states a header by name and value
+    /// compares against.
+    ///
+    /// [`TRACING_HEADER`] is reported beside them on every answer and names THIS call, so it
+    /// belongs to the case that asserts that rule
+    /// ([`a_simulated_invocation_reports_the_tracing_header_of_its_own_call`]) rather than to
+    /// a case about what an integration renders.
+    pub(crate) fn mapped_headers(&self) -> Value {
+        without_tracing_header(&self.headers())
+    }
+
+    /// The same, for the multi-valued view.
+    fn mapped_multi_value_headers(&self) -> Value {
+        without_tracing_header(&self.multi_value_headers())
+    }
+
+    /// The value reported under [`TRACING_HEADER`] in `headers`, where one is reported.
+    pub(crate) fn traced(&self) -> Option<String> {
+        self.headers()
+            .get(TRACING_HEADER)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    /// The values reported under [`TRACING_HEADER`] in `multiValueHeaders`, where any are.
+    fn multi_value_traced(&self) -> Option<Vec<String>> {
+        let values = self.multi_value_headers().get(TRACING_HEADER)?.clone();
+        Some(
+            values
+                .as_array()?
+                .iter()
+                .map(|value| value.as_str().unwrap_or_default().to_owned())
+                .collect(),
+        )
     }
 
     /// The execution log — the `log` member.
@@ -393,10 +456,10 @@ async fn the_simulated_response_is_the_one_the_methods_own_records_render() {
             simulated.simulated_body()
         );
         assert_eq!(
-            simulated.headers(),
+            simulated.mapped_headers(),
             *headers,
             "case {case:?}: expected headers {headers}, got {:?}",
-            simulated.headers()
+            simulated.mapped_headers()
         );
         // The multi-valued view of the same headers: each name mapped to the
         // single-element list of its value.
@@ -409,10 +472,10 @@ async fn the_simulated_response_is_the_one_the_methods_own_records_render() {
                 .collect(),
         );
         assert_eq!(
-            simulated.multi_value_headers(),
+            simulated.mapped_multi_value_headers(),
             expected_multi,
             "case {case:?}: expected multiValueHeaders {expected_multi}, got {:?}",
-            simulated.multi_value_headers()
+            simulated.mapped_multi_value_headers()
         );
         let log = simulated.log();
         assert!(
@@ -895,9 +958,19 @@ async fn a_simulated_invocation_changes_nothing_a_later_caller_sees() {
     )
     .await;
 
+    // The headers the METHOD's records render are the same both times; the tracing header
+    // beside them names the CALL, so the two answers name their own calls there.
     assert_eq!(
-        (second.status(), second.simulated_body(), second.headers()),
-        (first.status(), first.simulated_body(), first.headers()),
+        (
+            second.status(),
+            second.simulated_body(),
+            second.mapped_headers()
+        ),
+        (
+            first.status(),
+            first.simulated_body(),
+            first.mapped_headers()
+        ),
         "case the repeated simulation: expected the same answer twice, got {:?} then {:?}",
         first.body,
         second.body
@@ -916,4 +989,179 @@ async fn a_simulated_invocation_changes_nothing_a_later_caller_sees() {
          instead of {:?}",
         method_after.body, method_before.body
     );
+}
+
+/// A chain in X-Ray's own form — `1-<8 hex>-<24 hex>` — that a simulated request can name.
+const NAMED_CHAIN: &str = "1-5759e988-bd862e3fe1be46a994272793";
+
+/// One row: what the simulated request named in its tracing header, the chain the answer must
+/// report (`None` for a chain the call itself starts), and the sampling decision it must
+/// carry.
+struct Traced {
+    case: &'static str,
+    request: Value,
+    chain: Option<&'static str>,
+    sampled: bool,
+}
+
+#[tokio::test]
+async fn a_simulated_invocation_reports_the_tracing_header_of_its_own_call() {
+    // RULE: API Gateway reports the trace context of the call it answered ON that answer,
+    // under `X-Amzn-Trace-Id`, so a client correlates the answer it holds with the records of
+    // the work downstream of it: the member is reported in BOTH header maps the operation
+    // answers, the chain is the one the request named where it named one in X-Ray's own form
+    // and one started for this call where it did not, the parent is the span of this call's
+    // own work, and the sampling decision is the caller's where it took one — a simulated
+    // call reaches no stage that records a trace, so it takes none of its own.
+    //
+    // Rows differ along what the simulated request named: nothing at all, a chain with each
+    // sampling decision, a chain with no decision, a chain carried in the multi-valued
+    // member, the header spelled in another case, and text that names no chain at all.
+    let rows: Vec<Traced> = vec![
+        Traced {
+            case: "a request naming no chain",
+            request: json!({}),
+            chain: None,
+            sampled: false,
+        },
+        Traced {
+            case: "a chain the caller named, with no decision",
+            request: json!({ "headers": { "X-Amzn-Trace-Id": format!("Root={NAMED_CHAIN}") } }),
+            chain: Some(NAMED_CHAIN),
+            sampled: false,
+        },
+        Traced {
+            case: "a chain the caller is recording",
+            request: json!({
+                "headers": { "X-Amzn-Trace-Id": format!("Root={NAMED_CHAIN};Sampled=1") },
+            }),
+            chain: Some(NAMED_CHAIN),
+            sampled: true,
+        },
+        Traced {
+            case: "a chain the caller is not recording",
+            request: json!({
+                "headers": { "X-Amzn-Trace-Id": format!("Root={NAMED_CHAIN};Sampled=0") },
+            }),
+            chain: Some(NAMED_CHAIN),
+            sampled: false,
+        },
+        Traced {
+            case: "a chain carried with a parent span of the caller's own",
+            request: json!({
+                "headers": {
+                    "X-Amzn-Trace-Id":
+                        format!("Root={NAMED_CHAIN};Parent=53995c3f42cd8ad8;Sampled=1"),
+                },
+            }),
+            chain: Some(NAMED_CHAIN),
+            sampled: true,
+        },
+        Traced {
+            case: "the header in the multi-valued member",
+            request: json!({
+                "multiValueHeaders": {
+                    "X-Amzn-Trace-Id": [format!("Root={NAMED_CHAIN};Sampled=1")],
+                },
+            }),
+            chain: Some(NAMED_CHAIN),
+            sampled: true,
+        },
+        Traced {
+            case: "the header name in another case",
+            request: json!({
+                "headers": { "x-amzn-trace-id": format!("Root={NAMED_CHAIN};Sampled=1") },
+            }),
+            chain: Some(NAMED_CHAIN),
+            sampled: true,
+        },
+        Traced {
+            case: "a root that is no trace id, so the call starts a chain",
+            request: json!({ "headers": { "X-Amzn-Trace-Id": "Root=not-a-trace-id" } }),
+            chain: None,
+            sampled: false,
+        },
+        Traced {
+            case: "text that is no tracing header at all",
+            request: json!({ "headers": { "X-Amzn-Trace-Id": "nonsense" } }),
+            chain: None,
+            sampled: false,
+        },
+    ];
+
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "test-invoke-trace").await;
+    let resource = mock_method(&gateway, &api, &root, "pets").await;
+    let mut started: Vec<String> = Vec::new();
+    let mut spans: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for row in &rows {
+        let case = row.case;
+        let simulated = test_invoke(&gateway, &api, &resource, "GET", row.request.clone()).await;
+        assert_eq!(
+            simulated.http_status, 200,
+            "case {case:?}: expected the operation to answer 200, got {} with {:?}",
+            simulated.http_status, simulated.body
+        );
+        let reported = simulated.traced().unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected the answer to report {TRACING_HEADER}, got {:?}",
+                simulated.headers()
+            )
+        });
+        // What is reported IS a tracing header, and the chain it names is of X-Ray's own
+        // form (the readings are `service_common`'s, the emulator's one reading of them).
+        let named = service_common::xray_trace::trace_root(&reported).unwrap_or_default();
+        assert!(
+            service_common::xray_trace::is_trace_id(named),
+            "case {case:?}: expected a chain of X-Ray's form, got {reported:?}"
+        );
+        match row.chain {
+            Some(chain) => assert_eq!(
+                named, chain,
+                "case {case:?}: expected the chain {chain:?} continued, got {reported:?}"
+            ),
+            None => {
+                assert_ne!(
+                    named, NAMED_CHAIN,
+                    "case {case:?}: expected a chain of this call's own, got {reported:?}"
+                );
+                assert!(
+                    !started.contains(&named.to_string()),
+                    "case {case:?}: expected a chain no earlier call named, got {reported:?} \
+                     after {started:?}"
+                );
+                started.push(named.to_string());
+            }
+        }
+        assert_eq!(
+            service_common::xray_trace::sampling_decision(&reported),
+            Some(row.sampled),
+            "case {case:?}: expected the decision {sampled:?}, got {reported:?}",
+            sampled = row.sampled
+        );
+        // An answer names the span of the CALL's own work as the parent the work it reached
+        // hangs from, which is a span id of X-Ray's own form.
+        let span = service_common::xray_trace::parent_span(&reported).unwrap_or_default();
+        assert!(
+            service_common::xray_trace::is_span_id(span),
+            "case {case:?}: expected a span of X-Ray's form as the parent, got {reported:?}"
+        );
+        assert!(
+            spans.insert(span.to_string()),
+            "case {case:?}: expected a span no earlier call named, got {reported:?}"
+        );
+        // Both header maps report it, and the multi-valued view carries that one value.
+        assert_eq!(
+            simulated.multi_value_traced(),
+            Some(vec![reported.clone()]),
+            "case {case:?}: expected multiValueHeaders to carry {reported:?}, got {:?}",
+            simulated.multi_value_headers()
+        );
+        // The execution log reports the response headers of the call, this one among them.
+        assert!(
+            simulated.log().contains(&reported),
+            "case {case:?}: expected the execution log to report {reported:?}, got {:?}",
+            simulated.log()
+        );
+    }
 }

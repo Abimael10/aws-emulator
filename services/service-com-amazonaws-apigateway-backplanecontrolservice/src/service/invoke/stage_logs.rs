@@ -145,6 +145,15 @@ pub(super) struct Exchanged {
     pub(super) received: Vec<u8>,
 }
 
+impl Exchanged {
+    /// How many bytes crossed each way: the integration request as sent, and the backend's
+    /// answer as received. What a log line reports where the payloads themselves are not
+    /// reported ([`payload_line`], and a simulated invocation's own log).
+    pub(super) fn sizes(&self) -> (usize, usize) {
+        (self.sent.len(), self.received.len())
+    }
+}
+
 /// A configuration error of the method's integration, as the execution log records it.
 #[derive(Debug)]
 pub(super) struct Unperformed {

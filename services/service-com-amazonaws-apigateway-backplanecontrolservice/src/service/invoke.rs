@@ -292,8 +292,10 @@ pub(crate) mod stage_logs;
 /// The `AWS/ApiGateway` series a deployed stage PUBLISHES about the requests it answered,
 /// which is the only report a client gets of the traffic a stage served.
 mod stage_metrics;
-/// The X-Ray trace context this stage propagates onto the call its integration makes.
-mod trace_context;
+/// The X-Ray trace context this stage propagates onto the call its integration makes, and
+/// the tracing header an answer reports. `pub(crate)` because `TestInvokeMethod` reports the
+/// headers of the response it simulated, this header among them.
+pub(crate) mod trace_context;
 /// What a deployed stage answers a call no deployed method serves — which is an
 /// AUTHORIZATION decision before it is a routing one.
 mod unrouted_call;

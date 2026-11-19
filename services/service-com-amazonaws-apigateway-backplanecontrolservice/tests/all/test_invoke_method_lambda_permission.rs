@@ -36,6 +36,10 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+// The header every answer reports the call's trace context in is named once, in the suite
+// that asserts the whole rule over a table of callers' own headers.
+use crate::test_invoke_method::TRACING_HEADER;
+
 /// The Region every request below is signed for and every ARN names.
 pub(crate) const REGION: &str = "us-east-1";
 
@@ -562,6 +566,20 @@ async fn a_simulated_invocation_is_decided_by_the_functions_resource_policy() {
                 "case {case:?}: expected the execution log to report the invocation, got \
                  {log:?}"
             );
+            // The log covers the INTEGRATION's own phases, as a deployed stage's execution
+            // log covers them: the integration request as this integration's transformation
+            // made it, and the backend's answer as it arrived before the api mapped it. By
+            // SIZE, because a simulated invocation has no stage `dataTrace` setting to gate
+            // the payloads themselves.
+            for phase in [
+                "Endpoint request body after transformations",
+                "Endpoint response body before transformations",
+            ] {
+                assert!(
+                    log.contains(phase),
+                    "case {case:?}: expected the execution log to cover {phase:?}, got {log:?}"
+                );
+            }
         } else {
             assert_eq!(
                 (status, serde_json::from_str::<Value>(&body).ok()),
@@ -575,6 +593,31 @@ async fn a_simulated_invocation_is_decided_by_the_functions_resource_policy() {
                  {INVALID_PERMISSIONS:?}, got {log:?}"
             );
         }
+
+        // Every answer reports the TRACE CONTEXT of the call it answered, in both header maps
+        // the operation carries — whether the function was invoked or the api answered its
+        // own configuration error. The context is this call's own, so only its form is pinned
+        // here; the chain a caller's own header continues is
+        // `test_invoke_method::a_simulated_invocation_reports_the_tracing_header_of_its_own_call`.
+        let traced = simulated["headers"][TRACING_HEADER]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected the answer to report {TRACING_HEADER}, got {}",
+                    simulated["headers"]
+                )
+            })
+            .to_string();
+        assert!(
+            service_common::xray_trace::tracing_header(&traced).is_some(),
+            "case {case:?}: expected a tracing header naming a chain, got {traced:?}"
+        );
+        assert_eq!(
+            simulated["multiValueHeaders"][TRACING_HEADER],
+            json!([traced]),
+            "case {case:?}: expected multiValueHeaders to carry {traced:?}, got {}",
+            simulated["multiValueHeaders"]
+        );
 
         // What a status alone cannot show: whether the function RAN. One run is one run's
         // log in its own group, and a function that was never invoked has none.
