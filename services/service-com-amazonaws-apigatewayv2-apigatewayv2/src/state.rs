@@ -1600,6 +1600,40 @@ impl Api {
     }
 }
 
+/// Which of a route's collection members its stored configuration MATERIALIZED: a member
+/// named here belongs to the route's configuration whether or not it holds entries, so a
+/// reader reports it as the empty collection it is instead of leaving it out.
+///
+/// A route written from an OpenAPI definition (`ImportApi`, `ReimportApi`) materializes the
+/// two members the configuration of a route of an HTTP api consists of — the authorization
+/// scopes it is guarded by and the request parameters it declares — because the definition
+/// states that configuration for every operation it declares, and states it as nothing for
+/// an operation that configures nothing. A route written by `CreateRoute`/`UpdateRoute`
+/// materializes neither, and a member whose last entry is removed through the sub-resource
+/// that addresses the entries is no longer materialized either, so such a route reports a
+/// collection member only while it holds entries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaterializedRouteCollections {
+    /// `Route$AuthorizationScopes`.
+    pub authorization_scopes: bool,
+    /// `Route$RequestParameters`.
+    pub request_parameters: bool,
+}
+
+impl MaterializedRouteCollections {
+    /// What a route written from an OpenAPI definition materializes: the authorization
+    /// scopes and the request parameters the definition states for every operation it
+    /// declares. `RequestModels` is NOT among them — it is a WebSocket-only member
+    /// (`Route$RequestModels`, "Supported only for WebSocket APIs") while an imported api is
+    /// an HTTP one, so an imported route carries no such configuration at all.
+    pub const fn of_an_imported_route() -> Self {
+        Self {
+            authorization_scopes: true,
+            request_parameters: true,
+        }
+    }
+}
+
 /// A persisted `Route` resource, owned by its parent [`Api`].
 #[derive(Debug, Clone, Default)]
 pub struct Route {
@@ -1616,6 +1650,9 @@ pub struct Route {
     pub route_response_selection_expression: Option<String>,
     pub request_models: BTreeMap<String, String>,
     pub request_parameters: BTreeMap<String, wire::ParameterConstraints>,
+    /// Which of this route's collection members its stored configuration carries whether or
+    /// not they hold entries. See [`MaterializedRouteCollections`].
+    pub materialized_collections: MaterializedRouteCollections,
     /// True only for the `$default` route quick create mints alongside the api:
     /// "If you created an API using quick create, the $default route is managed by
     /// API Gateway" (`Route$ApiGatewayManaged`).
@@ -1654,16 +1691,21 @@ impl Route {
     ///
     /// The route's collection members — `RequestModels`, `RequestParameters` and
     /// `AuthorizationScopes` — are neither `@required` nor given a `@default` by the
-    /// model, so a route holding NO entries under one of them reports NOTHING for it
-    /// rather than an empty collection: an absent member and an empty one are different
-    /// facts to a client that branches on a member being present. This is the single
-    /// projection every reader of a route goes through, so the create, the readers, the
-    /// listing and the patch all report one route the same way.
+    /// model, so WHICH of them a route reports is part of the route's own stored
+    /// configuration rather than something read off the collection's size: a member is
+    /// reported while the route holds entries under it, and a member the writing call
+    /// MATERIALIZED ([`MaterializedRouteCollections`]) is reported as the empty collection
+    /// it is. A route holding nothing under a member nothing materialized reports NO such
+    /// member: an absent member and an empty one are different facts to a client that
+    /// branches on a member being present. This is the single projection every reader of a
+    /// route goes through, so the create, the readers, the listing and the patch all report
+    /// one route the same way.
     pub fn to_wire(&self) -> wire::Route {
         wire::Route {
             api_gateway_managed: Some(self.api_gateway_managed),
             api_key_required: Some(self.api_key_required),
-            authorization_scopes: (!self.authorization_scopes.is_empty())
+            authorization_scopes: (!self.authorization_scopes.is_empty()
+                || self.materialized_collections.authorization_scopes)
                 .then(|| self.authorization_scopes.clone()),
             authorization_type: Some(self.authorization_type.clone()),
             authorizer_id: self.authorizer_id.clone(),
@@ -1675,12 +1717,14 @@ impl Route {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect()
             }),
-            request_parameters: (!self.request_parameters.is_empty()).then(|| {
-                self.request_parameters
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            }),
+            request_parameters: (!self.request_parameters.is_empty()
+                || self.materialized_collections.request_parameters)
+                .then(|| {
+                    self.request_parameters
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                }),
             route_id: Some(self.route_id.clone()),
             route_key: self.route_key.clone(),
             route_response_selection_expression: self.route_response_selection_expression.clone(),
@@ -4172,12 +4216,15 @@ pub fn portal_endpoint_configuration(
 /// attach one. `Err` carries the message for `BadRequestException`.
 pub fn validate_subnet_ids(subnet_ids: &[String]) -> Result<(), String> {
     if subnet_ids.is_empty() {
-        return Err("Invalid value for SubnetIds: a VPC link must specify at least one \
-                    subnet."
-            .to_string());
+        return Err(EMPTY_SUBNET_IDS_MESSAGE.to_string());
     }
     validate_ec2_resource_ids("SubnetIds", SUBNET_ID_PREFIX, subnet_ids)
 }
+
+/// How API Gateway words the refusal of a `SubnetIds` list naming no subnet at all. The
+/// sentence is entirely fixed: it names the resource a list of subnets is required for and
+/// interpolates nothing from the request or from this service's state.
+pub const EMPTY_SUBNET_IDS_MESSAGE: &str = "SubnetIds for a vpc link cannot be empty";
 
 /// One entry of a domain name's `DomainNameConfigurations`.
 ///

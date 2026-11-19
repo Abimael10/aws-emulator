@@ -376,6 +376,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
                 .into_iter()
                 .collect(),
+            // A route the caller asked for carries the collection members it holds entries
+            // under and no others, so this create materializes none of them
+            // (`crate::state::MaterializedRouteCollections`).
+            materialized_collections: crate::state::MaterializedRouteCollections::default(),
             // Only quick create's `$default` route is API-Gateway-managed; a route the
             // caller asked for is its own.
             api_gateway_managed: false,

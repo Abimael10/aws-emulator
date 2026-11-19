@@ -842,6 +842,12 @@ pub fn write_definition_routes(api: &mut crate::state::Api, routes: Vec<Imported
                 route_key: imported.route_key,
                 target,
                 authorization_type: crate::state::DEFAULT_AUTHORIZATION_TYPE.to_string(),
+                // This definition states the whole configuration of the route it declares,
+                // so the two members that configuration consists of belong to the route
+                // whether the declaration filled them or left them empty
+                // (`crate::state::MaterializedRouteCollections`).
+                materialized_collections:
+                    crate::state::MaterializedRouteCollections::of_an_imported_route(),
                 // The caller's own definition asked for this route, so API Gateway does not
                 // manage it (`Route$ApiGatewayManaged`).
                 api_gateway_managed: false,

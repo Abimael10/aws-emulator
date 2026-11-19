@@ -213,6 +213,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The entry addressed was the route's LAST one, so the route no longer declares
+        // request parameters at all: the member leaves its configuration rather than staying
+        // behind as an empty map, whatever wrote the route
+        // (`crate::state::MaterializedRouteCollections`).
+        if route.request_parameters.is_empty() {
+            route.materialized_collections.request_parameters = false;
+        }
+
         // The api's routes have changed, so every stage of it that auto-deploys has the
         // new configuration released to it.
         api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());

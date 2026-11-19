@@ -15,6 +15,10 @@
 //!   the type's prefix (`subnet-`, `sg-`) followed by 8 or 17 lowercase hexadecimal
 //!   characters — and a request naming a value that does not, or naming no subnet at
 //!   all, is refused 400 `BadRequestException` with nothing persisted.
+//! * **A `SubnetIds` list naming no subnet at all is refused in API Gateway's own words for
+//!   that refusal class** ([`EMPTY_SUBNET_IDS_MESSAGE`], text that is entirely fixed and
+//!   interpolates nothing from the request or this service's state), while a list naming a
+//!   MALFORMED id keeps this service's member/value sentence.
 //! * **A created VPC link reports `PENDING` until its provisioning span has passed and
 //!   `AVAILABLE` after it**: a transition the clock owes, so reading it neither moves it
 //!   nor holds it back.
@@ -34,8 +38,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
-    EC2_ID_HEX_LENGTHS, MAX_VPC_LINKS, SECURITY_GROUP_ID_PREFIX, SUBNET_ID_PREFIX,
-    VPC_LINK_CREATE_SPAN, VPC_LINK_STATUS_AVAILABLE, VPC_LINK_STATUS_PENDING, VPC_LINK_VERSION_V2,
+    EC2_ID_HEX_LENGTHS, EMPTY_SUBNET_IDS_MESSAGE, MAX_VPC_LINKS, SECURITY_GROUP_ID_PREFIX,
+    SUBNET_ID_PREFIX, VPC_LINK_CREATE_SPAN, VPC_LINK_STATUS_AVAILABLE, VPC_LINK_STATUS_PENDING,
+    VPC_LINK_VERSION_V2,
 };
 use service_com_amazonaws_apigatewayv2_apigatewayv2::ComAmazonawsApigatewayv2Apigatewayv2State;
 use smithy_server_runtime::MultiServiceRouter;
@@ -369,6 +374,99 @@ async fn a_request_naming_an_unusable_subnet_or_security_group_is_refused() {
         1,
         "case \"a valid create after the refusals\": expected the store to hold one link"
     );
+}
+
+/// RULE: a `SubnetIds` list naming no subnet at all is refused with API Gateway's one fixed
+/// sentence for that refusal class, whatever else the request carries — and a list naming a
+/// MALFORMED id keeps this service's member/value sentence, so the fixed sentence is the
+/// EMPTY case and not every unusable list.
+///
+/// The rows vary what the rule generalises over: everything the request carries beside the
+/// empty list — the name (short, at the documented 128-character maximum, outside ASCII),
+/// whether security groups and tags are named, and whether the security-group list is itself
+/// empty — because the sentence names none of it. The recorded case that filed the issue, a
+/// create carrying the required members with `subnetIds` empty, is ONE row.
+#[tokio::test]
+async fn an_empty_subnet_list_is_refused_in_api_gateways_own_words() {
+    let emulator = emulator();
+
+    for (case, request) in [
+        (
+            "the required members only",
+            json!({ "name": "no-subnets", "subnetIds": [] }),
+        ),
+        (
+            "an empty subnet list beside two security groups and tags",
+            json!({
+                "name": "no-subnets-with-groups",
+                "subnetIds": [],
+                "securityGroupIds": ["sg-0a1b2c3d", "sg-00112233445566778"],
+                "tags": { "team": "platform", "env": "test" }
+            }),
+        ),
+        (
+            "both lists empty",
+            json!({ "name": "nothing-at-all", "subnetIds": [], "securityGroupIds": [] }),
+        ),
+        (
+            // `Name` targets `StringWithLengthBetween1And128`, so 128 characters is its
+            // documented maximum and the name is accepted: the empty list is what is refused.
+            "a name at the documented 128-character maximum",
+            json!({ "name": "n".repeat(128), "subnetIds": [] }),
+        ),
+        (
+            "a name outside ASCII",
+            json!({ "name": "決済-VPC-Link — ünïcödé 🎉", "subnetIds": [] }),
+        ),
+    ] {
+        let (status, refused) = call(&emulator, "POST", VPC_LINKS, Some(request)).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400 from CreateVpcLink, got {status} {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {refused}"
+        );
+        assert_eq!(
+            as_str(&refused, "message"),
+            EMPTY_SUBNET_IDS_MESSAGE,
+            "case {case:?}: expected the refusal {EMPTY_SUBNET_IDS_MESSAGE:?}, got {refused}"
+        );
+    }
+
+    // The other half: a list that names a subnet id of the wrong FORM is still worded in
+    // this service's member/value grammar, which names the member it rejected.
+    for (case, request) in [
+        (
+            "a subnet id that is not an EC2 resource id",
+            json!({ "name": "bad-subnet", "subnetIds": ["not-a-subnet"] }),
+        ),
+        (
+            "a well-formed subnet id followed by a malformed one",
+            json!({
+                "name": "second-subnet-bad",
+                "subnetIds": ["subnet-0a1b2c3d", "subnet-nope"]
+            }),
+        ),
+    ] {
+        let (status, refused) = call(&emulator, "POST", VPC_LINKS, Some(request)).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400 from CreateVpcLink, got {status} {refused}"
+        );
+        let message = as_str(&refused, "message");
+        assert_ne!(
+            message, EMPTY_SUBNET_IDS_MESSAGE,
+            "case {case:?}: a malformed id is not an empty list, so it keeps this service's \
+             member/value sentence, got {refused}"
+        );
+        assert!(
+            message.contains("SubnetIds"),
+            "case {case:?}: expected a sentence naming the member, got {refused}"
+        );
+    }
 }
 
 #[tokio::test]
