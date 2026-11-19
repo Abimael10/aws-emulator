@@ -36,7 +36,9 @@
 //! `cfn_lambda_role_grant_decides_its_secret_read` pins WHERE on one role a grant may be
 //! attached, and `cfn_agent_function_stack_settles` pins how many owning services one settling
 //! template may span; both hold the role's documents FIXED once the stack is created, which is
-//! the half this suite varies.
+//! the half this suite varies. `cfn_function_role_swap_decides_its_listings` varies the other
+//! half instead — it holds every document fixed and moves the FUNCTION between roles — and
+//! drives the same wire through the helpers below, which is why they are `pub(crate)`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -54,11 +56,11 @@ use super::query_wire::{elements, form_encode, opt_element, outputs_of, physical
 const REGION: &str = "us-east-1";
 
 /// Where Lambda binds `GetFunctionConfiguration` and `Invoke`.
-const FUNCTIONS_URI: &str = "/2015-03-31/functions";
+pub(crate) const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
 /// The terminal statuses this suite's accepted operations must settle on.
-const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
-const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
+pub(crate) const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+pub(crate) const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
 
 /// The suffix of every status CloudFormation reports for an operation still in flight, and so
 /// the one status class a poll for a terminal status looks past.
@@ -159,7 +161,7 @@ def handler(event, context):
 /// The emulator as it is ASSEMBLED, on one engine: the services that own the declared resources
 /// are the ones CloudFormation's in-process calls reach and the ones the handler's own SDK
 /// calls are dispatched back into, so every read below is of the record the deployment wrote.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = aws_emulator_router::build_router(engine);
     // The signature is never checked here, as in every other suite of this crate; the
@@ -178,7 +180,7 @@ fn authorization(service: &str) -> String {
 }
 
 /// One CloudFormation action over its awsQuery wire, answered with the status and the XML body.
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     action: &str,
     members: &[(&str, &str)],
@@ -204,7 +206,7 @@ async fn cloudformation(
 }
 
 /// One Lambda `restJson1` call, as its status, its headers and its parsed body.
-async fn lambda(
+pub(crate) async fn lambda(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -274,7 +276,7 @@ async fn sessions_api(router: &MultiServiceRouter, method: &str, body: &Value) -
 /// What one role's inline document grants: the log actions, plus each listing action the caller
 /// asks for, each on IAM's own any-resource wildcard — the two listings act on no single
 /// resource, so a statement about them names no ARN.
-fn role_document(vector_listing: bool, session_listing: bool) -> Value {
+pub(crate) fn role_document(vector_listing: bool, session_listing: bool) -> Value {
     let mut statements = vec![json!({
         "Effect": "Allow",
         "Action": LOG_ACTIONS,
@@ -311,7 +313,7 @@ fn trust_policy() -> Value {
 }
 
 /// One execution role as a template resource, carrying the document `grants` describes.
-fn role_resource(stack: &str, suffix: &str, grants: Value) -> Value {
+pub(crate) fn role_resource(stack: &str, suffix: &str, grants: Value) -> Value {
     json!({
         "Type": "AWS::IAM::Role",
         "Properties": {
@@ -326,7 +328,7 @@ fn role_resource(stack: &str, suffix: &str, grants: Value) -> Value {
 }
 
 /// One function as a template resource, running [`PROBE_SOURCE`] as the role `role` names.
-fn function_resource(stack: &str, suffix: &str, role: &str) -> Value {
+pub(crate) fn function_resource(stack: &str, suffix: &str, role: &str) -> Value {
     json!({
         "Type": "AWS::Lambda::Function",
         "Properties": {
@@ -425,7 +427,12 @@ async fn failure_reasons(router: &MultiServiceRouter, case: &str, stack: &str) -
 }
 
 /// Assert the stack settled on `wanted`, and answer the `DescribeStacks` answer it settled in.
-async fn settled_on(router: &MultiServiceRouter, case: &str, stack: &str, wanted: &str) -> String {
+pub(crate) async fn settled_on(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+    wanted: &str,
+) -> String {
     let (reached, described) = settled(router, case, stack).await;
     if reached != wanted {
         let reasons = failure_reasons(router, case, stack).await;
@@ -551,7 +558,7 @@ fn expected_listing(allowed: bool, held: usize) -> Value {
 /// Invoke `function` and assert each of its two listings was decided the way the statements in
 /// force decide it. `when` names the point in the stack's life the invocation was made at, so a
 /// failure says which side of an update it is about.
-async fn verdicts(
+pub(crate) async fn verdicts(
     router: &MultiServiceRouter,
     case: &str,
     when: &str,
@@ -578,7 +585,7 @@ async fn verdicts(
 /// Create the two resources the handlers count, so a served listing reports a number the
 /// emulator's state really holds rather than an empty one: one vector bucket and one session,
 /// each created through the owning service's own API.
-async fn seed(router: &MultiServiceRouter, case: &str, name: &str) {
+pub(crate) async fn seed(router: &MultiServiceRouter, case: &str, name: &str) {
     let (status, created) = s3vectors(
         router,
         "CreateVectorBucket",
@@ -597,7 +604,7 @@ async fn seed(router: &MultiServiceRouter, case: &str, name: &str) {
 }
 
 /// The output value a stack published under `key`.
-fn output(outputs: &BTreeMap<String, String>, case: &str, key: &str) -> String {
+pub(crate) fn output(outputs: &BTreeMap<String, String>, case: &str, key: &str) -> String {
     outputs
         .get(key)
         .cloned()
