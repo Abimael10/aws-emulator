@@ -148,34 +148,48 @@ async fn described_auto_scaling_instance(
 /// What BOTH reads report for one member of `name`, which must be one instance: the group's
 /// own projection and the instance reader report the same stored instance, so a case that
 /// read only one of them would not know whether the other agreed.
+///
+/// The two are two separate calls, and a transition the CLOCK owes the instance can come due
+/// BETWEEN them — so a disagreement is looked at again until both reads are of one instant,
+/// the way every wait in this suite looks again rather than taking one read's word. A
+/// disagreement that outlasts the deadline is the failure it always was.
 async fn reported_member(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
     instance_id: &str,
 ) -> Reported {
-    let held = group_instances(router, name).await;
-    let from_group = held
-        .iter()
-        .find(|instance| instance.instance_id == instance_id)
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: the group {name} must still hold {instance_id}, got {held:?}")
-        });
-    let (from_instance_read, group_of) = described_auto_scaling_instance(router, instance_id)
-        .await
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: DescribeAutoScalingInstances must report {instance_id}")
-        });
-    assert_eq!(
-        from_instance_read, from_group,
-        "case {case:?}: the two reads must report one instance for {instance_id}"
-    );
-    assert_eq!(
-        group_of, name,
-        "case {case:?}: the instance reader must report the group holding {instance_id}"
-    );
-    from_group
+    let deadline = Instant::now() + settle_deadline();
+    loop {
+        let held = group_instances(router, name).await;
+        let from_group = held
+            .iter()
+            .find(|instance| instance.instance_id == instance_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the group {name} must still hold {instance_id}, got {held:?}"
+                )
+            });
+        let (from_instance_read, group_of) = described_auto_scaling_instance(router, instance_id)
+            .await
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: DescribeAutoScalingInstances must report {instance_id}")
+            });
+        assert_eq!(
+            group_of, name,
+            "case {case:?}: the instance reader must report the group holding {instance_id}"
+        );
+        if from_instance_read == from_group {
+            return from_group;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the two reads must report one instance for {instance_id}, got \
+             {from_instance_read:?} from the instance reader and {from_group:?} from the group"
+        );
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
 }
 
 /// Create one group of `capacity` instances in one subnet of the account, carrying the

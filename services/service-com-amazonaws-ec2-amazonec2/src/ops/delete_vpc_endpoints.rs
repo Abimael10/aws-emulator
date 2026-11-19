@@ -165,36 +165,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each endpoint is judged on its own and reported in `Unsuccessful` when it cannot be
         // deleted — "information about the VPC endpoints that were not successfully deleted"
-        // — so one bad id does not refuse the endpoints beside it. An id this account holds no
-        // endpoint for is reported with the code and the sentence a bulk delete words that
-        // cause with, which is not the one an operation resolving an endpoint as its SUBJECT
-        // refuses with (see [`state::INVALID_VPC_ENDPOINT_NOT_FOUND`]).
+        // — so one bad id does not refuse the endpoints beside it. EVERY id this call cannot
+        // resolve to an endpoint of the account is reported with the ONE code a bulk delete
+        // words that cause with, whatever is wrong with the value: this operation has no
+        // per-item malformed class, because an id it cannot read resolves to no endpoint
+        // either, and the recorded answers carry the resource's not-found code for values
+        // outside the form EC2 issues as well as for ids inside it. That code is not the one
+        // an operation resolving an endpoint as its SUBJECT refuses with (see
+        // [`state::INVALID_VPC_ENDPOINT_NOT_FOUND`]), and the sentence beside it is worded by
+        // whether the value is an endpoint id EC2 could have ISSUED
+        // ([`state::unresolvable_vpc_endpoint_message`]).
         let mut unsuccessful: Vec<UnsuccessfulItem> = Vec::new();
         let mut deletable: Vec<String> = Vec::new();
         for endpoint_id in &requested {
-            let refusal = if !state::vpc_endpoint_id_is_well_formed(endpoint_id) {
-                Some((
-                    state::INVALID_VPC_ENDPOINT_ID_MALFORMED,
-                    state::invalid_id_message(endpoint_id),
-                ))
-            } else if store.vpc_endpoints.contains_key(endpoint_id) {
-                None
-            } else {
-                Some((
-                    state::INVALID_VPC_ENDPOINT_NOT_FOUND,
-                    state::vpc_endpoint_not_owned_message(endpoint_id),
-                ))
-            };
-            match refusal {
-                Some((code, message)) => unsuccessful.push(UnsuccessfulItem {
-                    resource_id: Some(endpoint_id.clone()),
-                    error: Some(UnsuccessfulItemError {
-                        code: Some(code.to_string()),
-                        message: Some(message),
-                    }),
-                }),
-                None => deletable.push(endpoint_id.clone()),
+            if store.vpc_endpoints.contains_key(endpoint_id) {
+                deletable.push(endpoint_id.clone());
+                continue;
             }
+            unsuccessful.push(UnsuccessfulItem {
+                resource_id: Some(endpoint_id.clone()),
+                error: Some(UnsuccessfulItemError {
+                    code: Some(state::INVALID_VPC_ENDPOINT_NOT_FOUND.to_string()),
+                    message: Some(state::unresolvable_vpc_endpoint_message(endpoint_id)),
+                }),
+            });
         }
 
         // The request is one that would have succeeded, so a dry run stops HERE: "If you

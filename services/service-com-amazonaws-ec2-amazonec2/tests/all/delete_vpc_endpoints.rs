@@ -8,10 +8,13 @@
 //! gateway endpoint, we delete the endpoint routes in the route tables for the endpoint …
 //! when you delete an interface endpoint, we delete its endpoint network interfaces"), and
 //! reports each id it could NOT delete in `Unsuccessful` — "information about the VPC
-//! endpoints that were not successfully deleted" — with that cause's own per-item code and
-//! sentence, rather than refusing the whole request for one id. A deleted endpoint then stops
-//! resolving, an endpoint the request did not name is untouched, and an authorized `DryRun`
-//! answers `DryRunOperation` having deleted nothing.
+//! endpoints that were not successfully deleted" — rather than refusing the whole request for
+//! one id. EVERY id it resolves no endpoint of the account for is reported under ONE per-item
+//! code, whatever is wrong with the value, with the sentence that cause is worded by whether
+//! the value is an id EC2 could have ISSUED: an id of the issued form is reported ABSENT, and
+//! a value outside that form, which decodes to no endpoint of any account, as one the caller
+//! does not OWN. A deleted endpoint then stops resolving, an endpoint the request did not name
+//! is untouched, and an authorized `DryRun` answers `DryRunOperation` having deleted nothing.
 //!
 //! Each table row is a distinct input along what that rule generalises over: how many ids one
 //! request carries, which of them resolve to an endpoint, WHERE in the list the ones that do
@@ -39,9 +42,6 @@ const DRY_RUN_STATUS: u16 = 412;
 /// spelt for the resource rather than for its id member, which is what a client that tells
 /// "not mine / already gone" from a real failure branches on.
 const INVALID_VPC_ENDPOINT_NOT_FOUND: &str = "InvalidVpcEndpoint.NotFound";
-
-/// The code a value that is not an endpoint id of this kind at all is reported with.
-const INVALID_VPC_ENDPOINT_ID_MALFORMED: &str = "InvalidVpcEndpointId.Malformed";
 
 /// The code `DescribeVpcEndpoints` refuses an id it holds no endpoint for with — the read
 /// that resolves an endpoint as the SUBJECT of the call, which is a different code from the
@@ -108,32 +108,38 @@ fn unsuccessful(case: &str, body: &str) -> Vec<Reported> {
         .collect()
 }
 
-/// What a well-formed id this account holds no endpoint for must be reported as: the code
-/// above and the sentence EC2 words that cause with — the fixed `user ` and ` does not own a
-/// resource `, around the account the lookup was made in and the id from the request.
-fn not_found_report(endpoint_id: &str) -> Reported {
+/// What an id of the form EC2 ISSUES that this account holds no endpoint for must be reported
+/// as: the one per-item code above and the sentence that names the endpoint ABSENT — the fixed
+/// `The `, ` '` and `' does not exist` around the resource as AWS names it in this sentence and
+/// the id from the request.
+fn absent_report(endpoint_id: &str) -> Reported {
     Reported {
         resource_id: endpoint_id.to_string(),
         code: INVALID_VPC_ENDPOINT_NOT_FOUND.to_string(),
+        message: format!("The Vpc Endpoint Id '{endpoint_id}' does not exist"),
+    }
+}
+
+/// What a value OUTSIDE that form must be reported as: the SAME per-item code — a bulk delete
+/// has no per-item malformed class, because a value it cannot read resolves to no endpoint
+/// either — with the sentence that names the resource one the caller does not OWN, since a
+/// value of no issued form decodes to no endpoint of any account: the fixed `user ` and ` does
+/// not own a resource ` around the account the lookup was made in and the value from the
+/// request.
+fn not_owned_report(value: &str) -> Reported {
+    Reported {
+        resource_id: value.to_string(),
+        code: INVALID_VPC_ENDPOINT_NOT_FOUND.to_string(),
         message: format!(
-            "user {owner} does not own a resource {endpoint_id}",
+            "user {owner} does not own a resource {value}",
             owner = engine::emulator_account_id(),
         ),
     }
 }
 
-/// What a value that is not an endpoint id of this kind must be reported as: EC2's one
-/// `Invalid id: "<value>"` sentence, with the value from the request in double quotes.
-fn malformed_report(value: &str) -> Reported {
-    Reported {
-        resource_id: value.to_string(),
-        code: INVALID_VPC_ENDPOINT_ID_MALFORMED.to_string(),
-        message: format!("Invalid id: \"{value}\""),
-    }
-}
-
-/// A well-formed VPC endpoint id, distinct per `slot`, far above anything this store's id
-/// counter can reach — so it resolves to no endpoint however many endpoints a test created.
+/// A VPC endpoint id of the form EC2 ISSUES (`vpce-` and 17 hexadecimal digits under a leading
+/// `0`), distinct per `slot` and far above anything this store's id counter can reach — so it
+/// resolves to no endpoint however many endpoints a test created.
 fn unresolvable_id(slot: usize) -> String {
     format!(
         "{prefix}-{suffix:017x}",
@@ -142,23 +148,30 @@ fn unresolvable_id(slot: usize) -> String {
     )
 }
 
-/// The forms a value that is NO endpoint id takes, one per slot that needs one.
+/// The values OUTSIDE the issued endpoint-id form a row reaches for, one per slot that needs
+/// one.
 ///
-/// Both are values a client plausibly sends: a `vpce-` prefix with a suffix that is not
-/// hexadecimal, and a VPC endpoint SERVICE id — which extends the endpoint's own prefix, so
-/// only the suffix separates the two kinds
-/// (`ec2::state::vpc_endpoint_id_is_well_formed`).
-const MALFORMED_VALUES: [&str; 2] = ["vpce-not-hex", "vpce-svc-0a1b2c3d4e5f6a7b8"];
+/// Each is a value a client plausibly sends and no mint can have produced: the all-zero
+/// placeholder, a long form whose leading digit no issued id carries, a `vpce-` prefix with a
+/// suffix that is not hexadecimal, and a VPC endpoint SERVICE id — which extends the
+/// endpoint's own prefix, so only the suffix separates the two kinds
+/// (`ec2::state::issued_id_is_well_formed` on `ec2::state::VPC_ENDPOINT_ID_PREFIX`).
+const VALUES_OUTSIDE_THE_ISSUED_FORM: [&str; 4] = [
+    "vpce-00000000000000000",
+    "vpce-11111111111111111",
+    "vpce-not-hex",
+    "vpce-svc-0a1b2c3d4e5f6a7b8",
+];
 
 /// What one slot of a request's `VpcEndpointIds` list carries.
 #[derive(Clone, Copy, Debug)]
 enum Slot {
     /// An endpoint this row created, which the delete has to remove.
     Real,
-    /// A well-formed id this account holds no endpoint for.
+    /// An id of the issued form this account holds no endpoint for.
     Unresolvable,
-    /// A value that is not an endpoint id of this kind at all.
-    Malformed,
+    /// A value outside the issued endpoint-id form.
+    OutsideTheIssuedForm,
 }
 
 /// The endpoint types a row's real ids are created from, in turn: both the type that stands
@@ -285,9 +298,14 @@ async fn a_bulk_delete_removes_what_it_resolves_and_reports_the_rest_per_item() 
             &[Slot::Unresolvable, Slot::Real, Slot::Unresolvable],
         ),
         (
-            "two endpoints with a value that is no id between them",
+            "two endpoints with a value outside the issued form between them",
             "10.62.0.0/16",
-            &[Slot::Real, Slot::Malformed, Slot::Real, Slot::Unresolvable],
+            &[
+                Slot::Real,
+                Slot::OutsideTheIssuedForm,
+                Slot::Real,
+                Slot::Unresolvable,
+            ],
         ),
         (
             "nothing but ids naming nothing",
@@ -295,9 +313,14 @@ async fn a_bulk_delete_removes_what_it_resolves_and_reports_the_rest_per_item() 
             &[Slot::Unresolvable, Slot::Unresolvable],
         ),
         (
-            "nothing but values that are no ids at all",
+            "nothing but values outside the issued form",
             "10.64.0.0/16",
-            &[Slot::Malformed, Slot::Malformed],
+            &[
+                Slot::OutsideTheIssuedForm,
+                Slot::OutsideTheIssuedForm,
+                Slot::OutsideTheIssuedForm,
+                Slot::OutsideTheIssuedForm,
+            ],
         ),
         ("one endpoint alone", "10.65.0.0/16", &[Slot::Real]),
     ];
@@ -323,12 +346,13 @@ async fn a_bulk_delete_removes_what_it_resolves_and_reports_the_rest_per_item() 
                 }
                 Slot::Unresolvable => {
                     let endpoint_id = unresolvable_id(slot_index);
-                    expected.push(not_found_report(&endpoint_id));
+                    expected.push(absent_report(&endpoint_id));
                     named.push(endpoint_id);
                 }
-                Slot::Malformed => {
-                    let value = MALFORMED_VALUES[expected.len() % MALFORMED_VALUES.len()];
-                    expected.push(malformed_report(value));
+                Slot::OutsideTheIssuedForm => {
+                    let value = VALUES_OUTSIDE_THE_ISSUED_FORM
+                        [expected.len() % VALUES_OUTSIDE_THE_ISSUED_FORM.len()];
+                    expected.push(not_owned_report(value));
                     named.push(value.to_string());
                 }
             }
@@ -411,7 +435,7 @@ async fn one_id_named_several_times_is_asked_for_once() {
         let expected: Vec<Reported> = if resolves {
             Vec::new()
         } else {
-            vec![not_found_report(&named)]
+            vec![absent_report(&named)]
         };
         assert_eq!(
             reported, expected,
@@ -447,9 +471,9 @@ async fn a_dry_run_reports_dry_run_operation_and_deletes_nothing() {
             &[Slot::Unresolvable],
         ),
         (
-            "a value that is no id at all",
+            "a value outside the issued form",
             "10.73.0.0/16",
-            &[Slot::Malformed],
+            &[Slot::OutsideTheIssuedForm],
         ),
     ];
 
@@ -464,7 +488,7 @@ async fn a_dry_run_reports_dry_run_operation_and_deletes_nothing() {
             .map(|(slot_index, slot)| match slot {
                 Slot::Real => endpoint_id.clone(),
                 Slot::Unresolvable => unresolvable_id(slot_index),
-                Slot::Malformed => MALFORMED_VALUES[0].to_string(),
+                Slot::OutsideTheIssuedForm => VALUES_OUTSIDE_THE_ISSUED_FORM[0].to_string(),
             })
             .collect();
         let references: Vec<&str> = named.iter().map(String::as_str).collect();

@@ -14,8 +14,10 @@
 //! 3. IT IS THE SAME SNAPSHOT A LATER READ REPORTS: `DescribeSnapshots` answers it by its own
 //!    id and in the listing filtered on the source volume, which is how a backup flow finds
 //!    it;
-//! 4. A `VolumeId` THIS OPERATION CANNOT RESOLVE IS REFUSED WITH ONE ANSWER, whichever way it
-//!    fails to name a volume of the account, and nothing is stored;
+//! 4. A `VolumeId` THIS OPERATION CANNOT RESOLVE IS REFUSED BY FORM THEN BY EXISTENCE — a
+//!    value outside the printed form EC2 issues before any lookup, and a value inside it that
+//!    names no volume of the account (a volume the account DELETED included) as absent — and
+//!    nothing is stored;
 //! 5. ANY OTHER REQUEST THAT CANNOT BE SERVED IS REFUSED WITH EC2'S OWN CODE AND NOTHING IS
 //!    STORED: a location or an Outpost this emulator has none of, a value outside a modelled
 //!    enum's catalog, and a `DryRun` that reports whether the call would have worked.
@@ -206,29 +208,66 @@ async fn a_snapshot_reports_the_volume_it_was_taken_of() {
     }
 }
 
-/// RULE 4: every `VolumeId` this operation cannot resolve to a volume of the account gets the
-/// SAME answer — 400 `InvalidVolumeID.Malformed` with the service's parameter-layer sentence
-/// naming the id the request sent — whether the value is not a volume id at all or is well
-/// formed and names no volume. The recorded unit `ec2.op-contract-create-snapshot` (corpus
-/// `simparity-behavioral-aws-v1`, named in this operation's issue) carries that answer for a
-/// well-formed id of the long form the account holds no volume for, which is why this
-/// operation does not split the two the way `DeleteVolume` and `AttachVolume` do.
+/// RULE 4: a `VolumeId` this operation cannot resolve is answered the FORM question before the
+/// EXISTENCE question — a value outside the printed form EC2 ISSUES is 400
+/// `InvalidVolumeID.Malformed` with the service's parameter-layer sentence naming the value,
+/// and a value INSIDE that form which names no volume of the account is 400
+/// `InvalidVolume.NotFound` with the sentence naming the volume absent — and nothing is stored
+/// either way.
+///
+/// The recorded wire units `ec2-ebs-volume-delete-and-snapshot-not-found` (a volume of the
+/// account deleted, then snapshotted by that same id) and `ec2-volume-snapshot-copy-lifecycle`
+/// (an id of the published long form nothing was created under) carry the not-found half; the
+/// recorded behavioral unit `ec2.op-contract-create-snapshot` carries the parameter-layer
+/// refusal for a value outside the issued form.
 ///
 /// The rows span both id forms EC2 has issued (8 and 17 hexadecimal digits), the all-zero
-/// placeholder, values outside that form, and the id of another kind of resource.
+/// placeholder, a long form whose leading digit no issued id carries, values outside that form,
+/// and the id of another kind of resource.
 #[tokio::test]
-async fn a_volume_id_this_operation_cannot_resolve_gets_one_answer() {
+async fn a_volume_id_this_operation_cannot_resolve_is_refused_by_form_then_existence() {
     let (router, _engine) = super::ec2_query::emulator();
     // One volume the account DOES hold, so each refusal below is about the id the request
     // named rather than about an empty store.
     let held = create_volume(&router, 1, false).await;
 
-    let rows: [(&str, &str); 8] = [
-        ("a well-formed long id naming no volume", UNKNOWN_VOLUME_ID),
-        ("a well-formed short id naming no volume", "vol-1a2b3c4d"),
+    // The ids of the ISSUED form that name no volume of the account: reported absent.
+    let absent: [(&str, &str); 2] = [
+        (
+            "a long id of the issued form naming no volume",
+            UNKNOWN_VOLUME_ID,
+        ),
+        ("a short id naming no volume", "vol-1a2b3c4d"),
+    ];
+    for (case, volume_id) in absent {
+        let (status, body) = op(&router, "CreateSnapshot", &[p("VolumeId", volume_id)]).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidVolume.NotFound",
+            "case {case:?}: expected InvalidVolume.NotFound, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("The volume '{volume_id}' does not exist."),
+            "case {case:?}: expected the refusal's whole sentence, got {:?}",
+            error_message(&body)
+        );
+    }
+
+    // The values OUTSIDE that form: refused before any lookup, in the parameter layer's own
+    // wording.
+    let unreadable: [(&str, &str); 7] = [
         (
             "the all-zero placeholder no mint can issue",
             "vol-00000000000000000",
+        ),
+        (
+            "a long form whose leading digit no issued id carries",
+            "vol-10000000000000001",
         ),
         ("a value that is not a volume id at all", "not-a-volume"),
         ("the prefix with no digits", "vol-"),
@@ -239,7 +278,7 @@ async fn a_volume_id_this_operation_cannot_resolve_gets_one_answer() {
             "snap-0123456789abcdef0",
         ),
     ];
-    for (case, volume_id) in rows {
+    for (case, volume_id) in unreadable {
         let (status, body) = op(&router, "CreateSnapshot", &[p("VolumeId", volume_id)]).await;
         assert_eq!(
             status, 400,
@@ -280,6 +319,58 @@ async fn a_volume_id_this_operation_cannot_resolve_gets_one_answer() {
         1,
         "that create mints exactly one snapshot, got {body}"
     );
+}
+
+/// RULE 4, the half the recorded wire unit turns on: a volume the account DELETED is a volume
+/// the account no longer holds, so a snapshot of its own id is refused
+/// `InvalidVolume.NotFound` — the id EC2 issued stays readable after the volume is gone, which
+/// is what lets a backup flow tell a deleted volume from an unreadable value.
+///
+/// The rows differ in the volume the delete removed: its size, and whether it was encrypted —
+/// what a snapshot of it would have reported.
+#[tokio::test]
+async fn snapshotting_a_deleted_volume_reports_the_volume_absent() {
+    let rows: [(&str, i32, bool); 3] = [
+        ("a one GiB plain volume", 1, false),
+        ("an eight GiB encrypted volume", 8, true),
+        ("a sixteen GiB plain volume", 16, false),
+    ];
+    for (case, size, encrypted) in rows {
+        let (router, _engine) = super::ec2_query::emulator();
+        let volume_id = create_volume(&router, size, encrypted).await;
+        // Snapshotting it works while the account holds it, so the refusal below is about the
+        // DELETE and not about the id.
+        let (status, body) = op(&router, "CreateSnapshot", &[p("VolumeId", &volume_id)]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the held volume to be snapshottable, got {status} with \
+             body {body}"
+        );
+
+        let (status, body) = op(&router, "DeleteVolume", &[p("VolumeId", &volume_id)]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected DeleteVolume to succeed, got {status} with body {body}"
+        );
+
+        let (status, body) = op(&router, "CreateSnapshot", &[p("VolumeId", &volume_id)]).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 once the volume is gone, got {status} with body \
+             {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidVolume.NotFound",
+            "case {case:?}: expected InvalidVolume.NotFound for the deleted volume, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("The volume '{volume_id}' does not exist."),
+            "case {case:?}: expected the refusal's whole sentence, got {:?}",
+            error_message(&body)
+        );
+    }
 }
 
 /// One refusal row: the case, the request's parameters, and the HTTP status and EC2 error

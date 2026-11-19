@@ -2753,8 +2753,9 @@ pub fn invalid_vpc_endpoint_id_not_found<E>(vpc_endpoint_id: &str) -> Scaffolded
     )
 }
 
-/// `InvalidVpcEndpoint.NotFound`: the code the BULK delete of VPC endpoints reports an id it
-/// resolves no endpoint for with, PER ITEM in `Unsuccessful`.
+/// `InvalidVpcEndpoint.NotFound`: the code the BULK delete of VPC endpoints reports EVERY id
+/// it resolves no endpoint for with, PER ITEM in `Unsuccessful` — whatever is wrong with the
+/// value.
 ///
 /// NOT [`INVALID_VPC_ENDPOINT_ID_NOT_FOUND`], and the recorded wire corpus is why: the
 /// operations that resolve a `VpcEndpointId` as the SUBJECT of the call refuse an unknown one
@@ -2763,22 +2764,51 @@ pub fn invalid_vpc_endpoint_id_not_found<E>(vpc_endpoint_id: &str) -> Scaffolded
 /// answered, so the two are kept apart rather than folded into one — the same way
 /// [`crate::state::INVALID_VPN_CONNECTION_ID`] and
 /// [`crate::state::INVALID_VPN_CONNECTION_ID_NOT_FOUND`] are.
+///
+/// The bulk delete has NO per-item malformed class beside it: a value this service cannot read
+/// as an endpoint id resolves to no endpoint either, and a bulk call reports that per item
+/// rather than refusing the ids beside it. The recorded units of the wire fixture
+/// `ec2-vpce-traj-endpoint-lookup-mistakes` are the evidence — their `DeleteVpcEndpoints`
+/// steps name values this crate's endpoint-id reader rejects, and they match the recorded
+/// per-item `code` and `message` only when this one code is reported for them; while a
+/// malformed class stood here, both diverged. The sentence the entry carries is
+/// [`unresolvable_vpc_endpoint_message`]'s.
 pub const INVALID_VPC_ENDPOINT_NOT_FOUND: &str = "InvalidVpcEndpoint.NotFound";
 
-/// The sentence that per-item report carries: the fixed `user ` and ` does not own a resource
-/// `, the account the lookup was made in ([`::engine::emulator_account_id`], the one account
-/// this emulator serves) and the endpoint id from the REQUEST.
+/// The sentence that per-item report carries for ONE id the bulk delete resolved no endpoint
+/// for, worded by whether the value is an endpoint id EC2 could have ISSUED
+/// ([`issued_id_is_well_formed`] on [`VPC_ENDPOINT_ID_PREFIX`]):
 ///
-/// A bulk delete says nothing about WHY an id resolved to nothing — an id of another account's
-/// endpoint and an id of an endpoint that is already gone read alike from here — so one
-/// wording covers both, which is what the recorded refusal shows. The echo is bounded by
+/// * an id of the ISSUED form the account holds no endpoint for — an endpoint of the account
+///   that is already gone, or an id of the form nothing was created under — is reported
+///   ABSENT, in the sentence [`id_not_found_message`] builds around
+///   [`VPC_ENDPOINT_ID_KIND`]: "The Vpc Endpoint Id '…' does not exist";
+/// * a value OUTSIDE that form — the all-zero placeholder, a long form whose leading digit
+///   no issued id carries, and a value this service cannot read as an endpoint id at all —
+///   decodes to no endpoint of any account, so it is reported as one the caller does not OWN:
+///   the fixed `user ` and ` does not own a resource ` around the account the lookup was made
+///   in ([`::engine::emulator_account_id`], the one account this emulator serves) and the id
+///   from the REQUEST.
+///
+/// Both are the recorded wording of this one cause, which is why the two live together: the
+/// wire corpus records the absent sentence for an id of the issued form, and the ownership
+/// sentence for the values the wire fixture `ec2-vpce-traj-endpoint-lookup-mistakes` names
+/// outside it (see [`INVALID_VPC_ENDPOINT_NOT_FOUND`] for what those recorded steps fix),
+/// while the behavioral corpus records it for the placeholder and for a long form outside the
+/// issued one. A bulk delete says nothing more about WHY an id resolved to nothing — an id of
+/// another account's endpoint and an id of an endpoint that is already gone read alike from
+/// here — so one sentence covers each class rather than one per reason. The echo is bounded by
 /// [`echoed_resource_id`], as every refusal quoting a caller-chosen id is.
-pub fn vpc_endpoint_not_owned_message(vpc_endpoint_id: &str) -> String {
-    format!(
-        "user {owner} does not own a resource {endpoint}",
-        owner = ::engine::emulator_account_id(),
-        endpoint = echoed_resource_id(vpc_endpoint_id),
-    )
+pub fn unresolvable_vpc_endpoint_message(vpc_endpoint_id: &str) -> String {
+    let endpoint = echoed_resource_id(vpc_endpoint_id);
+    if issued_id_is_well_formed(VPC_ENDPOINT_ID_PREFIX, vpc_endpoint_id) {
+        id_not_found_message(VPC_ENDPOINT_ID_KIND, &endpoint)
+    } else {
+        format!(
+            "user {owner} does not own a resource {endpoint}",
+            owner = ::engine::emulator_account_id(),
+        )
+    }
 }
 
 /// `InvalidVpcEndpointServiceId.NotFound` (HTTP 400): the request named a VPC endpoint

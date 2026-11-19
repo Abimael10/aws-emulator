@@ -742,20 +742,15 @@ pub fn require_known_volume<E>(
 /// The ONE definition of how this service resolves a volume id a request named: an id it
 /// cannot READ as a volume id ([`volume_id_is_readable`]) is answered as malformed, and a
 /// readable one this account holds no volume for as not found — the way the service orders
-/// the two, the FORM question before the EXISTENCE question. A volume whose
-/// withdrawal the clock has made due is one the account no longer holds
-/// ([`ComAmazonawsEc2Amazonec2State::volume_is_withdrawn`]), so it resolves as not found.
+/// the two, the FORM question before the EXISTENCE question. Each half has one body: the form
+/// one [`require_readable_volume_id`], the existence one [`require_held_volume`] (where the
+/// clock's own withdrawals are read).
 pub fn require_volume<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
     volume_id: &str,
 ) -> Result<&'store VolumeRecord, crate::scaffolded::Scaffolded<E>> {
     require_readable_volume_id(store, volume_id)?;
-    let now = Instant::now();
-    store
-        .volumes
-        .get(volume_id)
-        .filter(|record| !record.is_withdrawn_at(now))
-        .ok_or_else(|| invalid_volume_id_not_found(volume_id))
+    require_held_volume(store, volume_id)
 }
 
 /// [`require_volume`] for an operation that WRITES the volume it resolved.
@@ -813,6 +808,26 @@ pub fn require_readable_volume_id<E>(
     } else {
         Err(invalid_volume_id_malformed(volume_id))
     }
+}
+
+/// The volume the account HOLDS under `volume_id`, or the not-found refusal: the EXISTENCE
+/// half of [`require_volume`] on its own, for an operation that reads the id's FORM its own
+/// way.
+///
+/// A volume whose withdrawal the clock has made due is one the account no longer holds
+/// ([`ComAmazonawsEc2Amazonec2State::volume_is_withdrawn`]), so it resolves as not found here
+/// too — the two halves of the rule stay one definition each, whichever reading of the FORM
+/// the operation that calls this made.
+pub fn require_held_volume<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    volume_id: &str,
+) -> Result<&'store VolumeRecord, crate::scaffolded::Scaffolded<E>> {
+    let now = Instant::now();
+    store
+        .volumes
+        .get(volume_id)
+        .filter(|record| !record.is_withdrawn_at(now))
+        .ok_or_else(|| invalid_volume_id_not_found(volume_id))
 }
 
 /// Refuse a request that named something that is not a volume id at all: HTTP 400
