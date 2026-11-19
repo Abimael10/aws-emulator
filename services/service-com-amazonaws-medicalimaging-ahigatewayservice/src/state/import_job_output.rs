@@ -285,7 +285,7 @@ pub fn job_output_objects(
                 "inputFile": object.key,
                 // An object that WAS read as a DICOM P10 file and still landed in no image
                 // set is one the grouping could not place.
-                "message": object.skipped.unwrap_or(NO_STUDY_OR_SERIES),
+                "message": object.skipped.as_deref().unwrap_or(NO_STUDY_OR_SERIES),
             })
             .to_string(),
         );

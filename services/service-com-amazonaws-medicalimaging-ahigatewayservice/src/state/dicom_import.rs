@@ -26,7 +26,12 @@
 //!    series per image set (the model's `DICOMTags` declares one
 //!    `dicomSeriesInstanceUID`).
 //!
-//! What is STORED is the pixel data and the DICOM attributes the files carried. The
+//! What is STORED is the pixel data and the DICOM attributes the files carried — of the
+//! attributes the MODEL names, only the values its `DICOMTags` members can hold, which is
+//! the one rule every writer of those members answers to
+//! ([`super::unheld_requirement`]): a file carrying a value outside a member's modelled
+//! constraints is one of the individual failures the job's manifests report, rather than an
+//! image set reporting what the model forbids. The
 //! transfer syntax a file declared is not among them: it describes how that file encoded
 //! its own dataset, and the file is not what `GetImageFrame` serves back — so an imported
 //! frame has no stored transfer syntax, and that read answers the `contentType` its member
@@ -172,7 +177,7 @@ pub struct ScannedObject {
     pub instance: Option<ImportedInstance>,
     /// Why this object contributed no instance, when it contributed none. `None` for an
     /// object that was read as a DICOM P10 file.
-    pub skipped: Option<&'static str>,
+    pub skipped: Option<String>,
 }
 
 /// Everything one import established about its input prefix: what the object store
@@ -228,6 +233,18 @@ mod skipped {
     pub const TOO_LARGE: &str = "The object is larger than this service imports";
     /// The object's bytes are not a DICOM Part 10 file.
     pub const NOT_PART10: &str = "The object is not a readable DICOM P10 file";
+
+    /// The file's data set carries, for a DICOM attribute the model holds in a
+    /// `DICOMTags` member, a value that member cannot hold
+    /// ([`crate::state::unheld_requirement`]).
+    ///
+    /// The two variable parts are what the file itself carried: the attribute's DICOM
+    /// keyword and the requirement its value failed, which is the same requirement an
+    /// update document naming that attribute is refused with — so one rule about what a
+    /// member may hold is stated in one wording wherever a value is turned away.
+    pub fn unholdable_value(keyword: &str, requirement: &str) -> String {
+        format!("The object's {keyword} is not a value an image set can hold: {requirement}")
+    }
 }
 
 /// Why an object that WAS read as a DICOM P10 file still landed in no image set: the
@@ -327,7 +344,7 @@ pub async fn read_import_prefix(
             objects.push(ScannedObject {
                 key: key.to_string(),
                 instance: None,
-                skipped: Some(skipped::TOO_LARGE),
+                skipped: Some(skipped::TOO_LARGE.to_string()),
             });
             continue;
         }
@@ -349,19 +366,20 @@ pub async fn read_import_prefix(
 
 /// One object's bytes, read and parsed, or why it contributed no instance: the store did
 /// not serve it, it is larger than [`MAX_IMPORTED_OBJECT_BYTES`], it declared no length at
-/// all, or it is not a DICOM Part 10 file.
+/// all, it is not a DICOM Part 10 file, or it carries a value one of the modelled DICOM
+/// attributes of an image set cannot hold ([`read_part10`]).
 async fn read_object(
     client: &::aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
-) -> Result<ImportedInstance, &'static str> {
+) -> Result<ImportedInstance, String> {
     let read = client
         .get_object()
         .bucket(bucket)
         .key(key)
         .send()
         .await
-        .map_err(|_| skipped::UNREAD)?;
+        .map_err(|_| skipped::UNREAD.to_string())?;
     // The ceiling against what the store SAYS the object holds, BEFORE any of it is read
     // into this process — so the bound precedes the allocation rather than following it.
     // An answer that declares no length is not read at all: the cap cannot be checked
@@ -370,34 +388,46 @@ async fn read_object(
     let declared = read
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
-        .ok_or(skipped::UNREAD)?;
+        .ok_or(skipped::UNREAD.to_string())?;
     if declared > MAX_IMPORTED_OBJECT_BYTES {
-        return Err(skipped::TOO_LARGE);
+        return Err(skipped::TOO_LARGE.to_string());
     }
     let body = read
         .body
         .collect()
         .await
-        .map_err(|_| skipped::UNREAD)?
+        .map_err(|_| skipped::UNREAD.to_string())?
         .into_bytes();
     // And against what ARRIVED, so an answer whose declared length was not the truth
     // cannot get past it either.
     if body.len() > MAX_IMPORTED_OBJECT_BYTES {
-        return Err(skipped::TOO_LARGE);
+        return Err(skipped::TOO_LARGE.to_string());
     }
-    let mut instance = read_part10(&body).ok_or(skipped::NOT_PART10)?;
+    let mut instance = read_part10(&body)?;
     instance.source_key = Some(key.to_string());
     Ok(instance)
 }
 
-/// The instance a DICOM Part 10 file carries, or `None` when `bytes` are not one.
+/// The instance a DICOM Part 10 file carries, or why `bytes` describe none — the reason
+/// the job's output manifest reports against the object they came from.
 ///
 /// The file meta group is located first: a Part 10 FILE opens with a 128-byte preamble
 /// followed by the `DICM` magic code, and a Part 10 STREAM carries the magic code alone,
 /// so both forms are read. Everything after that — which transfer syntax the dataset is
 /// encoded in, how its elements are laid out, which character set its text is in — is the
 /// DICOM library's to decide from the file itself.
-pub fn read_part10(bytes: &[u8]) -> Option<ImportedInstance> {
+///
+/// What the data set carried is then held to what the MODEL says an image set's attributes
+/// may hold: each attribute the model names is destined for a `DICOMTags` member that
+/// declares its kind, its `@length`, its `@pattern` and its `@range`, and this file's bytes
+/// are no more walked by the boundary validator than an update document's blob is, so the
+/// one check every writer of those members runs ([`super::unheld_requirement`]) runs here
+/// too. A file carrying a value its member cannot hold describes no instance: a search
+/// summary and a served metadata document report what the members hold, so storing such a
+/// value would report what the model forbids. The object is reported as that object's own
+/// failure in the job's manifests, which is where a validation issue found during an import
+/// belongs, and the rest of the import is unaffected.
+pub fn read_part10(bytes: &[u8]) -> Result<ImportedInstance, String> {
     let dataset = if bytes.get(PART10_PREAMBLE_BYTES..PART10_PREAMBLE_BYTES + PART10_MAGIC.len())
         == Some(PART10_MAGIC.as_slice())
     {
@@ -405,9 +435,10 @@ pub fn read_part10(bytes: &[u8]) -> Option<ImportedInstance> {
     } else if bytes.starts_with(PART10_MAGIC) {
         bytes
     } else {
-        return None;
+        return Err(skipped::NOT_PART10.to_string());
     };
-    let object = ::dicom_object::from_reader(::std::io::Cursor::new(dataset)).ok()?;
+    let object = ::dicom_object::from_reader(::std::io::Cursor::new(dataset))
+        .map_err(|_| skipped::NOT_PART10.to_string())?;
     let tags = DICOMTags {
         dicom_patient_id: text(&object, tags::PATIENT_ID),
         dicom_patient_name: text(&object, tags::PATIENT_NAME),
@@ -441,12 +472,18 @@ pub fn read_part10(bytes: &[u8]) -> Option<ImportedInstance> {
         )
         .unwrap_or_default(),
     };
+    // Every modelled member at once, because a file assembles the whole of them: the first
+    // attribute whose value its member cannot hold is the one the refusal states, in the
+    // order the model declares the members.
+    if let Some((attribute, requirement)) = super::unheld_requirement(&tags) {
+        return Err(skipped::unholdable_value(attribute.keyword(), &requirement));
+    }
     let pixel_data = object
         .get(tags::PIXEL_DATA)
         .and_then(|element| element.value().to_bytes().ok())
         .map(|bytes| bytes.to_vec())
         .filter(|bytes| !bytes.is_empty());
-    Some(ImportedInstance {
+    Ok(ImportedInstance {
         // Filled in by the read that NAMED the object; nothing about the bytes names one.
         source_key: None,
         study_instance_uid: tags.dicom_study_instance_uid.clone(),

@@ -86,11 +86,11 @@ fn unplaceable(key: &str) -> ScannedObject {
 }
 
 /// One scanned object that carried no instance at all, passed over for `reason`.
-fn skipped(key: &str, reason: &'static str) -> ScannedObject {
+fn skipped(key: &str, reason: &str) -> ScannedObject {
     ScannedObject {
         key: key.to_string(),
         instance: None,
-        skipped: Some(reason),
+        skipped: Some(reason.to_string()),
     }
 }
 

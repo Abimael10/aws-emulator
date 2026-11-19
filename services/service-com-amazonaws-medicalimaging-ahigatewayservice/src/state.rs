@@ -86,6 +86,11 @@ pub use dicom_import::*;
 mod dicom_instance;
 pub use dicom_instance::*;
 
+/// What a modelled `DICOMTags` member may HOLD — the constraints the model declares on it,
+/// applied by every writer of one.
+mod modelled_attribute;
+pub use modelled_attribute::*;
+
 /// What a DICOM import job's completion WRITES, and what its outcome is decided from.
 pub mod import_job_output;
 

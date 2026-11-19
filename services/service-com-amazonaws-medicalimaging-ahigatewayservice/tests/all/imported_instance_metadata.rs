@@ -76,15 +76,16 @@ const POLL_DEADLINE: Duration = Duration::from_secs(120);
 /// How long a poll waits between looks.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// Explicit VR Little Endian — the encoding most DICOM files on disk carry.
-const EXPLICIT_VR_LE: &str = "1.2.840.10008.1.2.1";
+/// Explicit VR Little Endian — the encoding most DICOM files on disk carry, and the one
+/// [`part10_file`] writes a data set explicitly for.
+pub(crate) const EXPLICIT_VR_LE: &str = "1.2.840.10008.1.2.1";
 
 /// Implicit VR Little Endian — the DICOM default encoding, in which an element carries no
 /// value representation of its own and a reader takes it from the data dictionary.
 const IMPLICIT_VR_LE: &str = "1.2.840.10008.1.2";
 
 /// The SOP class every file below declares: Secondary Capture Image Storage.
-const SOP_CLASS: &str = "1.2.840.10008.5.1.4.1.1.7";
+pub(crate) const SOP_CLASS: &str = "1.2.840.10008.5.1.4.1.1.7";
 
 /// The implementation class UID the files below declare, which the file meta group of every
 /// Part 10 file carries.
@@ -130,7 +131,10 @@ const SOP_UID: &str = "1.2.826.0.1.3680043.9.7133.11.1.1.1";
 const OTHER_SOP_UID: &str = "1.2.826.0.1.3680043.9.7133.11.1.1.2";
 
 /// `value`, padded to the even length DICOM writes every data element value at.
-fn padded(value: &[u8], pad: u8) -> Vec<u8> {
+///
+/// Shared with the sibling suites that write Part 10 files: `crate::dicom_part10_reading`
+/// builds its own files from these, so one writer of a DICOM data element serves both.
+pub(crate) fn padded(value: &[u8], pad: u8) -> Vec<u8> {
     let mut bytes = value.to_vec();
     if bytes.len() % 2 == 1 {
         bytes.push(pad);
@@ -147,7 +151,7 @@ fn written(value: &str) -> String {
 /// One data element in EXPLICIT VR little endian: the tag, the value representation, then
 /// the value's length — 32-bit for the value representations DICOM gives the long form,
 /// 16-bit for the rest (DICOM PS3.5 section 7.1.2).
-fn explicit(group: u16, element: u16, vr: &[u8; 2], value: &[u8]) -> Vec<u8> {
+pub(crate) fn explicit(group: u16, element: u16, vr: &[u8; 2], value: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&group.to_le_bytes());
     out.extend_from_slice(&element.to_le_bytes());
@@ -175,15 +179,16 @@ fn implicit(group: u16, element: u16, value: &[u8]) -> Vec<u8> {
 
 /// One attribute of a data set: its tag, the value representation the explicit encoding
 /// writes, and the value as DICOM pads it.
-struct Attribute {
-    group: u16,
-    element: u16,
-    vr: &'static [u8; 2],
-    value: Vec<u8>,
+#[derive(Clone)]
+pub(crate) struct Attribute {
+    pub(crate) group: u16,
+    pub(crate) element: u16,
+    pub(crate) vr: &'static [u8; 2],
+    pub(crate) value: Vec<u8>,
 }
 
 /// A text attribute, padded with a space as DICOM pads text.
-fn text(group: u16, element: u16, vr: &'static [u8; 2], value: &str) -> Attribute {
+pub(crate) fn text(group: u16, element: u16, vr: &'static [u8; 2], value: &str) -> Attribute {
     Attribute {
         group,
         element,
@@ -193,7 +198,7 @@ fn text(group: u16, element: u16, vr: &'static [u8; 2], value: &str) -> Attribut
 }
 
 /// A UID attribute, padded with a NUL as DICOM pads a UI value.
-fn uid(group: u16, element: u16, value: &str) -> Attribute {
+pub(crate) fn uid(group: u16, element: u16, value: &str) -> Attribute {
     Attribute {
         group,
         element,
@@ -264,28 +269,6 @@ impl Case {
     /// the group length attribute carries and so the number the document must report for
     /// it.
     fn part10(&self, sop_uid: &str) -> (Vec<u8>, u32) {
-        let mut meta = Vec::new();
-        meta.extend(explicit(0x0002, 0x0001, b"OB", &[0x00, 0x01]));
-        meta.extend(explicit(
-            0x0002,
-            0x0002,
-            b"UI",
-            &padded(SOP_CLASS.as_bytes(), 0),
-        ));
-        meta.extend(explicit(0x0002, 0x0003, b"UI", &padded(sop_uid.as_bytes(), 0)));
-        meta.extend(explicit(
-            0x0002,
-            0x0010,
-            b"UI",
-            &padded(self.transfer_syntax.as_bytes(), 0),
-        ));
-        meta.extend(explicit(
-            0x0002,
-            0x0012,
-            b"UI",
-            &padded(IMPLEMENTATION_CLASS.as_bytes(), 0),
-        ));
-
         let mut attributes = vec![
             uid(0x0008, 0x0016, SOP_CLASS),
             uid(0x0008, 0x0018, sop_uid),
@@ -329,30 +312,80 @@ impl Case {
                 value: padded(pixels, 0),
             });
         }
-
-        let explicit_dataset = self.transfer_syntax == EXPLICIT_VR_LE;
-        let mut dataset = Vec::new();
-        for attribute in &attributes {
-            if explicit_dataset {
-                dataset.extend(explicit(
-                    attribute.group,
-                    attribute.element,
-                    attribute.vr,
-                    &attribute.value,
-                ));
-            } else {
-                dataset.extend(implicit(attribute.group, attribute.element, &attribute.value));
-            }
-        }
-
-        let mut file = vec![0_u8; 128];
-        file.extend_from_slice(b"DICM");
-        let group_length = u32::try_from(meta.len()).expect("a short meta group");
-        file.extend(explicit(0x0002, 0x0000, b"UL", &group_length.to_le_bytes()));
-        file.extend(meta);
-        file.extend(dataset);
-        (file, group_length)
+        part10_file(
+            sop_uid,
+            self.transfer_syntax,
+            Some(IMPLEMENTATION_CLASS),
+            &attributes,
+        )
     }
+}
+
+/// The DICOM Part 10 FILE carrying `attributes`: the 128-byte preamble, the `DICM` magic
+/// code, the file meta group (always explicit VR little endian, as DICOM PS3.10 requires)
+/// and the data set in the transfer syntax that group declares — explicit VR little endian
+/// written explicitly, every other transfer syntax written implicitly.
+///
+/// Answers the bytes and the length of the meta group's elements, which is the value the
+/// group length attribute carries and so the number the document must report for it.
+///
+/// The one writer of a Part 10 file in this test binary: `crate::dicom_part10_reading`
+/// builds its own files through it, so the two suites cannot drift on what such a file
+/// looks like. `implementation_class` is the `(0002,0012)` element, for a file that declares
+/// one, and the attributes are written in the order given — which DICOM wants ascending by
+/// tag.
+pub(crate) fn part10_file(
+    sop_uid: &str,
+    transfer_syntax: &str,
+    implementation_class: Option<&str>,
+    attributes: &[Attribute],
+) -> (Vec<u8>, u32) {
+    let mut meta = Vec::new();
+    meta.extend(explicit(0x0002, 0x0001, b"OB", &[0x00, 0x01]));
+    meta.extend(explicit(
+        0x0002,
+        0x0002,
+        b"UI",
+        &padded(SOP_CLASS.as_bytes(), 0),
+    ));
+    meta.extend(explicit(0x0002, 0x0003, b"UI", &padded(sop_uid.as_bytes(), 0)));
+    meta.extend(explicit(
+        0x0002,
+        0x0010,
+        b"UI",
+        &padded(transfer_syntax.as_bytes(), 0),
+    ));
+    if let Some(implementation_class) = implementation_class {
+        meta.extend(explicit(
+            0x0002,
+            0x0012,
+            b"UI",
+            &padded(implementation_class.as_bytes(), 0),
+        ));
+    }
+
+    let explicit_dataset = transfer_syntax == EXPLICIT_VR_LE;
+    let mut dataset = Vec::new();
+    for attribute in attributes {
+        if explicit_dataset {
+            dataset.extend(explicit(
+                attribute.group,
+                attribute.element,
+                attribute.vr,
+                &attribute.value,
+            ));
+        } else {
+            dataset.extend(implicit(attribute.group, attribute.element, &attribute.value));
+        }
+    }
+
+    let mut file = vec![0_u8; 128];
+    file.extend_from_slice(b"DICM");
+    let group_length = u32::try_from(meta.len()).expect("a short meta group");
+    file.extend(explicit(0x0002, 0x0000, b"UL", &group_length.to_le_bytes()));
+    file.extend(meta);
+    file.extend(dataset);
+    (file, group_length)
 }
 
 /// 16-bit unsigned samples, little endian: 1, 256, 255, 2571, 2, 3, 4 and 5.
@@ -484,8 +517,11 @@ fn seed_imported_image_set(
         .iter()
         .enumerate()
         .map(|(index, file)| {
-            let mut instance = read_part10(file).unwrap_or_else(|| {
-                panic!("case {case:?}: expected the written file to be read as DICOM")
+            let mut instance = read_part10(file).unwrap_or_else(|reason| {
+                panic!(
+                    "case {case:?}: expected the written file to be read as DICOM, got \
+                     {reason:?}"
+                )
             });
             instance.source_key = Some(format!("in/instance-{index}.dcm"));
             instance
