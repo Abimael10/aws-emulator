@@ -2613,6 +2613,12 @@ pub use capacity_manager_data_exports::*;
 pub mod instance_console;
 pub use instance_console::*;
 
+/// The non-volatile UEFI variable store one instance holds, which `GetInstanceUefiData`
+/// serves and a register of an AMI can be given an exact copy of — one definition, so the
+/// instance's store and the image attribute reporting one cannot disagree.
+pub mod instance_uefi_variables;
+pub use instance_uefi_variables::*;
+
 /// The BOOTS of one instance's guest — every time its operating system started, which is
 /// what the console it wrote carries one block of. A SUBMODULE for the same reason
 /// [`image_usage_reports`] is one, and `pub use` keeps every name reachable as

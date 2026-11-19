@@ -13527,6 +13527,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "flate2",
  "font8x8",
  "form_urlencoded",
  "hex",

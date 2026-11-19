@@ -35,6 +35,10 @@ font8x8 = "0.3"
 # `GetConsoleScreenshotResult$ImageData` carries the image as base64 text, and the body of
 # the armoured public key file an import may carry is base64 too.
 base64 = "0.22"
+# The zlib stream a UEFI variable store travels in: "a base64 encoded and zlib compressed
+# binary value" is what `GetInstanceUefiData` reports a store as, so the bytes have to be a
+# real zlib stream. Pure Rust, like the other codecs here.
+flate2 = "1"
 # The 2048-bit RSA key pair `CreateKeyPair` generates: the operation hands the caller the
 # private half, so the key has to be a real key.
 aws-lc-rs = "1"

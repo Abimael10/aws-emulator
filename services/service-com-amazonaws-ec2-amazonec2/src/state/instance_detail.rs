@@ -715,6 +715,56 @@ impl ComAmazonawsEc2Amazonec2State {
         mappings
     }
 
+    /// "The boot mode that was specified by the AMI" (`Instance$BootMode`): the mode the
+    /// image the instance was launched from declares, and — for an AMI this store does not
+    /// hold — the mode of the EBS-backed x86_64 HVM Linux image this crate publishes by
+    /// default ([`BOOT_MODE_UEFI_PREFERRED`]), the same fallback the instance's other
+    /// AMI-derived facts take and the same reading
+    /// [`ComAmazonawsEc2Amazonec2State::instance_sriov_net_support`] takes.
+    ///
+    /// The ONE reading of that fact, so the instance projection and anything else that asks
+    /// how an instance boots cannot answer differently.
+    pub fn instance_image_boot_mode(&self, instance: &InstanceRecord) -> Option<String> {
+        match instance
+            .image_id
+            .as_deref()
+            .and_then(|image_id| self.images.get(image_id))
+        {
+            Some(image) => image.boot_mode.clone(),
+            None => Some(BOOT_MODE_UEFI_PREFERRED.to_string()),
+        }
+    }
+
+    /// Whether the instance `instance` BOOTS UEFI — what `Instance$CurrentInstanceBootMode`
+    /// reports as "the boot mode that is used to boot the instance at launch or start".
+    ///
+    /// The mode the AMI REQUIRES where it requires one ([`Self::instance_image_boot_mode`]),
+    /// and — for an AMI that "supports both UEFI and Legacy BIOS" (`uefi-preferred`) — the
+    /// mode its INSTANCE TYPE offers, which is UEFI for a type that supports it and the
+    /// legacy BIOS for one that does not (the EC2 User Guide's "Boot modes": Graviton types
+    /// support UEFI only, the Nitro x86 types support both, and a pre-Nitro type only the
+    /// legacy BIOS). Read off the one derivation of an instance type's supported boot modes
+    /// this crate has ([`supported_boot_modes`]), so the instance report and
+    /// `DescribeInstanceTypes`' own `SupportedBootModes` cannot disagree about one type.
+    ///
+    /// The ONE reading of that fact: the instance projection reports it, and the UEFI
+    /// variable store an instance's firmware holds
+    /// ([`ComAmazonawsEc2Amazonec2State::instance_uefi_data`]) exists only for an instance
+    /// that boots that way.
+    pub fn instance_boots_uefi(&self, instance: &InstanceRecord) -> bool {
+        let type_supports_uefi = instance_type_record(&instance.instance_type)
+            .is_some_and(|record| {
+                supported_boot_modes(&record.architecture, record.nitro)
+                    .iter()
+                    .any(|mode| mode == INSTANCE_BOOT_MODE_UEFI)
+            });
+        match self.instance_image_boot_mode(instance).as_deref() {
+            Some(INSTANCE_BOOT_MODE_UEFI) => true,
+            Some(BOOT_MODE_UEFI_PREFERRED) => type_supports_uefi,
+            _ => false,
+        }
+    }
+
     /// Report every FIXED member of `instance` onto `view` — see the module docs for the
     /// set and for where each one is read from.
     ///
@@ -789,37 +839,14 @@ impl ComAmazonawsEc2Amazonec2State {
         // facts of the AMI, reported only for an AMI that carries them.
         view.platform = image.and_then(|image| image.platform.clone());
         view.tpm_support = image.and_then(|image| image.tpm_support.clone());
-        // "The boot mode that was specified by the AMI" (`Instance$BootMode`) — the mode
-        // the image the instance was launched from declares, and, for an AMI this store
-        // does not hold, the mode of the EBS-backed x86_64 HVM Linux image this crate
-        // publishes by default ([`BOOT_MODE_UEFI_PREFERRED`]), the same fallback the
-        // instance's other AMI-derived facts above take and the same reading
-        // [`ComAmazonawsEc2Amazonec2State::instance_sriov_net_support`] takes.
-        let boot_mode = match image {
-            Some(image) => image.boot_mode.clone(),
-            None => Some(BOOT_MODE_UEFI_PREFERRED.to_string()),
-        };
-        // "The boot mode that is used to boot the instance at launch or start"
-        // (`Instance$CurrentInstanceBootMode`): the mode the AMI REQUIRES where it requires
-        // one, and — for an AMI that "supports both UEFI and Legacy BIOS"
-        // (`uefi-preferred`) — the mode its INSTANCE TYPE offers, which is UEFI for a type
-        // that supports it and the legacy BIOS for one that does not (the EC2 User Guide's
-        // "Boot modes": Graviton types support UEFI only, the Nitro x86 types support both,
-        // and a pre-Nitro type only the legacy BIOS). Read off the one derivation of an
-        // instance type's supported boot modes this crate has
-        // ([`supported_boot_modes`]), so the instance report and
-        // `DescribeInstanceTypes`' own `SupportedBootModes` cannot disagree about one type.
-        let type_supports_uefi = instance_type_record(&instance.instance_type).is_some_and(|record| {
-            supported_boot_modes(&record.architecture, record.nitro)
-                .iter()
-                .any(|mode| mode == INSTANCE_BOOT_MODE_UEFI)
-        });
-        let boots_uefi = match boot_mode.as_deref() {
-            Some(INSTANCE_BOOT_MODE_UEFI) => true,
-            Some(BOOT_MODE_UEFI_PREFERRED) => type_supports_uefi,
-            _ => false,
-        };
-        view.current_instance_boot_mode = Some(if boots_uefi {
+        // "The boot mode that was specified by the AMI" (`Instance$BootMode`) and "the boot
+        // mode that is used to boot the instance at launch or start"
+        // (`Instance$CurrentInstanceBootMode`), both read through the ONE derivation of an
+        // instance's boot mode this crate has ([`Self::instance_image_boot_mode`] and
+        // [`Self::instance_boots_uefi`]), so every report of how one instance boots — this
+        // projection and the UEFI variable store its firmware holds — answers the same.
+        let boot_mode = self.instance_image_boot_mode(instance);
+        view.current_instance_boot_mode = Some(if self.instance_boots_uefi(instance) {
             INSTANCE_BOOT_MODE_UEFI.to_string()
         } else {
             INSTANCE_BOOT_MODE_LEGACY_BIOS.to_string()

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInstanceUefiData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInstanceUefiData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: serves the non-volatile UEFI variable store the instance the request names
+//! HOLDS — "base64 representation of the non-volatile UEFI variable store"
+//! (`GetInstanceUefiDataResult$UefiData`) — beside that instance's own id. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInstanceUefiData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A variable store is what the instance's firmware HOLDS, and it gets there one of two ways
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::instance_uefi_data`], the one definition of
+//! an instance's store): the AMI it was launched from was registered with one — "when you use
+//! register-image to create an AMI, you can create an exact copy of your variable store by
+//! passing the UEFI data in the `UefiData` parameter" — so the instance comes up with that
+//! exact copy, the same bytes `DescribeImageAttribute` reports as the image's `uefiData`; or
+//! its own firmware wrote the non-volatile variables of a machine of that architecture as it
+//! came up. An instance that boots the LEGACY BIOS runs no UEFI firmware, so it holds no such
+//! variables at all and reports none, and neither does one whose guest has not come up yet.
+//! Reading a store writes nothing, so two reads of one instance answer exactly the same bytes.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +81,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{require_looked_up_instance_record, require_service_state};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +151,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInstanceUefiData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInstanceUefiDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInstanceUefiData"))
+        // Nothing about this answer depends on the request's Region or headers: the variable
+        // store an instance holds is a fact of that instance.
+        let _ = ctx;
+
+        let state_handle = require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // Whether this instance's firmware has come up is a question about the CURRENT state,
+        // so a move the clock already owed is materialised before it is read: an instance
+        // whose launch settled a moment ago is `running` and its guest has booted, and both
+        // were due at that instant whether or not anybody called. This is the only write
+        // reading a variable store can cause, and it is the clock's, not this operation's.
+        store.materialize_due_transitions();
+
+        // "The ID of the instance from which to retrieve the UEFI data" (`$InstanceId`),
+        // resolved through the crate's reading of a request-named instance an operation LOOKS
+        // UP: a value outside the form EC2 issues is `InvalidInstanceID.Malformed`, and every
+        // id inside it the account holds no instance under is `InvalidInstanceID.NotFound`.
+        let instance = require_looked_up_instance_record(&store, &input.instance_id)?;
+
+        // "Checks whether you have the required permissions for the operation, without
+        // actually making the request … the error response is DryRunOperation" (`$DryRun`),
+        // answered AFTER the instance has been resolved — the same order
+        // `crate::ops::get_password_data` takes, on the recorded refusal of an id probed under
+        // `DryRun`: the flag asks whether the request WOULD have succeeded, so one naming an
+        // instance that does not exist is refused with that reason instead. Nothing is written
+        // either way.
+        if input.dry_run == Some(true) {
+            return Err(crate::scaffolded::Scaffolded::dry_run_operation());
+        }
+
+        Ok(GetInstanceUefiDataOutput {
+            // The id read back off the stored record rather than echoed from the request, so
+            // the response names the instance the service resolved.
+            instance_id: Some(instance.instance_id.clone()),
+            // "Base64 representation of the non-volatile UEFI variable store"
+            // (`$UefiData`) — the store the instance holds: the exact copy its AMI was
+            // registered with, or the variables its own firmware wrote. No member at all for
+            // an instance that holds no non-volatile UEFI variables, because there is no store
+            // to report rather than an empty one.
+            uefi_data: store.instance_uefi_data(instance),
+        })
     }
 }

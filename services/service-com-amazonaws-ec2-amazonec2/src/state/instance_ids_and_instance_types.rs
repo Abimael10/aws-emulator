@@ -521,6 +521,37 @@ pub fn require_instance_record_fully_worded<'store, E>(
     })
 }
 
+/// The stored instance `instance_id` names for an operation that LOOKS an id UP rather than
+/// DECODING it first: a value outside the id form `in_form` reads is
+/// `InvalidInstanceID.Malformed` — worded with the resource KIND, the sentence an operation
+/// that resolves the ONE instance it was given answers
+/// ([`crate::scaffolded::Scaffolded::instance_id_is_malformed`]) — and EVERY value inside that
+/// form the account holds no instance under is `InvalidInstanceID.NotFound`.
+///
+/// The same two refusals in the same order as [`require_instance_record`], differing in that
+/// the long-form identifier this service spent on a resource of ANOTHER KIND is reported as an
+/// instance that is not there rather than as an id that cannot be read: an id space is
+/// per-kind, so what some other kind of resource was given says nothing about whether a value
+/// reads as an instance id. WHICH reading of the id FORM decides the first half is the
+/// caller's to pass, because that too is a fact of the operation, recorded by its caller
+/// ([`instance_id_reads_as_one`] states the split): the RULE both readings follow lives here
+/// once, so no operation re-spells it.
+pub fn require_instance_record_in_form<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+    in_form: impl Fn(&str) -> bool,
+) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
+    if !in_form(instance_id) {
+        return Err(crate::scaffolded::Scaffolded::instance_id_is_malformed(
+            instance_id,
+        ));
+    }
+    store
+        .instances
+        .get(instance_id)
+        .ok_or_else(|| crate::scaffolded::Scaffolded::invalid_instance_id_not_found(instance_id))
+}
+
 /// The stored instance `instance_id` names, for an operation whose validator takes the
 /// WEAKER of the two readings of an instance id ([`instance_id_reads_as_one`]): a value
 /// outside both published forms is malformed, and every value INSIDE one of them is looked
@@ -528,26 +559,33 @@ pub fn require_instance_record_fully_worded<'store, E>(
 /// leading digit above zero, the all-zero placeholder) is answered
 /// `InvalidInstanceID.NotFound` rather than as an id that cannot be read.
 ///
-/// The same two refusals in the same order as [`require_instance_record`], differing only in
-/// WHICH reading of the id form decides between them. Which one an operation takes is a fact
-/// of that operation, recorded by its caller — the split
+/// [`require_instance_record_in_form`] under that reading. Which reading an operation takes is
+/// a fact of that operation, recorded by its caller — the split
 /// [`instance_id_reads_as_one`] states for the `InstanceIds` readers, and the one
 /// `ModifyInstanceMaintenanceOptions` is recorded taking — so neither reading is generalised
-/// to the other's operations. The malformed half is worded with the resource KIND, the
-/// sentence an operation that resolves the ONE instance it was given answers
-/// ([`crate::scaffolded::Scaffolded::instance_id_is_malformed`]).
+/// to the other's operations.
 pub fn require_readable_instance_record<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
     instance_id: &str,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
-    if !instance_id_reads_as_one(instance_id) {
-        return Err(crate::scaffolded::Scaffolded::instance_id_is_malformed(
-            instance_id,
-        ));
-    }
-    store.instances.get(instance_id).ok_or_else(|| {
-        crate::scaffolded::Scaffolded::invalid_instance_id_not_found(instance_id)
-    })
+    require_instance_record_in_form(store, instance_id, instance_id_reads_as_one)
+}
+
+/// The stored instance `instance_id` names, for an operation that looks an id up under the
+/// STRICTER reading of the form ([`instance_id_is_well_formed`]): a value EC2 never issued as
+/// an instance id — outside both published forms, the all-zero placeholder, or a long form
+/// whose leading digit is above zero — is malformed, and every id inside the issued form the
+/// account holds no instance under is `InvalidInstanceID.NotFound`.
+///
+/// [`require_instance_record_in_form`] under that reading, which is the one
+/// `GetInstanceUefiData` is recorded taking: its recorded contract probes ids DERIVED from the
+/// instance it launched — the issued form with a digit moved on — and requires such an id to be
+/// reported as an instance that does not exist.
+pub fn require_looked_up_instance_record<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
+    require_instance_record_in_form(store, instance_id, instance_id_is_well_formed)
 }
 
 /// The id prefix of an EC2 instance, as [`instance_id_is_well_formed`] reads one and as a
