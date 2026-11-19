@@ -33,7 +33,7 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, poll_until, Emulator, Reply, REGION};
+use crate::harness::{assert_own_endpoint, params, poll_until, Emulator, Reply, REGION};
 
 /// One row of the failover-default table: the case, the group id, the pairs beside the
 /// required ones, and how many shards the group must end up with.
@@ -47,6 +47,16 @@ type FailoverCase = (
 /// One row of the reshard table: the case, the shard count the group is created with, the
 /// reshard's own form pairs, and the shard count it must end up with.
 type ReshardCase = (&'static str, i32, Vec<(String, String)>, usize);
+
+/// One row of the placement table: the case and the Availability Zones the request names
+/// for the ONE shard it adds, in order — the primary's first. A row that names fewer zones
+/// than the shard has members leaves the rest for the service to place.
+type PlacementCase = (&'static str, &'static [&'static str]);
+
+/// One row of the minted-id table: the case, the shards the group is created with, the
+/// count the reshard asks for, and the ids the request names for the shards it adds, in
+/// order (an empty entry leaves that shard's id to the service).
+type MintedIdCase = (&'static str, i32, i32, &'static [&'static str]);
 
 /// One row of the refusal table: the case, the group the request names, its form pairs, and
 /// the status plus wire code it must be refused with.
@@ -764,4 +774,405 @@ async fn a_reshard_is_recorded_as_an_event() {
         "expected an event recording the reshard, got {messages:?} from {}",
         events.body
     );
+}
+
+/// Every `CacheClusterId` the group reports as a member, sorted.
+fn reported_members(reply: &Reply) -> Vec<String> {
+    let mut members: Vec<String> = reply
+        .all("NodeGroupMember/CacheClusterId")
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    members.sort();
+    members
+}
+
+/// Read the member cluster `id` back until it publishes the endpoint of the node it runs,
+/// and answer with that reply: a member a reshard minted is provisioned on the same clock
+/// as any other cluster, so the test looks again rather than waiting a fixed time.
+async fn poll_member_cluster(emulator: &Emulator, case: &str, id: &str) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        case,
+        &format!("the member cluster {id} publishing the endpoint of its node"),
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", id), ("ShowCacheNodeInfo", "true")]),
+        |reply| reply.text("CacheNode/Endpoint/Address").is_some(),
+    )
+    .await
+}
+
+/// "Specifies the preferred availability zones for each node group in the cluster" — the
+/// zones a reshard's `ReshardingConfiguration` names are where the members of the shard it
+/// adds are placed, and a member it names no zone for is placed by the service ("If you
+/// omit this parameter ElastiCache selects availability zones for you").
+///
+/// Read back through the CLUSTER each member is, so where the account runs a member cannot
+/// depend on which operation is asked: the group reports exactly the member clusters
+/// `DescribeCacheClusters` does, each of them in the zone it was placed in and answering on
+/// an endpoint of this emulator's own.
+///
+/// The rows span both members placed by the request, only the primary placed, and neither.
+#[tokio::test]
+async fn a_shard_a_reshard_adds_is_placed_where_the_request_asked() {
+    let rows: [PlacementCase; 3] = [
+        (
+            "both members of the new shard placed by the request",
+            &["us-east-1b", "us-east-1c"],
+        ),
+        ("only the new shard's primary placed", &["us-east-1d"]),
+        ("neither member of the new shard placed", &[]),
+    ];
+
+    for (case, zones) in rows {
+        let emulator = Emulator::new();
+        create_settled_group(
+            &emulator,
+            case,
+            "placed-group",
+            &[("NumNodeGroups", "2"), ("ReplicasPerNodeGroup", "1")],
+        )
+        .await;
+        let shards_before: Vec<String> = reported_shards(&describe_group(&emulator, "placed-group").await)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let clusters_before = account_cluster_ids(&emulator).await;
+
+        let mut pairs = params(&[("NodeGroupCount", "3")]);
+        for (index, zone) in zones.iter().enumerate() {
+            pairs.push((
+                format!(
+                    "ReshardingConfiguration.ReshardingConfiguration.1.PreferredAvailabilityZones.AvailabilityZone.{}",
+                    index + 1
+                ),
+                (*zone).to_string(),
+            ));
+        }
+        let resharded = reshard(&emulator, "placed-group", &pairs).await;
+        assert_eq!(
+            resharded.status, 200,
+            "case {case:?}: the reshard must answer 200, got {} {}",
+            resharded.status, resharded.body
+        );
+
+        let described = poll_group_available(&emulator, case, "placed-group").await;
+        let shards_after: Vec<String> = reported_shards(&described)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let added: Vec<String> = shards_after
+            .iter()
+            .filter(|id| !shards_before.contains(id))
+            .cloned()
+            .collect();
+        assert_eq!(
+            added.len(),
+            1,
+            "case {case:?}: expected one shard added to {shards_before:?}, got {shards_after:?}"
+        );
+        let added_shard = &added[0];
+
+        // The clusters the new shard brought with it are the ones the account did not run
+        // before, and their ids name the shard they belong to: a cluster mode enabled
+        // group's member is `<group>-<shard>-<ordinal>`, so a member is resolvable from
+        // the group and the shard a caller knows.
+        let clusters_after = account_cluster_ids(&emulator).await;
+        let mut minted: Vec<String> = clusters_after
+            .iter()
+            .filter(|id| !clusters_before.contains(id))
+            .cloned()
+            .collect();
+        minted.sort();
+        assert_eq!(
+            minted.len(),
+            2,
+            "case {case:?}: expected the new shard's primary and its one replica, got {minted:?}"
+        );
+        let member_prefix = format!("placed-group-{added_shard}-");
+        for member in &minted {
+            assert!(
+                member.starts_with(&member_prefix),
+                "case {case:?}: the member {member} must name the shard {added_shard} it \
+                 belongs to"
+            );
+        }
+
+        // Where each member landed, as the service that runs it reports: the zone the row
+        // asked for that member, or one of the signed Region's when it asked for none.
+        let mut placed_zones: Vec<String> = Vec::new();
+        for (ordinal, member) in minted.iter().enumerate() {
+            let cluster = poll_member_cluster(&emulator, case, member).await;
+            assert_eq!(
+                cluster.text("ReplicationGroupId"),
+                Some("placed-group"),
+                "case {case:?}: the member {member} must name its group, got {:?}",
+                cluster.text("ReplicationGroupId")
+            );
+            let zone = cluster
+                .text("PreferredAvailabilityZone")
+                .unwrap_or_default()
+                .to_string();
+            match zones.get(ordinal) {
+                Some(asked) => assert_eq!(
+                    &zone, asked,
+                    "case {case:?}: the member {member} must run in the zone the request \
+                     asked for, got {zone:?}"
+                ),
+                // A zone of the signed Region, named the way AWS names one: the Region
+                // followed by a single letter.
+                None => assert!(
+                    zone.strip_prefix(REGION)
+                        .is_some_and(|letter| letter.len() == 1
+                            && letter.starts_with(|letter: char| letter.is_ascii_lowercase())),
+                    "case {case:?}: a member the request placed no zone for must run in a \
+                     zone of {REGION}, got {zone:?}"
+                ),
+            }
+            assert_own_endpoint(
+                case,
+                &format!("the node endpoint of {member}"),
+                cluster.text("CacheNode/Endpoint/Address").unwrap_or_default(),
+                cluster.text("CacheNode/Endpoint/Port"),
+            );
+            placed_zones.push(zone);
+        }
+
+        // The group and the account agree about what it runs, and about where.
+        let settled = describe_group(&emulator, "placed-group").await;
+        let mut account = clusters_after.clone();
+        account.sort();
+        assert_eq!(
+            reported_members(&settled),
+            account,
+            "case {case:?}: the group must report exactly the member clusters \
+             DescribeCacheClusters does, got {:?} against {account:?}",
+            reported_members(&settled)
+        );
+        let group_zones = settled.all("NodeGroupMember/PreferredAvailabilityZone");
+        for zone in &placed_zones {
+            assert!(
+                group_zones.contains(&zone.as_str()),
+                "case {case:?}: the group must report the zone {zone:?} its new member runs \
+                 in, got {group_zones:?}"
+            );
+        }
+        assert_partitions_keyspace(case, &settled);
+    }
+}
+
+/// The identity of a shard a reshard ADDS: the request names it
+/// (`ReshardingConfiguration$NodeGroupId`) or the service mints one, and either way it is a
+/// four-digit id no shard of the group already holds, with member clusters of its own.
+///
+/// Source of the id form: `NodeGroup$NodeGroupId` — "A Valkey or Redis OSS (cluster mode
+/// disabled) replication group contains only 1 node group; therefore, the node group ID is
+/// 0001".
+///
+/// The rows span ids left entirely to the service, an id the request names, and a request
+/// that names one of the two shards it adds and leaves the other.
+#[tokio::test]
+async fn a_reshard_mints_free_four_digit_ids_for_the_shards_it_adds() {
+    let rows: [MintedIdCase; 3] = [
+        ("two shards grown to four, both ids the service's", 2, 4, &[]),
+        ("two shards grown to three, the request naming the id", 2, 3, &["0042"]),
+        (
+            "three shards grown to five, one id named and one left",
+            3,
+            5,
+            &["0011", ""],
+        ),
+    ];
+
+    for (case, created_shards, target, named_ids) in rows {
+        let emulator = Emulator::new();
+        create_settled_group(
+            &emulator,
+            case,
+            "minted-group",
+            &[
+                ("NumNodeGroups", &created_shards.to_string()),
+                ("ReplicasPerNodeGroup", "1"),
+            ],
+        )
+        .await;
+        let shards_before: Vec<String> = reported_shards(&describe_group(&emulator, "minted-group").await)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        let mut pairs = params(&[("NodeGroupCount", &target.to_string())]);
+        for (index, id) in named_ids.iter().enumerate() {
+            if !id.is_empty() {
+                pairs.push((
+                    format!(
+                        "ReshardingConfiguration.ReshardingConfiguration.{}.NodeGroupId",
+                        index + 1
+                    ),
+                    (*id).to_string(),
+                ));
+            }
+        }
+        let resharded = reshard(&emulator, "minted-group", &pairs).await;
+        assert_eq!(
+            resharded.status, 200,
+            "case {case:?}: the reshard must answer 200, got {} {}",
+            resharded.status, resharded.body
+        );
+
+        let described = poll_group_available(&emulator, case, "minted-group").await;
+        let shards_after: Vec<String> = reported_shards(&described)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            shards_after.len(),
+            usize::try_from(target).unwrap_or_default(),
+            "case {case:?}: expected {target} node groups, got {shards_after:?}"
+        );
+        // Every shard the group had it still has, under the id it had.
+        for held in &shards_before {
+            assert!(
+                shards_after.contains(held),
+                "case {case:?}: the shard {held} must keep its identity, got {shards_after:?}"
+            );
+        }
+        let added: Vec<&String> = shards_after
+            .iter()
+            .filter(|id| !shards_before.contains(id))
+            .collect();
+        assert_eq!(
+            added.len(),
+            shards_after.len() - shards_before.len(),
+            "case {case:?}: every shard past the ones the group held must be a new id, got \
+             {added:?} from {shards_after:?}"
+        );
+        for id in &added {
+            assert!(
+                id.len() == 4 && id.bytes().all(|byte| byte.is_ascii_digit()),
+                "case {case:?}: the minted shard id {id:?} must have the four-digit form"
+            );
+            assert!(
+                !shards_before.contains(id),
+                "case {case:?}: the minted shard id {id:?} must be one no live shard holds, \
+                 got {shards_before:?}"
+            );
+        }
+        // An id the request named is the id the shard it configured carries.
+        for id in named_ids.iter().filter(|id| !id.is_empty()) {
+            assert!(
+                added.iter().any(|added| added.as_str() == *id),
+                "case {case:?}: the shard the request named {id:?} must carry that id, got \
+                 {added:?}"
+            );
+        }
+        // And each new shard really runs the member clusters it reports.
+        let clusters = account_cluster_ids(&emulator).await;
+        for id in &added {
+            let prefix = format!("minted-group-{id}-");
+            let members: Vec<&String> = clusters
+                .iter()
+                .filter(|cluster| cluster.starts_with(&prefix))
+                .collect();
+            assert_eq!(
+                members.len(),
+                2,
+                "case {case:?}: the shard {id} must run the primary and replica its group's \
+                 shards carry, got {members:?} of {clusters:?}"
+            );
+        }
+        assert_partitions_keyspace(case, &described);
+    }
+}
+
+/// A reshard whose placement or whose selection cannot hold is refused, and the group is
+/// left exactly as it was.
+///
+/// The rows span the two ways they cannot: a `ReshardingConfiguration` that configures more
+/// shards than the request adds (it "specifies the preferred availability zones for each
+/// node group" being added, so there is no shard for the surplus to configure), and a
+/// selection list that names one shard twice, on either side of the selection.
+#[tokio::test]
+async fn a_reshard_whose_placement_or_selection_cannot_hold_is_refused() {
+    let emulator = Emulator::new();
+    create_settled_group(
+        &emulator,
+        "the selected group",
+        "selection-group",
+        &[("NumNodeGroups", "3"), ("ReplicasPerNodeGroup", "1")],
+    )
+    .await;
+
+    let rows: Vec<ReshardRefusal> = vec![
+        (
+            "two placements for the one shard being added",
+            "selection-group",
+            params(&[
+                ("NodeGroupCount", "4"),
+                (
+                    "ReshardingConfiguration.ReshardingConfiguration.1.PreferredAvailabilityZones.AvailabilityZone.1",
+                    "us-east-1a",
+                ),
+                (
+                    "ReshardingConfiguration.ReshardingConfiguration.2.PreferredAvailabilityZones.AvailabilityZone.1",
+                    "us-east-1b",
+                ),
+            ]),
+            400,
+            "InvalidParameterCombination",
+        ),
+        (
+            "one shard named twice among those to remove",
+            "selection-group",
+            params(&[
+                ("NodeGroupCount", "2"),
+                ("NodeGroupsToRemove.NodeGroupToRemove.1", "0003"),
+                ("NodeGroupsToRemove.NodeGroupToRemove.2", "0003"),
+            ]),
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "one shard named twice among those to retain",
+            "selection-group",
+            params(&[
+                ("NodeGroupCount", "2"),
+                ("NodeGroupsToRetain.NodeGroupToRetain.1", "0001"),
+                ("NodeGroupsToRetain.NodeGroupToRetain.2", "0001"),
+            ]),
+            400,
+            "InvalidParameterValue",
+        ),
+    ];
+
+    for (case, id, pairs, status, code) in rows {
+        let refused = reshard(&emulator, id, &pairs).await;
+        assert_eq!(
+            (refused.status, refused.error_code()),
+            (status, code),
+            "case {case:?}: expected HTTP {status} {code}, got {} {}",
+            refused.status,
+            refused.body
+        );
+        assert!(
+            !refused.error_message().is_empty(),
+            "case {case:?}: the refusal must state the rule it broke, got {}",
+            refused.body
+        );
+        // Nothing was written: the group still has the three shards it had, settled.
+        let described = describe_group(&emulator, "selection-group").await;
+        assert_eq!(
+            described.all("NodeGroups/NodeGroup/NodeGroupId"),
+            vec!["0001", "0002", "0003"],
+            "case {case:?}: a refused reshard must change nothing, got {}",
+            described.body
+        );
+        assert_eq!(
+            described.text("Status"),
+            Some(state::STATUS_AVAILABLE),
+            "case {case:?}: a refused reshard must leave the group settled, got {:?}",
+            described.text("Status")
+        );
+    }
 }
