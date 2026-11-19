@@ -52,6 +52,7 @@ use super::api_key_credential_providers::{
     MANAGED_SECRET_PREFIX, SECRET_SOURCE_EXTERNAL, SECRET_SOURCE_MANAGED,
 };
 use super::*;
+
 use crate::ops::types::{
     CoinbaseCdpConfigurationOutput, CreatePaymentCredentialProviderOutput,
     GetPaymentCredentialProviderOutput, PaymentProviderConfigurationInput,
@@ -90,6 +91,36 @@ pub const PAYMENT_CREDENTIAL_PROVIDER_ARN_TYPE: &str = "paymentcredentialprovide
 /// which member of `PaymentProviderConfigurationInput` the request carries.
 pub const PAYMENT_VENDOR_COINBASE_CDP: &str = "CoinbaseCDP";
 pub const PAYMENT_VENDOR_STRIPE_PRIVY: &str = "StripePrivy";
+
+/// The vendor this plane PUBLISHES and the on-disk
+/// `PaymentCredentialProviderVendorType` does not declare; see
+/// [`PUBLISHED_PAYMENT_VENDORS`].
+pub const PAYMENT_VENDOR_STRIPE: &str = "Stripe";
+
+/// The `credentialProviderVendor` value set this plane's refusal of a value outside
+/// the vendor type ENUMERATES, in the order it lists them.
+///
+/// Wider than the on-disk model's `PaymentCredentialProviderVendorType`
+/// (`smithy_query(query="shape",shape="PaymentCredentialProviderVendorType")` ->
+/// `values: [CoinbaseCDP, StripePrivy]`), which lags the service: the wire refusal
+/// names all three, and that enumeration is how a caller correcting its request
+/// learns which vendors are accepted at all. The CONSTRAINT itself is still the
+/// model's — the boundary walk enforces the shipped enum — so this set is the
+/// SENTENCE only, stated once here and read by the one place each refusal is worded
+/// (`crate::service::validation`).
+///
+/// One consequence, stated plainly rather than left for a reader to find: a value
+/// this set names and the shipped enum does not (`Stripe`) is still REFUSED, because
+/// what admits a value is the model the framework walks, and this model carries no
+/// `PaymentProviderConfigurationInput` member for that vendor's credentials, so there
+/// is nothing a create of one could store. Growing the shipped model is what would
+/// accept it; `tests/all/payment_vendor_value_set.rs` keeps that value among its
+/// refused rows so the emulator's answer for it is pinned, not quietly assumed.
+pub const PUBLISHED_PAYMENT_VENDORS: &[&str] = &[
+    PAYMENT_VENDOR_STRIPE,
+    PAYMENT_VENDOR_COINBASE_CDP,
+    PAYMENT_VENDOR_STRIPE_PRIVY,
+];
 
 /// The `PaymentProviderConfigurationInput` / `…Output` member each vendor's
 /// configuration is carried in (`smithy_query
@@ -231,10 +262,15 @@ struct SecretMembers {
     config: &'static str,
 }
 
-/// The byte lengths an Ed25519 private key is carried in: the 32-byte seed the
-/// key pair is derived from, and the 64-byte form that carries the seed followed
-/// by its public key, which is how a vendor hands one over.
-const ED25519_PRIVATE_KEY_LENGTHS: [usize; 2] = [32, 64];
+/// The bytes an Ed25519 private key is handed over as: the 32-byte seed the key
+/// pair is derived from, FOLLOWED by the public key that seed derives, which is
+/// the one form a vendor issues such a secret in.
+///
+/// The seed ALONE is not that form, and a value carrying only it is refused: the
+/// recorded refusal of a well-formed base64 secret shorter than the issued key is
+/// what fixes this length, so the check is the issued form rather than "any
+/// length Ed25519 could use".
+const ED25519_PRIVATE_KEY_BYTES: usize = 64;
 
 /// The key format a vendor fixes for one of its secrets, beyond the characters
 /// the member's own `@pattern` admits.
@@ -262,7 +298,7 @@ impl SecretKeyFormat {
     fn admits(self, value: &str) -> bool {
         match self {
             Self::Base64Ed25519PrivateKey => decoded_base64(value)
-                .is_some_and(|key| ED25519_PRIVATE_KEY_LENGTHS.contains(&key.len())),
+                .is_some_and(|key| key.len() == ED25519_PRIVATE_KEY_BYTES),
         }
     }
 }

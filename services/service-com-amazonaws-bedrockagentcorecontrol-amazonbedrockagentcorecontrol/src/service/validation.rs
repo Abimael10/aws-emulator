@@ -46,6 +46,10 @@
 //!    stated as the WINDOW the model declares rather than the single bound the value fell
 //!    outside ([`pointer_form`]). Which of the two an operation is worded in is read off
 //!    the same modelled `@http` URI rule 5's policy is.
+//! 7. the VALUE SET an enum clause enumerates is the one this endpoint PUBLISHES for the
+//!    type, which for a type the shipped model's snapshot lags is wider than the set that
+//!    snapshot declares ([`published_value_sets`]). Only the sentence is reconciled: what
+//!    ADMITS a value is still the model, walked by the framework.
 //!
 //! Rule 4's constraint set is read off the MODEL, not off the refusal: the structured
 //! refusal carries only the constraints that failed, so the ones a value satisfied would
@@ -71,6 +75,7 @@ use service_common::validation::{list_of_element, unanchored};
 use smithy_server_runtime::Refused;
 
 pub(super) mod pointer_form;
+mod published_value_sets;
 
 /// The error code a constraint failure is named by: the shape
 /// `com.amazonaws.bedrockagentcorecontrol#ValidationException`, which every operation of
@@ -221,6 +226,14 @@ fn message(
     if violations.is_empty() {
         return None;
     }
+    // Rule 7: the values an enum clause enumerates are the ones this endpoint publishes for
+    // the type, before anything is read off the violations — the clauses and the element
+    // sets below are then built from one statement of each set rather than from two.
+    let violations: Vec<Violation> = violations
+        .iter()
+        .map(published_value_sets::restated)
+        .collect();
+    let violations = violations.as_slice();
     // Rule 6: the form is the serving backend's, read off the operation's own input schema.
     // A refusal that reached no operation (`None`) is worded the way every family but one
     // words it, which is the conservative choice where the backend is unknown.

@@ -206,7 +206,7 @@ impl Family {
                 "credentialProviderVendor": "CoinbaseCDP",
                 "providerConfigurationInput": {"coinbaseCdpConfiguration": {
                     "apiKeyId": format!("cdp-api-key-{variant}"),
-                    "apiKeySecret": base64_key(32, b'a', standard),
+                    "apiKeySecret": base64_key(64, b'a', standard),
                     "walletSecret": format!("d2FsbGV0-{variant}"),
                 }},
             }),
@@ -309,9 +309,11 @@ fn coinbase_create(name: &str, api_key_secret: &str) -> Value {
 /// A `MANAGED` Coinbase CDP `apiKeySecret` that is not a base64-encoded Ed25519 private
 /// key refuses the create, and nothing is created under the name it asked for.
 ///
-/// The rows differ along WHY the value is not such a key: too few bytes, one byte short of
-/// the seed, one byte past it, one byte either side of the 64-byte form the vendor issues,
-/// and base64 that does not decode at all. Every value is inside the member's own pattern
+/// The rows differ along WHY the value is not such a key: too few bytes, the 32-byte seed
+/// without the public key the vendor issues beside it (in each base64 spelling, because one
+/// value is one value however it is spelled), one byte either side of the seed, one byte
+/// either side of the 64-byte form the vendor issues, and base64 that does not decode at
+/// all. Every value is inside the member's own pattern
 /// (`^[a-zA-Z0-9+/=\-_\s]*$`, `smithy_query(query="shape",
 /// shape="CoinbaseCdpConfigurationInput")`), so the refusal is the handler's rule and not
 /// the boundary constraint walk.
@@ -320,6 +322,15 @@ async fn a_coinbase_api_key_secret_that_is_not_an_ed25519_private_key_is_refused
     let rows = [
         ("a handful of bytes", base64_key(6, b'z', standard)),
         ("one byte short of the seed", base64_key(31, b'q', standard)),
+        ("the seed alone, padded", base64_key(32, b's', standard)),
+        (
+            "the seed alone, unpadded",
+            base64_key(32, b's', standard_no_pad),
+        ),
+        (
+            "the seed alone, URL-safe",
+            base64_key(32, b'\xfb', url_safe),
+        ),
         ("one byte past the seed", base64_key(33, b'q', standard)),
         ("one byte short of the issued key", base64_key(63, b'k', standard)),
         ("one byte past the issued key", base64_key(65, b'k', standard)),
@@ -376,10 +387,9 @@ async fn a_coinbase_api_key_secret_that_is_not_an_ed25519_private_key_is_refused
 /// A `MANAGED` Coinbase CDP `apiKeySecret` that IS a base64-encoded Ed25519 private key is
 /// stored, and the provider reads back through `GetPaymentCredentialProvider`.
 ///
-/// The rows differ along the key length the vendor hands over (the 32-byte seed, the
-/// 64-byte seed-and-public-key form) and along the base64 spelling it arrives in (padded,
-/// unpadded, URL-safe, wrapped across lines), because one key is one key however it is
-/// spelled.
+/// The rows differ along the base64 spelling the 64-byte seed-and-public-key form the
+/// vendor issues arrives in (padded, unpadded, URL-safe, wrapped across lines), because one
+/// key is one key however it is spelled.
 #[tokio::test]
 async fn a_coinbase_api_key_secret_in_the_vendors_key_format_is_accepted() {
     let wrapped = format!(
@@ -388,11 +398,15 @@ async fn a_coinbase_api_key_secret_in_the_vendors_key_format_is_accepted() {
         &base64_key(64, b'w', standard)[40..]
     );
     let rows = [
-        ("the 32-byte seed, padded", base64_key(32, b's', standard)),
-        ("the 32-byte seed, unpadded", base64_key(32, b's', standard_no_pad)),
-        ("the 32-byte seed, URL-safe", base64_key(32, b'\xfb', url_safe)),
         ("the 64-byte issued key", base64_key(64, b'i', standard)),
-        ("the 64-byte issued key, unpadded", base64_key(64, b'i', standard_no_pad)),
+        (
+            "the 64-byte issued key, unpadded",
+            base64_key(64, b'i', standard_no_pad),
+        ),
+        (
+            "the 64-byte issued key, URL-safe",
+            base64_key(64, b'\xfb', url_safe),
+        ),
         ("the 64-byte issued key wrapped across lines", wrapped),
     ];
     for (index, (case, api_key_secret)) in rows.into_iter().enumerate() {

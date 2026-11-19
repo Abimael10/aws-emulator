@@ -42,11 +42,14 @@ const SOURCE_MANAGED: &str = "MANAGED";
 const SOURCE_EXTERNAL: &str = "EXTERNAL";
 
 /// A Coinbase CDP `apiKeySecret` in the key format that vendor issues one in: the
-/// base64 of an Ed25519 private key (here the 32-byte seed). The service refuses a
+/// base64 of an Ed25519 private key (the 32-byte seed followed by the public key it
+/// derives). The service refuses a
 /// `MANAGED` value that is not such a key, so every row that hands one over sends one of
 /// these rather than an arbitrary string.
-const CDP_API_KEY_SECRET: &str = "YWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjZGU=";
-const CDP_API_KEY_SECRET_SECOND: &str = "YWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjZGY=";
+const CDP_API_KEY_SECRET: &str =
+    "YWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjZA==";
+const CDP_API_KEY_SECRET_SECOND: &str =
+    "YWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjZQ==";
 
 /// This service and Secrets Manager over one shared engine.
 struct Emulator {

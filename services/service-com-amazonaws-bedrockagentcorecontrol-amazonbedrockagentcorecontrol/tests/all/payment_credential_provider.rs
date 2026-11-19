@@ -39,10 +39,12 @@ const REGION: &str = "us-east-1";
 const NOT_FOUND: &str = "PaymentCredentialProvider not found";
 
 /// A credential a row hands the service, which must never appear in a control-plane
-/// response. The Coinbase CDP API key secret is the base64 of an Ed25519 private key —
+/// response. The Coinbase CDP API key secret is the base64 of an Ed25519 private key (the
+/// 32-byte seed followed by the public key it derives) —
 /// the key format that vendor issues one in, which the create requires — while the
 /// other three credentials are opaque to the service.
-const API_KEY_SECRET: &str = "YWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjZGU=";
+const API_KEY_SECRET: &str =
+    "YWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjZA==";
 const WALLET_SECRET: &str = "cdp-wallet-secret-value";
 const APP_SECRET: &str = "privy-app-secret-value";
 const PRIVATE_KEY: &str = "privy-authorization-private-key-value";

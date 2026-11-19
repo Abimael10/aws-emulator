@@ -127,9 +127,10 @@ impl Plane {
 }
 
 /// A Coinbase CDP `apiKeySecret` in the key format that vendor issues one in: the base64
-/// of an Ed25519 private key (here the 32-byte seed), which the payment plane's create
-/// requires of a secret it is to manage.
-const CDP_API_KEY_SECRET: &str = "YWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjZGU=";
+/// of an Ed25519 private key (the 32-byte seed followed by the public key it derives),
+/// which the payment plane's create requires of a secret it is to manage.
+const CDP_API_KEY_SECRET: &str =
+    "YWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjZA==";
 
 /// ONE secret a row's provider carries.
 #[derive(Debug, Clone)]
