@@ -440,12 +440,18 @@ fn member(case: &str, body: &Value, name: &str) -> String {
 
 /// Whether `text` is `width` hexadecimal digits, as a trace id's fields and a
 /// span id are.
-fn is_hex(text: &str, width: usize) -> bool {
+///
+/// `pub(crate)` so a sibling suite of this target reading the same grammar — the
+/// `apigateway_stage_trace_header_form` one — shares this reading rather than
+/// keeping a second copy of X-Ray's id widths.
+pub(crate) fn is_hex(text: &str, width: usize) -> bool {
     text.len() == width && text.chars().all(|digit| digit.is_ascii_hexdigit())
 }
 
 /// Whether `text` is a trace id of X-Ray's own form, `1-<8 hex>-<24 hex>`.
-fn is_trace_id(text: &str) -> bool {
+///
+/// `pub(crate)` for the reason [`is_hex`] is.
+pub(crate) fn is_trace_id(text: &str) -> bool {
     let mut fields = text.split('-');
     matches!(
         (fields.next(), fields.next(), fields.next(), fields.next()),
