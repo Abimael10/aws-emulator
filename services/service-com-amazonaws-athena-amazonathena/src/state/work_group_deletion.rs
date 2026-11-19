@@ -74,11 +74,13 @@ impl ComAmazonawsAthenaAmazonathenaState {
     ///
     /// What goes with the workgroup is what the workgroup is the address of: the query
     /// executions of its history (and any `ClientRequestToken` that named one of them), its
-    /// notebooks, its prepared statements and its sessions. The statements and the sessions are
+    /// notebooks, its prepared statements, its sessions and the calculations submitted into
+    /// those sessions. The statements, the sessions and their calculations are
     /// not among the three kinds `RecursiveDeleteOption` names, and so are not what a delete is
     /// refused over, but each is addressed TOGETHER WITH its workgroup — a statement by its
     /// `StatementName` and a workgroup, a session by the workgroup whose engine configuration
-    /// and execution role it runs under — so one whose workgroup is gone could never be read,
+    /// and execution role it runs under, a calculation inside the session it was submitted
+    /// into — so one whose workgroup is gone could never be read,
     /// listed or deleted again, and keeping it would hand a workgroup later created under the
     /// same name contents nobody created in it.
     ///
@@ -95,6 +97,7 @@ impl ComAmazonawsAthenaAmazonathenaState {
         self.notebooks.remove_work_group(name);
         self.prepared_statements.remove_work_group(name);
         self.sessions.remove_work_group(name);
+        self.calculations.remove_work_group(name);
         let executions: HashSet<String> = self
             .query_execution_ids(name)
             .into_iter()

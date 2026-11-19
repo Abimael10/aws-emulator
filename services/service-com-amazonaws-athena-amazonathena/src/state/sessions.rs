@@ -29,9 +29,10 @@
 //! Those four are the states the stored instants can yield. The others the enum carries
 //! follow from something else: BUSY from a calculation running ON the session ("the session
 //! is processing another task and is unable to accept a calculation"), and CREATED, DEGRADED
-//! and FAILED from outcomes nothing in this service produces — so a session reads IDLE while
-//! the calculation operations that would make BUSY observable are still scaffolds, each with
-//! its own issue. [`ACTIVE_SESSION_STATES`] still names the four states
+//! and FAILED from outcomes nothing in this service produces — so a session a calculation
+//! was submitted into still reads IDLE, because nothing in this service RUNS that
+//! calculation (see [`CalculationRegistry`]), and a session is BUSY only while one is
+//! running on it. [`ACTIVE_SESSION_STATES`] still names the four states
 //! `ListNotebookSessions` documents, because the filter a listing applies is the documented
 //! one rather than a list of what this projection happens to emit.
 //!
@@ -726,14 +727,15 @@ pub fn notebook_of_engine_configuration(
         .cloned()
 }
 
-/// The message a request addressing a `SessionId` this account holds no session under is
-/// refused with.
+/// The message a session-addressed request this service will not act on is refused with.
 ///
 /// FIXED text with no variable part: the `SessionId` the request named is deliberately not
 /// quoted back, so a refusal discloses nothing about which ids name sessions. It is the
-/// sentence Athena refuses a session id that never resolved with, shared by every operation
-/// of this service that addresses ONE session, so the same absent session reads the same way
-/// whichever of them was called.
+/// sentence Athena refuses such a request with, shared by every operation of this service
+/// that addresses ONE session, so the same request reads the same way whichever of them was
+/// called — whether the id resolved to no session of this account at all, or resolved to a
+/// session this service will not perform the request's work in (one whose resources are
+/// gone, or one serving no notebook for a calculation to be a cell of).
 pub const SESSION_NOT_FOUND: &str = "Not authorized to make this request.";
 
 /// The message a start that names a notebook version without the notebook it belongs to is

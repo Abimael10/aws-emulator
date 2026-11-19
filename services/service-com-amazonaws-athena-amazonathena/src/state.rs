@@ -65,6 +65,13 @@
 //! ([`SessionRecord::dashboard_url`]) — a projection of that same record rather than a
 //! resource of its own.
 //!
+//! CALCULATIONS live in the [`CalculationRegistry`] of
+//! [`ComAmazonawsAthenaAmazonathenaState::calculations`], each submitted into one notebook
+//! session: `StartCalculationExecution` writes a [`CalculationRecord`] there and
+//! `GetCalculationExecutionCode` answers out of that same record, so the code a read reports
+//! is the code a submission persisted. A session serving no notebook runs no calculation and
+//! takes none.
+//!
 //! PREPARED STATEMENTS live in the [`PreparedStatementRegistry`] of
 //! [`ComAmazonawsAthenaAmazonathenaState::prepared_statements`], scoped to the workgroup
 //! each belongs to: `CreatePreparedStatement` writes a [`PreparedStatementRecord`] there
@@ -131,6 +138,10 @@ pub use sessions::*;
 /// The interface one session serves, and the ARN that addresses it.
 mod session_dashboards;
 pub use session_dashboards::*;
+
+/// The calculations submitted into this account's notebook sessions, and the code of each.
+mod calculations;
+pub use calculations::*;
 
 /// The provisioned capacity this account reserved, and each reservation's lifecycle.
 mod capacity_reservations;
@@ -2345,6 +2356,10 @@ pub struct ComAmazonawsAthenaAmazonathenaState {
     /// `ListSessions`, `ListExecutors` and `ListNotebookSessions` read it; see
     /// [`SessionRegistry`].
     pub sessions: SessionRegistry,
+    /// Every calculation submitted into one of this account's notebook sessions.
+    /// `StartCalculationExecution` writes it and `GetCalculationExecutionCode` reads it;
+    /// see [`CalculationRegistry`].
+    pub calculations: CalculationRegistry,
     /// Every capacity reservation this account holds. `CreateCapacityReservation` writes
     /// it and `GetCapacityReservation` reads it; see [`CapacityReservationRegistry`].
     pub capacity_reservations: CapacityReservationRegistry,
@@ -2392,6 +2407,7 @@ impl Default for ComAmazonawsAthenaAmazonathenaState {
             query_databases: BTreeMap::new(),
             notebooks: NotebookRegistry::default(),
             sessions: SessionRegistry::default(),
+            calculations: CalculationRegistry::default(),
             capacity_reservations: CapacityReservationRegistry::default(),
             prepared_statements: PreparedStatementRegistry::default(),
             named_queries: NamedQueryRegistry::default(),

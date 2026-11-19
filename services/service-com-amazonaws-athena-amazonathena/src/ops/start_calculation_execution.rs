@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartCalculationExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartCalculationExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartCalculationExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The code of one calculation submitted into a notebook session, written into this
+//! service's [`crate::state::CalculationRegistry`]: the submission mints a
+//! `CalculationExecutionId`, stores a [`crate::state::CalculationRecord`] holding the code
+//! block the request carried, and `GetCalculationExecutionCode` answers out of that same
+//! record — so the code a later read reports is the code this call persisted.
+//!
+//! A calculation is a cell of the notebook the session serves, so a session started for no
+//! notebook runs none, and neither does one whose resources are gone: both are refused in
+//! the one sentence every session-addressed request this service will not act on is refused
+//! with ([`crate::state::SESSION_NOT_FOUND`]).
+//!
+//! What the submission REPORTS is what it did: "CREATED - The calculation has been created
+//! and is ready to run". Nothing here runs the code block — the Spark engine that would
+//! execute it is not part of this emulator — so no answer and no record claims a run, a
+//! result or a duration for work nothing performed, and the session the calculation was
+//! submitted into is left in the state it was in.
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +174,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartCalculationExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartCalculationExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // "You can supply the code to run as an inline code block within the request. The
+        // request syntax requires the StartCalculationExecutionRequest$CodeBlock parameter or
+        // the CalculationConfiguration$CodeBlock parameter, but not both." Checked before any
+        // lock is taken: a request that is going to be refused never walks the registry. The
+        // modelled length of a `CodeBlock` is 0..68000, so an EMPTY code block is a code block
+        // the request supplied.
+        let deprecated = input
+            .calculation_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.code_block.clone());
+        let code_block = match (input.code_block, deprecated) {
+            (Some(code_block), None) | (None, Some(code_block)) => code_block,
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(invalid_request(crate::state::CALCULATION_CODE_REQUIRED));
+            }
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StartCalculationExecutionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("Athena state is not reachable on this engine".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // "A unique case-sensitive string used to ensure the request to create the calculation
+        // is idempotent (executes only once). If another StartCalculationExecutionRequest is
+        // received, the same response is returned and another calculation is not created. If a
+        // parameter has changed, an error is returned." A repeat under a token this store
+        // already minted a calculation for answers with THAT calculation and submits nothing
+        // further.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(minted) = store.calculations.calculation_of_token(token) {
+                // The comparison itself lives on the record
+                // (`crate::state::CalculationRecord::matches_submission`), so a parameter a
+                // submission comes to persist is weighed in one place.
+                if !minted.matches_submission(
+                    &input.session_id,
+                    &code_block,
+                    input.description.as_deref(),
+                ) {
+                    return Err(invalid_request(
+                        crate::state::IDEMPOTENT_PARAMETERS_DO_NOT_MATCH,
+                    ));
+                }
+                return Ok(StartCalculationExecutionOutput {
+                    calculation_execution_id: Some(minted.id.clone()),
+                    state: Some(minted.state().to_string()),
+                });
+            }
+        }
+
+        // "Submits calculations for execution WITHIN A SESSION": the id names a session this
+        // account holds, or it names nothing this service will act on — the one sentence every
+        // session-addressed operation of this service states for that
+        // (`crate::state::SESSION_NOT_FOUND`), which discloses nothing about which ids name
+        // sessions.
+        let Some(session) = store.sessions.session(&input.session_id) else {
+            return Err(invalid_request(crate::state::SESSION_NOT_FOUND));
+        };
+        // A session whose resources are no longer running — one shutting down, one whose
+        // resources are gone, one that ended badly — runs nothing, so there is nothing for a
+        // calculation to be submitted into. It takes the session-addressed sentence rather
+        // than the distinct wording `CreatePresignedNotebookUrl` answers for the same
+        // condition (`crate::state::NOTEBOOK_SESSION_NOT_OPEN`), which is the message
+        // RECORDED for that operation: no recording covers this one for a session that is
+        // shutting down or gone, so the refusal stays inside the class every other
+        // session-addressed request of this operation takes.
+        if !session.is_active_at(now) {
+            return Err(invalid_request(crate::state::SESSION_NOT_FOUND));
+        }
+        // The code of a calculation is the code of a cell of the notebook the session's engine
+        // serves, and WHICH notebook that is was decided by the start that bound the session to
+        // one (`crate::state::NOTEBOOK_ID_CONFIG`). A session started for no notebook — or one
+        // whose notebook this account no longer holds — serves none, so it runs no calculation
+        // and the submission is refused in the same sentence.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartCalculationExecution"))
+        // That is where the RECORDED behaviour of this operation divides: a submission into a
+        // session whose start carried the notebook key is served and runs to completion, with
+        // the code readable back afterwards, while a submission into a session started without
+        // it — same account, same Spark enabled workgroup, same engine version, the session
+        // IDLE and its dashboard readable — is refused, and the refusal starts nothing.
+        let notebook_id = session
+            .notebook_id
+            .as_deref()
+            .filter(|notebook_id| store.notebooks.notebook(notebook_id).is_some())
+            .map(ToString::to_string);
+        let Some(notebook_id) = notebook_id else {
+            return Err(invalid_request(crate::state::SESSION_NOT_FOUND));
+        };
+        let session_id = session.id.clone();
+        let work_group = session.work_group.clone();
+
+        // Athena hands back a calculation that has been created, so nothing is owed by the
+        // clock here: the record is stored in the state it reads as
+        // (`crate::state::CalculationRecord::state`).
+        let record = crate::state::CalculationRecord {
+            id: crate::state::new_calculation_execution_id(),
+            session_id,
+            work_group,
+            notebook_id,
+            description: input.description,
+            code_block,
+            submitted_at: now,
+        };
+        let calculation_execution_id = record.id.clone();
+        let state_reached = record.state().to_string();
+        store
+            .calculations
+            .insert(record, input.client_request_token);
+
+        Ok(StartCalculationExecutionOutput {
+            calculation_execution_id: Some(calculation_execution_id),
+            state: Some(state_reached),
+        })
     }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// Every refusal above is a bad request rather than an unwritten operation, and
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request." Each one is caused by the request
+/// itself, which is the class [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
+fn invalid_request(message: impl Into<String>) -> StartCalculationExecutionError {
+    StartCalculationExecutionError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }
