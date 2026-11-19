@@ -40,6 +40,12 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/us-east-1/healthlake/aws4_request, \
      SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000";
 
+/// The placeholder signature [`AUTHORIZATION`] carries, for a request whose credential
+/// scope this harness varies ([`HealthLake::rpc_from`]). It is not verified here, for
+/// the reason [`AUTHORIZATION`] states.
+const ZERO_SIGNATURE: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
 /// The host an SDK resolves this service's endpoint to, which every request below
 /// carries unless a suite names another one.
 pub(crate) const ENDPOINT_HOST: &str = "healthlake.us-east-1.amazonaws.com";
@@ -252,6 +258,122 @@ impl HealthLake {
             .unwrap_or_else(|| panic!("the data store reports a DatastoreEndpoint, got {properties}"))
             .to_string();
         (id, endpoint_path(&endpoint))
+    }
+
+    /// Look at `DescribeFHIRDatastore` until the data store `id` reports `ACTIVE`, and
+    /// answer the `DatastoreProperties` of that read.
+    ///
+    /// A lifecycle transition this service owes is materialised by whichever call reads
+    /// the record next, so waiting for one means LOOKING again until it holds — never
+    /// waiting for a span, which would tie the outcome to how fast the host runs. The
+    /// deadline is the one every suite waits by
+    /// ([`crate::fhir_datastore_lifecycle::SETTLING_DEADLINE`]).
+    pub(crate) async fn poll_until_active(&self, id: &str) -> Value {
+        let deadline =
+            std::time::Instant::now() + crate::fhir_datastore_lifecycle::SETTLING_DEADLINE;
+        loop {
+            let (status, described) = self
+                .rpc("DescribeFHIRDatastore", &json!({ "DatastoreId": id }))
+                .await;
+            assert_eq!(
+                status, 200,
+                "DescribeFHIRDatastore must answer 200, got {status}: {described}"
+            );
+            let properties = &described["DatastoreProperties"];
+            if properties["DatastoreStatus"] == "ACTIVE" {
+                return properties.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the data store {id} did not reach ACTIVE within the settling deadline, \
+                 last read {described}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The same harness as [`HealthLake::new`], answering as an emulator a client
+    /// reached at `base` — `scheme://host[:port]`, the address its data port is
+    /// published on.
+    ///
+    /// A router that was never served on a port reports the framework's
+    /// [`smithy_server_runtime::UNSERVED_URL_BASE`], so a value built from the emulator's
+    /// own address and one built from a constant look alike. This seam names another
+    /// base, which makes what an address is built FROM observable.
+    pub(crate) fn served_at(base: &str) -> Self {
+        let mut service = Self::new();
+        service.router.set_url_base(
+            smithy_server_runtime::EndpointUrl::parse(base)
+                .unwrap_or_else(|| panic!("{base:?} is a usable emulator base URL")),
+        );
+        service
+    }
+
+    /// Dispatch one awsJson1_0 control-plane call from a client that reached this
+    /// emulator on `host`, with a credential scoped to `region`.
+    ///
+    /// Both are what an SDK pointed at the real service would carry, and neither is
+    /// part of the address this emulator is reached on.
+    pub(crate) async fn rpc_from(
+        &self,
+        host: &str,
+        region: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", host)
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/healthlake/\
+                     aws4_request, SignedHeaders=host;x-amz-date, Signature={ZERO_SIGNATURE}"
+                ),
+            )
+            .header("content-type", "application/x-amz-json-1.0")
+            .header("x-amz-target", format!("HealthLake.{operation}"))
+            .body(bytes::Bytes::from(
+                serde_json::to_vec(body).expect("the request body serializes"),
+            ))
+            .expect("the request builds");
+        decoded(self.router.dispatch(request).await)
+    }
+
+    /// Dispatch a FHIR interaction to the ABSOLUTE URL a client was handed: the
+    /// published `DatastoreEndpoint` with the interaction joined onto it, sent exactly
+    /// as a client that follows that value sends it — the whole URL on the request
+    /// line and the authority it names in `Host`.
+    ///
+    /// The sibling [`HealthLake::fhir`] sends the PATH alone, which says nothing about
+    /// the host a published endpoint announced; this one dispatches the announced
+    /// address itself, so what is under test is whether that address is one this
+    /// emulator answers on.
+    pub(crate) async fn fhir_at_url(
+        &self,
+        method: &str,
+        url: &str,
+        body: &Value,
+    ) -> (u16, Value) {
+        let authority = url
+            .split_once("://")
+            .map(|(_scheme, rest)| rest.split('/').next().unwrap_or(rest))
+            .unwrap_or_else(|| panic!("{url:?} must be an absolute URL"));
+        let payload = if body.is_null() {
+            Vec::new()
+        } else {
+            serde_json::to_vec(body).expect("the resource serializes")
+        };
+        let request = http::Request::builder()
+            .method(method)
+            .uri(url)
+            .header("host", authority)
+            .header("authorization", AUTHORIZATION)
+            .header("content-type", "application/fhir+json")
+            .body(bytes::Bytes::from(payload))
+            .expect("the request builds");
+        decoded(self.router.dispatch(request).await)
     }
 }
 
@@ -1257,4 +1379,263 @@ async fn the_rpc_surface_is_unchanged_by_the_rest_surfaces() {
         "SerializationException",
         "the refusal is the protocol's, got {refused}"
     );
+}
+
+/// Every address an emulator may be reached on, as the client that is talking to it
+/// sees it.
+///
+/// A published address is rooted at the emulator's OWN base, so the rows differ along
+/// what that base can be: a router that is not served on a port, a loopback address
+/// with a port, another port on that same address, an IPv6 literal, and a named host
+/// with no port at all.
+fn served_bases() -> [(&'static str, &'static str); 5] {
+    [
+        (
+            "an emulator that is not served on a port",
+            smithy_server_runtime::UNSERVED_URL_BASE,
+        ),
+        ("a loopback address and port", "https://127.0.0.1:37471"),
+        (
+            "another port on the same loopback address",
+            "https://127.0.0.1:44223",
+        ),
+        ("an IPv6 loopback address and port", "https://[::1]:9297"),
+        ("a named host with no port", "https://emulator.test"),
+    ]
+}
+
+/// Create one data store and answer its `DatastoreId` and the whole
+/// `CreateFHIRDatastore` body.
+async fn created_datastore(service: &HealthLake, name: &str) -> (String, Value) {
+    let (status, created) = service
+        .rpc(
+            "CreateFHIRDatastore",
+            &json!({ "DatastoreTypeVersion": "R4", "DatastoreName": name }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {name:?}: CreateFHIRDatastore must answer 200, got {status}: {created}"
+    );
+    let id = created["DatastoreId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {name:?}: the create reports a DatastoreId, got {created}"))
+        .to_string();
+    (id, created)
+}
+
+/// The `DatastoreEndpoint` of a `DatastoreProperties` (or of a response that carries it
+/// at the top level).
+fn published_endpoint(case: &str, body: &Value) -> String {
+    body["DatastoreEndpoint"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: a DatastoreEndpoint is required, got {body}"))
+        .to_string()
+}
+
+/// `DatastoreEndpoint` carries a routable address, and nothing else in the API tells a
+/// client where a data store's FHIR plane is — so every surface that projects it
+/// publishes THIS emulator's own base, the address the client is talking to, followed
+/// by the data store's own path.
+#[tokio::test]
+async fn every_surface_publishes_the_datastore_endpoint_on_the_address_this_emulator_is_served_on()
+{
+    for (case, base) in served_bases() {
+        let service = HealthLake::served_at(base);
+        let (id, created) = created_datastore(&service, case).await;
+        let expected = format!("{base}/datastore/{id}/r4/");
+
+        // The surfaces that project `DatastoreProperties`: the create that mints the
+        // data store, the read, the listing, and the delete.
+        assert_eq!(
+            published_endpoint(case, &created),
+            expected,
+            "case {case:?}: CreateFHIRDatastore must publish the data store's endpoint on \
+             this emulator's own base {base:?}, got {created}"
+        );
+        let properties = service.poll_until_active(&id).await;
+        assert_eq!(
+            published_endpoint(case, &properties),
+            expected,
+            "case {case:?}: DescribeFHIRDatastore must publish {expected:?}, got {properties}"
+        );
+        let (status, listed) = service.rpc("ListFHIRDatastores", &json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: ListFHIRDatastores must answer 200, got {status}: {listed}"
+        );
+        let entries = listed["DatastorePropertiesList"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let entry = entries
+            .iter()
+            .find(|entry| entry["DatastoreId"] == json!(id))
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: the listing reports {id}, got {listed}"));
+        assert_eq!(
+            published_endpoint(case, &entry),
+            expected,
+            "case {case:?}: ListFHIRDatastores must publish {expected:?}, got {entry}"
+        );
+        let (status, deleted) = service
+            .rpc("DeleteFHIRDatastore", &json!({ "DatastoreId": id }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DeleteFHIRDatastore must answer 200, got {status}: {deleted}"
+        );
+        assert_eq!(
+            published_endpoint(case, &deleted),
+            expected,
+            "case {case:?}: DeleteFHIRDatastore must publish {expected:?}, got {deleted}"
+        );
+
+        // The authority it names is the one the client reached this emulator on, so it
+        // is not the real service's host however the request was addressed.
+        let authority = base
+            .split_once("://")
+            .map(|(_scheme, rest)| rest)
+            .unwrap_or_else(|| panic!("case {case:?}: {base:?} is an absolute URL"));
+        assert_eq!(
+            endpoint_authority(&expected),
+            authority,
+            "case {case:?}: the published endpoint must name the authority this emulator is \
+             reached on, got {expected:?}"
+        );
+        assert!(
+            !endpoint_authority(&expected).ends_with("amazonaws.com"),
+            "case {case:?}: the published endpoint must not name the real service's host, \
+             got {expected:?}"
+        );
+    }
+}
+
+/// The authority of an absolute URL: everything between the scheme and the path.
+fn endpoint_authority(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_scheme, rest)| rest);
+    after_scheme.split('/').next().unwrap_or_default()
+}
+
+/// A client does with `DatastoreEndpoint` the one thing the member exists for: it sends
+/// the FHIR interactions there. So the published value is an address this emulator
+/// answers those interactions on — dialled whole, authority included, rather than by
+/// the path alone.
+#[tokio::test]
+async fn a_client_that_follows_the_published_datastore_endpoint_reaches_the_fhir_plane() {
+    for (case, base) in served_bases() {
+        let service = HealthLake::served_at(base);
+        let (id, _created) = created_datastore(&service, case).await;
+        let endpoint = published_endpoint(case, &service.poll_until_active(&id).await);
+
+        let submitted = json!({
+            "resourceType": "Patient",
+            "name": [{ "family": "Lovelace", "given": ["Ada"] }],
+        });
+        let (status, stored) = service
+            .fhir_at_url("POST", &format!("{endpoint}Patient"), &submitted)
+            .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: a FHIR create sent to the published {endpoint:?} must answer \
+             201, got {status}: {stored}"
+        );
+        let resource_id = stored["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: the create assigns an id, got {stored}"))
+            .to_string();
+
+        let (status, read) = service
+            .fhir_at_url(
+                "GET",
+                &format!("{endpoint}Patient/{resource_id}"),
+                &Value::Null,
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a FHIR read sent to the published {endpoint:?} must answer 200, \
+             got {status}: {read}"
+        );
+        assert_eq!(
+            (read["resourceType"].as_str(), read["id"].as_str()),
+            (Some("Patient"), Some(resource_id.as_str())),
+            "case {case:?}: the read must answer the resource the create stored, got {read}"
+        );
+        assert_eq!(
+            read["name"], submitted["name"],
+            "case {case:?}: the read must answer the submitted content, got {read}"
+        );
+    }
+}
+
+/// The address a client reached this emulator on is the emulator's, not the request's:
+/// neither the endpoint host an SDK resolved nor the Region its credential is scoped to
+/// changes the published endpoint. The Region a resource belongs to is named by its
+/// ARN, which DOES follow that scope.
+#[tokio::test]
+async fn the_published_endpoint_follows_the_emulator_and_not_the_request_host_or_region() {
+    let base = "https://127.0.0.1:37471";
+    let service = HealthLake::served_at(base);
+
+    // (case, the Host header, the Region the credential is scoped to)
+    let rows: [(&str, &str, &str); 5] = [
+        (
+            "the endpoint host an SDK resolves",
+            "healthlake.us-east-1.amazonaws.com",
+            "us-east-1",
+        ),
+        (
+            "the endpoint host of another Region",
+            "healthlake.us-west-2.amazonaws.com",
+            "us-west-2",
+        ),
+        (
+            "the data-transformation endpoint host",
+            "datatransformation.healthlake.eu-west-1.amazonaws.com",
+            "eu-west-1",
+        ),
+        (
+            "a dual-stack endpoint host",
+            "healthlake.ap-south-1.api.aws",
+            "ap-south-1",
+        ),
+        (
+            "the literal address the emulator is reached on",
+            "127.0.0.1:37471",
+            "us-east-1",
+        ),
+    ];
+
+    for (case, host, region) in rows {
+        let (status, created) = service
+            .rpc_from(
+                host,
+                region,
+                "CreateFHIRDatastore",
+                &json!({ "DatastoreTypeVersion": "R4", "DatastoreName": case }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateFHIRDatastore must answer 200, got {status}: {created}"
+        );
+        let id = created["DatastoreId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: the create reports a DatastoreId, got {created}"))
+            .to_string();
+        assert_eq!(
+            published_endpoint(case, &created),
+            format!("{base}/datastore/{id}/r4/"),
+            "case {case:?}: the published endpoint must name this emulator's base {base:?} \
+             whatever host and Region the request carried, got {created}"
+        );
+        let expected_arn = format!("arn:aws:healthlake:{region}:000000000000:datastore/fhir/{id}");
+        assert_eq!(
+            created["DatastoreArn"].as_str(),
+            Some(expected_arn.as_str()),
+            "case {case:?}: the ARN is what names the Region the data store belongs to, \
+             got {created}"
+        );
+    }
 }
