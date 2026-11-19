@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMaintenanceWindowTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMaintenanceWindowTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report one task registered with a maintenance window — the read half of this service's
+//! maintenance-window task slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMaintenanceWindowTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The task is the one `RegisterTaskWithMaintenanceWindow` persisted, in the one store in
+//! [`crate::state::maintenance_window_tasks`], so what this reports is what that register
+//! wrote and what deleting the window takes away. Both ids NAME a resource — "the maintenance
+//! window ID that includes the task to retrieve" and "the maintenance window task ID to
+//! retrieve" — so a window this endpoint holds none of, and a task that window holds none of,
+//! are each refused `DoesNotExistException`.
+//!
+//! Nothing is computed here and nothing is written: the report is the record, with the members
+//! the register chose for the task (its id, the bounds a targetless task holds, the cutoff
+//! behaviour and the priority) exactly as it chose them.
 //!
 //! ## Shape of an operation
 //!
@@ -209,18 +213,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMaintenanceWindowTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMaintenanceWindowTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMaintenanceWindowTask"))
+        // `WindowId`'s and `WindowTaskId`'s presence, lengths and patterns are MODELLED
+        // constraints the centralized walk has already refused anything outside of: what is
+        // resolved here is which window holds which task.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMaintenanceWindowTaskErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the maintenance window store is unavailable".to_string()),
+            })
+        })?;
+
+        // A window and its tasks live in the Region the endpoint names, which is the signed
+        // credential scope's.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        if store
+            .maintenance_window(&region, &input.window_id)
+            .is_none()
+        {
+            return Err(GetMaintenanceWindowTaskErrorModeled::DoesNotExistException(
+                DoesNotExistException {
+                    message: Some(
+                        crate::state::maintenance_windows::maintenance_window_not_found_message(
+                            &input.window_id,
+                        ),
+                    ),
+                },
+            )
+            .into());
+        }
+        let Some(held) =
+            store.maintenance_window_task(&region, &input.window_id, &input.window_task_id)
+        else {
+            return Err(GetMaintenanceWindowTaskErrorModeled::DoesNotExistException(
+                DoesNotExistException {
+                    message: Some(
+                        crate::state::maintenance_window_tasks::task_not_found_message(
+                            &input.window_id,
+                            &input.window_task_id,
+                        ),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetMaintenanceWindowTaskOutput {
+            window_id: Some(held.window_id.clone()),
+            window_task_id: Some(held.window_task_id.clone()),
+            targets: Some(held.targets.clone()),
+            task_arn: Some(held.task_arn.clone()),
+            service_role_arn: held.service_role_arn.clone(),
+            task_type: Some(held.task_type.clone()),
+            task_parameters: held.reported_task_parameters(),
+            task_invocation_parameters: held.task_invocation_parameters.clone(),
+            priority: held.priority,
+            max_concurrency: held.max_concurrency.clone(),
+            max_errors: held.max_errors.clone(),
+            logging_info: held.logging_info.clone(),
+            name: held.name.clone(),
+            description: held.description.clone(),
+            cutoff_behavior: Some(held.cutoff_behavior.clone()),
+            alarm_configuration: held.alarm_configuration.clone(),
+        })
     }
 }

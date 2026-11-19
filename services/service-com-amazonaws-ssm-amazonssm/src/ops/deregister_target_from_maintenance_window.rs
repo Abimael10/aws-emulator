@@ -12,11 +12,11 @@
 //! holds none of, are each refused `DoesNotExistException` and nothing is removed.
 //!
 //! "The system checks if the target is being referenced by a task" is what `Safe` asks for,
-//! and `TargetInUseException` is what such a reference is reported with. No task of a window
-//! can be registered yet (`RegisterTaskWithMaintenanceWindow` is still a scaffold stub with
-//! its own issue, `src/ops/register_task_with_maintenance_window.rs`), so no target this store
-//! holds is referenced by one and that refusal is never the answer here; when that writer
-//! lands, this is the one place the check belongs.
+//! and `TargetInUseException` is what such a reference is reported with: a task of the same
+//! window naming this target by id ([`crate::state::maintenance_window_tasks`]) is that
+//! reference, so the target stays and the refusal names the task that holds it. The model
+//! gives `Safe` no default, so an absent flag is read the safe way and only a request that
+//! explicitly states `Safe=false` removes a referenced target.
 //!
 //! ## Shape of an operation
 //!
@@ -193,11 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if !store.remove_maintenance_window_target(
-            &region,
-            &input.window_id,
-            &input.window_target_id,
-        ) {
+        // A target the window holds none of names nothing to remove, whatever the request
+        // asked of the safety check.
+        if store
+            .maintenance_window_target(&region, &input.window_id, &input.window_target_id)
+            .is_none()
+        {
             return Err(
                 DeregisterTargetFromMaintenanceWindowErrorModeled::DoesNotExistException(
                     DoesNotExistException {
@@ -212,6 +213,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+
+        // "The system checks if the target is being referenced by a task. If the target is
+        // being referenced, the system returns an error and doesn't deregister the target":
+        // the model gives `Safe` no default, so the check is the service's own reading of an
+        // absent flag and only a request that explicitly states `Safe=false` asks for the
+        // removal to go through regardless.
+        if input.safe != Some(false) {
+            let referencing = store
+                .maintenance_window_task_referencing_target(
+                    &region,
+                    &input.window_id,
+                    &input.window_target_id,
+                )
+                .map(|task| task.window_task_id.clone());
+            if let Some(window_task_id) = referencing {
+                return Err(
+                    DeregisterTargetFromMaintenanceWindowErrorModeled::TargetInUseException(
+                        TargetInUseException {
+                            message: Some(
+                                crate::state::maintenance_window_tasks::target_referenced_message(
+                                    &window_task_id,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        store.remove_maintenance_window_target(&region, &input.window_id, &input.window_target_id);
 
         // "The ID of the maintenance window the target was removed from" and "the ID of the
         // removed target definition": the request's own ids, now that the removal has

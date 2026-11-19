@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterTaskWithMaintenanceWindow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterTaskWithMaintenanceWindow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Add a task to a maintenance window — the write half of this service's maintenance-window
+//! task slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterTaskWithMaintenanceWindow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it persists is read back by `GetMaintenanceWindowTask` and goes with the window when
+//! `DeleteMaintenanceWindow` removes it; all three reach the one store in
+//! [`crate::state::maintenance_window_tasks`]. The register resolves ONE thing from state: the
+//! WINDOW the task is added to, which has to be a window the Region holds — "the ID of the
+//! maintenance window the task should be added to" names a window, so an id no window of this
+//! endpoint carries is refused `DoesNotExistException` and nothing is written.
+//!
+//! `TaskArn` is held as stated rather than resolved: "Maintenance Window does not validate the
+//! TaskArn when you register a task. A successful registration does not guarantee that the
+//! TaskArn is valid" (`MaintenanceWindowTask$TaskArn`). The `Targets` are criteria for the
+//! same reason a window's registered targets are — criteria describing no node today may
+//! describe one tomorrow — so they too are held as stated, except that one criterion form
+//! names a registered target of the same window by id, which is the reference
+//! `DeregisterTargetFromMaintenanceWindow` refuses to orphan.
+//!
+//! Three members are NOT echoes of the request, because the model states what the service
+//! puts there instead: `MaxConcurrency` and `MaxErrors` hold the documented placeholder for a
+//! targetless task, `CutoffBehavior` holds the documented default and `Priority` the modelled
+//! one (see [`crate::state::maintenance_window_tasks`]).
+//!
+//! The id is the SERVICE's to choose — no input member carries one — and a retry carrying the
+//! same `ClientToken` reports the task that register already minted rather than minting a
+//! second one.
+//!
+//! `FeatureNotAvailableException` reports "you attempted to register a LAMBDA or
+//! STEP_FUNCTIONS task in a region where the corresponding service isn't available": every
+//! Region this emulator serves ([`crate::state::global_infrastructure`]) is one both of those
+//! services are reachable in, so no register of either task type is refused for where it was
+//! sent.
 //!
 //! ## Shape of an operation
 //!
@@ -227,18 +250,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterTaskWithMaintenanceWindow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterTaskWithMaintenanceWindowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterTaskWithMaintenanceWindow"))
+        use crate::state::maintenance_window_tasks::{self as tasks, MaintenanceWindowTaskRecord};
+
+        // `WindowId`'s length and pattern, `TaskArn`'s and `Name`'s lengths and patterns,
+        // `TaskType`'s and `CutoffBehavior`'s enums, the `Targets` list's length and
+        // `MaxConcurrency`/`MaxErrors`/`Priority`'s patterns and range are MODELLED
+        // constraints, so the centralized walk has already refused anything outside them:
+        // what is resolved here is which window the task is added to.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterTaskWithMaintenanceWindowErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the maintenance window store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A window and its tasks live in the Region its endpoint names, which is the signed
+        // credential scope's — so the window id is resolved against that Region's records.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let targets = input.targets.unwrap_or_default();
+        let mut record = MaintenanceWindowTaskRecord {
+            // Replaced by the minted id below, once this register is known to be one.
+            window_task_id: String::new(),
+            region: region.clone(),
+            window_id: input.window_id,
+            task_arn: input.task_arn,
+            task_type: input.task_type,
+            // "For maintenance window tasks without a target specified, you can't supply a
+            // value for this option. Instead, the system inserts a placeholder value of 1":
+            // both bounds are read that one way.
+            max_concurrency: tasks::held_bound(&targets, input.max_concurrency),
+            max_errors: tasks::held_bound(&targets, input.max_errors),
+            targets,
+            task_parameters: input
+                .task_parameters
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            task_invocation_parameters: input.task_invocation_parameters,
+            // The register's `Priority` carries no modelled default while the task a read
+            // reports does (`default 0`), so an omitted priority is that one: "the lower the
+            // number the higher the priority".
+            priority: input.priority.unwrap_or(tasks::DEFAULT_PRIORITY),
+            logging_info: input.logging_info,
+            service_role_arn: input.service_role_arn,
+            name: input.name,
+            description: input.description,
+            // "CONTINUE_TASK: When the cutoff time is reached, any tasks that are running
+            // continue. The default value" — what a register carrying no cutoff behaviour
+            // asks for.
+            cutoff_behavior: input
+                .cutoff_behavior
+                .unwrap_or_else(|| tasks::DEFAULT_CUTOFF_BEHAVIOR.to_string()),
+            alarm_configuration: input.alarm_configuration,
+            client_token: input.client_token,
+            registered_at: now,
+        };
+
+        // "User-provided idempotency token": a retry of one register reports the task that
+        // register already minted, and the same token carrying different members is another
+        // call rather than a retry. Decided before the window is resolved, so a retry is
+        // answered the way the call it retries was.
+        if let Some(token) = record.client_token.clone() {
+            if let Some(held) = store.maintenance_window_task_with_client_token(&region, &token) {
+                if held.registration_fingerprint() != record.registration_fingerprint() {
+                    // The modelled shape's `Message` is optional and this service states this
+                    // refusal through its error code alone, the way its sibling register does.
+                    return Err(
+                        RegisterTaskWithMaintenanceWindowErrorModeled::IdempotentParameterMismatch(
+                            IdempotentParameterMismatch { message: None },
+                        )
+                        .into(),
+                    );
+                }
+                return Ok(RegisterTaskWithMaintenanceWindowOutput {
+                    window_task_id: Some(held.window_task_id.clone()),
+                });
+            }
+        }
+
+        // The window the task is added TO has to exist: a task of a window this endpoint
+        // holds none of would be a task nothing could ever run.
+        if store
+            .maintenance_window(&region, &record.window_id)
+            .is_none()
+        {
+            return Err(
+                RegisterTaskWithMaintenanceWindowErrorModeled::DoesNotExistException(
+                    DoesNotExistException {
+                        message: Some(
+                            crate::state::maintenance_windows::maintenance_window_not_found_message(
+                                &record.window_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is BOUNDED: past the emulator's own ceiling a register is refused rather
+        // than admitting another record, through the modelled refusal for exactly that.
+        if !store.can_hold_another_maintenance_window_task(&region, &record.window_id) {
+            return Err(
+                RegisterTaskWithMaintenanceWindowErrorModeled::ResourceLimitExceededException(
+                    ResourceLimitExceededException {
+                        message: Some(tasks::task_ceiling_message(&record.window_id)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The id is the SERVICE's to choose, in the one form the model admits: the 8-4-4-4-12
+        // hexadecimal `MaintenanceWindowTaskId`, minted by the crate's one minter of that
+        // form.
+        record.window_task_id = crate::state::new_uuid();
+        let window_task_id = record.window_task_id.clone();
+        store.insert_maintenance_window_task(record);
+
+        // "The ID of the task in the maintenance window": the id this call minted, which is
+        // the key the task is now held under.
+        Ok(RegisterTaskWithMaintenanceWindowOutput {
+            window_task_id: Some(window_task_id),
+        })
     }
 }

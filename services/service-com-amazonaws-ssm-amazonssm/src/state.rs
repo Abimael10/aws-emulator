@@ -158,7 +158,12 @@
 //! space, keyed by `(region, window target id)`:
 //! `RegisterTargetWithMaintenanceWindow` mints one against a window the Region holds,
 //! `DescribeMaintenanceWindowTargets` reports that window's own, and
-//! `DeregisterTargetFromMaintenanceWindow` removes it.
+//! `DeregisterTargetFromMaintenanceWindow` removes it. The **tasks** that window runs
+//! ([`maintenance_window_tasks`]) hang off the same key space, keyed by
+//! `(region, window task id)`: `RegisterTaskWithMaintenanceWindow` mints one against a window
+//! the Region holds and `GetMaintenanceWindowTask` reports it, and a task naming one of that
+//! window's registered targets by id is the reference that makes a safe deregistration of
+//! that target one the service refuses.
 //!
 //! Then the **execution previews** ([`execution_previews`]), keyed by
 //! `(region, execution preview id)`: `StartExecutionPreview` works out what running an
@@ -376,6 +381,10 @@ pub mod maintenance_windows;
 /// The targets registered with a maintenance window: the record a register persists, and how
 /// a describe and a deregister address one.
 pub mod maintenance_window_targets;
+
+/// The tasks registered with a maintenance window: the record a register persists, the values
+/// the service puts there instead of the ones it was handed, and how a read addresses one.
+pub mod maintenance_window_tasks;
 
 /// What an update that takes a `Replace` flag leaves behind: the one reading of an omitted
 /// member every such operation of this service holds to.
@@ -2272,6 +2281,14 @@ pub struct ComAmazonawsSsmAmazonssmState {
         maintenance_window_targets::MaintenanceWindowTargetRecord,
     >,
 
+    /// Every task registered with a maintenance window, keyed by `(region, window task id)`:
+    /// a task is registered through the endpoint of the Region its window lives in and is
+    /// identified there by the id the register minted, with the window it belongs to on the
+    /// record. A `BTreeMap` so a listing walks a stable, total order. See
+    /// [`maintenance_window_tasks`].
+    pub maintenance_window_tasks:
+        BTreeMap<(String, String), maintenance_window_tasks::MaintenanceWindowTaskRecord>,
+
     /// Every Session Manager session, keyed by `(region, session id)`: a session is started
     /// through one Region's endpoint and is reached there by the id the start minted
     /// ([`sessions::mint_session_id`]). A `BTreeMap` so a report walks a stable, total
@@ -2329,6 +2346,7 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             maintenance_windows: BTreeMap::new(),
             maintenance_window_sequence: 0,
             maintenance_window_targets: BTreeMap::new(),
+            maintenance_window_tasks: BTreeMap::new(),
             sessions: BTreeMap::new(),
             // One key per store, from the system's randomness: see `parameter_pagination`.
             page_token_key: parameter_pagination::PageTokenKey::new(),

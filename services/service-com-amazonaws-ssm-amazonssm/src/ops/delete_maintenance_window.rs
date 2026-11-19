@@ -6,9 +6,10 @@
 //! The window is the one `CreateMaintenanceWindow` persisted, in the one store in
 //! [`crate::state::maintenance_windows`], so what this removes is what a later
 //! `GetMaintenanceWindow` is then refused for. The TARGETS registered with it
-//! ([`crate::state::maintenance_window_targets`]) go with it: a target belongs to the window
-//! it was registered with and is addressed through it, so one left behind would be a record
-//! no call of this service could ever reach.
+//! ([`crate::state::maintenance_window_targets`]) go with it, and so do the TASKS
+//! ([`crate::state::maintenance_window_tasks`]): each belongs to the window it was registered
+//! with and is addressed through it, so one left behind would be a record no call of this
+//! service could ever reach.
 //!
 //! A `WindowId` this endpoint holds no window for is NOT a refusal — the operation models no
 //! not-found error at all — so a delete of a window that is already gone answers the id it
@@ -155,12 +156,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .maintenance_windows
             .remove(&(region.clone(), input.window_id.clone()));
         // The targets registered with the window go with it: each is addressed through the
-        // window, so one kept here could never be read or deregistered again.
+        // window, so one kept here could never be read or deregistered again. The tasks
+        // registered with it go the same way, for the same reason.
         store
             .maintenance_window_targets
             .retain(|(held_region, _), target| {
                 *held_region != region || target.window_id != input.window_id
             });
+        store.remove_maintenance_window_tasks_of(&region, &input.window_id);
 
         // "The ID of the deleted maintenance window": the id the request named, whether or
         // not this endpoint still held a window for it.
