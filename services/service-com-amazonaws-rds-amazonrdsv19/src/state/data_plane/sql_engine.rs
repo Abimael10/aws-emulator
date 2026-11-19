@@ -941,8 +941,8 @@ impl InstanceDatabase {
                 // is the transaction's OWN delta, against the schema its copy declared when
                 // the copy was taken.
                 let before = closed.copies.get(name).cloned().unwrap_or_default();
-                let applied = session_transactions::apply_schema(live, copy, &before).and_then(
-                    |redeclared| {
+                let applied = session_transactions::apply_schema(live, copy, &before, deadline)
+                    .and_then(|redeclared| {
                         for table in &redeclared {
                             session_transactions::copy_table(live, copy, table, deadline)?;
                         }
@@ -952,8 +952,7 @@ impl InstanceDatabase {
                             .cloned()
                             .collect();
                         session_transactions::apply_rows(live, copy, &rest, deadline)
-                    },
-                );
+                    });
                 // The bound is removed once the commit is over. The next statement on this
                 // connection installs its own, so a failure to remove this one cannot leave
                 // anything running unbounded.
@@ -1159,6 +1158,58 @@ impl InstanceDatabase {
         let opened = open_recorded_database(&self.view, &self.transactions, name)?;
         databases.open.insert(name.to_string(), opened);
         Ok(true)
+    }
+
+    /// Carry the TABLES of `source` into the database `name` on this engine, creating that
+    /// database when the engine does not hold it yet, and answer how many tables were carried.
+    ///
+    /// [`Self::load_from`] REPLACES an engine's whole set of databases, which is what
+    /// restoring a snapshot into a new resource's storage is. This ADDS to one of them and
+    /// replaces nothing — a table the database already holds is left exactly as it is — which
+    /// is what carrying in the data another ENDPOINT of the same resource holds is: a DB
+    /// cluster's Data API HTTP endpoint is served by another service, which keeps the rows
+    /// written through it in its own engine, in a database of the same name (see
+    /// [`super::super::data_api_rows`]).
+    ///
+    /// Each object is created from the DECLARATION its source holds and each table's rows are
+    /// carried over as the engine's own typed values, so every column keeps the type and the
+    /// bytes it had; the indexes, views and triggers over those tables follow them. The carry
+    /// reads `source` with ordinary SQL — its catalog and a `SELECT` per table — so that
+    /// connection has to admit those reads.
+    ///
+    /// Bounded like [`Self::load_from`]: the destination is taken with [`Self::lock_until`]
+    /// under [`COPY_DEADLINE`] rather than waited on, the carry is checked against that same
+    /// deadline as it goes, and the databases stay bounded by [`MAX_DATABASES_PER_INSTANCE`].
+    /// Blocking, CPU-bound work: a caller runs it on a blocking task, as a wire handler runs a
+    /// statement.
+    pub fn carry_tables_from(&self, name: &str, source: &Connection) -> Result<usize, EngineError> {
+        let deadline = Instant::now() + COPY_DEADLINE;
+        let mut databases = self.lock_until(deadline).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Cancelled,
+                format!(
+                    "the destination of a copy was in use for longer than {} seconds",
+                    COPY_DEADLINE.as_secs()
+                ),
+            )
+        })?;
+        // The name the engine already holds this database under, which the carry writes into:
+        // the engines resolve a database name ignoring case, so this does not open a second
+        // database beside one that only differs in case.
+        let destination = match resolve(&databases.open, name) {
+            Some(held) => match databases.open.get_mut(&held) {
+                Some(destination) => destination,
+                // `resolve` answers with a key of this very map, so there is nothing to carry
+                // into only if it holds no such database after all.
+                None => return Ok(0),
+            },
+            None => {
+                admit_another_database(&databases)?;
+                let opened = open_recorded_database(&self.view, &self.transactions, name)?;
+                databases.open.entry(name.to_string()).or_insert(opened)
+            }
+        };
+        carry_tables(source, destination, deadline)
     }
 
     /// Drop the database `name` with every table in it, and answer whether it was there.
@@ -1464,6 +1515,83 @@ fn copy_database(
             }
         }
     }
+}
+
+/// Carry every table of `source` that `destination` does not already hold into it, with its
+/// rows and then the indexes, views and triggers defined over those tables, and answer how
+/// many TABLES were carried.
+///
+/// Table by table rather than page by page ([`copy_database`]), because this ADDS to a
+/// database that already holds its own objects: a page copy would replace them. Each object is
+/// created from the DECLARATION its own engine holds for it and each table's rows are carried
+/// over by the same carry a commit makes ([`super::session_transactions::copy_table`]), as the
+/// engine's own typed values and in the kind order that carry declares
+/// ([`super::session_transactions::SCHEMA_ORDER`]) — so nothing about a column's type or a
+/// value's bytes is re-rendered here, and there is one carry of one engine's schema into
+/// another's rather than two.
+///
+/// A table's DECLARATION and its ROWS are carried inside one transaction of the destination's
+/// own, so a carry the engine refuses part way through — a row it will not take, the deadline
+/// — leaves the destination exactly as it was rather than a table holding some of its rows:
+/// an export must never report a row count no database holds. An object defined OVER those
+/// tables is logged and passed over instead, since it carries no rows of its own.
+///
+/// `deadline` is checked between objects and, by that same carry, between rows; the
+/// destination keeps the page ceiling its connection was opened with, so the engine answers
+/// `SQLITE_FULL` rather than growing past it.
+fn carry_tables(
+    source: &Connection,
+    destination: &mut Connection,
+    deadline: Instant,
+) -> Result<usize, EngineError> {
+    let objects = super::session_transactions::schema_objects(source)?;
+    // What the destination declares already, read once: a carry never writes over an object
+    // the database it carries into has of its own. A name is unique across an engine's
+    // schema, so the kind it was declared as does not enter the question.
+    let held: ::std::collections::BTreeSet<String> =
+        super::session_transactions::schema_objects(destination)?
+            .into_keys()
+            .map(|(name, _)| name)
+            .collect();
+    let mut carried = 0;
+    for kind in super::session_transactions::SCHEMA_ORDER {
+        for ((name, declared_as), declaration) in &objects {
+            if declared_as != kind || held.contains(name) {
+                continue;
+            }
+            if Instant::now() >= deadline {
+                return Err(carry_cancelled());
+            }
+            if kind != "table" {
+                if let Err(error) = destination.execute_batch(declaration) {
+                    ::tracing::warn!(
+                        object = %name,
+                        kind = %kind,
+                        %error,
+                        "an object defined over a carried table could not be created"
+                    );
+                }
+                continue;
+            }
+            let carrying = destination.transaction().map_err(from_engine)?;
+            carrying.execute_batch(declaration).map_err(from_engine)?;
+            super::session_transactions::copy_table(&carrying, source, name, deadline)?;
+            carrying.commit().map_err(from_engine)?;
+            carried += 1;
+        }
+    }
+    Ok(carried)
+}
+
+/// A carry that ran past [`COPY_DEADLINE`], worded as the copy it is.
+fn carry_cancelled() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::Cancelled,
+        format!(
+            "carrying a database's tables took longer than {} seconds",
+            COPY_DEADLINE.as_secs()
+        ),
+    )
 }
 
 /// An engine that could not be brought up or configured at all.

@@ -480,6 +480,10 @@ pub async fn captured_data_bytes(
 /// nothing. The store lock is taken only to read the database HANDLE, the copy runs on a
 /// blocking task, and the call belongs BEFORE the handler takes the store lock for the work
 /// the snapshot is part of.
+///
+/// This is the cluster's WIRE storage. The databases it holds through its Data API HTTP
+/// endpoint are that service's own, and are captured beside this one
+/// ([`super::capture_data_api_cluster_data`]).
 pub async fn capture_cluster_storage(
     state: &::engine::ServiceState<ComAmazonawsRdsAmazonrdsv19State>,
     key: &RegionalKey,
@@ -489,6 +493,49 @@ pub async fn capture_cluster_storage(
         .cluster_engine_endpoint(key)
         .map(DbEngineEndpoint::database);
     capture_storage(database, "DB cluster").await
+}
+
+/// The copy of a DB cluster's DATA an export reads: a copy of the cluster's wire storage
+/// (`storage`) with the tables of `data_api` — a captured copy of the databases the cluster
+/// holds through its Data API HTTP endpoint ([`super::capture_data_api_cluster_data`], the
+/// same copy a snapshot of that cluster carries) — carried into it.
+///
+/// A cluster's data is what its clients WROTE, through whichever of its endpoints they wrote
+/// it, so an export of that cluster or of a snapshot of it writes out both. It is a COPY
+/// throughout: neither the live storage nor the snapshot's own is written to, so an export
+/// changes nothing a later caller sees. A cluster this emulator keeps no wire storage for
+/// still has the Data API's tables, so the copy those are carried into is opened here rather
+/// than left absent; `Ok(None)` means the cluster has neither.
+///
+/// `default_database` is the cluster's own `DatabaseName`; see
+/// [`super::data_api_rows::carry_data_api_tables`] for what it decides. Both the copy and the
+/// carry are engine work on a blocking task, exactly as the capture above is.
+pub async fn capture_cluster_data(
+    storage: Option<Arc<sql_engine::InstanceDatabase>>,
+    data_api: Option<Arc<super::DataApiClusterData>>,
+    default_database: Option<&str>,
+) -> Result<Option<Arc<sql_engine::InstanceDatabase>>, String> {
+    let copy = capture_storage(storage, "DB cluster").await?;
+    let Some(data_api) = data_api else {
+        return Ok(copy);
+    };
+    let copy = match copy {
+        Some(copy) => copy,
+        None => Arc::new(sql_engine::InstanceDatabase::open().map_err(|error| {
+            format!("the DB cluster's data could not be read: {}", error.message)
+        })?),
+    };
+    let into = Arc::clone(&copy);
+    let default_database = default_database.map(ToString::to_string);
+    let carried = ::tokio::task::spawn_blocking(move || {
+        super::data_api_rows::carry_data_api_tables(&data_api, default_database.as_deref(), &into)
+    })
+    .await
+    .map_err(|error| format!("the DB cluster's data could not be copied: {error}"))?;
+    // How many tables were carried is the carry's own account of what it did; what the caller
+    // acts on is whether a database it could not read refused it.
+    let _tables = carried?;
+    Ok(Some(copy))
 }
 
 /// A COPY of the data an endpoint that has just been opened holds, for a caller that has

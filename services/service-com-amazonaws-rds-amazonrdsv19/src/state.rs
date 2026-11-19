@@ -323,6 +323,9 @@ mod data_api_endpoint;
 // and a restore of that snapshot installs: the hand-off to the service that owns those
 // databases.
 mod data_api_cluster_data;
+// And the tables such a copy contributes to a copy of the cluster's DATA: what an export of
+// that cluster, or of a snapshot of it, reads beside the rows its wire endpoint wrote.
+pub mod data_api_rows;
 // The address a resource publishes when its data plane is an AWS API this emulator serves
 // at its own endpoint (Amazon Neptune's graph API) rather than a native engine wire.
 mod api_plane_address;
@@ -371,7 +374,7 @@ pub use storage_encryption_key::*;
 pub use service_principal_call::*;
 pub use master_user_credentials::*;
 pub use data_plane::{
-    captured_data_bytes, capture_cluster_storage, capture_endpoint_storage,
+    captured_data_bytes, capture_cluster_data, capture_cluster_storage, capture_endpoint_storage,
     capture_instance_storage,
     cluster_endpoint::cluster_engine_wire,
     engine_wire, open_engine_endpoint, rewind_cluster_storage, wire_session::SessionTarget,

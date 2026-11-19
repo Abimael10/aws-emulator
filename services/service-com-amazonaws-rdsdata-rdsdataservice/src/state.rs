@@ -1566,6 +1566,22 @@ impl Database {
         self.version
     }
 
+    /// The engine connection this database's pages live in, for a reader that carries its
+    /// tables somewhere else.
+    ///
+    /// `pub(crate)`, and handed out of this crate only by
+    /// [`cluster_copies::CapturedClusterData::read_each`] — a reader of a CAPTURED copy, never
+    /// of a database this service still serves: the cluster a database here belongs to is
+    /// Amazon RDS's resource, and that control plane carries the tables of such a copy into
+    /// the copy of the cluster's data an export of it reads. It does so with ordinary SQL over
+    /// this connection — its catalog, and a `SELECT` per table — which the confinement
+    /// [`Self::open`] installed admits, and which is why the connection carries no capability
+    /// a caller's own statement does not already have.
+    #[must_use]
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     /// The high-water mark the engine keeps for each table whose key it assigns:
     /// the largest key the sequence has handed out, by table name.
     ///

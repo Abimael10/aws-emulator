@@ -131,7 +131,9 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # keyed by the cluster's ARN — so a DB cluster snapshot taken here carries a copy of them and
 # a restore installs it, through the capture and install that service publishes
 # (`src/state/data_api_cluster_data.rs`). The copy is made and installed by the service that
-# OWNS those databases, on the same shared engine; this crate never reads or writes one.
+# OWNS those databases, on the same shared engine; this crate never writes one. What it does
+# READ out of such a copy is the TABLES, when an export of a cluster or of a snapshot of one
+# writes a Parquet file per table of the data it holds (`src/state/data_api_rows.rs`).
 service-com-amazonaws-rdsdata-rdsdataservice = { workspace = true }
 # Every lifecycle change this service records is also published onto the account's DEFAULT
 # EventBridge bus as an `aws.rds` event, the way Amazon RDS publishes one with no opt-in:

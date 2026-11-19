@@ -453,6 +453,22 @@ impl ExportTaskRecord {
         self.pending_status = Some(PendingStatus::in_a_moment(EXPORT_TASK_STATUS_CANCELED));
     }
 
+    /// End the task as `FAILED`, carrying `cause` — "the reason the export failed, if it
+    /// failed" (`ExportTask$FailureCause`).
+    ///
+    /// What an export THIS EMULATOR could not run reports: the status is terminal at once and
+    /// the clock owes the task nothing more, because the export has already ended; its end
+    /// time is the instant it ended, and the progress it had reached stays as it was, since
+    /// `PercentProgress` is "the progress of the task as a percentage" and a failed task made
+    /// no more of it. A caller polling `DescribeExportTasks` therefore reaches a terminal
+    /// status with a reason rather than a task that never settles.
+    pub fn fail(&mut self, cause: String) {
+        self.status = EXPORT_TASK_STATUS_FAILED.to_string();
+        self.pending_status = None;
+        self.task_end_time = Some(crate::state::now_as_wire_timestamp());
+        self.failure_cause = Some(cause);
+    }
+
     /// Project the stored record onto the modelled `ExportTask` shape — the output of
     /// `CancelExportTask` and `StartExportTask`, and one entry of
     /// `DescribeExportTasks$ExportTasks`.

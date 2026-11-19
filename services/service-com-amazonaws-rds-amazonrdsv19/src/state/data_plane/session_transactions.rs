@@ -87,6 +87,19 @@ const MAX_COMMITS_REMEMBERED: usize = 1_024;
 /// bookkeeping one session can make this endpoint keep by naming new relations.
 const MAX_RELATIONS_READ: usize = 1_024;
 
+/// How many SCHEMA OBJECTS one transaction may carry over when it commits
+/// ([`apply_schema`]).
+///
+/// A client chooses this number — a transaction can declare as many tables, views, indexes
+/// and triggers as it likes before it commits — and the declarations are RETRIED while a
+/// round of them resolves something, so the work of carrying them over grows with the square
+/// of that number. The commit runs while the endpoint's engine is held, so the count is
+/// bounded here as well as by the deadline every round is checked against: past it the commit
+/// is refused rather than holding the engine for work one session asked for. Far more objects
+/// than a schema a client declares in one transaction, and far fewer than a number that keeps
+/// the engine busy.
+const MAX_SCHEMA_OBJECTS_CARRIED: usize = 1_024;
+
 /// The open transactions of one engine endpoint's sessions, shared with the update hook
 /// installed on every one of its databases' connections.
 #[derive(Debug, Default)]
@@ -467,6 +480,12 @@ pub fn apply_rows(
 /// refuses once nothing more can be declared is reported in the engine's own words rather
 /// than skipped.
 ///
+/// Bounded exactly as the row carry beside it is, because it runs in the same place — while
+/// the endpoint's engine is held — and because the number of objects is the CLIENT's to
+/// choose: `deadline` is the commit's own budget, checked before each declaration and each
+/// retry round, and [`MAX_SCHEMA_OBJECTS_CARRIED`] bounds how many objects one commit carries
+/// at all, so the retries cannot grow with the square of a count a session picked.
+///
 /// Answers the TABLES whose declaration the transaction changed, whose rows are then carried
 /// over WHOLE ([`copy_table`]): a row of such a table no longer has the columns the shared
 /// database held it under, so the table as the transaction left it is what the commit
@@ -476,6 +495,7 @@ pub fn apply_schema(
     live: &Connection,
     source: &Connection,
     before: &SchemaObjects,
+    deadline: Instant,
 ) -> Result<BTreeSet<String>, EngineError> {
     let declared = schema_objects(source)?;
     let held = schema_objects(live)?;
@@ -484,6 +504,7 @@ pub fn apply_schema(
     // longer declares. It goes only while the shared database still holds the declaration it
     // was dropped from — another session's own DDL on it since is that session's.
     for (object, sql) in before {
+        out_of_time(deadline)?;
         if !declared.contains_key(object) && held.get(object) == Some(sql) {
             let (name, kind) = object;
             let _ = live.execute_batch(&format!("DROP {kind} IF EXISTS {}", quoted(name)));
@@ -495,6 +516,16 @@ pub fn apply_schema(
     for (object, sql) in &declared {
         if before.get(object) == Some(sql) {
             continue;
+        }
+        out_of_time(deadline)?;
+        if changed.len() >= MAX_SCHEMA_OBJECTS_CARRIED {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                format!(
+                    "this endpoint carries at most {MAX_SCHEMA_OBJECTS_CARRIED} schema objects \
+                     of one transaction over"
+                ),
+            ));
         }
         let (name, kind) = object;
         if held.contains_key(object) {
@@ -520,9 +551,11 @@ pub fn apply_schema(
     }
     let mut rounds = 0usize;
     while !pending.is_empty() {
+        out_of_time(deadline)?;
         let mut refused: Vec<&String> = Vec::new();
         let mut last: Option<EngineError> = None;
         for sql in pending.iter().copied() {
+            out_of_time(deadline)?;
             if let Err(error) = live.execute_batch(sql).map_err(internal) {
                 last = Some(error);
                 refused.push(sql);
@@ -550,7 +583,12 @@ pub fn apply_schema(
 
 /// The order the KINDS of schema object are declared in: a table carries the columns a view,
 /// an index and a trigger name, so it is declared before them.
-const SCHEMA_ORDER: [&str; 4] = ["table", "view", "index", "trigger"];
+///
+/// `pub(super)` because it is the order of ANY carry of one engine's schema into another's,
+/// not only a commit's: the carry of another endpoint's databases into a copy of a cluster's
+/// data ([`super::sql_engine::InstanceDatabase::carry_tables_from`]) declares them in the same
+/// order, for the same reason.
+pub(super) const SCHEMA_ORDER: [&str; 4] = ["table", "view", "index", "trigger"];
 
 /// Make the rows of `table` in the shared database `live` the rows `source` holds for it,
 /// which is what carrying over a table whose DECLARATION the transaction changed means
@@ -677,7 +715,7 @@ fn out_of_time(deadline: Instant) -> Result<(), EngineError> {
     if Instant::now() >= deadline {
         return Err(EngineError::new(
             EngineErrorKind::Cancelled,
-            "carrying a transaction's rows over took longer than this endpoint serves",
+            "carrying a transaction's schema and rows over took longer than this endpoint serves",
         ));
     }
     Ok(())

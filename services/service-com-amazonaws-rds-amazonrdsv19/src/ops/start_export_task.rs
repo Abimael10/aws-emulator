@@ -541,6 +541,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // What the export READS: a COPY of the source's data — never the live storage of a
+        // cluster or the storage a stored snapshot holds, both of which this call leaves
+        // exactly as it found them — carrying the tables written through the cluster's Data
+        // API HTTP endpoint beside those written through its wire endpoint, because both of
+        // those endpoints write the one cluster's data. A SNAPSHOT source carries the copy of
+        // those databases taken when the snapshot was taken; a CLUSTER source is read as it
+        // stands, so its are copied now, by the service that owns them and with this
+        // service's store unlocked. Taken here, after every refusal above has been answered,
+        // so an export that was going to be refused copies nothing.
+        //
+        // A source this emulator could not READ ends the task as `FAILED` carrying the reason
+        // ([`failed_to_read`]): the export ran and ended, which is a terminal status a polling
+        // caller can branch on, where an internal failure would leave a task that never
+        // settles.
+        let mut source = source;
+        if source.source_type == crate::state::EXPORT_SOURCE_TYPE_CLUSTER {
+            match crate::state::capture_data_api_cluster_data(&*self.engine, &source.arn).await {
+                Ok(data_api) => source.data_api = data_api,
+                Err(cause) => return failed_to_read(&state, &key, cause),
+            }
+        }
+        let source = match source.data_api.take() {
+            Some(data_api) => {
+                let read = crate::state::capture_cluster_data(
+                    source.database.clone(),
+                    Some(data_api),
+                    source.default_database.as_deref(),
+                )
+                .await;
+                match read {
+                    Ok(database) => ExportSource { database, ..source },
+                    Err(cause) => return failed_to_read(&state, &key, cause),
+                }
+            }
+            None => source,
+        };
+
         // The export RUNS: the source's tables are read out of its own database and written
         // into the destination bucket as the Parquet objects an export leaves behind, with
         // the file that says what was exported beside them. The objects are recorded in
@@ -556,15 +593,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let only = export_only.clone();
                 let under = prefix.clone();
                 let part = part_file.clone();
-                ::tokio::task::spawn_blocking(move || {
+                let read = ::tokio::task::spawn_blocking(move || {
                     crate::state::exported_tables(&database, wire, &only, &under, &part)
                 })
-                .await
-                .map_err(|error| {
-                    crate::scaffolded::Scaffolded::internal_failure(format!(
-                        "the export could not read the source's tables: {error}"
-                    ))
-                })?
+                .await;
+                match read {
+                    Ok(tables) => tables,
+                    Err(error) => {
+                        return failed_to_read(
+                            &state,
+                            &key,
+                            format!("the source's tables could not be read: {error}"),
+                        )
+                    }
+                }
             }
             // A source this emulator holds no database for has no table to export: the
             // export writes the file that says so rather than inventing data.
@@ -641,24 +683,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         let answer = record.to_wire();
-        Ok(StartExportTaskOutput {
-            export_task_identifier: answer.export_task_identifier,
-            source_arn: answer.source_arn,
-            export_only: answer.export_only,
-            snapshot_time: answer.snapshot_time,
-            task_start_time: answer.task_start_time,
-            task_end_time: answer.task_end_time,
-            s3_bucket: answer.s3_bucket,
-            s3_prefix: answer.s3_prefix,
-            iam_role_arn: answer.iam_role_arn,
-            kms_key_id: answer.kms_key_id,
-            status: answer.status,
-            percent_progress: answer.percent_progress,
-            total_extracted_data_in_gb: answer.total_extracted_data_in_gb,
-            failure_cause: answer.failure_cause,
-            warning_message: answer.warning_message,
-            source_type: answer.source_type,
-        })
+        Ok(answered(answer))
+    }
+}
+
+/// End the export task `key` as `FAILED` with `cause` as its `FailureCause`, and answer the
+/// task as it now stands.
+///
+/// An export whose SOURCE this emulator could not read has run and ENDED: "the reason the
+/// export failed, if it failed" is what the task reports, and a terminal status is what a
+/// caller polling `DescribeExportTasks` branches on — an internal failure here would leave a
+/// stored task that never settles, which is nothing a client can act on. The objects of such
+/// an export are never written, so the destination holds nothing for it.
+fn failed_to_read(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsRdsAmazonrdsv19State>,
+    key: &(String, String),
+    cause: String,
+) -> Result<StartExportTaskOutput, StartExportTaskError> {
+    let mut store = state.lock();
+    let Some(record) = store.export_tasks.get_mut(key) else {
+        return Err(crate::scaffolded::Scaffolded::internal_failure(
+            "the export task this call recorded is no longer in the store".to_string(),
+        ));
+    };
+    record.fail(cause);
+    Ok(answered(record.to_wire()))
+}
+
+/// The operation's output for the task `answer` describes — one projection of the stored
+/// record ([`crate::state::ExportTaskRecord::to_wire`]) onto this operation's output shape, so
+/// the export this call ran and the export it could not run are reported through the same
+/// fields.
+fn answered(answer: CancelExportTaskOutput) -> StartExportTaskOutput {
+    StartExportTaskOutput {
+        export_task_identifier: answer.export_task_identifier,
+        source_arn: answer.source_arn,
+        export_only: answer.export_only,
+        snapshot_time: answer.snapshot_time,
+        task_start_time: answer.task_start_time,
+        task_end_time: answer.task_end_time,
+        s3_bucket: answer.s3_bucket,
+        s3_prefix: answer.s3_prefix,
+        iam_role_arn: answer.iam_role_arn,
+        kms_key_id: answer.kms_key_id,
+        status: answer.status,
+        percent_progress: answer.percent_progress,
+        total_extracted_data_in_gb: answer.total_extracted_data_in_gb,
+        failure_cause: answer.failure_cause,
+        warning_message: answer.warning_message,
+        source_type: answer.source_type,
     }
 }
 
@@ -679,6 +752,16 @@ struct ExportSource {
     /// the live database of a cluster's writer. `None` for a source this emulator holds no
     /// database for, which has no table to export.
     database: Option<::std::sync::Arc<crate::state::data_plane::sql_engine::InstanceDatabase>>,
+    /// The captured copy of the databases the source cluster holds through its DATA API HTTP
+    /// endpoint, whose tables the export writes out beside the ones above
+    /// ([`crate::state::capture_cluster_data`]): the copy the SNAPSHOT itself carries
+    /// ([`crate::state::DbClusterSnapshotRecord::data_api_storage`]), and for a CLUSTER source
+    /// the copy the handler takes as the export runs. `None` for a source that holds none —
+    /// a DB instance snapshot among them, since that API serves a DB CLUSTER.
+    data_api: Option<::std::sync::Arc<crate::state::DataApiClusterData>>,
+    /// The source cluster's own `DatabaseName`, which is the database of the cluster that a
+    /// Data API statement naming none wrote into.
+    default_database: Option<String>,
 }
 
 /// Resolve `SourceArn` — "the Amazon Resource Name (ARN) of the snapshot or cluster to
@@ -729,6 +812,11 @@ fn resolve_export_source(
                 wire: crate::state::engine_wire(&snapshot.engine)
                     .unwrap_or(crate::state::EngineWire::MySql),
                 database: snapshot.storage.clone(),
+                // A DB instance snapshot holds no Data API databases: that API addresses "an
+                // Amazon RDS DB cluster", so nothing was ever written to this source through
+                // one.
+                data_api: None,
+                default_database: None,
             })
         }
         crate::state::EXPORT_SOURCE_DB_CLUSTER_SNAPSHOT => {
@@ -766,6 +854,12 @@ fn resolve_export_source(
                 // when the snapshot was taken: it is what restoring the snapshot brings
                 // back, so it is also what exporting it writes out.
                 database: snapshot.storage.clone(),
+                // And the copy of the cluster's DATA API databases it carries beside that
+                // one, taken at the same instant and by the service that owns them: those
+                // tables are part of the data the snapshot holds, so they are part of what
+                // exporting it writes out.
+                data_api: snapshot.data_api_storage.clone(),
+                default_database: snapshot.database_name.clone(),
             })
         }
         _ => {
@@ -818,6 +912,12 @@ fn resolve_export_source(
                 wire: crate::state::engine_wire(&cluster.engine)
                     .unwrap_or(crate::state::EngineWire::MySql),
                 database,
+                // An export of a cluster reads what EVERY endpoint of it wrote, so the
+                // databases it holds through its Data API HTTP endpoint are copied as the
+                // export runs — by the service that owns them, which the handler asks once
+                // this store's guard is released.
+                data_api: None,
+                default_database: cluster.database_name.clone(),
             })
         }
     }

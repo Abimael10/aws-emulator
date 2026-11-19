@@ -49,6 +49,29 @@ pub struct CapturedClusterData {
     databases: Vec<(String, Mutex<Database>)>,
 }
 
+impl CapturedClusterData {
+    /// Hand the engine of each database this copy holds to `read`, under the name the cluster
+    /// holds it by (`""` for the default database, the one a request that names none
+    /// addresses).
+    ///
+    /// A READ: `read` is given the connection of the copy's own database and the copy is left
+    /// exactly as it was, so the same captured copy still installs the databases it captured
+    /// ([`ComAmazonawsRdsdataRdsdataserviceState::install_cluster_data`]). It is what a holder
+    /// of the copy that has to look INSIDE it needs — the control plane exporting a cluster's
+    /// data writes one file per table, so it reads the tables of these databases — and only a
+    /// CAPTURED database is ever reached this way, never one this service still serves. The
+    /// lock of each is taken only while that one is being read, for the reason this type's own
+    /// note gives.
+    pub fn read_each(&self, mut read: impl FnMut(&str, &::rusqlite::Connection)) {
+        for (name, database) in &self.databases {
+            let held = database
+                .lock()
+                .unwrap_or_else(::std::sync::PoisonError::into_inner);
+            read(name, held.connection());
+        }
+    }
+}
+
 impl ComAmazonawsRdsdataRdsdataserviceState {
     /// A private copy of every database this service holds for `resource_arn`, or `None`
     /// when it holds none at all.
