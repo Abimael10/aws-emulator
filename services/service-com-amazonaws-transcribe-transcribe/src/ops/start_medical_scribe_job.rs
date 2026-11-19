@@ -272,6 +272,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The documents this family's finished jobs owe their reported locations, taken
+        // and stored here for the reason `StartTranscriptionJob` states: the write fell
+        // due when each job finished, and a start is a call that observes every job of
+        // this family in this Region (`crate::state::due_job_outputs`). Taken under a
+        // lock of its own and written with none held.
+        let due = crate::state::due_job_outputs(
+            &mut state.lock().medical_scribe_jobs,
+            &region,
+            ::std::time::SystemTime::now(),
+        );
+        crate::state::settle_due_job_outputs(ctx, &state, &region, due, |store| {
+            &mut store.medical_scribe_jobs
+        })
+        .await;
+
         // The `aws:` tag-key namespace is reserved for the tags Amazon Web Services
         // applies itself, so a request naming a key in it is refused before anything is
         // recorded (see [`crate::state::reserved_tag_key_refusal`]).

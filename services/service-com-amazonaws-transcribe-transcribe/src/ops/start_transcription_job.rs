@@ -480,6 +480,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
 
+        // A finished job's reported output locations SERVE the documents they name, and
+        // that write fell due when the job finished — whether or not anybody asked for
+        // that job by name. A start observes every job of this family in this Region (it
+        // counts the ones being processed and makes way for the new record), so the
+        // documents the clock already owed them are taken here, once, and stored at
+        // those very locations: a client that directed its output to a bucket and key of
+        // its own fetches the transcript it knows the address of from its own start
+        // request, without having read the job back
+        // (`crate::state::due_job_outputs`). Taken under a lock of its own and written
+        // with none held, so no lock is held across the in-process call into object
+        // storage — and before this start's own clock read below, so what it stores is
+        // what the OTHER jobs already owed.
+        let due = crate::state::due_job_outputs(
+            &mut state.lock().transcription_jobs,
+            &region,
+            ::std::time::SystemTime::now(),
+        );
+        crate::state::settle_due_job_outputs(ctx, &state, &region, due, |store| {
+            &mut store.transcription_jobs
+        })
+        .await;
+
         // "To make a StartTranscriptionJob request, you must first upload your media
         // file into an Amazon S3 bucket; you can then specify the Amazon S3 location of
         // the file using the Media parameter": the location is resolved against this

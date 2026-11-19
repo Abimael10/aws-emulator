@@ -213,15 +213,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             (crate::state::due_output_objects(record), record.to_job())
         };
-        if !crate::state::store_job_outputs(ctx, &region, &outputs).await {
-            // A write the object store did not take leaves the job still owing it, so
-            // the documents go back to the record and a later read takes them again.
-            crate::state::return_due_output_objects(state.lock().medical_scribe_job_mut(
-                &region,
-                &input.medical_scribe_job_name,
-                now,
-            ));
-        }
+        // ONE write path for a job's due documents, the same one a listing and a later
+        // start of this family go through (`crate::state::settle_due_job_outputs`): a
+        // write the object store did not take leaves the job still owing it, so the
+        // documents go back to the record and a later read takes them again.
+        crate::state::settle_due_job_outputs(
+            ctx,
+            &state,
+            &region,
+            vec![(input.medical_scribe_job_name.clone(), outputs)],
+            |store| &mut store.medical_scribe_jobs,
+        )
+        .await;
 
         // Both locations this job reports are REPORTED as a caller can fetch them: this
         // family's start REQUIRES `OutputBucketName`, so the transcript and the clinical

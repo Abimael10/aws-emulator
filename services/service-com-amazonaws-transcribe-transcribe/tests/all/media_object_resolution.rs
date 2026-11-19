@@ -136,6 +136,22 @@ pub(crate) async fn s3(
     path: &str,
     body: &[u8],
 ) -> (u16, bytes::Bytes) {
+    let (status, _, served) = s3_response(emulator, method, path, body).await;
+    (status, served)
+}
+
+/// [`s3`] with the response HEADERS kept.
+///
+/// What an object is served AS — its `Content-Type`, and the rest of the metadata
+/// headers a GET of a stored object carries — is part of what a suite over a served
+/// document asserts (`crate::job_outputs_without_the_job_reader`), so the request is
+/// built once here and the two shapes of answer differ only in what they keep.
+pub(crate) async fn s3_response(
+    emulator: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, ::http::HeaderMap, bytes::Bytes) {
     let request = http::Request::builder()
         .method(method)
         .uri(format!("https://s3.{REGION}.amazonaws.com{path}"))
@@ -144,7 +160,11 @@ pub(crate) async fn s3(
         .body(bytes::Bytes::copy_from_slice(body))
         .expect("the request builds");
     let response = emulator.dispatch(request).await;
-    (response.status().as_u16(), response.body().clone())
+    (
+        response.status().as_u16(),
+        response.headers().clone(),
+        response.body().clone(),
+    )
 }
 
 /// `PUT /<bucket>` — `CreateBucket` — then `PUT /<bucket>/<key>` — `PutObject`, so the

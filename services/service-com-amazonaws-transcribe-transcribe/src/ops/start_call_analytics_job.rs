@@ -332,6 +332,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
 
+        // The documents this family's finished jobs owe their reported locations, taken
+        // and stored here for the reason `StartTranscriptionJob` states: the write fell
+        // due when each job finished, and a start is a call that observes every job of
+        // this family in this Region (`crate::state::due_job_outputs`). Taken under a
+        // lock of its own and written with none held.
+        let due = crate::state::due_job_outputs(
+            &mut state.lock().call_analytics_jobs,
+            &region,
+            ::std::time::SystemTime::now(),
+        );
+        crate::state::settle_due_job_outputs(ctx, &state, &region, due, |store| {
+            &mut store.call_analytics_jobs
+        })
+        .await;
+
         // "To make a StartCallAnalyticsJob request, you must first upload your media
         // file into an Amazon S3 bucket": every location this start names for its input
         // audio is resolved against this emulator's own Amazon S3 before anything is

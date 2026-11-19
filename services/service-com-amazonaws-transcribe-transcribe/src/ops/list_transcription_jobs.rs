@@ -186,6 +186,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // A finished job's reported output locations SERVE the documents they name, and
+        // that write fell due when the job finished — whether or not anybody asked for
+        // that job by name. A listing observes every job of this family in this Region,
+        // so the documents the clock already owed are taken here, once, and stored at
+        // those very locations before this listing answers: a client that directed its
+        // output to a bucket and key of its own fetches the transcript it knows the
+        // address of from its own start request, without having read the job back
+        // (`crate::state::due_job_outputs`). Collected under the lock and written after
+        // the guard is dropped, so no lock is held across the in-process call into
+        // object storage.
+        let due = crate::state::due_job_outputs(&mut state.lock().transcription_jobs, &region, now);
+        crate::state::settle_due_job_outputs(ctx, &state, &region, due, |store| {
+            &mut store.transcription_jobs
+        })
+        .await;
+
         let mut store = state.lock();
 
         // The family this listing reports: the records it pages, and the counter the

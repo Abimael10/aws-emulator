@@ -1798,6 +1798,75 @@ pub async fn store_job_outputs(
     stored_every_one
 }
 
+/// The documents every job `region` holds still owes the locations it REPORTS, with
+/// each record's clock-owed transitions materialised first — what an operation that
+/// observes a whole family, rather than one job of it by name, finds due.
+///
+/// The write a finished job owes falls due when the job FINISHES, whether or not
+/// anybody asks for that job by name ([`due_output_objects`]): a client that directed
+/// the output to a bucket and key of its own knows that address from its own start
+/// request and may fetch the document without ever reading the job back. So the calls
+/// that observe this family as a whole — a listing of it, and a later start, which
+/// counts and evicts the jobs the clock has finished — take what is due here exactly as
+/// the family's own reader takes it for one job, and the document is at its location by
+/// the time any of them has answered.
+///
+/// Each job's documents are taken ONCE in its lifetime, so what one such call stores is
+/// bounded by how many jobs have just finished and not by how many the Region holds.
+pub fn due_job_outputs<R: ClockedRecord + JobOutputs>(
+    store: &mut RegionalStore<R>,
+    region: &str,
+    now: SystemTime,
+) -> Vec<(String, Vec<OutputObject>)> {
+    let mut due = Vec::new();
+    for (name, record) in store.iter_in_mut(region) {
+        record.materialise_due_transitions(now);
+        let objects = due_output_objects(record);
+        if !objects.is_empty() {
+            due.push((name.to_string(), objects));
+        }
+    }
+    due
+}
+
+/// Store what [`due_job_outputs`] took and give back to its own record whatever the
+/// object store did not take ([`return_due_output_objects`]), so a write that was not
+/// taken stays owed.
+///
+/// A store that did not take the FIRST document is not asked for the rest: it is the
+/// same store for every one of them, so the remaining documents are handed straight
+/// back and the next call takes them again. That is what keeps a call which observes a
+/// whole family bounded — one attempt, not one per finished job, where the emulator was
+/// assembled with no object store at all — while still losing no document a job owes.
+///
+/// Awaited with NO lock held — the store is re-locked only to hand a failed write back
+/// — and each record is re-found under the name it was taken from: it may have been
+/// deleted while the write was in flight, which owes nothing. `family` names the store
+/// the records came from, so one spelling serves every job family.
+pub async fn settle_due_job_outputs<R, Family>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    state: &::engine::ServiceState<ComAmazonawsTranscribeTranscribeState>,
+    region: &str,
+    due: Vec<(String, Vec<OutputObject>)>,
+    family: Family,
+) where
+    R: JobOutputs,
+    Family: Fn(&mut ComAmazonawsTranscribeTranscribeState) -> &mut RegionalStore<R>,
+{
+    let mut taken = due.into_iter();
+    for (name, objects) in taken.by_ref() {
+        if !store_job_outputs(ctx, region, &objects).await {
+            let mut store = state.lock();
+            let jobs = family(&mut store);
+            return_due_output_objects(jobs.get_mut(region, &name));
+            for (owed_by, _) in taken {
+                return_due_output_objects(jobs.get_mut(region, &owed_by));
+            }
+            return;
+        }
+    }
+}
+
 /// The objects a job's reported output locations name in THIS SERVICE'S OWN bucket
 /// ([`service_managed_bucket`]), out of every location `record` reports
 /// ([`JobOutputs::output_objects`]).

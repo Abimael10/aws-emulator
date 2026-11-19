@@ -189,6 +189,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // The documents this family's finished jobs owe their reported locations, taken
+        // and stored here for the reason `ListTranscriptionJobs` states: the write fell
+        // due when each job finished, and a listing is a call that observes every job of
+        // this family in this Region (`crate::state::due_job_outputs`). Collected under
+        // the lock and written after the guard is dropped.
+        let due = crate::state::due_job_outputs(
+            &mut state.lock().medical_transcription_jobs,
+            &region,
+            now,
+        );
+        crate::state::settle_due_job_outputs(ctx, &state, &region, due, |store| {
+            &mut store.medical_transcription_jobs
+        })
+        .await;
+
         let mut store = state.lock();
 
         // The family this listing reports: the records it pages, and the counter the

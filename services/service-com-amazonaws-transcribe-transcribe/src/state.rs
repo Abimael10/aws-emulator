@@ -1743,11 +1743,22 @@ impl<R> RegionalStore<R> {
     /// `region`'s records for mutation, in name order — how a listing materialises
     /// every clock-owed transition of the Region it is reporting on.
     pub fn values_in_mut(&mut self, region: &str) -> impl Iterator<Item = &mut R> {
+        self.iter_in_mut(region).map(|(_, record)| record)
+    }
+
+    /// [`Self::iter_in`] for a caller that mutates the records it walks: `region`'s
+    /// records with the name each is stored under, in name order.
+    ///
+    /// The name comes with the record because what a caller does with a record it
+    /// materialised may have to be given BACK to that very record afterwards (see
+    /// [`due_job_outputs`], whose caller re-finds a record by name once the write it
+    /// took from it has been attempted).
+    pub fn iter_in_mut(&mut self, region: &str) -> impl Iterator<Item = (&str, &mut R)> {
         let owned = region.to_string();
         self.records
             .range_mut((owned.clone(), String::new())..)
             .take_while(move |((stored, _), _)| *stored == owned)
-            .map(|(_, record)| record)
+            .map(|((_, name), record)| (name.as_str(), record))
     }
 
     /// Whether this store holds any record for `region`.
