@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Subscribes a domain to real-time profile events: it persists the destination the
+//! request names and the tags it carries, mints the stream's ARN once, and answers from
+//! the record it stored, so a later `GetEventStream` and `ListEventStreams` report the
+//! same stream.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `EventStreamName` is the stream's identity within the domain (it is the operation's
+//! `@httpLabel`), so this is a CREATE and not a replace: the name is looked up and
+//! inserted under ONE hold of the store lock, so of any number of concurrent creates of
+//! one name exactly one is admitted and every other is refused `BadRequestException`
+//! (400) without touching what the winner stored.
+//!
+//! `Uri` names a Kinesis data stream — a resource of ANOTHER service — so it is persisted
+//! as the request stated it and reported back unchanged, the same way a domain holds the
+//! `DeadLetterQueueUrl` its create carried.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +163,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventStream"))
+        // A tag key is the one half of a tag map the boundary's constraint walk does not
+        // validate, so the model's own bounds on it are applied here.
+        if let Some(message) = crate::state::first_tag_key_violation("Tags", input.tags.as_ref()) {
+            return Err(bad_request(message));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let domain = store
+            .domains
+            .get_mut(&input.domain_name)
+            .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+
+        // The name identifies the stream within the domain, so a name the domain already
+        // holds is a conflict and never an overwrite — this surface has no operation that
+        // changes a stream's destination. The lookup and the insert below happen under
+        // this one hold of the store lock, which is what makes the check-and-insert
+        // atomic: a concurrent create of the same name either finds nothing and wins, or
+        // finds the winner's record and is refused here.
+        if domain.event_streams.contains_key(&input.event_stream_name) {
+            return Err(bad_request(crate::state::event_stream_exists(
+                &input.event_stream_name,
+            )));
+        }
+        if domain.event_streams.len() >= crate::state::MAX_EVENT_STREAMS_PER_DOMAIN {
+            return Err(bad_request(format!(
+                "The maximum number of event streams for domain {} has been reached: {}",
+                input.domain_name,
+                crate::state::MAX_EVENT_STREAMS_PER_DOMAIN
+            )));
+        }
+
+        let stored = crate::state::StoredEventStream {
+            arn: crate::state::event_stream_arn(
+                &region,
+                &input.domain_name,
+                &input.event_stream_name,
+            ),
+            name: input.event_stream_name,
+            uri: input.uri,
+            tags: input.tags,
+            created_at: now,
+        };
+
+        // The response is the record that was just stored, so it is the same stream the
+        // readers serve: the ARN minted for it and the tag map it was created with, so a
+        // stream created with no tags reports none.
+        let output = CreateEventStreamOutput {
+            event_stream_arn: stored.arn.clone(),
+            tags: stored.tags.clone(),
+        };
+
+        domain.event_streams.insert(stored.name.clone(), stored);
+        Ok(output)
     }
+}
+
+/// The request is invalid — HTTP 400, the error code a client branches on to learn that
+/// the stream it asked for cannot be created as asked.
+fn bad_request(message: String) -> CreateEventStreamError {
+    CreateEventStreamErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A domain the request names is not stored.
+fn not_found(message: String) -> CreateEventStreamError {
+    CreateEventStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> CreateEventStreamError {
+    CreateEventStreamErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
 }

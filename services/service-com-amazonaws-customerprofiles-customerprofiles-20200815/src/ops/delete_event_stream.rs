@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEventStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEventStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEventStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one event stream of a domain, so the domain stops delivering profile events
+//! to its destination — "Disables and deletes the specified event stream". The name is the
+//! stream's identity within the domain, so removing the entry removes the whole stream; a
+//! domain, or a stream in it, that is not stored is nothing to delete and is reported
+//! `ResourceNotFoundException` (404) rather than answered as a success.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +139,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEventStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEventStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEventStream"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let mut store = state.lock();
+        let domain = store
+            .domains
+            .get_mut(&input.domain_name)
+            .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+
+        // The name is the stream's identity within the domain, so removing the entry
+        // removes the whole stream. A name the domain does not hold is nothing to delete,
+        // so it earns the same refusal `GetEventStream` gives for it.
+        domain
+            .event_streams
+            .remove(&input.event_stream_name)
+            .ok_or_else(|| {
+                not_found(crate::state::event_stream_not_found(
+                    &input.event_stream_name,
+                ))
+            })?;
+
+        // The model declares no output members for this operation, so a success carries
+        // nothing beyond its 200.
+        Ok(DeleteEventStreamOutput {})
     }
+}
+
+/// A domain, or an event stream in it, the request names is not stored.
+fn not_found(message: String) -> DeleteEventStreamError {
+    DeleteEventStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> DeleteEventStreamError {
+    DeleteEventStreamErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEventStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEventStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEventStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one event stream of a domain from the record `CreateEventStream` stored: the
+//! ARN minted for it, the instant it was created, the destination it delivers to, and the
+//! tags it carries. It REPORTS, so it writes nothing: a domain, or a stream in it, that
+//! is not stored is `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +153,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEventStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEventStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEventStream"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let store = state.lock();
+        let domain = store
+            .domains
+            .get(&input.domain_name)
+            .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+        let stored = domain
+            .event_streams
+            .get(&input.event_stream_name)
+            .ok_or_else(|| {
+                not_found(crate::state::event_stream_not_found(
+                    &input.event_stream_name,
+                ))
+            })?;
+
+        // Every member is the stored record's, so two reads of one stream answer alike
+        // and a read answers what the create reported. `StoppedSince` is "The timestamp
+        // when the State changed to STOPPED" and nothing of this surface stops a stream,
+        // so there is no such instant to report (`crate::state::event_streams`).
+        Ok(GetEventStreamOutput {
+            domain_name: domain.name.clone(),
+            event_stream_arn: stored.arn.clone(),
+            created_at: crate::state::to_date_time(stored.created_at),
+            state: stored.state(),
+            stopped_since: None,
+            destination_details: stored.destination_details(),
+            tags: stored.tags.clone(),
+        })
     }
+}
+
+/// A domain, or an event stream in it, the request names is not stored.
+fn not_found(message: String) -> GetEventStreamError {
+    GetEventStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> GetEventStreamError {
+    GetEventStreamErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
 }

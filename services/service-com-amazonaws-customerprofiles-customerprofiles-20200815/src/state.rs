@@ -46,6 +46,15 @@ pub use upload_job_file::{
 /// one word their refusals with.
 pub mod segment_definitions;
 
+/// The event streams a domain holds: the destination each one delivers profile events to,
+/// and the sentences the operations addressing one word their refusals with.
+pub mod event_streams;
+
+pub use event_streams::{
+    event_stream_arn, event_stream_exists, event_stream_not_found, StoredEventStream,
+    EVENT_STREAM_DESTINATION_HEALTHY, EVENT_STREAM_STATE_RUNNING, MAX_EVENT_STREAMS_PER_DOMAIN,
+};
+
 pub use segment_definitions::{
     segment_definition_arn, segment_definition_exists, segment_definition_not_found,
     StoredSegmentDefinition, MAX_SEGMENT_DEFINITIONS_PER_DOMAIN, SEGMENT_TYPE_CLASSIC,
@@ -447,6 +456,11 @@ pub struct Domain {
     /// segment-definition operation), so the (domain, name) pair identifies exactly one
     /// definition. A `BTreeMap`, so a listing walks them in one stable order.
     pub segment_definitions: BTreeMap<String, StoredSegmentDefinition>,
+
+    /// The event streams defined in this domain, by `EventStreamName` — the name every
+    /// event-stream operation addresses one by. Ordered, so one page of a listing resumes
+    /// where the previous page stopped.
+    pub event_streams: BTreeMap<String, StoredEventStream>,
     /// The domain's recommender schemas, keyed by `RecommenderSchemaName` — the name is
     /// the schema's identity within the domain (`@httpLabel` on every recommender-schema
     /// operation), so the (domain, name) pair identifies exactly one schema. A
@@ -887,6 +901,7 @@ impl Domain {
             upload_jobs: BTreeMap::new(),
             calculated_attributes: BTreeMap::new(),
             segment_definitions: BTreeMap::new(),
+            event_streams: BTreeMap::new(),
             recommender_schemas: BTreeMap::new(),
             key_index: HashMap::new(),
             profile_keys: BTreeMap::new(),
