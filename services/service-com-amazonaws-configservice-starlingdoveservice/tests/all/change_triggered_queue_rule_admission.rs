@@ -16,6 +16,11 @@
 //! resource in the rule's scope, with no further call, and the verdict that function
 //! delivers is what the rule's compliance reads then report.**
 //!
+//! And that invocation is owed until it is MADE: a call that did not reach the function ran
+//! nothing and delivered no verdict, so a later pass makes it and the verdict still
+//! arrives, with no call from the client
+//! ([`an_invocation_a_pass_could_not_make_is_made_by_a_later_pass`]).
+//!
 //! Config, IAM, AWS Lambda and Amazon SQS are mounted on ONE engine, as
 //! `core/router/src/lib.rs` mounts them: the queue in the rule's scope is a real Amazon SQS
 //! queue a RUNNING configuration recorder observed through Amazon SQS' own API, the policy
@@ -87,6 +92,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Config, IAM, AWS Lambda and Amazon SQS over one shared engine.
 struct Emulator {
     router: MultiServiceRouter,
+    /// The engine every service above is mounted on, which is also the store a row reads
+    /// Config's own record of its passes out of ([`Emulator::failed_dispatches`]).
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -108,7 +116,7 @@ impl Emulator {
         router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
             Arc::clone(&engine),
         ));
-        Self { router }
+        Self { router, engine }
     }
 
     /// One RPC call: `POST /` carrying `X-Amz-Target`, signed for `signing_name`.
@@ -290,6 +298,25 @@ impl Emulator {
             );
             tokio::time::sleep(POLL_INTERVAL).await;
         }
+    }
+
+    /// How many of Config's passes have tried and FAILED to make the invocation of the
+    /// rule `name`'s evaluator, read out of the store the handlers share.
+    ///
+    /// Config publishes no evaluation status for a Custom Lambda rule
+    /// (`ConfigRuleEvaluationStatus`: "This operation does not return status information
+    /// about Config Custom Lambda rules"), so the store is where a row observes that a
+    /// pass really did try and could not reach the function.
+    fn failed_dispatches(&self, name: &str) -> u32 {
+        let state = service_com_amazonaws_configservice_starlingdoveservice::state::service_state(
+            &*self.engine,
+        )
+        .expect("the test engine is the shared engine");
+        let store = state.lock();
+        store
+            .config_rules
+            .get(name)
+            .map_or(0, |rule| rule.evaluation.failed_dispatches)
     }
 }
 
@@ -607,5 +634,177 @@ async fn a_change_triggered_rule_is_taken_only_when_config_may_invoke_its_evalua
             "case {case:?}: expected the evaluator's verdict on the recorded queue, got \
              {results:?}"
         );
+    }
+}
+
+/// Where a function's reserved concurrency is bound
+/// (`PUT`/`DELETE /2017-10-31/functions/{FunctionName}/concurrency`).
+fn concurrency_uri(name: &str) -> String {
+    format!("/2017-10-31/functions/{name}/concurrency")
+}
+
+/// Reserve `executions` simultaneous executions for the function `name`.
+///
+/// A reservation of ZERO leaves no slot for an invocation of it to run in, so every
+/// invocation of that function is throttled — which is how a row below makes Config's call
+/// fail without touching Config itself.
+async fn given_reserved_concurrency(case: &str, emulator: &Emulator, name: &str, executions: i64) {
+    let (status, answered) = emulator
+        .lambda(
+            "PUT",
+            &concurrency_uri(name),
+            Some(&json!({ "ReservedConcurrentExecutions": executions })),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: PutFunctionConcurrency answered {status} {answered}"
+    );
+}
+
+/// Give up the function `name`'s own reservation, so its invocations are bounded by the
+/// account's capacity again and the call Config makes can be served.
+async fn release_reserved_concurrency(case: &str, emulator: &Emulator, name: &str) {
+    let (status, answered) = emulator.lambda("DELETE", &concurrency_uri(name), None).await;
+    assert_eq!(
+        status, 204,
+        "case {case:?}: DeleteFunctionConcurrency answered {status} {answered}"
+    );
+}
+
+#[tokio::test]
+async fn an_invocation_a_pass_could_not_make_is_made_by_a_later_pass() {
+    // The invocation of a change-triggered rule's evaluator is owed until it is MADE: a
+    // call that did not reach the function ran nothing, so a later pass makes it and the
+    // verdict the function then delivers is still what the rule's compliance read reports.
+    //
+    // The rows differ along how many of Config's passes could not reach the evaluator
+    // before one could: none at all (the control, where the first pass makes the call),
+    // one, and several — so what the verdict's arrival shows is the invocation staying owed
+    // rather than one lucky first attempt. The function is made un-invocable through AWS
+    // Lambda's own API, so nothing here fakes the failure.
+    let cases: [(&str, u32); 3] = [
+        ("an evaluator Config can invoke straight away", 0),
+        ("one pass that could not reach the evaluator", 1),
+        ("several passes that could not reach the evaluator", 3),
+    ];
+
+    for (index, (case, unreachable_passes)) in cases.into_iter().enumerate() {
+        let emulator = Emulator::new();
+        emulator.recording().await;
+        let queue_url = emulator
+            .given_recorded_queue(case, &format!("owed-queue-{index}"))
+            .await;
+        let function_name = format!("owed-evaluator-{index}");
+        let function = given_function(case, &emulator, &function_name).await;
+        given_permission(
+            case,
+            &emulator,
+            &function_name,
+            CONFIG_PRINCIPAL,
+            INVOKE_ACTION,
+        )
+        .await;
+        if unreachable_passes > 0 {
+            given_reserved_concurrency(case, &emulator, &function_name, 0).await;
+        }
+
+        let rule = format!("owed-change-triggered-rule-{index}");
+        let (status, body) = emulator
+            .call(
+                "PutConfigRule",
+                &json!({
+                    "ConfigRule": {
+                        "ConfigRuleName": rule,
+                        "Scope": { "ComplianceResourceTypes": [QUEUE_RESOURCE_TYPE] },
+                        "Source": {
+                            "Owner": "CUSTOM_LAMBDA",
+                            "SourceIdentifier": function,
+                            "SourceDetails": [{
+                                "EventSource": "aws.config",
+                                "MessageType": CHANGE_NOTIFICATION,
+                            }],
+                        },
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the rule to be created, got {status} with {body}"
+        );
+
+        if unreachable_passes > 0 {
+            // Wait for the CONDITION this row is about: Config has tried, and failed, to
+            // make the invocation that many times. Each failure is a pass that reached a
+            // function with no slot to run in.
+            let deadline = Instant::now() + CONVERGENCE_BUDGET;
+            loop {
+                let tried = emulator.failed_dispatches(&rule);
+                if tried >= unreachable_passes {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "case {case:?}: expected {unreachable_passes} pass(es) to fail to reach \
+                     the evaluator, got {tried}"
+                );
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            // Nothing ran, so nothing delivered a verdict: Config records none of its own
+            // for a rule whose verdicts are the function's.
+            let while_unreachable = reported(&emulator, &rule).await;
+            assert!(
+                while_unreachable.is_empty(),
+                "case {case:?}: expected no verdict while the evaluator could not be \
+                 invoked, got {while_unreachable:?}"
+            );
+            release_reserved_concurrency(case, &emulator, &function_name).await;
+        }
+
+        // The invocation was still OWED, so a later pass makes it — with no further call
+        // from this suite — and the verdict the function delivered for the recorded queue
+        // is what the rule's compliance read reports.
+        let deadline = Instant::now() + CONVERGENCE_BUDGET;
+        let results = loop {
+            let results = reported(&emulator, &rule).await;
+            if !results.is_empty() {
+                break results;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: expected the evaluator to be invoked for {queue_url} and to \
+                 deliver a verdict, got nothing after {} failed pass(es)",
+                emulator.failed_dispatches(&rule)
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        };
+        assert_eq!(
+            results,
+            vec![(
+                NON_COMPLIANT.to_string(),
+                CHANGE_NOTIFICATION.to_string(),
+                QUEUE_RESOURCE_TYPE.to_string(),
+                queue_url.clone(),
+            )],
+            "case {case:?}: expected the evaluator's verdict on the recorded queue, got \
+             {results:?}"
+        );
+        // A pass that REACHED the function has answered the invocation, so nothing owes it
+        // again: the control row, whose evaluator was invocable throughout, records no
+        // failed try at all.
+        let tried = emulator.failed_dispatches(&rule);
+        assert!(
+            tried >= unreachable_passes,
+            "case {case:?}: expected at least {unreachable_passes} failed pass(es) to be \
+             recorded, got {tried}"
+        );
+        if unreachable_passes == 0 {
+            assert_eq!(
+                tried, 0,
+                "case {case:?}: expected an invocable evaluator to cost no failed pass, got \
+                 {tried}"
+            );
+        }
     }
 }

@@ -221,6 +221,27 @@ pub struct RuleEvaluationEntry {
     /// pump does not invoke the function again for the same pass. It stays set when the
     /// pass settles, because the invocation it names has happened.
     pub dispatched_token: Option<String>,
+    /// How far through the subjects of the pass [`Self::dispatched_token`] names Config
+    /// has got: the `(resourceType, resourceId)` of the last recorded resource an
+    /// invocation was made for, for a CHANGE-TRIGGERED rule whose scope covers more
+    /// recorded resources than one pass hands its evaluator
+    /// ([`super::MAX_INVOCATIONS_PER_PASS`]).
+    ///
+    /// A pass that could not hand every subject over leaves this set and
+    /// [`Self::dispatched_token`] unset, so the rule still OWES its evaluator an
+    /// invocation and the next pass carries on after that resource — which is what keeps a
+    /// recorded configuration item from being silently never pushed. Cleared when Config
+    /// invokes a fresh pass ([`ConfigRuleEntry::mint_evaluation_result_token`]).
+    pub dispatched_through: Option<(String, String)>,
+    /// How many passes have tried and FAILED to make this pass's invocation at all — the
+    /// call to the function could not be made, so nothing ran and no verdict was
+    /// delivered.
+    ///
+    /// Such a pass is owed again ([`super::custom_lambda_rule`]), so a later one tries
+    /// again; this counts the tries, because a rule whose evaluator can never be invoked
+    /// must not be retried without end. Cleared when Config invokes a fresh pass
+    /// ([`ConfigRuleEntry::mint_evaluation_result_token`]).
+    pub failed_dispatches: u32,
 }
 
 impl RuleEvaluationEntry {
@@ -405,6 +426,11 @@ impl ConfigRuleEntry {
         self.evaluation.result_token = self
             .delivers_own_evaluations()
             .then(|| mint_result_token(&self.name, invoked_at));
+        // The new pass has its own subjects to hand over and its own tries to make: how
+        // far the PREVIOUS pass got, and how often it failed to reach the evaluator at
+        // all, say nothing about this one.
+        self.evaluation.dispatched_through = None;
+        self.evaluation.failed_dispatches = 0;
     }
 
     /// Record `result` as this rule's verdict on the resource it names, keeping the
