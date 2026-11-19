@@ -462,12 +462,15 @@ async fn two_stores_mint_different_identifiers_for_their_first_resource() {
     }
 }
 
-/// RULE (see the module docs): the dedicated label `RegisterCustomEndpoint` mints into the
-/// account's endpoint address is minted the same way — fresh per store, carrying no creation
-/// counter — while the register itself stays a get-or-create, so repeating it in one store
-/// reports the address the first call minted.
+/// RULE: the custom endpoint's `EndpointAddress` is NOT an identifier this service mints —
+/// it is the connection target a device dials, so it is the address this emulator is served
+/// at (the `custom_endpoint_registration` suite drives that rule over the addresses this
+/// process is published at). Two stores therefore report the SAME address, because the
+/// serving address is a property of the process rather than of a store, while the register
+/// stays a get-or-create: repeating it in one store reports the address the first call
+/// registered.
 #[tokio::test]
-async fn a_custom_endpoint_label_is_minted_fresh_per_store() {
+async fn a_custom_endpoint_address_is_the_serving_address_not_a_minted_label() {
     let (first, second) = (emulator(), emulator());
     let mut addresses: Vec<String> = Vec::new();
 
@@ -487,20 +490,23 @@ async fn a_custom_endpoint_label_is_minted_fresh_per_store() {
                 )
             })
             .to_string();
-        // `EndpointAddress`: len 1..256, pattern ^[A-Za-z0-9._@-]+$
-        // (`smithy_query(query="shape",shape="EndpointAddress")`).
+        // `EndpointAddress`: len 1..256
+        // (`smithy_query(query="shape",shape="EndpointAddress")`). Its pattern
+        // `^[A-Za-z0-9._@-]+$` admits no `:`, so it describes the public hostname AWS mints
+        // rather than the `host[:port]` a served emulator is reached at, and what the member
+        // has to carry is an address the caller can dial.
         assert!(
             (1..=256).contains(&address.chars().count())
                 && address
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._@-".contains(c)),
-            "case {case:?}: expected an EndpointAddress matching ^[A-Za-z0-9._@-]+$ of \
-             1..=256 characters, got {address:?}"
+                    .all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c)),
+            "case {case:?}: expected an EndpointAddress of 1..=256 characters shaped like a \
+             host[:port], got {address:?}"
         );
-        let label = address.split('.').next().unwrap_or_default();
         assert!(
-            !label.ends_with("00000000"),
-            "case {case:?}: expected a label carrying no creation counter, got {label:?}"
+            !address.contains("amazonaws.com"),
+            "case {case:?}: expected no name in a zone AWS publishes its own endpoints in, got \
+             {address:?}"
         );
 
         // Get-or-create: the second register in the SAME store reports the first address.
@@ -508,16 +514,17 @@ async fn a_custom_endpoint_label_is_minted_fresh_per_store() {
         assert_eq!(
             again.string("EndpointAddress"),
             Some(address.as_str()),
-            "case {case:?}: expected the register to report the address it minted, got {:?}",
+            "case {case:?}: expected the register to report the address it registered, got {:?}",
             again.string("EndpointAddress")
         );
         addresses.push(address);
     }
 
-    assert_ne!(
+    assert_eq!(
         addresses[0], addresses[1],
-        "expected two stores to mint different endpoint labels, got {:?} from both",
-        addresses[0]
+        "expected both stores to announce the one address this process is served at, got {:?} \
+         and {:?}",
+        addresses[0], addresses[1]
     );
 }
 

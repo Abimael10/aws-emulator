@@ -6,9 +6,14 @@
 //! for and answers its `EndpointAddress`.
 //!
 //! The request carries no identifier, so the endpoint is a per-account, per-region
-//! SINGLETON and this call is a get-or-create: the first call MINTS the address and stores
-//! it, and every later call answers the address already held — which is also what
+//! SINGLETON and this call is a get-or-create: the first call stores the address and
+//! answers it, and every later call answers the address already held — which is also what
 //! `GetCustomEndpoint` reports.
+//!
+//! The address is the one this emulator is SERVED at
+//! ([`crate::state::announced_custom_endpoint_address`]), because `EndpointAddress` is the
+//! connection target a device then dials — see that module for why no name of AWS's own, and
+//! no name derived from the serving host, can be announced here.
 //!
 //! The endpoint is keyed by that region, so the store keeps endpoints for at most
 //! [`crate::state::MAX_CONFIGURED_REGIONS`] regions and only under a key shaped like a
@@ -187,18 +192,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Get-or-create: the first register of a region mints its dedicated address and
-        // stores it; every later register answers that same stored address, so repeating
+        // Get-or-create: the first register of a region stores its dedicated address and
+        // answers it; every later register answers that same stored address, so repeating
         // the call registers nothing new.
+        //
+        // WHICH address is announced is read once, from the one endpoint this emulator
+        // serves its whole surface at ([`crate::state::announced_custom_endpoint_address`]):
+        // the member is a connection target a device DIALS, so it carries an address this
+        // process answers on rather than a name of AWS's own.
         //
         // The store keeps endpoints for a bounded number of regions: past it, a register
         // for a region it does not already hold is refused rather than grown into. The
         // operation models no quota error, so the refusal is the modelled error closest to
         // "this service will not take another one now" — the one this service's per-region
         // puts answer at the same bound.
+        let announced = crate::state::announced_custom_endpoint_address(ctx);
         let endpoint_address = state
             .lock()
-            .register_custom_endpoint(&region)
+            .register_custom_endpoint(&region, &announced)
             .ok_or_else(|| {
                 audit(&akid, &region, "refused");
                 RegisterCustomEndpointErrorModeled::ThrottlingException(ThrottlingException {

@@ -3,10 +3,12 @@
 //! @op GetCustomEndpoint
 //!
 //! Reports the custom endpoint of the region this request was signed for: the
-//! `EndpointAddress` that region's `RegisterCustomEndpoint` minted.
+//! `EndpointAddress` that region's `RegisterCustomEndpoint` stored, which is the address
+//! this emulator is served at ([`crate::state::announced_custom_endpoint_address`]) — the
+//! register and this read therefore report one and the same value.
 //!
 //! The endpoint is a per-account, per-region SINGLETON — this read carries no identifier —
-//! and it exists only where a register MINTED one, so a region none has registered answers
+//! and it exists only where a register REGISTERED one, so a region none has registered answers
 //! the modelled `ResourceNotFoundException`
 //! ([`crate::state::custom_endpoint_not_found_on_read`]). A pure read: it stores nothing,
 //! so reading one region's endpoint cannot change what a later caller sees anywhere.

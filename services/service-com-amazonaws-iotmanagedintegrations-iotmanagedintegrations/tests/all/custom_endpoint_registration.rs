@@ -7,23 +7,27 @@
 //! the routes, status codes, bodies and modelled errors asserted here are the ones a client
 //! sees.
 //!
-//! RULE: the custom endpoint is a per-account, per-region SINGLETON that a register MINTS
+//! RULE: the custom endpoint is a per-account, per-region SINGLETON that a register
+//! REGISTERS
 //! (`smithy_query(query="operation",operation="RegisterCustomEndpoint,GetCustomEndpoint")`
 //! -> `POST /custom-endpoint` (201) and `GET /custom-endpoint` (200, `@readonly`), each with
 //! an EMPTY request shape and a `@required` `EndpointAddress` on its response, the read
 //! modelling `ResourceNotFoundException` and the register `ThrottlingException`). So:
 //!
-//! * the first register of a region MINTS that region's dedicated `EndpointAddress`, stores
-//!   it, and answers it; the address satisfies the modelled `EndpointAddress` constraints
-//!   and carries the region it was registered for;
+//! * `EndpointAddress` is the connection target a device DIALS ("The IoT managed
+//!   integrations dedicated, custom endpoint for the device to route traffic through"), so
+//!   the address a register answers and a read reports is the `host[:port]` THIS emulator is
+//!   SERVED at — never a name in a zone AWS publishes its own endpoints in, and never a name
+//!   derived from the serving host, neither of which anything answers for;
+//! * the first register of a region stores that address and answers it;
 //! * the register is a GET-OR-CREATE: repeating it answers the address the first call
-//!   minted, however many times it is repeated, and mints no second endpoint;
+//!   registered, however many times it is repeated, and registers no second endpoint;
 //! * a read PROJECTS the stored address, so a register is observable through
 //!   `GetCustomEndpoint`, and repeated reads report the same address;
-//! * the endpoint exists only where a register minted one: a region none has registered
+//! * the endpoint exists only where a register registered one: a region none has registered
 //!   answers the modelled `ResourceNotFoundException`, and reading it registers nothing;
-//! * the endpoint is scoped to the region the request was signed for, so each region
-//!   reports its own address and no other region's;
+//! * registration is scoped to the region the request was signed for, so a region nobody
+//!   registered reports no endpoint however many others are registered;
 //! * the store is BOUNDED in the regions it holds: the key is the region of the request's
 //!   own credential scope, so a register for a further region past `MAX_CONFIGURED_REGIONS`
 //!   is refused, and a scope region that is not shaped like a region name never becomes a
@@ -31,22 +35,45 @@
 //!
 //! The regions below span the class the rule generalises over — the test's default, regions
 //! in other partitions' naming styles, the longest and shortest names the key guard admits,
-//! and names that fail its shape — together with repeat counts from one call to several.
+//! and names that fail its shape — together with repeat counts from one call to several, and
+//! [`SERVING_BASES`] spans the addresses this emulator is published at.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::state::{
-    CUSTOM_ENDPOINT_LABEL_LENGTH, CUSTOM_ENDPOINT_RESOURCE_TYPE, MAX_CONFIGURED_REGIONS,
-    MAX_REGION_NAME_LENGTH,
+    CUSTOM_ENDPOINT_RESOURCE_TYPE, MAX_CONFIGURED_REGIONS, MAX_REGION_NAME_LENGTH,
 };
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::{
     ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState as ServiceState, EmulatedService,
 };
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EndpointUrl, MultiServiceRouter, UNSERVED_URL_BASE};
 
 /// The region the test's requests are signed for unless a case names another.
 const REGION: &str = "us-east-1";
+
+/// The base URL this suite's emulator is published at, the way the data port publishes the
+/// URL it bound, and the `host[:port]` of it — which is the whole address the custom endpoint
+/// is announced at.
+const SERVING_BASE: &str = "https://127.0.0.1:34567";
+const SERVING_AUTHORITY: &str = "127.0.0.1:34567";
+
+/// The DNS zones AWS publishes its OWN endpoints in, none of which the announced address may
+/// be named in: a name under one of them resolves off this machine — at genuine AWS
+/// infrastructure — so a device pointed at it would leave this emulator carrying the
+/// credentials it holds. One suffix per AWS partition (the `dnsSuffix` values of the AWS
+/// SDKs' endpoint metadata), plus the zones AWS serves dual-stack and short-form endpoints
+/// under.
+const AWS_ENDPOINT_ZONES: [&str; 8] = [
+    "amazonaws.com",
+    "amazonaws.com.cn",
+    "c2s.ic.gov",
+    "sc2s.sgov.gov",
+    "cloud.adc-e.uk",
+    "csp.hci.ic.gov",
+    "api.aws",
+    "on.aws",
+];
 
 /// The route both operations are bound to (`smithy_query` above): the method is what tells
 /// the register from the read.
@@ -81,26 +108,25 @@ impl Reply {
     }
 }
 
-/// Whether `address` satisfies the modelled `EndpointAddress` constraints — its length
-/// bounds and its pattern `^[A-Za-z0-9._@-]+$`, both quoted on
-/// [`ENDPOINT_ADDRESS_LENGTH`].
-fn is_modelled_endpoint_address(address: &str) -> bool {
+/// Whether `address` is an address a device could DIAL: non-empty, inside the modelled
+/// `EndpointAddress` length bounds ([`ENDPOINT_ADDRESS_LENGTH`]), and written with the
+/// characters a `host[:port]` carries and nothing else (no scheme, no path).
+///
+/// The modelled pattern `^[A-Za-z0-9._@-]+$` is not asserted: it admits no `:`, so it
+/// describes the public hostname AWS mints rather than the `host[:port]` an emulator served
+/// on a port of its own is reached at, and the member has to carry an address the caller can
+/// actually reach.
+fn is_dialable_address(address: &str) -> bool {
     let length = address.chars().count();
     length >= ENDPOINT_ADDRESS_LENGTH.0
         && length <= ENDPOINT_ADDRESS_LENGTH.1
-        && address
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "._@-".contains(character))
+        && address.chars().all(|character| {
+            character.is_ascii_alphanumeric() || ".-:[]".contains(character)
+        })
 }
 
-/// The dedicated label of `address`: everything before its first separator, which is what a
-/// register MINTS for one region.
-fn label_of(address: &str) -> &str {
-    address.split('.').next().unwrap_or(address)
-}
-
-/// A router holding one `iotmanagedintegrations` service over a fresh shared engine: the
-/// same assembly `core/router` performs, with one service mounted.
+/// A router holding one `iotmanagedintegrations` service over a fresh shared engine, served
+/// at [`SERVING_BASE`]: the same assembly `core/router` performs, with one service mounted.
 fn emulator() -> MultiServiceRouter {
     emulator_over(Arc::new(engine::InMemoryEngine::new()))
 }
@@ -108,26 +134,40 @@ fn emulator() -> MultiServiceRouter {
 /// [`emulator`] over an engine the caller keeps a handle to, so a test can inspect the
 /// service's store directly — what the store HOLDS is not visible on the wire.
 fn emulator_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+    emulator_served_at(engine, SERVING_BASE)
+}
+
+/// [`emulator_over`] published at `base`, the way the data port publishes the URL it bound —
+/// or left on the base an emulator served on no port names ([`UNSERVED_URL_BASE`]) when
+/// `base` is that one.
+fn emulator_served_at(engine: Arc<engine::InMemoryEngine>, base: &str) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     // The signature itself is not under test here, so requests are unauthenticated.
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
+    if base != UNSERVED_URL_BASE {
+        router.set_url_base(
+            EndpointUrl::parse(base).unwrap_or_else(|| panic!("{base:?} is a usable endpoint URL")),
+        );
+    }
     router
 }
 
 /// Send one request and reduce the answer. The `Authorization` credential scope is what
-/// routes the request to this service and names the region it addresses.
-async fn call_signed(
+/// routes the request to this service and names the region it addresses; `arriving_at` is
+/// the `Host` the request carries, for a case that varies the endpoint it arrived on.
+async fn call_arriving_at(
     router: &MultiServiceRouter,
     region: &str,
     method: &str,
     path: &str,
     body: Option<Value>,
+    arriving_at: Option<&str>,
 ) -> Reply {
     let payload = body.map_or_else(bytes::Bytes::new, |value| {
         bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize the request body"))
     });
-    let request = http::Request::builder()
+    let mut builder = http::Request::builder()
         .method(method)
         .uri(format!(
             "https://api.iotmanagedintegrations.{region}.amazonaws.com{path}"
@@ -139,9 +179,11 @@ async fn call_signed(
                  iotmanagedintegrations/aws4_request, SignedHeaders=host, Signature=0"
             ),
         )
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("a well-formed request");
+        .header("content-type", "application/json");
+    if let Some(host) = arriving_at {
+        builder = builder.header("host", host);
+    }
+    let request = builder.body(payload).expect("a well-formed request");
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
@@ -161,6 +203,17 @@ async fn call_signed(
         error_type,
         body,
     }
+}
+
+/// [`call_arriving_at`] for a request that names no `Host` of its own.
+async fn call_signed(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Reply {
+    call_arriving_at(router, region, method, path, body, None).await
 }
 
 /// Register the custom endpoint of `region`.
@@ -197,9 +250,9 @@ fn region_cases() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// RULE (see the module docs): the first register of a region mints that region's dedicated
-/// `EndpointAddress`, and a read projects the stored address — for every region the key
-/// guard admits.
+/// RULE (see the module docs): the first register of a region stores that region's
+/// `EndpointAddress` — the address this emulator is served at — and a read projects the
+/// stored address, for every region the key guard admits.
 #[tokio::test]
 async fn a_register_mints_an_endpoint_the_read_reports() {
     for (label, region) in region_cases() {
@@ -220,20 +273,14 @@ async fn a_register_mints_an_endpoint_the_read_reports() {
             )
         });
         assert!(
-            is_modelled_endpoint_address(address),
-            "case {label:?}: the minted address must satisfy the modelled EndpointAddress \
-             constraints, got {address:?}"
-        );
-        assert!(
-            address.contains(region.as_str()),
-            "case {label:?}: the address is the endpoint of the region it was registered for, \
-             so it must carry {region:?}, got {address:?}"
+            is_dialable_address(address),
+            "case {label:?}: the announced address must be one a device can dial, got \
+             {address:?}"
         );
         assert_eq!(
-            label_of(address).chars().count(),
-            CUSTOM_ENDPOINT_LABEL_LENGTH,
-            "case {label:?}: the dedicated label must be minted at its full length, got {:?}",
-            label_of(address)
+            address, SERVING_AUTHORITY,
+            "case {label:?}: the address is the host:port this emulator is served at, expected \
+             {SERVING_AUTHORITY:?}, got {address:?}"
         );
 
         let read = read_in(&router, &region).await;
@@ -398,9 +445,11 @@ async fn a_region_with_no_registered_endpoint_is_not_found() {
     }
 }
 
-/// RULE: the endpoint is scoped to the region the request was signed for, the way every
-/// other resource of this service is — so each region reports the address registered through
-/// its own endpoint, and a region nobody registered reports none.
+/// RULE: REGISTRATION is scoped to the region the request was signed for, the way every
+/// other resource of this service is — so a region nobody registered reports none, however
+/// many others are registered. WHICH address a registered region reports is not the region's
+/// to choose: it is the one endpoint this process is served at, so every region reports that
+/// same dialable address.
 #[tokio::test]
 async fn the_endpoint_is_scoped_to_the_signing_region() {
     let router = emulator();
@@ -435,16 +484,11 @@ async fn the_endpoint_is_scoped_to_the_signing_region() {
              endpoint ({address:?}), got {:?}",
             read.body
         );
-        for (other_region, other_address) in &registered {
-            if other_region == region {
-                continue;
-            }
-            assert_ne!(
-                address, other_address,
-                "case {region:?}: each region's endpoint is its own, so it must differ from \
-                 {other_region:?}'s ({other_address:?})"
-            );
-        }
+        assert_eq!(
+            address, SERVING_AUTHORITY,
+            "case {region:?}: the address a region reports is the one host:port this emulator \
+             is served at, expected {SERVING_AUTHORITY:?}, got {address:?}"
+        );
     }
 
     // A region nobody registered holds nothing, with other regions registered: a register
@@ -568,5 +612,193 @@ async fn a_scope_region_that_is_not_a_region_name_is_refused() {
             held, 0,
             "case {label:?}: a refused register must mint nothing, the store holds {held}"
         );
+    }
+}
+
+/// Every address this emulator is published at that a case below drives, with the
+/// `host[:port]` the custom endpoint must then be announced at: loopback on a fixed port,
+/// loopback on a port the OS could hand out, an IPv6 loopback literal, a host name with a
+/// port, a host name on no port of its own, and the base an emulator served on no port names
+/// at all (`smithy_server_runtime::UNSERVED_URL_BASE`).
+const SERVING_BASES: [(&str, &str, &str); 6] = [
+    ("loopback on a fixed port", SERVING_BASE, SERVING_AUTHORITY),
+    (
+        "loopback on an ephemeral port",
+        "https://127.0.0.1:49512",
+        "127.0.0.1:49512",
+    ),
+    (
+        "an IPv6 loopback literal",
+        "https://[::1]:9297",
+        "[::1]:9297",
+    ),
+    (
+        "a host name with a port",
+        "https://emulator.internal:8443",
+        "emulator.internal:8443",
+    ),
+    (
+        "a host name on no port of its own",
+        "https://emulator.internal",
+        "emulator.internal",
+    ),
+    (
+        "an emulator served on no port at all",
+        UNSERVED_URL_BASE,
+        "emulator.invalid",
+    ),
+];
+
+/// The host of `address`, without the port it names: what the zone assertions read. An IPv6
+/// literal keeps its brackets, which is where its own colons live.
+fn host_of(address: &str) -> &str {
+    match address.find(']') {
+        Some(end) => &address[..=end],
+        None => address.split(':').next().unwrap_or(address),
+    }
+}
+
+/// RULE: `EndpointAddress` is the connection target a device dials, so the register answers
+/// — and the read reports — the `host[:port]` THIS emulator is served at, whatever address it
+/// is published at. One row per address of [`SERVING_BASES`].
+#[tokio::test]
+async fn the_announced_address_is_the_one_this_emulator_is_served_at() {
+    for (case, base, expected) in SERVING_BASES {
+        let router = emulator_served_at(Arc::new(engine::InMemoryEngine::new()), base);
+
+        let registered = register_in(&router, REGION).await;
+        assert_eq!(
+            registered.status, 201,
+            "case {case:?}: expected HTTP 201 from RegisterCustomEndpoint, got {} with body {:?}",
+            registered.status, registered.body
+        );
+        assert_eq!(
+            registered.endpoint_address(),
+            Some(expected),
+            "case {case:?}: the register announces the address this emulator is served at, \
+             expected {expected:?}, got {:?}",
+            registered.body
+        );
+
+        // The read reports the same singleton, so a client that discovers the endpoint
+        // through the read path is handed that same dialable address.
+        let read = read_in(&router, REGION).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected HTTP 200 from GetCustomEndpoint, got {} with body {:?}",
+            read.status, read.body
+        );
+        assert_eq!(
+            read.endpoint_address(),
+            Some(expected),
+            "case {case:?}: the read reports the same announced address, expected {expected:?}, \
+             got {:?}",
+            read.body
+        );
+        assert!(
+            is_dialable_address(expected),
+            "case {case:?}: the announced address must be one a device can dial, got \
+             {expected:?}"
+        );
+        for zone in AWS_ENDPOINT_ZONES {
+            assert!(
+                !host_of(expected).ends_with(zone),
+                "case {case:?}: the announced address is never named in a zone AWS publishes \
+                 its own endpoints in, but {expected:?} ends in {zone:?}"
+            );
+        }
+    }
+}
+
+/// RULE: the serving address is a property of the PROCESS, so nothing a request carries moves
+/// it — neither the endpoint host it arrived on (including a host of AWS's own) nor the
+/// region it addresses — and the answer is never a name in a zone AWS publishes its own
+/// endpoints in. The rows differ along the FORM of the endpoint the request arrived on and
+/// along the partition of the region it addresses.
+#[tokio::test]
+async fn no_arrival_host_or_region_moves_the_announced_address() {
+    let router = emulator();
+
+    // (case, the region the request is signed for, the `Host` it arrived at)
+    let arrivals: &[(&str, &str, Option<&str>)] = &[
+        (
+            "this service's regional endpoint host",
+            "us-east-1",
+            Some("api.iotmanagedintegrations.us-east-1.amazonaws.com"),
+        ),
+        (
+            "a FIPS endpoint host",
+            "us-gov-west-1",
+            Some("api.iotmanagedintegrations-fips.us-gov-west-1.amazonaws.com"),
+        ),
+        (
+            "a dual-stack endpoint host",
+            "ap-southeast-2",
+            Some("api.iotmanagedintegrations.ap-southeast-2.api.aws"),
+        ),
+        (
+            "a China-partition endpoint host",
+            "cn-north-1",
+            Some("api.iotmanagedintegrations.cn-north-1.amazonaws.com.cn"),
+        ),
+        (
+            "loopback on the port this emulator serves",
+            "eu-west-1",
+            Some(SERVING_AUTHORITY),
+        ),
+        (
+            "a bare name on a port of the caller's choosing",
+            "eu-central-1",
+            Some("iot.test.internal:34567"),
+        ),
+        ("no Host header at all", "sa-east-1", None),
+        (
+            "a Host that is not an address at all",
+            "ap-south-1",
+            Some("iotmanagedintegrations us-east-1"),
+        ),
+    ];
+
+    for (case, region, arriving_at) in arrivals {
+        for (operation, method, expected_status) in
+            [("RegisterCustomEndpoint", "POST", 201), ("GetCustomEndpoint", "GET", 200)]
+        {
+            let body = (method == "POST").then(|| json!({}));
+            let reply = call_arriving_at(
+                &router,
+                region,
+                method,
+                CUSTOM_ENDPOINT_ROUTE,
+                body,
+                *arriving_at,
+            )
+            .await;
+            assert_eq!(
+                reply.status, expected_status,
+                "case {case:?}: expected HTTP {expected_status} from {operation}, got {} with \
+                 body {:?}",
+                reply.status, reply.body
+            );
+            let address = reply.endpoint_address().unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: {operation} must answer the required EndpointAddress, got \
+                     {:?}",
+                    reply.body
+                )
+            });
+            assert_eq!(
+                address, SERVING_AUTHORITY,
+                "case {case:?}: {operation} announces the address this emulator is served at, \
+                 whatever endpoint the request arrived on and whatever region it addresses, \
+                 expected {SERVING_AUTHORITY:?}, got {address:?}"
+            );
+            for zone in AWS_ENDPOINT_ZONES {
+                assert!(
+                    !host_of(address).ends_with(zone),
+                    "case {case:?}: {operation} must announce no name in a zone AWS publishes \
+                     its own endpoints in, but {address:?} ends in {zone:?}"
+                );
+            }
+        }
     }
 }
