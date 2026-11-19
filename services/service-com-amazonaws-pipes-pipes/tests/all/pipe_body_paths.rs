@@ -22,6 +22,12 @@
 //! (string, number, the whole document), where the path sits in the template (bare,
 //! quoted, unquoted inside an object, beside a path that reads the envelope), and whether
 //! a filter reads the same body the template renders from.
+//!
+//! Two rules about the RENDER itself are asserted over tables of their own: what a stage is
+//! handed is the template's own text with every placeholder filled, byte for byte, each
+//! value written as its place in the template asks; and the reserved `aws.pipes.` variables
+//! of a template render the values the service fills — the pipe's own identity, the ARNs it
+//! is configured with, the instant the stage received the event, and the event itself.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -33,7 +39,7 @@ use crate::pipe_data_plane::{
     collect_at_least, collect_during, counted, emulator, given_queue, sqs, wait_for_visible,
     QUIET,
 };
-use crate::pipe_lifecycle::{call, REGION};
+use crate::pipe_lifecycle::{call, describe, REGION};
 
 /// The role every pipe below names. Nothing in this suite turns on its policies.
 const ROLE: &str = "arn:aws:iam::000000000000:role/pipes-body-paths";
@@ -131,7 +137,9 @@ async fn a_path_into_a_record_body_selects_what_the_body_spells() {
             patterns: &[],
             messages: &[Sent {
                 body: r#"{"id": "quoted-1"}"#,
-                delivered: Some("quoted-1"),
+                // A render is the template's own text with the placeholder filled, so the
+                // quotes the template opened and closed with are delivered as written.
+                delivered: Some("\"quoted-1\""),
             }],
         },
         Row {
@@ -330,6 +338,196 @@ async fn the_payload_keeps_the_body_as_sent_and_an_unresolvable_path_delivers_no
             }
         }
     }
+}
+
+/// RULE: what a stage is handed for one event is the template's own text with every
+/// placeholder filled, byte for byte, and HOW a value is written follows the form of the
+/// template: in JSON text a placeholder standing as a value carries the value's JSON — so a
+/// string is quoted by the render itself — one standing inside a string literal carries a
+/// string's characters escaped for that literal and any other value's own JSON, and a
+/// template that is not JSON text carries every value's characters unescaped.
+///
+/// The rows differ along what the rule generalises over: where the placeholder stands (as a
+/// JSON value, inside a string literal, in a template that is not JSON), the type of the
+/// value it carries (string, string holding a quote, object, number) and the spacing the
+/// template's author wrote.
+#[tokio::test]
+async fn an_input_template_delivers_its_own_bytes_with_every_value_written_as_its_place_asks() {
+    // The one body every row sends, holding a value of each type a placeholder can carry.
+    const BODY: &str = r#"{"text": "hello", "object": {"key": "value"}, "quoted": "she said \"hi\" today", "count": 3}"#;
+
+    // (case, the template, the BYTES the target must receive)
+    let rows: Vec<(&str, &str, &str)> = vec![
+        (
+            "an-unquoted-string-is-auto-quoted",
+            r#"{"v": <$.body.text>}"#,
+            r#"{"v": "hello"}"#,
+        ),
+        (
+            // Inlined inside a string literal, an object keeps its own JSON quotes: the
+            // literal the template opened is broken rather than the object escaped.
+            "an-object-inlined-in-a-string-literal",
+            r#"{"v": "x <$.body.object>"}"#,
+            r#"{"v": "x {"key":"value"}"}"#,
+        ),
+        (
+            "a-quoted-string-is-escaped-quote-and-all",
+            r#"{"v": "<$.body.quoted>"}"#,
+            r#"{"v": "she said \"hi\" today"}"#,
+        ),
+        (
+            "an-unquoted-number",
+            r#"{"n": <$.body.count>}"#,
+            r#"{"n": 3}"#,
+        ),
+        (
+            // Every form at once, with the author's own spacing.
+            "the-three-forms-in-one-template",
+            r#"{"unquoted_string": <$.body.text>, "obj_in_string": "x <$.body.object>", "quoted_with_embedded_quote": "<$.body.quoted>"}"#,
+            r#"{"unquoted_string": "hello", "obj_in_string": "x {"key":"value"}", "quoted_with_embedded_quote": "she said \"hi\" today"}"#,
+        ),
+        (
+            // Not JSON text: the characters, nothing escaped and nothing quoted.
+            "a-template-that-is-not-json-text",
+            "order <$.body.text> says <$.body.quoted>",
+            "order hello says she said \"hi\" today",
+        ),
+    ];
+
+    for (case, template, expected) in rows {
+        let router = emulator();
+        let (source_url, source_arn) = given_queue(&router, &format!("{case}-src")).await;
+        let (target_url, target_arn) = given_queue(&router, &format!("{case}-tgt")).await;
+        let created = call(
+            &router,
+            "POST",
+            &format!("/v1/pipes/{case}"),
+            Some(json!({
+                "Source": source_arn,
+                "Target": target_arn,
+                "RoleArn": ROLE,
+                "DesiredState": "RUNNING",
+                "SourceParameters": source_parameters(&[]),
+                "TargetParameters": { "InputTemplate": template },
+            })),
+            REGION,
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreatePipe answered {} {}",
+            created.status, created.body
+        );
+        send(&router, &source_url, case, BODY).await;
+
+        let delivered = collect_at_least(&router, &target_url, 1, BUDGET).await;
+        let first = delivered
+            .first()
+            .unwrap_or_else(|| panic!("case {case:?}: nothing was delivered"));
+        assert_eq!(
+            first, expected,
+            "case {case:?}: expected the target to receive {expected:?}, got {first:?}"
+        );
+    }
+}
+
+/// RULE: the reserved `aws.pipes.*` variables of an `InputTemplate` render the values the
+/// service fills — the pipe's own ARN and name, the ARNs of the source, enrichment and
+/// target it is configured with, the instant the stage received the event and the event
+/// itself — so a delivered payload carries those values and never the placeholder text.
+///
+/// The pipe's own ARN and name are read back from `DescribePipe`, so the render is compared
+/// against what the control plane reports rather than against text this test wrote. The
+/// ingestion time is the one value the CLOCK fills, so it is asserted on its form: an
+/// instant a consumer can read back.
+#[tokio::test]
+async fn the_reserved_pipe_variables_render_the_pipes_own_identity() {
+    let case = "reserved-pipe-variables";
+    let router = emulator();
+    let (source_url, source_arn) = given_queue(&router, &format!("{case}-src")).await;
+    let (target_url, target_arn) = given_queue(&router, &format!("{case}-tgt")).await;
+
+    // Every reserved variable the service fills, each as one member of a JSON template.
+    let template = concat!(
+        r#"{"pipeArn": "<aws.pipes.pipe-arn>", "pipeName": "<aws.pipes.pipe-name>", "#,
+        r#""sourceArn": "<aws.pipes.source-arn>", "targetArn": "<aws.pipes.target-arn>", "#,
+        r#""enrichmentArn": "<aws.pipes.enrichment-arn>", "#,
+        r#""ingestedAt": "<aws.pipes.event.ingestion-time>", "#,
+        r#""event": <aws.pipes.event.json>}"#,
+    );
+    let created = call(
+        &router,
+        "POST",
+        &format!("/v1/pipes/{case}"),
+        Some(json!({
+            "Source": source_arn,
+            "Target": target_arn,
+            "RoleArn": ROLE,
+            "DesiredState": "RUNNING",
+            "SourceParameters": source_parameters(&[]),
+            "TargetParameters": { "InputTemplate": template },
+        })),
+        REGION,
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: CreatePipe answered {} {}",
+        created.status, created.body
+    );
+    let described = describe(&router, case).await;
+    let pipe_arn = described.string("Arn");
+    let pipe_name = described.string("Name");
+
+    send(&router, &source_url, case, r#"{"marker": "reserved-1"}"#).await;
+    let delivered = collect_at_least(&router, &target_url, 1, BUDGET).await;
+    let first = delivered
+        .first()
+        .unwrap_or_else(|| panic!("case {case:?}: nothing was delivered"));
+    let rendered: Value = serde_json::from_str(first).unwrap_or_else(|error| {
+        panic!("case {case:?}: the delivered payload is not JSON ({error}): {first:?}")
+    });
+
+    // (the member, what the variable renders) for every value the pipe's own
+    // configuration fills.
+    let expected: Vec<(&str, String)> = vec![
+        ("pipeArn", pipe_arn.clone()),
+        ("pipeName", pipe_name.clone()),
+        ("sourceArn", source_arn.clone()),
+        ("targetArn", target_arn.clone()),
+        // This pipe configures no enrichment, so the variable stands for no resource.
+        ("enrichmentArn", String::new()),
+    ];
+    for (member, value) in expected {
+        assert_eq!(
+            rendered[member].as_str(),
+            Some(value.as_str()),
+            "case {case:?}: expected {member} to render {value:?}, got {rendered}"
+        );
+    }
+
+    let ingested = rendered["ingestedAt"].as_str().unwrap_or_default();
+    assert!(
+        aws_smithy_types::DateTime::from_str(
+            ingested,
+            aws_smithy_types::date_time::Format::DateTime
+        )
+        .is_ok(),
+        "case {case:?}: expected an instant a consumer can read, got {ingested:?}"
+    );
+    // The event as the document it is: the record envelope, body decoded as a reader of
+    // the record reads it.
+    assert_eq!(
+        rendered["event"]["body"],
+        json!({ "marker": "reserved-1" }),
+        "case {case:?}: expected the event variable to carry the record, got {rendered}"
+    );
+    assert_eq!(
+        rendered["event"]["eventSourceARN"].as_str(),
+        Some(source_arn.as_str()),
+        "case {case:?}: expected the event variable to carry the record envelope, got \
+         {rendered}"
+    );
 }
 
 /// The `SourceParameters` a pipe is created with: one record per batch, and the patterns

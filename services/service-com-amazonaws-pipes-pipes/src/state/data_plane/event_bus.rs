@@ -35,9 +35,7 @@
 //! ([`super::Clients`]), so the only bus a pipe can reach is one this emulator itself holds:
 //! no socket is opened and no name is resolved for the ARN a pipe carries.
 
-use ::serde_json::Value;
-
-use super::{resolved_parameter, target_body, CallFailure, Clients, Delivery};
+use super::{resolved_parameter, CallFailure, Clients, Delivery};
 use crate::ops::types::PipeTargetEventBridgeEventBusParameters;
 
 /// The resource type an event bus ARN names: `arn:…:events:…:event-bus/<name>`.
@@ -147,8 +145,8 @@ pub(super) async fn publish(
         if let Some(endpoint) = &bus.endpoint_id {
             request = request.endpoint_id(endpoint);
         }
-        for (payload, event) in chunk {
-            request = request.entries(entry(bus, payload.as_ref(), event.as_ref())?);
+        for delivery in chunk {
+            request = request.entries(entry(bus, delivery)?);
         }
         let answered = request.send().await.map_err(|error| {
             super::called_service::call_failure(
@@ -186,14 +184,18 @@ pub(super) async fn publish(
 
 /// ONE event as the entry that publishes it: the payload the target stage was handed as its
 /// `Detail`, under the members the pipe configured as THIS event resolves them.
+///
+/// The `Detail` is the payload as the BODY it is — an event rendered through the target's
+/// `InputTemplate` publishes the bytes that render produced, so the entry carries the
+/// detail document the template's author spelled out.
 fn entry(
     bus: &Bus,
-    payload: &Value,
-    event: &Value,
+    delivery: &Delivery<'_>,
 ) -> Result<::aws_sdk_eventbridge::types::PutEventsRequestEntry, String> {
+    let event = delivery.event();
     let mut built = ::aws_sdk_eventbridge::types::PutEventsRequestEntry::builder()
         .event_bus_name(bus.arn())
-        .detail(target_body(payload));
+        .detail(delivery.payload().body().into_owned());
     if let Some(source) = resolved_parameter(SOURCE, bus.source.as_deref(), event)? {
         built = built.source(source);
     }
@@ -227,6 +229,7 @@ mod tests {
     use ::serde_json::json;
 
     use super::{entry, resolve, Bus};
+    use super::super::{Delivery, Payload};
     use crate::ops::types::PipeTargetEventBridgeEventBusParameters;
 
     /// The bus every row below publishes on.
@@ -345,7 +348,13 @@ mod tests {
         {
             let bus = resolve(BUS, "us-east-1", Some(&configured));
             let event = event();
-            let built = entry(&bus, &event, &event)
+            // A target the pipe configures no template for is handed the event itself,
+            // which is what this table is about: the MEMBERS the entry carries.
+            let delivery = Delivery::of(
+                Payload::Event(&event),
+                ::std::borrow::Cow::Borrowed(&event),
+            );
+            let built = entry(&bus, &delivery)
                 .unwrap_or_else(|reason| panic!("case {case:?}: no entry was built ({reason})"));
             assert_eq!(
                 built.event_bus_name(),
@@ -415,7 +424,11 @@ mod tests {
         for (case, configured) in rows {
             let bus: Bus = resolve(BUS, "us-east-1", Some(&configured));
             let event = event();
-            let built = entry(&bus, &event, &event);
+            let delivery = Delivery::of(
+                Payload::Event(&event),
+                ::std::borrow::Cow::Borrowed(&event),
+            );
+            let built = entry(&bus, &delivery);
             assert!(
                 built.is_err(),
                 "case {case:?}: expected the delivery to fail, got {built:?}"

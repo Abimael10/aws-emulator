@@ -18,6 +18,10 @@
 //! `FilterCriteria.Filters` are ORed, and what the target RECEIVES is the record envelope
 //! with the body exactly as sent.
 //!
+//! A second rule is asserted over its own table: a pattern is matched against the record as
+//! the SOURCE API delivered it, so a clause on a member the POLLER adds to the envelope
+//! (which source the record came from, the source ARN, the Region) matches no record at all.
+//!
 //! The rows differ along what the rule generalises over: the format of the body, the form
 //! of the `body` clause, the document a JSON body spells (object or list) against the
 //! scalars that spell none, the matching operators the clause uses, how many patterns are
@@ -657,6 +661,119 @@ async fn the_criteria_in_force_are_the_ones_the_pipe_carries_when_a_record_is_po
             "case {case:?}: expected every polled record consumed, {left} are still visible \
              on the source"
         );
+    }
+}
+
+/// RULE: a `FilterCriteria` pattern is matched against the record as the SOURCE API
+/// delivered it, so a clause on a member the POLLER adds to the record envelope — which
+/// says where the record came from, not what the source published — matches no record at
+/// all, while the same clause form on a member the source API itself delivered decides
+/// records as ever.
+///
+/// The rows differ along what the rule generalises over: which poller-added member the
+/// clause reads (the event source, the source ARN, the Region), the form of the clause (a
+/// value list, a prefix, an existence test), whether the poller-added clause stands alone,
+/// beside a clause on a source-delivered member (ANDed, so it can never be satisfied) or
+/// as one of two ORed patterns (so the other still decides) — against the control rows
+/// whose clauses read only members the source API delivered.
+#[tokio::test]
+async fn a_filter_on_a_poller_added_member_never_matches() {
+    // The records every row below sends: one whose body spells the document the control
+    // clauses read, and one whose body does not.
+    const RECORDS: &[Sent] = &[
+        Sent {
+            body: r#"{"kind": "alpha", "marker": "poller-added-1"}"#,
+            tier: None,
+            admitted: false,
+        },
+        Sent {
+            body: "plain-poller-added-2",
+            tier: None,
+            admitted: false,
+        },
+    ];
+    // The same records, with the one the control clauses admit marked as admitted.
+    const ADMITTED_BY_THE_CONTROL: &[Sent] = &[
+        Sent {
+            body: r#"{"kind": "alpha", "marker": "poller-added-1"}"#,
+            tier: None,
+            admitted: true,
+        },
+        Sent {
+            body: "plain-poller-added-2",
+            tier: None,
+            admitted: false,
+        },
+    ];
+
+    let rows = [
+        Row {
+            case: "a-value-clause-on-the-event-source",
+            patterns: &[r#"{"eventSource": ["aws:sqs"]}"#],
+            batch_size: Some(1),
+            messages: RECORDS,
+        },
+        Row {
+            case: "a-prefix-clause-on-the-source-arn",
+            patterns: &[r#"{"eventSourceARN": [{"prefix": "arn:aws:sqs:"}]}"#],
+            batch_size: Some(1),
+            messages: RECORDS,
+        },
+        Row {
+            case: "a-value-clause-on-the-region",
+            patterns: &[r#"{"awsRegion": ["us-west-2"]}"#],
+            batch_size: Some(1),
+            messages: RECORDS,
+        },
+        Row {
+            // The member is not there at all, so an existence test for it is not satisfied.
+            case: "an-existence-clause-on-the-event-source",
+            patterns: &[r#"{"eventSource": [{"exists": true}]}"#],
+            batch_size: Some(1),
+            messages: RECORDS,
+        },
+        Row {
+            // ANDed with a clause the record DOES satisfy: the pattern still admits
+            // nothing, because one of its clauses can never be satisfied.
+            case: "a-poller-added-clause-beside-a-source-member-clause",
+            patterns: &[r#"{"eventSource": ["aws:sqs"], "body": {"kind": ["alpha"]}}"#],
+            batch_size: Some(1),
+            messages: RECORDS,
+        },
+        Row {
+            // ORed with one that reads the body: the other pattern decides, so the pipe
+            // still delivers what that one admits.
+            case: "a-poller-added-pattern-ored-with-a-body-pattern",
+            patterns: &[
+                r#"{"eventSource": ["aws:sqs"]}"#,
+                r#"{"body": {"kind": ["alpha"]}}"#,
+            ],
+            batch_size: Some(1),
+            messages: ADMITTED_BY_THE_CONTROL,
+        },
+        Row {
+            // The control: a member the source API delivered, read by the same clause
+            // forms the rows above use.
+            case: "an-existence-clause-on-a-source-delivered-member",
+            patterns: &[r#"{"messageId": [{"exists": true}]}"#],
+            batch_size: Some(1),
+            messages: &[
+                Sent {
+                    body: r#"{"kind": "alpha", "marker": "control-1"}"#,
+                    tier: None,
+                    admitted: true,
+                },
+                Sent {
+                    body: "plain-control-2",
+                    tier: None,
+                    admitted: true,
+                },
+            ],
+        },
+    ];
+
+    for row in &rows {
+        run_row(row).await;
     }
 }
 

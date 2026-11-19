@@ -562,12 +562,14 @@ fn pipe_name_field(violation: &Violation) -> Option<crate::ops::types::Validatio
 /// A BODY member is reported by the clause the body-schema validator states for the class
 /// of constraint it broke, quoting the value the caller submitted — every one of those
 /// sentences through `service_common::validation_message`, which is their home for the
-/// whole tree. Only a TOP-LEVEL member is worded: one nested inside a structure, a map
-/// entry or a list element is reported by the layer that owns that member — a tag's content
-/// is the tagging layer's ([`tag_content_clause`]) — so its clause is not this layer's to
-/// state. A class that layer has no recorded sentence for (a `@length` MINIMUM on a body
-/// string, a `@range`, an enum, an absent `@required` member) keeps the framework's own
-/// wording rather than being given one here.
+/// whole tree. WHERE in the body the member sits is not part of that wording: a member
+/// nested inside a structure (`targetParameters.inputTemplate`) breaks its own modelled
+/// constraint and is reported by the same clause as a top-level one, because the schema
+/// validator states the clause for the VALUE and the class, not for the path. The one
+/// exception is a TAG's content, which the resource-tagging layer in front of this service
+/// owns and words itself ([`tag_content_clause`]). A class that layer has no recorded
+/// sentence for (a `@length` MINIMUM on a body string, a `@range`, an enum, an absent
+/// `@required` member) keeps the framework's own wording rather than being given one here.
 fn clause(
     input_schema: &::aws_smithy_schema::Schema,
     violation: &Violation,
@@ -577,7 +579,9 @@ fn clause(
         return matches!(violation.kind, ViolationKind::MinLength(_))
             .then(|| member_of(violation).to_string());
     }
-    if violation.path.contains('.') {
+    // A value INSIDE one of the tag members is one tag's content: the tagging layer's to
+    // word, so this layer states no clause for it.
+    if violation.path.contains('.') && TAG_CONTENT_MEMBERS.contains(&member_of(violation)) {
         return None;
     }
     match (echo, &violation.kind) {

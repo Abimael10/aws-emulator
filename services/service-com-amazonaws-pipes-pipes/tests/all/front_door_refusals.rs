@@ -10,7 +10,8 @@
 //! * a member in the JSON request BODY is reported by the clause the body-schema validator
 //!   states for that class, in brackets: the regular expression and the string that did not
 //!   match it for a `@pattern`, the value and both lengths for a `@length` maximum on a
-//!   string, the property counts for one on a map;
+//!   string, the property counts for one on a map — wherever in the body that member sits,
+//!   at the top level or nested inside a structure;
 //! * a member carried OUTSIDE the body has no body-schema clause: a `@httpQuery` value that
 //!   is EMPTY where the model requires at least one character never arrives as a parameter
 //!   at all, and the refusal names the member alone;
@@ -45,10 +46,13 @@ const KMS_KEY_PATTERN: &str = r"^[a-zA-Z0-9_\-/:]*$";
 const PIPE_NAME_PATTERN: &str = r"^[\.\-_A-Za-z0-9]+$";
 
 /// The published maxima the length rows sit past. Source: the same model — `PipeDescription`
-/// `@length(0, 512)`, `KmsKeyIdentifier` `@length(0, 2048)`, `TagMap` `@length(1, 50)`.
+/// `@length(0, 512)`, `KmsKeyIdentifier` `@length(0, 2048)`, `TagMap` `@length(1, 50)`,
+/// `InputTemplate` `@length(0, 8192)` (the member of both `PipeTargetParameters` and
+/// `PipeEnrichmentParameters`).
 const MAX_DESCRIPTION: usize = 512;
 const MAX_KMS_KEY: usize = 2048;
 const MAX_TAGS: usize = 50;
+const MAX_INPUT_TEMPLATE: usize = 8192;
 
 /// Assert that `reply` is a 400 `ValidationException` carrying exactly `message`.
 fn assert_refused(case: &str, reply: &Reply, message: &str) {
@@ -246,6 +250,98 @@ async fn a_body_map_past_its_entry_maximum_states_the_property_counts() {
             "case {case:?}: a refused TagResource must have stored no tag, got {described:?}"
         );
     }
+}
+
+/// RULE: a body member longer than its modelled `@length` maximum is reported by that same
+/// bracketed clause wherever it sits in the request body — a member nested inside a
+/// structure breaks its own modelled constraint and is quoted the same way a top-level one
+/// is, because the clause states the value and the class and not the path to it.
+///
+/// The rows differ along which nested member carries the value and so which maximum it
+/// broke, which structure it sits in (the target's parameters, the enrichment's, a target's
+/// own queue parameters), how far past the maximum the value is, and which operation
+/// carried it: the clause is the same for `CreatePipe` and `UpdatePipe`.
+#[tokio::test]
+async fn a_nested_body_member_past_its_length_maximum_quotes_the_value_and_both_lengths() {
+    // (the case, the body members leading to the member, the member, its maximum).
+    let rows: Vec<(&str, &str, &str, usize)> = vec![
+        (
+            "targetinputtemplate",
+            "TargetParameters",
+            "InputTemplate",
+            MAX_INPUT_TEMPLATE,
+        ),
+        (
+            "enrichmentinputtemplate",
+            "EnrichmentParameters",
+            "InputTemplate",
+            MAX_INPUT_TEMPLATE,
+        ),
+    ];
+
+    for (case, structure, member, maximum) in rows {
+        for past in [1usize, 97] {
+            let router = router();
+            // A template over its bound is still a template a caller WROTE, so the value
+            // carries the text one does: the clause has to quote the whole of it.
+            let value = format!("{{\"v\": \"{}\"}}", "a".repeat(maximum + past));
+            let expected = format!(
+                "[string \"{value}\" is too long (length: {}, maximum allowed: {maximum})]",
+                value.chars().count()
+            );
+
+            let mut body = minimal_body(SOURCE_SQS, TARGET_LAMBDA);
+            body[structure] = json!({ member: value });
+            let refused = create(&router, case, body).await;
+            assert_refused(&format!("CreatePipe {case} +{past}"), &refused, &expected);
+            let described = describe(&router, case).await;
+            assert_eq!(
+                described.status, 404,
+                "case {case:?}: a refused CreatePipe must have stored no pipe, got {described:?}"
+            );
+
+            // The same clause from the OTHER operation that carries the member — and the
+            // refusal changes nothing about the pipe it addressed.
+            let live = format!("{case}live");
+            let created = create(&router, &live, minimal_body(SOURCE_SQS, TARGET_LAMBDA)).await;
+            assert_eq!(
+                created.status, 200,
+                "the fixture pipe must be created, got {created:?}"
+            );
+            let refused = call(
+                &router,
+                "PUT",
+                &format!("/v1/pipes/{live}"),
+                Some(json!({ "RoleArn": ROLE, structure: { member: value } })),
+                REGION,
+            )
+            .await;
+            assert_refused(&format!("UpdatePipe {case} +{past}"), &refused, &expected);
+            let described = describe(&router, &live).await;
+            assert_eq!(
+                described.status, 200,
+                "case {case:?}: a refused UpdatePipe must leave the pipe where it was, got \
+                 {described:?}"
+            );
+            assert_eq!(
+                described.body[structure].get(member),
+                None,
+                "case {case:?}: a refused UpdatePipe must store nothing it carried, got \
+                 {described:?}"
+            );
+        }
+    }
+
+    // At the bound the request is accepted, so the rule is about the value being PAST the
+    // maximum and not about the member being nested.
+    let router = router();
+    let mut body = minimal_body(SOURCE_SQS, TARGET_LAMBDA);
+    body["TargetParameters"] = json!({ "InputTemplate": "t".repeat(MAX_INPUT_TEMPLATE) });
+    let created = create(&router, "templateatthebound", body).await;
+    assert_eq!(
+        created.status, 200,
+        "a template of {MAX_INPUT_TEMPLATE} characters is inside its bound, got {created:?}"
+    );
 }
 
 /// RULE: a `@httpQuery` value that is EMPTY where the model requires at least one

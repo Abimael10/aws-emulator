@@ -101,7 +101,7 @@ pub(super) async fn start(
     // payloads themselves rather than from a second copy of them.
     let events: Vec<&::serde_json::Value> = payloads
         .iter()
-        .map(|(payload, _)| payload.as_ref())
+        .map(|delivery| delivery.payload().value())
         .collect();
     let arn = machine.arn();
     let input = ::serde_json::to_string(&events).map_err(|error| {
