@@ -22,7 +22,15 @@
 //!    language calls `Next` whichever member declared it, and a state nothing in the
 //!    definition names;
 //! 5. what `CreateStateMachine` and `UpdateStateMachine` refuse a definition for is
-//!    what the validation reports about it, stated one subject per diagnostic.
+//!    what the validation reports about it, stated one subject per diagnostic;
+//! 6. a value the schema requires content in and the definition left EMPTY is reported
+//!    with the fixed sentence for that class, the value it is about named only by
+//!    `location`;
+//! 7. a retrier's `BackoffRate` below the smallest value the language documents for it
+//!    is an ERROR located at that figure, which is what makes `result` FAIL;
+//! 8. of a group of fields the language declares as ALTERNATIVES, a state carries at
+//!    most one, and one carrying more earns an ERROR naming the whole group, located
+//!    at the state.
 //!
 //! The harness (`Emulator`, `error_code`, `ROLE_ARN`, `create_machine`) is the one
 //! `state_machine_lifecycle` builds and the validation readers are
@@ -50,6 +58,51 @@ const STATE: &str = "Work";
 
 /// The `Resource` a `Task` state under test names.
 const RESOURCE: &str = "arn:aws:states:::aws-sdk:sts:getCallerIdentity";
+
+/// The sentence the service answers a value the schema requires content in and the
+/// definition left empty with — an `ErrorEquals` naming no error, a `States` map
+/// declaring no state. The text is FIXED: which value was left empty is what the
+/// diagnostic's `location` says.
+const EMPTY_VALUE: &str = "Value cannot be empty";
+
+/// The sentence the service answers a retrier's `BackoffRate` written below the
+/// smallest value the Amazon States Language documents for it ("BackoffRate
+/// (Optional) … The value must be greater than or equal to 1.0") with.
+const MINIMUM_BACKOFF_RATE: &str = "Minimum value is 1.0";
+
+/// How the service begins the sentence it answers a state carrying more than one field
+/// of a group the language declares as alternatives with; the group itself follows,
+/// bracketed.
+const ONE_OF_FIELDS: &str = "There should only be one of the following fields: ";
+
+/// That sentence about the group `fields`.
+fn one_of(fields: &str) -> String {
+    format!("{ONE_OF_FIELDS}[{fields}]")
+}
+
+/// The locations the diagnostics whose message is `message` were reported at, in the
+/// order the validation reported them, each held to the severity and code a schema
+/// error carries.
+fn located(body: &Value, case: &str, message: &str) -> Vec<String> {
+    diagnostics(body)
+        .iter()
+        .filter(|diagnostic| diagnostic["message"].as_str() == Some(message))
+        .map(|diagnostic| {
+            assert_eq!(
+                (
+                    diagnostic["severity"].as_str(),
+                    diagnostic["code"].as_str()
+                ),
+                (Some(SEVERITY_ERROR), Some(SCHEMA_VALIDATION_FAILED)),
+                "case {case:?}: expected a schema-validation ERROR, got {diagnostic:?}"
+            );
+            diagnostic["location"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
 
 /// One ERROR diagnostic as the wire reports it.
 fn error_at(code: &str, location: &str, message: &str) -> Value {
@@ -302,7 +355,7 @@ async fn a_retrier_and_a_catcher_are_judged_against_the_fields_they_declare() {
             vec![error_at(
                 SCHEMA_VALIDATION_FAILED,
                 &format!("/States/{STATE}/Retry[0]/ErrorEquals"),
-                "'ErrorEquals' must name at least one error",
+                EMPTY_VALUE,
             )],
         ),
         (
@@ -954,6 +1007,681 @@ async fn an_update_states_the_same_subjects_as_the_validation() {
             (400, "InvalidDefinition", expected_message.as_str()),
             "case {case:?}: expected the update to state {expected_message:?}, got {status} \
              with {updated:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 6: a value the schema requires content in, left empty
+// ---------------------------------------------------------------------------
+
+/// A value the schema requires content in and the definition left EMPTY is one
+/// `SCHEMA_VALIDATION_FAILED` ERROR whose message is the fixed sentence for that
+/// class, with the value it is about named only by `location`.
+///
+/// Rows differ along WHICH value was left empty (an `ErrorEquals`, a `States` map),
+/// which array holds the entry that left it empty, where in that array the entry sits,
+/// and how deeply the machine declaring it is nested — the sentence never moves with
+/// any of them.
+#[tokio::test]
+async fn a_value_left_empty_is_reported_with_the_fixed_sentence_for_that_class() {
+    let emulator = Emulator::new();
+
+    // (case, the definition, the locations the empty-value error is reported at)
+    let rows: Vec<(&str, String, Vec<String>)> = vec![
+        (
+            "a retrier that names no error",
+            machine(json!({
+                "Type": "Task",
+                "Resource": RESOURCE,
+                "Retry": [{ "ErrorEquals": [] }],
+                "Next": "Done",
+            })),
+            vec![format!("/States/{STATE}/Retry[0]/ErrorEquals")],
+        ),
+        (
+            "a catcher that names no error",
+            machine(json!({
+                "Type": "Task",
+                "Resource": RESOURCE,
+                "Catch": [{ "ErrorEquals": [], "Next": "Done" }],
+                "Next": "Done",
+            })),
+            vec![format!("/States/{STATE}/Catch[0]/ErrorEquals")],
+        ),
+        (
+            "the second retrier of the array",
+            machine(json!({
+                "Type": "Task",
+                "Resource": RESOURCE,
+                "Retry": [
+                    { "ErrorEquals": ["States.Timeout"] },
+                    { "ErrorEquals": [] },
+                ],
+                "Next": "Done",
+            })),
+            vec![format!("/States/{STATE}/Retry[1]/ErrorEquals")],
+        ),
+        (
+            "every retrier of the array",
+            machine(json!({
+                "Type": "Task",
+                "Resource": RESOURCE,
+                "Retry": [{ "ErrorEquals": [] }, { "ErrorEquals": [] }],
+                "Next": "Done",
+            })),
+            vec![
+                format!("/States/{STATE}/Retry[0]/ErrorEquals"),
+                format!("/States/{STATE}/Retry[1]/ErrorEquals"),
+            ],
+        ),
+        (
+            "a retrier of a state the Map state's own machine declares",
+            machine(json!({
+                "Type": "Map",
+                "ItemProcessor": {
+                    "StartAt": "P",
+                    "States": {
+                        "P": {
+                            "Type": "Task",
+                            "Resource": RESOURCE,
+                            "Retry": [{ "ErrorEquals": [] }],
+                            "End": true,
+                        },
+                    },
+                },
+                "Next": "Done",
+            })),
+            vec![format!(
+                "/States/{STATE}/ItemProcessor/States/P/Retry[0]/ErrorEquals"
+            )],
+        ),
+        (
+            "a States map declaring no state",
+            json!({ "StartAt": STATE, "States": {} }).to_string(),
+            vec!["/States".to_string()],
+        ),
+        (
+            "the States map of the machine a Map state runs",
+            machine(json!({
+                "Type": "Map",
+                "ItemProcessor": { "StartAt": "P", "States": {} },
+                "Next": "Done",
+            })),
+            vec![format!("/States/{STATE}/ItemProcessor/States")],
+        ),
+        (
+            "an ErrorEquals that names an error, which is not empty at all",
+            machine(json!({
+                "Type": "Task",
+                "Resource": RESOURCE,
+                "Retry": [{ "ErrorEquals": ["States.ALL"] }],
+                "Next": "Done",
+            })),
+            vec![],
+        ),
+    ];
+
+    for (case, definition, expected) in rows {
+        let body = validate(
+            &emulator,
+            case,
+            &json!({ "definition": &definition, "severity": SEVERITY_WARNING }),
+        )
+        .await;
+        let reported = located(&body, case, EMPTY_VALUE);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {EMPTY_VALUE:?} at {expected:?}, got {reported:?} in \
+             {body:?}"
+        );
+        if expected.is_empty() {
+            continue;
+        }
+        assert_eq!(
+            result_of(&body),
+            VALIDATION_RESULT_FAIL,
+            "case {case:?}: an empty value fails the definition, got {body:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 7: the bound the language documents for a retrier's own figure
+// ---------------------------------------------------------------------------
+
+/// A retrier's `BackoffRate` below the smallest value the language documents for it is
+/// one `SCHEMA_VALIDATION_FAILED` ERROR located at that figure, which is what makes
+/// `result` FAIL and what a create refuses the same definition for; a rate at or above
+/// that bound is reported nowhere.
+///
+/// Rows differ along the VALUE the definition writes — the bound itself, the bound in
+/// its integer form, the documented default, one above it, one just below it, zero, a
+/// negative rate, and a value that is no figure at all — and along which retrier of the
+/// array carries it.
+#[tokio::test]
+async fn a_retriers_backoff_rate_is_held_to_the_minimum_the_language_documents() {
+    let emulator = Emulator::new();
+
+    // (case, the Retry array, the locations the bound is reported at, whether the rate
+    // is a FIGURE this bound judges at all — a value of another type is a schema defect
+    // of a kind this rule says nothing about, so what a create does with it belongs to
+    // that rule and is not asserted here)
+    let rows: Vec<(&str, Value, Vec<String>, bool)> = vec![
+        (
+            "the bound itself",
+            json!([{ "ErrorEquals": ["States.ALL"], "BackoffRate": 1.0 }]),
+            vec![],
+            true,
+        ),
+        (
+            "the bound written as a whole number",
+            json!([{ "ErrorEquals": ["States.ALL"], "BackoffRate": 1 }]),
+            vec![],
+            true,
+        ),
+        (
+            "the default the language documents",
+            json!([{ "ErrorEquals": ["States.ALL"], "BackoffRate": 2.0 }]),
+            vec![],
+            true,
+        ),
+        (
+            "a rate well above the bound",
+            json!([{ "ErrorEquals": ["States.ALL"], "BackoffRate": 10.5 }]),
+            vec![],
+            true,
+        ),
+        (
+            "a rate just below the bound",
+            json!([{ "ErrorEquals": ["States.ALL"], "BackoffRate": 0.9 }]),
+            vec![format!("/States/{STATE}/Retry[0]/BackoffRate")],
+            true,
+        ),
+        (
+            "a rate of zero",
+            json!([{ "ErrorEquals": ["States.ALL"], "BackoffRate": 0 }]),
+            vec![format!("/States/{STATE}/Retry[0]/BackoffRate")],
+            true,
+        ),
+        (
+            "a negative rate",
+            json!([{ "ErrorEquals": ["States.ALL"], "BackoffRate": -2.5 }]),
+            vec![format!("/States/{STATE}/Retry[0]/BackoffRate")],
+            true,
+        ),
+        (
+            "the second retrier of the array",
+            json!([
+                { "ErrorEquals": ["States.Timeout"], "BackoffRate": 2.0 },
+                { "ErrorEquals": ["States.ALL"], "BackoffRate": 0.5 },
+            ]),
+            vec![format!("/States/{STATE}/Retry[1]/BackoffRate")],
+            true,
+        ),
+        (
+            "both retriers of the array",
+            json!([
+                { "ErrorEquals": ["States.Timeout"], "BackoffRate": 0.25 },
+                { "ErrorEquals": ["States.ALL"], "BackoffRate": 0.5 },
+            ]),
+            vec![
+                format!("/States/{STATE}/Retry[0]/BackoffRate"),
+                format!("/States/{STATE}/Retry[1]/BackoffRate"),
+            ],
+            true,
+        ),
+        (
+            "a rate that is no figure at all, which this bound says nothing about",
+            json!([{ "ErrorEquals": ["States.ALL"], "BackoffRate": "0.5" }]),
+            vec![],
+            false,
+        ),
+    ];
+
+    for (index, (case, retry, expected, a_figure)) in rows.into_iter().enumerate() {
+        let definition = machine(json!({
+            "Type": "Task",
+            "Resource": RESOURCE,
+            "Retry": retry,
+            "Next": "Done",
+        }));
+
+        let body = validate(
+            &emulator,
+            case,
+            &json!({ "definition": &definition, "severity": SEVERITY_WARNING }),
+        )
+        .await;
+        let reported = located(&body, case, MINIMUM_BACKOFF_RATE);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {MINIMUM_BACKOFF_RATE:?} at {expected:?}, got {reported:?} \
+             in {body:?}"
+        );
+
+        if !a_figure {
+            continue;
+        }
+        // What a create does with the same definition follows from the same walk: a
+        // rate the validation reports is a rate `CreateStateMachine` refuses.
+        let (status, code, message) =
+            created(&emulator, &format!("backoff-{index}"), &definition).await;
+        if expected.is_empty() {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a definition the validation passes is created, got {status} \
+                 {code} {message:?}"
+            );
+            continue;
+        }
+        assert_eq!(
+            result_of(&body),
+            VALIDATION_RESULT_FAIL,
+            "case {case:?}: a rate below the bound fails the definition, got {body:?}"
+        );
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "InvalidDefinition"),
+            "case {case:?}: expected the create to refuse the definition, got {status} {code} \
+             {message:?}"
+        );
+        for location in &expected {
+            let subject = format!(
+                "{SCHEMA_VALIDATION_FAILED}: {MINIMUM_BACKOFF_RATE} at {location}"
+            );
+            assert!(
+                message.contains(&subject),
+                "case {case:?}: expected the refusal to state {subject:?}, got {message:?}"
+            );
+        }
+    }
+}
+
+/// The same bound wherever a `Retry` is declared: on each state type that declares one
+/// and in each machine a state nests, located at the retrier that carries it. A
+/// `BackoffRate` written on a CATCHER is not a retrier's figure at all, so it is
+/// reported as the unsupported field it is and not against this bound.
+///
+/// Rows differ along which state type declares the `Retry`, and along how deeply the
+/// machine declaring it is nested.
+#[tokio::test]
+async fn the_backoff_rate_bound_holds_for_every_retry_a_definition_declares() {
+    let emulator = Emulator::new();
+
+    /// A retrier naming the catch-all with a rate below the bound.
+    fn under() -> Value {
+        json!([{ "ErrorEquals": ["States.ALL"], "BackoffRate": 0.5 }])
+    }
+
+    // (case, the definition, the locations the bound is reported at)
+    let rows: Vec<(&str, String, Vec<String>)> = vec![
+        (
+            "a Task state's own Retry",
+            machine(json!({
+                "Type": "Task",
+                "Resource": RESOURCE,
+                "Retry": under(),
+                "Next": "Done",
+            })),
+            vec![format!("/States/{STATE}/Retry[0]/BackoffRate")],
+        ),
+        (
+            "a Map state's own Retry",
+            machine(json!({
+                "Type": "Map",
+                "ItemProcessor": {
+                    "StartAt": "P",
+                    "States": { "P": { "Type": "Pass", "End": true } },
+                },
+                "Retry": under(),
+                "Next": "Done",
+            })),
+            vec![format!("/States/{STATE}/Retry[0]/BackoffRate")],
+        ),
+        (
+            "a Parallel state's own Retry",
+            machine(json!({
+                "Type": "Parallel",
+                "Branches": [{
+                    "StartAt": "B",
+                    "States": { "B": { "Type": "Pass", "End": true } },
+                }],
+                "Retry": under(),
+                "Next": "Done",
+            })),
+            vec![format!("/States/{STATE}/Retry[0]/BackoffRate")],
+        ),
+        (
+            "the Retry of a state the Map state's own machine declares",
+            machine(json!({
+                "Type": "Map",
+                "ItemProcessor": {
+                    "StartAt": "P",
+                    "States": {
+                        "P": {
+                            "Type": "Task",
+                            "Resource": RESOURCE,
+                            "Retry": under(),
+                            "End": true,
+                        },
+                    },
+                },
+                "Next": "Done",
+            })),
+            vec![format!(
+                "/States/{STATE}/ItemProcessor/States/P/Retry[0]/BackoffRate"
+            )],
+        ),
+        (
+            "the Retry of a state a Parallel branch declares",
+            machine(json!({
+                "Type": "Parallel",
+                "Branches": [{
+                    "StartAt": "B",
+                    "States": {
+                        "B": {
+                            "Type": "Task",
+                            "Resource": RESOURCE,
+                            "Retry": under(),
+                            "End": true,
+                        },
+                    },
+                }],
+                "Next": "Done",
+            })),
+            vec![format!(
+                "/States/{STATE}/Branches[0]/States/B/Retry[0]/BackoffRate"
+            )],
+        ),
+        (
+            "a catcher carrying the figure, which a catcher does not declare",
+            machine(json!({
+                "Type": "Task",
+                "Resource": RESOURCE,
+                "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "Done", "BackoffRate": 0.5 }],
+                "Next": "Done",
+            })),
+            vec![],
+        ),
+    ];
+
+    for (case, definition, expected) in rows {
+        let body = validate(
+            &emulator,
+            case,
+            &json!({ "definition": &definition, "severity": SEVERITY_WARNING }),
+        )
+        .await;
+        let reported = located(&body, case, MINIMUM_BACKOFF_RATE);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {MINIMUM_BACKOFF_RATE:?} at {expected:?}, got {reported:?} \
+             in {body:?}"
+        );
+        assert_eq!(
+            result_of(&body),
+            VALIDATION_RESULT_FAIL,
+            "case {case:?}: the definition carries a schema error either way, got {body:?}"
+        );
+        if !expected.is_empty() {
+            continue;
+        }
+        // The one row whose figure is in no retrier: what it earns is the sentence for
+        // a field the entry does not declare, at the entry.
+        let unsupported = error_at(
+            SCHEMA_VALIDATION_FAILED,
+            &format!("/States/{STATE}/Catch[0]"),
+            "Field 'BackoffRate' is not supported",
+        );
+        let all = diagnostics(&body);
+        assert!(
+            all.contains(&unsupported),
+            "case {case:?}: expected the diagnostic {unsupported:?}, got {all:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 8: the fields the language declares as ALTERNATIVES
+// ---------------------------------------------------------------------------
+
+/// A state carrying more than one field of a group the language declares as
+/// ALTERNATIVES — a value and the `*Path` that reads it, the four ways a `Wait` waits,
+/// the two ways a state continues — is one `SCHEMA_VALIDATION_FAILED` ERROR naming the
+/// whole group, located at the STATE.
+///
+/// Rows differ along WHICH group the state carries twice, which state type declares
+/// that group, which of its fields the row carries, and how deeply the state is
+/// nested; the control rows carry one field of a group, two fields of DIFFERENT groups
+/// (which is what a `Fail` state naming both an error and a cause is), and a group's
+/// fields on a type that declares neither.
+#[tokio::test]
+async fn a_state_carries_at_most_one_field_of_a_group_of_alternatives() {
+    let emulator = Emulator::new();
+
+    /// The minimal state of `state_type` with `extra` merged into it, as the rows that
+    /// add a second field of a group start from.
+    fn with(state_type: &str, extra: Value) -> Value {
+        let mut state = minimal(state_type);
+        let members = state.as_object_mut().expect("a state is an object");
+        for (member, value) in extra.as_object().expect("the members are an object") {
+            members.insert(member.clone(), value.clone());
+        }
+        state
+    }
+
+    // (case, the definition, the diagnostic the group earns)
+    let rows: Vec<(&str, String, Option<Value>)> = vec![
+        (
+            "a Fail state naming its error twice",
+            machine(json!({ "Type": "Fail", "Error": "Boom", "ErrorPath": "$.error" })),
+            Some(error_at(
+                SCHEMA_VALIDATION_FAILED,
+                &format!("/States/{STATE}"),
+                &one_of("Error, ErrorPath"),
+            )),
+        ),
+        (
+            "a Fail state naming its cause twice",
+            machine(json!({ "Type": "Fail", "Cause": "why", "CausePath": "$.cause" })),
+            Some(error_at(
+                SCHEMA_VALIDATION_FAILED,
+                &format!("/States/{STATE}"),
+                &one_of("Cause, CausePath"),
+            )),
+        ),
+        (
+            "a Task state bounding its work twice",
+            machine(with(
+                "Task",
+                json!({ "TimeoutSeconds": 5, "TimeoutSecondsPath": "$.timeout" }),
+            )),
+            Some(error_at(
+                SCHEMA_VALIDATION_FAILED,
+                &format!("/States/{STATE}"),
+                &one_of("TimeoutSeconds, TimeoutSecondsPath"),
+            )),
+        ),
+        (
+            "a Task state bounding its heartbeat twice",
+            machine(with(
+                "Task",
+                json!({ "HeartbeatSeconds": 5, "HeartbeatSecondsPath": "$.beat" }),
+            )),
+            Some(error_at(
+                SCHEMA_VALIDATION_FAILED,
+                &format!("/States/{STATE}"),
+                &one_of("HeartbeatSeconds, HeartbeatSecondsPath"),
+            )),
+        ),
+        (
+            "a Wait state waiting both for a span and until an instant",
+            machine(json!({
+                "Type": "Wait",
+                "Seconds": 1,
+                "Timestamp": "2024-01-01T00:00:00Z",
+                "Next": "Done",
+            })),
+            Some(error_at(
+                SCHEMA_VALIDATION_FAILED,
+                &format!("/States/{STATE}"),
+                &one_of("SecondsPath, Seconds, TimestampPath, Timestamp"),
+            )),
+        ),
+        (
+            "a Wait state waiting for a span and for the path to one",
+            machine(json!({
+                "Type": "Wait",
+                "Seconds": 1,
+                "SecondsPath": "$.seconds",
+                "Next": "Done",
+            })),
+            Some(error_at(
+                SCHEMA_VALIDATION_FAILED,
+                &format!("/States/{STATE}"),
+                &one_of("SecondsPath, Seconds, TimestampPath, Timestamp"),
+            )),
+        ),
+        (
+            "a state both continuing and ending",
+            machine(json!({ "Type": "Pass", "Next": "Done", "End": true })),
+            Some(error_at(
+                SCHEMA_VALIDATION_FAILED,
+                &format!("/States/{STATE}"),
+                &one_of("Next, End"),
+            )),
+        ),
+        (
+            "a Map state naming its items twice",
+            machine(with("Map", json!({ "Items": [1, 2], "ItemsPath": "$.items" }))),
+            Some(error_at(
+                SCHEMA_VALIDATION_FAILED,
+                &format!("/States/{STATE}"),
+                &one_of("Items, ItemsPath"),
+            )),
+        ),
+        (
+            "a Map state bounding its concurrency twice",
+            machine(with(
+                "Map",
+                json!({ "MaxConcurrency": 2, "MaxConcurrencyPath": "$.concurrency" }),
+            )),
+            Some(error_at(
+                SCHEMA_VALIDATION_FAILED,
+                &format!("/States/{STATE}"),
+                &one_of("MaxConcurrency, MaxConcurrencyPath"),
+            )),
+        ),
+        (
+            "a Map state tolerating a count twice",
+            machine(with(
+                "Map",
+                json!({
+                    "ToleratedFailureCount": 1,
+                    "ToleratedFailureCountPath": "$.tolerated",
+                }),
+            )),
+            Some(error_at(
+                SCHEMA_VALIDATION_FAILED,
+                &format!("/States/{STATE}"),
+                &one_of("ToleratedFailureCount, ToleratedFailureCountPath"),
+            )),
+        ),
+        (
+            "a Map state tolerating a percentage twice",
+            machine(with(
+                "Map",
+                json!({
+                    "ToleratedFailurePercentage": 1,
+                    "ToleratedFailurePercentagePath": "$.tolerated",
+                }),
+            )),
+            Some(error_at(
+                SCHEMA_VALIDATION_FAILED,
+                &format!("/States/{STATE}"),
+                &one_of("ToleratedFailurePercentage, ToleratedFailurePercentagePath"),
+            )),
+        ),
+        (
+            "a state of the machine a Map state runs, naming its error twice",
+            machine(json!({
+                "Type": "Map",
+                "ItemProcessor": {
+                    "StartAt": "P",
+                    "States": {
+                        "P": { "Type": "Fail", "Error": "Boom", "ErrorPath": "$.error" },
+                    },
+                },
+                "Next": "Done",
+            })),
+            Some(error_at(
+                SCHEMA_VALIDATION_FAILED,
+                &format!("/States/{STATE}/ItemProcessor/States/P"),
+                &one_of("Error, ErrorPath"),
+            )),
+        ),
+        (
+            "a Fail state naming an error and a cause, which are not alternatives",
+            machine(json!({ "Type": "Fail", "Error": "Boom", "Cause": "on purpose" })),
+            None,
+        ),
+        (
+            "a Fail state naming each of them by its path alone",
+            machine(json!({ "Type": "Fail", "ErrorPath": "$.error", "CausePath": "$.cause" })),
+            None,
+        ),
+        (
+            "a Wait state waiting one way",
+            machine(json!({ "Type": "Wait", "Timestamp": "2024-01-01T00:00:00Z", "Next": "Done" })),
+            None,
+        ),
+        (
+            "a Pass state carrying a group of fields its type declares neither of",
+            machine(json!({
+                "Type": "Pass",
+                "Error": "Boom",
+                "ErrorPath": "$.error",
+                "End": true,
+            })),
+            None,
+        ),
+    ];
+
+    for (case, definition, expected) in rows {
+        let body = validate(
+            &emulator,
+            case,
+            &json!({ "definition": &definition, "severity": SEVERITY_WARNING }),
+        )
+        .await;
+        let all = diagnostics(&body);
+        let grouped: Vec<Value> = all
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with(ONE_OF_FIELDS))
+            })
+            .cloned()
+            .collect();
+        let Some(expected) = expected else {
+            assert!(
+                grouped.is_empty(),
+                "case {case:?}: expected no alternative-field diagnostic, got {grouped:?}"
+            );
+            continue;
+        };
+        assert_eq!(
+            grouped,
+            vec![expected.clone()],
+            "case {case:?}: expected exactly the diagnostic {expected:?}, got {grouped:?} in \
+             {all:?}"
+        );
+        assert_eq!(
+            result_of(&body),
+            VALIDATION_RESULT_FAIL,
+            "case {case:?}: a state carrying two of a group fails the definition, got {body:?}"
         );
     }
 }

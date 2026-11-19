@@ -602,10 +602,85 @@ pub fn entry_object_message(member: &str) -> String {
     format!("every entry of '{}' must be a JSON object", echoed(member))
 }
 
-/// What a schema diagnostic says about an `ErrorEquals` that names nothing: the list
-/// decides which errors the entry takes over, so an empty one takes over none and the
-/// entry can never do anything.
-pub const EMPTY_ERROR_EQUALS_MESSAGE: &str = "'ErrorEquals' must name at least one error";
+/// What a schema diagnostic says about a value the language requires to carry
+/// something and the definition left EMPTY — an `ErrorEquals` that names no error, a
+/// `States` map that declares no state.
+///
+/// RECORDED text, and it has no variable part: WHICH value was left empty is what the
+/// diagnostic's `location` carries ("For errors specific to a field, the location
+/// could be in the format: `/States/<StateName>/<FieldName>`"), so one sentence serves
+/// every field of the schema that may not be empty.
+pub const EMPTY_VALUE_MESSAGE: &str = "Value cannot be empty";
+
+/// What a schema diagnostic says about a figure the definition wrote BELOW the
+/// smallest value the language documents for it: that smallest value, as the language
+/// writes it.
+///
+/// RECORDED text. The sentence names the bound and nothing else — which figure broke
+/// it is what `location` carries, exactly as [`EMPTY_VALUE_MESSAGE`]'s does.
+pub fn minimum_value_message(minimum: &str) -> String {
+    format!("Minimum value is {minimum}")
+}
+
+/// The member a retrier grows its interval by on each attempt.
+const BACKOFF_RATE_MEMBER: &str = "BackoffRate";
+
+/// The smallest `BackoffRate` the Amazon States Language admits: "BackoffRate
+/// (Optional) … The value must be greater than or equal to 1.0", a rate below which
+/// would SHRINK the interval it is documented to grow.
+const MIN_BACKOFF_RATE: f64 = 1.0;
+
+/// That bound as the language writes it, which is what the diagnostic about it states
+/// ([`minimum_value_message`]): the member carries a rate rather than a count, so its
+/// bound is stated as the decimal it is.
+const MIN_BACKOFF_RATE_STATED: &str = "1.0";
+
+/// What a schema diagnostic says about a state carrying more than one field of a group
+/// the language declares as ALTERNATIVES: the whole group, in brackets, as a list.
+///
+/// RECORDED text. The group is named in full however many of its fields the state
+/// carried, because what the caller has to do is keep ONE of them; WHICH state carries
+/// them is what `location` says.
+pub fn one_of_fields_message(fields: &[&str]) -> String {
+    format!(
+        "There should only be one of the following fields: [{}]",
+        fields.join(", ")
+    )
+}
+
+/// The groups of state fields the Amazon States Language declares as ALTERNATIVES, in
+/// the order the diagnostic about each group lists them.
+///
+/// Three kinds of alternative, which are one rule: a value and the `*Path` that READS
+/// that value from the state's input ("Error and Cause […] can also be specified using
+/// ErrorPath and CausePath", and the same pairing for a `Task`'s two bounds and a
+/// `Map`'s items and tolerances); the four ways a `Wait` state declares how long it
+/// waits; and the two ways any state declares where the execution goes after it
+/// (`Next`, or `"End": true`). A state carrying two fields of one group has declared
+/// the same thing twice and the language says which of the two it meant in neither.
+///
+/// Each group is judged only for a state whose TYPE declares its fields
+/// ([`state_fields`]), so a field a type does not declare at all is reported as the
+/// unsupported field it is and not as an alternative to something.
+///
+/// The ORDER inside a group is part of the sentence, and it is the service's own for
+/// that group rather than one rule across groups: RECORDED, a `Fail` state's error pair
+/// is stated value-first (`[Error, ErrorPath]`) and a `Wait` state's four ways are
+/// stated path-first, pair by pair (`[SecondsPath, Seconds, TimestampPath,
+/// Timestamp]`). So each group is written here exactly as the diagnostic about THAT
+/// group states it, and a group added later takes its own order from the same place.
+const EXCLUSIVE_FIELD_GROUPS: &[&[&str]] = &[
+    &["Next", "End"],
+    &["SecondsPath", "Seconds", "TimestampPath", "Timestamp"],
+    &["Error", "ErrorPath"],
+    &["Cause", "CausePath"],
+    &["TimeoutSeconds", "TimeoutSecondsPath"],
+    &["HeartbeatSeconds", "HeartbeatSecondsPath"],
+    &["Items", "ItemsPath"],
+    &["MaxConcurrency", "MaxConcurrencyPath"],
+    &["ToleratedFailureCount", "ToleratedFailureCountPath"],
+    &["ToleratedFailurePercentage", "ToleratedFailurePercentagePath"],
+];
 
 /// What a schema diagnostic says about an entry of an `ErrorEquals` that is not an
 /// error NAME.
@@ -1001,7 +1076,7 @@ pub(super) fn diagnose_machine(
         into.push(error(
             SCHEMA_VALIDATION_FAILED,
             at(prefix, "/States"),
-            "'States' must declare at least one state",
+            EMPTY_VALUE_MESSAGE,
         ));
         return;
     }
@@ -1242,6 +1317,9 @@ fn diagnose_state<'a>(
     // What the state does with a failure of its own work, for a type that declares
     // it.
     diagnose_error_handlers(state, state_type, &here, into);
+    // The fields the language declares as ALTERNATIVES, of which a state may carry
+    // one.
+    diagnose_exclusive_fields(state, state_type, &here, into);
     // A `Fail` state's `Error` and `Cause` are reported verbatim by
     // `DescribeExecution`, through shapes with their own maxima, so a
     // definition carrying a longer one could never be reported.
@@ -1411,8 +1489,47 @@ fn diagnose_state<'a>(
     }
 }
 
+/// The ALTERNATIVE-field rule of one state: of a group of fields the language declares
+/// as alternatives ([`EXCLUSIVE_FIELD_GROUPS`]), a state carries at most one.
+///
+/// The diagnostic is located at the STATE rather than at either field: the state is
+/// what carries one field too many, and neither of the two is the one to remove.
+///
+/// A field is counted as DECLARED where the state writes the member at all, whatever
+/// it wrote in it: the language gives each of these fields one admitted form — `"End"`
+/// is only ever `true` — so a state that writes the member has declared the thing the
+/// group is about there.
+fn diagnose_exclusive_fields(
+    state: &Map<String, Value>,
+    state_type: &str,
+    here: &str,
+    into: &mut Diagnosis,
+) {
+    let declared = state_fields(state_type);
+    for group in EXCLUSIVE_FIELD_GROUPS {
+        // A group whose fields the type does not declare says nothing about a state of
+        // that type: such a field earns the unsupported-field diagnostic instead.
+        if !group.iter().all(|field| declared.contains(field)) {
+            continue;
+        }
+        let carried = group
+            .iter()
+            .filter(|field| state.contains_key(**field))
+            .count();
+        if carried > 1 {
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(here, ""),
+                one_of_fields_message(group),
+            ));
+        }
+    }
+}
+
 /// The `Retry` and `Catch` rules of one state: what the language requires of the
-/// retriers and catchers a state of this type declares.
+/// retriers and catchers a state of this type declares — the fields each entry owes
+/// and may carry, the errors it takes over, and the bounds the language documents for
+/// a retrier's own figures.
 ///
 /// A member the type does not declare at all is not judged here: that it is there is
 /// already reported ([`state_fields`]), and what it holds says nothing more about a
@@ -1483,52 +1600,77 @@ fn diagnose_error_handlers(
             // `ErrorEquals` names the errors the entry takes over, so what it holds is
             // a non-empty list of error NAMES: a list that is neither is reported at
             // the member, and one name that is not a string at that name's own
-            // position.
-            let Some(declared) = entry.get(ERROR_EQUALS_MEMBER) else {
-                continue;
-            };
-            let array = nested_at(&at_entry, format_args!("/{ERROR_EQUALS_MEMBER}"));
-            let Some(names) = declared.as_array() else {
-                into.push(error(
-                    SCHEMA_VALIDATION_FAILED,
-                    at(&array, ""),
-                    array_member_message(ERROR_EQUALS_MEMBER),
-                ));
-                continue;
-            };
-            if names.is_empty() {
-                into.push(error(
-                    SCHEMA_VALIDATION_FAILED,
-                    at(&array, ""),
-                    EMPTY_ERROR_EQUALS_MESSAGE,
-                ));
-            }
-            for (position, name) in names.iter().enumerate() {
-                if !name.is_string() {
+            // position. The checks below it are about OTHER members of the same entry,
+            // so what this one has nothing left to say about leaves the block rather
+            // than the entry.
+            'error_equals: {
+                let Some(declared) = entry.get(ERROR_EQUALS_MEMBER) else {
+                    break 'error_equals;
+                };
+                let array = nested_at(&at_entry, format_args!("/{ERROR_EQUALS_MEMBER}"));
+                let Some(names) = declared.as_array() else {
                     into.push(error(
                         SCHEMA_VALIDATION_FAILED,
-                        at(&indexed_at(&array, position), ""),
-                        ERROR_NAME_MESSAGE,
+                        at(&array, ""),
+                        array_member_message(ERROR_EQUALS_MEMBER),
                     ));
-                }
-            }
-            // `States.ALL` matches every error there is, so the language admits it
-            // only as the ONE entry of the list it is named in, and only in the LAST
-            // entry of the array that holds that list: a name beside it, and an entry
-            // after it, can never decide anything. Each entry that names it outside
-            // those two positions is reported at the name itself, which is what the
-            // caller has to move.
-            if names.len() < 2 && index + 1 == entries.len() {
-                continue;
-            }
-            for (position, name) in names.iter().enumerate() {
-                if name.as_str() == Some(ALL_ERRORS) {
+                    break 'error_equals;
+                };
+                if names.is_empty() {
                     into.push(error(
                         SCHEMA_VALIDATION_FAILED,
-                        at(&indexed_at(&array, position), ""),
-                        ALL_ERRORS_ALONE_MESSAGE,
+                        at(&array, ""),
+                        EMPTY_VALUE_MESSAGE,
                     ));
                 }
+                for (position, name) in names.iter().enumerate() {
+                    if !name.is_string() {
+                        into.push(error(
+                            SCHEMA_VALIDATION_FAILED,
+                            at(&indexed_at(&array, position), ""),
+                            ERROR_NAME_MESSAGE,
+                        ));
+                    }
+                }
+                // `States.ALL` matches every error there is, so the language admits it
+                // only as the ONE entry of the list it is named in, and only in the LAST
+                // entry of the array that holds that list: a name beside it, and an entry
+                // after it, can never decide anything. Each entry that names it outside
+                // those two positions is reported at the name itself, which is what the
+                // caller has to move.
+                if names.len() < 2 && index + 1 == entries.len() {
+                    break 'error_equals;
+                }
+                for (position, name) in names.iter().enumerate() {
+                    if name.as_str() == Some(ALL_ERRORS) {
+                        into.push(error(
+                            SCHEMA_VALIDATION_FAILED,
+                            at(&indexed_at(&array, position), ""),
+                            ALL_ERRORS_ALONE_MESSAGE,
+                        ));
+                    }
+                }
+            }
+            // A retrier's own figures carry NUMBERS the language bounds, so one the
+            // definition wrote outside its bound is a schema error of this entry,
+            // reported at the figure itself: the rate the interval grows by is bounded
+            // below, since a rate under it would shrink the interval it grows. The
+            // figure is judged only where the entry DECLARES it — a catcher carries no
+            // such member, and one written there is reported as the unsupported field
+            // it is above rather than twice.
+            let backoff_rate = entry
+                .get(BACKOFF_RATE_MEMBER)
+                .filter(|_| fields.contains(&BACKOFF_RATE_MEMBER))
+                .and_then(Value::as_f64);
+            if backoff_rate.is_some_and(|rate| rate < MIN_BACKOFF_RATE) {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(
+                        &nested_at(&at_entry, format_args!("/{BACKOFF_RATE_MEMBER}")),
+                        "",
+                    ),
+                    minimum_value_message(MIN_BACKOFF_RATE_STATED),
+                ));
             }
         }
     }
