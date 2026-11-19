@@ -3,21 +3,23 @@
 //! `GetCompatibleElasticsearchVersions`, driven as real restJson1 requests
 //! through the router.
 //!
-//! The rule under test: the operation reports the upgrade paths out of the
-//! service's supported engine versions — a request naming a domain is answered
-//! with ONE entry whose `SourceVersion` is the version that domain stores, and
-//! a request naming none with every supported source version. From a version a
-//! domain reaches every later supported version of its own major, crosses a
-//! major boundary only from the last supported version of a major, into the
-//! versions of the major that follows it, and from ANY Elasticsearch version
-//! reaches the first OpenSearch major the service offers.
+//! The rule under test: the operation reports the upgrade paths out of every
+//! engine release the service answers for — a request naming a domain is
+//! answered with ONE entry whose `SourceVersion` is the version that domain
+//! stores, and a request naming none with every release an upgrade can start
+//! from, the legacy Elasticsearch lines a long-lived domain may still be
+//! running included. A target is always a release the service still offers as a
+//! destination: from a version a domain reaches every later OFFERED release of
+//! its own major, crosses a major boundary only from the last release of a
+//! major, into the releases of the major that follows it, and from
+//! Elasticsearch 6.8 onwards also reaches the first OpenSearch major.
 //!
-//! The rows below span that class: the first and last supported version, a
-//! version in the middle of a major, the last version of an Elasticsearch and
-//! of an OpenSearch major, a version the service no longer offers, an
-//! OpenSearch version, and the model's abbreviated `OS_X.Y` spelling. The
-//! modelled FORM of a version string, and so which spellings a row may use, is
-//! this service's own model:
+//! The rows below span that class: an early minor of each legacy line, the last
+//! release of an Elasticsearch and of an OpenSearch major, a release in the
+//! middle of a major, the newest release of all, releases the inventory does not
+//! carry (older than every line, and inside a line it does carry), and the
+//! model's abbreviated `OS_X.Y` spelling. The modelled FORM of a version string,
+//! and so which spellings a row may use, is this service's own model:
 //!
 //! ```text
 //! smithy_query(query="shape",shape="ElasticsearchVersionString",model_path="services/service-com-amazonaws-elasticsearchservice-amazonelasticsearchservice2015/smithy-model/com-amazonaws-elasticsearchservice-amazonelasticsearchservice2015.json")
@@ -128,37 +130,73 @@ fn order(version: &str) -> (u8, u32, u32) {
     )
 }
 
-/// One row per way a source version can sit in the supported set: the version,
-/// whether the service still OFFERS it (and so lists it as a source of the
+/// The OpenSearch 1.x line, which every Elasticsearch release the migration is
+/// open from reaches whole.
+const OPENSEARCH_1_LINE: [&str; 4] = [
+    "OpenSearch_1.0",
+    "OpenSearch_1.1",
+    "OpenSearch_1.2",
+    "OpenSearch_1.3",
+];
+
+/// The 6.x releases the service still offers as a destination — the 6.x line is
+/// entered at 6.3, so its own early minors are not among them.
+const OFFERED_6_LINE: [&str; 5] = ["6.3", "6.4", "6.5", "6.7", "6.8"];
+
+/// One row per way a source version can sit in the inventory: the version,
+/// whether the inventory CARRIES it (and so lists it as a source of the
 /// account-wide matrix), and the versions the upgrade-path rule reaches from it.
-/// The supported set these are drawn from is the service's own published list of
-/// engine versions, named once in `state::SUPPORTED_ENGINE_VERSIONS`; `7.10` is
-/// one row of the set, not the rule.
+/// The inventory these are drawn from is the service's own list of engine
+/// releases, named once in `state::ENGINE_RELEASES`; `7.10` is one row of it,
+/// not the rule.
 struct UpgradePath {
     version: &'static str,
-    offered: bool,
+    in_inventory: bool,
     targets: &'static [&'static str],
 }
 
-const UPGRADE_PATHS: [UpgradePath; 10] = [
-    // A version the service no longer offers, which an old domain can still be
-    // running: the boundary to cross is into the first major offered after it,
-    // and the Elasticsearch-to-OpenSearch migration is open from it too.
+const UPGRADE_PATHS: [UpgradePath; 15] = [
+    // Older than every line the inventory carries, which a domain created in
+    // the service's first years can still be running: the boundary to cross is
+    // into the first line offered after it, whose only destination is its last
+    // minor.
+    UpgradePath {
+        version: "1.5",
+        in_inventory: false,
+        targets: &["5.6"],
+    },
+    // An early minor of the oldest line the inventory carries: a source of an
+    // upgrade, and inside its own line only its last minor is a destination.
+    UpgradePath {
+        version: "5.1",
+        in_inventory: true,
+        targets: &["5.6"],
+    },
+    // The last release of that line, so it crosses into the next one — but not
+    // onto OpenSearch, which the migration does not reach back this far.
     UpgradePath {
         version: "5.6",
-        offered: false,
-        targets: &[
-            "6.8",
-            "OpenSearch_1.0",
-            "OpenSearch_1.1",
-            "OpenSearch_1.2",
-            "OpenSearch_1.3",
-        ],
+        in_inventory: true,
+        targets: &OFFERED_6_LINE,
     },
-    // The last supported version of its major, so it crosses into the next one.
+    // An early minor of the next line, which is entered at 6.3: it reaches the
+    // destinations of its own line and nothing beyond it.
+    UpgradePath {
+        version: "6.0",
+        in_inventory: true,
+        targets: &OFFERED_6_LINE,
+    },
+    // Late in that line but not its last release: only what follows it there.
+    UpgradePath {
+        version: "6.7",
+        in_inventory: true,
+        targets: &["6.8"],
+    },
+    // The last release of its major, so it crosses into the next one, and the
+    // oldest release the migration onto OpenSearch is open from.
     UpgradePath {
         version: "6.8",
-        offered: true,
+        in_inventory: true,
         targets: &[
             "7.1",
             "7.4",
@@ -173,10 +211,10 @@ const UPGRADE_PATHS: [UpgradePath; 10] = [
         ],
     },
     // Mid-major: the later minors of its own major, plus the OpenSearch line
-    // every Elasticsearch version can migrate onto.
+    // the migration is open onto.
     UpgradePath {
         version: "7.7",
-        offered: true,
+        in_inventory: true,
         targets: &[
             "7.8",
             "7.9",
@@ -191,24 +229,19 @@ const UPGRADE_PATHS: [UpgradePath; 10] = [
     // one.
     UpgradePath {
         version: "7.10",
-        offered: true,
-        targets: &[
-            "OpenSearch_1.0",
-            "OpenSearch_1.1",
-            "OpenSearch_1.2",
-            "OpenSearch_1.3",
-        ],
+        in_inventory: true,
+        targets: &OPENSEARCH_1_LINE,
     },
     // Mid-major inside the OpenSearch line: no boundary crossing, and no
     // Elasticsearch-to-OpenSearch migration to make.
     UpgradePath {
         version: "OpenSearch_1.2",
-        offered: true,
+        in_inventory: true,
         targets: &["OpenSearch_1.3"],
     },
     UpgradePath {
         version: "OpenSearch_1.3",
-        offered: true,
+        in_inventory: true,
         targets: &[
             "OpenSearch_2.3",
             "OpenSearch_2.5",
@@ -224,7 +257,7 @@ const UPGRADE_PATHS: [UpgradePath; 10] = [
     // The abbreviated spelling the model's pattern also admits, mid-major.
     UpgradePath {
         version: "OS_2.3",
-        offered: true,
+        in_inventory: true,
         targets: &[
             "OpenSearch_2.5",
             "OpenSearch_2.7",
@@ -238,18 +271,35 @@ const UPGRADE_PATHS: [UpgradePath; 10] = [
     },
     UpgradePath {
         version: "OpenSearch_2.19",
-        offered: true,
-        targets: &["OpenSearch_3.0", "OpenSearch_3.1"],
+        in_inventory: true,
+        targets: &[
+            "OpenSearch_3.1",
+            "OpenSearch_3.3",
+            "OpenSearch_3.5",
+            "OpenSearch_3.7",
+        ],
     },
+    // A release the inventory does not carry, inside a line it does: placed in
+    // the same order and answered by the same rule.
     UpgradePath {
         version: "OpenSearch_3.0",
-        offered: true,
-        targets: &["OpenSearch_3.1"],
+        in_inventory: false,
+        targets: &[
+            "OpenSearch_3.1",
+            "OpenSearch_3.3",
+            "OpenSearch_3.5",
+            "OpenSearch_3.7",
+        ],
     },
-    // The newest supported version: nothing to upgrade to.
     UpgradePath {
-        version: "OpenSearch_3.1",
-        offered: true,
+        version: "OpenSearch_3.5",
+        in_inventory: true,
+        targets: &["OpenSearch_3.7"],
+    },
+    // The newest release of all: nothing to upgrade to.
+    UpgradePath {
+        version: "OpenSearch_3.7",
+        in_inventory: true,
         targets: &[],
     },
 ];
@@ -330,10 +380,10 @@ async fn a_domains_answer_reports_its_stored_version_and_its_upgrade_targets() {
     }
 }
 
-/// With no domain named, every supported version an upgrade can start from gets
-/// an entry, in upgrade order, and each entry reaches at least one version.
+/// With no domain named, every release an upgrade can start from gets an entry,
+/// in upgrade order, and each entry reaches at least one version.
 #[tokio::test]
-async fn the_catalog_covers_every_supported_source_version() {
+async fn the_catalog_covers_every_source_release() {
     let case = "no domain named";
     let router = router();
     let answer = compatible(&router, None).await;
@@ -366,11 +416,11 @@ async fn the_catalog_covers_every_supported_source_version() {
         );
     }
 
-    // Each row the service still offers is a source the catalog carries, with
-    // the same targets the per-domain answer gives — except the newest version,
-    // which is the source of no upgrade, and a version the service no longer
-    // offers, which is the source of an upgrade but not an engine to start a
-    // domain on. A row written in the abbreviated `OS_X.Y` spelling is the same
+    // Each release the inventory carries is a source the catalog carries, with
+    // the same targets the per-domain answer gives — except the newest release,
+    // which is the source of no upgrade, and a release the inventory does not
+    // carry, which a domain can still be running but which the service does not
+    // publish. A row written in the abbreviated `OS_X.Y` spelling is the same
     // version as its `OpenSearch_X.Y` catalog entry.
     for path in UPGRADE_PATHS {
         let version = path.version;
@@ -380,7 +430,7 @@ async fn the_catalog_covers_every_supported_source_version() {
             None => version.to_string(),
         };
         let entry = found.iter().find(|(source, _)| *source == canonical);
-        let listed = path.offered && !expected_targets.is_empty();
+        let listed = path.in_inventory && !expected_targets.is_empty();
         match (entry, listed) {
             (Some((_, targets)), true) => assert_eq!(
                 *targets,
@@ -399,36 +449,91 @@ async fn the_catalog_covers_every_supported_source_version() {
     }
 }
 
-/// Every Elasticsearch source the matrix carries reports its OpenSearch upgrade
-/// targets, and the matrix carries the OpenSearch line as a source too: this is
-/// what an upgrade planner reads to decide a current domain can be moved onto
-/// OpenSearch at all.
+/// The migration onto the OpenSearch line is open from Elasticsearch 6.8
+/// onwards and from nothing older: this is what an upgrade planner reads to
+/// decide whether a domain can be moved onto OpenSearch at all, and whether it
+/// must step up its own line first.
 #[tokio::test]
-async fn every_elasticsearch_source_reaches_the_opensearch_line() {
+async fn the_opensearch_migration_is_open_from_the_last_6_x_release_onwards() {
     let case = "the account-wide matrix";
     let router = router();
     let found = entries(case, &compatible(&router, None).await);
 
-    let mut elasticsearch_sources = 0;
+    // The release the migration is open from, as the handler's own rule names
+    // it; a source older than this one reaches only the Elasticsearch line.
+    let migration_from = order("6.8");
+
+    let mut migrating = 0;
+    let mut stepping = 0;
     let mut opensearch_sources = 0;
     for (source, targets) in &found {
-        if order(source).0 == 0 {
-            elasticsearch_sources += 1;
+        let source_order = order(source);
+        if source_order.0 == 1 {
+            opensearch_sources += 1;
+            continue;
+        }
+        let reaches_opensearch = targets.iter().any(|target| order(target).0 == 1);
+        if source_order >= migration_from {
+            migrating += 1;
             assert!(
-                targets.iter().any(|target| order(target).0 == 1),
+                reaches_opensearch,
                 "case {case:?}: Elasticsearch source {source:?} must reach the OpenSearch \
                  line, got {targets:?}"
             );
         } else {
-            opensearch_sources += 1;
+            stepping += 1;
+            assert!(
+                !reaches_opensearch,
+                "case {case:?}: Elasticsearch source {source:?} is older than the \
+                 migration's own floor and must reach only the Elasticsearch line, got \
+                 {targets:?}"
+            );
         }
     }
     assert!(
-        elasticsearch_sources > 0 && opensearch_sources > 0,
-        "case {case:?}: the matrix must cover both engine lines, got \
-         {elasticsearch_sources} Elasticsearch and {opensearch_sources} OpenSearch sources \
-         in {found:?}"
+        migrating > 0 && stepping > 0 && opensearch_sources > 0,
+        "case {case:?}: the matrix must cover both engine lines on both sides of the \
+         migration's floor, got {migrating} migrating and {stepping} stepping \
+         Elasticsearch sources and {opensearch_sources} OpenSearch sources in {found:?}"
     );
+}
+
+/// The matrix spans the legacy lines a long-lived domain may still be running,
+/// and an early minor of a line is a SOURCE of an upgrade without being a
+/// destination of one: the service no longer moves a domain onto it.
+#[tokio::test]
+async fn a_retired_minor_is_a_source_but_never_a_target() {
+    let case = "the account-wide matrix";
+    let router = router();
+    let found = entries(case, &compatible(&router, None).await);
+
+    // Rows: one early minor from each legacy line, plus the last minor of the
+    // older line and the release the newer line is entered at, which ARE
+    // destinations. The two sets are the service's own
+    // (`state::ENGINE_RELEASES`), not this operation's input.
+    for (version, is_target) in [
+        ("5.1", false),
+        ("5.3", false),
+        ("5.5", false),
+        ("5.6", true),
+        ("6.0", false),
+        ("6.2", false),
+        ("6.3", true),
+    ] {
+        assert!(
+            found.iter().any(|(source, _)| source == version),
+            "case {version:?}: the matrix must carry a legacy release as a source, got \
+             {found:?}"
+        );
+        let offered_as_target = found
+            .iter()
+            .any(|(_, targets)| targets.iter().any(|target| target == version));
+        assert_eq!(
+            offered_as_target, is_target,
+            "case {version:?}: expected offered as an upgrade target={is_target}, got \
+             {offered_as_target} in {found:?}"
+        );
+    }
 }
 
 /// A domain created without a version has no source version stored to narrow

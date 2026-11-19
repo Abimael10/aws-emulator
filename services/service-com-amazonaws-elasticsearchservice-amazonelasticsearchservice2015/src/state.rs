@@ -304,44 +304,85 @@ pub fn engine_type_of(version: Option<&str>) -> &'static str {
     }
 }
 
-/// Every engine version a domain of this service can run, in upgrade order:
-/// the Elasticsearch versions the service still offers as an upgrade source,
-/// then the OpenSearch versions a domain can be moved onto.
+/// One engine release of the inventory this service answers upgrade paths over.
+///
+/// A release plays TWO parts in that answer, and the two sets are not the same
+/// one: a domain created at any time in the service's history may still be
+/// RUNNING a release, which makes it a source of an upgrade, while the releases
+/// an upgrade may move a domain ONTO are only those the service still offers as
+/// a target. A minor retired as a target therefore keeps its row in the matrix —
+/// its own upgrade paths — but appears in nobody's `TargetVersions`.
+#[derive(Debug, Clone, Copy)]
+pub struct EngineRelease {
+    /// The release as `ElasticsearchVersionString` spells it (`X.Y` for the
+    /// Elasticsearch line, `OpenSearch_X.Y` for the OpenSearch line).
+    pub version: &'static str,
+    /// Whether an in-place upgrade may move a domain ONTO this release.
+    pub upgrade_target: bool,
+}
+
+/// Every engine release this service answers an upgrade path for, oldest first.
 ///
 /// The model constrains only the FORM of a version string
 /// (`ElasticsearchVersionString`'s pattern — `X.Y`, `OpenSearch_X.Y`, `OS_X.Y`),
-/// never which versions exist, so the supported set is named here ONCE and
-/// every version answer is derived from it rather than from a per-operation
-/// list. It is the inventory the service CURRENTLY offers: the Elasticsearch
-/// 6.8/7.x line and the OpenSearch 1.x/2.x/3.x line, the engines a domain can
-/// be created on or upgraded to. A version retired from that inventory is no
-/// longer a source or a target of an upgrade, which is why none is listed here;
-/// a domain still running one is answered by the same rule
-/// ([`compatible_target_versions`]) from its place in this order.
-pub const SUPPORTED_ENGINE_VERSIONS: [&str; 22] = [
-    "6.8",
-    "7.1",
-    "7.4",
-    "7.7",
-    "7.8",
-    "7.9",
-    "7.10",
-    "OpenSearch_1.0",
-    "OpenSearch_1.1",
-    "OpenSearch_1.2",
-    "OpenSearch_1.3",
-    "OpenSearch_2.3",
-    "OpenSearch_2.5",
-    "OpenSearch_2.7",
-    "OpenSearch_2.9",
-    "OpenSearch_2.11",
-    "OpenSearch_2.13",
-    "OpenSearch_2.15",
-    "OpenSearch_2.17",
-    "OpenSearch_2.19",
-    "OpenSearch_3.0",
-    "OpenSearch_3.1",
+/// never which releases exist, so the inventory is named here ONCE and every
+/// version answer is derived from it rather than from a per-operation list. It
+/// covers the whole span a domain can be sitting on — the legacy Elasticsearch
+/// 5.x and 6.x lines a long-lived domain may never have moved off, the 7.x line,
+/// and the OpenSearch 1.x/2.x/3.x line — because the upgrade matrix is what such
+/// a domain's owner reads to plan the move, and a line missing from it reads as
+/// "this domain cannot be upgraded at all".
+///
+/// `upgrade_target` is false for the early minors of the two legacy lines, which
+/// the service no longer accepts as the destination of an upgrade: inside the
+/// 5.x line only its last minor is still a destination, and the 6.x line is
+/// entered at 6.3. Everything the service currently offers is both.
+pub const ENGINE_RELEASES: [EngineRelease; 34] = [
+    EngineRelease { version: "5.1", upgrade_target: false },
+    EngineRelease { version: "5.3", upgrade_target: false },
+    EngineRelease { version: "5.5", upgrade_target: false },
+    EngineRelease { version: "5.6", upgrade_target: true },
+    EngineRelease { version: "6.0", upgrade_target: false },
+    EngineRelease { version: "6.2", upgrade_target: false },
+    EngineRelease { version: "6.3", upgrade_target: true },
+    EngineRelease { version: "6.4", upgrade_target: true },
+    EngineRelease { version: "6.5", upgrade_target: true },
+    EngineRelease { version: "6.7", upgrade_target: true },
+    EngineRelease { version: "6.8", upgrade_target: true },
+    EngineRelease { version: "7.1", upgrade_target: true },
+    EngineRelease { version: "7.4", upgrade_target: true },
+    EngineRelease { version: "7.7", upgrade_target: true },
+    EngineRelease { version: "7.8", upgrade_target: true },
+    EngineRelease { version: "7.9", upgrade_target: true },
+    EngineRelease { version: "7.10", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_1.0", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_1.1", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_1.2", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_1.3", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_2.3", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_2.5", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_2.7", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_2.9", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_2.11", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_2.13", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_2.15", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_2.17", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_2.19", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_3.1", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_3.3", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_3.5", upgrade_target: true },
+    EngineRelease { version: "OpenSearch_3.7", upgrade_target: true },
 ];
+
+/// The oldest Elasticsearch release the migration onto the OpenSearch line may
+/// start from, as its order key ([`version_order`]) — Elasticsearch 6.8.
+///
+/// The service's own documentation of the move off Elasticsearch names 6.8 and
+/// the 7.x line as the releases an in-place upgrade can carry onto OpenSearch; a
+/// domain on an older Elasticsearch release steps up its own line first, which
+/// is why the lineage boundary is open from here and not from every
+/// Elasticsearch release.
+const OPENSEARCH_MIGRATION_FROM: (u8, u32, u32) = (0, 6, 8);
 
 /// One version's place in the upgrade order: its lineage (Elasticsearch before
 /// OpenSearch — a domain moves from the one to the other and never back), then
@@ -359,30 +400,33 @@ pub fn version_order(version: &str) -> Option<(u8, u32, u32)> {
     Some((lineage, major.parse().ok()?, minor.parse().ok()?))
 }
 
-/// The supported set in upgrade order, each entry with its order key.
-fn ordered_versions() -> Vec<((u8, u32, u32), &'static str)> {
-    let mut catalog: Vec<((u8, u32, u32), &'static str)> = SUPPORTED_ENGINE_VERSIONS
+/// The inventory in upgrade order, each release with its order key.
+fn ordered_versions() -> Vec<((u8, u32, u32), EngineRelease)> {
+    let mut catalog: Vec<((u8, u32, u32), EngineRelease)> = ENGINE_RELEASES
         .iter()
-        .filter_map(|version| version_order(version).map(|order| (order, *version)))
+        .filter_map(|release| version_order(release.version).map(|order| (order, *release)))
         .collect();
-    catalog.sort_unstable();
+    catalog.sort_unstable_by_key(|(order, _)| *order);
     catalog
 }
 
 /// The versions ONE in-place upgrade can move a domain running `version` onto,
 /// in upgrade order.
 ///
-/// The service's upgrade paths step through the supported set: from any version
-/// a domain reaches every LATER supported version of its own major, and a major
-/// boundary is crossed only from the last supported version of a major, into
-/// the versions of the major that follows it — so the last supported 2.x
-/// OpenSearch version reaches the 3.x ones. The one boundary that is open from
-/// EVERY version of a lineage is the migration out of Elasticsearch: a domain
-/// on any Elasticsearch version reaches the first OpenSearch major the service
-/// offers, which is how a current Elasticsearch domain is moved onto OpenSearch
-/// without first stepping to the last Elasticsearch version. A version the
-/// supported set does not carry is placed in the same order and answered by the
-/// same rule; a string outside the modelled forms reaches nothing.
+/// A target is always a release the service still OFFERS as a destination
+/// (`EngineRelease::upgrade_target`), and the upgrade steps through the
+/// inventory: from any version a domain reaches every LATER offered release of
+/// its own major, and a major boundary is crossed only from the last release of
+/// a major, into the releases of the major that follows it — so the last 2.x
+/// OpenSearch release reaches the 3.x ones, while an early minor of a line
+/// reaches only the later minors of that same line. The one boundary that is
+/// open from more than the last release of a major is the migration out of
+/// Elasticsearch: from [`OPENSEARCH_MIGRATION_FROM`] onwards an Elasticsearch
+/// domain also reaches the first OpenSearch major, which is how a current
+/// Elasticsearch domain is moved onto OpenSearch without first stepping to the
+/// last Elasticsearch release. A version the inventory does not carry is placed
+/// in the same order and answered by the same rule; a string outside the
+/// modelled forms reaches nothing.
 pub fn compatible_target_versions(version: &str) -> Vec<String> {
     let Some(source) = version_order(version) else {
         return Vec::new();
@@ -390,16 +434,16 @@ pub fn compatible_target_versions(version: &str) -> Vec<String> {
     let catalog = ordered_versions();
     let source_major = (source.0, source.1);
 
-    // The majors the supported set carries, in order, so "the major after this
-    // one" is a single step along that list.
+    // The majors the inventory carries, in order, so "the major after this one"
+    // is a single step along that list.
     let mut majors: Vec<(u8, u32)> = catalog
         .iter()
         .map(|((lineage, major, _), _)| (*lineage, *major))
         .collect();
     majors.dedup();
 
-    // The last supported version of the source's own major: only a domain
-    // sitting at or past it may cross into the next major.
+    // The last release of the source's own major: only a domain sitting at or
+    // past it may cross into the next major.
     let last_of_source_major = catalog
         .iter()
         .filter(|((lineage, major, _), _)| (*lineage, *major) == source_major)
@@ -412,31 +456,32 @@ pub fn compatible_target_versions(version: &str) -> Vec<String> {
             .and_then(|at| majors.get(at + 1))
             .copied(),
         Some(_) => None,
-        // A major the supported set carries no version of at all: the boundary
-        // to cross is into the first supported major after it.
+        // A major the inventory carries no release of at all: the boundary to
+        // cross is into the first major after it.
         None => majors
             .iter()
             .find(|(lineage, major)| (*lineage, *major) > source_major)
             .copied(),
     };
 
-    // The lineage boundary: the first OpenSearch major the set carries is
-    // reachable from EVERY Elasticsearch version, not only from the last one of
-    // its major.
-    let first_opensearch_major = (source.0 == 0)
+    // The lineage boundary: the first OpenSearch major the inventory carries is
+    // reachable from every Elasticsearch release the migration is open from,
+    // not only from the last one of its major.
+    let first_opensearch_major = (source.0 == 0 && source >= OPENSEARCH_MIGRATION_FROM)
         .then(|| majors.iter().find(|(lineage, _)| *lineage == 1).copied())
         .flatten();
 
     catalog
         .into_iter()
-        .filter(|(order, _)| {
+        .filter(|(order, release)| {
             let major = (order.0, order.1);
-            *order > source
+            release.upgrade_target
+                && *order > source
                 && (major == source_major
                     || Some(major) == next_major
                     || Some(major) == first_opensearch_major)
         })
-        .map(|(_, version)| version.to_string())
+        .map(|(_, release)| release.version.to_string())
         .collect()
 }
 
@@ -449,14 +494,15 @@ pub fn compatible_versions_map(version: &str) -> CompatibleVersionsMap {
     }
 }
 
-/// Every supported version an upgrade can move a domain OFF, with the versions
-/// it reaches — what `GetCompatibleElasticsearchVersions` answers when the
-/// request names no domain. A version nothing is reachable from (the newest one)
-/// carries no entry, since it is the source of no upgrade.
+/// Every release an upgrade can move a domain OFF, with the versions it reaches
+/// — what `GetCompatibleElasticsearchVersions` answers when the request names no
+/// domain. It spans the whole inventory, the legacy lines included, since a
+/// domain may still be running one of them; a release nothing is reachable from
+/// (the newest one) carries no entry, since it is the source of no upgrade.
 pub fn compatible_versions_catalog() -> Vec<CompatibleVersionsMap> {
-    SUPPORTED_ENGINE_VERSIONS
+    ENGINE_RELEASES
         .iter()
-        .map(|version| compatible_versions_map(version))
+        .map(|release| compatible_versions_map(release.version))
         .filter(|map| {
             map.target_versions
                 .as_ref()

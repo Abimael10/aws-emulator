@@ -15,6 +15,32 @@ Issue-Commit: 09ea2d6b5347c41b77d17c7337847f8c3ab13f71
 
 # es: the package, package-version-history and compatible-version catalogs are synthetic
 
+## Resolution
+
+Cause 2 (GetCompatibleElasticsearchVersions) is FIXED: the upgrade matrix is now
+keyed on every engine release a domain may still be running — the legacy
+Elasticsearch 5.x and 6.x lines included — while each row's `TargetVersions`
+carries only the releases the service still accepts as the destination of an
+in-place upgrade, with the move onto the OpenSearch line open from the last 6.x
+release onwards (`state::ENGINE_RELEASES`,
+`state::compatible_target_versions`). The fixture
+`es-catalog-get-compatible-elasticsearch-versions` replays clean, and
+`tests/all/compatible_versions.rs` pins the rule over a table spanning the
+class.
+
+Causes 1 and 3 (the DescribePackages row set, and GetPackageVersionHistory on
+the package ids of that recording) are DECLINED, both for one reason: what is
+left of them is the IDENTITY of the recorded catalogue — 92 `PackageID`s the
+service mints ("internal ID of the package", its own model documentation) over a
+row set of names, descriptions and per-version publication instants that no rule
+derives. Serving those recorded ids would mean transcribing them out of the
+recording rather than implementing a rule. The rule itself is implemented and
+tested (`state/package_catalog.rs`, `tests/all/published_package_catalog.rs`):
+the catalogue is populated, every row projects every modelled `PackageDetails`
+member with its own creation and last-update instants, every row resolves by its
+id with a newest-first version history, every Region reports the same rows, and a
+read of them writes nothing.
+
 > _Note: this issue was identified against the code base at commit `09ea2d6b5347c41b77d17c7337847f8c3ab13f71`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

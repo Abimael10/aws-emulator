@@ -2,12 +2,14 @@
 
 //! @op GetCompatibleElasticsearchVersions
 //!
-//! Reports the upgrade paths out of the service's supported engine versions. A
-//! request that names a domain is answered from that domain's STORED
+//! Reports the upgrade paths out of the engine releases this service answers
+//! for. A request that names a domain is answered from that domain's STORED
 //! `ElasticsearchVersion` — one entry, whose `SourceVersion` is the version the
-//! domain runs — and a request that names none is answered with every supported
-//! source version. Nothing here writes: the versions a domain can move onto are
-//! computed from what is stored plus [`crate::state::SUPPORTED_ENGINE_VERSIONS`].
+//! domain runs — and a request that names none is answered with every release an
+//! upgrade can start from, the legacy Elasticsearch lines a long-lived domain
+//! may still be running included. Nothing here writes: the versions a domain can
+//! move onto are computed from what is stored plus
+//! [`crate::state::ENGINE_RELEASES`].
 //!
 //! ## Shape of an operation
 //!
