@@ -20,12 +20,15 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — which operation serves a request. EDITED HERE: the key
+//!   and the handler stay the generated table's, but the operation is served through
+//!   [`StatedPerOperation`], so a request refused before its handler runs is worded
+//!   with the REQUEST in hand — the value a clause quotes, which the refusal alone
+//!   does not carry.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. EDITED HERE: delegated to [`validation`], the one place
+//!   this service's refusal wording lives, so the two paths cannot word one refusal
+//!   differently.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -40,9 +43,15 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+mod validation;
+
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema_server::ProtocolError;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
+    Refused, Service,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The routing key an UNSIGNED awsJson request to this service resolves to.
@@ -62,6 +71,29 @@ const TARGET_ROUTE_KEY: &str = "route53domains_v20140515";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same modelled operations the generated table holds, each wrapped in
+    /// [`StatedPerOperation`] so a request refused before its handler runs is worded the
+    /// way this service words it — including the value a clause quotes, which only a
+    /// reading of the REQUEST can state. Keyed by the routing key the protocol resolves
+    /// (the key the generated table uses) and built from the SAME shared engine, so a
+    /// wrapped operation reads and writes the one store.
+    stated: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`StatedPerOperation`] and keyed by its operation shape name — the routing key
+/// `ServerProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                ::std::boxed::Box::new(StatedPerOperation::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -69,9 +101,110 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut stated = OperationRoutingTable::new();
+        // EVERY modelled operation (one per file in `src/ops/`), because the rule is the
+        // SERVICE's and not one operation's: a clause quotes the value the request
+        // carried wherever a constrained member of this model is refused, and an
+        // operation whose input declares no constraint simply never has a violation to
+        // state, which the wrapper reads off that operation's own input schema.
+        wrap_operations!(
+            stated,
+            engine,
+            accept_domain_transfer_from_another_aws_account::AcceptDomainTransferFromAnotherAwsAccount,
+            associate_delegation_signer_to_domain::AssociateDelegationSignerToDomain,
+            cancel_domain_transfer_to_another_aws_account::CancelDomainTransferToAnotherAwsAccount,
+            check_domain_availability::CheckDomainAvailability,
+            check_domain_transferability::CheckDomainTransferability,
+            delete_domain::DeleteDomain,
+            delete_tags_for_domain::DeleteTagsForDomain,
+            disable_domain_auto_renew::DisableDomainAutoRenew,
+            disable_domain_transfer_lock::DisableDomainTransferLock,
+            disassociate_delegation_signer_from_domain::DisassociateDelegationSignerFromDomain,
+            enable_domain_auto_renew::EnableDomainAutoRenew,
+            enable_domain_transfer_lock::EnableDomainTransferLock,
+            get_contact_reachability_status::GetContactReachabilityStatus,
+            get_domain_detail::GetDomainDetail,
+            get_domain_prices::GetDomainPrices,
+            get_domain_suggestions::GetDomainSuggestions,
+            get_operation_detail::GetOperationDetail,
+            list_domains::ListDomains,
+            list_operations::ListOperations,
+            list_prices::ListPrices,
+            list_tags_for_domain::ListTagsForDomain,
+            push_domain::PushDomain,
+            register_domain::RegisterDomain,
+            reject_domain_transfer_from_another_aws_account::RejectDomainTransferFromAnotherAwsAccount,
+            renew_domain::RenewDomain,
+            resend_contact_reachability_email::ResendContactReachabilityEmail,
+            resend_operation_authorization::ResendOperationAuthorization,
+            retrieve_domain_auth_code::RetrieveDomainAuthCode,
+            transfer_domain::TransferDomain,
+            transfer_domain_to_another_aws_account::TransferDomainToAnotherAwsAccount,
+            update_domain_contact::UpdateDomainContact,
+            update_domain_contact_privacy::UpdateDomainContactPrivacy,
+            update_domain_nameservers::UpdateDomainNameservers,
+            update_tags_for_domain::UpdateTagsForDomain,
+            view_billing::ViewBilling,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            stated,
         }
+    }
+}
+
+/// One modelled operation, served so that a request refused BEFORE its handler runs is
+/// worded the way this service words it — with the value a clause quotes in hand, which
+/// only the request carries.
+///
+/// Nothing else is re-implemented. A request this wrapper does not refuse is handed to the
+/// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
+/// serialize, telemetry and every modelled error. The violations come from the framework's
+/// own machinery ([`validation::stated_from_request`]), so this cannot refuse a request the
+/// framework's own walk would accept, nor accept one it would refuse. The cost is that a
+/// request is read twice, once here and once in the operation's own sequence, because the
+/// framework hands no already-built input to an operation.
+struct StatedPerOperation<O> {
+    operation: O,
+}
+
+impl<O> StatedPerOperation<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+impl<O> ErasedOperation for StatedPerOperation<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The definition is read, used and dropped inside each statement:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`.
+            let refused = validation::stated_from_request::<O>(svc.definition().protocol(), req);
+            if let Some((violations, stated)) = refused {
+                return svc.definition().refusal_response(
+                    ProtocolError::Invalid(violations),
+                    Some(stated),
+                    req,
+                );
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not change
+    /// which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
     }
 }
 
@@ -93,16 +226,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
     }
 
-    fn override_operation(
-        &self,
-        req: &aws_smithy_runtime_api::http::Request,
-    ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+    fn override_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — wrapped in [`StatedPerOperation`]
+        // so a refused request is worded the way this service words it, with the value its
+        // clause quotes. A key the model does not name resolves to `None` here exactly as
+        // it does in the generated table, so the router's routing-error path is unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.stated.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -115,27 +246,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // than the framework's generic `ValidationException`, because that is the
         // code a Route 53 Domains client branches on.
         //
-        // The message is the framework's clause for each violated member, wrapped in
-        // the envelope AWS reports a constraint refusal in: the number of violations
-        // found, then the clauses. The count is what tells a caller whether one
-        // member or several are wrong, so it is the violation count of THIS request,
-        // never a fixed number.
+        // The wording is [`validation`]'s, the one place this service's refusal prose
+        // lives, so a refusal that reaches this seam — one raised for an operation the
+        // wrapped table does not hold — reads exactly like one the wrapper answered. This
+        // path has no request in hand, so a clause stated at a collection member states no
+        // value rather than one rebuilt from the violations.
         match refusal {
-            Refusal::Invalid(violations) => {
-                let clauses: Vec<String> = violations
-                    .iter()
-                    .map(smithy_server_runtime::Violation::message)
-                    .collect();
-                let found = clauses.len();
-                let noun = if found == 1 { "error" } else { "errors" };
-                Some(Refused {
-                    code: "InvalidInput".to_string(),
-                    message: format!(
-                        "{found} validation {noun} detected: {}",
-                        clauses.join("; ")
-                    ),
-                })
-            }
+            Refusal::Invalid(violations) => validation::stated(violations, &HashMap::new()),
             // An unauthenticated caller is not an input problem: leave the
             // framework's 403 wording alone.
             _ => None,

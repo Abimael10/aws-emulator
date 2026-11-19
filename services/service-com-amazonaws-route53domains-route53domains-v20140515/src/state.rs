@@ -390,16 +390,37 @@ pub fn resolve_domain_name(raw: &str) -> Result<String, DomainNameError> {
     Ok(name)
 }
 
+/// A problem with the REQUEST, in the envelope this service reports one in: the fixed
+/// "Invalid request. Problems: " followed by the problem itself.
+///
+/// The ONE place that envelope is spelled. It is what the real service wraps a problem with
+/// the request as a whole in — a name the account does not hold, an id no record carries, a
+/// member left blank — as against a value outside a constraint the MODEL declares, which is
+/// reported in the validation envelope the boundary layer states
+/// (`crate::service::validation`).
+pub fn request_problem(problem: &str) -> String {
+    format!("Invalid request. Problems: {problem}")
+}
+
 /// The message an `InvalidInput` refusal of a malformed `DomainName` carries.
 ///
-/// It names the member and the rule the value failed, the way the framework's boundary
-/// validator words a refusal, so a caller can fix the request from the message alone.
+/// A problem the real service has its own sentence for is stated in the request-problem
+/// envelope ([`request_problem`]), naming the part of the name the caller has to change:
+/// a member carrying no name at all, and a LABEL over the longest one DNS gives
+/// ([`MAX_LABEL_LEN`]). Anything else names the member and the rule the value failed, the
+/// way the framework's boundary validator words a refusal, so a caller can fix the request
+/// from the message alone.
 pub fn invalid_domain_name_message(raw: &str) -> String {
     // A value with nothing in it is not a name that broke one of the syntax rules: the
-    // member carries no name at all, and that condition is refused in its own words
-    // ("Invalid request. Problems: " followed by the problem).
+    // member carries no name at all.
     if raw.trim().is_empty() {
-        return "Invalid request. Problems: Domain name cannot be blank".to_string();
+        return request_problem("Domain name cannot be blank");
+    }
+    // A label longer than DNS allows one is reported as that label, whichever label of the
+    // name it is: the offending label is the part to shorten, and the name around it is
+    // not what was wrong.
+    if let Some(label) = raw.split('.').find(|label| label.len() > MAX_LABEL_LEN) {
+        return request_problem(&format!("Domain label too long: [{label}]"));
     }
     format!(
         "Value '{raw}' at 'domainName' failed to satisfy constraint: Member must be a \
@@ -433,7 +454,31 @@ pub fn unsupported_tld_message(raw: &str) -> String {
 /// sensitive, so they are lower-cased) — so every domain-scoped operation that cannot
 /// resolve a name to one of the account's domains answers with the identical sentence.
 pub fn unknown_domain_message(name: &str) -> String {
-    format!("Invalid request. Problems: Domain {name} not found in account.")
+    request_problem(&format!("Domain {name} not found in account."))
+}
+
+/// The message the `InvalidInput` refusal of an `OperationId` no record of this account
+/// carries states.
+///
+/// A lookup that MISSED is a problem with the request rather than a value outside a
+/// constraint, so it is worded in the request-problem envelope ([`request_problem`]) and
+/// not as a constraint clause: the id is a well-formed id that names no operation. The
+/// fixed text is "No operation found for operationId : " — the space before the colon is
+/// the real service's — and the one variable part is the id the request asked about.
+pub fn unknown_operation_message(operation_id: &str) -> String {
+    request_problem(&format!(
+        "No operation found for operationId : {operation_id}"
+    ))
+}
+
+/// The message the `InvalidInput` refusal of an `OperationId` with nothing in it states.
+///
+/// The model admits the empty string (`OperationId` is `@length(0, 255)`), so the boundary
+/// validator passes it, but a member carrying no id names no operation to look up at all:
+/// that is a problem with the request, reported as an invalid id rather than as a lookup
+/// that missed — the same split [`invalid_domain_name_message`] makes for a blank name.
+pub fn blank_operation_id_message() -> String {
+    request_problem("Invalid OperationId")
 }
 
 /// The message the `DomainLimitExceeded` refusal carries when the account is at
@@ -447,16 +492,16 @@ pub fn domain_limit_message() -> String {
 /// A tag is identified by its key, so a tag without one names nothing to add or update.
 /// Worded in the envelope this service reports a request-level problem in.
 pub fn blank_tag_key_message() -> String {
-    "Invalid request. Problems: Tag key cannot be blank".to_string()
+    request_problem("Tag key cannot be blank")
 }
 
 /// The message the `InvalidInput` refusal carries when a domain is at
 /// [`MAX_TAGS_PER_DOMAIN`].
 pub fn tag_limit_message() -> String {
-    format!(
-        "Invalid request. Problems: The number of tags for a domain has exceeded the \
-         allowed threshold of {MAX_TAGS_PER_DOMAIN}"
-    )
+    request_problem(&format!(
+        "The number of tags for a domain has exceeded the allowed threshold of \
+         {MAX_TAGS_PER_DOMAIN}"
+    ))
 }
 
 /// The TLD of an already resolved domain name: everything after its first label.

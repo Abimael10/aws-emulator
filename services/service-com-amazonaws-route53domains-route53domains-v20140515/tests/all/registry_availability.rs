@@ -417,3 +417,366 @@ async fn a_constraint_violation_names_how_many_violations_were_found() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The rule: a constraint clause quotes the value the REQUEST carried, whole
+// ---------------------------------------------------------------------------
+
+/// The one-violation envelope over `clause`.
+fn one_violation(clause: &str) -> String {
+    format!("1 validation error detected: {clause}")
+}
+
+#[tokio::test]
+async fn a_constraint_clause_quotes_the_whole_submitted_value() {
+    // A clause quotes the value the request carried however long it was, so the rows
+    // differ along the LENGTH of that value — at 256 bytes, one past it, and far past it,
+    // the 256 being where the boundary walk starts eliding a value behind a marker naming
+    // its byte count — and along the member and the operation refused, so the rule is not
+    // one member's. `DomainName` and `OperationId` are both `@length(0, 255)`
+    // (`smithy_query(query="shape",shape="DomainName,OperationId")`).
+    let cases: [(&str, &str, &str, &str, usize); 6] = [
+        (
+            "a name at the elision ceiling",
+            "CheckDomainAvailability",
+            "DomainName",
+            "domainName",
+            256,
+        ),
+        (
+            "a name one byte past it",
+            "CheckDomainAvailability",
+            "DomainName",
+            "domainName",
+            257,
+        ),
+        (
+            "a name far past it",
+            "CheckDomainAvailability",
+            "DomainName",
+            "domainName",
+            4096,
+        ),
+        (
+            "an operation id at the ceiling",
+            "GetOperationDetail",
+            "OperationId",
+            "operationId",
+            256,
+        ),
+        (
+            "an operation id past it",
+            "GetOperationDetail",
+            "OperationId",
+            "operationId",
+            300,
+        ),
+        (
+            "a deleted name far past it",
+            "DeleteDomain",
+            "DomainName",
+            "domainName",
+            1024,
+        ),
+    ];
+    let emulator = Emulator::new();
+
+    for (case, operation, member, path, length) in cases {
+        let submitted = "a".repeat(length);
+        let mut request = serde_json::Map::new();
+        request.insert(member.to_string(), Value::String(submitted.clone()));
+        let (status, body) = emulator.call(operation, &Value::Object(request)).await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "InvalidInput".to_string()),
+            "case {case:?}: expected 400 InvalidInput, got {status} {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        let expected = one_violation(&format!(
+            "Value '{submitted}' at '{path}' failed to satisfy constraint: Member must have \
+             length less than or equal to 255"
+        ));
+        assert_eq!(
+            message, expected,
+            "case {case:?}: the clause must quote the whole submitted value, got {message:?}"
+        );
+        assert!(
+            !message.contains("bytes]"),
+            "case {case:?}: no clause states a byte-count marker in place of the value, \
+             got {message:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The rule: a value the model withholds is stated by no clause
+// ---------------------------------------------------------------------------
+
+/// The value set a clause states for `ContactType`, in the order this service's front door
+/// lists one.
+///
+/// The model declares that enum `[PERSON, COMPANY, ASSOCIATION, PUBLIC_BODY, RESELLER]`
+/// (`smithy_query(query="shape",shape="ContactType")`); the order below is the one the
+/// table those values are held in is walked in, which is neither the declaration order nor
+/// lexicographic. It holds exactly the values the model declares, reordered.
+const CONTACT_TYPE_SET: &str = "[ASSOCIATION, RESELLER, PERSON, PUBLIC_BODY, COMPANY]";
+
+#[tokio::test]
+async fn a_withheld_members_value_is_stated_by_no_clause() {
+    // `ContactDetail` is `@sensitive`, so every value inside one is withheld whatever
+    // constraint it broke. Rows differ along WHICH contact of the input carried it (all
+    // four `ContactDetail` members: `smithy_query(query="operation",
+    // operation="UpdateDomainContact")`), along the constraint broken (an enum value set,
+    // two different `@length` maximums) and along the value submitted.
+    //
+    // `ContactNumber` is `@length(0, 30)` and `Email` `@length(0, 254)`
+    // (`smithy_query(query="shape",shape="ContactDetail")`).
+    let past_phone_bound = "1".repeat(31);
+    let past_email_bound = "e".repeat(255);
+    let enum_set = format!("Member must satisfy enum value set: {CONTACT_TYPE_SET}");
+    let cases: [(&str, &str, &str, &str, &str); 5] = [
+        (
+            "an admin contact type outside the enum",
+            "AdminContact",
+            "contactType",
+            "BOGUS",
+            &enum_set,
+        ),
+        (
+            "a registrant contact type in the wrong case",
+            "RegistrantContact",
+            "contactType",
+            "person",
+            &enum_set,
+        ),
+        (
+            "a tech contact type left empty",
+            "TechContact",
+            "contactType",
+            "",
+            &enum_set,
+        ),
+        (
+            "a billing contact phone number past its bound",
+            "BillingContact",
+            "phoneNumber",
+            &past_phone_bound,
+            "Member must have length less than or equal to 30",
+        ),
+        (
+            "an admin contact email past its bound",
+            "AdminContact",
+            "email",
+            &past_email_bound,
+            "Member must have length less than or equal to 254",
+        ),
+    ];
+    let emulator = Emulator::new();
+
+    for (case, contact, member, submitted, requirement) in cases {
+        // The modelled member name the request body carries is the clause's path segment
+        // with its first letter upper-cased.
+        let modelled = format!("{}{}", member[..1].to_uppercase(), &member[1..]);
+        let mut detail = serde_json::Map::new();
+        detail.insert(modelled, Value::String(submitted.to_string()));
+        let mut request = serde_json::Map::new();
+        request.insert(
+            "DomainName".to_string(),
+            Value::String("withheld-probe.com".to_string()),
+        );
+        request.insert(contact.to_string(), Value::Object(detail));
+        let (status, body) = emulator
+            .call("UpdateDomainContact", &Value::Object(request))
+            .await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "InvalidInput".to_string()),
+            "case {case:?}: expected 400 InvalidInput, got {status} {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        let path = format!("{}{}.{member}", contact[..1].to_lowercase(), &contact[1..]);
+        let expected = one_violation(&format!(
+            "Value at '{path}' failed to satisfy constraint: {requirement}"
+        ));
+        assert_eq!(
+            message, expected,
+            "case {case:?}: a withheld member's clause states the member and the \
+             requirement and no value, got {message:?}"
+        );
+        if !submitted.is_empty() {
+            assert!(
+                !message.contains(submitted),
+                "case {case:?}: the submitted value must not be echoed, got {message:?}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The rule: a constraint a list's ELEMENTS break is stated at the list member
+// ---------------------------------------------------------------------------
+
+/// The value set a clause states for `OperationStatus`, in the order this service's front
+/// door lists one.
+///
+/// The model declares that enum `[SUBMITTED, IN_PROGRESS, ERROR, SUCCESSFUL, FAILED]`
+/// (`smithy_query(query="shape",shape="OperationStatus")`); as for
+/// [`CONTACT_TYPE_SET`] the order below is the table's rather than the declaration's, and
+/// holds exactly the values the model declares.
+const OPERATION_STATUS_SET: &str = "[IN_PROGRESS, ERROR, SUCCESSFUL, SUBMITTED, FAILED]";
+
+#[tokio::test]
+async fn a_constraint_a_list_element_breaks_is_stated_at_the_list_member() {
+    // One clause at the list member, quoting the whole list and nesting the element
+    // shape's declared set, however many elements offended and wherever they sat: the rows
+    // differ along how many of the list's elements break the constraint (one, one of two,
+    // both) and along where the offending element sits.
+    let cases: [(&str, Value, &str); 4] = [
+        (
+            "one offending element",
+            json!(["BOGUS_STATUS"]),
+            "[BOGUS_STATUS]",
+        ),
+        (
+            "an offending element after a good one",
+            json!(["SUBMITTED", "BOGUS_STATUS"]),
+            "[SUBMITTED, BOGUS_STATUS]",
+        ),
+        (
+            "an offending element before a good one",
+            json!(["BOGUS_STATUS", "SUBMITTED"]),
+            "[BOGUS_STATUS, SUBMITTED]",
+        ),
+        (
+            "two offending elements",
+            json!(["BOGUS_ONE", "BOGUS_TWO"]),
+            "[BOGUS_ONE, BOGUS_TWO]",
+        ),
+    ];
+    let emulator = Emulator::new();
+
+    for (case, status_filter, quoted) in cases {
+        let (status, body) = emulator
+            .call("ListOperations", &json!({ "Status": status_filter }))
+            .await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "InvalidInput".to_string()),
+            "case {case:?}: expected 400 InvalidInput, got {status} {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        let expected = one_violation(&format!(
+            "Value '{quoted}' at 'status' failed to satisfy constraint: Member must satisfy \
+             constraint: [Member must satisfy enum value set: {OPERATION_STATUS_SET}]"
+        ));
+        assert_eq!(
+            message, expected,
+            "case {case:?}: one clause at the list member, quoting the list, \
+             got {message:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The rule: a @pattern requirement states the expression, not its anchors
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_pattern_requirement_states_the_expression_without_its_anchors() {
+    // `^`/`$` is how a model writes "the whole value", which the requirement sentence
+    // already says, so the clause states the expression between them. Rows differ along
+    // the member, the expression and the depth the member sits at: `IdnLangCode` targets
+    // `LangCode` and a nameserver's `Name` targets `HostName`
+    // (`smithy_query(query="shape",shape="LangCode,HostName")`).
+    let lang_code = "Member must satisfy regular expression pattern: (|[A-Za-z]{2,3})";
+    let host_name = "Member must satisfy regular expression pattern: [a-zA-Z0-9_\\-.]*";
+    let cases: [(&str, &str, Value, &str, &str, &str); 4] = [
+        (
+            "a language name where a language code belongs",
+            "CheckDomainAvailability",
+            json!({ "DomainName": "pattern-probe.com", "IdnLangCode": "english" }),
+            "english",
+            "idnLangCode",
+            lang_code,
+        ),
+        (
+            "a language code of one letter",
+            "CheckDomainAvailability",
+            json!({ "DomainName": "pattern-probe.com", "IdnLangCode": "f" }),
+            "f",
+            "idnLangCode",
+            lang_code,
+        ),
+        (
+            "a language code of digits",
+            "CheckDomainAvailability",
+            json!({ "DomainName": "pattern-probe.com", "IdnLangCode": "12" }),
+            "12",
+            "idnLangCode",
+            lang_code,
+        ),
+        (
+            "a host name carrying a character the expression excludes",
+            "UpdateDomainNameservers",
+            json!({
+                "DomainName": "pattern-probe.com",
+                "Nameservers": [{ "Name": "ns one.example.com" }],
+            }),
+            "ns one.example.com",
+            "nameservers.1.member.name",
+            host_name,
+        ),
+    ];
+    let emulator = Emulator::new();
+
+    for (case, operation, request, submitted, path, requirement) in cases {
+        let (status, body) = emulator.call(operation, &request).await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "InvalidInput".to_string()),
+            "case {case:?}: expected 400 InvalidInput, got {status} {body}"
+        );
+        let expected = one_violation(&format!(
+            "Value '{submitted}' at '{path}' failed to satisfy constraint: {requirement}"
+        ));
+        assert_eq!(
+            body["message"].as_str().unwrap_or_default(),
+            expected,
+            "case {case:?}: the clause states the expression without its anchors, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_nested_element_set_states_every_value_the_model_declares() {
+    // The set a clause nests is the element shape's WHOLE declared set, not the one value
+    // the request happened to break — read here off a list the issue's cases do not name,
+    // `Type`, whose element enum the model declares with 21 values.
+    let emulator = Emulator::new();
+    let (status, body) = emulator
+        .call("ListOperations", &json!({ "Type": ["BOGUS_TYPE"] }))
+        .await;
+    assert_eq!(
+        (status, error_code(&body)),
+        (400, "InvalidInput".to_string()),
+        "expected 400 InvalidInput, got {status} {body}"
+    );
+    let message = body["message"].as_str().unwrap_or_default();
+    let opened = format!(
+        "{} Member must satisfy constraint: [Member must satisfy enum value set: [",
+        one_violation("Value '[BOGUS_TYPE]' at 'type' failed to satisfy constraint:")
+    );
+    let stated = message
+        .strip_prefix(opened.as_str())
+        .and_then(|rest| rest.strip_suffix("]]"))
+        .unwrap_or_default();
+    let mut listed: Vec<&str> = stated.split(", ").collect();
+    listed.sort_unstable();
+    let declared: Vec<&str> =
+        service_com_amazonaws_route53domains_route53domains_v20140515::ops::types::OPERATION_TYPE_VALUES
+            .to_vec();
+    assert_eq!(
+        listed, declared,
+        "the nested set must list every declared `OperationType`, got {message:?}"
+    );
+}

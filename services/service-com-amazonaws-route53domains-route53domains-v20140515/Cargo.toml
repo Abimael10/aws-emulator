@@ -8,6 +8,9 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The fleet's shared refusal wording: AWS's validation envelope, the value a clause
+# quotes, the members a refusal withholds and the order an enum's value set is listed in.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

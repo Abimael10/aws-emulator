@@ -158,6 +158,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries request metadata only; this operation needs none of it.
         let _ = ctx;
+
+        // The model admits the empty string (`OperationId` is `@length(0, 255)`), so a
+        // request can reach here carrying no id at all. That names no operation to look
+        // up, which is a problem with the request rather than a lookup that missed.
+        if input.operation_id.trim().is_empty() {
+            return Err(GetOperationDetailErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::blank_operation_id_message()),
+            })
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::state::state_unavailable(Self::NAME))?;
         let mut state = state.lock();
@@ -168,12 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_operations(crate::state::now_millis());
 
         let Some(record) = state.operation(&input.operation_id) else {
+            // The id names no operation this account submitted: a lookup MISS, which this
+            // service reports as a problem with the request rather than as a value outside
+            // an input constraint.
             return Err(GetOperationDetailErrorModeled::InvalidInput(InvalidInput {
-                message: Some(format!(
-                    "Value '{}' at 'operationId' failed to satisfy constraint: Member must be \
-                     the id of an operation submitted by this account",
-                    input.operation_id
-                )),
+                message: Some(crate::state::unknown_operation_message(&input.operation_id)),
             })
             .into());
         };

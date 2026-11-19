@@ -493,6 +493,65 @@ async fn a_malformed_domain_name_is_invalid_input_everywhere_it_is_accepted() {
     }
 }
 
+#[tokio::test]
+async fn a_label_longer_than_dns_allows_is_refused_as_that_label() {
+    // A label over the 63 octets DNS gives one (RFC 1035 §2.3.4) is reported as the
+    // offending LABEL, so the rows differ along which label of the name is too long, by
+    // how much, and which operation was called — and a name whose longest label is
+    // exactly 63 is not refused at all, which the row below the loop pins.
+    let longest_allowed = "a".repeat(63);
+    let one_too_long = "a".repeat(64);
+    let far_too_long = "b".repeat(200);
+    let cases: [(&str, String, &str); 4] = [
+        (
+            "the first label one character too long",
+            format!("{one_too_long}.com"),
+            &one_too_long,
+        ),
+        (
+            "the first label far too long",
+            format!("{far_too_long}.com"),
+            &far_too_long,
+        ),
+        (
+            "a later label too long",
+            format!("host.{one_too_long}.com"),
+            &one_too_long,
+        ),
+        (
+            "the longest allowed label beside a too-long one",
+            format!("{longest_allowed}.{one_too_long}.com"),
+            &one_too_long,
+        ),
+    ];
+    let emulator = Emulator::new();
+
+    for operation in ["CheckDomainAvailability", "GetDomainDetail", "DeleteDomain"] {
+        for (case, name, label) in &cases {
+            let (status, body) = emulator
+                .call(operation, &json!({ "DomainName": name }))
+                .await;
+            assert_eq!(
+                (status, error_code(&body)),
+                (400, "InvalidInput".to_string()),
+                "case {operation}/{case:?}: expected 400 InvalidInput, got {status} {body}"
+            );
+            assert_eq!(
+                body["message"].as_str(),
+                Some(format!("Invalid request. Problems: Domain label too long: [{label}]").as_str()),
+                "case {operation}/{case:?}: the refusal names the offending label, got {body}"
+            );
+        }
+    }
+
+    // ...and a name whose label is exactly the longest DNS allows resolves.
+    assert_eq!(
+        availability(&emulator, &format!("{longest_allowed}.com")).await,
+        "AVAILABLE",
+        "a label of 63 octets is a name a registry delegates"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The rule: GetDomainDetail reports the stored record, not the request
 // ---------------------------------------------------------------------------
@@ -1092,5 +1151,76 @@ async fn neither_caller_driven_store_grows_past_its_ceiling() {
         (status, error_code(&body)),
         (400, "InvalidInput".to_string()),
         "an evicted OperationId must be refused, got {status} {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The rule: an operation id that names no record is a problem with the REQUEST
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_operation_id_that_names_no_record_is_refused_as_a_request_problem() {
+    let emulator = Emulator::new();
+    // One id this account really did submit, so the rows that must be refused are refused
+    // for naming no record rather than because nothing was ever submitted.
+    let issued = register(&emulator, "operation-id-probe.com").await;
+
+    // Rows differ along WHY the id names no record: a well-formed id never issued, an id
+    // in a form this service never mints, an issued id in another case (ids are matched
+    // exactly), and an id past the one the store holds. The model admits the empty string
+    // (`OperationId` is `@length(0, 255)`), which carries no id to look up at all and is
+    // reported as an invalid id instead; a blank-looking id of spaces is the same
+    // condition.
+    let never_issued = "00000000-0000-4000-8000-000000000000";
+    let lookup_misses = [
+        ("a well-formed id never issued", never_issued.to_string()),
+        ("an id in no form this service mints", "not-a-uuid".to_string()),
+        ("an issued id in another case", issued.to_uppercase()),
+        ("an id with its last character dropped", issued[..issued.len() - 1].to_string()),
+    ];
+    for (case, operation_id) in lookup_misses {
+        let (status, body) = emulator
+            .call("GetOperationDetail", &json!({ "OperationId": operation_id }))
+            .await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "InvalidInput".to_string()),
+            "case {case:?}: expected 400 InvalidInput, got {status} {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(
+                format!("Invalid request. Problems: No operation found for operationId : {operation_id}")
+                    .as_str()
+            ),
+            "case {case:?}: a lookup miss names the id it missed on, got {body}"
+        );
+    }
+
+    for (case, operation_id) in [("an empty id", ""), ("an id of spaces", "   ")] {
+        let (status, body) = emulator
+            .call("GetOperationDetail", &json!({ "OperationId": operation_id }))
+            .await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "InvalidInput".to_string()),
+            "case {case:?}: expected 400 InvalidInput, got {status} {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some("Invalid request. Problems: Invalid OperationId"),
+            "case {case:?}: an id with nothing in it is refused as invalid, got {body}"
+        );
+    }
+
+    // ...and the id this account did submit still reads back, so none of the above is a
+    // refusal of every id.
+    let (status, detail) = emulator
+        .call("GetOperationDetail", &json!({ "OperationId": issued }))
+        .await;
+    assert_eq!(
+        (status, detail["OperationId"].as_str()),
+        (200, Some(issued.as_str())),
+        "the issued OperationId must still be reported, got {status} {detail}"
     );
 }
