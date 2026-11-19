@@ -27,8 +27,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_wafv2_awswaf_20190729::state::{
-    is_api_key_shaped, MAX_API_KEYS_PER_SCOPE, MAX_TOKEN_DOMAINS_PER_API_KEY, SCOPE_CLOUDFRONT,
-    SCOPE_REGIONAL,
+    is_api_key_shaped, API_KEY_ENVELOPE_LEN, MAX_API_KEYS_PER_SCOPE, MAX_TOKEN_DOMAINS_PER_API_KEY,
+    SCOPE_CLOUDFRONT, SCOPE_REGIONAL,
 };
 
 use crate::web_acl_lifecycle::Waf;
@@ -50,14 +50,14 @@ const MAX_API_KEY_LENGTH: usize = 2048;
 const MAX_TOKEN_DOMAIN_LENGTH: usize = 253;
 
 /// A value carrying the form a minted key takes, so it is well formed, but that no
-/// mint ever answered: an envelope of the smallest size a key is rendered at, with
-/// every byte of it zero, so nothing this service sealed can be behind it. Checked
-/// against [`is_api_key_shaped`] wherever it is used, so the case cannot silently
-/// become a malformed one.
+/// mint ever answered: an envelope of the one size a key is rendered at, with every
+/// byte of it zero, so nothing this service sealed can be behind it. Checked against
+/// [`is_api_key_shaped`] wherever it is used, so the case cannot silently become a
+/// malformed one.
 pub(crate) fn well_formed_unknown_key() -> String {
     use base64::Engine as _;
 
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0_u8; 128])
+    base64::engine::general_purpose::STANDARD.encode(vec![0_u8; API_KEY_ENVELOPE_LEN])
 }
 
 /// The awsJson error code of a refusal, as its `__type` carries it.

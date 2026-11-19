@@ -2,16 +2,17 @@
 
 //! @op CreateAPIKey
 //! Mints one API key for the token domains the request names, stores it under the
-//! requested `Scope`, and answers the key value it stored — nothing else holds the
-//! domains the key was defined with, so `GetDecryptedAPIKey` and `ListAPIKeys` read
-//! them back out of that record rather than out of the key value.
+//! requested `Scope`, and answers the key value it stored — the record beside the key
+//! is what `ListAPIKeys` enumerates, and the key value itself carries the same
+//! definition sealed, which is what `GetDecryptedAPIKey` reads back out of it.
 //!
 //! The key value itself is opaque ([`crate::state::new_api_key`]): "the generated,
-//! encrypted API key", unique and unpredictable per call, which a client copies into
-//! its JavaScript CAPTCHA integration and hands back to this service. It is not an
-//! AWS credential — no request is signed with it, and the credential store mints only
-//! the kinds that are (an access key, a session) — so it is minted here, as the key's
-//! own record, and the response is the only place it appears.
+//! encrypted API key", unique and unpredictable per call, and rendered at the one
+//! width every key is rendered at whatever definition it carries, which a client
+//! copies into its JavaScript CAPTCHA integration and hands back to this service. It
+//! is not an AWS credential — no request is signed with it, and the credential store
+//! mints only the kinds that are (an access key, a session) — so it is minted here,
+//! as the key's own record, and the response is the only place it appears.
 //!
 //! `TokenDomains` is checked here rather than at the request boundary
 //! (`skip_validation` on the input struct, see `super::types::create_api_key_types`)
