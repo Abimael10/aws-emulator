@@ -399,15 +399,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     });
                 }
             }
-            // What the caller could not know is which IAM role the pair is
-            // already bound to, so that is what the refusal names — read off the
-            // STORED association, never off this request.
+            // What the caller could not know is what the refusal names: the IAM role
+            // the pair is already bound to, or — when the request asks for that very
+            // role — the id of the association that holds the pair. Both are read off
+            // the STORED association, never off this request.
             return Err(
                 CreatePodIdentityAssociationErrorModeled::ResourceInUseException(
                     ResourceInUseException {
                         cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(crate::state::service_account_already_associated(
+                        message: Some(crate::state::duplicate_association_refusal(
+                            &existing.association_id,
                             &existing.role_arn,
+                            &input.role_arn,
                         )),
                         ..Default::default()
                     },

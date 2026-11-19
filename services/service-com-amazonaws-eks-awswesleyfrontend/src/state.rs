@@ -1074,29 +1074,49 @@ pub fn child_resource_not_found(message: String) -> ResourceNotFoundException {
     }
 }
 
-/// The sentence this service refuses an `updateId` no update of the resource the
+/// The sentence `CancelUpdate` refuses an `updateId` no update of the resource the
 /// request addresses carries with.
 ///
 /// The id is the WHOLE of what a caller can act on — an update is addressed by it
 /// and by the resource it belongs to, and the resource is already in the request's
 /// own path — so the sentence states the update by that id and nothing else: fixed
-/// text around the id, in the register of the recorded service, with no trailing
-/// period and no mention of the scoping member the lookup was narrowed by.
-/// Whichever reason the id resolved to nothing (never minted, minted for another
-/// cluster, or belonging to another resource of this cluster), the update asked for
-/// is what was not found, so every caller words it this way.
-pub fn update_not_found_message(update_id: &str) -> String {
+/// text around the id, with no trailing period and no mention of the scoping member
+/// the lookup was narrowed by. Whichever reason the id resolved to nothing (never
+/// minted, minted for another cluster, or belonging to another resource of this
+/// cluster), the update asked for is what was not found, so the one sentence covers
+/// all three.
+pub fn cancel_update_not_found_message(update_id: &str) -> String {
     format!("Update {update_id} not found")
 }
 
-/// The `ResourceNotFoundException` payload an operation addressed to ONE update
-/// answers for an `updateId` it did not resolve.
+/// The `ResourceNotFoundException` payload `CancelUpdate` answers for an `updateId`
+/// it did not resolve.
 ///
 /// NO identity member is set — see [`cluster_not_found`] for the rule: the UPDATE is
 /// the resource reported missing, and the exception models no member for one, so the
-/// id lives in the message ([`update_not_found_message`]) and nowhere else.
-pub fn update_not_found(update_id: &str) -> ResourceNotFoundException {
-    child_resource_not_found(update_not_found_message(update_id))
+/// id lives in the message ([`cancel_update_not_found_message`]) and nowhere else.
+pub fn cancel_update_not_found(update_id: &str) -> ResourceNotFoundException {
+    child_resource_not_found(cancel_update_not_found_message(update_id))
+}
+
+/// The sentence `DescribeUpdate` refuses an `updateId` no update of the resource the
+/// request addresses carries with.
+///
+/// The READ of an update words the same absence in its own fixed text rather than
+/// `CancelUpdate`'s ([`cancel_update_not_found_message`]): each operation addressed
+/// to one update carries the sentence the service answers it with, and the variable
+/// part of both is the requested id alone — no trailing period, and no clause naming
+/// the `nodegroupName`, `addonName` or `capabilityName` the lookup was scoped by,
+/// which is already in the caller's own request.
+pub fn describe_update_not_found_message(update_id: &str) -> String {
+    format!("No update found for ID: {update_id}")
+}
+
+/// The `ResourceNotFoundException` payload `DescribeUpdate` answers for an
+/// `updateId` it did not resolve — memberless, for the reason
+/// [`cancel_update_not_found`] carries.
+pub fn describe_update_not_found(update_id: &str) -> ResourceNotFoundException {
+    child_resource_not_found(describe_update_not_found_message(update_id))
 }
 
 /// The sentence this service refuses a `(addonName, addonVersion)` pair the
@@ -2418,6 +2438,43 @@ pub fn service_account_already_associated(role_arn: &str) -> String {
         "The service account is already associated with a different IAM role: {}",
         elided_value(role_arn, MAX_ECHOED_VALUE)
     )
+}
+
+/// The sentence that same refusal carries when the request asks for the role the
+/// pair is ALREADY bound to: it names the association already holding the pair, by
+/// its id.
+///
+/// A create that offers the role the binding already has learns nothing from being
+/// told which role that is — it asked for that one. What it could not know is the
+/// id of the association standing in its way, which is the single datum that lets
+/// it adopt or update that association instead of listing the cluster to find it.
+#[must_use]
+pub fn association_already_exists(association_id: &str) -> String {
+    format!(
+        "Association already exists: {}",
+        elided_value(association_id, MAX_ECHOED_VALUE)
+    )
+}
+
+/// The sentence a writer of an EKS Pod Identity association refuses a
+/// `(namespace, service account)` pair that already holds one with.
+///
+/// ONE reading of the rule, so every writer refuses alike: the refusal reports
+/// what the caller could not know. A request offering a DIFFERENT role is told the
+/// role the pair is bound to ([`service_account_already_associated`]); one
+/// offering the role it is already bound to is told the id of the association that
+/// holds it ([`association_already_exists`]).
+#[must_use]
+pub fn duplicate_association_refusal(
+    bound_association_id: &str,
+    bound_role_arn: &str,
+    requested_role_arn: &str,
+) -> String {
+    if requested_role_arn == bound_role_arn {
+        association_already_exists(bound_association_id)
+    } else {
+        service_account_already_associated(bound_role_arn)
+    }
 }
 
 /// The `ResourceNotFoundException` payload for an `associationId` this service

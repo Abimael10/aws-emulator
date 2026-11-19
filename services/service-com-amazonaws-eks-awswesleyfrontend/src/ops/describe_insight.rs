@@ -183,6 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The cluster's own identifier, which the refusal below reports: an insight is
+        // analysed against the cluster EKS manages, and that cluster is identified by
+        // the id it publishes for itself ([`state::derive_cluster_resource_id`], the id
+        // inside its API server endpoint host and its OIDC issuer URL) rather than by
+        // the name the request addressed it with.
+        let cluster_id = state::derive_cluster_resource_id(&cluster.arn);
         // The insight is identified WITHIN the cluster by its id, which is the same id
         // `ListInsights` reported for it.
         let Some(insight) = guard
@@ -192,11 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             // The resource this reports is the INSIGHT, not the cluster, so the
             // missing one is reported without naming the cluster in the payload — the
-            // rule every child-resource read of this service follows.
+            // rule every child-resource read of this service follows. The sentence
+            // states the two identifiers of the analysis that was asked for as
+            // `key=value` pairs: the insight id the request carried and the id of the
+            // cluster it was asked for.
             return Err(DescribeInsightErrorModeled::ResourceNotFoundException(
                 state::child_resource_not_found(format!(
-                    "No insight found with id: {} for cluster: {}.",
-                    input.id, input.cluster_name
+                    "Cannot find insight insightId={} clusterId={cluster_id}",
+                    input.id
                 )),
             )
             .into());

@@ -222,10 +222,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DeleteCertificateAuthorityErrorModeled::ResourceNotFoundException(
                     // The certificate authority is the resource reported missing, so
                     // the payload names no cluster: see
-                    // [`crate::state::child_resource_not_found`].
+                    // [`crate::state::child_resource_not_found`]. The sentence is
+                    // built from the request's own two `@httpLabel`s and ends in no
+                    // full stop.
                     crate::state::child_resource_not_found(format!(
-                        "No certificate authority found with id: {authority_id} for cluster: \
-                         {cluster_name}."
+                        "Certificate authority {authority_id} not found for cluster \
+                         {cluster_name}"
                     )),
                 )
                 .into(),

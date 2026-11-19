@@ -337,7 +337,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "You can specify one ARN for each access entry. You can't specify the same
-        // ARN in more than one access entry." `clientRequestToken` is
+        // ARN in more than one access entry." The entry the cluster already holds for
+        // that principal is the resource in use, and the sentence saying so is the
+        // service's own fixed text ([`state::ACCESS_ENTRY_ALREADY_IN_USE`]).
+        // `clientRequestToken` is
         // `@idempotencyToken`, which an SDK resends when it RETRIES the same call, so
         // a retry of the create that wrote this entry is absorbed and answered with
         // it rather than with a conflict. A blank token identifies nothing, so it
@@ -357,11 +360,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateAccessEntryErrorModeled::ResourceInUseException(
                 ResourceInUseException {
                     cluster_name: Some(input.cluster_name.clone()),
-                    message: Some(format!(
-                        "The access entry for principal ARN {} already exists for \
-                         cluster {}.",
-                        input.principal_arn, input.cluster_name
-                    )),
+                    message: Some(state::ACCESS_ENTRY_ALREADY_IN_USE.to_string()),
                     ..Default::default()
                 },
             )

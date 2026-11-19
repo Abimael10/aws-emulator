@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The CLASS and the SENTENCE of three refusals this service composes itself,
+//! The CLASS and the SENTENCE of the refusals this service composes itself,
 //! driven end to end over the same `MultiServiceRouter` the production binary
 //! mounts.
 //!
@@ -26,6 +26,23 @@
 //!   this service's one page-token sentence, on EVERY paginated listing it serves.
 //!   Rows differ along the listing, along where the token travels (the query string
 //!   or the request body) and along how the token misses.
+//! * A SECOND ACCESS ENTRY FOR A PRINCIPAL a cluster already holds one for is
+//!   `ResourceInUseException` (409) carrying the service's fixed already-in-use
+//!   sentence, which takes nothing from the request. Rows differ along the form of
+//!   the principal the entry is keyed by.
+//! * AN UPDATE OF A CLUSTER THAT IS NOT `ACTIVE` is `InvalidRequestException` (400)
+//!   in one fixed sentence naming neither the cluster nor the status it is in. Rows
+//!   differ along the member the update asks to change and along the status the
+//!   cluster is in.
+//! * AN `insightId` THE CLUSTER HAS NO INSIGHT FOR is `ResourceNotFoundException`
+//!   (404) stating the analysis asked for as `key=value` pairs: the requested
+//!   insight id and the cluster's OWN id. Rows differ along the shape of the id and
+//!   along the cluster, whose id is what the sentence's second half tracks.
+//! * A `certificateAuthorityId` THE CLUSTER DOES NOT HOLD is
+//!   `ResourceNotFoundException` (404) naming the id and the cluster, while the id
+//!   it DOES hold and that signs for it is `ResourceInUseException` (409) in the
+//!   fixed sentence that names the remediation. Rows differ along the shape of the
+//!   id.
 //!
 //! Each suite also checks the helper the handlers compose the sentence with against
 //! the text written out here, so neither the handlers nor the shared helper can drift
@@ -44,11 +61,14 @@
 use std::time::{Duration, Instant};
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    access_policy_arn, cluster_deletion_protected, update_not_found_message,
-    ACCESS_ENTRY_INVALID_NEXT_TOKEN_MESSAGE, INVALID_NEXT_TOKEN_MESSAGE,
+    access_policy_arn, cancel_update_not_found_message, cluster_deletion_protected,
+    derive_cluster_resource_id, describe_update_not_found_message, ACCESS_ENTRY_ALREADY_IN_USE,
+    ACCESS_ENTRY_INVALID_NEXT_TOKEN_MESSAGE, ACTIVE_CERTIFICATE_AUTHORITY_UNDELETABLE,
+    CLUSTER_NOT_ACTIVE_FOR_UPDATE, INVALID_NEXT_TOKEN_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::certificate_authority_deletion::delete_authority;
 use crate::cluster_lifecycle::{
     access_entry_cluster_request, create, delete, describe, minimal_request, REGION,
 };
@@ -183,8 +203,8 @@ pub(crate) async fn active_cluster(router: &MultiServiceRouter, case: &str, clus
 // ---------------------------------------------------------------------------
 // RULE: an `updateId` that resolves to no update of the resource the request
 // addresses is 404 ResourceNotFoundException stating the update by that id, in
-// ONE sentence — whichever operation asked, and whichever way the lookup
-// missed.
+// the ONE sentence the operation asked carries — whichever way the lookup
+// missed, with the id as the only variable part.
 // ---------------------------------------------------------------------------
 
 /// Which operation asks for the update, and under which scoping member. The scope is
@@ -309,7 +329,7 @@ async fn an_update_id_that_resolves_to_nothing_is_refused_in_one_fixed_sentence(
         for (operation, caller) in callers {
             let case = format!("{row} / {operation}");
             let answer = ask_for_update(&router, caller, CLUSTER, update_id).await;
-            assert_refused_as_missing_update(&case, &answer, update_id, CLUSTER);
+            assert_refused_as_missing_update(&case, caller, &answer, update_id, CLUSTER);
         }
     }
 
@@ -323,7 +343,23 @@ async fn an_update_id_that_resolves_to_nothing_is_refused_in_one_fixed_sentence(
     {
         let case = format!("an existing cluster-plane id / {operation}");
         let answer = ask_for_update(&router, caller, CLUSTER, &real_id).await;
-        assert_refused_as_missing_update(&case, &answer, &real_id, CLUSTER);
+        assert_refused_as_missing_update(&case, caller, &answer, &real_id, CLUSTER);
+    }
+}
+
+/// The sentence the operation that asked words a missing update with, and the shared
+/// helper that has to agree with it: `CancelUpdate` and `DescribeUpdate` each carry
+/// their own fixed text, and the requested id is the only variable part of either.
+fn missing_update_sentence(caller: Caller, update_id: &str) -> (String, String) {
+    match caller {
+        Caller::CancelUpdate => (
+            format!("Update {update_id} not found"),
+            cancel_update_not_found_message(update_id),
+        ),
+        Caller::DescribeUpdate(_) => (
+            format!("No update found for ID: {update_id}"),
+            describe_update_not_found_message(update_id),
+        ),
     }
 }
 
@@ -333,6 +369,7 @@ async fn an_update_id_that_resolves_to_nothing_is_refused_in_one_fixed_sentence(
 /// neither it nor a handler can drift from this text.
 fn assert_refused_as_missing_update(
     case: &str,
+    caller: Caller,
     answer: &Answer,
     update_id: &str,
     cluster: &str,
@@ -347,17 +384,15 @@ fn assert_refused_as_missing_update(
         "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
     );
     let actual = answer.message();
-    let expected = format!("Update {update_id} not found");
+    let (expected, from_helper) = missing_update_sentence(caller, update_id);
     assert_eq!(
         actual, expected,
         "case {case:?}: expected the update-not-found sentence, got {actual:?}"
     );
     assert_eq!(
-        update_not_found_message(update_id),
-        expected,
-        "case {case:?}: the helper every caller words this refusal with must be AWS's \
-         sentence, got {:?}",
-        update_not_found_message(update_id)
+        from_helper, expected,
+        "case {case:?}: the helper this operation words the refusal with must be AWS's \
+         sentence, got {from_helper:?}"
     );
     assert!(
         !actual.contains(cluster),
@@ -805,5 +840,445 @@ async fn a_page_token_no_listing_minted_is_a_malformed_parameter_on_every_listin
         (CLUSTER_PLANE_SENTENCE, ACCESS_ENTRY_PLANE_SENTENCE),
         "each plane's listings must word this refusal with that plane's own sentence, got \
          {INVALID_NEXT_TOKEN_MESSAGE:?} and {ACCESS_ENTRY_INVALID_NEXT_TOKEN_MESSAGE:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RULE: a second access entry for a `principalArn` a cluster already holds one
+// for is 409 ResourceInUseException with the service's fixed already-in-use
+// sentence — no part of it comes from the request.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_duplicate_access_entry_principal_is_refused_with_the_in_use_sentence() {
+    const CLUSTER: &str = "entry-in-use";
+    // AWS's own sentence, written out here rather than only imported, so a change to
+    // the service's constant cannot keep this green; the constant is then checked
+    // against the same text below, which is what ties the handler to it.
+    const EXPECTED: &str = "The specified access entry resource is already in use on this cluster.";
+    let router = emulator();
+    active_cluster(&router, "setup", CLUSTER).await;
+
+    // Rows differ along the form of the principal the entry is keyed by — the value
+    // the sentence must NOT carry — over the IAM principal forms this API keys an
+    // entry by: a role, a user, and a role with a long name.
+    let long_role = principal_arn(&format!("dup{}", "9".repeat(60)));
+    let principals: Vec<(&str, String)> = vec![
+        ("an IAM role", principal_arn("dup-role")),
+        (
+            "an IAM user",
+            "arn:aws:iam::000000000000:user/dup-user".to_string(),
+        ),
+        ("a role with a long name", long_role),
+    ];
+
+    for (case, principal) in &principals {
+        let first = create_entry(&router, CLUSTER, principal).await;
+        assert_eq!(
+            first.status, 200,
+            "case {case:?}: setup CreateAccessEntry expected 200, got {first:?}"
+        );
+        let refused = create_entry(&router, CLUSTER, principal).await;
+        assert_eq!(
+            refused.status, 409,
+            "case {case:?}: expected HTTP 409, got {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ResourceInUseException",
+            "case {case:?}: expected ResourceInUseException, got {refused:?}"
+        );
+        let actual = refused.message();
+        assert_eq!(
+            actual, EXPECTED,
+            "case {case:?}: expected the already-in-use sentence, got {actual:?}"
+        );
+        assert!(
+            !actual.contains(principal.as_str()) && !actual.contains(CLUSTER),
+            "case {case:?}: the whole sentence is fixed text, so it carries neither the \
+             principal nor the cluster, got {actual:?}"
+        );
+    }
+
+    assert_eq!(
+        ACCESS_ENTRY_ALREADY_IN_USE, EXPECTED,
+        "the constant this refusal is worded with must be AWS's sentence, got \
+         {ACCESS_ENTRY_ALREADY_IN_USE:?}"
+    );
+
+    // CONTROL: a principal the cluster holds no entry for is created, so the rows
+    // above are refused for the entry they repeat and not because the operation
+    // refuses everything.
+    let fresh = create_entry(&router, CLUSTER, &principal_arn("fresh-role")).await;
+    assert_eq!(
+        fresh.status, 200,
+        "control: a principal with no entry yet is created, got {fresh:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RULE: `UpdateClusterConfig` against a cluster that is not ACTIVE is 400
+// InvalidRequestException in one fixed sentence, which names neither the cluster
+// nor the status it is in, and nothing is changed.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_update_of_a_cluster_that_is_not_active_is_refused_in_one_fixed_sentence() {
+    // AWS's own sentence — see the note in the suite above on why it is written out.
+    const EXPECTED: &str = "Cluster is currently not in Active State, so it cannot be updated";
+    let router = emulator();
+
+    // Rows differ along the member the update asks to change, over three of the kinds
+    // `UpdateClusterConfig` takes (`smithy_query query="operation"
+    // operation="UpdateClusterConfig"`: `logging`, `accessConfig`,
+    // `deletionProtection`), so what the refusal reports is the cluster's state and
+    // not the member. Each row gets its OWN cluster, addressed straight after the
+    // create that starts it, which is the window the status it reports is in.
+    let creating: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "a logging change",
+            serde_json::json!({
+                "logging": { "clusterLogging": [{ "types": ["api"], "enabled": true }] },
+            }),
+        ),
+        (
+            "an access-configuration change",
+            serde_json::json!({ "accessConfig": { "authenticationMode": "API" } }),
+        ),
+        (
+            "the deletion-protection switch",
+            serde_json::json!({ "deletionProtection": true }),
+        ),
+    ];
+
+    for (index, (case, body)) in creating.iter().enumerate() {
+        let cluster = format!("not-active-{index}");
+        let created = create(&router, &minimal_request(&cluster)).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: setup CreateCluster expected 200, got {created:?}"
+        );
+        let refused = update_config(&router, &cluster, body).await;
+        assert_not_updatable(case, &refused, &cluster, EXPECTED);
+    }
+
+    // The same sentence whatever shape the cluster itself has: a fourth row creates a
+    // cluster asking for more than the minimum and changes a member of its own.
+    const SHAPED: &str = "not-active-shaped";
+    let case = "a cluster created with more than the minimum";
+    let mut request = access_entry_cluster_request(SHAPED);
+    request["deletionProtection"] = serde_json::json!(true);
+    let created = create(&router, &request).await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: setup CreateCluster expected 200, got {created:?}"
+    );
+    let refused = update_config(
+        &router,
+        SHAPED,
+        &serde_json::json!({ "deletionProtection": false }),
+    )
+    .await;
+    assert_not_updatable(case, &refused, SHAPED, EXPECTED);
+
+    // Not every status outside ACTIVE is reached through this gate: a cluster whose
+    // deletion is in flight is no longer readable at all, so it is reported by the
+    // cluster-not-found rule rather than by this one.
+
+    assert_eq!(
+        CLUSTER_NOT_ACTIVE_FOR_UPDATE, EXPECTED,
+        "the constant this refusal is worded with must be AWS's sentence, got \
+         {CLUSTER_NOT_ACTIVE_FOR_UPDATE:?}"
+    );
+
+    // CONTROL: the same change on the same cluster once it IS active is served, so the
+    // rows above are refused for the status and not because the operation refuses
+    // everything.
+    const RUNNING: &str = "active-and-updatable";
+    active_cluster(&router, "control", RUNNING).await;
+    let served = update_config(
+        &router,
+        RUNNING,
+        &serde_json::json!({ "deletionProtection": true }),
+    )
+    .await;
+    assert_eq!(
+        served.status, 200,
+        "control: an ACTIVE cluster takes the update, got {served:?}"
+    );
+}
+
+/// What the rule requires of one refused update: the 400 class, the modelled code,
+/// and the fixed sentence that leaks neither the cluster's name nor its status.
+fn assert_not_updatable(case: &str, answer: &Answer, cluster: &str, expected: &str) {
+    assert_eq!(
+        answer.status, 400,
+        "case {case:?}: expected HTTP 400, got {answer:?}"
+    );
+    assert_eq!(
+        error_code(answer),
+        "InvalidRequestException",
+        "case {case:?}: expected InvalidRequestException, got {answer:?}"
+    );
+    let actual = answer.message();
+    assert_eq!(
+        actual, expected,
+        "case {case:?}: expected the not-active sentence, got {actual:?}"
+    );
+    assert!(
+        !actual.contains(cluster),
+        "case {case:?}: the whole sentence is fixed text, so it does not name the \
+         cluster, got {actual:?}"
+    );
+    for status in ["CREATING", "UPDATING", "FAILED", "PENDING"] {
+        assert!(
+            !actual.contains(status),
+            "case {case:?}: the sentence does not leak the status the cluster is in, got \
+             {actual:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE: an `insightId` the cluster has no insight for is 404
+// ResourceNotFoundException stating the analysis asked for as `key=value` pairs —
+// the requested insight id, and the id of the CLUSTER rather than its name.
+// ---------------------------------------------------------------------------
+
+/// `DescribeInsight`: `GET /clusters/{clusterName}/insights/{id}`.
+async fn describe_insight(router: &MultiServiceRouter, cluster: &str, id: &str) -> Answer {
+    call(
+        router,
+        REGION,
+        "GET",
+        &format!(
+            "/clusters/{}/insights/{}",
+            encode_label(cluster),
+            encode_label(id)
+        ),
+        "",
+    )
+    .await
+}
+
+/// `ListInsights`: `POST /clusters/{clusterName}/insights`, unfiltered.
+async fn list_insights(router: &MultiServiceRouter, cluster: &str) -> Answer {
+    call(
+        router,
+        REGION,
+        "POST",
+        &format!("/clusters/{}/insights", encode_label(cluster)),
+        "{}",
+    )
+    .await
+}
+
+/// The id this service identifies `cluster` BY, derived from the ARN the cluster
+/// itself reports — never from the name the request addressed it with. It is the id
+/// the cluster publishes inside its API server endpoint host and its OIDC issuer
+/// URL, which is where a caller can see the same value.
+async fn cluster_id_of(router: &MultiServiceRouter, case: &str, cluster: &str) -> String {
+    let described = describe(router, cluster).await;
+    let arn = described.body["cluster"]["arn"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the cluster must report its ARN, got {described:?}")
+        })
+        .to_owned();
+    let cluster_id = derive_cluster_resource_id(&arn);
+    // The same value the cluster itself publishes: the last segment of its OIDC issuer
+    // URL. Read here so the sentence's second half is checked against something a
+    // CALLER can see, not only against the helper that builds it.
+    let issuer = described.body["cluster"]["identity"]["oidc"]["issuer"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: an ACTIVE cluster publishes its OIDC issuer, got {described:?}")
+        })
+        .to_owned();
+    assert!(
+        issuer.ends_with(&format!("/{cluster_id}")),
+        "case {case:?}: the cluster's id is the one it publishes, got {issuer:?} against \
+         {cluster_id:?}"
+    );
+    cluster_id
+}
+
+#[tokio::test]
+async fn an_unknown_insight_id_is_refused_naming_the_insight_and_the_cluster_id() {
+    const CLUSTER: &str = "insight-missing";
+    const OTHER: &str = "insight-missing-elsewhere";
+    let router = emulator();
+    active_cluster(&router, "setup", CLUSTER).await;
+    active_cluster(&router, "setup", OTHER).await;
+
+    // CONTROL: an id the cluster's own listing reports IS served, so the rows below
+    // are refused for the id they name and not because the read refuses everything.
+    let listed = list_insights(&router, CLUSTER).await;
+    assert_eq!(
+        listed.status, 200,
+        "control: setup ListInsights expected 200, got {listed:?}"
+    );
+    let served_id = listed.body["insights"]
+        .as_array()
+        .and_then(|insights| insights.first())
+        .and_then(|insight| insight["id"].as_str())
+        .unwrap_or_else(|| panic!("control: the cluster must report insights, got {listed:?}"))
+        .to_owned();
+    let served = describe_insight(&router, CLUSTER, &served_id).await;
+    assert_eq!(
+        served.status, 200,
+        "control: an insight the listing reports is readable, got {served:?}"
+    );
+
+    // Rows differ along the SHAPE of the id that resolves to no insight: a well-formed
+    // UUID nothing analysed, a real id in the wrong case, a value that is no UUID, one
+    // carrying characters path encoding must carry through, a single character and a
+    // long one.
+    let long_id = "7".repeat(256);
+    let unresolvable: Vec<(&str, String)> = vec![
+        (
+            "a well-formed UUID no analysis minted",
+            "00000000-0000-0000-0000-000000000000".to_string(),
+        ),
+        ("a real insight id in upper case", served_id.to_uppercase()),
+        ("a value that is not a UUID", "not-an-insight".to_string()),
+        (
+            "a value needing path encoding",
+            "insight id/with slash".to_string(),
+        ),
+        ("a single character", "x".to_string()),
+        ("a 256-character value", long_id),
+    ];
+
+    let cluster_id = cluster_id_of(&router, "setup", CLUSTER).await;
+    for (case, id) in &unresolvable {
+        let refused = describe_insight(&router, CLUSTER, id).await;
+        assert_eq!(
+            refused.status, 404,
+            "case {case:?}: expected HTTP 404, got {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {refused:?}"
+        );
+        let actual = refused.message();
+        let expected = format!("Cannot find insight insightId={id} clusterId={cluster_id}");
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected the insight-not-found sentence, got {actual:?}"
+        );
+        assert!(
+            !actual.contains(CLUSTER),
+            "case {case:?}: the sentence reports the cluster's ID, not the name the \
+             request used, got {actual:?}"
+        );
+    }
+
+    // The second half of the sentence tracks the CLUSTER: the same unresolvable id
+    // asked of another cluster reports that cluster's own id.
+    let other_id = cluster_id_of(&router, "setup", OTHER).await;
+    assert_ne!(
+        other_id, cluster_id,
+        "setup: two clusters must carry different ids, got {other_id:?}"
+    );
+    let case = "the same unknown id on another cluster";
+    let refused = describe_insight(&router, OTHER, "not-an-insight").await;
+    let actual = refused.message();
+    assert_eq!(
+        actual,
+        format!("Cannot find insight insightId=not-an-insight clusterId={other_id}"),
+        "case {case:?}: expected the other cluster's id, got {actual:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RULE: a `certificateAuthorityId` the cluster does not hold is 404
+// ResourceNotFoundException naming the id and the cluster; the one it does hold
+// and that signs for it is 409 ResourceInUseException in the fixed sentence that
+// names the remediation.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_unknown_certificate_authority_id_is_refused_naming_the_id_and_the_cluster() {
+    const CLUSTER: &str = "ca-missing";
+    let router = emulator();
+    active_cluster(&router, "setup", CLUSTER).await;
+
+    // The id the cluster DOES hold, read from what the cluster reports as its signer,
+    // so no id is written here by hand.
+    let described = describe(&router, CLUSTER).await;
+    let signer = described.body["cluster"]["certificateAuthority"]["active"]["id"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("setup: the cluster must report its signing CA, got {described:?}")
+        })
+        .to_owned();
+
+    // Rows differ along the SHAPE of the id that resolves to no certificate authority:
+    // a well-formed UUID the cluster never held, the signer's id in the wrong case, a
+    // value that is no UUID, one carrying characters path encoding must carry through,
+    // a single character and a long one.
+    let long_id = "4".repeat(256);
+    let unresolvable: Vec<(&str, String)> = vec![
+        (
+            "a well-formed UUID the cluster never held",
+            "00000000-0000-4000-8000-000000000000".to_string(),
+        ),
+        ("the signer's id in upper case", signer.to_uppercase()),
+        ("a value that is not a UUID", "not-a-ca-id".to_string()),
+        (
+            "a value needing path encoding",
+            "ca id/with slash".to_string(),
+        ),
+        ("a single character", "x".to_string()),
+        ("a 256-character value", long_id),
+    ];
+
+    for (case, id) in &unresolvable {
+        let refused = delete_authority(&router, REGION, CLUSTER, id, None).await;
+        assert_eq!(
+            refused.status, 404,
+            "case {case:?}: expected HTTP 404, got {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {refused:?}"
+        );
+        let actual = refused.message();
+        let expected = format!("Certificate authority {id} not found for cluster {CLUSTER}");
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected the authority-not-found sentence, got {actual:?}"
+        );
+    }
+
+    // CONTROL, and the sibling refusal: the id the cluster DOES hold is not reported
+    // missing — it is the certificate authority that signs, which is the 409 whose
+    // fixed sentence names the remediation instead.
+    const IN_USE: &str = "Cannot delete the active certificate authority. Activate a different \
+                          CA first.";
+    let case = "the certificate authority that signs for the cluster";
+    let refused = delete_authority(&router, REGION, CLUSTER, &signer, None).await;
+    assert_eq!(
+        (refused.status, error_code(&refused).as_str()),
+        (409, "ResourceInUseException"),
+        "case {case:?}: expected 409 ResourceInUseException, got {refused:?}"
+    );
+    let actual = refused.message();
+    assert_eq!(
+        actual, IN_USE,
+        "case {case:?}: expected the active-authority sentence, got {actual:?}"
+    );
+    assert!(
+        !actual.contains(signer.as_str()) && !actual.contains(CLUSTER),
+        "case {case:?}: the whole sentence is fixed text, so it names neither the \
+         authority nor the cluster, got {actual:?}"
+    );
+    assert_eq!(
+        ACTIVE_CERTIFICATE_AUTHORITY_UNDELETABLE, IN_USE,
+        "the constant this refusal is worded with must be AWS's sentence, got \
+         {ACTIVE_CERTIFICATE_AUTHORITY_UNDELETABLE:?}"
     );
 }

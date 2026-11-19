@@ -310,8 +310,11 @@ async fn the_signing_certificate_authority_cannot_be_deleted() {
 
 // ---------------------------------------------------------------------------
 // RULE: one `(namespace, serviceAccount)` pair holds at most one EKS Pod Identity
-// association, and the refusal of a second one names the IAM role that pair is
-// ALREADY bound to — taken from the stored association, never from the request.
+// association, and the refusal of a second one reports what the caller could not
+// know — the IAM role that pair is ALREADY bound to when the request offers a
+// different one, and the id of the association holding the pair when it offers the
+// role already bound — both taken from the stored association, never from the
+// request.
 // ---------------------------------------------------------------------------
 
 /// The rows differ along the relationship between the roles of the two calls (a
@@ -319,7 +322,7 @@ async fn the_signing_certificate_authority_cannot_be_deleted() {
 /// along whether the stored role is the one the create wrote or one an UPDATE
 /// since changed it to — which is what shows the role is read from state.
 #[tokio::test]
-async fn a_second_association_for_one_pair_names_the_role_already_bound() {
+async fn a_second_association_for_one_pair_reports_the_binding_in_the_way() {
     let router = cluster_fixture(REGION, CLUSTER).await;
 
     struct Row {
@@ -424,13 +427,21 @@ async fn a_second_association_for_one_pair_names_the_role_already_bound() {
             (409, "ResourceInUseException"),
             "case {case:?}: expected 409 ResourceInUseException, got {refused:?}"
         );
-        assert_eq!(
-            refused.message(),
+        // A create offering a DIFFERENT role is told which role owns the pair; one
+        // offering the role already bound learns nothing from that, so it is told the
+        // id of the association standing in its way instead.
+        let expected = if row.second_role == bound_role {
+            format!("Association already exists: {association_id}")
+        } else {
             format!(
                 "The service account is already associated with a different IAM role: \
                  {bound_role}"
-            ),
-            "case {case:?}: the refusal names the role the pair is bound to, got {refused:?}"
+            )
+        };
+        assert_eq!(
+            refused.message(),
+            expected,
+            "case {case:?}: the refusal reports the binding in the way, got {refused:?}"
         );
 
         // The refused create wrote nothing: the pair still resolves to the one

@@ -68,6 +68,29 @@ pub fn cluster_being_deleted(cluster_name: &str) -> String {
     format!("Cluster is being deleted: {cluster_name}")
 }
 
+/// The refusal a change to a cluster that is not `ACTIVE` earns from
+/// `UpdateClusterConfig`.
+///
+/// A configuration change is applied to a running control plane, so a cluster
+/// still being created, being deleted, or that failed cannot take one. The whole
+/// sentence is fixed text: it names neither the cluster — which the request
+/// addresses in its own `@httpLabel` — nor the status it is in, which a caller
+/// reads from `DescribeCluster` and which would be stale by the time it read this
+/// message anyway.
+pub const CLUSTER_NOT_ACTIVE_FOR_UPDATE: &str =
+    "Cluster is currently not in Active State, so it cannot be updated";
+
+/// The refusal a second access entry for a `principalArn` the cluster already
+/// holds one for earns.
+///
+/// "You can specify one ARN for each access entry. You can't specify the same ARN
+/// in more than one access entry" (`CreateAccessEntryRequest$principalArn`), so
+/// the entry already held is the resource in use. The whole sentence is fixed
+/// text: the principal and the cluster are both the request's own members, so
+/// there is nothing about either the caller could not know.
+pub const ACCESS_ENTRY_ALREADY_IN_USE: &str =
+    "The specified access entry resource is already in use on this cluster.";
+
 /// The refusal a `DeleteCluster` of a cluster whose `DeletionProtection` is on
 /// earns.
 ///

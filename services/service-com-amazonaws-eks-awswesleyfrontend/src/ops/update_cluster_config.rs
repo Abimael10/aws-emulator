@@ -428,15 +428,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             // An update can only be started on a cluster that is running: one still being
-            // created, or being deleted, or that failed, cannot take one.
+            // created, or being deleted, or that failed, cannot take one. The refusal is
+            // the service's own fixed sentence, which names neither the cluster nor the
+            // status it is in ([`crate::state::CLUSTER_NOT_ACTIVE_FOR_UPDATE`]).
             if record.status != STATUS_ACTIVE {
                 return Err(invalid_request(
                     &cluster_name,
-                    format!(
-                        "Cluster {cluster_name} is in {} status; it must be {STATUS_ACTIVE} to \
-                         update its configuration",
-                        record.status
-                    ),
+                    crate::state::CLUSTER_NOT_ACTIVE_FOR_UPDATE.to_string(),
                 ));
             }
 

@@ -329,16 +329,21 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         let namespace = addon.namespace.clone();
         // Only an association ANOTHER owner holds can conflict: the ones this
         // add-on owns are the ones the requested set replaces. Each service
-        // account is kept with the IAM role it is already bound to, because that
-        // role is what the conflict is reported as
-        // ([`service_account_already_associated`]).
-        let taken: ::std::collections::BTreeMap<String, String> = self
+        // account is kept with the association holding it — its id and the IAM
+        // role it is bound to — because those are what the conflict is reported
+        // as ([`duplicate_association_refusal`]).
+        let taken: ::std::collections::BTreeMap<String, (String, String)> = self
             .pod_identity_associations_in(&region, &cluster_name)
             .filter(|record| {
                 record.namespace == namespace
                     && record.owner_arn.as_deref() != Some(owner_arn.as_str())
             })
-            .map(|record| (record.service_account.clone(), record.role_arn.clone()))
+            .map(|record| {
+                (
+                    record.service_account.clone(),
+                    (record.association_id.clone(), record.role_arn.clone()),
+                )
+            })
             .collect();
         let conflict = pending
             .pod_identity_associations
@@ -346,18 +351,28 @@ impl ComAmazonawsEksAwswesleyfrontendState {
             .unwrap_or_default()
             .iter()
             .find_map(|association| {
-                taken
-                    .get(&association.service_account)
-                    .map(|role_arn| (association.service_account.clone(), role_arn.clone()))
+                taken.get(&association.service_account).map(|bound| {
+                    (
+                        association.service_account.clone(),
+                        bound.clone(),
+                        association.role_arn.clone(),
+                    )
+                })
             });
 
-        if let Some((service_account, bound_role_arn)) = conflict {
+        if let Some((service_account, (bound_association_id, bound_role_arn), requested_role_arn)) =
+            conflict
+        {
             if let Some(addon) = self.addons.get_mut(key) {
                 addon.fail_update(
                     at,
                     AddonIssue {
                         code: Some(ADDON_ISSUE_CONFIGURATION_CONFLICT.to_string()),
-                        message: Some(service_account_already_associated(&bound_role_arn)),
+                        message: Some(duplicate_association_refusal(
+                            &bound_association_id,
+                            &bound_role_arn,
+                            &requested_role_arn,
+                        )),
                         resource_ids: Some(vec![service_account]),
                     },
                 );

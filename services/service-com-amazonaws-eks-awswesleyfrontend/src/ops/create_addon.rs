@@ -731,24 +731,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The cluster's pairs are collected in ONE walk and each requested entry is
         // looked up in that set, rather than re-walking the store per entry: the work
         // is the sum of the two bounded sides, not their product. Each taken service
-        // account is kept with the IAM role it is already bound to, because that role
-        // is what the conflict is reported as
-        // ([`crate::state::service_account_already_associated`]).
-        let taken_service_accounts: ::std::collections::BTreeMap<&str, &str> = guard
+        // account is kept with the association holding it — its id and the IAM role it
+        // is bound to — because those are what the conflict is reported as
+        // ([`crate::state::duplicate_association_refusal`]).
+        let taken_service_accounts: ::std::collections::BTreeMap<&str, (&str, &str)> = guard
             .pod_identity_associations_in(&region, &input.cluster_name)
             .filter(|record| record.namespace == namespace)
-            .map(|record| (record.service_account.as_str(), record.role_arn.as_str()))
+            .map(|record| {
+                (
+                    record.service_account.as_str(),
+                    (record.association_id.as_str(), record.role_arn.as_str()),
+                )
+            })
             .collect();
-        if let Some(bound_role_arn) = requested_associations.iter().find_map(|association| {
-            taken_service_accounts
-                .get(association.service_account.as_str())
-                .copied()
-        }) {
+        if let Some((bound, requested_role_arn)) =
+            requested_associations.iter().find_map(|association| {
+                taken_service_accounts
+                    .get(association.service_account.as_str())
+                    .map(|bound| (*bound, association.role_arn.as_str()))
+            })
+        {
+            let (bound_association_id, bound_role_arn) = bound;
             return Err(CreateAddonErrorModeled::ResourceInUseException(
                 ResourceInUseException {
                     cluster_name: Some(input.cluster_name.clone()),
                     addon_name: Some(input.addon_name.clone()),
-                    message: Some(state::service_account_already_associated(bound_role_arn)),
+                    message: Some(state::duplicate_association_refusal(
+                        bound_association_id,
+                        bound_role_arn,
+                        requested_role_arn,
+                    )),
                     ..Default::default()
                 },
             )

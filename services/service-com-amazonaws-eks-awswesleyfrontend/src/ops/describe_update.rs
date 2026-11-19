@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so the message names it by the id the request carried, whichever reason the
         // lookup missed on; the exception's identity members stay unset — EKS does not
         // echo the request's `nodegroupName`/`addonName` into a not-found payload (see
-        // [`crate::state::update_not_found`]).
+        // [`crate::state::describe_update_not_found`]).
         let found = record
             .updates
             .get(&input.update_id)
@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 update: Some(update.to_update()),
             }),
             None => Err(DescribeUpdateErrorModeled::ResourceNotFoundException(
-                crate::state::update_not_found(&input.update_id),
+                crate::state::describe_update_not_found(&input.update_id),
             )
             .into()),
         }
