@@ -309,9 +309,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             endpoint_configuration: crate::state::resolve_portal_endpoint_configuration(
                 &portal_id,
                 &region,
-                ctx.parts(),
                 &input.endpoint_configuration,
             ),
+            // Where this emulator SERVES that portal's website for the client that created
+            // it, which is what the portal's URL-typed members name; the generated domain
+            // name above is a domain NAME and carries no authority and no path.
+            site_base: crate::state::announced_portal_site_base(&portal_id, &region, ctx.parts()),
             included_portal_product_arns,
             logo_uri: input.logo_uri,
             portal_content,

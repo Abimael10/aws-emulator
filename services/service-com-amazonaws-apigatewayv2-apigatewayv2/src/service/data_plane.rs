@@ -111,7 +111,7 @@ pub const NOT_FOUND_MESSAGE: &str = "Not Found";
 /// The first path segment that marks an endpoint carried IN THE PATH rather than in the
 /// host. Re-exported from [`crate::state::LOCAL_ENDPOINT_PREFIX`], which owns the marker
 /// because the control plane ANNOUNCES it (see
-/// `crate::state::announced_portal_default_domain_name`), so what a caller is given and
+/// `crate::state::announced_portal_site_base`), so what a caller is given and
 /// what the data planes read are one constant.
 pub use crate::state::LOCAL_ENDPOINT_PREFIX;
 

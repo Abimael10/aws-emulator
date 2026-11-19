@@ -21,17 +21,27 @@
 //! * **An account holds at most `MAX_PORTALS` portals**, after which a create is refused
 //!   429 `TooManyRequestsException`.
 //! * **`GetPortal` on an id nothing minted is 404 `NotFoundException`**.
+//! * **The generated default domain name is a bare DNS host name**:
+//!   `EndpointConfigurationResponse$PortalDefaultDomainName` ("This domain name is generated
+//!   and managed by API Gateway") carries dot-separated host labels and nothing else — no
+//!   scheme, no `:port`, no path — because a client prefixes a scheme to it and names it as
+//!   the target of a DNS alias record. It is generated from the portal's own id and the
+//!   Region it lives in, so every portal-reading operation reports the same value whichever
+//!   endpoint the caller reached this service at, and it is a name this emulator answers the
+//!   portal's published page on.
 //!
 //! The rows vary what each rule generalises over: which union alternative the request
 //! names (and how many), which optional members it carries (none, some, all), the number
-//! of included portal-product ARNs (absent, empty, one, several), and the region the
+//! of included portal-product ARNs (absent, empty, one, several), the region the
 //! request is signed for — the region being what the generated domain name and hosted
-//! zone id are derived from.
+//! zone id are derived from — and, for the domain-name rule, the endpoint the calls are
+//! addressed at (this service's own AWS host, an IP literal with a port and without one, a
+//! loopback name with a port).
 
 use serde_json::{json, Value};
 
 use crate::api_lifecycle::{
-    as_str, assert_minted_id, call, call_in_region, emulator, error_code, instant,
+    as_str, assert_minted_id, call, call_at_host, call_in_region, emulator, error_code, instant,
 };
 
 /// The region [`call`] signs for, mirrored here because the generated endpoint values
@@ -322,12 +332,13 @@ async fn create_portal_persists_the_record_and_get_portal_reports_it_back() {
         // the account's own domain and certificate only when the request brought one.
         let endpoint = endpoint_configuration(case, &created);
         let default_domain = as_str(&endpoint, "portalDefaultDomainName");
-        assert!(
-            default_domain.starts_with(&format!("{portal_id}."))
-                && default_domain.contains(REGION),
-            "case {case:?}: expected a default domain name derived from the portal id and \
-             region, got {default_domain:?}"
+        assert_eq!(
+            default_domain,
+            generated_domain_name(&portal_id, REGION),
+            "case {case:?}: expected the host AWS generates for this portal and region, got \
+             {default_domain:?}"
         );
+        assert_domain_name(case, &default_domain);
         let hosted_zone = as_str(&endpoint, "portalDomainHostedZoneId");
         assert!(
             hosted_zone.starts_with('Z')
@@ -819,4 +830,359 @@ async fn an_account_holds_at_most_the_portals_its_quota_allows() {
         "TooManyRequestsException",
         "expected TooManyRequestsException, got {body}"
     );
+}
+
+/// The modelled bound of the member under test: `PortalDefaultDomainName` targets
+/// `__stringMin3Max256` (`smithy_query(query="shape", shape="EndpointConfigurationResponse")`).
+const DOMAIN_NAME_LENGTH: (usize, usize) = (3, 256);
+
+/// The longest a single label of a DNS name may be, from the preferred name syntax of
+/// RFC 1035 ("labels must be 63 characters or less").
+const MAX_DOMAIN_LABEL_LENGTH: usize = 63;
+
+/// What cannot appear anywhere in a host NAME: the scheme separator, a path separator, a
+/// port separator, the query and fragment markers, userinfo, whitespace, an empty label.
+const NOT_IN_A_HOST_NAME: &[&str] = &["://", "/", ":", "?", "#", "@", " ", ".."];
+
+/// Assert `value` is a bare DNS host name and nothing more: within the modelled length
+/// bound, at least two labels, every label a non-empty run of at most
+/// [`MAX_DOMAIN_LABEL_LENGTH`] letters, digits and inner hyphens, and none of
+/// [`NOT_IN_A_HOST_NAME`] anywhere in it.
+fn assert_domain_name(case: &str, value: &str) {
+    let (min, max) = DOMAIN_NAME_LENGTH;
+    let length = value.chars().count();
+    assert!(
+        (min..=max).contains(&length),
+        "case {case:?}: expected a domain name of {min}..{max} characters, got {length} in \
+         {value:?}"
+    );
+    for forbidden in NOT_IN_A_HOST_NAME {
+        assert!(
+            !value.contains(forbidden),
+            "case {case:?}: a domain name carries no {forbidden:?}, got {value:?}"
+        );
+    }
+    assert!(
+        !value.starts_with('.') && !value.ends_with('.'),
+        "case {case:?}: expected host labels only, got {value:?}"
+    );
+    let labels: Vec<&str> = value.split('.').collect();
+    assert!(
+        labels.len() >= 2,
+        "case {case:?}: expected a multi-label host name, got {value:?}"
+    );
+    for label in labels {
+        assert!(
+            !label.is_empty() && label.chars().count() <= MAX_DOMAIN_LABEL_LENGTH,
+            "case {case:?}: expected a 1..{MAX_DOMAIN_LABEL_LENGTH} label, got {label:?} in \
+             {value:?}"
+        );
+        assert!(
+            label
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-'),
+            "case {case:?}: expected a letter-digit-hyphen label, got {label:?} in {value:?}"
+        );
+        assert!(
+            !label.starts_with('-') && !label.ends_with('-'),
+            "case {case:?}: a label carries no leading or trailing hyphen, got {label:?} in \
+             {value:?}"
+        );
+    }
+}
+
+/// The generated default domain name a portal body reports.
+fn default_domain_name(case: &str, body: &Value) -> String {
+    as_str(&endpoint_configuration(case, body), "portalDefaultDomainName")
+}
+
+/// The host AWS generates for a portal, written out here independently of the service's own
+/// spelling of it so these cases assert the service against the recorded AWS answer rather
+/// than against itself: `p-{portal-id}.apigw-portal.{region}.on.aws`, the form every
+/// recorded AWS portal response carries, with the portal's own id and Region filled in.
+pub(crate) fn generated_domain_name(portal_id: &str, region: &str) -> String {
+    format!("p-{portal_id}.apigw-portal.{region}.on.aws")
+}
+
+/// A domain the account owns with the certificate it is served under: the other
+/// alternative of `EndpointConfigurationRequest`, whose `AcmManaged` members are both
+/// required.
+fn brought_domain() -> Value {
+    json!({
+        "acmManaged": {
+            "domainName": "developers.example.com",
+            "certificateArn": format!(
+                "arn:aws:acm:{REGION}:{ACCOUNT_ID}:certificate/\
+                 11111111-2222-3333-4444-555555555555"
+            )
+        }
+    })
+}
+
+/// One row of the domain-name table: where the calls are addressed, the Region they are
+/// signed for, and the domain configuration the portal is created with.
+struct DomainRow {
+    case: &'static str,
+    /// The `Host` the calls carry — the endpoint this client reached the emulator at.
+    host: &'static str,
+    region: &'static str,
+    /// The request's `endpointConfiguration`.
+    endpoint_configuration: fn() -> Value,
+    /// The domain this row's request brings, when it brings one.
+    own_domain: Option<&'static str>,
+}
+
+fn domain_rows() -> Vec<DomainRow> {
+    vec![
+        DomainRow {
+            case: "this service's own AWS host, API Gateway's default domain",
+            host: "apigateway.eu-west-1.amazonaws.com",
+            region: REGION,
+            endpoint_configuration: || json!({ "none": {} }),
+            own_domain: None,
+        },
+        DomainRow {
+            case: "the emulator's own endpoint as an IP literal with a port",
+            host: "127.0.0.1:44539",
+            region: REGION,
+            endpoint_configuration: || json!({ "none": {} }),
+            own_domain: None,
+        },
+        DomainRow {
+            case: "the emulator's own endpoint as an IP literal with no port",
+            host: "127.0.0.1",
+            region: OTHER_REGION,
+            endpoint_configuration: || json!({ "none": {} }),
+            own_domain: None,
+        },
+        DomainRow {
+            case: "a loopback name with a port, and a domain the account brought",
+            host: "localhost:9297",
+            region: "us-west-2",
+            endpoint_configuration: brought_domain,
+            own_domain: Some("developers.example.com"),
+        },
+        DomainRow {
+            case: "this service's AWS host in a third Region, and a brought domain",
+            host: "apigateway.eu-central-1.amazonaws.com",
+            region: "eu-central-1",
+            endpoint_configuration: brought_domain,
+            own_domain: Some("developers.example.com"),
+        },
+    ]
+}
+
+/// Create one portal for `row` and answer `(portal id, the created body)`.
+async fn portal_of_row(
+    emulator: &smithy_server_runtime::MultiServiceRouter,
+    row: &DomainRow,
+) -> (String, Value) {
+    let (status, created) = call_at_host(
+        emulator,
+        row.host,
+        row.region,
+        "POST",
+        "/v2/portals",
+        Some(json!({
+            "authorization": { "none": {} },
+            "endpointConfiguration": (row.endpoint_configuration)(),
+            "portalContent": portal_content("Domain Name Portal")
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {:?}: expected 201 from CreatePortal, got {status} {created}",
+        row.case
+    );
+    (as_str(&created, "portalId"), created)
+}
+
+/// `EndpointConfigurationResponse$PortalDefaultDomainName` — "This domain name is generated
+/// and managed by API Gateway" — is a bare DNS host name, generated from the portal's own id
+/// and the Region it lives in: no scheme, no `:port` and no path, whichever endpoint the
+/// caller reached this service at, and the same value on every operation that reports the
+/// portal.
+#[tokio::test]
+async fn every_portal_reader_reports_a_bare_generated_domain_name() {
+    for row in domain_rows() {
+        let case = row.case;
+        let emulator = emulator();
+        let (portal_id, created) = portal_of_row(&emulator, &row).await;
+
+        // Generated from the portal's own id and its Region; the endpoint the caller
+        // reached this emulator at is no part of a domain NAME.
+        let expected = generated_domain_name(&portal_id, row.region);
+        let created_domain = default_domain_name(case, &created);
+        assert_eq!(
+            created_domain, expected,
+            "case {case:?}: expected the generated domain name from CreatePortal, got {created}"
+        );
+        assert_domain_name(&format!("{case}: CreatePortal"), &created_domain);
+
+        // A domain the account brought is reported beside it and displaces nothing.
+        assert_eq!(
+            endpoint_configuration(case, &created)
+                .get("domainName")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            row.own_domain.map(str::to_string),
+            "case {case:?}: expected the domain the request brought, got {created}"
+        );
+
+        let (status, read) = call_at_host(
+            &emulator,
+            row.host,
+            row.region,
+            "GET",
+            &format!("/v2/portals/{portal_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetPortal, got {status} {read}"
+        );
+        let read_domain = default_domain_name(case, &read);
+        assert_eq!(
+            read_domain, expected,
+            "case {case:?}: expected the same generated domain name from GetPortal, got {read}"
+        );
+        assert_domain_name(&format!("{case}: GetPortal"), &read_domain);
+
+        let (status, patched) = call_at_host(
+            &emulator,
+            row.host,
+            row.region,
+            "PATCH",
+            &format!("/v2/portals/{portal_id}"),
+            Some(json!({
+                "endpointConfiguration": { "none": {} },
+                "portalContent": portal_content("Renamed Domain Name Portal")
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from UpdatePortal, got {status} {patched}"
+        );
+        let patched_domain = default_domain_name(case, &patched);
+        assert_eq!(
+            patched_domain, expected,
+            "case {case:?}: expected the same generated domain name from UpdatePortal, got \
+             {patched}"
+        );
+        assert_domain_name(&format!("{case}: UpdatePortal"), &patched_domain);
+
+        let (status, listed) =
+            call_at_host(&emulator, row.host, row.region, "GET", "/v2/portals", None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from ListPortals, got {status} {listed}"
+        );
+        let summary = listed
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| as_str(item, "portalId") == portal_id)
+                    .cloned()
+            })
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: ListPortals must report the portal, got {listed}")
+            });
+        let listed_domain = default_domain_name(case, &summary);
+        assert_eq!(
+            listed_domain, expected,
+            "case {case:?}: expected the same generated domain name in the portal's summary, \
+             got {listed}"
+        );
+        assert_domain_name(&format!("{case}: ListPortals"), &listed_domain);
+    }
+}
+
+/// One portal, one domain name: portals of the same account are generated different names,
+/// however the client that created them addressed this emulator.
+#[tokio::test]
+async fn each_portal_is_generated_a_domain_name_of_its_own() {
+    let emulator = emulator();
+    let mut held: Vec<(String, String)> = Vec::new();
+    for row in domain_rows() {
+        let (portal_id, created) = portal_of_row(&emulator, &row).await;
+        let domain = default_domain_name(row.case, &created);
+        assert_domain_name(row.case, &domain);
+        assert!(
+            !held.iter().any(|(_, seen)| seen == &domain),
+            "case {:?}: the generated domain name {domain:?} is already held, by {held:?}",
+            row.case
+        );
+        held.push((portal_id, domain));
+    }
+    assert_eq!(
+        held.len(),
+        domain_rows().len(),
+        "expected one generated domain name per portal, got {held:?}"
+    );
+}
+
+/// The generated domain name is a name this emulator ANSWERS on, not decoration: a portal
+/// created through the emulator's own endpoint — a client that resolves no AWS host — is
+/// served its published page on the domain it was told about, and on that same endpoint with
+/// the portal behind the reserved path marker.
+#[tokio::test]
+async fn the_generated_domain_name_serves_the_portals_published_page() {
+    let case = "a portal created through the emulator's own endpoint";
+    let local_endpoint = "127.0.0.1:44539";
+    let emulator = emulator();
+    let (portal_id, created) = portal_of_row(
+        &emulator,
+        &DomainRow {
+            case,
+            host: local_endpoint,
+            region: REGION,
+            endpoint_configuration: || json!({ "none": {} }),
+            own_domain: None,
+        },
+    )
+    .await;
+    let domain = default_domain_name(case, &created);
+    assert_domain_name(case, &domain);
+
+    let (status, published) = call_at_host(
+        &emulator,
+        local_endpoint,
+        REGION,
+        "POST",
+        &format!("/v2/portals/{portal_id}/publish"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "case {case:?}: expected 202 from PublishPortal, got {status} {published}"
+    );
+
+    // Both addressings of the one portal: the generated domain name as the host, and the
+    // emulator's own endpoint with the portal behind the reserved path marker.
+    let addressings = [
+        ("the generated domain name", domain, "/".to_string()),
+        (
+            "the emulator's own endpoint with the portal in the path",
+            local_endpoint.to_string(),
+            format!("/_aws/portal/{portal_id}/"),
+        ),
+    ];
+    for (addressing, host, path) in addressings {
+        // The wait is for the CONDITION — the publish having settled and the page being
+        // served — and never for a fixed time; the poll is the data-plane suite's own.
+        let page = crate::portal_data_plane::fetch_path_until_served(
+            &emulator,
+            &format!("{case}: {addressing}"),
+            &host,
+            &path,
+        )
+        .await;
+        crate::portal_data_plane::served(&format!("{case}: {addressing}"), &page, &portal_id);
+    }
 }

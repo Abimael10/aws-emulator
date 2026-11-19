@@ -224,7 +224,7 @@ pub(crate) async fn call_in_region(
 /// `Host` for every service, and a client that resolves AWS's own hosts sends this
 /// service's. Both route here through the credential scope, and a value this service
 /// ANNOUNCES for a client to fetch follows the endpoint the request came in on — see
-/// `state::announced_portal_default_domain_name` — so a suite that asserts on such a value
+/// `state::announced_portal_site_base` — so a suite that asserts on such a value
 /// drives this directly.
 pub(crate) async fn call_at_host(
     emulator: &MultiServiceRouter,

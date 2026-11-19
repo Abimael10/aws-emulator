@@ -33,6 +33,16 @@ pub struct Portal {
     /// (its own, or API Gateway's default) and the response reports the default domain
     /// name and hosted zone id the service generated for it.
     pub endpoint_configuration: wire::EndpointConfigurationResponse,
+    /// The address this emulator ANNOUNCES this portal's website at, resolved once by the
+    /// create from the endpoint that request reached this emulator at
+    /// ([`announced_portal_site_base`]) and never rebuilt, so every URL-typed member that
+    /// sends a client to the portal (`Preview$PreviewUrl`) names one address for the life
+    /// of the record.
+    ///
+    /// It is NOT what `EndpointConfigurationResponse$PortalDefaultDomainName` reports:
+    /// that member is a domain name, so it is host labels only, while this address carries
+    /// the authority and path a client that resolves no AWS host has to fetch.
+    pub site_base: String,
     pub included_portal_product_arns: Vec<String>,
     /// The logo image URI the caller supplied, if any. Not a member of any modelled
     /// portal RESPONSE shape — the logo is reported through
@@ -291,7 +301,7 @@ impl Portal {
                     }
                     .to_string(),
                 ),
-                preview_url: Some(portal_preview_url(&settled.endpoint_configuration)),
+                preview_url: Some(portal_preview_url(&settled.site_base)),
                 // Nothing failed, so there is no exception to explain.
                 status_exception: ::std::option::Option::None,
             },

@@ -3968,24 +3968,47 @@ pub fn portal_arn(region: &str, portal_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("/portals/{portal_id}"))
 }
 
-/// The second label of the default domain API Gateway generates for a portal:
-/// `{portal-id}.portal.{region}.amazonaws.com`. CHOSEN, like the rest of that host (see
-/// [`portal_default_domain_name`]), and read back by the portal data plane for a request
-/// that carries the endpoint in its path.
+/// The segment that names a PORTAL's data plane behind [`LOCAL_ENDPOINT_PREFIX`]:
+/// `/_aws/portal/{portal-id}`. CHOSEN, and read back by the portal data plane for a request
+/// that carries the endpoint in its path, so the path a client is given and the path that is
+/// served cannot drift apart.
 pub const PORTAL_ENDPOINT_LABEL: &str = "portal";
+
+/// The parts of the host AWS generates for a portal, around the portal's own id and the
+/// Region it lives in: `p-{portal-id}.apigw-portal.{region}.on.aws`.
+///
+/// CARRIED from the answers AWS gives rather than chosen here — the same practice
+/// [`PORTAL_DOMAIN_HOSTED_ZONES`] follows for the zone those domains are aliased through —
+/// because a client reads this member to build the portal's URL and to point a DNS alias at
+/// it, and only the host AWS really generates has that form. The id and the Region are the
+/// portal's own; everything around them is this fixed text.
+const PORTAL_DEFAULT_DOMAIN_ID_PREFIX: &str = "p-";
+const PORTAL_DEFAULT_DOMAIN_LABEL: &str = "apigw-portal";
+const PORTAL_DEFAULT_DOMAIN_SUFFIX: &str = "on.aws";
 
 /// The default domain name API Gateway generates for a portal: the host a consumer
 /// reaches the portal on when the account brought no domain of its own
 /// (`EndpointConfigurationResponse$PortalDefaultDomainName`: "This domain name is
 /// generated and managed by API Gateway").
 ///
-/// AWS publishes no format for it, so the host follows this service's own convention
-/// for a generated endpoint host — `{resource-id}.{subdomain}.{region}.amazonaws.com`,
-/// as [`execute_api_endpoint`] builds for an api. What the member has to hold is a
-/// name that is unique to the portal, stable across reads and within the modelled
-/// 3..256 bound; the subdomain label is CHOSEN.
+/// The host is AWS's own form for it — `p-{portal-id}.apigw-portal.{region}.on.aws`, the
+/// parts of which are [`PORTAL_DEFAULT_DOMAIN_ID_PREFIX`],
+/// [`PORTAL_DEFAULT_DOMAIN_LABEL`] and [`PORTAL_DEFAULT_DOMAIN_SUFFIX`] — filled in with
+/// the portal's own id and the Region it lives in, so the name is unique to the portal,
+/// stable across reads and within the modelled 3..256 bound.
+///
+/// It is a DOMAIN NAME and nothing else: dot-separated host labels, with no scheme, no
+/// `:port` and no path segment, because that is what the member is FOR — a client prefixes
+/// a scheme to it to build the portal's URL and names it as the target of a DNS alias
+/// record, and an authority or a path in it makes both impossible. The address THIS
+/// EMULATOR serves the portal's website at, which does carry a port and a path for a client
+/// that resolves no AWS host, is [`announced_portal_site_base`], reported through the
+/// portal's URL-typed members instead.
 pub fn portal_default_domain_name(portal_id: &str, region: &str) -> String {
-    format!("{portal_id}.{PORTAL_ENDPOINT_LABEL}.{region}.amazonaws.com")
+    format!(
+        "{PORTAL_DEFAULT_DOMAIN_ID_PREFIX}{portal_id}.{PORTAL_DEFAULT_DOMAIN_LABEL}.\
+         {region}.{PORTAL_DEFAULT_DOMAIN_SUFFIX}"
+    )
 }
 
 /// The single path segment a portal's preview is served under, and the one
@@ -3997,19 +4020,19 @@ pub const PORTAL_PREVIEW_SEGMENT: &str = "preview";
 /// The URL a portal's preview is served on.
 ///
 /// A preview is the portal's own content served before anything is published, so it is
-/// served on the domain API Gateway generates and manages for the portal
-/// ([`portal_default_domain_name`]) rather than on a domain the account brought, which
+/// served on the portal's own website rather than on a domain the account brought, which
 /// need not resolve to the portal yet, under a path of its own.
+///
+/// `site_base` is the address this emulator announces that website at
+/// ([`announced_portal_site_base`]), which is where the preview can be fetched:
+/// `Preview$PreviewUrl` is a URL, so it carries the authority and path a client that
+/// resolves no AWS host needs, while the portal's generated DOMAIN NAME carries neither.
 ///
 /// AWS publishes no format for `Preview$PreviewUrl`, so the path label is CHOSEN; what
 /// the member has to hold is a URL that names THIS portal and is stable across reads,
-/// which it is because it is derived from the endpoint configuration the create
-/// resolved once.
-pub fn portal_preview_url(endpoint: &wire::EndpointConfigurationResponse) -> String {
-    format!(
-        "https://{}/{PORTAL_PREVIEW_SEGMENT}",
-        endpoint.portal_default_domain_name
-    )
+/// which it is because it is derived from the address the create resolved once.
+pub fn portal_preview_url(site_base: &str) -> String {
+    format!("https://{site_base}/{PORTAL_PREVIEW_SEGMENT}")
 }
 
 /// How many characters follow the leading `Z` of a hosted zone id, matching the
@@ -4135,41 +4158,42 @@ pub fn endpoint_hosted_zone_id(endpoint_type: &str, region: &str) -> String {
 /// carries the generated default domain name and its hosted zone id, and reports
 /// `DomainName`/`CertificateArn` only for the domain the account brought.
 ///
-/// The default domain is generated by [`announced_portal_default_domain_name`], which is
-/// where the choice between the two addresses it can name is explained.
+/// The default domain is the host [`portal_default_domain_name`] generates from the
+/// portal's own id and Region, whichever endpoint the request reached this emulator at:
+/// the member is a domain name, so it names no authority and no path.
 pub fn resolve_portal_endpoint_configuration(
     portal_id: &str,
     region: &str,
-    parts: &::http::request::Parts,
     requested: &wire::EndpointConfigurationRequest,
 ) -> wire::EndpointConfigurationResponse {
     portal_endpoint_configuration(
-        announced_portal_default_domain_name(portal_id, region, parts),
+        portal_default_domain_name(portal_id, region),
         portal_domain_hosted_zone_id(region),
         requested,
     )
 }
 
-/// The default domain this service ANNOUNCES for a portal: the address a consumer reaches
-/// that portal's website on, resolved ONCE when the portal is created and stored, so every
-/// later read reports the same value.
+/// The address this service ANNOUNCES a portal's WEBSITE at — the base of every URL-typed
+/// member that sends a client to it (`Preview$PreviewUrl`) — resolved ONCE when the portal
+/// is created and stored, so every later read reports the same value.
 ///
-/// Which address that is follows the endpoint the CREATE was addressed at, because the
-/// member exists for a client to fetch and a value nothing on the caller's machine resolves
-/// names no portal it can reach:
+/// A URL a client FETCHES has to lead back to this emulator, so which address it names
+/// follows the endpoint the CREATE was addressed at:
 ///
 /// * a request that addressed this service by one of AWS's own hosts comes from a client
-///   that resolves them, so the portal is announced on the generated host
-///   [`portal_default_domain_name`] builds — the shape
-///   `EndpointConfigurationResponse$PortalDefaultDomainName` documents;
+///   that resolves them, so the website is named on the portal's own generated domain
+///   ([`portal_default_domain_name`]), which the portal data plane claims host-style;
 /// * a request that addressed the EMULATOR'S OWN endpoint ([`local_endpoint_host`]) comes
-///   from a client that resolves nothing else, so the portal is announced on that same
-///   endpoint with its own path behind the [`LOCAL_ENDPOINT_PREFIX`] marker. This is the
-///   address the portal data plane serves, and the same shape this emulator's API Gateway
-///   (REST) stages are reached at (`/_aws/execute-api/{api-id}/{stage}`).
+///   from a client that resolves nothing else, so the website is named on that same
+///   endpoint with the portal's own path behind the [`LOCAL_ENDPOINT_PREFIX`] marker. This
+///   is the address the portal data plane serves there, and the same shape this emulator's
+///   API Gateway (REST) stages are reached at (`/_aws/execute-api/{api-id}/{stage}`).
 ///
-/// Both forms are within the modelled 3..256 bound of the member.
-pub fn announced_portal_default_domain_name(
+/// It is NOT `EndpointConfigurationResponse$PortalDefaultDomainName`: that member is a
+/// domain NAME and carries host labels only, whichever endpoint a caller reached this
+/// emulator at ([`portal_default_domain_name`]), so the authority and path the local form
+/// needs are carried here and reported through a URL instead.
+pub fn announced_portal_site_base(
     portal_id: &str,
     region: &str,
     parts: &::http::request::Parts,
@@ -4627,8 +4651,8 @@ pub fn execute_api_host(api_id: &str, region: &str) -> String {
 /// for a caller to invoke it at — `Api$ApiEndpoint` included.
 ///
 /// An announced address is one the caller DIALS, so it has to lead back to this emulator.
-/// Which address that is follows the same rule [`announced_portal_default_domain_name`]
-/// applies to a portal's website:
+/// Which address that is follows the same rule [`announced_portal_site_base`] applies to a
+/// portal's website:
 ///
 /// * a request that addressed the EMULATOR'S OWN endpoint
 ///   ([`reached_emulator_endpoint`]) comes from a client that resolves nothing else, so the

@@ -227,13 +227,13 @@ const CONDITION_DEADLINE: Duration = Duration::from_secs(60);
 /// it is served or [`CONDITION_DEADLINE`] passes, so neither a fast nor a loaded host changes
 /// what the case observes.
 async fn fetch_once_published(emulator: &MultiServiceRouter, case: &str, host: &str) -> Answer {
-    fetch_until(emulator, case, host, "the portal's page", |page| {
+    fetch_until(emulator, case, host, "/", "the portal's page", |page| {
         page.status == 200
     })
     .await
 }
 
-/// Fetch the root page of `host` until `holds` is true of the answer, and answer that fetch.
+/// Fetch `host` `path` until `holds` is true of the answer, and answer that fetch.
 /// `waited_for` names the condition in the failure message.
 ///
 /// The one poll-until reading in this suite: the page is asked for again until the condition
@@ -243,22 +243,38 @@ async fn fetch_until(
     emulator: &MultiServiceRouter,
     case: &str,
     host: &str,
+    path: &str,
     waited_for: &str,
     holds: impl Fn(&Answer) -> bool,
 ) -> Answer {
     let deadline = std::time::Instant::now() + CONDITION_DEADLINE;
     loop {
-        let page = fetch(emulator, host, "/").await;
+        let page = fetch(emulator, host, path).await;
         if holds(&page) {
             return page;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "case {case:?}: {host} never served {waited_for}, last answer {}",
+            "case {case:?}: {host}{path} never served {waited_for}, last answer {}",
             page.summary()
         );
         tokio::task::yield_now().await;
     }
+}
+
+/// Fetch `host` `path` until the portal's page is SERVED there, and answer that fetch —
+/// [`fetch_until`] on that one condition. Shared with `portal_lifecycle`, which waits on it
+/// too.
+pub(crate) async fn fetch_path_until_served(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    host: &str,
+    path: &str,
+) -> Answer {
+    fetch_until(emulator, case, host, path, "the portal's page", |page| {
+        page.status == 200
+    })
+    .await
 }
 
 /// One row: how the portal is created, and how the request addresses it.
@@ -590,6 +606,7 @@ async fn the_served_page_is_rendered_from_the_build_the_publish_made() {
         &emulator,
         case,
         &published.default_domain,
+        "/",
         "the republished build",
         |page| page.text.contains("Renamed Portal"),
     )
@@ -664,12 +681,14 @@ async fn the_preview_url_serves_the_portals_current_content_once_it_is_ready() {
     );
 }
 
-/// The domain a portal ANNOUNCES is an address the client that created it can reach: a
-/// create addressed at the emulator's own endpoint is announced on that endpoint, a create
-/// addressed at this service's AWS host on the generated AWS host, and in both cases the
-/// announced address is the one that serves the portal's page and its preview.
+/// The URL a portal ANNOUNCES for its preview is an address the client that created it can
+/// fetch: a create addressed at the emulator's own endpoint announces that endpoint with the
+/// portal behind the reserved path marker, a create addressed at this service's AWS host
+/// announces the generated domain, and either way the announced URL is where the preview is
+/// served — while `portalDefaultDomainName` stays the generated DOMAIN NAME, which carries
+/// no authority and no path (asserted over its own rows in `portal_lifecycle`).
 #[tokio::test]
-async fn a_portal_announces_the_endpoint_its_creator_can_reach() {
+async fn a_portal_announces_a_preview_url_its_creator_can_fetch() {
     // (case, the host CreatePortal was addressed at, whether that host is the emulator's
     // own endpoint)
     let cases: &[(&str, &str, bool)] = &[
@@ -705,24 +724,23 @@ async fn a_portal_announces_the_endpoint_its_creator_can_reach() {
             .get("endpointConfiguration")
             .cloned()
             .unwrap_or(Value::Null);
-        let announced = as_str(&endpoint, "portalDefaultDomainName");
-        let expected = if *local {
+        // The generated domain name is what the endpoint configuration reports, whichever
+        // endpoint this create was addressed at: it is a domain NAME.
+        let generated = crate::portal_lifecycle::generated_domain_name(&portal_id, REGION);
+        assert_eq!(
+            as_str(&endpoint, "portalDefaultDomainName"),
+            generated,
+            "case {case:?}: the portal must report its generated domain name, got {endpoint}"
+        );
+        // The address this emulator serves that portal's website at, which its URL-typed
+        // members name: the endpoint the creating client reached.
+        let announced = if *local {
             format!("{host}/_aws/portal/{portal_id}")
         } else {
-            format!("{portal_id}.portal.{REGION}.amazonaws.com")
+            generated.clone()
         };
-        assert_eq!(
-            announced, expected,
-            "case {case:?}: the portal must be announced at the endpoint its creator \
-             reaches, got {endpoint}"
-        );
-        // Either form is within the modelled 3..256 bound of the member.
-        assert!(
-            (3..=256).contains(&announced.chars().count()),
-            "case {case:?}: the announced domain must be a 3..256 string, got {announced:?}"
-        );
 
-        // And it is the address that SERVES the portal: a client that fetches what it was
+        // It is the address that SERVES the portal: a client that fetches what it was
         // announced reaches this portal's page once a publish has settled.
         let (host_part, path_part) = match announced.split_once('/') {
             Some((host, path)) => (host.to_string(), format!("/{path}/")),
@@ -736,8 +754,7 @@ async fn a_portal_announces_the_endpoint_its_creator_can_reach() {
             FORBIDDEN_MESSAGE,
         );
         build(&emulator, case, &portal_id, Build::Publish).await;
-        sleep(past_the_build());
-        let page = fetch(&emulator, &host_part, &path_part).await;
+        let page = fetch_path_until_served(&emulator, case, &host_part, &path_part).await;
         served(case, &page, &portal_id);
 
         // The preview URL the service announces is built from that same address, and the
@@ -755,7 +772,8 @@ async fn a_portal_announces_the_endpoint_its_creator_can_reach() {
             status, 202,
             "case {case:?}: PreviewPortal must answer 202, got {status} {started}"
         );
-        sleep(past_the_build());
+        // The preview URL is reported from the instant a preview was started, so the read
+        // below waits for nothing; what the PAGE waits on is polled further down.
         let (status, read) = call_at_host(
             &emulator,
             host,
@@ -778,13 +796,13 @@ async fn a_portal_announces_the_endpoint_its_creator_can_reach() {
             format!("https://{announced}/{PORTAL_PREVIEW_SEGMENT}"),
             "case {case:?}: the preview URL must name the announced address, got {read}"
         );
-        let page = fetch(
+        let preview_path =
+            format!("{}/{PORTAL_PREVIEW_SEGMENT}", path_part.trim_end_matches('/'));
+        let page = fetch_path_until_served(
             &emulator,
+            &format!("{case}: the preview"),
             &host_part,
-            &format!(
-                "{}/{PORTAL_PREVIEW_SEGMENT}",
-                path_part.trim_end_matches('/')
-            ),
+            &preview_path,
         )
         .await;
         served(&format!("{case}: the preview"), &page, &portal_id);
@@ -1001,12 +1019,16 @@ async fn a_domain_no_portal_reports_is_not_claimed() {
     let emulator = emulator();
     let published = portal(&emulator, case, open_portal()).await;
     build(&emulator, case, &published.portal_id, Build::Publish).await;
-    sleep(past_the_build());
+    // The condition this case needs is the portal's OWN domain serving its page — that is
+    // what makes "and these other hosts do not" mean anything — so it is polled for rather
+    // than waited out.
+    let page = fetch_path_until_served(&emulator, case, &published.default_domain, "/").await;
+    served(case, &page, &published.portal_id);
 
     let foreign = [
         (
             "another portal id's generated domain",
-            "zzzzzzzzzz.portal.eu-west-1.amazonaws.com".to_string(),
+            "p-zzzzzzzzzz.apigw-portal.eu-west-1.on.aws".to_string(),
             "/".to_string(),
         ),
         (
