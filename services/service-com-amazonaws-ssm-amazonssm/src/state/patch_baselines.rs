@@ -584,6 +584,22 @@ pub fn predefined_baseline_id(region: &str, name: &str) -> String {
     format!("{BASELINE_ID_PREFIX}{digits}")
 }
 
+/// Whether `id` has the form every patch baseline id is published in: [`BASELINE_ID_PREFIX`]
+/// followed by exactly [`BASELINE_ID_HEX_DIGITS`] lowercase hexadecimal digits, the spelling
+/// the service's own documented ids carry (`pb-0574b43a65ea646ed`).
+///
+/// This crate's one reading of that shape: what tells a baseline id apart from text that
+/// could never name one.
+#[must_use]
+pub fn is_baseline_id(id: &str) -> bool {
+    id.strip_prefix(BASELINE_ID_PREFIX).is_some_and(|digits| {
+        digits.len() == BASELINE_ID_HEX_DIGITS
+            && digits
+                .bytes()
+                .all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
 /// Mint the `BaselineId` of a baseline being created: [`BASELINE_ID_PREFIX`] followed by
 /// [`BASELINE_ID_HEX_DIGITS`] lowercase hex digits.
 ///

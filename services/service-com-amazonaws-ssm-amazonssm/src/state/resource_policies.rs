@@ -505,7 +505,7 @@ impl ResourcePolicyStore {
     /// policies, each with its own id.
     fn mint_policy_id(&mut self) -> String {
         self.minted += 1;
-        super::minted_uuid(now_nanos(), self.minted)
+        super::minted_uuid(super::ID_KIND_RESOURCE_POLICY, now_nanos(), self.minted)
     }
 }
 

@@ -21,6 +21,13 @@
 //! "Adds or overwrites one or more tags" (`AddTagsToResource`): a key the resource
 //! already carries takes the submitted value rather than appearing twice, which is what
 //! makes the set a map from key to value ([`merge_tags`]).
+//!
+//! The pair is read in two steps, and each step has its own refusal: the id is first read
+//! against the form the DECLARED type's ids are published in
+//! ([`resource_id_format_violation`]) — an id of another type's form names no resource of
+//! this type whatever the Region holds, so that is a refusal of the request — and only then
+//! resolved against the records the Region holds, where a well-formed id naming nothing is
+//! the messageless `InvalidResourceId`.
 
 use std::collections::BTreeMap;
 
@@ -62,6 +69,11 @@ pub const TAGGING_TYPE_AUTOMATION: &str = "Automation";
 /// operations read and rewrite.
 pub const TAGGING_TYPE_ASSOCIATION: &str = super::associations::TAGGING_TYPE_ASSOCIATION;
 
+/// The `ResourceTypeForTagging` value whose id is a Patch Manager baseline's minted id:
+/// "PatchBaseline: pb-012345abcde" (`AddTagsToResourceRequest$ResourceId`), from the same
+/// enum.
+pub const TAGGING_TYPE_PATCH_BASELINE: &str = "PatchBaseline";
+
 /// The `ResourceTypeForTagging` value whose id is a maintenance window's minted id
 /// (`super::maintenance_windows::TAGGING_TYPE_MAINTENANCE_WINDOW`, from the same enum):
 /// "MaintenanceWindow: mw-012345abcde" (`AddTagsToResourceRequest$ResourceId`), so the
@@ -73,6 +85,82 @@ pub const TAGGING_TYPE_MAINTENANCE_WINDOW: &str =
 /// (`AddTagsToResource`'s own doc). The same doc states one exception — "Automations can
 /// have a maximum of 5 tags" — which [`max_tags_for`] answers for.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The form the ids of one `ResourceTypeForTagging` are published in, written as the regular
+/// expression a refusal of a mis-shaped id states ([`resource_id_format_violation`]), or
+/// `None` for a type whose "ID of the resource" is a NAME or an ARN rather than an id of a
+/// fixed form (`Document` and `Parameter`, where "use the name of the resource", and
+/// `OpsMetadata`, addressed by the tail of its ARN) or an opaque id the service publishes no
+/// form for (`Automation`, whose `AutomationExecutionId` is modelled by its length alone, and
+/// `ManagedInstance`, whose `InstanceId` admits both an EC2 instance id and a hybrid
+/// activation's `mi-` id).
+///
+/// Each form is the one this crate already reads that type's ids by, so the sentence a refusal
+/// states and the check it is taken against cannot drift apart: a maintenance window
+/// ([`super::maintenance_windows::is_maintenance_window_id`]) and a patch baseline
+/// ([`super::patch_baselines::is_baseline_id`]) carry a prefix and a fixed count of lowercase
+/// hexadecimal digits, an OpsItem ([`super::ops_items::is_ops_item_id`]) likewise, and an
+/// association ([`super::associations::is_association_id`]) and a cloud connector
+/// ([`super::cloud_connectors::is_cloud_connector_id`]) the hyphenated hexadecimal groups
+/// their modelled patterns declare.
+#[must_use]
+pub fn resource_id_format(resource_type: &str) -> Option<&'static str> {
+    match resource_type {
+        TAGGING_TYPE_ASSOCIATION => Some(
+            "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        ),
+        TAGGING_TYPE_CLOUD_CONNECTOR => {
+            Some("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+        }
+        TAGGING_TYPE_MAINTENANCE_WINDOW => Some("mw-[0-9a-f]{17}"),
+        TAGGING_TYPE_OPS_ITEM => Some("oi-[0-9a-f]{12}"),
+        TAGGING_TYPE_PATCH_BASELINE => Some("pb-[0-9a-f]{17}"),
+        _ => None,
+    }
+}
+
+/// Whether `resource_id` has the form [`resource_id_format`] states for `resource_type`.
+fn resource_id_has_its_form(resource_type: &str, resource_id: &str) -> bool {
+    match resource_type {
+        TAGGING_TYPE_ASSOCIATION => super::associations::is_association_id(resource_id),
+        TAGGING_TYPE_CLOUD_CONNECTOR => {
+            super::cloud_connectors::is_cloud_connector_id(resource_id)
+        }
+        TAGGING_TYPE_MAINTENANCE_WINDOW => {
+            super::maintenance_windows::is_maintenance_window_id(resource_id)
+        }
+        TAGGING_TYPE_OPS_ITEM => super::ops_items::is_ops_item_id(resource_id),
+        TAGGING_TYPE_PATCH_BASELINE => super::patch_baselines::is_baseline_id(resource_id),
+        // A type whose ids have no published form constrains nothing here.
+        _ => true,
+    }
+}
+
+/// Why `(resource_type, resource_id)` names no resource that type could ever have, or `None`
+/// when the id has the form that type's ids are published in.
+///
+/// A tag request addresses a resource by `(ResourceType, ResourceId)`, so the id is read
+/// against the form the DECLARED type's ids carry — and that is a check on the REQUEST, taken
+/// before anything is looked up: an id of another type's form names no resource of this type
+/// whether or not this Region holds one under it, which is why the two refusals are different.
+/// A mis-shaped id is the format refusal worded below; a well-formed id the Region holds
+/// nothing under is the separate `InvalidResourceId`, which models no message at all. The one
+/// reading of that rule for every operation of the tag plane, so a write and a read of one
+/// resource cannot disagree about which ids its type admits.
+#[must_use]
+pub fn resource_id_format_violation(resource_type: &str, resource_id: &str) -> Option<String> {
+    let format = resource_id_format(resource_type)?;
+    (!resource_id_has_its_form(resource_type, resource_id))
+        .then(|| resource_id_format_message(format, resource_type))
+}
+
+/// How that refusal is worded: the form the type's ids have, then the type the request
+/// declared — fixed text around the two, so a caller is told which id form the type it named
+/// requires.
+#[must_use]
+pub fn resource_id_format_message(format: &str, resource_type: &str) -> String {
+    format!("resourceId should be in format {format} for resource type {resource_type}")
+}
 
 /// How many tags the resources of `resource_type` may carry.
 ///

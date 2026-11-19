@@ -1075,9 +1075,9 @@ async fn a_resume_token_naming_nothing_the_report_holds_is_refused() {
 }
 
 /// RULE: an association id that names none of the Region's associations is
-/// `AssociationDoesNotExist` — whose message, on the reads that resolve an association by the
-/// id their request carries, NAMES the association asked about — and an execution id that names
-/// none of the association's executions is `AssociationExecutionDoesNotExist`.
+/// `AssociationDoesNotExist` — whose message, on every operation that resolves an association
+/// by the id its request carries, NAMES the association asked about — and an execution id that
+/// names none of the association's executions is `AssociationExecutionDoesNotExist`.
 #[tokio::test]
 async fn an_id_that_resolves_to_nothing_is_refused() {
     let case = "an id that resolves to nothing";
@@ -1090,9 +1090,10 @@ async fn an_id_that_resolves_to_nothing_is_refused() {
         .map(|(execution_id, _, _)| execution_id.clone())
         .expect("the create dispatched a run");
 
-    // One row per READ that resolves an association by the id its request carries: every one of
-    // them refuses an id that resolves to nothing the same way, and names it.
-    let reads = |asked_about: &str| -> Vec<(&'static str, Value)> {
+    // One row per operation that resolves an association by the id its request carries —
+    // the reads of it and the writes that dispatch or change it: every one of them refuses
+    // an id that resolves to nothing the same way, and names it.
+    let addressed_by_id = |asked_about: &str| -> Vec<(&'static str, Value)> {
         vec![
             (
                 "DescribeAssociationExecutions",
@@ -1103,12 +1104,6 @@ async fn an_id_that_resolves_to_nothing_is_refused() {
                 json!({"AssociationId": asked_about, "ExecutionId": execution_id}),
             ),
             ("DescribeAssociation", json!({"AssociationId": asked_about})),
-        ]
-    };
-    // The operations that DISPATCH or change an association answer the error's own documented
-    // sentence instead, which names no id.
-    let writes = |asked_about: &str| -> Vec<(&'static str, Value)> {
-        vec![
             (
                 "StartAssociationsOnce",
                 json!({"AssociationIds": [asked_about]}),
@@ -1128,7 +1123,7 @@ async fn an_id_that_resolves_to_nothing_is_refused() {
         ("another Region's view of an id", OTHER_REGION, id.clone()),
     ];
     for (row, region, asked_about) in rows {
-        for (operation, body) in reads(&asked_about) {
+        for (operation, body) in addressed_by_id(&asked_about) {
             let (status, parsed) = call_in_region(&router, region, operation, &body).await;
             assert_eq!(
                 (status, error_code(&parsed).as_str()),
@@ -1141,21 +1136,6 @@ async fn an_id_that_resolves_to_nothing_is_refused() {
                 associations::association_does_not_exist(&asked_about),
                 "case {row:?} on {operation}: expected the refusal to name the association \
                  asked about, got {parsed:?}"
-            );
-        }
-        for (operation, body) in writes(&asked_about) {
-            let (status, parsed) = call_in_region(&router, region, operation, &body).await;
-            assert_eq!(
-                (status, error_code(&parsed).as_str()),
-                (400, "AssociationDoesNotExist"),
-                "case {row:?} on {operation}: expected the association refusal, got {status} \
-                 with {parsed:?}"
-            );
-            assert_eq!(
-                error_message(&parsed),
-                associations::ASSOCIATION_DOES_NOT_EXIST,
-                "case {row:?} on {operation}: expected the documented refusal sentence, got \
-                 {parsed:?}"
             );
         }
     }

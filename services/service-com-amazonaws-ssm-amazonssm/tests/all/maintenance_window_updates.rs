@@ -585,7 +585,11 @@ async fn an_update_is_held_to_the_rules_every_write_of_a_window_holds_to() {
             "a cron of five fields",
             json!({ "Schedule": "cron(0 8 1 * ?)" }),
             Some(
-                "The schedule is invalid. Verify your cron or rate expression and try again."
+                // A `cron(...)` body is refused by what its parse found: the body runs out
+                // of fields before the parser has read the ones it needs, so the parse
+                // failed at the body's end.
+                "Invalid CRON expression: error at position 9, details: Unexpected end of \
+                 expression."
                     .to_string(),
             ),
         ),

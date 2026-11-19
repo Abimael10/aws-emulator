@@ -47,24 +47,28 @@ const DOCUMENT_CONTENT: &str = r#"{
 
 /// The `ResourceTypeForTagging` values the model's enum declares
 /// (`smithy_query(query="shape", shape="ResourceTypeForTagging")`), each beside an id of
-/// the form `AddTagsToResourceRequest$ResourceId` documents for it: `mw-012345abcde` for
-/// a maintenance window, `pb-012345abcde` for a patch baseline,
-/// `example-c160-4567-8519-012345abcde` for an automation, the name for a document or a
-/// parameter, `mi-1a2b3c4d5e6f` for a managed node, and the ARN tail for an OpsMetadata
-/// object. Each id is well formed for its type and names nothing: the `OpsItem` row has
-/// the form the modelled `OpsItemId` pattern requires (`^(oi)-[0-9a-f]{12}$`), and the
-/// `CloudConnector` row the 36-character id a `CloudConnectorId` is.
+/// the form `AddTagsToResourceRequest$ResourceId` documents for it: `mw-` and `pb-` ids for
+/// a maintenance window and a patch baseline, `example-c160-4567-8519-012345abcde` for an
+/// automation, the name for a document or a parameter, an `mi-ID_number` id for a managed
+/// node, and the ARN tail for an OpsMetadata object. Each id is WELL FORMED for its type and
+/// names nothing, so a refusal of one is about the id naming no resource rather than about
+/// its form (`crate::state::tagging::resource_id_format`, which the mis-shaped ids of
+/// `all/tag_resource_id_format.rs` are refused by): the two prefixed ids carry the count of
+/// hexadecimal digits the service's own ids carry, the `OpsItem` row the form the modelled
+/// `OpsItemId` pattern requires (`^(oi)-[0-9a-f]{12}$`), the `Association` row the
+/// hyphenated form its modelled pattern requires, and the `CloudConnector` row the
+/// 36-character id a `CloudConnectorId` is.
 const TAGGABLE_TYPES: &[(&str, &str)] = &[
     ("Association", "aa112233-4455-6677-8899-aabbccddeeff"),
     ("Automation", "example-c160-4567-8519-012345abcde"),
     ("CloudConnector", "ffffffff-ffff-ffff-ffff-ffffffffffff"),
     ("Document", "ADocumentNobodyCreated"),
-    ("MaintenanceWindow", "mw-012345abcde"),
-    ("ManagedInstance", "mi-1a2b3c4d5e6f"),
+    ("MaintenanceWindow", "mw-0123456789abcdef0"),
+    ("ManagedInstance", "mi-1a2b3c4d5e6f78901"),
     ("OpsItem", "oi-0123456789ab"),
     ("OpsMetadata", "aws/ssm/MyGroup/appmanager"),
     ("Parameter", "/Tags/NobodyPutThis"),
-    ("PatchBaseline", "pb-012345abcde"),
+    ("PatchBaseline", "pb-0123456789abcdef0"),
 ];
 
 /// `AddTagsToResource`, returning `(status, body)`.

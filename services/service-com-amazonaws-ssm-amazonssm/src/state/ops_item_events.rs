@@ -185,7 +185,11 @@ impl ComAmazonawsSsmAmazonssmState {
             .created_at
             .duration_since(::std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        super::minted_uuid(since_epoch.as_nanos(), self.ops_item_event_sequence)
+        super::minted_uuid(
+            super::ID_KIND_OPS_ITEM_EVENT,
+            since_epoch.as_nanos(),
+            self.ops_item_event_sequence,
+        )
     }
 
     /// Append one event to `ops_item_id`'s trail in `region`, returning its event id.

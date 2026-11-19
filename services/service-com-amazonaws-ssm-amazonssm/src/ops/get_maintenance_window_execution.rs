@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMaintenanceWindowExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMaintenanceWindowExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Retrieve details about one execution of a maintenance window — one RUN of it, reached by
+//! the id that run was executed under. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMaintenanceWindowExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The answer is computed from the executions this service holds
+//! ([`crate::state::maintenance_window_executions`]): the id is resolved against the runs
+//! recorded for the Region the read was asked through, and what that record holds is what
+//! is reported. Nothing here mutates the store — a read must not change what a later caller
+//! sees.
+//!
+//! ## An id no execution is held under is REFUSED
+//!
+//! `WindowExecutionId`'s length and hexadecimal-group pattern are MODELLED, so the
+//! centralized walk has already refused anything that is not shaped like one; what is left
+//! is whether this endpoint holds a run under it. The operation models ONE client error for
+//! that — `DoesNotExistException` (HTTP 400), "the ID specified for a resource, such as a
+//! maintenance window or patch baseline, doesn't exist" — worded for the data store the id
+//! was looked for in ([`crate::state::maintenance_window_executions::WINDOW_EXECUTION_DOES_NOT_EXIST`]).
+//! An execution id and a window id are different id spaces, so a window's own id names no
+//! execution either.
+//!
+//! What records a run is stated where the records live: nothing in this emulator picks up a
+//! maintenance window's tasks, the way nothing picks up a command's invocations, so no run
+//! is recorded and no execution of one is invented.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +166,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMaintenanceWindowExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMaintenanceWindowExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMaintenanceWindowExecution"))
+        // `WindowExecutionId`'s length and pattern are MODELLED constraints, so the
+        // centralized walk has already refused anything outside them. What is left is
+        // whether this endpoint holds a run of a window under that id.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMaintenanceWindowExecutionErrorModeled::InternalServerError(InternalServerError {
+                message: Some(
+                    "the maintenance window execution store is unavailable".to_string(),
+                ),
+            })
+        })?;
+
+        // A maintenance window is reached through the endpoint of ONE Region, so a run of it
+        // is resolved against that Region's records — the signed credential scope's Region,
+        // never one from the request body.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        let Some(execution) = store.maintenance_window_execution(&region, &input.window_execution_id)
+        else {
+            return Err(
+                GetMaintenanceWindowExecutionErrorModeled::DoesNotExistException(
+                    DoesNotExistException {
+                        message: Some(
+                            crate::state::maintenance_window_executions::WINDOW_EXECUTION_DOES_NOT_EXIST
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(execution.to_get_output())
     }
 }

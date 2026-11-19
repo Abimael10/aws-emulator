@@ -386,6 +386,10 @@ pub mod maintenance_window_targets;
 /// the service puts there instead of the ones it was handed, and how a read addresses one.
 pub mod maintenance_window_tasks;
 
+/// The RUNS of a maintenance window: the record one of its executions is held as, and how a
+/// read addresses one by the id it was executed under.
+pub mod maintenance_window_executions;
+
 /// What an update that takes a `Replace` flag leaves behind: the one reading of an omitted
 /// member every such operation of this service holds to.
 pub mod replacing_update;
@@ -2289,6 +2293,17 @@ pub struct ComAmazonawsSsmAmazonssmState {
     pub maintenance_window_tasks:
         BTreeMap<(String, String), maintenance_window_tasks::MaintenanceWindowTaskRecord>,
 
+    /// Every execution of a maintenance window this service has recorded, keyed by
+    /// `(region, window execution id)`: a window runs at the endpoint of the Region it was
+    /// created in and each of its runs is identified there by the id that run was executed
+    /// under. A `BTreeMap` so a walk over them is stable and total. See
+    /// [`maintenance_window_executions`], which is also where what puts a record here —
+    /// and what does not — is stated.
+    pub maintenance_window_executions: BTreeMap<
+        (String, String),
+        maintenance_window_executions::MaintenanceWindowExecutionRecord,
+    >,
+
     /// Every Session Manager session, keyed by `(region, session id)`: a session is started
     /// through one Region's endpoint and is reached there by the id the start minted
     /// ([`sessions::mint_session_id`]). A `BTreeMap` so a report walks a stable, total
@@ -2347,6 +2362,7 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             maintenance_window_sequence: 0,
             maintenance_window_targets: BTreeMap::new(),
             maintenance_window_tasks: BTreeMap::new(),
+            maintenance_window_executions: BTreeMap::new(),
             sessions: BTreeMap::new(),
             // One key per store, from the system's randomness: see `parameter_pagination`.
             page_token_key: parameter_pagination::PageTokenKey::new(),
@@ -2457,7 +2473,7 @@ impl ComAmazonawsSsmAmazonssmState {
             .created_at
             .duration_since(::std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        minted_uuid(since_epoch.as_nanos(), self.minted_command_ids)
+        minted_uuid(ID_KIND_COMMAND, since_epoch.as_nanos(), self.minted_command_ids)
     }
 
     /// What `setting` holds at `region`'s endpoint.
@@ -3585,8 +3601,33 @@ impl ActivationRecord {
     }
 }
 
-/// This service's ONE minter of an opaque, UUID-shaped identifier: the Sha256 of an
-/// instant and a mint counter, rendered as a UUID.
+/// The kind of resource a `CommandId` identifies, as [`minted_uuid`] reads it.
+///
+/// The kinds below are the id SPACES this service mints into. Each one is a different kind
+/// of resource, identified by its own id and reached through its own operations, so an id
+/// of one kind names no resource of another however alike the two ids are shaped: a Run
+/// Command command id and an Automation execution id are both 36-character UUIDs and
+/// neither resolves in the other's API.
+pub const ID_KIND_COMMAND: &str = "command";
+
+/// The kind an automation execution's (and its step executions') id identifies
+/// ([`ID_KIND_COMMAND`]).
+pub const ID_KIND_AUTOMATION_EXECUTION: &str = "automation-execution";
+
+/// The kind an execution preview's id identifies ([`ID_KIND_COMMAND`]).
+pub const ID_KIND_EXECUTION_PREVIEW: &str = "execution-preview";
+
+/// The kind a resource policy's `PolicyId` identifies ([`ID_KIND_COMMAND`]).
+pub const ID_KIND_RESOURCE_POLICY: &str = "resource-policy";
+
+/// The kind an OpsItem event's id identifies ([`ID_KIND_COMMAND`]).
+pub const ID_KIND_OPS_ITEM_EVENT: &str = "ops-item-event";
+
+/// The kind an OpsItem related-item association's id identifies ([`ID_KIND_COMMAND`]).
+pub const ID_KIND_OPS_ITEM_RELATED_ITEM: &str = "ops-item-related-item";
+
+/// This service's ONE minter of an opaque, UUID-shaped identifier: the Sha256 of the kind
+/// of resource being identified, an instant and a mint counter, rendered as a UUID.
 ///
 /// Every id this service mints for a resource it creates goes through here — a
 /// `CommandId` ([`ComAmazonawsSsmAmazonssmState::mint_command_id`]), a resource policy's
@@ -3595,14 +3636,26 @@ impl ActivationRecord {
 /// (the group boundaries and the version and variant bits) is `service_common`'s one
 /// rendering of 16 opaque bytes, so neither is restated per caller.
 ///
+/// `kind` names the RESOURCE KIND the id is for ([`ID_KIND_COMMAND`] and its siblings), and
+/// it is part of the digest because every kind this service identifies holds its own mint
+/// counter: two kinds' counters stand at the same figure as often as not, so without the
+/// kind in the digest the first command and the first automation execution of one store
+/// would carry the SAME id and an operation that resolves one kind would resolve an id of
+/// the other. The kinds are disjoint id spaces — an id names a resource of one kind and of
+/// no other — which is what lets each operation refuse an id it does not own. The sibling
+/// minter of a prefixed hexadecimal id ([`minted_prefixed_hex_id`]) is kept disjoint the
+/// same way, by the prefix each kind's ids carry.
+///
 /// `seed_nanos` is an instant of the store's own (its creation, or now) and `counter` the
 /// number of ids that minter has handed out, so two ids of one run differ, consecutive
 /// ones are unrelated, and the value is not a count a caller can read off the wire.
 /// Nothing of the request is in it.
-pub fn minted_uuid(seed_nanos: u128, counter: u64) -> String {
+pub fn minted_uuid(kind: &str, seed_nanos: u128, counter: u64) -> String {
     use ::sha2::Digest;
 
     let mut digest = ::sha2::Sha256::new();
+    digest.update(kind.as_bytes());
+    digest.update([0u8]);
     digest.update(seed_nanos.to_be_bytes());
     digest.update(counter.to_be_bytes());
     let mut bytes = [0u8; 16];

@@ -69,9 +69,12 @@ const UNMINTED: [&str; 2] = [
     "ffffffff-ffff-4fff-bfff-ffffffffffff",
 ];
 
-/// AWS's own sentence for `AssociationDoesNotExist`: "The specified association doesn't
-/// exist." (`AssociationDoesNotExist$Message`).
-const DOES_NOT_EXIST: &str = "The specified association doesn't exist.";
+/// How `AssociationDoesNotExist` is worded where the request carries the id it could not
+/// resolve: "Association <AssociationId> does not exist." — fixed text around that id, so a
+/// call naming several associations says which of them is gone.
+fn does_not_exist(association_id: &str) -> String {
+    format!("Association {association_id} does not exist.")
+}
 
 /// Register a node of `region` the way its own registration would, carrying `tag_value` under
 /// [`TAG_KEY`] so a tag target selects it.
@@ -445,32 +448,43 @@ async fn an_id_the_region_holds_no_association_under_refuses_the_whole_request()
         elsewhere,
     ));
 
-    // (case, the ids one call names)
-    let rows: Vec<(&str, Vec<String>)> = vec![
-        ("an id nothing was minted under, alone", vec![UNMINTED[0].to_string()]),
+    // (case, the ids one call names, the first of them that resolves to nothing — which is
+    // the id the refusal names, the call being refused at the first id it cannot resolve)
+    let rows: Vec<(&str, Vec<String>, String)> = vec![
+        (
+            "an id nothing was minted under, alone",
+            vec![UNMINTED[0].to_string()],
+            UNMINTED[0].to_string(),
+        ),
         (
             "an unresolvable id first",
             vec![UNMINTED[0].to_string(), held[0].clone(), held[1].clone()],
+            UNMINTED[0].to_string(),
         ),
         (
             "an unresolvable id in the middle",
             vec![held[0].clone(), UNMINTED[1].to_string(), held[1].clone()],
+            UNMINTED[1].to_string(),
         ),
         (
             "an unresolvable id last",
             vec![held[0].clone(), held[1].clone(), held[2].clone(), UNMINTED[1].to_string()],
+            UNMINTED[1].to_string(),
         ),
         (
             "an association of another Region",
             vec![held[2].clone(), other_region_id.clone()],
+            other_region_id.clone(),
         ),
         (
             "every id unresolvable",
             vec![UNMINTED[0].to_string(), UNMINTED[1].to_string()],
+            UNMINTED[0].to_string(),
         ),
     ];
 
-    for (case, named) in &rows {
+    for (case, named, unresolvable) in &rows {
+        let expected = does_not_exist(unresolvable);
         let (status, body) = start(&router, REGION, named).await;
         assert_eq!(
             status, 400,
@@ -486,8 +500,8 @@ async fn an_id_the_region_holds_no_association_under_refuses_the_whole_request()
             .or_else(|| body["Message"].as_str())
             .unwrap_or("<no message>");
         assert_eq!(
-            message, DOES_NOT_EXIST,
-            "case {case:?}: expected {DOES_NOT_EXIST:?}, got {message:?}"
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
         // Nothing is dispatched for a refused request: every association it named beside the
         // unresolvable id, and every other one, still reports the run it already had.

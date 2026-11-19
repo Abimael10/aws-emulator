@@ -159,6 +159,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A resource lives in the Region its endpoint names, which is the signed
         // credential scope's — so an id is resolved against that Region's records.
         let region = crate::state::request_region(ctx.parts());
+
+        // The id is read against the form the DECLARED `ResourceType`'s ids are published in
+        // before anything is looked up, exactly as the write of a tag set reads it
+        // ([`crate::state::tagging::resource_id_format_violation`]): an id of another type's
+        // form names no resource of this type whatever this Region holds, so it is refused as
+        // a malformed request rather than as an id naming nothing.
+        if let Some(why) = crate::state::tagging::resource_id_format_violation(
+            &input.resource_type,
+            &input.resource_id,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
         let store = state.lock();
 
         // `InvalidResourceId` carries NO message member at all, so the error code is the

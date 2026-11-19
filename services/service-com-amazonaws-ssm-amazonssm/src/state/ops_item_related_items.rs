@@ -354,8 +354,11 @@ impl ComAmazonawsSsmAmazonssmState {
             .unwrap_or_default();
         loop {
             self.ops_item_related_item_sequence += 1;
-            let candidate =
-                super::minted_uuid(since_epoch.as_nanos(), self.ops_item_related_item_sequence);
+            let candidate = super::minted_uuid(
+                super::ID_KIND_OPS_ITEM_RELATED_ITEM,
+                since_epoch.as_nanos(),
+                self.ops_item_related_item_sequence,
+            );
             if !self
                 .ops_item_related_items
                 .keys()

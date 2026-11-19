@@ -1785,7 +1785,11 @@ impl ComAmazonawsSsmAmazonssmState {
             .created_at
             .duration_since(::std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        super::minted_uuid(since_epoch.as_nanos(), self.minted_automation_ids)
+        super::minted_uuid(
+            super::ID_KIND_AUTOMATION_EXECUTION,
+            since_epoch.as_nanos(),
+            self.minted_automation_ids,
+        )
     }
 
     /// Materialise everything the clock owes every automation execution at `now`: each

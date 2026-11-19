@@ -180,9 +180,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
-        let does_not_exist = || {
+        // The refusal NAMES the association the request asked about
+        // ([`crate::state::associations::association_does_not_exist`]), the way every read
+        // addressed by an `AssociationId` words it: the id is the one variable part of that
+        // sentence, so a caller tearing several associations down can tell WHICH one is
+        // gone. A request that addressed the association by the document and the node a
+        // create paired carried no id to name, so it is refused with the sentence that
+        // names none.
+        let does_not_exist = |association_id: Option<&str>| {
             DeleteAssociationErrorModeled::AssociationDoesNotExist(AssociationDoesNotExist {
-                message: Some(crate::state::associations::ASSOCIATION_DOES_NOT_EXIST.to_string()),
+                message: Some(association_id.map_or_else(
+                    || crate::state::associations::ASSOCIATION_DOES_NOT_EXIST.to_string(),
+                    crate::state::associations::association_does_not_exist,
+                )),
             })
         };
         // The two ways an association is addressed, read exactly as `DescribeAssociation`
@@ -198,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (Some(id), _, _) => id.to_string(),
             (None, Some(name), Some(instance_id)) => store
                 .association_of_node(&region, name, instance_id)
-                .ok_or_else(does_not_exist)?
+                .ok_or_else(|| does_not_exist(None))?
                 .association_id
                 .clone(),
             (None, _, _) => {
@@ -210,9 +220,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The specified association doesn't exist" (`AssociationDoesNotExist`): the removal
         // itself is what says whether this Region held one, so a delete naming an association
         // that is not there is refused rather than answered as a removal that removed
-        // nothing.
+        // nothing. The id the request resolved to is the one the refusal names — for a
+        // delete addressed by the document and the node, the pairing resolved an id above,
+        // and the association it named is the one being removed here.
         if !store.remove_association(&region, &association_id) {
-            return Err(does_not_exist().into());
+            return Err(does_not_exist(
+                non_empty(input.association_id.as_deref()).map(|_| association_id.as_str()),
+            )
+            .into());
         }
 
         Ok(DeleteAssociationOutput {})

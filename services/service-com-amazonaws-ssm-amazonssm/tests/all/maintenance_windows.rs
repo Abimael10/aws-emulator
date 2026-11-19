@@ -590,11 +590,23 @@ async fn a_schedule_states_a_cron_or_rate_expression() {
             "case {case:?}: expected a validation refusal, got {response}"
         );
         let message = error_message(&response);
-        assert_eq!(
-            message,
-            "The schedule is invalid. Verify your cron or rate expression and try again.",
-            "case {case:?}: the refusal is worded as this error class is, got {message:?}"
-        );
+        // A `cron(...)` body is refused by what its PARSE found — the position it failed at
+        // and the rule the expression broke, which
+        // `all/maintenance_window_schedule_refusals.rs` asserts in full, row by row; every
+        // other value that states no schedule is refused with this error class's own
+        // sentence, which is exact here.
+        if schedule.starts_with("cron(") {
+            assert!(
+                message.starts_with("Invalid CRON expression: error at position "),
+                "case {case:?}: a malformed cron states where its parse failed, got {message:?}"
+            );
+        } else {
+            assert_eq!(
+                message,
+                "The schedule is invalid. Verify your cron or rate expression and try again.",
+                "case {case:?}: the refusal is worded as this error class is, got {message:?}"
+            );
+        }
     }
 }
 

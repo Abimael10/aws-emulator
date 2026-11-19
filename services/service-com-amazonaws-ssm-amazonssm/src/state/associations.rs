@@ -168,21 +168,23 @@ pub const INVALID_SCHEDULE: &str =
 /// and TargetMaps can't be specified together" (`CreateAssociationRequest$TargetMaps`).
 pub const TARGETS_AND_TARGET_MAPS: &str = "Both Targets and TargetMaps can't be specified together";
 
-/// How this service states that an id names no association of the endpoint a READ of one was
-/// asked through: `AssociationDoesNotExist` NAMES the association the request asked about —
+/// How this service states that an id names no association of the endpoint a call was asked
+/// through: `AssociationDoesNotExist` NAMES the association the request asked about —
 /// "Association <AssociationId> does not exist." — where the fixed text is
 /// "Association … does not exist." and the variable part is the id the request carried, so a
 /// caller reading the refusal can tell which association is gone.
 ///
-/// THE ONE wording of that refusal for the reads that resolve an association by the id their
-/// request carries: `DescribeAssociation` and the two reads of an association's executions.
+/// THE ONE wording of that refusal for every operation that resolves an association by an id
+/// its request carries: the reads (`DescribeAssociation` and the two reads of an
+/// association's executions) and the writes (`DeleteAssociation`, `UpdateAssociation` and the
+/// dispatch of named associations).
 pub fn association_does_not_exist(association_id: &str) -> String {
     format!("Association {association_id} does not exist.")
 }
 
 /// The same refusal where no id is there to name, and where the operation answers the error's
-/// own documented sentence: a read addressed by the document and the node a create paired,
-/// which carries no association id, and the operations that DISPATCH or change an association.
+/// own documented sentence: a call addressed by the document and the node a create paired,
+/// which carries no association id.
 pub const ASSOCIATION_DOES_NOT_EXIST: &str = "The specified association doesn't exist.";
 
 /// How this service states an `AssociationVersion` the association does not hold.

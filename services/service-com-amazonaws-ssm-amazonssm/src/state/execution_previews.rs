@@ -516,7 +516,11 @@ impl ComAmazonawsSsmAmazonssmState {
             .created_at
             .duration_since(::std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        super::minted_uuid(since_epoch.as_nanos(), self.minted_execution_preview_ids)
+        super::minted_uuid(
+            super::ID_KIND_EXECUTION_PREVIEW,
+            since_epoch.as_nanos(),
+            self.minted_execution_preview_ids,
+        )
     }
 
     /// Materialise everything the clock owes every execution preview at `now`.

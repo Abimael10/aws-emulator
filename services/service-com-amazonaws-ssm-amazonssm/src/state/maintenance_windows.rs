@@ -32,7 +32,8 @@
 //! report of its upcoming executions can never disagree.
 //!
 //! The grammars are read by maintained parsers rather than by a hand-written one: the
-//! `cron` crate for a `cron(...)` body normalised by [`normalised_cron`], `chrono` for an
+//! workspace's one cron reading ([`::service_common::schedule_expression`], which parses a
+//! body through the `cron` crate and words what a refused one stopped on), `chrono` for an
 //! `at(...)` instant and for the ISO-8601 instants that bound a window, and `chrono-tz`
 //! for the IANA zone a window states its schedule in. A body carrying one of the
 //! wildcards this service's own cron dialect documents and that crate's grammar does not
@@ -117,8 +118,10 @@ const RATE_UNITS: &[(&str, u64)] = &[
 ];
 
 /// How many whitespace-separated fields a `cron(...)` body carries, from the same
-/// reference's cron table: Minutes, Hours, Day-of-month, Month, Day-of-week, Year — six.
-const CRON_FIELDS: usize = 6;
+/// reference's cron table: Minutes, Hours, Day-of-month, Month, Day-of-week, Year — six,
+/// which is the count the workspace's one cron reading declares
+/// ([`::service_common::schedule_expression::CRON_FIELDS`]).
+const CRON_FIELDS: usize = ::service_common::schedule_expression::CRON_FIELDS;
 
 /// The index of the day-of-month field among the six a `cron(...)` body carries.
 const DAY_OF_MONTH_FIELD: usize = 2;
@@ -134,10 +137,6 @@ const NO_SPECIFIC_VALUE_FIELDS: [usize; 2] = [DAY_OF_MONTH_FIELD, DAY_OF_WEEK_FI
 /// How many times one weekday can fall in a month, which is what the `<day-of-week>#<nth>`
 /// form may ask for: a 31-day month holds five of one weekday at most.
 const MAX_WEEKDAYS_IN_MONTH: u8 = 5;
-
-/// The field values the normalised seven-field expression carries for every field but the
-/// one under test, so a field is judged on its own.
-const NEUTRAL_CRON_FIELDS: [&str; CRON_FIELDS + 1] = ["0", "0", "0", "*", "*", "*", "*"];
 
 /// The format an `at(...)` body states its instant in: `at(yyyy-mm-ddThh:mm:ss)`, a local
 /// date and time with no zone offset, since the zone is `ScheduleTimezone`'s to state.
@@ -488,15 +487,26 @@ pub fn invalid_schedule_timezone_message(timezone: &str) -> String {
 /// The length bound (1..256) is modelled, so the boundary walk has already refused
 /// anything outside it by the time a handler runs. Both operations that WRITE a window's
 /// schedule are held to this one rule, so a schedule one accepts is one the other does.
+///
+/// A `cron(...)` body the service's cron parser cannot read is refused by what that PARSE
+/// found — the position it stopped at and the rule the field broke, which the shared reading
+/// of that parser's report words
+/// ([`::service_common::schedule_expression::seconds_first_cron_failure`]) — rather than by
+/// the class sentence, which is what a value stating no documented form at all is refused
+/// with: a caller debugging an expression is told which part of it the parser would not take.
 #[must_use]
-pub fn schedule_violation(schedule: &str) -> Option<&'static str> {
-    let readable = match form_of(schedule) {
-        Some((ScheduleForm::At, body)) => at_expression_states_an_instant(body),
-        Some((ScheduleForm::Rate, body)) => rate_period(body).is_some(),
-        Some((ScheduleForm::Cron, body)) => cron_expression_states_its_instants(body),
-        None => false,
-    };
-    (!readable).then_some(INVALID_SCHEDULE)
+pub fn schedule_violation(schedule: &str) -> Option<String> {
+    match form_of(schedule) {
+        Some((ScheduleForm::At, body)) => {
+            (!at_expression_states_an_instant(body)).then(|| INVALID_SCHEDULE.to_string())
+        }
+        Some((ScheduleForm::Rate, body)) => {
+            rate_period(body).is_none().then(|| INVALID_SCHEDULE.to_string())
+        }
+        Some((ScheduleForm::Cron, body)) => (!cron_expression_states_its_instants(body))
+            .then(|| ::service_common::schedule_expression::seconds_first_cron_failure(body)),
+        None => Some(INVALID_SCHEDULE.to_string()),
+    }
 }
 
 /// Refuse a `ScheduleTimezone` that names no time zone; `None` for an absent member (the
@@ -619,12 +629,13 @@ fn is_schedulable(seconds: u64) -> bool {
 /// Whether a `cron(...)` body states the instants it has to: six fields, each one the cron
 /// grammar reads in the place it stands.
 ///
-/// The `cron` crate reads the seven-field form (seconds first), so a literal `0` seconds
-/// field is prepended, and a `?` in the day-of-month or day-of-week field is the `*` that
-/// grammar spells the same statement with. A field stating one of this service's own
-/// dialect forms ([`names_service_wildcard`]) is a statement that grammar does not read at
-/// all, so it is accepted on the service's grammar instead of being refused on the
-/// parser's.
+/// The grammar and its reading of a field in its own place are the workspace's one cron
+/// reading ([`::service_common::schedule_expression`]), which also prepends the seconds field
+/// that grammar's seven-field form takes and reads a `?` in the day-of-month or day-of-week
+/// field as the `*` it spells the same statement with. What is this service's own is the
+/// DIALECT: a field stating one of the forms [`names_service_wildcard`] lists is a statement
+/// that grammar does not read at all, so it is accepted on the service's grammar instead of
+/// being refused on the parser's.
 fn cron_expression_states_its_instants(body: &str) -> bool {
     let fields: Vec<&str> = body.split_whitespace().collect();
     if fields.len() != CRON_FIELDS {
@@ -642,7 +653,7 @@ fn cron_expression_states_its_instants(body: &str) -> bool {
     // Every field reads on its own; the whole expression is read once more so a
     // combination of fields the grammar refuses is refused too — except for a body in this
     // service's own dialect, which that grammar cannot read as a whole either.
-    service_dialect || normalised_cron(&fields).parse::<::cron::Schedule>().is_ok()
+    service_dialect || ::service_common::schedule_expression::parse_cron(body).is_ok()
 }
 
 /// Whether `field`, standing at `index` among the six a `cron(...)` body carries, states one
@@ -681,33 +692,12 @@ fn names_service_wildcard(index: usize, field: &str) -> bool {
     false
 }
 
-/// The six documented fields as the seven-field expression the `cron` crate reads.
-fn normalised_cron(fields: &[&str]) -> String {
-    let mut expression = String::from(NEUTRAL_CRON_FIELDS[0]);
-    for (index, field) in fields.iter().enumerate() {
-        expression.push(' ');
-        expression.push_str(cron_field_as_parsed(index, field));
-    }
-    expression
-}
-
-/// One field as the `cron` crate's grammar reads it: `?` ("no specific value") is `*` in
-/// that grammar, in the two fields it is a statement in.
-fn cron_field_as_parsed(index: usize, field: &str) -> &str {
-    if field == "?" && NO_SPECIFIC_VALUE_FIELDS.contains(&index) {
-        "*"
-    } else {
-        field
-    }
-}
-
-/// Whether `field` is one the cron grammar reads in the place `index` names, judged by
-/// parsing it there with every other field neutral — so the answer is about that field and
-/// not about the rest of the expression.
+/// Whether `field` is one the cron grammar reads in the place `index` names among the six a
+/// `cron(...)` body carries — the workspace's one reading of a field in its own place
+/// ([`::service_common::schedule_expression::cron_field_parses`]), so the answer is about that
+/// field and not about the rest of the expression.
 fn cron_field_parses(index: usize, field: &str) -> bool {
-    let mut expression = NEUTRAL_CRON_FIELDS;
-    expression[index + 1] = cron_field_as_parsed(index, field);
-    expression.join(" ").parse::<::cron::Schedule>().is_ok()
+    ::service_common::schedule_expression::cron_field_parses(index, field)
 }
 
 /// The zone `timezone` names, or the default one when it names none — which the write path
@@ -746,12 +736,12 @@ impl WindowSchedule {
             (ScheduleForm::At, body) => at_instant(body, zone).map(Self::Once),
             (ScheduleForm::Rate, body) => rate_period(body).map(Self::Rate),
             (ScheduleForm::Cron, body) => {
-                let fields: Vec<&str> = body.split_whitespace().collect();
-                if fields.len() != CRON_FIELDS {
-                    return None;
-                }
-                normalised_cron(&fields)
-                    .parse()
+                // The documented six fields as the grammar reads them, through the
+                // workspace's one cron parse
+                // ([`::service_common::schedule_expression::parse_cron`]): a body that
+                // parse cannot read names no instant this module can compute, which is the
+                // body in this service's own dialect.
+                ::service_common::schedule_expression::parse_cron(body)
                     .ok()
                     .map(|parsed| Self::Cron(Box::new(parsed), zone))
             }
@@ -1415,12 +1405,76 @@ mod tests {
                  {violation:?}"
             );
             if let Some(message) = violation {
-                assert_eq!(
-                    message, INVALID_SCHEDULE,
-                    "case {case:?}: the refusal is worded as this error class is, got \
-                     {message:?}"
-                );
+                // A `cron(...)` body is refused by what its PARSE found — the position and
+                // the rule, which [`a_malformed_cron_states_where_and_why_it_failed`] asserts
+                // in full, row by row; every other unreadable value is refused with this
+                // error class's own sentence, which is exact here.
+                if schedule.starts_with("cron(") {
+                    assert!(
+                        message.starts_with("Invalid CRON expression: error at position "),
+                        "case {case:?}: a malformed cron states where its parse failed, got \
+                         {message:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        message, INVALID_SCHEDULE,
+                        "case {case:?}: the refusal is worded as this error class is, got \
+                         {message:?}"
+                    );
+                }
             }
+        }
+    }
+
+    /// A `cron(...)` body the parser will not read is refused by WHERE the parse stopped and
+    /// WHICH rule the field broke — the shared reading of that parser's report
+    /// ([`::service_common::schedule_expression::seconds_first_cron_failure`], whose own
+    /// suite spans every field and every kind of rule) — never by one sentence for every
+    /// malformed expression. The rows here differ along the kind of rule broken, so a window
+    /// schedule is shown to carry that report through.
+    #[test]
+    fn a_malformed_cron_states_where_and_why_it_failed() {
+        use ::service_common::schedule_expression::{
+            cron_parse_failure, NO_SPECIFIC_VALUE_DETAIL, NO_SPECIFIC_VALUE_POSITION,
+            UNEXPECTED_END_DETAIL, WHOLE_FIELD_POSITION,
+        };
+
+        // (case, cron body, position, detail)
+        let rows: [(&str, &str, i64, &str); 4] = [
+            (
+                "no specific value where the parser reads an hour",
+                "0 25 ? * MON *",
+                NO_SPECIFIC_VALUE_POSITION,
+                NO_SPECIFIC_VALUE_DETAIL,
+            ),
+            (
+                "an hour past the values an hour admits",
+                "0 0 99 * MON *",
+                WHOLE_FIELD_POSITION,
+                "Hour values must be between 0 and 23.",
+            ),
+            (
+                "a field of characters the grammar does not read",
+                "zzz 8 1 * MON *",
+                0,
+                "Illegal characters for this position: 'ZZZ'",
+            ),
+            (
+                "fewer fields than the parse needs",
+                "0 8 1 * ?",
+                9,
+                UNEXPECTED_END_DETAIL,
+            ),
+        ];
+
+        for (case, body, position, detail) in rows {
+            let expected = cron_parse_failure(position, detail);
+            let refusal = schedule_violation(&format!("cron({body})"));
+            assert_eq!(
+                refusal.as_deref(),
+                Some(expected.as_str()),
+                "case {case:?}: expected {expected:?}, got {refusal:?}"
+            );
         }
     }
 

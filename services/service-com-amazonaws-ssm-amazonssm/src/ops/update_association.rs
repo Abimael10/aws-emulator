@@ -345,9 +345,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::node_registration::settle_registrations(&*self.engine, &region);
         let mut store = state.lock();
 
+        // The refusal NAMES the association the request asked about, which this call always
+        // addresses by its `AssociationId`
+        // ([`crate::state::associations::association_does_not_exist`]).
         let does_not_exist = || {
             UpdateAssociationErrorModeled::AssociationDoesNotExist(AssociationDoesNotExist {
-                message: Some(crate::state::associations::ASSOCIATION_DOES_NOT_EXIST.to_string()),
+                message: Some(crate::state::associations::association_does_not_exist(
+                    &input.association_id,
+                )),
             })
         };
         // The association this call changes, and the two things about it that decide whether
