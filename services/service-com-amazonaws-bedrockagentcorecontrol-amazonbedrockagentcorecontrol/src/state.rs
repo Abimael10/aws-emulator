@@ -833,11 +833,13 @@ pub fn agent_runtime_endpoint_status_conflict(status: &str) -> ConflictException
 /// version it points to, the version it is actually serving, and the status the
 /// clock drives.
 ///
-/// The endpoint PINS a version: the runtime publishing another version does not
-/// move an endpoint onto it, so the version lives here rather than being read
-/// off the runtime at reporting time. The runtime's own id, name and ARN are NOT
-/// copied in — they are read from the runtime that holds the record, so one
-/// resource is never spelled two ways.
+/// An endpoint a CALLER created PINS a version: the runtime publishing another
+/// version does not move it, so the version lives here rather than being read
+/// off the runtime at reporting time. The one endpoint the SERVICE manages is
+/// the exception — it tracks the newest published version, which
+/// [`agent_runtime_default_endpoint`] is where that is written. The runtime's own
+/// id, name and ARN are NOT copied in — they are read from the runtime that holds
+/// the record, so one resource is never spelled two ways.
 #[derive(Debug, Clone)]
 pub struct AgentRuntimeEndpointRecord {
     /// The endpoint's own identifier (`AgentRuntimeEndpointId`), minted at
@@ -2045,10 +2047,16 @@ pub mod consent_portals;
 /// handler names `crate::state::…` for it exactly as it does for the resources
 /// beside it.
 pub mod online_evaluation_configs;
+/// The endpoint every agent runtime is created WITH: the service-managed one, how it
+/// tracks the runtime's newest published version, and why it does not block the
+/// runtime's own delete. Re-exported, so a handler names `crate::state::…` for it
+/// exactly as it does for the runtime that holds it.
+pub mod agent_runtime_default_endpoint;
 /// Whether this account may use the AgentCore Registry at all: the entitlement
 /// every registry call is decided by, and the out-of-band grant that is the only
 /// thing which gives an account one.
 pub mod registry_entitlement;
+pub use agent_runtime_default_endpoint::*;
 pub use api_key_credential_providers::*;
 pub use capacity_providers::*;
 pub use consent_portals::*;

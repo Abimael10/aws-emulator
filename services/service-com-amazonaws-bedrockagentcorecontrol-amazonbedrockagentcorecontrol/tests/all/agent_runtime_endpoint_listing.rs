@@ -15,7 +15,8 @@
 //! not-found error, an `agentRuntimeId` inside the modelled grammar that names no
 //! runtime of this account is answered the modelled success with an empty page, the
 //! modelled `ValidationException` being reserved for input that fails a modelled
-//! constraint.
+//! constraint. Every runtime holds the endpoint the service manages for it
+//! ([`MANAGED_ENDPOINT`]) from its create onward, so each listing reports that one too.
 //!
 //! Sources: `smithy_query(query="operation",operation="ListAgentRuntimeEndpoints,\
 //! CreateAgentRuntimeEndpoint,GetAgentRuntimeEndpoint")` for the routes, the success
@@ -48,11 +49,17 @@ const FIRST_VERSION: &str = "1";
 const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 100;
 
-/// The settle spans `src/state.rs` gives the runtime `CREATING` -> `READY` transition
-/// (`RUNTIME_SETTLE_DELAY`, 500 ms) and then the endpoint's own
-/// (`AGENT_RUNTIME_ENDPOINT_SETTLE_DELAY`, 3 s), plus a second of slack: an endpoint
-/// fronts a runtime version, so it is ready one span after the version it serves is.
-const PAST_ENDPOINT_SETTLE: Duration = Duration::from_millis(4_500);
+/// The endpoint the service manages for every agent runtime: it is established by
+/// `CreateAgentRuntime` itself, so every listing below reports it beside the endpoints the
+/// row created.
+const MANAGED_ENDPOINT: &str = "DEFAULT";
+
+/// How long a poll for a clock-owed transition keeps looking before giving up. Generous:
+/// it only bounds a hang, and the CONDITION is what each row waits for.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a poll waits between looks.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The members an `AgentRuntimeEndpoint` list entry and a `GetAgentRuntimeEndpoint`
 /// answer both carry (`smithy_query shape=AgentRuntimeEndpoint` against that operation's
@@ -319,10 +326,13 @@ async fn a_listing_reports_every_persisted_endpoint_in_name_order() {
         );
         let listing = answer.body;
 
+        // The managed endpoint is there from the create, so it is reported beside the
+        // endpoints this row created.
         let mut expected_names: Vec<String> = row
             .endpoints
             .iter()
             .map(|body| text(body, "/name"))
+            .chain(std::iter::once(MANAGED_ENDPOINT.to_string()))
             .collect();
         expected_names.sort();
         assert_eq!(
@@ -376,7 +386,11 @@ async fn pages_cover_every_endpoint_exactly_once() {
     for name in names {
         endpoint(&router, &runtime_id, &json!({"name": name})).await;
     }
-    let mut expected: Vec<String> = names.iter().map(|name| (*name).to_string()).collect();
+    let mut expected: Vec<String> = names
+        .iter()
+        .map(|name| (*name).to_string())
+        .chain(std::iter::once(MANAGED_ENDPOINT.to_string()))
+        .collect();
     expected.sort();
 
     for page_size in [
@@ -414,7 +428,7 @@ async fn pages_cover_every_endpoint_exactly_once() {
                 .map(ToString::to_string);
             calls += 1;
             assert!(
-                calls <= names.len() + 1,
+                calls <= expected.len() + 1,
                 "case {case:?}: the walk must end within one page per endpoint, got {calls} calls \
                  having walked {walked:?}"
             );
@@ -462,10 +476,18 @@ async fn max_results_outside_the_modelled_range_is_refused() {
             answer.body
         );
         if expected_status == 200 {
+            // The runtime holds the managed endpoint and the one this test created, in
+            // ascending name order, cut to the page size the row asked for.
+            let held = [MANAGED_ENDPOINT.to_string(), "only".to_string()];
+            let page: Vec<String> = held
+                .iter()
+                .take(max_results.max(0) as usize)
+                .cloned()
+                .collect();
             assert_eq!(
                 reported_names(&answer.body),
-                vec!["only".to_string()],
-                "case {case:?}: a page size inside the range reports the stored endpoint, got {}",
+                page,
+                "case {case:?}: a page size inside the range reports the stored endpoints, got {}",
                 answer.body
             );
         } else {
@@ -563,7 +585,10 @@ async fn a_runtime_this_account_does_not_hold_is_an_empty_page() {
     let still_held = list_endpoints(&router, &held, None, None).await;
     assert_eq!(
         (still_held.status, reported_names(&still_held.body)),
-        (200, vec!["held_endpoint".to_string()]),
+        (
+            200,
+            vec![MANAGED_ENDPOINT.to_string(), "held_endpoint".to_string()]
+        ),
         "case {:?}: the runtime this account does hold reports its endpoint, got {} with {}",
         "held runtime with one endpoint",
         still_held.status,
@@ -728,7 +753,7 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
     let resumed = list_endpoints(&router, &runtime_id, Some(1), Some(&token)).await;
     assert_eq!(
         (resumed.status, reported_names(&resumed.body)),
-        (200, vec!["second".to_string()]),
+        (200, vec!["first".to_string()]),
         "case {:?}: the token this listing issued resumes it after the entry the page ended on, \
          got {} with {}",
         "the token this listing issued",
@@ -766,6 +791,12 @@ async fn the_listing_reports_the_pinned_version_and_the_clock_owed_status() {
     );
     for entry in reported(&answer.body) {
         let name = text(&entry, "/name");
+        // The managed endpoint tracks the runtime rather than pinning a version, so the
+        // pin assertions below are about the endpoints this row created; what the managed
+        // one reports is asserted in `agent_runtime_default_endpoint`.
+        if name == MANAGED_ENDPOINT {
+            continue;
+        }
         let (_, pinned) = expected_pins
             .iter()
             .find(|(candidate, _)| *candidate == name)
@@ -789,9 +820,9 @@ async fn the_listing_reports_the_pinned_version_and_the_clock_owed_status() {
         );
     }
 
-    tokio::time::sleep(PAST_ENDPOINT_SETTLE).await;
-
-    let settled = list_endpoints(&router, &runtime_id, None, None).await;
+    // The transition is the clock's, so the suite LOOKS AGAIN until it holds rather than
+    // waiting a fixed span: how fast the host runs must not decide the outcome.
+    let settled = poll_until_every_endpoint_is_ready(&router, &runtime_id).await;
     assert_eq!(
         settled.status, 200,
         "the listing stays readable once the clock-owed transition is due, got {} with {}",
@@ -821,5 +852,26 @@ async fn the_listing_reports_the_pinned_version_and_the_clock_owed_status() {
                 read.body
             );
         }
+    }
+}
+
+/// Look again until every endpoint of `runtime_id` reports `READY`, which is what a caller
+/// polling a listing for the clock-owed transition does. Waits for the CONDITION, bounded
+/// only by [`SETTLE_DEADLINE`] so a stuck emulator still ends the test.
+async fn poll_until_every_endpoint_is_ready(
+    router: &MultiServiceRouter,
+    runtime_id: &str,
+) -> Answer {
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let answer = list_endpoints(router, runtime_id, None, None).await;
+        let entries = reported(&answer.body);
+        let ready = answer.status == 200
+            && !entries.is_empty()
+            && entries.iter().all(|entry| text(entry, "/status") == "READY");
+        if ready || std::time::Instant::now() >= deadline {
+            return answer;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }

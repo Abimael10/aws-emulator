@@ -11,10 +11,11 @@
 //! A change is served only on a SETTLED endpoint: one whose create or whose previous
 //! shift the clock still owes a transition for is in a transient status, and a second
 //! shift asked for then is this operation's modelled 409 — the endpoint has one live
-//! version, so two shifts cannot be in flight at once. An endpoint is addressed only
-//! THROUGH its runtime, so a runtime this account does not hold, an endpoint name that
-//! runtime does not hold and an `agentRuntimeVersion` the runtime never published are
-//! each the modelled 404. A request naming no version leaves the pin where it is, and one
+//! version, so two shifts cannot be in flight at once. What the request REFERENCES is
+//! resolved first, though: an endpoint is addressed only THROUGH its runtime, so a runtime
+//! this account does not hold, an endpoint name that runtime does not hold and an
+//! `agentRuntimeVersion` the runtime never published are each the modelled 404, whatever
+//! status the endpoint is in. A request naming no version leaves the pin where it is, and one
 //! naming no description leaves the description where it is.
 //!
 //! ## Shape of an operation
@@ -240,6 +241,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.endpoint_name)
             .ok_or_else(endpoint_not_found)?;
 
+        // `agentRuntimeVersion` names the version the endpoint is to serve from, so it
+        // has to be one the runtime actually published; naming none leaves the pin where
+        // it is, because an update changes what it names and nothing else.
+        //
+        // Resolved BEFORE the status gate below: what the request REFERENCES either
+        // exists or it does not, whatever the endpoint is busy with, so a version the
+        // runtime never published is reported as the not-found it is rather than as the
+        // conflict a shift in flight would be.
+        let target_version = match input.agent_runtime_version.as_deref() {
+            Some(requested) => {
+                runtime
+                    .version_for(Some(requested))
+                    .ok_or_else(version_not_found)?
+                    .version
+            }
+            None => endpoint.target_version,
+        };
+
         // One endpoint serves ONE version at a time, so a change is taken only while the
         // endpoint is settled: a create or an earlier shift the clock still owes a
         // transition for leaves it in a transient status, and a second shift asked for
@@ -253,18 +272,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `agentRuntimeVersion` names the version the endpoint is to serve from, so it
-        // has to be one the runtime actually published; naming none leaves the pin where
-        // it is, because an update changes what it names and nothing else.
-        let target_version = match input.agent_runtime_version.as_deref() {
-            Some(requested) => {
-                runtime
-                    .version_for(Some(requested))
-                    .ok_or_else(version_not_found)?
-                    .version
-            }
-            None => endpoint.target_version,
-        };
         // Until the shift is due the endpoint keeps serving what it serves now, which a
         // settled endpoint reports as the version it points at.
         let live_version = endpoint.target_version;

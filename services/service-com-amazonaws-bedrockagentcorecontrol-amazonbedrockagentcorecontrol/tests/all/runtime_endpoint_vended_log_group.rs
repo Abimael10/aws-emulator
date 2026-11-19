@@ -157,6 +157,18 @@ impl Emulator {
             .await
     }
 
+    /// `DELETE /runtimes/{agentRuntimeId}/runtime-endpoints/{endpointName}/` — the route
+    /// the model binds `DeleteAgentRuntimeEndpoint` to.
+    async fn delete_endpoint(&self, region: &str, runtime_id: &str, name: &str) -> Answer {
+        self.control(
+            "DELETE",
+            &format!("/runtimes/{runtime_id}/runtime-endpoints/{name}/"),
+            region,
+            None,
+        )
+        .await
+    }
+
     /// One CloudWatch Logs call (`awsJson1_1`, `Logs_20140328.<Operation>`) signed for
     /// `region`. The credential scope names `logs`, which is what the router claims on.
     async fn logs(&self, region: &str, operation: &str, body: &Value) -> Answer {
@@ -712,9 +724,15 @@ async fn deleting_the_runtime_retains_the_vended_groups_and_their_events() {
             }
         }
 
-        // The runtime goes, and its endpoints with it. (`DeleteAgentRuntimeEndpoint` is
-        // still a scaffold stub in this crate and removes nothing at all, so the delete
-        // this suite drives is the runtime's.)
+        // A runtime is not destroyed underneath a live endpoint, so the endpoint the
+        // caller created is torn down first and the runtime goes after it; the endpoint
+        // the service manages for the runtime goes with the runtime.
+        let deleted_endpoint = emulator.delete_endpoint(REGION, &runtime_id, endpoint).await;
+        assert_eq!(
+            deleted_endpoint.status, 202,
+            "case {case:?}: expected HTTP 202 from DeleteAgentRuntimeEndpoint, got {} and body {}",
+            deleted_endpoint.status, deleted_endpoint.body
+        );
         let deleted_runtime = emulator.delete_runtime(REGION, &runtime_id).await;
         assert_eq!(
             deleted_runtime.status, 202,

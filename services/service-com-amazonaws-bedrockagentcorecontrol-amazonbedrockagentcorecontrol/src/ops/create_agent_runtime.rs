@@ -14,7 +14,9 @@
 //! account, or whose trust policy does not let this service assume it, is refused the
 //! same way.
 //!
-//! A served create also VENDS the logs of the default endpoint it establishes: the
+//! A served create also ESTABLISHES the runtime's default endpoint — the
+//! service-managed endpoint that tracks the runtime's newest published version, so the
+//! runtime is invocable from this answer onward — and VENDS that endpoint's logs: the
 //! CloudWatch Logs group derived from the `agentRuntimeId` it mints and that endpoint's
 //! name exists from then on, with no retention and so with no expiry, and it belongs to the
 //! account rather than to the runtime — see [`crate::state::runtime_logs`].
@@ -330,6 +332,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_at: crate::state::timestamp(now),
                 status: version.status_at(now).to_string(),
             };
+            // The runtime is invocable from this answer onward and an invocation is
+            // addressed to an endpoint, so the create establishes the service's own:
+            // the endpoint that tracks the runtime's newest published version, which
+            // this create publishes as version 1. Every endpoint BESIDE it is a
+            // `CreateAgentRuntimeEndpoint` call of the caller's.
+            let default_endpoint = crate::state::managed_default_endpoint(
+                &region,
+                &agent_runtime_id,
+                store.mint_runtime_endpoint_id(
+                    &agent_runtime_id,
+                    crate::state::DEFAULT_RUNTIME_ENDPOINT,
+                    now,
+                ),
+                &version,
+                now,
+            );
             let record = crate::state::AgentRuntimeRecord {
                 agent_runtime_id: agent_runtime_id.clone(),
                 agent_runtime_arn,
@@ -338,9 +356,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 latest_version: version.version,
                 highest_version_published: version.version,
                 versions: [(version.version, version)].into_iter().collect(),
-                // A runtime is created with no endpoints: each one is its own
-                // `CreateAgentRuntimeEndpoint` call.
-                endpoints: Default::default(),
+                endpoints: [(
+                    default_endpoint.endpoint_name.clone(),
+                    default_endpoint,
+                )]
+                .into_iter()
+                .collect(),
                 tags: crate::state::sorted_map(input.tags),
                 workload_identity_details: output.workload_identity_details.clone(),
             };

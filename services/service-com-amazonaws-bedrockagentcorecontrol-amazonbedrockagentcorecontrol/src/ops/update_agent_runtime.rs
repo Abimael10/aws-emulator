@@ -6,6 +6,11 @@
 //! becomes version N+1 in [`crate::state`], the previous versions stay readable,
 //! and the clock owes the new version its `UPDATING` -> `READY` transition.
 //!
+//! A publish also MOVES the endpoint this service manages for the runtime onto the
+//! version it published — that endpoint is the address of whatever the runtime runs now
+//! ([`crate::state::AgentRuntimeRecord::track_published_version`]) — while every endpoint
+//! a caller created stays pinned to the version it named.
+//!
 //! The new version RUNS the artifact the request names, so a `codeConfiguration`
 //! artifact's object-storage location is resolved FIRST — a request naming an object
 //! that is not there is refused with the operation's modelled validation error and no
@@ -319,9 +324,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_at: crate::state::timestamp(version.last_updated_at),
             status: version.status_at(now).to_string(),
         };
+        let published_settles_at = version.settles_at;
         record.versions.insert(next_version, version);
         record.latest_version = next_version;
         record.highest_version_published = next_version;
+        // The service-managed endpoint is the address of whatever this runtime runs now,
+        // so the version just published is what it moves onto; the endpoints the caller
+        // created pin the versions they named and stay there.
+        record.track_published_version(next_version, published_settles_at, now);
 
         if let Some(token) = input.client_token {
             store.remember_client_token(

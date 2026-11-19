@@ -7,6 +7,13 @@
 //! `GetAgentRuntime` answers `ResourceNotFoundException` and `ListAgentRuntimes`
 //! no longer reports it.
 //!
+//! A removal of the RUNTIME is served only on a runtime that holds no endpoint a caller
+//! created: an endpoint is a stable address callers invoke, so it is torn down
+//! deliberately rather than destroyed underneath them, and a delete asked for while one is
+//! still attached is this operation's modelled 409 with nothing written. The endpoint this
+//! service manages itself ([`crate::state::is_service_managed_endpoint`]) is not the
+//! caller's to remove, so it never blocks the delete.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -186,7 +193,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(not_found)?;
 
         // A `version` query deletes that one version; without it the whole
-        // runtime goes, every version with it.
+        // runtime goes, every version with it — and so does the last version
+        // left, since a runtime holds no versions only by being gone.
+        let removes_the_runtime = match input.agent_runtime_version.as_deref() {
+            None => true,
+            Some(raw) => raw
+                .parse::<u32>()
+                .is_ok_and(|version| record.versions.contains_key(&version))
+                && record.versions.len() == 1,
+        };
+
+        // An endpoint is a stable address callers invoke, so a runtime is not
+        // destroyed underneath one: a delete that would remove a runtime still
+        // holding an endpoint a CALLER created is refused, nothing is written,
+        // and the caller deletes its endpoints first. The endpoint this service
+        // manages itself is not the caller's to remove, so it never blocks the
+        // delete; it goes when the runtime goes.
+        if removes_the_runtime && record.holds_caller_created_endpoints() {
+            return Err(DeleteAgentRuntimeErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::AGENT_RUNTIME_HAS_ENDPOINTS.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The version the request named, or every version the runtime holds.
         let deleted_version = match input.agent_runtime_version.as_deref() {
             Some(raw) => {
                 let requested = raw

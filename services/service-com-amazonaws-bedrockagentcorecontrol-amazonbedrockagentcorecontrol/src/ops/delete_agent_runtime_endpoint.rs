@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAgentRuntimeEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAgentRuntimeEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAgentRuntimeEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one endpoint from its agent runtime's record in [`crate::state`], so a later
+//! `GetAgentRuntimeEndpoint` answers `ResourceNotFoundException`,
+//! `ListAgentRuntimeEndpoints` no longer reports it, and a `DeleteAgentRuntime` the
+//! endpoint was blocking can go ahead.
+//!
+//! An endpoint is addressed only THROUGH its runtime, so both path labels name ONE
+//! endpoint: a runtime this account does not hold and an endpoint name that runtime does
+//! not hold are the same modelled 404, in the sentence every operation addressing an
+//! endpoint shares. The answer reports the endpoint it just removed in the status a
+//! deletion puts it in.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +162,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAgentRuntimeEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAgentRuntimeEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAgentRuntimeEndpoint"))
+        // This delete writes the agent runtime store only; `ctx` carries request metadata
+        // this operation needs none of.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAgentRuntimeEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the agent runtime store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // This route addresses ONE endpoint, by both of the identifiers it is named by, so
+        // the lookup that fails is the endpoint's whichever half of the pair names nothing:
+        // a runtime this account does not hold and an endpoint name that runtime does not
+        // carry are the same endpoint-level not-found, in the sentence every operation
+        // addressing an endpoint shares.
+        let not_found = || {
+            DeleteAgentRuntimeEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::agent_runtime_endpoint_not_found(
+                    &input.endpoint_name,
+                    &input.agent_runtime_id,
+                ),
+            )
+        };
+        let runtime = store
+            .agent_runtimes
+            .get_mut(&input.agent_runtime_id)
+            .ok_or_else(not_found)?;
+        let removed = runtime
+            .endpoints
+            .remove(&input.endpoint_name)
+            .ok_or_else(not_found)?;
+
+        Ok(DeleteAgentRuntimeEndpointOutput {
+            // The deletion is accepted (202) and carried out, so the endpoint this call
+            // just removed is reported in the status a deletion puts it in.
+            status: crate::state::STATUS_DELETING.to_string(),
+            agent_runtime_id: Some(input.agent_runtime_id.clone()),
+            endpoint_name: Some(removed.endpoint_name),
+        })
     }
 }
