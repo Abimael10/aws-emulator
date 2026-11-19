@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(position) =
                     store.notebook_metadata_page_position(&input.work_group, token)
                 else {
-                    return Err(invalid_request(crate::state::INVALID_NEXT_TOKEN));
+                    return Err(invalid_request(crate::state::page_token_malformed(token)));
                 };
                 position
             }

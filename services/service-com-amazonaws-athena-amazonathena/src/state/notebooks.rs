@@ -64,13 +64,15 @@ pub const MAX_NOTEBOOKS: usize = 100;
 /// other half of the bound [`MAX_NOTEBOOKS`] starts; see there.
 pub const MAX_NOTEBOOK_BYTES_TOTAL: usize = 64 * 1024 * 1024;
 
-/// The engine family whose workgroups run notebooks.
+/// The engine family whose workgroups run notebooks, named by the version prefix Athena
+/// gives it.
 ///
 /// Athena's two engine families are named by the engine versions `ListEngineVersions`
 /// reports: an Athena SQL workgroup selects an "Athena engine version", and an Apache
 /// Spark workgroup — the kind `ImportNotebook` documents it imports into, "a Spark enabled
-/// workgroup" — selects a PySpark one. The PREFIX is what identifies the family, so a
-/// workgroup on any PySpark engine version is Spark enabled.
+/// workgroup" — selects a PySpark one. Which family a version belongs to is answered in ONE
+/// place ([`engine_version_category`]); this constant is the PySpark line's own name, which
+/// is what that answer rests on for this family.
 pub const PYSPARK_ENGINE_VERSION_PREFIX: &str = "PySpark engine version";
 
 /// One notebook, as this service persists it.
@@ -273,14 +275,14 @@ pub fn new_notebook_id() -> String {
 
 /// Whether `record` is the Spark enabled workgroup a notebook can live in.
 ///
-/// The engine version the workgroup selected is what decides
-/// ([`PYSPARK_ENGINE_VERSION_PREFIX`]), and the three configuration members Athena
-/// documents as Spark-only say the same thing where a request set them instead:
-/// `ExecutionRole` ("This property applies only to Spark enabled workgroups"),
-/// `AdditionalConfiguration` ("a user defined JSON string that is passed to the notebook
-/// engine") and `EngineConfiguration` (the coordinator and executor DPU sizes a Spark
-/// session runs on). A workgroup carrying none of them runs Athena SQL, and holds no
-/// notebooks.
+/// The engine version the workgroup selected is what decides, through the ONE place this
+/// service names an engine family ([`engine_version_category`]), and the three
+/// configuration members Athena documents as Spark-only say the same thing where a request
+/// set them instead: `ExecutionRole` ("This property applies only to Spark enabled
+/// workgroups"), `AdditionalConfiguration` ("a user defined JSON string that is passed to
+/// the notebook engine") and `EngineConfiguration` (the coordinator and executor DPU sizes
+/// a Spark session runs on). A workgroup carrying none of them runs Athena SQL, and holds
+/// no notebooks.
 pub fn is_spark_enabled(record: &WorkGroupRecord) -> bool {
     let configuration = &record.configuration;
     let selected = configuration
@@ -288,7 +290,7 @@ pub fn is_spark_enabled(record: &WorkGroupRecord) -> bool {
         .as_ref()
         .and_then(|version| version.selected_engine_version.as_deref())
         .unwrap_or_default();
-    selected.starts_with(PYSPARK_ENGINE_VERSION_PREFIX)
+    engine_version_category(selected) == ENGINE_CATEGORY_SPARK
         || configuration.execution_role.is_some()
         || configuration.additional_configuration.is_some()
         || configuration.engine_configuration.is_some()

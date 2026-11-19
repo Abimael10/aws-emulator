@@ -21,8 +21,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    DEFAULT_EFFECTIVE_ENGINE_VERSION, ENGINE_VERSION_AUTO, ERROR_CODE_INVALID_INPUT,
-    INVALID_NEXT_TOKEN, PYSPARK_ENGINE_VERSION_PREFIX, SELECTABLE_ENGINE_VERSIONS,
+    page_token_malformed, DEFAULT_EFFECTIVE_ENGINE_VERSION, ENGINE_VERSION_AUTO,
+    ERROR_CODE_INVALID_INPUT, PYSPARK_ENGINE_VERSION_PREFIX, SELECTABLE_ENGINE_VERSIONS,
 };
 use service_common::page_tokens::AUTHENTICATOR_BYTES;
 use smithy_server_runtime::MultiServiceRouter;
@@ -280,8 +280,9 @@ async fn a_next_token_this_service_did_not_mint_names_no_page() {
         );
         assert_eq!(
             message(&refused),
-            INVALID_NEXT_TOKEN,
-            "case {case:?}: expected the sentence {INVALID_NEXT_TOKEN:?}, got {refused:?}"
+            page_token_malformed(&token),
+            "case {case:?}: expected the sentence {:?}, got {refused:?}",
+            page_token_malformed(&token)
         );
         assert_eq!(
             refused["AthenaErrorCode"].as_str(),

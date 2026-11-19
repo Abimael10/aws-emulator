@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => {
                 let Some(position) = store.tags_page_position(&input.resource_arn, token) else {
-                    return Err(invalid_request(crate::state::INVALID_NEXT_TOKEN));
+                    return Err(invalid_request(crate::state::page_token_malformed(token)));
                 };
                 position
             }

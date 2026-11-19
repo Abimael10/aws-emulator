@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(position) = store.work_groups_page_position(token) else {
                     return Err(ListWorkGroupsError::invalid_request(
                         crate::state::ERROR_CODE_INVALID_INPUT,
-                        crate::state::INVALID_NEXT_TOKEN,
+                        crate::state::page_token_malformed(token),
                     ));
                 };
                 position

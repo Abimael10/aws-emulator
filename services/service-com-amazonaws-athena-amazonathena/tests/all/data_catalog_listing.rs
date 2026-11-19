@@ -23,9 +23,9 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    DATA_CATALOG_STATUS_CREATE_COMPLETE, DATA_CATALOG_TYPE_FEDERATED, DATA_CATALOG_TYPE_GLUE,
-    DATA_CATALOG_TYPE_HIVE, DATA_CATALOG_TYPE_LAMBDA, ERROR_CODE_INVALID_INPUT,
-    GLUE_DATA_CATALOG_NAME, INVALID_NEXT_TOKEN,
+    page_token_malformed, DATA_CATALOG_STATUS_CREATE_COMPLETE, DATA_CATALOG_TYPE_FEDERATED,
+    DATA_CATALOG_TYPE_GLUE, DATA_CATALOG_TYPE_HIVE, DATA_CATALOG_TYPE_LAMBDA,
+    ERROR_CODE_INVALID_INPUT, GLUE_DATA_CATALOG_NAME,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -336,7 +336,7 @@ async fn a_token_this_listing_did_not_mint_is_refused() {
         );
         assert_eq!(
             message(&body),
-            INVALID_NEXT_TOKEN,
+            page_token_malformed(&token),
             "case {case:?}: expected the sentence for a token that names no page, got {:?}",
             message(&body)
         );

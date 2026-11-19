@@ -250,17 +250,6 @@ pub fn named_query_not_found(id: &str) -> String {
     format!("NamedQuery: {id} does not exist")
 }
 
-/// The message `ListNamedQueries` refuses a `NextToken` it did not mint with.
-///
-/// Amazon Athena words a pagination-token refusal per OPERATION — this listing's wording is
-/// the fixed text `The nextPageToken is malformed: ` with the token the CALLER supplied as its
-/// one variable part, so a client reads back the token this listing would not resume from. Not
-/// the sentence the other paginated listings of this service answer with
-/// ([`super::INVALID_NEXT_TOKEN`]), which is why it is worded here rather than shared.
-pub fn named_queries_page_token_malformed(token: &str) -> String {
-    format!("The nextPageToken is malformed: {token}")
-}
-
 /// The refusal message for a create that would take `work_group` past
 /// [`MAX_NAMED_QUERIES_PER_WORK_GROUP`].
 pub fn too_many_named_queries(work_group: &str) -> String {

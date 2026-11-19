@@ -24,9 +24,9 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    could_not_find_resource, reserved_tag_key_message, ARN_ACCOUNT_MISMATCH,
+    could_not_find_resource, page_token_malformed, reserved_tag_key_message, ARN_ACCOUNT_MISMATCH,
     CAPACITY_RESERVATION_RESOURCE_TYPE, DATA_CATALOG_RESOURCE_TYPE, DEFAULT_WORK_GROUP,
-    INVALID_NEXT_TOKEN, MAX_TAGS_PER_RESOURCE, RESERVED_TAG_KEY_PREFIX, TAG_TEXT_PUNCTUATION,
+    MAX_TAGS_PER_RESOURCE, RESERVED_TAG_KEY_PREFIX, TAG_TEXT_PUNCTUATION,
     WORK_GROUP_RESOURCE_TYPE,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -909,8 +909,9 @@ async fn a_listing_pages_the_tags_a_resource_holds() {
         );
         assert_eq!(
             message(&body),
-            INVALID_NEXT_TOKEN,
-            "case {case:?}: expected the message {INVALID_NEXT_TOKEN:?}, got {body:?}"
+            page_token_malformed(token),
+            "case {case:?}: expected the message {:?}, got {body:?}",
+            page_token_malformed(token)
         );
     }
 }

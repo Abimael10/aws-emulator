@@ -4,8 +4,9 @@
 //! same router the emulator boots (awsJson1_1, `x-amz-target: AmazonAthena.<Operation>`), so
 //! every assertion is about what an SDK client observes.
 //!
-//! THE RULE UNDER TEST: Amazon Athena words a pagination-token refusal per OPERATION, and this
-//! listing's wording is the fixed text `The nextPageToken is malformed: ` followed by the token
+//! THE RULE UNDER TEST: Amazon Athena words a pagination-token refusal the same way for every
+//! one of its paginated reads, and that wording is the fixed text
+//! `The nextPageToken is malformed: ` followed by the token
 //! exactly as the request carried it — so a client reads back the token the listing would not
 //! resume from. The refusal is this operation's own `InvalidRequestException` (HTTP 400,
 //! `smithy_query(query="operation",operation="ListNamedQueries")`), and it writes nothing: the
@@ -152,8 +153,8 @@ async fn a_token_this_listing_did_not_mint_is_refused_naming_that_token() {
         );
         assert_eq!(
             crate::harness::message(&refused),
-            state::named_queries_page_token_malformed(token),
-            "case {case:?}: expected the wording this listing states a token refusal in, got \
+            state::page_token_malformed(token),
+            "case {case:?}: expected the wording this service states a token refusal in, got \
              {refused:?}"
         );
     }

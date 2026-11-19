@@ -283,11 +283,16 @@ impl WorkGroupRecord {
     /// includes its name, state, description, and the date and time it was created", so
     /// every member it carries is projected from this same record — the listing reports no
     /// value the detailed read ([`Self::to_work_group`]) would not.
+    ///
+    /// The description is one of those four members and is therefore always reported:
+    /// `WorkGroupDescriptionString` is 0 to 1024 characters, so a workgroup nobody gave a
+    /// description to has the EMPTY one rather than none, and a client reading a summary
+    /// can tell that from a member it was not told about.
     pub fn to_summary(&self) -> WorkGroupSummary {
         WorkGroupSummary {
             name: Some(self.name.clone()),
             state: Some(self.state.clone()),
-            description: self.description.clone(),
+            description: Some(self.description.clone().unwrap_or_default()),
             creation_time: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             engine_version: self.configuration.engine_version.clone(),
             // Filled only for an IAM Identity Center enabled workgroup, whose Identity
@@ -390,6 +395,11 @@ pub fn default_work_group_record(created_at: SystemTime) -> WorkGroupRecord {
 /// dropped, and the effective version is the selected one, or
 /// [`DEFAULT_EFFECTIVE_ENGINE_VERSION`] when the selection is
 /// [`ENGINE_VERSION_AUTO`] (or absent, AUTO being the documented default).
+///
+/// The engine FAMILY is read only in the same way, and is decided here as well: it follows
+/// from the version the query or session actually runs on, so it is derived from the
+/// effective version through [`engine_version_category`] rather than taken from the
+/// request.
 pub fn resolved_engine_version(requested: Option<&EngineVersion>) -> EngineVersion {
     let selected = requested
         .and_then(|version| version.selected_engine_version.clone())
@@ -400,6 +410,7 @@ pub fn resolved_engine_version(requested: Option<&EngineVersion>) -> EngineVersi
         selected.clone()
     };
     EngineVersion {
+        category: Some(engine_version_category(&effective).to_string()),
         selected_engine_version: Some(selected),
         effective_engine_version: Some(effective),
     }
@@ -2248,7 +2259,16 @@ pub fn results_not_readable(state: &str) -> String {
 }
 
 /// The message a paginated read refuses a `NextToken` it did not mint with.
-pub const INVALID_NEXT_TOKEN: &str = "Invalid NextToken is provided";
+///
+/// Amazon Athena calls that value a nextPageToken inside this sentence and words the
+/// refusal the same way for every one of its paginated reads: the fixed text
+/// `The nextPageToken is malformed: ` with the token the CALLER supplied as its one
+/// variable part, so a client — or an operator reading a log — reads back exactly the value
+/// no listing would resume from. The ONE place it is worded, so no listing of this service
+/// can drift onto a sentence of its own.
+pub fn page_token_malformed(token: &str) -> String {
+    format!("The nextPageToken is malformed: {token}")
+}
 
 /// The separator inside a page cursor. A unit separator, which no identifier, workgroup
 /// name or decimal position can contain, so the parts of a cursor can never run together.

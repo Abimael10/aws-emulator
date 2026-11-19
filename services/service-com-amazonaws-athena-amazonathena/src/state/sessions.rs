@@ -428,6 +428,8 @@ impl SessionRecord {
                 selected_engine_version: self.engine_version.clone(),
                 // Read only, and ignored on the way in: the resolution decides it.
                 effective_engine_version: None,
+                // Decided by the resolution too, from the version it resolves to.
+                category: None,
             }))),
             notebook_version: self.notebook_version.clone(),
             status: Some(self.to_session_status(now)),

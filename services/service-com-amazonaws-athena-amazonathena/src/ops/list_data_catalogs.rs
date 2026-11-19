@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(position) = store.data_catalogs_page_position(token) else {
                     return Err(ListDataCatalogsError::invalid_request(
                         crate::state::ERROR_CODE_INVALID_INPUT,
-                        crate::state::INVALID_NEXT_TOKEN,
+                        crate::state::page_token_malformed(token),
                     ));
                 };
                 position

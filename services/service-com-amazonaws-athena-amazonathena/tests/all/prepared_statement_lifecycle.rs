@@ -15,10 +15,10 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    no_prepared_statement_with_name, prepared_statement_already_exists,
+    no_prepared_statement_with_name, page_token_malformed, prepared_statement_already_exists,
     prepared_statement_does_not_exist, prepared_statement_name_not_found,
     prepared_statement_not_found, too_many_prepared_statement_names, too_many_prepared_statements,
-    ERROR_CODE_INVALID_INPUT, ERROR_CODE_STATEMENT_NOT_FOUND, INVALID_NEXT_TOKEN,
+    ERROR_CODE_INVALID_INPUT, ERROR_CODE_STATEMENT_NOT_FOUND,
     MAX_PREPARED_STATEMENTS_PER_WORK_GROUP, MAX_PREPARED_STATEMENT_NAMES_PER_BATCH,
     WORK_GROUP_NOT_FOUND,
 };
@@ -1288,22 +1288,22 @@ async fn a_listing_refuses_an_absent_workgroup_and_a_token_it_did_not_mint() {
         (
             "a token that is not even the shape of a minted one",
             json!({ "WorkGroup": WORK_GROUP, "NextToken": "not-a-token" }),
-            INVALID_NEXT_TOKEN.to_string(),
+            page_token_malformed("not-a-token"),
         ),
         (
             "a token of the right form that this service never minted",
             json!({ "WorkGroup": WORK_GROUP, "NextToken": "00112233445566778899aabb" }),
-            INVALID_NEXT_TOKEN.to_string(),
+            page_token_malformed("00112233445566778899aabb"),
         ),
         (
             "a token minted for another workgroup's listing",
             json!({ "WorkGroup": WORK_GROUP, "NextToken": neighbours_token }),
-            INVALID_NEXT_TOKEN.to_string(),
+            page_token_malformed(&neighbours_token),
         ),
         (
             "a token minted for another listing of this account",
             json!({ "WorkGroup": WORK_GROUP, "NextToken": work_groups_token }),
-            INVALID_NEXT_TOKEN.to_string(),
+            page_token_malformed(&work_groups_token),
         ),
     ];
 

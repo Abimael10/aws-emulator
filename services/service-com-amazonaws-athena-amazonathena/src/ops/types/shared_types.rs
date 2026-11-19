@@ -218,6 +218,7 @@ pub struct ResultReuseInformation {
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#EngineVersion")]
 #[derive(Debug, Clone, Default)]
 pub struct EngineVersion {
+    pub category: Option<String>,
     pub selected_engine_version: Option<String>,
     pub effective_engine_version: Option<String>,
 }

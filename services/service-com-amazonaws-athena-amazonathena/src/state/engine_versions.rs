@@ -42,6 +42,39 @@ pub const SELECTABLE_ENGINE_VERSIONS: &[&str] = &[
     PYSPARK_ENGINE_VERSION,
 ];
 
+/// The engine family of Athena's SQL engine versions: the Presto-derived engine the
+/// `Athena engine version N` line runs queries on, and the family the Auto option
+/// resolves into.
+pub const ENGINE_CATEGORY_PRESTO: &str = "Presto";
+
+/// The engine family of Athena's Spark engine versions, the one a Spark enabled workgroup
+/// runs its sessions and notebooks on.
+pub const ENGINE_CATEGORY_SPARK: &str = "Spark";
+
+/// What a version name carries when it names a member of the Spark family: Athena names
+/// every one of them after Spark (`PySpark engine version 3`, `Apache Spark version 3.5`)
+/// and no SQL version after anything but Athena's own engine line, so this one word is
+/// what tells the two families apart — the PySpark line's own name
+/// ([`PYSPARK_ENGINE_VERSION_PREFIX`]) carries it too. Matched without regard to ASCII
+/// case, for the reason the catalog's other name comparisons are.
+const SPARK_FAMILY_MARKER: &str = "spark";
+
+/// The engine family `version` belongs to: [`ENGINE_CATEGORY_SPARK`] for a version naming
+/// Athena's Spark engine ([`SPARK_FAMILY_MARKER`]), and [`ENGINE_CATEGORY_PRESTO`] for
+/// every other one — the Athena SQL line and the Auto option, which resolves into it.
+///
+/// The ONE place this service decides a family, so the family a listing publishes for a
+/// version cannot drift from the family reported for a workgroup or a session running that
+/// same version, nor from the family that decides whether a workgroup holds notebooks
+/// ([`is_spark_enabled`]).
+pub fn engine_version_category(version: &str) -> &'static str {
+    if version.to_ascii_lowercase().contains(SPARK_FAMILY_MARKER) {
+        ENGINE_CATEGORY_SPARK
+    } else {
+        ENGINE_CATEGORY_PRESTO
+    }
+}
+
 /// The catalog as the modelled `EngineVersion` entries a listing reports: each selectable
 /// version beside the version it resolves to.
 ///
@@ -56,6 +89,8 @@ pub fn selectable_engine_versions() -> Vec<EngineVersion> {
                 selected_engine_version: Some((*selected).to_string()),
                 // Read only, and ignored on the way in: the resolution decides it.
                 effective_engine_version: None,
+                // Decided by the resolution too, from the version it resolves to.
+                category: None,
             }))
         })
         .collect()

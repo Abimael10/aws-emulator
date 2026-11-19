@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let Some(position) = store.executions_page_position(&work_group, token) else {
                         return Err(ListQueryExecutionsError::invalid_request(
                             crate::state::ERROR_CODE_INVALID_INPUT,
-                            crate::state::INVALID_NEXT_TOKEN,
+                            crate::state::page_token_malformed(token),
                         ));
                     };
                     position

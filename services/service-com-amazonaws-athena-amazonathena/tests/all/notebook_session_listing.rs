@@ -31,8 +31,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    self, SessionRecord, ERROR_CODE_INVALID_INPUT, ERROR_CODE_NOTEBOOK_NOT_FOUND,
-    INVALID_NEXT_TOKEN, NOTEBOOK_TYPE_IPYNB,
+    self, page_token_malformed, SessionRecord, ERROR_CODE_INVALID_INPUT,
+    ERROR_CODE_NOTEBOOK_NOT_FOUND, NOTEBOOK_TYPE_IPYNB,
 };
 use service_common::page_tokens::AUTHENTICATOR_BYTES;
 use smithy_server_runtime::MultiServiceRouter;
@@ -739,8 +739,9 @@ async fn a_next_token_this_service_did_not_mint_names_no_page() {
         );
         assert_eq!(
             message(&refused),
-            INVALID_NEXT_TOKEN,
-            "case {case:?}: expected the sentence {INVALID_NEXT_TOKEN:?}, got {refused:?}"
+            page_token_malformed(&token),
+            "case {case:?}: expected the sentence {:?}, got {refused:?}",
+            page_token_malformed(&token)
         );
         assert_eq!(
             refused["AthenaErrorCode"].as_str(),

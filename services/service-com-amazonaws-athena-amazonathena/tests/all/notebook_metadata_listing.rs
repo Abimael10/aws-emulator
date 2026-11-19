@@ -19,7 +19,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    self, ERROR_CODE_INVALID_INPUT, INVALID_NEXT_TOKEN, NOTEBOOK_TYPE_IPYNB,
+    self, page_token_malformed, ERROR_CODE_INVALID_INPUT, NOTEBOOK_TYPE_IPYNB,
     PYSPARK_ENGINE_VERSION,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -367,7 +367,7 @@ async fn a_listing_is_paged_and_a_token_it_did_not_mint_is_refused() {
             status,
             &refused,
             ERROR_CODE_INVALID_INPUT,
-            INVALID_NEXT_TOKEN,
+            &page_token_malformed(&token),
         );
     }
 

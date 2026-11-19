@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::ops::types::WORK_GROUP_STATE_VALUES;
 use service_com_amazonaws_athena_amazonathena::state::{
-    self, DEFAULT_EFFECTIVE_ENGINE_VERSION, ENGINE_VERSION_AUTO,
+    self, engine_version_category, DEFAULT_EFFECTIVE_ENGINE_VERSION, ENGINE_VERSION_AUTO,
     MAX_WORK_GROUP_CONFIGURATION_BYTES, QUERY_EXECUTION_COMPLETION, WORK_GROUP_STATE_DISABLED,
     WORK_GROUP_STATE_ENABLED,
 };
@@ -654,6 +654,9 @@ async fn the_effective_engine_version_is_resolved_on_update_rather_than_echoed()
         assert_eq!(
             reported,
             json!({
+                // The engine family is resolved beside the versions, from the version the
+                // queries run on.
+                "Category": engine_version_category(effective),
                 "SelectedEngineVersion": selected,
                 "EffectiveEngineVersion": effective,
             }),

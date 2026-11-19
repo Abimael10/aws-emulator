@@ -29,8 +29,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_athena_amazonathena::state::{
-    self, EXECUTOR_STATE_CREATING, EXECUTOR_STATE_REGISTERED, EXECUTOR_TYPE_COORDINATOR,
-    IDEMPOTENT_PARAMETERS_DO_NOT_MATCH, INVALID_NEXT_TOKEN, PYSPARK_ENGINE_VERSION,
+    self, page_token_malformed, EXECUTOR_STATE_CREATING, EXECUTOR_STATE_REGISTERED,
+    EXECUTOR_TYPE_COORDINATOR, IDEMPOTENT_PARAMETERS_DO_NOT_MATCH, PYSPARK_ENGINE_VERSION,
     SESSION_NOT_FOUND, SESSION_STATE_CREATING, SESSION_STATE_IDLE, SESSION_STATE_TERMINATED,
     SESSION_STATE_TERMINATING, WORK_GROUP_NOT_FOUND,
 };
@@ -982,6 +982,7 @@ async fn sessions_are_listed_newest_first_and_paged() {
         ),
     ];
     for (case, work_group, token) in bogus {
+        let expected_message = page_token_malformed(&token);
         let (status, refused) = call(
             &router,
             "ListSessions",
@@ -990,11 +991,7 @@ async fn sessions_are_listed_newest_first_and_paged() {
         .await;
         assert_eq!(
             (status, error_code(&refused), message(&refused)),
-            (
-                400,
-                INVALID_REQUEST.to_string(),
-                INVALID_NEXT_TOKEN.to_string()
-            ),
+            (400, INVALID_REQUEST.to_string(), expected_message),
             "case {case:?}: expected the token to name no page, got {status} with {refused:?}"
         );
     }

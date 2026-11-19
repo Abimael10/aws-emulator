@@ -18,8 +18,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    DEFAULT_EFFECTIVE_ENGINE_VERSION, DEFAULT_WORK_GROUP, ENGINE_VERSION_AUTO,
-    ERROR_CODE_INVALID_INPUT, INVALID_NEXT_TOKEN, WORK_GROUP_STATE_DISABLED,
+    page_token_malformed, DEFAULT_EFFECTIVE_ENGINE_VERSION, DEFAULT_WORK_GROUP,
+    ENGINE_VERSION_AUTO, ERROR_CODE_INVALID_INPUT, WORK_GROUP_STATE_DISABLED,
     WORK_GROUP_STATE_ENABLED,
 };
 use service_common::page_tokens::AUTHENTICATOR_BYTES;
@@ -244,12 +244,13 @@ async fn every_registered_work_group_is_listed_with_what_the_writes_persisted() 
             "case {:?}: expected the state {expected_state}, got {group:?}",
             row.case
         );
+        // A workgroup nobody described has the empty description, not an absent member.
+        let expected_description = row.description.unwrap_or_default();
         assert_eq!(
             group["Description"].as_str(),
-            row.description,
-            "case {:?}: expected the description {:?}, got {group:?}",
-            row.case,
-            row.description
+            Some(expected_description),
+            "case {:?}: expected the description {expected_description:?}, got {group:?}",
+            row.case
         );
         let expected_selected = row.selected_engine_version.unwrap_or(ENGINE_VERSION_AUTO);
         let expected_effective = row
@@ -421,10 +422,11 @@ async fn a_next_token_this_service_did_not_mint_names_no_page() {
             "InvalidRequestException",
             "case {case:?}: expected InvalidRequestException, got {refused:?}"
         );
+        let expected_message = page_token_malformed(&token);
         assert_eq!(
             message(&refused),
-            INVALID_NEXT_TOKEN,
-            "case {case:?}: expected the sentence {INVALID_NEXT_TOKEN:?}, got {refused:?}"
+            expected_message,
+            "case {case:?}: expected the sentence {expected_message:?}, got {refused:?}"
         );
         assert_eq!(
             refused["AthenaErrorCode"].as_str(),

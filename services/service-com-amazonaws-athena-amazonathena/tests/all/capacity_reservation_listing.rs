@@ -21,10 +21,11 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    self, CapacityReservationRecord, CANCELLED_CAPACITY_RESERVATION_RETENTION, CAPACITY_ALLOCATION,
-    CAPACITY_RESERVATION_STATUS_ACTIVE, CAPACITY_RESERVATION_STATUS_CANCELLED,
-    CAPACITY_RESERVATION_STATUS_CANCELLING, CAPACITY_RESERVATION_STATUS_PENDING,
-    CAPACITY_RESERVATION_STATUS_UPDATE_PENDING, ERROR_CODE_INVALID_INPUT, INVALID_NEXT_TOKEN,
+    self, page_token_malformed, CapacityReservationRecord, CANCELLED_CAPACITY_RESERVATION_RETENTION,
+    CAPACITY_ALLOCATION, CAPACITY_RESERVATION_STATUS_ACTIVE,
+    CAPACITY_RESERVATION_STATUS_CANCELLED, CAPACITY_RESERVATION_STATUS_CANCELLING,
+    CAPACITY_RESERVATION_STATUS_PENDING, CAPACITY_RESERVATION_STATUS_UPDATE_PENDING,
+    ERROR_CODE_INVALID_INPUT,
 };
 use service_common::page_tokens::AUTHENTICATOR_BYTES;
 use smithy_server_runtime::MultiServiceRouter;
@@ -697,8 +698,9 @@ async fn a_next_token_this_service_did_not_mint_names_no_page() {
         );
         assert_eq!(
             message(&refused),
-            INVALID_NEXT_TOKEN,
-            "case {case:?}: expected the sentence {INVALID_NEXT_TOKEN:?}, got {refused:?}"
+            page_token_malformed(&token),
+            "case {case:?}: expected the sentence {:?}, got {refused:?}",
+            page_token_malformed(&token)
         );
         assert_eq!(
             refused["AthenaErrorCode"].as_str(),
