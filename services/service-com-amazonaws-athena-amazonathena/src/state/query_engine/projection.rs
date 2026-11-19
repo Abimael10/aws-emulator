@@ -24,8 +24,12 @@
 //! engine's, and what this reading contributes is the name and the type the projected
 //! expression has.
 
-use ::sqlparser::ast::{Expr, Function, Query, SelectItem, SetExpr, Statement as SqlStatement};
+use ::sqlparser::ast::{
+    BinaryOperator, DataType, Expr, Function, Query, SelectItem, SetExpr, Statement as SqlStatement,
+    UnaryOperator, Value as SqlValue,
+};
 
+use super::exact_decimal::EXACT_DECIMAL_FUNCTION;
 use super::ColumnType;
 use crate::state::catalog_sql::statement::{parse_statements, unnamed_column};
 
@@ -123,16 +127,101 @@ fn projected_items(sql: &str) -> Option<Vec<SelectItem>> {
 
 /// The type `expression` has whatever it evaluates to, where Athena's own signature for it
 /// gives it one.
+///
+/// Four readings, each a property of the EXPRESSION and not of a value:
+///
+/// * a CAST names the type its value is read to, which is the type the column has;
+/// * a BOOLEAN-valued expression — the `TRUE`/`FALSE` literal, a comparison, a logical
+///   operator, a null or range test — is boolean, however the engine under [`super`] stores
+///   the answer (it has no boolean type and answers 1 and 0);
+/// * an exact-decimal reading ([`super::exact_decimal`]) is the `DECIMAL` of the precision
+///   and scale that reading names;
+/// * a function whose result type Athena fixes ([`FIXED_RESULT_FUNCTIONS`]) has that type.
 fn fixed_type_of(expression: &Expr) -> Option<ColumnType> {
     match expression {
         // A parenthesised expression is the expression inside it.
         Expr::Nested(inner) => fixed_type_of(inner),
         Expr::Function(function) => fixed_result_type(function),
+        Expr::Cast { data_type, .. } => cast_type(data_type),
+        Expr::Value(value) => matches!(value.value, SqlValue::Boolean(..))
+            .then_some(ColumnType::Boolean),
+        // Every operator below answers a truth value: the comparisons, the logical
+        // connectives and the tests a predicate is written with.
+        Expr::BinaryOp { op, .. } if answers_a_truth_value(op) => Some(ColumnType::Boolean),
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            ..
+        } => Some(ColumnType::Boolean),
+        Expr::IsNull(..)
+        | Expr::IsNotNull(..)
+        | Expr::IsTrue(..)
+        | Expr::IsNotTrue(..)
+        | Expr::IsFalse(..)
+        | Expr::IsNotFalse(..)
+        | Expr::IsDistinctFrom(..)
+        | Expr::IsNotDistinctFrom(..)
+        | Expr::Between { .. }
+        | Expr::Like { .. }
+        | Expr::ILike { .. }
+        | Expr::InList { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Exists { .. } => Some(ColumnType::Boolean),
         _ => None,
     }
 }
 
-/// The fixed result type of `function`, if it is one of [`FIXED_RESULT_FUNCTIONS`].
+/// Whether `op` answers a TRUTH VALUE whatever it is applied to: the comparison operators
+/// and the logical connectives, each of which Athena types boolean.
+fn answers_a_truth_value(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::And
+            | BinaryOperator::Or
+            | BinaryOperator::Xor
+    )
+}
+
+/// The type a CAST's target names, as the result set reports it — `None` for a type this
+/// engine computes no value of, which is left to the value the run produced.
+///
+/// The integer widths are reported as the width this engine holds them at, which is the type
+/// a column DECLARED in one of them reports as well
+/// (`crate::state::catalog_sql::data::engine_type`), so one type name is reported for a value
+/// whichever of the two named it. The exact-numeric type is not here: a cast to it is read as
+/// the digits it has ([`super::exact_decimal`]), and the reading that replaces it is what
+/// types the column.
+fn cast_type(data_type: &DataType) -> Option<ColumnType> {
+    match data_type {
+        DataType::Boolean | DataType::Bool => Some(ColumnType::Boolean),
+        DataType::TinyInt(..)
+        | DataType::SmallInt(..)
+        | DataType::Int(..)
+        | DataType::Integer(..) => Some(ColumnType::Integer),
+        DataType::BigInt(..) => Some(ColumnType::BigInt),
+        DataType::Float(..)
+        | DataType::Real
+        | DataType::Double(..)
+        | DataType::DoublePrecision => Some(ColumnType::Double),
+        DataType::Char(..)
+        | DataType::Varchar(..)
+        | DataType::CharVarying(..)
+        | DataType::Text
+        | DataType::String(..) => Some(ColumnType::VarChar),
+        DataType::Binary(..) | DataType::Varbinary(..) | DataType::Blob(..) => {
+            Some(ColumnType::VarBinary)
+        }
+        _ => None,
+    }
+}
+
+/// The fixed result type of `function`, if it is one of [`FIXED_RESULT_FUNCTIONS`] or the
+/// exact-decimal reading, whose type is the precision and scale it was called with.
 ///
 /// The name is the LAST part of the function's name — a qualified name names the same
 /// function — read without its quoting and folded, because a function name is matched
@@ -145,10 +234,39 @@ fn fixed_result_type(function: &Function) -> Option<ColumnType> {
         .to_string()
         .trim_matches('"')
         .to_ascii_lowercase();
+    if name == EXACT_DECIMAL_FUNCTION {
+        return exact_decimal_type(function);
+    }
     FIXED_RESULT_FUNCTIONS
         .iter()
         .find(|(fixed, _)| *fixed == name.as_str())
         .map(|(_, column_type)| *column_type)
+}
+
+/// The `DECIMAL` type an exact-decimal reading produces: the precision and the scale its
+/// call names, which the rewriting that built the call wrote as whole numbers.
+fn exact_decimal_type(function: &Function) -> Option<ColumnType> {
+    use ::sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments};
+
+    let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
+        return None;
+    };
+    let [_, precision, scale] = &args[..] else {
+        return None;
+    };
+    let whole = |argument: &FunctionArg| -> Option<i32> {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) = argument else {
+            return None;
+        };
+        let SqlValue::Number(digits, _) = &value.value else {
+            return None;
+        };
+        digits.parse::<i32>().ok()
+    };
+    Some(ColumnType::Decimal {
+        precision: whole(precision)?,
+        scale: whole(scale)?,
+    })
 }
 
 #[cfg(test)]

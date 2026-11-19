@@ -44,7 +44,17 @@ visible with the code rather than only in a review:
   column, expression-depth and compound-select limits. One run is additionally bounded by
   a wall-clock deadline and a step budget enforced from the engine's progress handler, and
   the retained result set is capped in rows, cells and bytes. `load_extension` is not an
-  enabled feature of the dependency, so it is not reachable from this crate at all.
+  enabled feature of the dependency, so it is not reachable from this crate at all. The one
+  SQL function this crate registers of its own (`src/state/query_engine/exact_decimal.rs`,
+  the EXACT-NUMERIC reading Athena's `DECIMAL` type needs and this engine has no counterpart
+  for) computes in this process over the digits a value carries, reaches nothing outside the
+  database, and is bounded twice before it rescales anything: the declaration it is called
+  with carries a precision of 1 to 38 and a scale no larger than it, and both the text of a
+  value and the number that text denotes are refused past the digits this emulator reads one
+  to — so neither the scale a statement declares nor the magnitude of a value it names
+  decides how many digits this process builds. A value that does not FIT the declared
+  precision at that scale fails the statement rather than being reported, which is what the
+  type means.
   `tests/all/query_execution_lifecycle.rs` asserts that the SQL which would reach the host
   ends the query FAILED, carrying a reason with no host path in it.
 * **Where it runs, and what it holds.** The engine is synchronous and CPU-bound, so a
@@ -80,7 +90,11 @@ visible with the code rather than only in a review:
 * **What it does not do yet.** A table a statement defines in the ENGINE rather than in the
   catalog (a plain `CREATE TABLE`, a `CREATE TABLE AS SELECT`) is visible to later queries
   in the same database and not to `ListTableMetadata`, and no query result object is written
-  to the results location — both have their own issues. A failed query the ENGINE refused
+  to the results location — both have their own issues. ARITHMETIC over an exact decimal is
+  the engine's own: a `DECIMAL` value a statement projects carries its exact digits, and a
+  sum or product computed from two of them is computed as the engine computes it, which is
+  in binary floating point — so such a column reports the engine's approximate type rather
+  than the fixed-point type the operands had. A failed query the ENGINE refused
   reports the engine's OWN diagnostic (with anything path-shaped redacted) or this
   emulator's wording for a bound it stopped the run at, so it does not match the wording
   Athena's own engine would use for the same failure — a message-fidelity gap for its own

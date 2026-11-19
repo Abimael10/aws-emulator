@@ -229,7 +229,9 @@ fn query_cases() -> Vec<QueryCase> {
             columns: Some(vec![
                 ("i", "integer"),
                 ("big", "bigint"),
-                ("d", "double"),
+                // A number written with a decimal point is an EXACT value of Athena's
+                // fixed-point type, not an approximate double.
+                ("d", "decimal"),
                 ("s", "varchar"),
                 ("b", "varbinary"),
                 ("u", "unknown"),

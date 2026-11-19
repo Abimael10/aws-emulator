@@ -20,6 +20,10 @@
 //! slice runs SQL and holds rows, and [`super::catalog_sql`] is what resolves a statement
 //! against the catalog and hands the objects it reads to [`run_over`].
 
+/// The EXACT-NUMERIC (`DECIMAL`) value a statement projects, read as the digits it has
+/// rather than through the engine's binary double.
+mod exact_decimal;
+
 /// The type a projected column has by the submitted statement's own signature for it,
 /// rather than by the values it produced.
 mod projection;
@@ -47,29 +51,35 @@ pub const STATEMENT_TYPE_UTILITY: &str = "UTILITY";
 
 /// Athena's type name for a 32-bit integer column, as `ColumnInfo$Type` reports it.
 ///
-/// Every name below is one of Athena's own SQL type names, and the precision beside it
-/// is that type's own width: a 32-bit integer spans 10 decimal digits, a 64-bit one 19,
-/// a double carries 17 significant decimal digits, and the unbounded character and
-/// binary types report their maximum length.
-const TYPE_INTEGER: (&str, i32) = ("integer", 10);
+/// Every name below is one of Athena's own SQL type names, and the `(precision, scale)`
+/// beside it is that type's own width: a 32-bit integer spans 10 decimal digits, a 64-bit
+/// one 19, a double carries 17 significant decimal digits, and the unbounded character and
+/// binary types report their maximum length. Only the fixed-point type carries digits AFTER
+/// the point, so every type named here reports a scale of zero ([`TYPE_DECIMAL`]).
+const TYPE_INTEGER: (&str, i32, i32) = ("integer", 10, 0);
 /// Athena's type name for a 64-bit integer column; see [`TYPE_INTEGER`].
-const TYPE_BIGINT: (&str, i32) = ("bigint", 19);
+const TYPE_BIGINT: (&str, i32, i32) = ("bigint", 19, 0);
 /// Athena's type name for a double-precision column; see [`TYPE_INTEGER`].
-const TYPE_DOUBLE: (&str, i32) = ("double", 17);
+const TYPE_DOUBLE: (&str, i32, i32) = ("double", 17, 0);
 /// Athena's type name for a boolean column; see [`TYPE_INTEGER`].
-const TYPE_BOOLEAN: (&str, i32) = ("boolean", 0);
+const TYPE_BOOLEAN: (&str, i32, i32) = ("boolean", 0, 0);
 /// Athena's type name for a character column; see [`TYPE_INTEGER`].
-const TYPE_VARCHAR: (&str, i32) = ("varchar", 2_147_483_647);
+const TYPE_VARCHAR: (&str, i32, i32) = ("varchar", 2_147_483_647, 0);
 /// HIVE's type name for a character column, which is what a statement Athena performs on
 /// its Hive DDL engine reports instead of [`TYPE_VARCHAR`]: the type declares no width at
 /// all, so the precision beside it is zero rather than a length.
-const TYPE_STRING: (&str, i32) = ("string", 0);
+const TYPE_STRING: (&str, i32, i32) = ("string", 0, 0);
 /// Athena's type name for a binary column; see [`TYPE_INTEGER`].
-const TYPE_VARBINARY: (&str, i32) = ("varbinary", 1_073_741_824);
+const TYPE_VARBINARY: (&str, i32, i32) = ("varbinary", 1_073_741_824, 0);
 /// The type name reported for a column the engine produced no typed value for — a
 /// projection of `NULL`, or a column of a result set with no rows at all, neither of
 /// which carries a type to report; see [`TYPE_INTEGER`].
-const TYPE_UNKNOWN: (&str, i32) = ("unknown", 0);
+const TYPE_UNKNOWN: (&str, i32, i32) = ("unknown", 0, 0);
+/// Athena's type name for an EXACT-NUMERIC column, the one type whose width is not the
+/// type's own: a `DECIMAL(precision, scale)` column reports the precision and the scale the
+/// value was read to (see [`exact_decimal`]), which is also where `ColumnInfo$Scale` —
+/// "meaningful for DECIMAL data types" — is anything but zero.
+const TYPE_DECIMAL: &str = "decimal";
 
 /// The `ColumnNullable` every column reports.
 ///
@@ -287,6 +297,12 @@ impl Database {
         connection.set_limit(Limit::SQLITE_LIMIT_COLUMN, MAX_COLUMNS)?;
         connection.set_limit(Limit::SQLITE_LIMIT_EXPR_DEPTH, MAX_EXPR_DEPTH)?;
         connection.set_limit(Limit::SQLITE_LIMIT_COMPOUND_SELECT, MAX_COMPOUND_SELECT)?;
+
+        // The EXACT-NUMERIC reading, registered before any request reaches the engine: a
+        // `DECIMAL` value is carried as the digits it has rather than through this engine's
+        // binary double (see [`exact_decimal`]). The authorizer below admits the call as it
+        // admits every other function that is not one of `DENIED_SQL_FUNCTIONS`.
+        exact_decimal::register_exact_decimal(&connection)?;
 
         // Default-deny: every action a query legitimately needs is named, and anything
         // else — including an action a future engine version introduces — is refused.
@@ -639,6 +655,11 @@ pub fn run_over(
     // same rows in a production it has; one carrying none is run exactly as submitted.
     let expanded = table_functions::expanded(sql);
     let sql = expanded.as_deref().unwrap_or(sql);
+    // An exact-numeric value the statement PROJECTS is read as the digits it has rather
+    // than through this engine's double; a statement projecting none is, again, run as
+    // submitted.
+    let exact = exact_decimal::exactly_projected(sql);
+    let sql = exact.as_deref().unwrap_or(sql);
     let mut database = handle.lock().unwrap_or_else(PoisonError::into_inner);
     let guard = Arc::new(RunGuard::default());
     let handler = Arc::clone(&guard);
@@ -984,8 +1005,32 @@ fn execute_once(
             )
         })
         .collect();
-    // The types the statement itself fixes, which no value of the run can decide.
+    // The types the statement itself fixes, which no value of the run can decide. They are
+    // used only where the projection's columns can be matched up with the result's one for
+    // one: a projection carrying a wildcard stands for as many columns as the relations it
+    // reads hold.
     let fixed_types = projection::fixed_column_types(sql);
+    let fixed_types = if fixed_types.len() == columns.len() {
+        fixed_types
+    } else {
+        Vec::new()
+    };
+    // The type each column reports BEFORE a value is looked at: the STATEMENT's own
+    // signature for the projected expression where it fixes one — which is also what the
+    // values are RENDERED as, so a boolean column's values are `true` and `false` rather
+    // than the 1 and 0 this engine stores them as — and the engine's own declaration
+    // otherwise. A column neither fixes a type for is the one the values decide.
+    let fixed: Vec<Option<ColumnType>> = columns
+        .iter()
+        .enumerate()
+        .map(|(index, (_, declared))| {
+            fixed_types
+                .get(index)
+                .copied()
+                .flatten()
+                .or(*declared)
+        })
+        .collect();
     // The names the statement's own projection gives its columns, which the text of a
     // computed expression cannot decide.
     let projected_names = projection::projected_names(sql);
@@ -998,8 +1043,7 @@ fn execute_once(
     let mut scanned: usize = 0;
     let mut retained: usize = 0;
     let mut cells: usize = 0;
-    let mut observed: Vec<Option<ColumnType>> =
-        columns.iter().map(|(_, declared)| *declared).collect();
+    let mut observed: Vec<Option<ColumnType>> = fixed.clone();
 
     while let Some(row) = rows.next()? {
         if records.len() >= MAX_RESULT_ROWS {
@@ -1036,18 +1080,20 @@ fn execute_once(
         cells = cells.saturating_add(columns.len());
 
         let mut data = Vec::with_capacity(columns.len());
-        for (index, (_, declared)) in columns.iter().enumerate() {
+        for index in 0..columns.len() {
             let value = row.get_ref(index)?;
-            // A column the engine declares a type for reports THAT type; one without is
-            // inferred from the values it produces, and the inferred type has to hold
-            // every one of them, so every row is looked at rather than only the first.
-            if declared.is_none() {
+            let fixed = fixed.get(index).copied().flatten();
+            // A column whose type the statement or the engine already fixes reports THAT
+            // type; one without is inferred from the values it produces, and the inferred
+            // type has to hold every one of them, so every row is looked at rather than
+            // only the first.
+            if fixed.is_none() {
                 if let Some(slot) = observed.get_mut(index) {
                     *slot = ColumnType::widened(*slot, value);
                 }
             }
             data.push(Datum {
-                var_char_value: rendered(value, *declared),
+                var_char_value: rendered(value, fixed),
             });
         }
         records.push(Row { data: Some(data) });
@@ -1058,20 +1104,14 @@ fn execute_once(
         .zip(observed.iter())
         .enumerate()
         .map(|(index, ((name, _), column_type))| {
-            // The STATEMENT's own signature for the projected expression wins over the type
-            // the values imply, and only for the columns it fixes one for: a column of a
-            // projection the reading could not match up with the result is not among them.
-            let fixed = (fixed_types.len() == columns.len())
-                .then(|| fixed_types.get(index).copied().flatten())
-                .flatten();
-            // The STATEMENT's own name for the projected column likewise wins over the name
-            // the engine answers, which for a computed column is the SQL text that produced
-            // it — and under the same condition, so a projection that could not be matched up
-            // with the result renames nothing.
+            // The STATEMENT's own name for the projected column wins over the name the
+            // engine answers, which for a computed column is the SQL text that produced it —
+            // and only where the projection could be matched up with the result, so one that
+            // could not renames nothing.
             let projected = (projected_names.len() == columns.len())
                 .then(|| projected_names.get(index).cloned().flatten())
                 .flatten();
-            column_metadata(projected.as_deref().unwrap_or(name), fixed.or(*column_type))
+            column_metadata(projected.as_deref().unwrap_or(name), *column_type)
         })
         .collect();
 
@@ -1167,12 +1207,19 @@ fn retained_bytes(value: rusqlite::types::ValueRef<'_>) -> usize {
 
 /// One value as the text `Datum$VarCharValue` carries, or `None` for SQL NULL — which
 /// Athena reports as a datum with no value rather than as the empty string.
-fn rendered(value: rusqlite::types::ValueRef<'_>, declared: Option<ColumnType>) -> Option<String> {
+///
+/// `reported` is the type the column itself reports where something other than this value
+/// fixes it (the statement's own signature, or the engine's declaration): a value is
+/// rendered as a value of its column's type, not of its storage class — which is what makes
+/// a boolean column's values `true` and `false`. An EXACT-NUMERIC value already carries its
+/// own digits as text by the time it is read ([`exact_decimal`]), so it is reported as it
+/// stands.
+fn rendered(value: rusqlite::types::ValueRef<'_>, reported: Option<ColumnType>) -> Option<String> {
     use rusqlite::types::ValueRef;
     match value {
         ValueRef::Null => None,
         ValueRef::Integer(integer) => {
-            if declared == Some(ColumnType::Boolean) {
+            if reported == Some(ColumnType::Boolean) {
                 // A boolean column's values are Athena's own `true`/`false`, not the 1
                 // and 0 the engine stores them as.
                 Some((integer != 0).to_string())
@@ -1197,6 +1244,15 @@ enum ColumnType {
     BigInt,
     /// A double-precision number.
     Double,
+    /// An EXACT fixed-point number of `precision` significant digits, `scale` of them
+    /// after the point — the type whose values carry their own digits rather than a binary
+    /// approximation of them (see [`exact_decimal`]).
+    Decimal {
+        /// How many significant digits a value of this column carries in all.
+        precision: i32,
+        /// How many of them are after the decimal point.
+        scale: i32,
+    },
     /// A boolean.
     Boolean,
     /// Character data.
@@ -1273,18 +1329,22 @@ impl ColumnType {
             Self::Boolean => 0,
             Self::Integer => 1,
             Self::BigInt => 2,
-            Self::Double => 3,
-            Self::VarBinary => 4,
-            Self::VarChar => 5,
+            // An exact fixed-point value holds every whole number of its own precision, and
+            // a double holds a value of any scale at the precision it carries.
+            Self::Decimal { .. } => 3,
+            Self::Double => 4,
+            Self::VarBinary => 5,
+            Self::VarChar => 6,
         }
     }
 
-    /// This type's Athena name and its precision.
-    fn named(self) -> (&'static str, i32) {
+    /// This type's Athena name, its precision and its scale.
+    fn named(self) -> (&'static str, i32, i32) {
         match self {
             Self::Integer => TYPE_INTEGER,
             Self::BigInt => TYPE_BIGINT,
             Self::Double => TYPE_DOUBLE,
+            Self::Decimal { precision, scale } => (TYPE_DECIMAL, precision, scale),
             Self::Boolean => TYPE_BOOLEAN,
             Self::VarChar => TYPE_VARCHAR,
             Self::VarBinary => TYPE_VARBINARY,
@@ -1303,10 +1363,11 @@ fn column_metadata(name: &str, column_type: Option<ColumnType>) -> ColumnInfo {
     )
 }
 
-/// The `ColumnInfo` one column reports: its name, the `(type name, precision)` pair the
-/// engine that served it names its type by, and whether its values compare case-sensitively.
-fn column_info(name: &str, named: (&str, i32), case_sensitive: bool) -> ColumnInfo {
-    let (type_name, precision) = named;
+/// The `ColumnInfo` one column reports: its name, the `(type name, precision, scale)`
+/// triple the engine that served it names its type by, and whether its values compare
+/// case-sensitively.
+fn column_info(name: &str, named: (&str, i32, i32), case_sensitive: bool) -> ColumnInfo {
+    let (type_name, precision, scale) = named;
     ColumnInfo {
         // "The catalog to which the query results belong": every statement here is served
         // by the one engine this service runs, so the catalog a result column belongs to
@@ -1324,9 +1385,9 @@ fn column_info(name: &str, named: (&str, i32), case_sensitive: bool) -> ColumnIn
         label: Some(name.to_string()),
         r#type: type_name.to_string(),
         precision,
-        // Every type above is a whole-number or character type, none of which has digits
-        // after a decimal point.
-        scale: 0,
+        // "For DECIMAL data types" the scale is the digits a value carries after the point;
+        // every other type here carries none, and reports zero.
+        scale,
         nullable: Some(COLUMN_NULLABLE_UNKNOWN.to_string()),
         case_sensitive,
     }
