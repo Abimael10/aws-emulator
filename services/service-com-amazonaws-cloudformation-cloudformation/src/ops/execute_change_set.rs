@@ -24,8 +24,11 @@
 //!
 //! The change set itself moves to `EXECUTE_IN_PROGRESS` and reaches `EXECUTE_COMPLETE`
 //! with the stack, and "CloudFormation deletes all other change sets associated with the
-//! stack because they aren't valid for the updated stack". A change set whose creation has
-//! not completed, or that has already been executed, is refused with the modelled
+//! stack because they aren't valid for the updated stack" — each of those plans is
+//! INVALIDATED, which leaves it queryable and listable in the modelled `OBSOLETE` execution
+//! status rather than unaddressable. A change set whose creation has
+//! not completed, that has already been executed, or that an execution has made obsolete is
+//! refused with the modelled
 //! `InvalidChangeSetStatusException`, and a request whose `ClientRequestToken` an operation
 //! on the stack already claimed with the modelled `TokenAlreadyExistsException` — whichever
 //! operation claimed it, as in `UpdateStack`: this execution changes the stack, and a
@@ -850,9 +853,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // "When you execute a change set, CloudFormation deletes all other change sets
             // associated with the stack because they aren't valid for the updated stack."
-            store.change_sets.retain(|other| {
-                other.stack_id != stack_id || other.change_set_id == change_set_id
-            });
+            // The plan each of them describes was computed against the configuration this
+            // execution supersedes, so each is INVALIDATED rather than taken away: the
+            // record stays queryable and listable and reports `OBSOLETE`, which is the
+            // status the model carries for exactly this state ("in an OBSOLETE state because
+            // the stack was already updated") and the status a later execution of such a
+            // plan is refused on ([`crate::state::StoredChangeSet::obsolete`]).
+            for other in store.change_sets.iter_mut().filter(|other| {
+                other.stack_id == stack_id && other.change_set_id != change_set_id
+            }) {
+                other.obsolete();
+            }
             // The change set is executing now and reaches EXECUTE_COMPLETE with the stack
             // it applied: its execution is finished when the stack operation it started is,
             // so a stack held past this span — by a wait condition nobody has signalled, or

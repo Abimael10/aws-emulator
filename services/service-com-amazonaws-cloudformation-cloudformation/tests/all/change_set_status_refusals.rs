@@ -45,22 +45,16 @@ const TOPIC: &str = r#"{"Resources":{"A":{"Type":"AWS::SNS::Topic"}}}"#;
 const TWO_TOPICS: &str =
     r#"{"Resources":{"A":{"Type":"AWS::SNS::Topic"},"B":{"Type":"AWS::SNS::Topic"}}}"#;
 
-/// `OBSOLETE` has no constant in this service's `execution_status` module — nothing here
-/// puts a change set into it — so the one spelling of it this suite needs lives here, and
-/// using it is what makes the tables below cover a status the recorded calls never did.
-///
-/// Source: the model's `ExecutionStatus` enum,
-/// `smithy_query(query="shape",shape="ExecutionStatus")` =
-/// `[UNAVAILABLE, AVAILABLE, EXECUTE_IN_PROGRESS, EXECUTE_COMPLETE, EXECUTE_FAILED, OBSOLETE]`.
-const OBSOLETE: &str = "OBSOLETE";
-
-/// Every value of that enum, with what a `DeleteChangeSet` for a change set in it must
+/// Every value of the model's `ExecutionStatus` enum
+/// (`smithy_query(query="shape",shape="ExecutionStatus")` =
+/// `[UNAVAILABLE, AVAILABLE, EXECUTE_IN_PROGRESS, EXECUTE_COMPLETE, EXECUTE_FAILED,
+/// OBSOLETE]`), with what a `DeleteChangeSet` for a change set in it must
 /// answer once the change set's own creation has concluded.
 const EVERY_EXECUTION_STATUS: [(&str, bool); 6] = [
     // (the ExecutionStatus, whether the plan may be discarded in it)
     (execution_status::UNAVAILABLE, true),
     (execution_status::AVAILABLE, true),
-    (OBSOLETE, true),
+    (execution_status::OBSOLETE, true),
     // The one status in which CloudFormation is applying the plan right now.
     (execution_status::EXECUTE_IN_PROGRESS, false),
     (execution_status::EXECUTE_COMPLETE, true),
@@ -87,9 +81,9 @@ async fn delete_change_set(
 ///
 /// The statuses a change set reaches by itself are driven through the wire in
 /// [`an_execution_reports_the_status_of_the_stack_operation_it_started`]; the tables here are
-/// about the GUARDS, so they state the pair directly and can therefore cover the statuses no
-/// flow of this emulator produces (`OBSOLETE`) as well as the ones that need a held or
-/// failing deployment.
+/// about the GUARDS, so they state the pair directly and can therefore cover every status
+/// without the flow that reaches it (an execution of another change set of the stack for
+/// `OBSOLETE`, a held or failing deployment for the rest).
 fn put_in_status(
     engine: &Arc<engine::InMemoryEngine>,
     stack_name: &str,
@@ -287,7 +281,7 @@ async fn execute_change_set_reports_the_status_that_refuses_it() {
         RefusalCase {
             case: "a plan another change set superseded",
             status: change_set_status::CREATE_COMPLETE,
-            execution: OBSOLETE,
+            execution: execution_status::OBSOLETE,
             reports_execution_status: true,
         },
     ];

@@ -1441,6 +1441,14 @@ pub mod execution_status {
     /// the stack policy in force refused one of the actions its plan would have taken, so
     /// the plan was not carried out and the change set is no longer executable.
     pub const EXECUTE_FAILED: &str = "EXECUTE_FAILED";
+    /// The status of a change set another change set's execution SUPERSEDED: "a change set
+    /// might be ... in an `OBSOLETE` state because the stack was already updated"
+    /// (`DescribeChangeSetOutput$ExecutionStatus`). The plan was computed against a stack
+    /// configuration that is no longer the one in force, so it can no longer be executed —
+    /// and the record stays, because a caller that comes back to it must be told its plan is
+    /// stale rather than that it never existed
+    /// ([`super::StoredChangeSet::obsolete`]).
+    pub const OBSOLETE: &str = "OBSOLETE";
 }
 
 /// `ChangeSetType` values (the model's `ChangeSetType` enum).
