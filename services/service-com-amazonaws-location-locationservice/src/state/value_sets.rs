@@ -38,3 +38,25 @@ where
     sentence.push('.');
     sentence
 }
+
+/// `Ok` when `value` is one of `allowed`, matched exactly as such a member documents
+/// its values, otherwise the sentence [`documented_value_set_refusal`] words for it.
+///
+/// Every member this service constrains to a documented value set makes the SAME
+/// membership check against its own set, so the check lives here beside the sentence
+/// it is refused with rather than once per member; a member whose value also
+/// resolves to something (a catalog entry) looks the value up instead and words its
+/// refusal with [`documented_value_set_refusal`] directly.
+pub fn validate_documented_value_set(
+    member: &str,
+    allowed: &[&str],
+    value: &str,
+) -> Result<(), String> {
+    if allowed.contains(&value) {
+        return Ok(());
+    }
+    Err(documented_value_set_refusal(
+        member,
+        allowed.iter().copied(),
+    ))
+}

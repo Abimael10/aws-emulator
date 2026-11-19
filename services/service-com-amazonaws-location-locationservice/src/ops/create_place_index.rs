@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePlaceIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePlaceIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePlaceIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates and persists a place index resource in
+//! [`crate::state::ComAmazonawsLocationLocationserviceState::place_indexes`], keyed
+//! by `IndexName`, and answers with the stored name, the generated ARN and the
+//! stored creation timestamp. A `DataSource` outside the documented set of
+//! geospatial data providers, or a retired `PricingPlan`, is a
+//! `ValidationException`; a name that already exists is a `ConflictException`. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,6 +160,15 @@ impl From<CreatePlaceIndexErrorModeled> for CreatePlaceIndexError {
     }
 }
 
+/// This operation's channel for a member the request got wrong: the shape comes from
+/// [`crate::state::field_validation_exception`], which every operation shares; only the
+/// lift into this operation's own error enum is local.
+fn field_validation_failed(member: &str, why: String) -> CreatePlaceIndexErrorModeled {
+    CreatePlaceIndexErrorModeled::ValidationException(crate::state::field_validation_exception(
+        member, why,
+    ))
+}
+
 /// The `CreatePlaceIndex` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -198,18 +205,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePlaceIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePlaceIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePlaceIndex"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePlaceIndexErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Location state store is unavailable".to_string(),
+            })
+        })?;
+
+        // `DataSource` is a plain `String` in the model, so the request boundary
+        // accepts any text: which data providers exist, and the fact that they are
+        // matched case-sensitively, are this service's own check.
+        crate::state::validate_place_index_data_source(&input.data_source).map_err(|why| {
+            field_validation_failed(crate::state::PLACE_INDEX_DATA_SOURCE_MEMBER, why)
+        })?;
+        // `PricingPlan` is deprecated and admits only one of its enum's values.
+        crate::state::validate_deprecated_pricing_plan(input.pricing_plan.as_deref())
+            .map_err(|why| field_validation_failed("PricingPlan", why))?;
+        // The `Tags` member doc: 'Cannot use "aws:" as a prefix for a key.' The
+        // modelled key pattern admits `:`, so the reservation is this service's check,
+        // and every write of a tag map makes it.
+        crate::state::validate_tag_keys(input.tags.iter().flatten().map(|(key, _)| key.as_str()))
+            .map_err(|why| field_validation_failed(crate::state::TAGS_MEMBER, why))?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+
+        // An index name is unique within an account, so creating one that already
+        // exists is a conflict rather than a silent overwrite. The sentence is this
+        // service's own refusal form: the resource, then the name the request asked
+        // for.
+        if store.place_indexes.contains_key(&input.index_name) {
+            return Err(CreatePlaceIndexErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::resource_already_exists(
+                        crate::state::PLACE_INDEX_RESOURCE,
+                        &input.index_name,
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Bound the store: refuse past the emulator's ceiling with the modelled
+        // quota error rather than growing without limit.
+        if store.place_indexes.len() >= crate::state::MAX_PLACE_INDEXES {
+            return Err(CreatePlaceIndexErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of place index resources ({}) has been reached.",
+                        crate::state::MAX_PLACE_INDEXES
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let index = crate::state::PlaceIndex {
+            name: input.index_name.clone(),
+            arn: crate::state::place_index_arn(&region, &input.index_name),
+            description: input.description.unwrap_or_default(),
+            data_source: input.data_source.clone(),
+            // The storage option is stored as the create sent it, with an unset
+            // `IntendedUse` filled in with the member's documented default, so the
+            // index's own read reports a configuration however the create spelled it.
+            data_source_configuration: crate::state::stored_data_source_configuration(
+                input.data_source_configuration,
+            ),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            create_time: now,
+            update_time: now,
+        };
+
+        let output = CreatePlaceIndexOutput {
+            index_name: index.name.clone(),
+            index_arn: index.arn.clone(),
+            create_time: crate::state::to_date_time(index.create_time),
+        };
+        store.place_indexes.insert(index.name.clone(), index);
+        Ok(output)
     }
 }

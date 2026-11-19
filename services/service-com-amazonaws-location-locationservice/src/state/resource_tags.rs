@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::{
     ComAmazonawsLocationLocationserviceState, GEOFENCE_COLLECTION_RESOURCE, MAP_RESOURCE,
-    ROUTE_CALCULATOR_RESOURCE, TRACKER_RESOURCE,
+    PLACE_INDEX_RESOURCE, ROUTE_CALCULATOR_RESOURCE, TRACKER_RESOURCE,
 };
 
 /// How a refusal names a resource whose ARN carries a `resourcetype` this service
@@ -47,15 +47,17 @@ pub enum TaggedKind {
     GeofenceCollection,
     Map,
     RouteCalculator,
+    PlaceIndex,
 }
 
 impl TaggedKind {
     /// Every kind an ARN resolves to, so a caller can walk the resolvable set.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Tracker,
         Self::GeofenceCollection,
         Self::Map,
         Self::RouteCalculator,
+        Self::PlaceIndex,
     ];
 
     /// The `resourcetype` segment an ARN of this kind carries, spelled as the
@@ -68,6 +70,7 @@ impl TaggedKind {
             Self::GeofenceCollection => "geofence-collection",
             Self::Map => "map",
             Self::RouteCalculator => "route-calculator",
+            Self::PlaceIndex => "place-index",
         }
     }
 
@@ -79,6 +82,7 @@ impl TaggedKind {
             Self::GeofenceCollection => GEOFENCE_COLLECTION_RESOURCE,
             Self::Map => MAP_RESOURCE,
             Self::RouteCalculator => ROUTE_CALCULATOR_RESOURCE,
+            Self::PlaceIndex => PLACE_INDEX_RESOURCE,
         }
     }
 
@@ -196,6 +200,7 @@ impl ComAmazonawsLocationLocationserviceState {
                 .route_calculators
                 .get(&target.name)
                 .map(|held| &held.tags),
+            TaggedKind::PlaceIndex => self.place_indexes.get(&target.name).map(|held| &held.tags),
         }
     }
 
@@ -214,6 +219,10 @@ impl ComAmazonawsLocationLocationserviceState {
             TaggedKind::Map => self.maps.get_mut(&target.name).map(|held| &mut held.tags),
             TaggedKind::RouteCalculator => self
                 .route_calculators
+                .get_mut(&target.name)
+                .map(|held| &mut held.tags),
+            TaggedKind::PlaceIndex => self
+                .place_indexes
                 .get_mut(&target.name)
                 .map(|held| &mut held.tags),
         }

@@ -40,6 +40,10 @@ const MAP_STYLE: &str = "VectorEsriStreets";
 /// The data provider a test route calculator is created with.
 const CALCULATOR_DATA_SOURCE: &str = "Esri";
 
+/// The geospatial data provider a test place index is created with, from the
+/// `CreatePlaceIndexRequest$DataSource` catalog.
+const INDEX_DATA_SOURCE: &str = "Esri";
+
 /// The sentence a tag key carrying the reserved prefix is refused with.
 const RESERVED_PREFIX_REFUSAL: &str =
     "'Tags' must not use the reserved prefix 'aws:' in a tag key.";
@@ -79,6 +83,10 @@ fn calculator_body(name: &str) -> Value {
     json!({ "CalculatorName": name, "DataSource": CALCULATOR_DATA_SOURCE })
 }
 
+fn index_body(name: &str) -> Value {
+    json!({ "IndexName": name, "DataSource": INDEX_DATA_SOURCE })
+}
+
 fn tracker_path(name: &str) -> String {
     format!("/tracking/v0/trackers/{name}")
 }
@@ -93,6 +101,10 @@ fn map_path(name: &str) -> String {
 
 fn calculator_path(name: &str) -> String {
     format!("/routes/v0/calculators/{name}")
+}
+
+fn index_path(name: &str) -> String {
+    format!("/places/v0/indexes/{name}")
 }
 
 /// Every resource kind this service stores tags on, with the operations that create and
@@ -127,6 +139,13 @@ const TAGGABLE_KINDS: &[TaggableKind] = &[
         create_body: calculator_body,
         arn_member: "CalculatorArn",
         describe_path: calculator_path,
+    },
+    TaggableKind {
+        arn_resource_type: "place-index",
+        create_path: "/places/v0/indexes",
+        create_body: index_body,
+        arn_member: "IndexArn",
+        describe_path: index_path,
     },
 ];
 
@@ -811,7 +830,6 @@ async fn an_arn_of_this_vendor_naming_a_resource_the_store_lacks_is_not_found() 
     // well-formed ARN of this service's vendor, so the refusal is a not-found rather than
     // a bad request.
     let arns = [
-        format!("arn:aws:geo:{REGION}:{ACCOUNT}:place-index/anything"),
         format!("arn:aws:geo:{REGION}:{ACCOUNT}:key/anything"),
         format!("arn:aws:geo:{REGION}:{ACCOUNT}:job/anything"),
         format!("arn:aws:geo:{REGION}:{ACCOUNT}:not-a-location-type/anything"),

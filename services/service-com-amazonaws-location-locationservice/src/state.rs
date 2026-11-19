@@ -36,7 +36,7 @@ pub use tracker_consumers::{
 /// The sentence a value outside a member's documented set is refused with, kept
 /// beside this module because every such check in the crate words it the same way.
 mod value_sets;
-pub use value_sets::documented_value_set_refusal;
+pub use value_sets::{documented_value_set_refusal, validate_documented_value_set};
 
 /// The map styles a map resource can carry and the data provider each is sourced
 /// from, kept beside this module because a map write checks the style and every map
@@ -109,6 +109,31 @@ pub struct ComAmazonawsLocationLocationserviceState {
     /// Map resources by `MapName`, ordered for the same reason as
     /// [`Self::trackers`].
     pub maps: BTreeMap<String, Map>,
+    /// Place index resources by `IndexName`, ordered for the same reason as
+    /// [`Self::trackers`].
+    pub place_indexes: BTreeMap<String, PlaceIndex>,
+}
+
+/// One place index resource: the members a place index read reports for it, with
+/// the storage option kept as the modelled `DataSourceConfiguration` the index was
+/// created with so a read reports the configuration the create stored.
+#[derive(Debug, Clone)]
+pub struct PlaceIndex {
+    pub name: String,
+    pub arn: String,
+    /// `DescribePlaceIndex`/`ListPlaceIndexes` model `Description` as required, and
+    /// the member is `len 0..1000`, so an unset description is the empty string.
+    pub description: String,
+    /// The geospatial data provider the index geocodes against, as the create
+    /// request spelled it.
+    pub data_source: String,
+    /// The storage option the index was created with, which
+    /// `DescribePlaceIndexResponse$DataSourceConfiguration` models as required, so
+    /// an index created without one carries the member's documented default.
+    pub data_source_configuration: crate::ops::types::DataSourceConfiguration,
+    pub tags: BTreeMap<String, String>,
+    pub create_time: EpochMillis,
+    pub update_time: EpochMillis,
 }
 
 /// One map resource: the members a map read reports for it, with the configuration
@@ -299,6 +324,11 @@ pub const MAX_GEOFENCE_COLLECTIONS: usize = 1_000;
 /// refuses past it with the modelled `ServiceQuotaExceededException` rather than
 /// growing the store without limit.
 pub const MAX_MAPS: usize = 1_000;
+
+/// Emulator memory bound, NOT an AWS quota: place index resources held at once.
+/// `CreatePlaceIndex` refuses past it with the modelled
+/// `ServiceQuotaExceededException` rather than growing the store without limit.
+pub const MAX_PLACE_INDEXES: usize = 1_000;
 
 /// Emulator memory bound, NOT an AWS quota: geofences held per collection, the
 /// least recently updated evicted first. The real service bounds a collection with
@@ -574,6 +604,13 @@ pub fn map_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("geo", region, &format!("map/{name}"))
 }
 
+/// `arn:aws:geo:<region>:<account>:place-index/<name>` — the format
+/// `CreatePlaceIndexResponse$IndexArn` documents ("Format example:
+/// arn:aws:geo:region:account-id:place-index/ExamplePlaceIndex").
+pub fn place_index_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn("geo", region, &format!("place-index/{name}"))
+}
+
 /// The data providers a route calculator can source traffic and road network data
 /// from, spelled exactly as a request must spell them.
 ///
@@ -597,13 +634,11 @@ pub const ROUTE_CALCULATOR_DATA_SOURCE_MEMBER: &str = "DataSource";
 /// The member is a plain `String` in the model rather than an enum, so the request
 /// boundary accepts any text and the provider set is the service's own check.
 pub fn validate_route_calculator_data_source(data_source: &str) -> Result<(), String> {
-    if ROUTE_CALCULATOR_DATA_SOURCES.contains(&data_source) {
-        return Ok(());
-    }
-    Err(documented_value_set_refusal(
+    validate_documented_value_set(
         ROUTE_CALCULATOR_DATA_SOURCE_MEMBER,
-        ROUTE_CALCULATOR_DATA_SOURCES,
-    ))
+        &ROUTE_CALCULATOR_DATA_SOURCES,
+        data_source,
+    )
 }
 
 /// `Ok` when a request's deprecated `PricingPlan` carries the one value it still
@@ -619,6 +654,55 @@ pub fn validate_deprecated_pricing_plan(pricing_plan: Option<&str>) -> Result<()
         None => Ok(()),
         Some(plan) if plan == ALWAYS_PRICING_PLAN => Ok(()),
         Some(_) => Err(format!("'PricingPlan' must be {ALWAYS_PRICING_PLAN}")),
+    }
+}
+
+/// The geospatial data providers a place index can geocode against, spelled exactly
+/// as a request must spell them.
+///
+/// Source: the `CreatePlaceIndexRequest$DataSource` member doc, which lists `Esri`,
+/// `Grab` and `Here` as the valid values and notes that the field is
+/// case-sensitive. Kept beside the route calculator's own set rather than shared
+/// with it: each member publishes its own list, and the two are free to differ.
+pub const PLACE_INDEX_DATA_SOURCES: [&str; 3] = ["Esri", "Grab", "Here"];
+
+/// The member a refusal about the requested geospatial data provider names, as the
+/// model spells it on `CreatePlaceIndexRequest`.
+pub const PLACE_INDEX_DATA_SOURCE_MEMBER: &str = "DataSource";
+
+/// `Ok` when `data_source` names one of [`PLACE_INDEX_DATA_SOURCES`], matched
+/// case-sensitively as the member documents, otherwise the sentence the refusal
+/// states — the one [`documented_value_set_refusal`] words for every member this
+/// service constrains to a documented value set.
+///
+/// The member is a plain `String` in the model rather than an enum, so the request
+/// boundary accepts any text and the provider set is the service's own check.
+pub fn validate_place_index_data_source(data_source: &str) -> Result<(), String> {
+    validate_documented_value_set(
+        PLACE_INDEX_DATA_SOURCE_MEMBER,
+        &PLACE_INDEX_DATA_SOURCES,
+        data_source,
+    )
+}
+
+/// The storage option a place index carries when its create named none.
+///
+/// The model's `DataSourceConfiguration$IntendedUse` doc: "Default value:
+/// `SingleUse`". `DescribePlaceIndexResponse$DataSourceConfiguration` is required,
+/// so a read reports the default rather than omitting the configuration.
+pub const DEFAULT_INTENDED_USE: &str = "SingleUse";
+
+/// The `DataSourceConfiguration` a place index is stored with for the one a create
+/// request carried: the configuration as sent, with an unset `IntendedUse` filled in
+/// with the member's documented default.
+pub fn stored_data_source_configuration(
+    requested: Option<crate::ops::types::DataSourceConfiguration>,
+) -> crate::ops::types::DataSourceConfiguration {
+    let intended_use = requested
+        .and_then(|configuration| configuration.intended_use)
+        .unwrap_or_else(|| DEFAULT_INTENDED_USE.to_string());
+    crate::ops::types::DataSourceConfiguration {
+        intended_use: Some(intended_use),
     }
 }
 
@@ -789,6 +873,9 @@ pub const ROUTE_CALCULATOR_RESOURCE: &str = "Route calculator";
 
 /// How this service names a map resource in a refusal about it.
 pub const MAP_RESOURCE: &str = "Map";
+
+/// How this service names a place index resource in a refusal about it.
+pub const PLACE_INDEX_RESOURCE: &str = "Place index";
 
 /// The `ResourceNotFoundException` sentence stated for a name no resource of that
 /// kind is stored under: the resource's own name as this service writes it, then the

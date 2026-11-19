@@ -4,7 +4,8 @@
 //! documented set, over the wire, for every operation that makes such a check.
 //!
 //! Several members of this API are plain strings in the model rather than enums
-//! (`CreateRouteCalculatorRequest$DataSource`, `MapConfiguration$Style`), so the
+//! (`CreateRouteCalculatorRequest$DataSource`,
+//! `CreatePlaceIndexRequest$DataSource`, `MapConfiguration$Style`), so the
 //! request boundary accepts any text and the service itself refuses a value outside
 //! the set its documentation publishes. Every one of those refusals reads as one
 //! sentence: the member name as the model spells it in single quotes, "must be one
@@ -24,6 +25,14 @@ use crate::harness::{call, emulator, Answer};
 /// The data providers `CreateRouteCalculator` publishes, in the order its
 /// `DataSource` member doc lists them ("Valid values include: Esri … Grab … Here").
 const DATA_SOURCES: [&str; 3] = ["Esri", "Grab", "Here"];
+
+/// The geospatial data providers `CreatePlaceIndex` publishes, in the order its own
+/// `DataSource` member doc lists them
+/// (`smithy_query(query="doc",shape="CreatePlaceIndexRequest",member="DataSource")`:
+/// "Valid values include: Esri … Grab … Here"). Written out beside the route
+/// calculator's set rather than shared with it, so a crate that confused the two
+/// members' catalogs fails here.
+const PLACE_INDEX_DATA_SOURCES: [&str; 3] = ["Esri", "Grab", "Here"];
 
 /// The map styles `CreateMap` publishes, in the order the `MapConfiguration$Style`
 /// member doc lists them (`smithy_query(query="doc",shape="MapConfiguration",
@@ -79,6 +88,17 @@ fn value_sets() -> Vec<ValueSet> {
             // `DataSource` carries no `@length` and no pattern, so the request
             // boundary accepts every row below — including the empty value — and
             // each is refused by the value-set check alone.
+            rejected: &["Bing", "HERE", "esri", " Grab", "Grab ", "Esri,Here", ""],
+        },
+        ValueSet {
+            operation: "CreatePlaceIndex",
+            path: "/places/v0/indexes",
+            member: "DataSource",
+            allowed: &PLACE_INDEX_DATA_SOURCES,
+            request: |name, value| json!({ "IndexName": name, "DataSource": value }),
+            // `DataSource` carries no `@length` and no pattern here either, so the
+            // request boundary accepts every row below and each is refused by the
+            // value-set check alone.
             rejected: &["Bing", "HERE", "esri", " Grab", "Grab ", "Esri,Here", ""],
         },
         ValueSet {
