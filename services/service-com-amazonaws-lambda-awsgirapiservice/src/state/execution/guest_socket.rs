@@ -21,7 +21,8 @@
 //!   other end that plane's own protocol handler is serving — in this process, exactly as a
 //!   request a handler sends over HTTP is carried by the in-process callback. So the whole of
 //!   what a run can reach is what a service put in that register, nothing it opens leaves
-//!   this process, no host port is dialled and no name is resolved anywhere on the path: an
+//!   this process, no host port is dialled and no name is resolved against a host name service
+//!   — a name is resolved by this environment's own resolver ([`super::guest_resolver`]) and an
 //!   address is a KEY here, not something to connect to. An address no plane of this emulator
 //!   answers at is answered the way a host answers one — a refused connection for an address
 //!   of this machine, no route for an address of another host, an unresolvable name for a
@@ -333,11 +334,15 @@ impl Failure {
     }
 
     /// A name nothing resolves: no resolver of this runtime holds an address for it.
-    fn unresolved(host: &str) -> Self {
+    ///
+    /// The wording a host answers one with, which names neither the name asked about nor this
+    /// emulator: it is what `gai_strerror` states for `EAI_NONAME`, so a program reading the
+    /// error reads what it reads off a host.
+    fn unresolved() -> Self {
         Self {
             kind: "name",
             errno: Some(EAI_NONAME),
-            message: format!("Name or service not known: {host}"),
+            message: "Name or service not known".to_string(),
         }
     }
 
@@ -442,6 +447,7 @@ impl Sockets {
         let answered = match ::serde_json::from_str::<Value>(document) {
             Ok(asked) => match verb {
                 "connect" => self.connected(dialing, inside, runtime, &asked, within),
+                "resolve" => resolved_name(inside, &asked),
                 "route" => self.routed(inside, &asked),
                 "datagram" => self.delivered(inside, &asked),
                 "send" => self.sent(runtime, &asked, within),
@@ -524,7 +530,7 @@ impl Sockets {
         let Some(Dialed { authority, plane, .. }) =
             dialing.and_then(|dialing| dialing.dialable(&host, port))
         else {
-            return Err(nothing_answers(&host));
+            return Err(nothing_answers(inside, &host));
         };
         let waiting = clamped(asked, within);
         // Where the connection LEAVES from, read off the same route a datagram's is
@@ -664,23 +670,22 @@ impl Sockets {
         inside: Option<&VpcAttachment>,
         host: &str,
     ) -> Result<(String, u16), Failure> {
-        let named = host.trim_start_matches('[').trim_end_matches(']');
-        let address = match named.parse::<::std::net::IpAddr>() {
-            Ok(address) => address,
-            Err(_name) if ::emulator_server::is_loopback_host(named) => {
-                ::std::net::IpAddr::V4(::std::net::Ipv4Addr::LOCALHOST)
-            }
-            Err(_name) => return Err(Failure::unresolved(host)),
-        };
+        // WHICH address the destination is, as the environment's own resolver answers it
+        // ([`super::guest_resolver`]): an address is itself, and a name is what that resolver
+        // holds for it — so a route is looked up toward the same address a handler resolving
+        // the name itself would then address.
+        let address = *super::guest_resolver::addresses_of(inside, host)
+            .first()
+            .ok_or_else(Failure::unresolved)?;
         if address.is_loopback() || bound_to(address) {
             return Ok((address.to_string(), self.lent_port()));
         }
         let ::std::net::IpAddr::V4(destination) = address else {
-            return Err(nothing_answers(host));
+            return Err(nothing_answers(inside, host));
         };
         let source = inside
             .and_then(|inside| inside.source_toward(destination))
-            .ok_or_else(|| nothing_answers(host))?;
+            .ok_or_else(|| nothing_answers(inside, host))?;
         Ok((source.to_string(), self.lent_port()))
     }
 
@@ -819,18 +824,46 @@ impl Sockets {
 }
 
 /// What a connection to an address NO plane of this emulator answers at comes to, as a host
-/// answers it, read off the ADDRESS itself: a refused connection for an address of THIS
-/// machine — the address is here and nothing is listening on that port — no route for an
-/// address of another host, and a name that resolves to nothing for a value that is a name
-/// rather than an address.
-fn nothing_answers(host: &str) -> Failure {
-    let named = host.trim_start_matches('[').trim_end_matches(']');
-    match named.parse::<::std::net::IpAddr>() {
-        Ok(address) if address.is_loopback() || bound_to(address) => Failure::refused(),
-        Ok(_elsewhere) => Failure::no_route(),
-        Err(_name) if ::emulator_server::is_loopback_host(named) => Failure::refused(),
-        Err(_name) => Failure::unresolved(host),
+/// answers it, read off the address the destination RESOLVES to
+/// ([`super::guest_resolver`]): a refused connection for an address of THIS machine — the
+/// address is here and nothing is listening on that port — no route for an address of another
+/// host, and a name that resolves to nothing for a name this environment's resolver holds no
+/// address under.
+fn nothing_answers(inside: Option<&VpcAttachment>, host: &str) -> Failure {
+    let Some(address) = super::guest_resolver::addresses_of(inside, host)
+        .into_iter()
+        .next()
+    else {
+        return Failure::unresolved();
+    };
+    if address.is_loopback() || bound_to(address) {
+        return Failure::refused();
     }
+    Failure::no_route()
+}
+
+/// The addresses a NAME has, as the resolver of this execution environment answers it
+/// ([`super::guest_resolver`]) — one entry per address, naming the family it belongs to, in
+/// the order the resolver answers them.
+///
+/// A name that resolver holds no address under is answered as a name that does not exist,
+/// which is what the guest raises for one.
+fn resolved_name(inside: Option<&VpcAttachment>, asked: &Value) -> Result<Value, Failure> {
+    let host = host_of(asked);
+    let addresses = super::guest_resolver::addresses_of(inside, &host);
+    if addresses.is_empty() {
+        return Err(Failure::unresolved());
+    }
+    let answered: Vec<Value> = addresses
+        .iter()
+        .map(|address| {
+            json!({
+                "address": address.to_string(),
+                "family": if address.is_ipv4() { "inet" } else { "inet6" },
+            })
+        })
+        .collect();
+    Ok(json!({ "addresses": answered }))
 }
 
 /// Whether `address` is the interface the core binds its listeners on, as the operator chose
@@ -1305,11 +1338,13 @@ mod tests {
 
     /// RULE: an address NO plane of this emulator answers at is answered the way a host
     /// answers one — a refused connection for an address of this machine, no route for an
-    /// address of another host, and a name that resolves to nothing for a name.
+    /// address of another host, and a name that resolves to nothing for a name this
+    /// environment's resolver holds no address under.
     ///
     /// The rows span what the reading generalises over: an address of this machine, its
-    /// loopback name, a routable address, and a host name of AWS's own naming — the shape a
-    /// control plane publishes for a plane this emulator has opened nothing for.
+    /// loopback name, a routable address, a host name of AWS's own naming — the shape a
+    /// control plane publishes for a plane this emulator has opened nothing for — and a name
+    /// the resolver DOES hold an address for, which has a route rather than no name.
     #[test]
     fn an_address_no_plane_answers_at_is_answered_as_a_host_answers_one() {
         let rows: &[(&str, &str, &str, Option<i32>)] = &[
@@ -1322,9 +1357,10 @@ mod tests {
                 "name",
                 Some(EAI_NONAME),
             ),
+            ("a name that resolves", "example.com", "other", Some(ENETUNREACH)),
         ];
         for (case, host, kind, errno) in rows {
-            let failed = nothing_answers(host);
+            let failed = nothing_answers(None, host);
             assert_eq!(
                 failed.kind, *kind,
                 "case {case:?}: expected the {kind} failure, got {:?}",
@@ -1463,6 +1499,15 @@ mod tests {
                 Some(i64::from(EAI_NONAME)),
                 i64::from(EAI_NONAME),
             ),
+            // A name this environment's resolver DOES hold an address for is routed toward
+            // that address, which a function attached to no VPC has no route to.
+            (
+                "a name that resolves to an address of another host",
+                "example.com",
+                None,
+                Some(i64::from(ENETUNREACH)),
+                i64::from(ENETUNREACH),
+            ),
         ];
         for (case, host, expected, route_errno, datagram_errno) in rows {
             let asked = json!({ "host": host, "port": 53, "data": "" }).to_string();
@@ -1552,6 +1597,12 @@ mod tests {
                 "cluster-x.cluster-abc.us-east-1.docdb.amazonaws.com",
                 27017,
                 i64::from(EAI_NONAME),
+            ),
+            (
+                "a name that resolves to an address nothing is served at",
+                "example.com",
+                443,
+                i64::from(ENETUNREACH),
             ),
         ];
         for (case, host, port, errno) in rows {

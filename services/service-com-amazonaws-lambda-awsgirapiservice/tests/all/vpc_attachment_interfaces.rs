@@ -80,10 +80,14 @@ type RefusalRow = (
 /// Lambda and the Amazon EC2 service that owns VPCs, subnets, security groups and network
 /// interfaces, on ONE shared engine, plus an EC2 client over the router's own in-process
 /// callback.
-struct Emulator {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
-    ec2: aws_sdk_ec2::Client,
+///
+/// `pub(crate)` because every suite that drives a VPC-attached function stands the two
+/// services up this one way, rather than keeping a second copy of the harness
+/// (`tests/all/sandbox_name_resolution.rs`).
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
+    pub(crate) ec2: aws_sdk_ec2::Client,
 }
 
 /// An EC2 client for [`REGION`] over `callback`, the in-process seam this emulator routes on:
@@ -108,7 +112,8 @@ pub(crate) fn ec2_client(callback: &EmbeddedEmulator) -> aws_sdk_ec2::Client {
     aws_sdk_ec2::Client::from_conf(config)
 }
 
-fn emulator() -> Emulator {
+/// See [`Emulator`].
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Pinned off so the suite does not depend on how the emulator process was started;

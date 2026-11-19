@@ -504,14 +504,16 @@ pub fn runtime_stdlib_modules() -> Vec<PackageModule> {
 /// appended to this source ([`super::xray_daemon::DATAGRAM_SOURCE`],
 /// [`super::guest_socket::STREAM_SOURCE`]).
 ///
-/// A Lambda function in this emulator has no HOST network: there is no name service to resolve
-/// a name against and no host interface to bind or listen on, so every call that would do one
-/// of those raises the error a Python program handles for it. What a function CAN reach is
-/// this emulator's own: the in-process X-Ray daemon a datagram goes to, and the data-plane
-/// listeners this emulator has opened, which a stream socket connects to. The NAMES are all
-/// here — the address families, the socket types, the option levels, the errors and the
-/// default timeout — so a module that imports `socket` to name one of them imports cleanly,
-/// which is what the standard library's own HTTP, email and URL modules do.
+/// A Lambda function in this emulator has no HOST network: there is no host interface to bind
+/// or listen on, so every call that would do one of those raises the error a Python program
+/// handles for it. What a function CAN reach is this emulator's own: the in-process X-Ray
+/// daemon a datagram goes to, and the data-plane listeners this emulator has opened, which a
+/// stream socket connects to. A NAME is resolved by the resolver of the execution environment
+/// ([`super::guest_resolver`], reached through the host seam), which answers out of the zones
+/// this emulator can name an address in. The NAMES are all here — the address families, the
+/// socket types, the option levels, the errors and the default timeout — so a module that
+/// imports `socket` to name one of them imports cleanly, which is what the standard library's
+/// own HTTP, email and URL modules do.
 const SOCKET_SOURCE: &str = r#"
 """The socket interface of this runtime: a connection reaches this emulator's own listeners."""
 
@@ -716,11 +718,12 @@ def getaddrinfo(host, port, family=AF_UNSPEC, type=0, proto=0, flags=0):
     """The addresses `host`:`port` names.
 
     An ADDRESS is a pure conversion: the address itself is the answer, resolved against
-    nothing. The loopback NAME is this machine, which is where the planes this emulator opens
-    are served, so it answers the loopback address. Any other name has no resolver to answer
-    it — a function has no host name service — so it raises what a resolver raises for a name
-    it holds nothing for, and an address of a family the caller did not ask for raises what a
-    resolver raises for that.
+    nothing. A NAME is resolved by the resolver of this execution environment
+    ([`_resolved`]): this machine's own names — which is where the planes this emulator opens
+    are served — the private zone of the VPC the function is attached to, and the public names
+    the DNS standards themselves fix. A name that resolver holds no address under raises what a
+    resolver raises for a name that does not exist, and an address of a family the caller did
+    not ask for raises what a resolver raises for that.
     """
     if isinstance(host, (bytes, bytearray)):
         host = bytes(host).decode("utf-8", "replace")
@@ -739,7 +742,39 @@ def getaddrinfo(host, port, family=AF_UNSPEC, type=0, proto=0, flags=0):
         if family not in (AF_UNSPEC, AF_INET6):
             raise gaierror(-6, "Address family for hostname not supported")
         return [(AF_INET6, kind, protocol, "", (address, number, 0, 0))]
-    raise gaierror(-2, "Name or service not known")
+    resolved = _resolved(address)
+    if not resolved:
+        raise gaierror(EAI_NONAME, "Name or service not known")
+    answered = []
+    for entry in resolved:
+        held = entry.get("address") or ""
+        if entry.get("family") == "inet6":
+            if family in (AF_UNSPEC, AF_INET6):
+                answered.append((AF_INET6, kind, protocol, "", (held, number, 0, 0)))
+        elif family in (AF_UNSPEC, AF_INET):
+            answered.append((AF_INET, kind, protocol, "", (held, number)))
+    if not answered:
+        # The name resolves, but to no address of the family the caller asked about.
+        raise gaierror(EAI_ADDRFAMILY, "Address family for hostname not supported")
+    return answered
+
+
+def _resolved(host):
+    """The addresses this environment's own resolver answers `host` with, as one entry per
+    address naming its family — and none for a name it holds no address under.
+
+    The resolver is the host's: a name is looked up in the zones this emulator can name an
+    address in, and an answer it cannot be asked for at all is a name that resolved to
+    nothing, which is what the caller reports.
+    """
+    try:
+        answered = _net_asked("resolve", {"host": host})
+    except gaierror:
+        return []
+    except OSError:
+        return []
+    held = answered.get("addresses")
+    return held if isinstance(held, list) else []
 
 
 def getnameinfo(*_arguments, **_keywords):
@@ -747,13 +782,18 @@ def getnameinfo(*_arguments, **_keywords):
 
 
 def gethostbyname(name):
-    """The address a name stands for: the loopback address for this machine's own name, and
-    nothing for any other — this runtime has no host name service."""
-    if str(name).lower() in _LOOPBACK_NAMES:
+    """The address a name stands for: the first IPv4 address this environment's own resolver
+    holds for it ([`_resolved`]), and what a resolver raises for a name that does not exist
+    when it holds none."""
+    named = str(name)
+    if named.lower() in _LOOPBACK_NAMES:
         return _LOOPBACK_ADDRESS
-    if _is_ipv4_address(str(name)):
-        return str(name)
-    raise gaierror(-2, "Name or service not known")
+    if _is_ipv4_address(named):
+        return named
+    for entry in _resolved(named):
+        if entry.get("family") != "inet6":
+            return entry.get("address") or ""
+    raise gaierror(EAI_NONAME, "Name or service not known")
 
 
 def gethostbyname_ex(name):

@@ -277,6 +277,14 @@ pub(super) fn report(
         if let Some(status) = reported_status(completion) {
             line.push_str("Status: ");
             line.push_str(status);
+            // The CLASS of the failure, as its own field after the status: a client reading
+            // the report of a run the platform ended reads WHICH bound ended it here, which
+            // is the one place the plain-text framing states it.
+            if let Some(class) = reported_error_class(completion) {
+                line.push('\t');
+                line.push_str(ERROR_TYPE_FIELD);
+                line.push_str(class);
+            }
         }
         return line;
     }
@@ -292,15 +300,40 @@ pub(super) fn report(
             ::serde_json::json!(round_hundredths(spent)),
         );
     }
-    platform(
-        at,
-        "report",
-        ::serde_json::json!({
-            "requestId": request_id,
-            "metrics": metrics,
-            "status": status(completion),
-        }),
-    )
+    let mut record = ::serde_json::json!({
+        "requestId": request_id,
+        "metrics": metrics,
+        "status": status(completion),
+    });
+    // The same class the plain-text line states as its `Error Type` field, under the member
+    // the structured record carries it with — so a client reading either format reads one
+    // classification of the run.
+    if let (Some(members), Some(class)) = (record.as_object_mut(), reported_error_class(completion))
+    {
+        members.insert(
+            "errorType".to_string(),
+            ::serde_json::Value::String(class.to_string()),
+        );
+    }
+    platform(at, "report", record)
+}
+
+/// The name the plain-text `REPORT` line states the class of a failure under, with the
+/// separator that closes a field name.
+const ERROR_TYPE_FIELD: &str = "Error Type: ";
+
+/// The class the REPORT states beside its status, or `None` for a run whose report states
+/// none.
+///
+/// It is the class the PLATFORM ended the run under ([`super::platform_error_class`]) — the
+/// very class the error envelope of that run carries — and it is stated exactly where the
+/// report carries the platform's own `error` status: a run stopped at the function's own
+/// `Timeout` is reported as the timeout it is by the status itself, and a run the HANDLER
+/// completed answered for itself.
+fn reported_error_class(completion: &Completion) -> Option<&'static str> {
+    (status(completion) == STATUS_ERROR)
+        .then(|| super::platform_error_class(completion))
+        .flatten()
 }
 
 /// The status the plain-text `REPORT` line closes on, or `None` for a run that carries none.
@@ -592,7 +625,8 @@ mod tests {
                  Size: 256 MB\tMax Memory Used: 42 MB\tStatus: timeout",
             ),
             (
-                "the same frame for a run whose environment failed",
+                "the same frame for a run the memory ceiling ended, which states the class \
+                 the platform killed it under beside the status",
                 report(
                     false,
                     at(),
@@ -601,7 +635,35 @@ mod tests {
                     measured(),
                 ),
                 "REPORT RequestId: req-1\tDuration: 12.35 ms\tBilled Duration: 13 ms\tMemory \
-                 Size: 256 MB\tMax Memory Used: 42 MB\tStatus: error",
+                 Size: 256 MB\tMax Memory Used: 42 MB\tStatus: error\tError Type: \
+                 Runtime.OutOfMemory",
+            ),
+            (
+                "the same frame for a run whose runtime ended for a reason the platform \
+                 cannot state",
+                report(
+                    false,
+                    at(),
+                    "req-1",
+                    &Completion::Stopped(Stop::Steps),
+                    measured(),
+                ),
+                "REPORT RequestId: req-1\tDuration: 12.35 ms\tBilled Duration: 13 ms\tMemory \
+                 Size: 256 MB\tMax Memory Used: 42 MB\tStatus: error\tError Type: \
+                 Runtime.ExitError",
+            ),
+            (
+                "the same frame for a run whose answer passed the response quota",
+                report(
+                    false,
+                    at(),
+                    "req-1",
+                    &Completion::Stopped(Stop::Response),
+                    measured(),
+                ),
+                "REPORT RequestId: req-1\tDuration: 12.35 ms\tBilled Duration: 13 ms\tMemory \
+                 Size: 256 MB\tMax Memory Used: 42 MB\tStatus: error\tError Type: \
+                 Function.ResponseSizeTooLarge",
             ),
             (
                 "the same frame for a handler that raised, which answered for itself",
@@ -673,6 +735,90 @@ mod tests {
             assert!(
                 !rendered.contains('\t'),
                 "case {case:?}: no plain-text framing is left in a structured record, got \
+                 {rendered:?}"
+            );
+        }
+    }
+
+    /// RULE: the CLASS the platform ended a run under is reported in both formats of its
+    /// report — as the plain-text line's own `Error Type` field and as the structured
+    /// record's `errorType` member — and in neither for a run that answered for itself.
+    ///
+    /// The rows span what the reading generalises over: every bound a run can be stopped by,
+    /// a run nothing could drive, and the completions the HANDLER itself reached.
+    #[test]
+    fn both_formats_of_a_report_name_one_class_for_the_run() {
+        // (case, the completion, the class its report states — `None` for a run that states
+        // none)
+        let rows: Vec<(&str, Completion, Option<&str>)> = vec![
+            (
+                "a run the memory ceiling ended",
+                Completion::Stopped(Stop::Memory),
+                Some("Runtime.OutOfMemory"),
+            ),
+            (
+                "a run that ran past its step budget",
+                Completion::Stopped(Stop::Steps),
+                Some("Runtime.ExitError"),
+            ),
+            (
+                "a run that took more host time than one run may",
+                Completion::Stopped(Stop::HostCeiling),
+                Some("Runtime.ExitError"),
+            ),
+            (
+                "a run whose answer passed the response quota",
+                Completion::Stopped(Stop::Response),
+                Some("Function.ResponseSizeTooLarge"),
+            ),
+            (
+                "a run nothing could drive",
+                Completion::Internal("the engine is gone".to_string()),
+                Some("Runtime.InternalError"),
+            ),
+            // A run stopped at the function's own `Timeout` is reported as the timeout it is
+            // by the status itself, which is what a client reads it off.
+            (
+                "a run stopped at the function's own Timeout",
+                Completion::Stopped(Stop::Deadline),
+                None,
+            ),
+            (
+                "a handler that answered",
+                Completion::Returned("{}".to_string()),
+                None,
+            ),
+            (
+                "a handler that raised",
+                Completion::Raised {
+                    error_type: "ValueError".to_string(),
+                    error_message: "no".to_string(),
+                    stack_trace: Vec::new(),
+                    initialization: false,
+                },
+                None,
+            ),
+        ];
+        for (case, completion, expected) in rows {
+            let text = report(false, at(), "req-1", &completion, measured());
+            let fields: Vec<&str> = text.split('\t').collect();
+            let stated = expected.map(|class| format!("{ERROR_TYPE_FIELD}{class}"));
+            assert_eq!(
+                fields
+                    .iter()
+                    .find(|field| field.starts_with(ERROR_TYPE_FIELD))
+                    .copied(),
+                stated.as_deref(),
+                "case {case:?}: expected the field {stated:?} among the report's own fields, \
+                 got {text:?}"
+            );
+            let rendered = report(true, at(), "req-1", &completion, measured());
+            let parsed: ::serde_json::Value =
+                ::serde_json::from_str(&rendered).expect("the record is JSON");
+            let actual = parsed["record"]["errorType"].as_str();
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the structured record to state {expected:?}, got \
                  {rendered:?}"
             );
         }

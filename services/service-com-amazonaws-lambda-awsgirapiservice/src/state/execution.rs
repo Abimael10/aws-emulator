@@ -268,6 +268,10 @@ pub mod xray_daemon;
 pub mod vpc_network;
 pub use vpc_network::VpcAttachment;
 
+/// The NAME SERVICE of a running handler: which addresses a host name resolves to inside the
+/// execution environment.
+pub mod guest_resolver;
+
 /// The engine memory the runs of this process may hold TOGETHER, stated in the MB a
 /// function's `MemorySize` is stated in.
 ///
@@ -1190,48 +1194,19 @@ fn answered(
             },
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
-        // A run the sandbox ended at the function's own `Timeout` is reported as that
-        // class of failure: the error names the sandbox timeout, and the message states
-        // the invocation and the timeout it ran past — in the frame every failure the
-        // SANDBOX reports an invocation with carries, `RequestId: <id> Error: <what
-        // happened>`, which is the same frame the runtime's own kill is reported in below.
-        Completion::Stopped(Stop::Deadline) => (
-            sandbox_error_document(
-                &format!(
-                    "RequestId: {request_id} Error: Task timed out after {:.2} seconds",
-                    budget.wall_clock.as_secs_f64()
-                ),
-                SANDBOX_TIMEDOUT,
-            ),
-            Some(FUNCTION_ERROR_UNHANDLED.to_string()),
-        ),
-        // A run the memory ceiling ended is one whose runtime was killed, which is what
-        // AWS reports it as: "Runtime exited with error: signal: killed". The CLASS is the
-        // out-of-memory one rather than the runtime's generic exit, because what ended the
-        // run is known: it held more memory than its function is configured for.
-        Completion::Stopped(Stop::Memory) => (
-            sandbox_error_document(
-                &format!("RequestId: {request_id} Error: {RUNTIME_KILLED}"),
-                RUNTIME_OUT_OF_MEMORY,
-            ),
-            Some(FUNCTION_ERROR_UNHANDLED.to_string()),
-        ),
-        // A run the RESPONSE ceiling ended produced an answer Lambda will not carry, and
-        // Lambda attributes that failure to the response rather than reporting it as a
-        // runtime that exited: the error names the response-size class and states the
-        // quota the response passed.
-        Completion::Stopped(Stop::Response) => (
-            oversize_response_document(budget.response_bytes),
-            Some(FUNCTION_ERROR_UNHANDLED.to_string()),
-        ),
+        // A run the PLATFORM ended at one of its bounds: the document states what happened
+        // ([`stopped_document`]) and names WHICH bound ended it ([`stopped_class`]) — the
+        // same class the run's own REPORT record states beside its status
+        // ([`log_records::report`]), so a client reading the answer and one reading the log
+        // read ONE classification of the run.
         Completion::Stopped(stop) => (
-            sandbox_error_document(stop.reason(), RUNTIME_EXIT_ERROR),
+            stopped_document(*stop, request_id, budget),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
         Completion::Internal(why) => (
             error_document(
                 why,
-                Some("Runtime.InternalError"),
+                Some(RUNTIME_INTERNAL_ERROR),
                 request_id,
                 &[],
                 engine,
@@ -1285,8 +1260,81 @@ fn answered(
     }
 }
 
+/// The error payload a run the PLATFORM ended at one of the function's bounds answers with:
+/// the sentence that states what happened, under the class that names the bound
+/// ([`stopped_class`]).
+fn stopped_document(stop: Stop, request_id: &str, budget: Budget) -> Vec<u8> {
+    match stop {
+        // A run the RESPONSE ceiling ended produced an answer Lambda will not carry, and that
+        // refusal is the RESPONSE's rather than the run's: Lambda states it the same way
+        // whichever side produced the oversize answer, so it is worded in the one place both
+        // are answered from ([`oversize_response_document`]).
+        Stop::Response => oversize_response_document(budget.response_bytes),
+        other => sandbox_error_document(
+            &stopped_message(other, request_id, budget),
+            stopped_class(other),
+        ),
+    }
+}
+
+/// What the PLATFORM states about a run IT ended at one of the function's bounds: the
+/// sentence the error envelope carries, in the frame every failure the SANDBOX reports an
+/// invocation with is stated in — `RequestId: <id> Error: <what happened>`.
+fn stopped_message(stop: Stop, request_id: &str, budget: Budget) -> String {
+    match stop {
+        // The run outlasted the function's own `Timeout`: the message states the invocation
+        // and the span it ran past.
+        Stop::Deadline => format!(
+            "RequestId: {request_id} Error: Task timed out after {:.2} seconds",
+            budget.wall_clock.as_secs_f64()
+        ),
+        // A run the memory ceiling ended is one whose runtime was killed, which is what AWS
+        // reports it as: "Runtime exited with error: signal: killed".
+        Stop::Memory => format!("RequestId: {request_id} Error: {RUNTIME_KILLED}"),
+        // Any other bound of the run is reported as the bound it is. The response quota is
+        // worded by [`stopped_document`], where the document both sides of it are answered
+        // from is built.
+        other => other.reason().to_string(),
+    }
+}
+
+/// The class the platform reports a run it ended at `stop` under.
+///
+/// A bound the platform can NAME is reported under its own class — the memory ceiling as the
+/// out-of-memory kill it is, the function's `Timeout` as the sandbox timeout, an answer past
+/// the response quota as that quota's failure — and a run whose runtime ended for a reason
+/// the platform cannot state is reported under the class of a runtime that exited
+/// ([`RUNTIME_EXIT_ERROR`]).
+fn stopped_class(stop: Stop) -> &'static str {
+    match stop {
+        Stop::Deadline => SANDBOX_TIMEDOUT,
+        Stop::Memory => RUNTIME_OUT_OF_MEMORY,
+        Stop::Response => RESPONSE_SIZE_TOO_LARGE,
+        Stop::Steps | Stop::HostCeiling => RUNTIME_EXIT_ERROR,
+    }
+}
+
+/// The class the platform reports a run IT ended under, or `None` for a run the HANDLER
+/// itself completed — one that returned, streamed or raised, whose outcome is in its own
+/// answer rather than in a classification of the platform's.
+///
+/// ONE reading, so the `errorType` of the error envelope an invocation answers with and the
+/// class its REPORT record states beside its status ([`log_records::report`]) cannot name two
+/// different failures of one run.
+fn platform_error_class(completion: &Completion) -> Option<&'static str> {
+    match completion {
+        Completion::Stopped(stop) => Some(stopped_class(*stop)),
+        Completion::Internal(_) => Some(RUNTIME_INTERNAL_ERROR),
+        Completion::Returned(_) | Completion::Streamed { .. } | Completion::Raised { .. } => None,
+    }
+}
+
 /// The `errorType` of a run whose runtime ended instead of answering.
 const RUNTIME_EXIT_ERROR: &str = "Runtime.ExitError";
+
+/// The `errorType` of a run this emulator's own interpreter could not be built or driven for,
+/// which is no failure of the handler's.
+const RUNTIME_INTERNAL_ERROR: &str = "Runtime.InternalError";
 
 /// The `errorType` of a run the platform ended because it held more memory than the
 /// function's own `MemorySize` allows. Running out of memory is a failure the platform can

@@ -42,7 +42,9 @@ use ::std::net::Ipv4Addr;
 use ::ipnet::Ipv4Net;
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 use ::simple_dns::rdata::{RData, A, PTR};
-use ::simple_dns::{Name, Packet, PacketFlag, ResourceRecord, CLASS, QTYPE, TYPE};
+use ::simple_dns::{
+    Name, Packet, PacketFlag, QCLASS, Question, ResourceRecord, CLASS, QTYPE, RCODE, TYPE,
+};
 
 /// How far into the VPC's own IPv4 range the Amazon-provided DNS server sits: "the Amazon DNS
 /// server … is located at the base of your VPC network range plus two" (Amazon VPC User Guide,
@@ -64,6 +66,11 @@ const ANSWER_TTL_SECONDS: u32 = 60;
 /// which is the `ip-name` hostname EC2 gives a private address
 /// (`ec2::private_dns_name`).
 const IP_NAME_PREFIX: &str = "ip-";
+
+/// The id a lookup made THROUGH this module carries ([`VpcAttachment::addresses_of`]): one
+/// query is built, handed to the resolver and read back before the next is built, so the id
+/// matches no other exchange and is the same for every one of them.
+const LOOKUP_QUERY_ID: u16 = 1;
 
 /// The zone a reverse lookup of an IPv4 address is asked in (RFC 1035's `IN-ADDR.ARPA`
 /// domain).
@@ -280,6 +287,50 @@ impl VpcAttachment {
         Some(bytes)
     }
 
+    /// The IPv4 addresses the VPC's own DNS server answers for `name`, ASKED OF IT the way a
+    /// client asks: one `A` question, carried to [`Self::resolved`] as a real DNS message and
+    /// read back off the reply that server answered with.
+    ///
+    /// Empty for a name it holds no address under — a name of its own zone that names no
+    /// address in the VPC, a name of another zone it would have to recurse for, and every name
+    /// at all while the VPC's `enableDnsSupport` is off, which leaves it with no server to
+    /// answer. So a name service that asks this ([`super::guest_resolver`]) is answered by the
+    /// same server, and with the same records, as a handler that sends the query itself.
+    #[must_use]
+    pub fn addresses_of(&self, name: &str) -> Vec<Ipv4Addr> {
+        let Ok(asked) = Name::new(name) else {
+            return Vec::new();
+        };
+        let mut query = Packet::new_query(LOOKUP_QUERY_ID);
+        query.set_flags(PacketFlag::RECURSION_DESIRED);
+        query.questions.push(Question::new(
+            asked.into_owned(),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        let Ok(bytes) = query.build_bytes_vec() else {
+            return Vec::new();
+        };
+        let Some(reply) = self.resolved(&bytes) else {
+            return Vec::new();
+        };
+        let Ok(answered) = Packet::parse(&reply) else {
+            return Vec::new();
+        };
+        if answered.rcode() != RCODE::NoError {
+            return Vec::new();
+        }
+        answered
+            .answers
+            .iter()
+            .filter_map(|record| match &record.rdata {
+                RData::A(A { address }) => Some(Ipv4Addr::from(*address)),
+                _other => None,
+            })
+            .collect()
+    }
+
     /// What the resolver holds for ONE question.
     fn answer_for(&self, asked: &Name<'_>, kind: QTYPE) -> Answer {
         let name = asked.to_string().trim_end_matches('.').to_ascii_lowercase();
@@ -382,4 +433,4 @@ fn reversed_address(labels: &str) -> Option<Ipv4Addr> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

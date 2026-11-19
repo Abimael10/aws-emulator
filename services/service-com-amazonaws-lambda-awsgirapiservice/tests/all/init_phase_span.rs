@@ -21,6 +21,12 @@
 //! waits: not at all, well inside the span, and past it — and each asserts the whole answer a
 //! client reads (the status, the function-error signal, and the payload or the error class),
 //! never a span of this host's time.
+//!
+//! Each row RUNS a handler, so this suite takes the one invocation stream the suites that run
+//! handlers share ([`crate::invoke_request_id::one_invocation_stream_at_a_time`]): this
+//! emulator serves a bounded number of runs at once, and the memory bound a run is stopped on
+//! is read from the whole process, so suites that stand interpreters up in parallel otherwise
+//! stop one another's runs.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +38,7 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::ACTIVATION_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::asynchronous_invoke_run::{call, router_on, PYTHON_HANDLER};
+use crate::invoke_request_id::one_invocation_stream_at_a_time;
 use crate::synchronous_invoke_run::package;
 
 /// Where `CreateFunction` is bound.
@@ -148,6 +155,7 @@ fn rows() -> Vec<(&'static str, u64, bool)> {
 
 #[tokio::test]
 async fn a_module_that_waits_past_the_init_span_is_answered_the_platforms_timeout() {
+    let _stream = one_invocation_stream_at_a_time().await;
     for (case, module_wait, past_the_limit) in rows() {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let router = router_on(&engine);

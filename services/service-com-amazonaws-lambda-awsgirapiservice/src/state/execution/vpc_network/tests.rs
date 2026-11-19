@@ -13,7 +13,7 @@ use ::simple_dns::{Name, Packet, Question, QCLASS, QTYPE, RCODE, TYPE};
 
 /// The Region the rows below run in, whose private DNS domain is
 /// `<region>.compute.internal`.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The id every query below carries, which its reply has to answer under.
 const QUERY_ID: u16 = 0x4d2;
@@ -21,7 +21,7 @@ const QUERY_ID: u16 = 0x4d2;
 /// One VPC of `cidr`, with one subnet per entry of `subnets` and one Lambda interface in each,
 /// written into the EC2 store the way that service holds them — so the attachment below is
 /// read off the records EC2 itself keeps.
-fn attached(
+pub(crate) fn attached(
     engine: &::engine::InMemoryEngine,
     cidr: &str,
     subnets: &[(&str, &str)],
@@ -78,7 +78,7 @@ fn attached(
 
 /// The attachment of a function in one VPC of `10.7.0.0/16` with an interface in each of two
 /// subnets.
-fn two_subnet_attachment(engine: &::engine::InMemoryEngine) -> VpcAttachment {
+pub(crate) fn two_subnet_attachment(engine: &::engine::InMemoryEngine) -> VpcAttachment {
     attached(
         engine,
         "10.7.0.0/16",
