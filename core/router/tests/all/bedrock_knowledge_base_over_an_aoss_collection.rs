@@ -77,9 +77,12 @@ pub const VECTOR_FIELD: &str = "bedrock-knowledge-base-default-vector";
 pub const TEXT_FIELD: &str = "AMAZON_BEDROCK_TEXT_CHUNK";
 pub const METADATA_FIELD: &str = "AMAZON_BEDROCK_METADATA";
 
-/// How many times a read looks again for a transition the clock owes. Generous: every wait
-/// here is for the CONDITION and nothing asserts how long it took.
-const SETTLE_ATTEMPTS: usize = 400;
+/// How many times a read looks again for a transition the clock owes. Generous — the whole
+/// wait is two minutes, because a host running every suite of this workspace at once is far
+/// slower than one running this file alone, while one look is 25 ms, so a stage that does
+/// settle is seen to have settled at once: every wait here is for the CONDITION and nothing
+/// asserts how long it took.
+const SETTLE_ATTEMPTS: usize = 4_800;
 
 /// How long one look waits before the next.
 const SETTLE_PAUSE: Duration = Duration::from_millis(25);
@@ -112,7 +115,7 @@ pub fn build_router() -> MultiServiceRouter {
 
 /// A SigV4 `Authorization` header whose credential scope names `signing_name` in
 /// [`REGION`] and whose credential is [`ACCESS_KEY_ID`].
-fn authorization(signing_name: &str) -> String {
+pub fn authorization(signing_name: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential={ACCESS_KEY_ID}/20260101/{REGION}/{signing_name}/\
          aws4_request, SignedHeaders=host, Signature=0000"
@@ -129,7 +132,7 @@ async fn dispatch(router: &MultiServiceRouter, request: http::Request<Bytes>) ->
 
 /// One OpenSearch Serverless CONTROL-plane call, over the `awsJson1_0` wire its model
 /// declares.
-async fn aoss(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub async fn aoss(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -172,7 +175,7 @@ pub async fn rest(
 /// The authority a published endpoint is dialled at and the path prefix it carries, so a
 /// REST request is addressed exactly where the collection said to address it — whether the
 /// published address names the collection in its HOST or in its PATH.
-fn addressed(endpoint: &str) -> (String, String) {
+pub fn addressed(endpoint: &str) -> (String, String) {
     let after_scheme = endpoint
         .strip_prefix("https://")
         .or_else(|| endpoint.strip_prefix("http://"))
