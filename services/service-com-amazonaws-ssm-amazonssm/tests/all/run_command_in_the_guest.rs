@@ -28,7 +28,9 @@ use super::ec2_instance_managed_nodes::{
     launched_long_enough_ago, Emulator, Grant, AL2023_NAME_PATTERN, REGION, SSM_CORE_POLICY_ARN,
 };
 
-/// The published command document that runs a shell script on a Linux node.
+/// The published command document that runs a shell script on a Linux node, which is what
+/// [`send`] carries — so every suite that drives a script through this one sends it the same
+/// way.
 const RUN_SHELL_SCRIPT: &str = "AWS-RunShellScript";
 
 /// The step of that document a Linux node runs — the name its content declares, which is
@@ -80,7 +82,15 @@ async fn node(emulator: &Emulator, case: &str, role: &str) -> String {
 }
 
 /// Send one script to `instance` and answer the command id.
-async fn send(emulator: &Emulator, case: &str, instance: &str, commands: &[&str]) -> String {
+///
+/// `pub(crate)` for the same reason [`finish_due`] is: the suite about what an instance's
+/// boot program wrote sends its reads the same way.
+pub(crate) async fn send(
+    emulator: &Emulator,
+    case: &str,
+    instance: &str,
+    commands: &[&str],
+) -> String {
     let (status, answered) = emulator
         .ssm(
             REGION,
@@ -132,7 +142,15 @@ pub(crate) fn finish_due(emulator: &Emulator, command_id: &str) {
 
 /// Look at the invocation until it reaches a terminal status, up to a deadline far longer
 /// than the span that move is owed after.
-async fn finished(emulator: &Emulator, case: &str, command_id: &str, instance: &str) -> Value {
+///
+/// `pub(crate)`: every suite that reads an invocation back waits for it the same way, and the
+/// catalog of terminal statuses it waits on belongs in one place.
+pub(crate) async fn finished(
+    emulator: &Emulator,
+    case: &str,
+    command_id: &str,
+    instance: &str,
+) -> Value {
     let deadline = Instant::now() + FINISH_DEADLINE;
     loop {
         let (status, answered) = emulator

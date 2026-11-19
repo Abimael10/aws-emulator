@@ -99,8 +99,12 @@ async fn registered_nodes(emulator: &Emulator, case: &str, count: usize) -> Vec<
 
 /// Poll the node report FILTERED on one node's id — the read a client waiting for its
 /// instance to come under management makes — until that node is reported `Online`, and
-/// assert the filtered report holds that node and nothing else.
-async fn online(emulator: &Emulator, case: &str, instance: &str) {
+/// assert the filtered report holds that node and nothing else; answer the row it reported.
+///
+/// `pub(crate)`, like [`finish_due`]: every suite that waits for a launch to come under
+/// management makes this same filtered read, and a second copy of the poll would be a second
+/// answer to "when is an instance a managed node".
+pub(crate) async fn online(emulator: &Emulator, case: &str, instance: &str) -> Value {
     let body = json!({"Filters": [{"Key": "InstanceIds", "Values": [instance]}]});
     let deadline = Instant::now() + DEADLINE;
     loop {
@@ -123,7 +127,7 @@ async fn online(emulator: &Emulator, case: &str, instance: &str) {
                 "case {case:?}: expected the filter to select {instance} alone, got {row}"
             );
             if row["PingStatus"].as_str() == Some("Online") {
-                return;
+                return (*row).clone();
             }
         }
         assert!(

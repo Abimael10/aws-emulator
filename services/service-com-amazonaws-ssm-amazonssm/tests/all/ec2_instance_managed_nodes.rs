@@ -365,6 +365,24 @@ impl Emulator {
         image_id: &str,
         profile_name: Option<&str>,
     ) -> String {
+        self.launch_with_user_data(case, image_id, profile_name, None)
+            .await
+    }
+
+    /// [`Self::launch`] carrying `user_data` — the program the instance's guest runs when it
+    /// comes up — for a suite about what that program left behind.
+    ///
+    /// The text travels as the API carries it: "the user data to make available to the
+    /// instance" is base64-encoded on the wire, so a case states the program and this encodes
+    /// it.
+    pub(crate) async fn launch_with_user_data(
+        &self,
+        case: &str,
+        image_id: &str,
+        profile_name: Option<&str>,
+        user_data: Option<&str>,
+    ) -> String {
+        let encoded = user_data.map(::aws_smithy_types::base64::encode);
         let mut params = vec![
             ("ImageId", image_id),
             ("InstanceType", INSTANCE_TYPE),
@@ -373,6 +391,9 @@ impl Emulator {
         ];
         if let Some(name) = profile_name {
             params.push(("IamInstanceProfile.Name", name));
+        }
+        if let Some(encoded) = encoded.as_deref() {
+            params.push(("UserData", encoded));
         }
         let body = self.ec2(case, "RunInstances", &params).await;
         elements(&body, "instanceId")
