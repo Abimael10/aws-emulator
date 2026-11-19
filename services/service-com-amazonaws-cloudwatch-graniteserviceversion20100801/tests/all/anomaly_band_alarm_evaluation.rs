@@ -231,6 +231,43 @@ fn metrics(dimensions: &Value, width: Option<f64>) -> Value {
     ])
 }
 
+/// The query array of an alarm that GRADES the series `graded` while drawing its band from the
+/// series `band_from`: the model a band is drawn from is the one for the metric the band's
+/// expression reads ("A math expression can use the `Id` of the other metrics or queries to
+/// refer to those metrics", `MetricDataQuery$Expression`), which need not be the series the
+/// alarm grades.
+fn metrics_over(graded: &Value, band_from: &Value) -> Value {
+    json!([
+        {
+            "Id": "m1",
+            "ReturnData": true,
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": NAMESPACE,
+                    "MetricName": METRIC,
+                    "Dimensions": graded,
+                },
+                "Period": PERIOD,
+                "Stat": "Average",
+            },
+        },
+        {
+            "Id": "m2",
+            "ReturnData": false,
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": NAMESPACE,
+                    "MetricName": METRIC,
+                    "Dimensions": band_from,
+                },
+                "Period": PERIOD,
+                "Stat": "Average",
+            },
+        },
+        {"Id": "ad1", "Expression": "ANOMALY_DETECTION_BAND(m2, 2)", "ReturnData": true},
+    ])
+}
+
 /// Publish one datapoint of the series `dimensions`.
 async fn publish(router: &MultiServiceRouter, dimensions: &Value, value: f64, at: f64) {
     ok(
@@ -575,24 +612,32 @@ async fn a_live_band_alarm_re_creates_the_model_its_threshold_is_drawn_from() {
     );
 
     // Both models are deleted. The one the live alarm's threshold is drawn from is created
-    // again for it — by the evaluation the clock owes that alarm, so a span later — and the one
-    // no alarm references stays gone.
+    // again for it — by the evaluation the clock owes that alarm, so a span later, as a NEW
+    // model under a newly minted identifier — and the one no alarm references stays gone.
     for dimensions in [&watched, &unwatched] {
         delete_detector(&router, dimensions).await;
     }
     wait_for_evaluation();
     let listed = described_detectors(&router).await;
-    let reported = |id: &str| -> Option<Value> {
+    let reported = |series: &Value| -> Option<Value> {
         listed
             .iter()
-            .find(|detector| {
-                detector.get("AnomalyDetectorId").and_then(Value::as_str) == Some(id)
-            })
+            .find(|detector| detector.get("Dimensions") == Some(series))
             .cloned()
     };
-    let restored = reported(&watched_id).unwrap_or_else(|| {
-        panic!("the model the live alarm's threshold is drawn from must be re-created, got {listed:?}")
+    let restored = reported(&watched).unwrap_or_else(|| {
+        panic!("the model the live alarm's threshold is drawn from must be created again, got {listed:?}")
     });
+    let restored_id = restored
+        .get("AnomalyDetectorId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert_ne!(
+        restored_id, watched_id,
+        "a model created again after a delete is a new model under a new identifier, got \
+         {restored}"
+    );
     let state = restored
         .get("StateValue")
         .and_then(Value::as_str)
@@ -600,11 +645,15 @@ async fn a_live_band_alarm_re_creates_the_model_its_threshold_is_drawn_from() {
         .to_string();
     assert!(
         ["PENDING_TRAINING", "TRAINED", "TRAINED_INSUFFICIENT_DATA"].contains(&state.as_str()),
-        "a re-created model reports a modelled AnomalyDetectorStateValue, got {state:?}"
+        "a model created again reports a modelled AnomalyDetectorStateValue, got {state:?}"
     );
     assert!(
-        reported(&unwatched_id).is_none(),
+        reported(&unwatched).is_none(),
         "a model no alarm's threshold is drawn from must stay deleted, got {listed:?}"
+    );
+    assert_ne!(
+        unwatched_id, watched_id,
+        "two models over two series carry two identifiers"
     );
     let still_ok = described_alarm(&router, AlarmKind::Metric, name)
         .await
@@ -648,17 +697,33 @@ async fn a_live_band_alarm_re_creates_the_model_its_threshold_is_drawn_from() {
 #[tokio::test]
 async fn a_band_alarm_whose_model_says_nothing_yet_keeps_the_state_it_has() {
     let router = build_router();
-    // No detector at all: the designated query yields a band with no points, so there is no
-    // threshold to compare the series against and the alarm reports the state its creation left
-    // it in rather than one nothing computed.
-    let dimensions = dimensions(0);
+    // The alarm grades a series that HAS published data, and its band is drawn from another
+    // series that has published none — so the model the write created for that series was
+    // trained on nothing and says nothing, there is no threshold to compare the graded series
+    // against, and the alarm reports the state its creation left it in rather than one nothing
+    // computed.
+    let graded = dimensions(0);
+    let band_from = dimensions(1);
     wait_for_period_room(PERIOD, PERIOD_ROOM).await;
     let stamp = graded_window_stamp(PERIOD);
-    seed_baseline(&router, &dimensions, stamp).await;
-    publish(&router, &dimensions, IN_BAND, stamp).await;
+    seed_baseline(&router, &graded, stamp).await;
+    publish(&router, &graded, IN_BAND, stamp).await;
 
     let name = "band-alarm-without-a-model";
-    put_band_alarm(&router, name, &dimensions, Some(2.0), "GreaterThanUpperThreshold").await;
+    ok(
+        &router,
+        "PutMetricAlarm",
+        &json!({
+            "AlarmName": name,
+            "Metrics": metrics_over(&graded, &band_from),
+            "ThresholdMetricId": "ad1",
+            "ComparisonOperator": "GreaterThanUpperThreshold",
+            "EvaluationPeriods": 1,
+            "TreatMissingData": "missing",
+            "ActionsEnabled": false,
+        }),
+    )
+    .await;
     wait_for_evaluation();
     let alarm = described_alarm(&router, AlarmKind::Metric, name)
         .await
@@ -673,14 +738,25 @@ async fn a_band_alarm_whose_model_says_nothing_yet_keeps_the_state_it_has() {
         "an evaluation that decided nothing writes no decision record, got {alarm}"
     );
 
-    // The model the alarm's threshold needs is one the store owes it, so the detector reader
-    // reports it — and once its training is due the same alarm is decided by the band.
+    // The model the alarm's threshold is drawn from is the one the write created for the series
+    // the BAND reads, and the detector reader reports it — for that series and for no other.
     let listed = described_detectors(&router).await;
     assert_eq!(
         listed.len(),
         1,
-        "the model the live alarm's threshold is drawn from must be created for it, got {listed:?}"
+        "the write must create the model its band is drawn from, and only that one, got \
+         {listed:?}"
     );
+    assert_eq!(
+        listed[0].get("Dimensions").cloned(),
+        Some(band_from.clone()),
+        "the model created must be the one for the series the band reads, got {listed:?}"
+    );
+
+    // Once that series has published a history of its own, the same model has something to
+    // expect a value by, and the same alarm is decided by the band it draws.
+    seed_baseline(&router, &band_from, stamp).await;
+    publish(&router, &band_from, IN_BAND, stamp).await;
     wait_for_evaluation();
     let decided = described_alarm(&router, AlarmKind::Metric, name)
         .await
@@ -688,7 +764,7 @@ async fn a_band_alarm_whose_model_says_nothing_yet_keeps_the_state_it_has() {
     assert_eq!(
         decided.get("StateValue").and_then(Value::as_str),
         Some("OK"),
-        "an in-band value must drive the alarm to OK once the model it needs is trained, got \
+        "an in-band value must drive the alarm to OK once the model it needs has a history, got \
          {decided}"
     );
 }

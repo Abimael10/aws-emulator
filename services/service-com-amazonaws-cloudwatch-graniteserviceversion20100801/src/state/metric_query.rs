@@ -657,8 +657,8 @@ impl SeriesSource for StoreSeriesSource<'_> {
         // on, under the identity the write that stored the detector was keyed by. A series
         // computed from others is no metric's series and no detector's.
         let metric = series.metric.as_ref()?;
-        let detector_id = super::AnomalyDetectorForm::of_series_metric(metric).detector_id();
-        let stored = self.store.anomaly_detectors.get(&detector_id)?;
+        let detector_key = super::AnomalyDetectorForm::of_series_metric(metric).detector_key();
+        let stored = self.store.anomaly_detectors.get(&detector_key)?;
         // What the model was TRAINED on is the metric's own history and not the span this read
         // happens to cover ([`anomaly_training_history`]), so the band a graph shows over one
         // window and the band an alarm compares one period against are the same numbers.
@@ -674,8 +674,8 @@ impl SeriesSource for StoreSeriesSource<'_> {
         let Some(metric) = series.metric.as_ref() else {
             return 0;
         };
-        let detector_id = super::AnomalyDetectorForm::of_series_metric(metric).detector_id();
-        if !self.store.anomaly_detectors.contains_key(&detector_id) {
+        let detector_key = super::AnomalyDetectorForm::of_series_metric(metric).detector_key();
+        if !self.store.anomaly_detectors.contains_key(&detector_key) {
             return 0;
         }
         self.store

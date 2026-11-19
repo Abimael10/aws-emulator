@@ -1249,6 +1249,14 @@ fn write_alarm(
             now,
         );
 
+    // The MODEL this alarm's threshold is drawn from. A band is a MODEL's — "You can use the
+    // model to display a band of expected normal values when the metric is graphed."
+    // (`PutAnomalyDetector`) — and this alarm designates one as its threshold ("In an alarm based
+    // on an anomaly detection model, this is the ID of the ANOMALY_DETECTION_BAND function used
+    // as the threshold for the alarm", `PutMetricAlarmInput$ThresholdMetricId`), so the write
+    // that configures it creates the model for each metric that band is drawn from where the
+    // account holds none. An alarm thresholded by a number names no band and creates nothing.
+    store.create_band_models(&alarm, now);
     store.alarms.insert(
         input.alarm_name.clone(),
         crate::state::StoredAlarm {

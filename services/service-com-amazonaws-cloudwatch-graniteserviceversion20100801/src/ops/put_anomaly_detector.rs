@@ -201,9 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         validate_configuration(input.configuration.as_ref())?;
 
         let now_secs = crate::state::now_secs();
-        let detector_id = form.detector_id();
+        // WHICH model this write acts on: the identity of what it watches, so a second write of
+        // the same metric and statistic updates that model rather than adding a second one.
+        let detector_key = form.detector_key();
         let mut store = state.lock();
-        if !store.anomaly_detectors.contains_key(&detector_id)
+        if !store.anomaly_detectors.contains_key(&detector_key)
             && store.anomaly_detectors.len() >= crate::state::MAX_ANOMALY_DETECTORS
         {
             return Err(PutAnomalyDetectorErrorModeled::LimitExceededException(
@@ -217,43 +219,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let single = form.single_metric().cloned();
-        let math = match &form {
-            crate::state::AnomalyDetectorForm::SingleMetric(_) => None,
-            crate::state::AnomalyDetectorForm::MetricMath(math) => Some(math.clone()),
-        };
+        // The identifier the model is reported under: the one minted for the model this write
+        // CREATES, and the one it already carries where this write updates a model that exists —
+        // "The unique identifier of the anomaly detector that you created or updated."
+        // (`PutAnomalyDetectorOutput$AnomalyDetectorId`).
+        let detector_id = store
+            .anomaly_detectors
+            .get(&detector_key)
+            .and_then(|stored| stored.detector.anomaly_detector_id.clone())
+            .unwrap_or_else(crate::state::minted_anomaly_detector_id);
+
         store.anomaly_detectors.insert(
-            detector_id.clone(),
-            crate::state::StoredAnomalyDetector {
-                // Stored as the shape its reader returns, so every member this operation
-                // accepts round-trips through `DescribeAnomalyDetectors` unchanged.
-                detector: AnomalyDetector {
-                    anomaly_detector_id: Some(detector_id.clone()),
-                    // The deprecated flat members report the SAME metric the single-metric
-                    // structure carries ("Use SingleMetricAnomalyDetector.Namespace
-                    // property.", `AnomalyDetector$Namespace`), so a client reading either
-                    // spelling reads one model; a metric-math model has no single metric to
-                    // report them for.
-                    namespace: single.as_ref().and_then(|single| single.namespace.clone()),
-                    metric_name: single
-                        .as_ref()
-                        .and_then(|single| single.metric_name.clone()),
-                    dimensions: single.as_ref().and_then(|single| single.dimensions.clone()),
-                    stat: single.as_ref().and_then(|single| single.stat.clone()),
-                    configuration: input.configuration.clone(),
-                    // A write trains the model from the configuration it carries, and
-                    // training is owed a span later, so the model this call wrote is pending
-                    // training whether this call created it or updated one that was already
-                    // trained.
-                    state_value: Some(
-                        crate::state::ANOMALY_DETECTOR_PENDING_TRAINING.to_string(),
-                    ),
-                    metric_characteristics: input.metric_characteristics.clone(),
-                    single_metric_anomaly_detector: single,
-                    metric_math_anomaly_detector: math,
-                },
-                trained_due_secs: now_secs + crate::state::TRAINING_DELAY_SECS,
-            },
+            detector_key,
+            crate::state::StoredAnomalyDetector::created(
+                &form,
+                input.configuration.clone(),
+                input.metric_characteristics.clone(),
+                detector_id.clone(),
+                now_secs,
+            ),
         );
 
         Ok(PutAnomalyDetectorOutput {

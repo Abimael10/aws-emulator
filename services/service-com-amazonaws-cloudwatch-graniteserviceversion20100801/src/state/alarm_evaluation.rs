@@ -108,7 +108,7 @@ use super::{
     HISTORY_DATA_VERSION, MAX_STATE_REASON_DATA_LEN,
 };
 use crate::ops::types::{
-    AlarmHistoryItem, AnomalyDetector, MetricAlarm, MetricDataQuery, STATISTIC_VALUES,
+    AlarmHistoryItem, MetricAlarm, MetricDataQuery, STATISTIC_VALUES,
 };
 
 /// The grid of period windows an alarm's evaluation grades its series over: where the
@@ -960,8 +960,8 @@ impl State {
         let alarm = stored.alarm.clone();
         budget.charge_alarm();
         // An alarm whose threshold is a MODEL keeps that model: the evaluation that is now due
-        // re-creates the detector its band is drawn from if the store no longer holds it.
-        self.restore_referenced_models(&alarm, now_secs);
+        // creates the detector its band is drawn from if the store no longer holds it.
+        self.create_band_models(&alarm, now_secs);
         // This alarm is being evaluated now, so its NEXT evaluation is owed a span from here
         // rather than being due again at once: it is re-armed before the fold runs, so the
         // fold is charged to this request only and a following request pays for the alarms
@@ -1039,12 +1039,12 @@ impl State {
         self.make_parents_due(name, now_secs);
     }
 
-    /// Re-create every anomaly detection model a LIVE alarm's threshold is drawn from that this
+    /// Create the anomaly detection models every LIVE alarm's threshold is drawn from that this
     /// store no longer holds, for the alarms whose evaluation the clock has already made due.
     ///
-    /// The detector store's side of the same rule [`Self::restore_referenced_models`] states for
-    /// one alarm, for the reader that reports the models: an alarm's due evaluation needs the
-    /// model its band is drawn from, and that evaluation was owed at this instant whether or not
+    /// The detector store's side of the same rule [`Self::create_band_models`] states for one
+    /// alarm, for the reader that reports the models: an alarm's due evaluation needs the model
+    /// its band is drawn from, and that evaluation was owed at this instant whether or not
     /// anybody called — so a model deleted under such an alarm is back a span later, while one
     /// no alarm's threshold is drawn from stays deleted. Bounded by
     /// [`MAX_ALARMS_EVALUATED_PER_REQUEST`], like every other pass one request pays for.
@@ -1060,56 +1060,46 @@ impl State {
             .map(|stored| stored.alarm.clone())
             .collect();
         for alarm in &needed {
-            self.restore_referenced_models(alarm, now_secs);
+            self.create_band_models(alarm, now_secs);
         }
     }
 
-    /// Re-create the anomaly detection model `alarm`'s threshold is drawn from, when the store
-    /// no longer holds it.
+    /// Create the anomaly detection model `alarm`'s threshold is drawn from, when the store
+    /// holds none for the metric that band is drawn from.
     ///
-    /// An alarm whose threshold is a model KEEPS that model alive: the alarm names the band as
-    /// its threshold ("the ID of the ANOMALY_DETECTION_BAND function used as the threshold for
-    /// the alarm", `MetricAlarm$ThresholdMetricId`), so the evaluation that is due for it needs
-    /// a model for the metric its band is drawn from and creates one where there is none —
-    /// pending training, exactly as a newly created model is. A model no live alarm's threshold
-    /// is drawn from is not re-created: deleting it removes it for good.
+    /// An alarm whose threshold is a model OWNS that model: the alarm names the band as its
+    /// threshold ("the ID of the ANOMALY_DETECTION_BAND function used as the threshold for the
+    /// alarm", `MetricAlarm$ThresholdMetricId`) and a band is a model's ("You can use the model
+    /// to display a band of expected normal values when the metric is graphed.",
+    /// `PutAnomalyDetector`), so the write that configures such an alarm creates the model for
+    /// each metric its band is drawn from where the account holds none — pending training,
+    /// exactly as a model a caller created directly is — and the evaluation that is later due for
+    /// that alarm creates one again if the model was deleted under it. A model no live alarm's
+    /// threshold is drawn from is not created again: deleting it removes it for good.
     ///
-    /// The re-created model carries no training configuration and no metric characteristics:
-    /// those were the deleted model's own, and the alarm names only the metric and statistic
-    /// its band is drawn from.
-    fn restore_referenced_models(&mut self, alarm: &MetricAlarm, now_secs: f64) {
+    /// The model this creates carries no training configuration and no metric characteristics:
+    /// the alarm names only the metric and statistic its band is drawn from, and a model created
+    /// again after a delete cannot carry what the deleted model was configured with. Its
+    /// identifier is minted for it like any other model's, so a model created again after a
+    /// delete is a DIFFERENT model with a different identifier.
+    pub fn create_band_models(&mut self, alarm: &MetricAlarm, now_secs: f64) {
         for metric in band_model_metrics(alarm) {
             let form = super::AnomalyDetectorForm::of_series_metric(&metric);
-            let detector_id = form.detector_id();
-            if self.anomaly_detectors.contains_key(&detector_id)
+            let detector_key = form.detector_key();
+            if self.anomaly_detectors.contains_key(&detector_key)
                 || self.anomaly_detectors.len() >= super::MAX_ANOMALY_DETECTORS
             {
                 continue;
             }
-            let single = form.single_metric().cloned();
             self.anomaly_detectors.insert(
-                detector_id.clone(),
-                super::StoredAnomalyDetector {
-                    detector: AnomalyDetector {
-                        anomaly_detector_id: Some(detector_id),
-                        // The deprecated flat members report the same metric the single-metric
-                        // structure carries, as a model this service wrote itself does.
-                        namespace: single.as_ref().and_then(|single| single.namespace.clone()),
-                        metric_name: single
-                            .as_ref()
-                            .and_then(|single| single.metric_name.clone()),
-                        dimensions: single.as_ref().and_then(|single| single.dimensions.clone()),
-                        stat: single.as_ref().and_then(|single| single.stat.clone()),
-                        configuration: None,
-                        state_value: Some(
-                            super::ANOMALY_DETECTOR_PENDING_TRAINING.to_string(),
-                        ),
-                        metric_characteristics: None,
-                        single_metric_anomaly_detector: single,
-                        metric_math_anomaly_detector: None,
-                    },
-                    trained_due_secs: now_secs + super::TRAINING_DELAY_SECS,
-                },
+                detector_key,
+                super::StoredAnomalyDetector::created(
+                    &form,
+                    None,
+                    None,
+                    super::minted_anomaly_detector_id(),
+                    now_secs,
+                ),
             );
         }
     }

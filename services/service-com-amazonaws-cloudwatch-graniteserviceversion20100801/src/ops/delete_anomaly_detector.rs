@@ -173,7 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`DeleteAnomalyDetectorInput$AnomalyDetectorId`) — and otherwise the metric and
         // statistic (or the queries) it watches do, under the rule both detector writers
         // share.
-        let detector_id = match input.anomaly_detector_id.as_deref() {
+        //
+        // Either identification resolves to the key the store holds the model under
+        // ([`crate::state::AnomalyDetectorForm::detector_key`]): an identifier is the model's
+        // OWN, minted for it by the write that created it, so it is looked up among the models
+        // this store holds rather than computed from what the request names.
+        let named_id = match input.anomaly_detector_id.as_deref() {
             Some(named) => {
                 // An identifier names the model on its own, so it is never combined with the
                 // metric that would name another one: the refusal lists the forms the request
@@ -197,8 +202,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::one_detector_identification_message(&found),
                     ));
                 }
-                named.to_string()
+                Some(named.to_string())
             }
+            None => None,
+        };
+        let mut store = state.lock();
+        let detector_key = match named_id {
+            Some(named) => store
+                .anomaly_detectors
+                .iter()
+                .find(|(_, stored)| {
+                    stored.detector.anomaly_detector_id.as_deref() == Some(named.as_str())
+                })
+                .map(|(key, _)| key.clone()),
             None => {
                 let form = crate::state::anomaly_detector_form(
                     input.single_metric_anomaly_detector.as_ref(),
@@ -214,12 +230,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if let Some(missing) = crate::state::anomaly_detector_form_missing(&form) {
                     return Err(missing_parameter(missing));
                 }
-                form.detector_id()
+                Some(form.detector_key())
             }
         };
 
-        let mut store = state.lock();
-        if store.anomaly_detectors.remove(&detector_id).is_none() {
+        if detector_key
+            .and_then(|key| store.anomaly_detectors.remove(&key))
+            .is_none()
+        {
             // "The named resource does not exist." (`ResourceNotFoundException`) — what a
             // caller deleting a model no write of theirs created is told, whether they named
             // it by identifier or by metric. The identifier is not echoed: the caller may have

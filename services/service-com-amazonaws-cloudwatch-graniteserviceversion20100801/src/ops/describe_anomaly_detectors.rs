@@ -298,7 +298,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             anomaly_detectors: Some(
                 page.iter()
                     .take(page_size)
-                    .map(|stored| stored.detector.clone())
+                    .map(|stored| stored.reported())
                     .collect(),
             ),
             next_token,
@@ -307,7 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The identifier a stored model is ordered and paged by, which every model this store holds
-/// carries ([`crate::state::AnomalyDetectorForm::detector_id`]).
+/// carries ([`crate::state::minted_anomaly_detector_id`]).
 fn detector_id_of(stored: &crate::state::StoredAnomalyDetector) -> &str {
     stored
         .detector

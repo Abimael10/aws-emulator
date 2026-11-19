@@ -92,6 +92,13 @@ pub mod alarm_reads;
 
 pub use alarm_reads::*;
 
+/// The anomaly detection models this store holds: the identifier a write mints for one, the
+/// record it stores, and what a read of that record reports. Re-exported below, so a handler
+/// reaches them as `crate::state::…` like every other part of this store.
+pub mod anomaly_detector_reads;
+
+pub use anomaly_detector_reads::*;
+
 /// The Contributor Insights rule syntax a `RuleDefinition` carries, evaluated over the log
 /// events ingested into the log groups a rule names, and the report `GetInsightRuleReport`
 /// answers from what that evaluation collected.
@@ -1531,7 +1538,9 @@ pub fn o_tel_enrichment_filters(
 ///
 /// Held as the modelled [`AnomalyDetector`] itself rather than a parallel record, so every
 /// member `PutAnomalyDetector` accepts round-trips through `DescribeAnomalyDetectors` without
-/// a field-by-field copy that can silently drop one — the same way an alarm is held.
+/// a field-by-field copy that can silently drop one — the same way an alarm is held. The record
+/// is created and projected for a read in one place
+/// ([`anomaly_detector_reads`]).
 #[derive(Debug, Clone, Default)]
 pub struct StoredAnomalyDetector {
     /// The detector as `DescribeAnomalyDetectors` reports it.
@@ -1673,7 +1682,8 @@ impl AnomalyDetectorForm {
         }
     }
 
-    /// The unique identifier of the detector this form names.
+    /// WHICH model this form names: the identity of the thing it watches, under which this store
+    /// keys the models it holds.
     ///
     /// A detector is identified by WHAT it watches — the metric, its dimensions and the
     /// statistic for a single-metric detector, and the queries for a metric-math one — so a
@@ -1683,17 +1693,25 @@ impl AnomalyDetectorForm {
     /// training configuration and the metric characteristics are NOT part of the identity:
     /// they are properties of the model rather than of the series it is trained on.
     ///
-    /// The identifier is a digest of that identity in hex, which keeps it inside the modelled
-    /// `AnomalyDetectorId` (1..128, `^[A-Za-z0-9_./:%()+-]+$`) whatever a metric, a dimension
-    /// or an expression is spelled with.
-    pub fn detector_id(&self) -> String {
+    /// This is the store's own key, NOT the identifier a read reports: that one is minted for
+    /// the model by the write that created it
+    /// ([`super::anomaly_detector_reads::minted_anomaly_detector_id`]), so a model deleted and
+    /// created again for the same metric is a different model under the same key.
+    ///
+    /// The key is a digest of that identity in hex, so one bounded key serves whatever a metric,
+    /// a dimension or an expression is spelled with.
+    pub fn detector_key(&self) -> String {
         ::hex::encode(<::sha2::Sha256 as ::sha2::Digest>::digest(
             self.identity().as_bytes(),
         ))
     }
 
     /// What this form watches, rendered canonically: the dimension set is normalised, so the
-    /// same metric named with its dimensions in another order is the same detector.
+    /// same metric named with its dimensions in another order is the same detector, and the
+    /// account is resolved — "If you omit this parameter, the current account is used."
+    /// (`SingleMetricAnomalyDetector$AccountId`) — so a form that names this account's own id is
+    /// the same detector as one that names no account at all, which is what lets a described
+    /// model be fed straight back into a write.
     fn identity(&self) -> String {
         let mut document = Map::new();
         document.insert(
@@ -1702,7 +1720,10 @@ impl AnomalyDetectorForm {
         );
         match self {
             Self::SingleMetric(single) => {
-                insert_member(&mut document, "accountId", json_text(&single.account_id));
+                document.insert(
+                    "accountId".to_string(),
+                    Value::from(detector_account_id(single.account_id.as_deref())),
+                );
                 insert_member(&mut document, "namespace", json_text(&single.namespace));
                 insert_member(&mut document, "metricName", json_text(&single.metric_name));
                 document.insert(
@@ -2037,10 +2058,11 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// `PutManagedInsightRules` entry naming a resource kind neither half publishes a template
     /// of that name for is reported back among the rules that could not be enabled.
     pub managed_rule_templates: Vec<ManagedRuleTemplate>,
-    /// Anomaly detection models by their unique identifier
-    /// ([`AnomalyDetectorForm::detector_id`]), which is what identifies the metric and
-    /// statistic (or the queries) a model was created for, so a second write for the same
-    /// thing updates that model rather than adding a second one.
+    /// Anomaly detection models by the identity of what they watch
+    /// ([`AnomalyDetectorForm::detector_key`]) — the metric and statistic (or the queries) a
+    /// model was created for — so a second write for the same thing updates that model rather
+    /// than adding a second one. The identifier a read reports is the model's own, minted for it
+    /// by the write that created it ([`minted_anomaly_detector_id`]).
     pub anomaly_detectors: HashMap<String, StoredAnomalyDetector>,
     /// Dashboards by dashboard name.
     ///

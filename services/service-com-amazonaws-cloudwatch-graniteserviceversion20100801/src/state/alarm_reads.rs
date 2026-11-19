@@ -75,10 +75,15 @@ fn epoch_millis(secs: f64) -> i64 {
 /// not derivable from the clock). Nothing here comes from the request, so a creation identity
 /// is never a function of client input.
 ///
+/// Shared by every identity this service MINTS — a creation identity, and the identifier a write
+/// mints for an anomaly detection model
+/// ([`super::anomaly_detector_reads::minted_anomaly_detector_id`]) — so one mixing serves them
+/// all.
+///
 /// This is adequate for an emulator's opaque values but it is not an OS CSPRNG: if
 /// `getrandom`/`rand` is ever declared in the workspace manifest, mint from it and delete this
 /// mixing.
-fn minted_bytes() -> [u8; 16] {
+pub(crate) fn minted_bytes() -> [u8; 16] {
     use ::sha2::{Digest, Sha256};
     use std::hash::{BuildHasher, Hasher};
 

@@ -99,6 +99,32 @@ fn metric_math(metric: &str, expression: &str) -> Value {
     ]})
 }
 
+/// The single-metric structure a READ of a model reports, for a write that named `written`: the
+/// identity in full — the account the series belongs to ("If you omit this parameter, the
+/// current account is used.", `SingleMetricAnomalyDetector$AccountId`) and the dimensions it
+/// carries, the EMPTY list where the write named none.
+fn reported_single(written: &Value) -> Value {
+    let mut reported = written.clone();
+    if reported.get("AccountId").is_none() {
+        reported["AccountId"] = Value::from(engine::emulator_account_id());
+    }
+    if reported.get("Dimensions").is_none() {
+        reported["Dimensions"] = json!([]);
+    }
+    reported
+}
+
+/// The training configuration a READ of a model reports, for a write that named `written` (or
+/// named none): present, carrying the time ranges it excludes — the empty list where the write
+/// excluded none — and nothing the write left out.
+fn reported_configuration(written: Option<&Value>) -> Value {
+    let mut reported = written.cloned().unwrap_or_else(|| json!({}));
+    if reported.get("ExcludedTimeRanges").is_none() {
+        reported["ExcludedTimeRanges"] = json!([]);
+    }
+    reported
+}
+
 #[tokio::test]
 async fn every_detector_form_round_trips_through_describe_anomaly_detectors() {
     // Rows differ along which spelling names the detector, which statistic it watches, how
@@ -230,17 +256,21 @@ async fn every_detector_form_round_trips_through_describe_anomaly_detectors() {
             "case {case:?}: a model whose training has just started is pending training, got \
              {detector}"
         );
+        // What the read reports is the identity the write named, IN FULL: the account the
+        // series belongs to, and the dimensions it carries — a list of none where the write
+        // named none.
+        let expected_reported = expected_single.as_ref().map(reported_single);
         assert_eq!(
             detector.get("SingleMetricAnomalyDetector").cloned(),
-            expected_single,
-            "case {case:?}: expected the single metric detector {expected_single:?}, got \
+            expected_reported,
+            "case {case:?}: expected the single metric detector {expected_reported:?}, got \
              {detector}"
         );
         // The deprecated flat members report the same metric the structure carries, so a
         // client reading either spelling reads one model.
         for member in ["Namespace", "MetricName", "Stat", "Dimensions"] {
             let flat = detector.get(member).cloned();
-            let structured = expected_single
+            let structured = expected_reported
                 .as_ref()
                 .and_then(|single| single.get(member).cloned());
             assert_eq!(
@@ -248,7 +278,16 @@ async fn every_detector_form_round_trips_through_describe_anomaly_detectors() {
                 "case {case:?}: {member} must mirror the single metric detector, got {detector}"
             );
         }
-        for member in ["Configuration", "MetricCharacteristics", "MetricMathAnomalyDetector"] {
+        // Every model is trained under a configuration, so the member is reported whether or
+        // not the write named one, carrying the ranges it excludes.
+        let expected_configuration = reported_configuration(request.get("Configuration"));
+        assert_eq!(
+            detector.get("Configuration").cloned(),
+            Some(expected_configuration.clone()),
+            "case {case:?}: expected the training configuration {expected_configuration}, got \
+             {detector}"
+        );
+        for member in ["MetricCharacteristics", "MetricMathAnomalyDetector"] {
             assert_eq!(
                 detector.get(member).cloned(),
                 request.get(member).cloned(),
