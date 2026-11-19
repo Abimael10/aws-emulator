@@ -32,6 +32,15 @@
 //!   back. A value and a length bound say the same thing twice, and this service's recorded
 //!   refusals of a member that broke its bound AND its expression together state neither
 //!   clause with a value;
+//! * a COLLECTION member outside its `@length` is the one length clause that DOES state a
+//!   value, and the value is the collection ITSELF — a list as `[…]`, a map as `{…}`. The
+//!   framework's walk, which length-checks the member before it descends into the entries,
+//!   has only a summary of its SIZE (`<n> items`, `<n> entries`) and no value any caller
+//!   sent, so there is nothing of the caller's own to say twice. A summary of size ZERO
+//!   determines that collection completely, so the clause states it from the summary alone
+//!   ([`::service_common::validation_message::quoting_an_empty_submitted_collection`], where
+//!   the rendering lives); a summary of any other size needs the request's own elements,
+//!   which this seam is not handed, and keeps the framework's valueless clause;
 //! * a member outside either end of its `@range` is stated with no value for the same
 //!   reason: the clause names the member and the numeric bound it broke, and the number that
 //!   broke it is not echoed back;
@@ -60,6 +69,16 @@
 //! through here. `ShapeNamespacedErrorType`, in front of every operation, is what writes
 //! that name — for this shape wherever it comes from, so a refusal worded here and one a
 //! handler answers name it identically.
+//!
+//! WHICH shape is named is a property of the OPERATION, not of this seam: the classic IoT
+//! surface refuses an invalid request with the legacy exception above, while the planes
+//! whose operations model `ValidationException` name that one. This seam is handed the
+//! violations alone and never the operation they were found in, so it states the classic
+//! surface's shape, and the other planes are served in front of it
+//! ([`super::modelled_refusal`]) — which states the same envelope, clauses and value
+//! rendering under the shape those operations model.
+
+use std::collections::HashSet;
 
 use ::smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 
@@ -69,28 +88,68 @@ use ::smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 /// input-constraint failure, and its code and status are not this service's to change) and
 /// a refusal with nothing to state.
 pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
+    refused_under(refusal, super::INVALID_REQUEST_EXCEPTION, &HashSet::new())
+}
+
+/// The same statement of `refusal`, under the error shape `code` and with the member paths
+/// in `quoting_a_collection` stated WITH their value — for the planes of this service whose
+/// operations model ANOTHER shape for an invalid request ([`super::modelled_refusal`]), so
+/// one envelope, one clause set and one value rendering serve every operation and only the
+/// shape name differs.
+///
+/// A path belongs in that set when the CALLER of this function has already put the submitted
+/// COLLECTION into the clause's value half — which the layer holding the request can do for a
+/// collection of any size, where this seam can only do it for an empty one
+/// ([`as_this_service_states`]).
+pub(crate) fn refused_under(
+    refusal: &Refusal,
+    code: &str,
+    quoting_a_collection: &HashSet<String>,
+) -> Option<Refused> {
+    let (stated, mut stating_collections) = as_this_service_states(refusal);
+    stating_collections.extend(quoting_a_collection.iter().cloned());
     ::service_common::validation_message::aws_validation_refusal_withholding_violations(
-        &in_stated_value_set_order(refusal),
-        states_no_value,
+        &stated,
+        |violation| states_no_value(violation, &stating_collections),
     )
     .map(|stated| Refused {
-        code: super::INVALID_REQUEST_EXCEPTION.to_owned(),
+        code: code.to_owned(),
         message: stated.message,
     })
 }
 
-/// `refusal` with every enumerated type's value set in the order this service's front door
-/// states it, and every other violation untouched.
-fn in_stated_value_set_order(refusal: &Refusal) -> Refusal {
-    match refusal {
-        Refusal::Invalid(violations) => Refusal::Invalid(
-            violations
-                .iter()
-                .map(::service_common::validation_message::in_hashed_enum_order)
-                .collect(),
-        ),
-        other => other.clone(),
-    }
+/// `refusal` with the two things this service states of its own — every enumerated type's
+/// value set in the order its front door states it, and the EMPTY collection a clause about
+/// a collection member quotes where the framework's walk summarised its size
+/// ([`::service_common::validation_message::quoting_an_empty_submitted_collection`]) — beside
+/// the member paths whose clause now states such a collection.
+///
+/// The paths are collected HERE, where the rewriting happens, rather than read back off the
+/// rewritten value: whether a clause states a collection is a fact about what this service
+/// put there, not about how the value happens to be spelled. Every other violation is
+/// untouched.
+fn as_this_service_states(refusal: &Refusal) -> (Refusal, HashSet<String>) {
+    let Refusal::Invalid(violations) = refusal else {
+        return (refusal.clone(), HashSet::new());
+    };
+    let mut stating_collections = HashSet::new();
+    let stated = violations
+        .iter()
+        .map(::service_common::validation_message::in_hashed_enum_order)
+        .map(|violation| {
+            let path = violation.path.clone();
+            let value = violation.value.clone();
+            let quoted =
+                ::service_common::validation_message::quoting_an_empty_submitted_collection(
+                    violation,
+                );
+            if quoted.value != value {
+                stating_collections.insert(path);
+            }
+            quoted
+        })
+        .collect();
+    (Refusal::Invalid(stated), stating_collections)
 }
 
 /// The expression every name type of the THING REGISTRY carries, as a clause quotes it:
@@ -125,14 +184,24 @@ const REGISTRY_NAME_EXPRESSION: &str = "[a-zA-Z0-9:_-]+";
 /// second one is why this is asked about the violation rather than about its member path: the
 /// same member path states its value for this requirement and withholds it for the `@length`
 /// bound of the very same type.
-fn states_no_value(violation: &Violation) -> bool {
+///
+/// A `@length` broken by a COLLECTION is the third class stated WITH a value: the clause
+/// states the collection itself, because the walk's own rendering of one is a size no caller
+/// sent rather than a value that would say the bound twice. `quoting_a_collection` names the
+/// member paths where the collection was restored into the clause; a collection NOBODY could
+/// restore keeps the summary the walk left, which the shared clause builder drops the same
+/// way.
+fn states_no_value(violation: &Violation, quoting_a_collection: &HashSet<String>) -> bool {
     let withheld_by_class = match &violation.kind {
         ViolationKind::Pattern(expression) => expression != REGISTRY_NAME_EXPRESSION,
         ViolationKind::MissingRequiredMember
-        | ViolationKind::MinLength(_)
-        | ViolationKind::MaxLength(_)
         | ViolationKind::MinValue(_)
         | ViolationKind::MaxValue(_) => true,
+        // The text that broke a length bound says the bound twice; the COLLECTION that
+        // broke one is the value the clause states.
+        ViolationKind::MinLength(_) | ViolationKind::MaxLength(_) => {
+            !quoting_a_collection.contains(&violation.path)
+        }
         // The classes whose requirement is a SET of admissible values, or the elements
         // themselves, are stated BESIDE the value they rejected.
         ViolationKind::EnumValue(_) | ViolationKind::UniqueItems => false,
@@ -159,10 +228,12 @@ mod tests {
     }
 
     /// RULE: a member the request did not carry, a member outside a `@pattern` that is not
-    /// a registry name's, and a member outside its `@length` or its `@range` are each
-    /// stated with NO value; a REGISTRY NAME outside its expression and every other
-    /// constraint class state the value the request submitted; and a `@pattern` is quoted
-    /// without the anchors a whole-value pattern wraps it in.
+    /// a registry name's, and a member whose own TEXT is outside its `@length` or its
+    /// `@range` are each stated with NO value; a REGISTRY NAME outside its expression, a
+    /// COLLECTION outside its `@length` (stated with the collection itself where the walk's
+    /// summary determines it) and every other constraint class state the value the request
+    /// submitted; and a `@pattern` is quoted without the anchors a whole-value pattern wraps
+    /// it in.
     #[test]
     fn an_absent_member_states_no_value_and_every_other_class_states_one() {
         // The rows span the classes the framework reports: an absent member, a value
@@ -242,6 +313,37 @@ mod tests {
                 ),
                 "1 validation error detected: Value 'MAYBE' at 'status' failed to satisfy \
                  constraint: Member must satisfy enum value set: [ACTIVE]",
+            ),
+            (
+                // The walk summarises an empty list as `0 items`, which no caller sent;
+                // the clause states the collection itself.
+                "an empty list at a member whose length has a minimum",
+                violation(
+                    "mandatoryParameters",
+                    ViolationKind::MinLength(1),
+                    Some("0 items"),
+                ),
+                "1 validation error detected: Value '[]' at 'mandatoryParameters' failed to \
+                 satisfy constraint: Member must have length greater than or equal to 1",
+            ),
+            (
+                "an empty map at a member whose length has a minimum",
+                violation(
+                    "tokenSigningPublicKeys",
+                    ViolationKind::MinLength(1),
+                    Some("0 entries"),
+                ),
+                "1 validation error detected: Value '{}' at 'tokenSigningPublicKeys' failed \
+                 to satisfy constraint: Member must have length greater than or equal to 1",
+            ),
+            (
+                // A collection the summary does not determine: the elements are not here,
+                // so the clause states the requirement and no value rather than a size
+                // nobody submitted.
+                "a list past its length maximum",
+                violation("queries", ViolationKind::MaxLength(1), Some("2 items")),
+                "1 validation error detected: Value at 'queries' failed to satisfy \
+                 constraint: Member must have length less than or equal to 1",
             ),
             (
                 // `LogTargetType`, declared DEFAULT, THING_GROUP, CLIENT_ID, SOURCE_IP,

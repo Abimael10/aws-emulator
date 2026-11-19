@@ -71,12 +71,15 @@
 //! routing key names.
 
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, OperationContext, OperationRoutingTable, Refusal, Refused,
+    Service,
 };
 use std::sync::Arc;
 
 // How this service words a request the framework refused before any handler ran lives in
-// `service/validation.rs`, beside the seam that answers it.
+// `service/validation.rs`, beside the seam that answers it; WHICH error shape that refusal
+// names for the planes whose operations model another one, in `service/modelled_refusal.rs`.
+mod modelled_refusal;
 mod validation;
 
 // WHERE a command-execution `targetArn` outside this account is refused — in front of the
@@ -209,16 +212,30 @@ const NAMESPACED_ERROR_SHAPES: &[&str] = &[INVALID_REQUEST_EXCEPTION, SQL_PARSE_
 /// It names no operation of its own, because the operation is the routing key the request
 /// carries: ONE gate stands in front of all of this service's operations, and the action it
 /// judges is that key under this service's own IAM prefix.
+///
+/// The operation an authorized request is handed to is read off this service's own tables: the
+/// generated routing table, or — for the planes whose operations model another error shape for
+/// an invalid request — the wrapped one [`modelled_refusal`] builds, which serves the same
+/// modelled operation behind the layer that states that shape. Neither is a re-route: both
+/// tables are keyed by the operation's own modelled name.
 pub struct AuthorizationGate<Eng> {
     /// The same shared engine the entry constructed each operation from, so the decision reads
     /// the account's own IAM and STS stores rather than a second copy of them.
     engine: Arc<Eng>,
+    /// The operations served through [`modelled_refusal`], keyed by the routing key the
+    /// protocol resolves: those whose model declares another error shape for an invalid
+    /// request than the classic surface's. A key this table does not hold is served by the
+    /// generated routing table, which is every other operation of this service.
+    stated_refusals: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> AuthorizationGate<Eng> {
     /// A gate on the shared engine.
     fn new(engine: Arc<Eng>) -> Self {
-        Self { engine }
+        Self {
+            stated_refusals: modelled_refusal::stated_refusals(&engine),
+            engine,
+        }
     }
 }
 
@@ -267,7 +284,11 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizationGate<Eng> {
             {
                 return refused;
             }
-            match svc.definition().routing_table().get(operation) {
+            match self
+                .stated_refusals
+                .get(operation)
+                .or_else(|| svc.definition().routing_table().get(operation))
+            {
                 Some(modelled) => modelled.run(svc, req, ctx).await,
                 // Unreachable in practice: the key came from this service's own protocol.
                 // Answer the framework's own no-such-operation response rather than inventing

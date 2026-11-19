@@ -47,7 +47,10 @@
 //!   the operations that rule covers;
 //! * a member outside either end of its `@length` is stated with no value either — the
 //!   clause names the bound it broke, not the text that broke it — which the child suite
-//!   [`length_constraint_clauses`] pins over the operations and bounds that rule covers;
+//!   [`length_constraint_clauses`] pins over the operations and bounds that rule covers,
+//!   while a COLLECTION outside its `@length` is stated WITH the collection, which the
+//!   child suite [`modelled_refusal_shape`] pins beside the error SHAPE each plane's
+//!   operations model;
 //! * a member outside either end of its `@range` is stated with no value for the same
 //!   reason — the clause names the numeric bound it broke, not the number that broke it —
 //!   which the child suite [`range_constraint_clauses`] pins over the operations, the
@@ -81,6 +84,12 @@ use smithy_server_runtime::MultiServiceRouter;
 /// module of a `#[path]`-declared file resolves next to that file unless it says otherwise.
 #[path = "not_found_wording/length_constraint_clauses.rs"]
 mod length_constraint_clauses;
+
+/// The error SHAPE that same envelope is named with, per OPERATION, and the COLLECTION half
+/// of a clause: a child of THIS suite for the reason the one above is, and declared the same
+/// way.
+#[path = "not_found_wording/modelled_refusal_shape.rs"]
+mod modelled_refusal_shape;
 
 /// The `@pattern` class of that same envelope: which half of a clause it states — the
 /// rejected name for a registry name, the expression alone for every other member — over the

@@ -7,6 +7,13 @@
 //! on every later call — and answers with the address that endpoint is SERVED at, which
 //! is the address of this emulator's own endpoint.
 //!
+//! An `endpointType` the request names is resolved against the documented catalog
+//! ([`EndpointType`]) before anything is read or created: a token that names no type at
+//! all, and a type AWS has RETIRED and resolves no endpoint for any more
+//! ([`EndpointType::retirement`]), are each refused with the modelled
+//! `InvalidRequestException` (HTTP 400) and create nothing, because an address handed back
+//! is an address the caller then DIALS.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -117,7 +124,7 @@ impl From<DescribeEndpointErrorModeled> for DescribeEndpointError {
 /// so the token is bounded like the DNS label it is (RFC 1035 §2.3.4: 63 octets).
 const MAX_REGION_LENGTH: usize = 63;
 
-/// The endpoint types `DescribeEndpoint` serves.
+/// The endpoint types `DescribeEndpoint` knows.
 ///
 /// The catalog is the `endpointType` member's own documentation — "Valid endpoint
 /// types include: `iot:Data` ... `iot:Data-ATS` ... `iot:CredentialProvider` ...
@@ -126,6 +133,10 @@ const MAX_REGION_LENGTH: usize = 63;
 /// ```text
 /// smithy_query(query="doc",shape="DescribeEndpointRequest",member="endpointType",model_path="services/service-com-amazonaws-iot-awsiotservice/smithy-model/com-amazonaws-iot-awsiotservice.json")
 /// ```
+///
+/// Knowing a type is not serving it: a type AWS has RETIRED is still a type this operation
+/// recognises — it is refused by naming the type that serves its APIs now rather than as a
+/// token nobody ever heard of ([`EndpointType::retirement`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointType {
     /// `iot:Data` — the VeriSign signed data endpoint, and the type a request that
@@ -135,8 +146,24 @@ pub enum EndpointType {
     DataAts,
     /// `iot:CredentialProvider` — the IoT credentials provider API endpoint.
     CredentialProvider,
-    /// `iot:Jobs` — the IoT device management Jobs API endpoint.
+    /// `iot:Jobs` — the IoT device management Jobs API endpoint, RETIRED: its APIs are
+    /// served through the ATS data endpoint now ([`EndpointType::retirement`]).
     Jobs,
+}
+
+/// What a RETIRED endpoint type is refused by naming: the APIs it used to serve, and the
+/// type that serves them now.
+///
+/// A retired type is one AWS no longer resolves an endpoint for, so a caller asking for it
+/// cannot be handed an address: it is told which type to ask for instead, which is a
+/// MIGRATION rather than a typo, and that is what separates this refusal from the one an
+/// unrecognised token earns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retirement {
+    /// The APIs the retired type's endpoints used to serve, as the refusal names them.
+    pub apis: &'static str,
+    /// The endpoint type those APIs are reached through now.
+    pub replacement: EndpointType,
 }
 
 impl EndpointType {
@@ -164,6 +191,21 @@ impl EndpointType {
         }
     }
 
+    /// Why this type resolves no endpoint any more, or `None` for one AWS still serves.
+    ///
+    /// The Jobs endpoint type is retired: the Jobs and Commands APIs it used to serve are
+    /// reached through the ATS data endpoint, so an account has no `iot:Jobs` endpoint to
+    /// be told about at all.
+    pub const fn retirement(self) -> Option<Retirement> {
+        match self {
+            Self::Jobs => Some(Retirement {
+                apis: "IoT Jobs and Commands APIs",
+                replacement: Self::DataAts,
+            }),
+            Self::Data | Self::DataAts | Self::CredentialProvider => None,
+        }
+    }
+
     /// The endpoint type `requested` names, or `None` when it names none.
     pub fn parse(requested: &str) -> Option<Self> {
         Self::ALL
@@ -171,6 +213,31 @@ impl EndpointType {
             .copied()
             .find(|candidate| candidate.token() == requested)
     }
+}
+
+/// How this operation refuses an `endpointType` it does not recognise: the token the
+/// request carried, and the fixed clause.
+///
+/// The value is echoed back because it is the caller's own input and the only thing that
+/// says WHICH token was not recognised; nothing of this service's state is in the
+/// sentence.
+#[must_use]
+pub fn unrecognized_endpoint_type_message(requested: &str) -> String {
+    format!("Endpoint type {requested} not recognized.")
+}
+
+/// How this operation refuses an `endpointType` AWS has RETIRED: the APIs that type used
+/// to serve, the type they are reached through now, the type the request asked for, and
+/// the instruction to ask for the replacement.
+#[must_use]
+pub fn retired_endpoint_type_message(retired: EndpointType, retirement: Retirement) -> String {
+    let replacement = retirement.replacement.token();
+    let apis = retirement.apis;
+    let retired = retired.token();
+    format!(
+        "{apis} are now available through {replacement} endpoints instead of {retired} \
+         endpoints. Please use {replacement}."
+    )
 }
 
 /// The address this account's IoT endpoint is PUBLISHED at: the `host[:port]` of the one
@@ -286,31 +353,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Which endpoint the caller asked for. `endpointType` is optional, so a
-        // request that names none asks for the default data endpoint; one that names
-        // a token outside the documented catalog is refused with the operation's own
-        // modelled client error rather than served some other endpoint.
+        // request that names none asks for the default data endpoint; one that names a
+        // token outside the documented catalog, and one that names a type AWS no longer
+        // resolves an endpoint for, are each refused with the operation's own modelled
+        // client error (`InvalidRequestException`, HTTP 400) rather than served some
+        // other endpoint — a caller handed an address for a type nothing answers at
+        // would dial it and find nothing there.
         let endpoint_type = match input.endpoint_type.as_deref() {
             None => EndpointType::DEFAULT,
             Some(requested) => match EndpointType::parse(requested) {
                 Some(endpoint_type) => endpoint_type,
                 None => {
                     audit(ctx, "validation-refused", input.endpoint_type.as_deref());
-                    let valid = EndpointType::ALL
-                        .iter()
-                        .map(|candidate| candidate.token())
-                        .collect::<Vec<_>>()
-                        .join(", ");
                     return Err(DescribeEndpointErrorModeled::InvalidRequestException(
                         InvalidRequestException {
-                            message: Some(format!(
-                                "endpointType must be one of [{valid}], got '{requested}'"
-                            )),
+                            message: Some(unrecognized_endpoint_type_message(requested)),
                         },
                     )
                     .into());
                 }
             },
         };
+        if let Some(retirement) = endpoint_type.retirement() {
+            audit(ctx, "validation-refused", Some(endpoint_type.token()));
+            return Err(DescribeEndpointErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(retired_endpoint_type_message(endpoint_type, retirement)),
+                },
+            )
+            .into());
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             audit(ctx, "store-unavailable", Some(endpoint_type.token()));

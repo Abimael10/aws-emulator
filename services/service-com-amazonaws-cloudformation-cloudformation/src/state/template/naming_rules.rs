@@ -112,6 +112,19 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // model), which a generated name is already inside — letters, digits and the hyphen
         // are all admitted — but may be longer than.
         crate::state::provisioning::iot_authorizer::IOT_AUTHORIZER => rules(128, Characters::AsGenerated),
+        // AWS IoT `CreateProvisioningTemplate.templateName`: `TemplateName`,
+        // `@length(min: 1, max: 36)` with pattern `^[0-9A-Za-z_-]+$` (AWS IoT's own Smithy
+        // model), which a generated name is already inside — letters, digits and the hyphen
+        // are all admitted — but is very likely longer than.
+        crate::state::provisioning::iot_provisioning_resources::IOT_PROVISIONING_TEMPLATE => {
+            rules(36, Characters::AsGenerated)
+        }
+        // The same service's `CreateRoleAlias.roleAlias`: `RoleAlias`,
+        // `@length(min: 1, max: 128)` with pattern `^[\w=,@-]+$` (that same model), which a
+        // generated name is already inside but may be longer than.
+        crate::state::provisioning::iot_provisioning_resources::IOT_ROLE_ALIAS => {
+            rules(128, Characters::AsGenerated)
+        }
         // The same service's `CreateTopicRule.ruleName`: `RuleName`,
         // `@length(min: 1, max: 128)` with pattern `^[a-zA-Z0-9_]+$` (AWS IoT's own Smithy
         // model), which admits letters, digits and the UNDERSCORE and no hyphen at all — so a
@@ -793,6 +806,20 @@ pub(super) fn database_port(
 pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str> {
     match resource_type {
         "AWS::BedrockAgentCore::Runtime" => Some("AgentRuntimeName"),
+        // AWS IoT's `CreateProvisioningTemplate` takes a `templateName` — "Ref returns the
+        // provisioning template name" — so the type publishes `TemplateName`; the type's last
+        // segment is `ProvisioningTemplate`, so neither `ProvisioningTemplateName` nor `Name`
+        // finds it. That name is what the template is CREATED under and the identifier every
+        // call on one takes, so it is the physical id.
+        crate::state::provisioning::iot_provisioning_resources::IOT_PROVISIONING_TEMPLATE => {
+            Some("TemplateName")
+        }
+        // The same service's `CreateRoleAlias` takes the alias's own text as its `roleAlias`
+        // member — "Ref returns the role alias" — so the type publishes `RoleAlias`; the
+        // type's last segment is `RoleAlias`, so neither `RoleAliasName` nor `Name` finds it.
+        crate::state::provisioning::iot_provisioning_resources::IOT_ROLE_ALIAS => {
+            Some("RoleAlias")
+        }
         // A monitoring subscription is identified by the DISTRIBUTION it is made on: every
         // call on one binds that `DistributionId` as its URI label, CloudFront mints no
         // identifier for the subscription itself, and a distribution has at most one — so the

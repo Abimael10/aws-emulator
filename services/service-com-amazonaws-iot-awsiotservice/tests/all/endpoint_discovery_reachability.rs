@@ -34,10 +34,11 @@ const REGION: &str = "us-west-1";
 /// discovery call reports this address and that the data plane answers at it.
 const SERVED_AT: &str = "https://127.0.0.1:41287";
 
-/// The endpoint types a client discovers an IoT data plane with: the whole catalog
-/// `DescribeEndpointRequest$endpointType` documents (`iot:Data`, `iot:Data-ATS`,
-/// `iot:CredentialProvider`, `iot:Jobs`), plus the request that names none — every one of
-/// which has to lead a client back to this emulator.
+/// The endpoint types a client discovers an IoT data plane with: every type
+/// `DescribeEndpointRequest$endpointType` documents that AWS still resolves an endpoint
+/// for (`iot:Data`, `iot:Data-ATS`, `iot:CredentialProvider` — `iot:Jobs` is retired and
+/// refused, which `tests/all/describe_endpoint.rs` drives), plus the request that names
+/// none — every one of which has to lead a client back to this emulator.
 ///
 /// Each row carries its own thing, so no row can pass by reading another's shadow.
 const DISCOVERY_CASES: &[(Option<&str>, &str)] = &[
@@ -45,7 +46,6 @@ const DISCOVERY_CASES: &[(Option<&str>, &str)] = &[
     (Some("iot:Data"), "probe-data"),
     (Some("iot:Data-ATS"), "probe-data-ats"),
     (Some("iot:CredentialProvider"), "probe-credentials"),
-    (Some("iot:Jobs"), "probe-jobs"),
 ];
 
 /// The emulator: the IoT control plane and the IoT data plane on ONE engine, served at

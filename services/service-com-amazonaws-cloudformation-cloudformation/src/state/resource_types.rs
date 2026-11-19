@@ -654,6 +654,8 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::IoT::Certificate",
     "AWS::IoT::Policy",
     "AWS::IoT::PolicyPrincipalAttachment",
+    "AWS::IoT::ProvisioningTemplate",
+    "AWS::IoT::RoleAlias",
     "AWS::IoT::Thing",
     "AWS::IoT::ThingPrincipalAttachment",
     "AWS::IoT::TopicRule",

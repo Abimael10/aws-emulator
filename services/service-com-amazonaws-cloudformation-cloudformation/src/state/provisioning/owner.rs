@@ -83,6 +83,12 @@ impl Owner {
             Self::IotAuthorizer => {
                 iot_authorizer::create(ctx, region, resource, propagated).await
             }
+            // A provisioning template and a role alias are each taggable: `Tags` is the tag
+            // list their creates take, so each carries the tags CloudFormation gives the
+            // resource beside its own.
+            Self::IotProvisioningResource(kind) => {
+                iot_provisioning_resources::create(ctx, region, kind, resource, propagated).await
+            }
             // A topic rule IS taggable: `TagResource` addresses one by the ARN its create
             // minted, so it carries the tags CloudFormation gives the resource beside its own
             // ([`iot_topic_rule::create`]).
@@ -304,6 +310,9 @@ impl Owner {
             // declaration asked for.
             Self::LogsResource(_) => Ok(logs_resources::ready()),
             Self::IotAuthorizer => Ok(iot_authorizer::ready()),
+            // A provisioning template and a role alias each EXIST from the moment their
+            // create answers ([`iot_provisioning_resources::ready`]).
+            Self::IotProvisioningResource(_) => Ok(iot_provisioning_resources::ready()),
             // A rule is LIVE the moment `CreateTopicRule` answers
             // ([`iot_topic_rule::ready`]).
             Self::IotTopicRule => Ok(iot_topic_rule::ready()),
@@ -472,6 +481,10 @@ impl Owner {
             // authorizer's `Arn` is the one its create answered with. So there is nothing
             // left to read once any of them is up.
             Self::LogsResource(_) | Self::IotAuthorizer => Ok(BTreeMap::new()),
+            // A provisioning template's `TemplateArn` and a role alias's `RoleAliasArn` are
+            // the ones their own creates answered with, so there is nothing left to read once
+            // either is up.
+            Self::IotProvisioningResource(_) => Ok(BTreeMap::new()),
             // A topic rule's `Arn` is the one its create read back from the service that
             // minted it, so there is nothing left to read once the rule is up.
             Self::IotTopicRule => Ok(BTreeMap::new()),
@@ -643,6 +656,7 @@ impl Owner {
             // deleted in.
             Self::LogsResource(_) => Ok(logs_resources::removal()),
             Self::IotAuthorizer => Ok(iot_authorizer::removal()),
+            Self::IotProvisioningResource(_) => Ok(iot_provisioning_resources::removal()),
             // `DeleteTopicRule` takes the rule away as it answers too
             // ([`iot_topic_rule::removal`]).
             Self::IotTopicRule => Ok(iot_topic_rule::removal()),
@@ -830,6 +844,9 @@ impl Owner {
             }
             Self::IotAuthorizer => {
                 iot_authorizer::update(ctx, region, resource, declared).await
+            }
+            Self::IotProvisioningResource(kind) => {
+                iot_provisioning_resources::update(ctx, region, kind, resource, declared).await
             }
             // `ReplaceTopicRule` writes the WHOLE payload of the rule it addresses by name, so
             // a changed declaration is applied by replacing it and the rule keeps its identity
@@ -1028,6 +1045,9 @@ impl Owner {
             // log group and of an authorizer that already exist are reconciled by no arm here
             // yet ([`Provisioner::retag`]'s own default), so nothing is asked about them.
             Self::LogsResource(_) | Self::IotAuthorizer => Ok(()),
+            // The tags of a provisioning template and of a role alias that already exist are
+            // reconciled by no arm here yet either, so nothing is asked about them.
+            Self::IotProvisioningResource(_) => Ok(()),
             // The tags of a topic rule that already exists are reconciled by its own update,
             // which re-applies the declaration's whole tag set through `TagResource`
             // ([`iot_topic_rule::update`]), so nothing is asked about them here.
@@ -1176,6 +1196,10 @@ impl Owner {
                 logs_resources::delete(ctx, region, kind, resource).await
             }
             Self::IotAuthorizer => iot_authorizer::delete(ctx, region, resource).await,
+            // Nor of a provisioning template or a role alias, for the same reason.
+            Self::IotProvisioningResource(kind) => {
+                iot_provisioning_resources::delete(ctx, region, kind, resource).await
+            }
             // AWS IoT takes no snapshot of a topic rule on the way out either.
             Self::IotTopicRule => iot_topic_rule::delete(ctx, region, resource).await,
             // CloudFront takes no snapshot of a distribution or an origin access control on
@@ -1384,6 +1408,10 @@ impl Owner {
             Self::IotAuthorizer => {
                 iot_authorizer::actual_configuration(ctx, region, resource).await?
             }
+            Self::IotProvisioningResource(kind) => {
+                iot_provisioning_resources::actual_configuration(ctx, region, kind, resource)
+                    .await?
+            }
             Self::IotTopicRule => {
                 iot_topic_rule::actual_configuration(ctx, region, resource).await?
             }
@@ -1543,6 +1571,9 @@ impl Owner {
             Self::LogsResource(_) | Self::IotAuthorizer | Self::IotTopicRule => {
                 message.to_string()
             }
+            // The two other AWS IoT providers report that service's own message as it came
+            // too.
+            Self::IotProvisioningResource(_) => message.to_string(),
             // Amazon CloudFront's does the same.
             Self::CloudFrontResource(_) => message.to_string(),
             // Amazon ECS's does the same.

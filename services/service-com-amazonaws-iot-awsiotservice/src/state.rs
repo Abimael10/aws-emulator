@@ -4154,6 +4154,22 @@ pub fn missing_package_version_message(package_name: &str, version_name: &str) -
     format!("PackageVersion {version_name} for package {package_name} not found")
 }
 
+/// How this service refuses the delete of a software package the catalog still holds
+/// versions of.
+///
+/// The package catalog deletes a package only once it holds no versions, and states that
+/// precondition by naming the package the request asked for — SINGLE-QUOTED, the way this
+/// family states a name it reports back — and the association that holds the delete up.
+/// Nothing of the stored record is part of the sentence: how many versions exist is not
+/// stated, because what the caller is told is that versions are associated with the
+/// package, not how many.
+pub fn undeletable_package_message(package_name: &str) -> String {
+    format!(
+        "Unable to delete package '{package_name}' as there are package versions associated \
+         with it"
+    )
+}
+
 /// How this service states that a `(packageName, versionName)` pair already names a
 /// package version, so creating it again is refused.
 ///

@@ -140,6 +140,19 @@ pub(super) const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
         resource_type: "AWS::IoT::Authorizer",
         required: &["AuthorizerFunctionArn"],
     },
+    // `AWS::IoT::ProvisioningTemplate`: the template IS the body that describes what is
+    // provisioned, provisioned AS a role, so both are published "Required: Yes" and both are
+    // members `CreateProvisioningTemplate` declares required beside the name.
+    RequiredProperties {
+        resource_type: super::iot_provisioning_resources::IOT_PROVISIONING_TEMPLATE,
+        required: &["ProvisioningRoleArn", "TemplateBody"],
+    },
+    // `AWS::IoT::RoleAlias`: an alias IS a name for a role, so `RoleArn` is published
+    // "Required: Yes" and is the member `CreateRoleAlias` declares required beside the alias.
+    RequiredProperties {
+        resource_type: super::iot_provisioning_resources::IOT_ROLE_ALIAS,
+        required: &["RoleArn"],
+    },
     // `AWS::Lambda::Function`: the deployment package is the function, and `CreateFunction`
     // declares `Code` required.
     RequiredProperties {

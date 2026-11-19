@@ -355,12 +355,17 @@ async fn a_package_is_deleted_only_once_its_versions_are_gone() {
                 "case {case:?}: expected ValidationException, got {:?}",
                 refused.error_code
             );
-            assert!(
-                refused
-                    .message()
-                    .contains(&format!("{} version(s)", versions.len())),
-                "case {case:?}: expected the refusal to count the versions in the way, \
-                 got {:?}",
+            // The sentence names the package the request asked for and the association
+            // that holds the delete up, and nothing of the stored record: it is the same
+            // text however many versions are in the way.
+            let expected = format!(
+                "Unable to delete package '{package}' as there are package versions \
+                 associated with it"
+            );
+            assert_eq!(
+                refused.message(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
                 refused.message()
             );
 

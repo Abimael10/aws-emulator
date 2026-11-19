@@ -888,15 +888,15 @@ async fn a_target_outside_the_account_is_refused_before_the_requests_own_members
                 "case {case:?}: the admitted id names the seeded execution, got {reply:?}"
             );
         } else {
+            // The shape is the one THIS operation models for an invalid request:
+            // `GetCommandExecution`'s errors are `InternalServerException`,
+            // `ResourceNotFoundException`, `ThrottlingException` and `ValidationException`
+            // (`smithy_query(query="operation",operation="GetCommandExecution")`) — the
+            // commands plane does not model the classic surface's legacy exception, so a
+            // constraint refusal of it names `ValidationException`.
             assert_eq!(
-                (
-                    reply.status,
-                    reply
-                        .error_code
-                        .as_deref()
-                        .is_some_and(|code| code.starts_with("InvalidRequestException"))
-                ),
-                (400, true),
+                (reply.status, reply.error_code.as_deref()),
+                (400, Some("ValidationException")),
                 "case {case:?}: a malformed executionId on a device of this account is the \
                  constraint violation, got {reply:?}"
             );

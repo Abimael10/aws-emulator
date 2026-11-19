@@ -21,7 +21,9 @@
 //!   recorded in this service's state, and reused by every later call — so repeating the
 //!   call returns the same endpoint;
 //! * an `endpointType` outside the catalog the model documents is refused with the
-//!   modelled `InvalidRequestException` (400) and creates no endpoint.
+//!   modelled `InvalidRequestException` (400) naming the token it did not recognise, and
+//!   creates no endpoint; a documented type AWS has RETIRED is refused the same way,
+//!   naming the type its APIs are served through now.
 //!
 //! What this suite does NOT prove is that the published host is the router's dispatch
 //! key: this router resolves a service from the SigV4 credential scope first
@@ -87,10 +89,12 @@ struct TypeCase {
     endpoint_type: Option<&'static str>,
 }
 
-/// Every endpoint type the `endpointType` member documents (read with
+/// Every endpoint type the `endpointType` member documents that AWS still resolves an
+/// endpoint for (read with
 /// `smithy_query(query="doc",shape="DescribeEndpointRequest",member="endpointType",
 /// model_path="services/service-com-amazonaws-iot-awsiotservice/smithy-model/com-amazonaws-iot-awsiotservice.json")`),
-/// plus the request that names none.
+/// plus the request that names none. `iot:Jobs` is documented but RETIRED, so it is
+/// refused rather than served and is driven below with the other refusals.
 const TYPE_CASES: &[TypeCase] = &[
     TypeCase {
         name: "no endpointType at all",
@@ -107,10 +111,6 @@ const TYPE_CASES: &[TypeCase] = &[
     TypeCase {
         name: "iot:CredentialProvider",
         endpoint_type: Some("iot:CredentialProvider"),
-    },
-    TypeCase {
-        name: "iot:Jobs",
-        endpoint_type: Some("iot:Jobs"),
     },
 ];
 
@@ -244,6 +244,14 @@ impl Reply {
         self.json()["__type"]
             .as_str()
             .unwrap_or_else(|| panic!("no __type in {}", self.text()))
+            .to_string()
+    }
+
+    /// The `message` an error response carries.
+    fn message(&self) -> String {
+        self.json()["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no message in {}", self.text()))
             .to_string()
     }
 }
@@ -539,7 +547,8 @@ async fn the_published_address_is_not_rendered_from_the_endpoint_record() {
 }
 
 /// An `endpointType` outside the documented catalog is refused with the modelled
-/// `InvalidRequestException` (400), and the refusal creates no endpoint.
+/// `InvalidRequestException` (400) naming the token it did not recognise, and the refusal
+/// creates no endpoint.
 #[tokio::test]
 async fn an_endpoint_type_outside_the_catalog_is_refused() {
     // 128 characters is the member's modelled maximum length, so this value reaches
@@ -551,6 +560,7 @@ async fn an_endpoint_type_outside_the_catalog_is_refused() {
         ("a plausible but undocumented type", "iot:Data-TLS".to_string()),
         ("a type crossing two endpoints", "iot:Jobs-ATS".to_string()),
         ("a token with inner whitespace", "iot: Jobs".to_string()),
+        ("a token in another casing", "IOT:DATA".to_string()),
         ("the longest value the model allows", longest_valid_length),
     ];
 
@@ -571,6 +581,14 @@ async fn an_endpoint_type_outside_the_catalog_is_refused() {
             "InvalidRequestException",
             "case {name}: expected InvalidRequestException, got {}",
             reply.text()
+        );
+        // The sentence names the token the request carried and nothing else.
+        let expected = format!("Endpoint type {endpoint_type} not recognized.");
+        assert_eq!(
+            reply.message(),
+            expected,
+            "case {name}: expected {expected:?}, got {:?}",
+            reply.message()
         );
         assert_eq!(
             emulator.recorded_identifier(REGION),
@@ -600,6 +618,55 @@ async fn an_endpoint_type_outside_the_catalog_is_refused() {
     );
 }
 
+/// A documented endpoint type AWS has RETIRED resolves no endpoint: it is refused with
+/// the modelled `InvalidRequestException` (400) naming the type its APIs are served
+/// through now, and nothing is created.
+#[tokio::test]
+async fn a_retired_endpoint_type_is_refused_naming_its_replacement() {
+    // The retired types of the documented catalog, each with the sentence AWS states:
+    // the APIs that type used to serve, the type they are reached through now, and the
+    // instruction to ask for it.
+    let cases: &[(&str, &str)] = &[(
+        "iot:Jobs",
+        "IoT Jobs and Commands APIs are now available through iot:Data-ATS endpoints \
+         instead of iot:Jobs endpoints. Please use iot:Data-ATS.",
+    )];
+
+    for (endpoint_type, expected) in cases {
+        // Several regions, so the refusal is not a property of one of them.
+        for region in [REGION, DEFAULT_REGION, "ap-southeast-2"] {
+            let emulator = Emulator::new();
+            let reply = emulator
+                .describe_endpoint(Signing::SignedFor(region), Some(endpoint_type))
+                .await;
+            assert_eq!(
+                reply.status,
+                400,
+                "case {endpoint_type} in {region}: expected 400, got {} body {}",
+                reply.status,
+                reply.text()
+            );
+            assert_eq!(
+                reply.error_code(),
+                "InvalidRequestException",
+                "case {endpoint_type} in {region}: expected InvalidRequestException, got {}",
+                reply.text()
+            );
+            assert_eq!(
+                reply.message(),
+                *expected,
+                "case {endpoint_type} in {region}: expected {expected:?}, got {:?}",
+                reply.message()
+            );
+            assert_eq!(
+                emulator.recorded_identifier(region),
+                None,
+                "case {endpoint_type} in {region}: a refused call created an endpoint"
+            );
+        }
+    }
+}
+
 /// Past `MAX_ENDPOINT_REGIONS` the store stops recording new regions — and every region
 /// is still told the address this emulator is served at, because that is where its
 /// endpoint answers whether or not a record for it fit.
@@ -614,7 +681,7 @@ async fn the_address_stays_stable_past_the_recorded_region_bound() {
 
     for region in &regions {
         let reply = emulator
-            .describe_endpoint(Signing::SignedFor(region), Some("iot:Jobs"))
+            .describe_endpoint(Signing::SignedFor(region), Some("iot:Data-ATS"))
             .await;
         assert_eq!(
             reply.status,
@@ -640,7 +707,7 @@ async fn the_address_stays_stable_past_the_recorded_region_bound() {
     // Every region — recorded or not — answers with the same address on a later call.
     for region in &regions {
         let again = emulator
-            .describe_endpoint(Signing::SignedFor(region), Some("iot:Jobs"))
+            .describe_endpoint(Signing::SignedFor(region), Some("iot:Data-ATS"))
             .await;
         assert_eq!(
             again.endpoint_address(),

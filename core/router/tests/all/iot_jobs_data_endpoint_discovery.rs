@@ -67,16 +67,18 @@ struct TypeCase {
 }
 
 /// `iot:Data-ATS` is the type AWS recommends (and the one the Jobs data plane is
-/// reached through); `iot:Jobs` is the device-management Jobs API endpoint. Both
-/// are in the catalog `DescribeEndpointRequest$endpointType` documents.
+/// reached through); `iot:Data` is the other data endpoint type. Both are in the
+/// catalog `DescribeEndpointRequest$endpointType` documents and both still resolve an
+/// endpoint — unlike `iot:Jobs`, whose APIs AWS now serves through `iot:Data-ATS` and
+/// which the control plane therefore refuses.
 const TYPE_CASES: &[TypeCase] = &[
     TypeCase {
         endpoint_type: "iot:Data-ATS",
         thing_name: "discovery-probe-ats",
     },
     TypeCase {
-        endpoint_type: "iot:Jobs",
-        thing_name: "discovery-probe-jobs",
+        endpoint_type: "iot:Data",
+        thing_name: "discovery-probe-data",
     },
 ];
 

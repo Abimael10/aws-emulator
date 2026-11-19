@@ -28,6 +28,10 @@
 //! public keys it carries, which status it asks for, which optional booleans it
 //! carries, whether it carries tags, and the region the call is signed for — rather
 //! than one recorded request.
+//!
+//! `ListAuthorizers` is driven here too, beside the create and the reader whose records it
+//! reports: the account's authorizers one page at a time, in the direction the request
+//! names and narrowed to the status it asks about.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -111,6 +115,32 @@ impl Reply {
     fn member_epoch(&self, name: &str) -> Option<f64> {
         self.member(name).and_then(Value::as_f64)
     }
+
+    /// The `authorizerName` of every row a `ListAuthorizers` response reports, in the
+    /// order the page carries them.
+    fn authorizer_names(&self) -> Vec<String> {
+        self.body
+            .get("authorizers")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.get("authorizerName").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `authorizerArn` the row at `index` of a `ListAuthorizers` page reports.
+    fn authorizer_arn(&self, index: usize) -> Option<String> {
+        self.body
+            .get("authorizers")?
+            .as_array()?
+            .get(index)?
+            .get("authorizerArn")?
+            .as_str()
+            .map(str::to_string)
+    }
 }
 
 /// The emulator under test: ONE shared engine with the IoT service mounted on it,
@@ -191,6 +221,20 @@ impl Emulator {
     async fn deactivate(&self, name: &str) -> Reply {
         self.update(name, &json!({ "status": "INACTIVE" })).await
     }
+
+    /// `ListAuthorizers`, bound to `GET /authorizers` by this service's own model, with
+    /// `query` carrying the listing's own members (`isAscendingOrder`, `status`,
+    /// `pageSize`, `marker`) exactly as a client writes them.
+    async fn list(&self, query: &str) -> Reply {
+        self.call("GET", &format!("/authorizers{query}"), None, REGION)
+            .await
+    }
+}
+
+/// The ARN of the Lambda function an authorizer created for `name` authorizes with: a
+/// function of the name, so no two rows share one and no row carries a literal.
+fn function_arn(name: &str) -> String {
+    format!("arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:{name}")
 }
 
 /// The ARN an authorizer created in `region` must carry.
@@ -1096,4 +1140,161 @@ async fn an_update_writes_only_to_the_authorizer_it_addresses() {
             );
         }
     }
+}
+
+/// RULE: `ListAuthorizers` reports the authorizers the account holds — one page at a time,
+/// in the alphabetical direction `isAscendingOrder` names, narrowed to the `status` the
+/// request asks about — each as the name and ARN its create persisted, and reports nothing
+/// for an account that holds none.
+#[tokio::test]
+async fn a_listing_reports_the_authorizers_the_account_holds() {
+    let emulator = Emulator::new();
+
+    // An empty account first: a listing of nothing is an empty page, not a refusal.
+    let empty = emulator.list("").await;
+    assert_eq!(
+        empty.status, 200,
+        "an account holding no authorizer must still list, got {empty:?}"
+    );
+    assert_eq!(
+        empty.authorizer_names(),
+        Vec::<String>::new(),
+        "an account holding no authorizer must report none, got {empty:?}"
+    );
+    assert_eq!(
+        empty.text("nextMarker"),
+        None,
+        "a listing that is not truncated carries no marker, got {empty:?}"
+    );
+
+    // Names deliberately NOT created in alphabetical order, so a direction assertion
+    // cannot pass through the creation order, and one of them deactivated, so the status
+    // filter has both values to tell apart. Each create NAMES its status: an authorizer
+    // created without one is out of service, which the child suite pins.
+    let created = ["mid-authorizer", "a-authorizer", "z-authorizer"];
+    for name in created {
+        assert_eq!(
+            emulator
+                .create(
+                    name,
+                    &json!({
+                        "authorizerFunctionArn": function_arn(name),
+                        "status": "ACTIVE",
+                    }),
+                )
+                .await
+                .status,
+            200,
+            "case {name:?}: the authorizer must be creatable"
+        );
+    }
+    assert_eq!(
+        emulator.deactivate("mid-authorizer").await.status,
+        200,
+        "the authorizer must be deactivatable"
+    );
+
+    // (case, query, the names the page must report in order)
+    let rows: [(&str, &str, Vec<&str>); 6] = [
+        (
+            "no query at all",
+            "",
+            vec!["z-authorizer", "mid-authorizer", "a-authorizer"],
+        ),
+        (
+            "ascending alphabetical order",
+            "?isAscendingOrder=true",
+            vec!["a-authorizer", "mid-authorizer", "z-authorizer"],
+        ),
+        (
+            "descending alphabetical order",
+            "?isAscendingOrder=false",
+            vec!["z-authorizer", "mid-authorizer", "a-authorizer"],
+        ),
+        (
+            "the authorizers still in service",
+            "?status=ACTIVE&isAscendingOrder=true",
+            vec!["a-authorizer", "z-authorizer"],
+        ),
+        (
+            "the authorizers out of service",
+            "?status=INACTIVE&isAscendingOrder=true",
+            vec!["mid-authorizer"],
+        ),
+        (
+            "one page of a page size smaller than the account holds",
+            "?isAscendingOrder=true&pageSize=2",
+            vec!["a-authorizer", "mid-authorizer"],
+        ),
+    ];
+
+    for (case, query, expected) in rows {
+        let page = emulator.list(query).await;
+        assert_eq!(
+            page.status, 200,
+            "case {case:?}: expected HTTP 200, got {page:?}"
+        );
+        assert_eq!(
+            page.authorizer_names(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {page:?}"
+        );
+        // Every row reports the ARN the create minted for that name, so a listing and a
+        // describe cannot drift.
+        for (index, name) in expected.iter().enumerate() {
+            assert_eq!(
+                page.authorizer_arn(index).as_deref(),
+                Some(expected_arn(REGION, name).as_str()),
+                "case {case:?}: expected the minted ARN for {name:?}, got {page:?}"
+            );
+        }
+    }
+
+    // A page smaller than the account holds is truncated, and its marker resumes the
+    // listing after it — so the pages together are the whole listing, each name once.
+    let first = emulator.list("?isAscendingOrder=true&pageSize=2").await;
+    let marker = first
+        .text("nextMarker")
+        .unwrap_or_else(|| panic!("a truncated page must carry a marker, got {first:?}"));
+    let second = emulator
+        .list(&format!("?isAscendingOrder=true&pageSize=2&marker={marker}"))
+        .await;
+    assert_eq!(
+        second.status, 200,
+        "the resumed page must be served, got {second:?}"
+    );
+    assert_eq!(
+        second.authorizer_names(),
+        vec!["z-authorizer"],
+        "the resumed page must report the rest of the listing, got {second:?}"
+    );
+    assert_eq!(
+        second.text("nextMarker"),
+        None,
+        "the last page carries no marker, got {second:?}"
+    );
+
+    // A marker no listing of this service issued is refused rather than read as a
+    // position: it is the modelled `InvalidRequestException` (400).
+    let refused = emulator
+        .list("?isAscendingOrder=true&marker=QUJDRA")
+        .await;
+    assert_eq!(
+        refused.status, 400,
+        "a marker this listing did not issue must be refused, got {refused:?}"
+    );
+
+    // A deleted authorizer leaves the listing, so the page is the store and not a
+    // snapshot taken at create time.
+    assert_eq!(
+        emulator.delete("mid-authorizer").await.status,
+        200,
+        "the deactivated authorizer must be deletable"
+    );
+    let after = emulator.list("?isAscendingOrder=true").await;
+    assert_eq!(
+        after.authorizer_names(),
+        vec!["a-authorizer", "z-authorizer"],
+        "a deleted authorizer must leave the listing, got {after:?}"
+    );
 }

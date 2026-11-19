@@ -323,6 +323,44 @@ pub fn quoting_the_submitted_collection(
     }
 }
 
+/// `violation` with the value half of its clause restored to the EMPTY collection the
+/// request submitted, where the framework's walk stored its own summary of one.
+///
+/// The same restoring rule as [`quoting_the_submitted_collection`], for the layer that has
+/// the violations but NOT the request they were found in
+/// (`Service::override_refusal`): the walk renders a list as `<n> items` and a map as
+/// `<n> entries`, and where that `<n>` is ZERO the collection is determined completely by
+/// the summary — an empty list renders `[]` and an empty map `{}`
+/// ([`crate::validation::rendered_list`], [`crate::validation::rendered_map`]) — so the
+/// collection AWS quotes can be stated without reading the request back.
+///
+/// ONLY that one clause is touched: a summary stating any other size needs the request's
+/// own elements and keeps the framework's text, and so does a violation whose stored value
+/// is already the caller's own bytes.
+#[must_use]
+pub fn quoting_an_empty_submitted_collection(violation: Violation) -> Violation {
+    if !matches!(
+        violation.kind,
+        ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
+    ) {
+        return violation;
+    }
+    let Some(stored) = violation.value.as_deref() else {
+        return violation;
+    };
+    let rendered = if list_item_count(stored) == Some(0) {
+        crate::validation::rendered_list(&[])
+    } else if map_entry_count(stored) == Some(0) {
+        crate::validation::rendered_map(&[])
+    } else {
+        return violation;
+    };
+    Violation {
+        value: Some(rendered),
+        ..violation
+    }
+}
+
 /// `violation` with the clause's value half restored to the WHOLE value the caller
 /// submitted, where the framework stored its own elision of it.
 ///

@@ -162,15 +162,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every version has to go first, so a delete that names only the package never
-        // takes versions with it.
-        let version_count = package.versions.len();
-        if version_count > 0 {
+        // takes versions with it. The refusal is the modelled `ValidationException`
+        // (HTTP 400), worded by the package family
+        // ([`crate::state::undeletable_package_message`]), and the record is left whole.
+        if !package.versions.is_empty() {
             return Err(DeletePackageErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "Package {} still holds {version_count} version(s); all package \
-                         versions must be deleted before deleting the software package",
-                        input.package_name
+                    message: Some(crate::state::undeletable_package_message(
+                        &input.package_name,
                     )),
                 },
             )
