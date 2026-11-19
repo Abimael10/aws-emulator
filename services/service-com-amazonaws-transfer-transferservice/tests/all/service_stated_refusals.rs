@@ -8,7 +8,7 @@
 //! caller sent (no member name, no value, no identifier), so a client matching or
 //! logging the service's refusal recognises it.
 //!
-//! Three conditions, each asserted over a TABLE whose rows differ along what the
+//! Five conditions, each asserted over a TABLE whose rows differ along what the
 //! condition generalises over rather than along the one request a report cited:
 //!
 //! 1. a server configuration that hosts its endpoint in a VPC and names no
@@ -18,7 +18,20 @@
 //! 2. a connector transfer that names no file to transfer — the rows span both connector
 //!    kinds and both ways of naming nothing;
 //! 3. host key material the service cannot read — the rows span the FORMS of unreadable
-//!    material, including both published bounds of `HostKeyBody`'s `len 0..4096`.
+//!    material, including both published bounds of `HostKeyBody`'s `len 0..4096`;
+//! 4. a resource reference the store cannot resolve — the rows span how the reference
+//!    came not to be held (its own delete, the delete of the resource it was written on,
+//!    an identifier nothing ever minted) and the operation that is asked for it, readers
+//!    and mutations alike, over the agreement and the server kinds;
+//! 5. a write of a web app's customization that lost the claim — the rows span the
+//!    operation that lost, how many writers overlapped, and whether the web app held a
+//!    customization already.
+//!
+//! Conditions 4 and 5 are where the refusal CLASS matters as much as the wording: both
+//! answers are in the asking operation's modelled error set, so a client that branches on
+//! the code it models (to conclude "already deleted", or to retry a lost write) classifies
+//! what it is given, and the read and the mutations of one vanished reference cannot
+//! disagree about whether it is gone.
 //!
 //! Every request goes over the real wire path (`POST /` with
 //! `X-Amz-Target: TransferService.<Op>`) through the shared [`crate::harness`], so what
@@ -26,7 +39,11 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{generated_host_key, member_of, Answer, Emulator, ROLE, SSH_KEY};
+use crate::harness::{
+    custom_directories, generated_host_key, member_of, Answer, Emulator, ROLE, SSH_KEY,
+    UNMINTED_SERVER_ID,
+};
+use crate::web_app_customization_write_guard::{create_web_app, futures_of};
 
 /// Assert `answer` is 400 `InvalidRequestException` whose `Message` is exactly
 /// `expected` and carries none of `absent` — the values the request sent.
@@ -299,4 +316,438 @@ async fn host_key_material_the_service_cannot_read_is_refused_with_one_fixed_tex
         "case \"readable material after the refusals\": expected 200, got {} with body {}",
         imported.status, imported.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// 4. A resource reference the store cannot resolve
+// ---------------------------------------------------------------------------
+
+/// The text the service states for a `ServerId` nothing in the store answers to.
+const UNKNOWN_SERVER: &str = "Unknown server";
+
+/// The text the service states for a `(ServerId, AgreementId)` pair the store does not
+/// hold — the pair the model makes `AgreementResource`'s identifiers
+/// (`smithy_query(query="operation",operation="DeleteAgreement")` takes both, each
+/// `@required`) — whichever half of it is the one that resolves to nothing.
+const UNKNOWN_AGREEMENT: &str = "Unknown agreement";
+
+/// `AgreementId`s of the modelled form (`len 19..19`, pattern `^a-([0-9a-f]{17})$`) that
+/// no `CreateAgreement` ever minted: the low end of the id space and the high end.
+const NEVER_MINTED_AGREEMENTS: [&str; 2] = ["a-00000000000000000", "a-fffffffffffffffff"];
+
+/// A `ServerId` of the modelled form (`len 19..19`, pattern `^s-([0-9a-f]{17})$`) that no
+/// `CreateServer` minted, beside the harness's own [`UNMINTED_SERVER_ID`]: the high end of
+/// the id space.
+const NEVER_MINTED_SERVER: &str = "s-fffffffffffffffff";
+
+/// Assert `answer` is the service's not-found for `resource`, reported as
+/// `resource_type`, whose whole `Message` is the fixed `expected` text.
+///
+/// The status and the code are the service's single answer to a resource reference it
+/// cannot resolve: HTTP 400 on the recorded wire (which
+/// `ResourceNotFoundException`'s modelled `@httpError` does not describe) and the
+/// `ResourceNotFoundException` every operation of these planes models — so a refusal from
+/// outside the asking operation's modelled error set fails here.
+fn assert_fixed_not_found(
+    case: &str,
+    op: &str,
+    answer: &Answer,
+    resource_type: &str,
+    resource: &str,
+    expected: &str,
+) {
+    assert_eq!(
+        (answer.status, answer.error_code().as_str()),
+        (400, "ResourceNotFoundException"),
+        "case {case:?}: expected {op} to answer 400 ResourceNotFoundException, got {} with \
+         body {}",
+        answer.status,
+        answer.body
+    );
+    for (member, want) in [("ResourceType", resource_type), ("Resource", resource)] {
+        assert_eq!(
+            member_of(&answer.body, member).as_str(),
+            Some(want),
+            "case {case:?}: expected {op} to report {member} {want:?}, got {}",
+            answer.body
+        );
+    }
+    let message = member_of(&answer.body, "Message")
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        message, expected,
+        "case {case:?}: expected {op} to answer the service's fixed text {expected:?}, got \
+         {message:?}"
+    );
+    assert!(
+        !message.contains(resource),
+        "case {case:?}: expected {op}'s refusal to carry no identifier, got {message:?}"
+    );
+}
+
+/// Create one agreement on `server_id` between `parties`, carrying `members` beyond the
+/// server, the two profiles and the access role, and hand back its `AgreementId`.
+async fn create_agreement(
+    emulator: &Emulator,
+    case: &str,
+    server_id: &str,
+    parties: (&str, &str),
+    members: &Value,
+) -> String {
+    let mut request = json!({
+        "ServerId": server_id,
+        "LocalProfileId": parties.0,
+        "PartnerProfileId": parties.1,
+        "AccessRole": ROLE,
+    });
+    let object = request.as_object_mut().expect("the request is an object");
+    for (member, value) in members.as_object().expect("the members are an object") {
+        object.insert(member.clone(), value.clone());
+    }
+    emulator.create_agreement(case, request).await
+}
+
+/// The two AS2 profiles every agreement in this module is written between.
+async fn parties(emulator: &Emulator) -> (String, String) {
+    (
+        emulator
+            .create_profile(json!({"As2Id": "local-party", "ProfileType": "LOCAL"}))
+            .await,
+        emulator
+            .create_profile(json!({"As2Id": "partner-party", "ProfileType": "PARTNER"}))
+            .await,
+    )
+}
+
+/// RULE: a `(ServerId, AgreementId)` pair the store does not hold is refused, by EVERY
+/// operation of the agreement plane — the reader and the mutations alike — with the
+/// modelled `ResourceNotFoundException` carrying the service's fixed agreement text, so
+/// the planes cannot disagree about whether the agreement is gone and none of them
+/// answers outside the operation's modelled error set.
+///
+/// The rows differ along how the pair came not to be held: its own delete removed it, the
+/// delete of the SERVER it was written on took it (with the agreement ACTIVE, and with it
+/// INACTIVE and configured through `CustomDirectories`), the identifier was never minted,
+/// and neither half of the pair was.
+#[tokio::test]
+async fn a_pair_the_store_does_not_hold_is_refused_with_one_fixed_text_on_every_plane() {
+    let emulator = Emulator::new();
+    let (local, partner) = parties(&emulator).await;
+    let parties = (local.as_str(), partner.as_str());
+
+    // (case, the pair every operation below is addressed at)
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+
+    // Its own delete took it.
+    {
+        let case = "the agreement its own delete removed";
+        let server_id = emulator.create_server(json!({})).await;
+        let agreement_id = create_agreement(
+            &emulator,
+            case,
+            &server_id,
+            parties,
+            &json!({"BaseDirectory": "/amzn-s3-demo-bucket/as2"}),
+        )
+        .await;
+        let deleted = emulator
+            .call(
+                "DeleteAgreement",
+                json!({"ServerId": &server_id, "AgreementId": &agreement_id}),
+            )
+            .await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: expected DeleteAgreement 200, got {} with body {}",
+            deleted.status, deleted.body
+        );
+        rows.push((case.to_string(), server_id, agreement_id));
+    }
+
+    // The delete of the server it was written on took it. The server's delete is served
+    // while the agreement still references it, whatever the agreement's own Status, so
+    // the agreement is left addressed at a server the store no longer holds.
+    for (case, members) in [
+        (
+            "an ACTIVE agreement the delete of its server took",
+            json!({"BaseDirectory": "/amzn-s3-demo-bucket/as2", "Status": "ACTIVE"}),
+        ),
+        (
+            "an INACTIVE custom-directories agreement the delete of its server took",
+            json!({
+                "CustomDirectories": custom_directories("/amzn-s3-demo-bucket/as2/custom"),
+                "Status": "INACTIVE",
+            }),
+        ),
+    ] {
+        let server_id = emulator.create_server(json!({})).await;
+        let agreement_id =
+            create_agreement(&emulator, case, &server_id, parties, &members).await;
+
+        // The agreement really is held, in the configuration the row created it with,
+        // before the server's delete is what takes it away.
+        let read = emulator.describe_agreement(&server_id, &agreement_id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected the agreement to be readable before the delete, got {} \
+             with body {}",
+            read.status, read.body
+        );
+        assert_eq!(
+            member_of(read.get("Agreement"), "Status").as_str(),
+            member_of(&members, "Status").as_str(),
+            "case {case:?}: expected the agreement to hold the Status it was created with, \
+             got {}",
+            read.body
+        );
+
+        let deleted = emulator
+            .call("DeleteServer", json!({"ServerId": &server_id}))
+            .await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: expected DeleteServer to be served while the agreement \
+             referenced the server, got {} with body {}",
+            deleted.status, deleted.body
+        );
+        rows.push((case.to_string(), server_id, agreement_id));
+    }
+
+    // An identifier nothing minted, on a server that exists; and a pair neither half of
+    // which was ever minted.
+    let live_server = emulator.create_server(json!({})).await;
+    for agreement_id in NEVER_MINTED_AGREEMENTS {
+        rows.push((
+            format!("the never-minted {agreement_id} on a server that exists"),
+            live_server.clone(),
+            agreement_id.to_string(),
+        ));
+    }
+    for server_id in [UNMINTED_SERVER_ID, NEVER_MINTED_SERVER] {
+        rows.push((
+            format!("a pair on the never-minted {server_id}"),
+            server_id.to_string(),
+            NEVER_MINTED_AGREEMENTS[0].to_string(),
+        ));
+    }
+
+    for (case, server_id, agreement_id) in &rows {
+        for (op, request) in [
+            (
+                "DescribeAgreement",
+                json!({"ServerId": server_id, "AgreementId": agreement_id}),
+            ),
+            (
+                "DeleteAgreement",
+                json!({"ServerId": server_id, "AgreementId": agreement_id}),
+            ),
+            (
+                "UpdateAgreement",
+                json!({
+                    "ServerId": server_id,
+                    "AgreementId": agreement_id,
+                    "Status": "INACTIVE",
+                }),
+            ),
+        ] {
+            let answer = emulator.call(op, request).await;
+            assert_fixed_not_found(case, op, &answer, "Agreement", agreement_id, UNKNOWN_AGREEMENT);
+            let message = member_of(&answer.body, "Message")
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                !message.contains(server_id),
+                "case {case:?}: expected {op}'s refusal to carry nothing the request sent, \
+                 got {message:?} carrying {server_id:?}"
+            );
+        }
+    }
+}
+
+/// RULE (the same condition, one kind up): a `ServerId` the store does not hold is
+/// refused, by every operation of the server plane, with the modelled
+/// `ResourceNotFoundException` carrying the service's fixed server text — so a server
+/// whose delete was served reads as gone on every plane, as the agreements it took with it
+/// do.
+///
+/// The rows differ along how the server came not to be held: its delete was served while
+/// an ACTIVE agreement referenced it, its delete was served with nothing written on it,
+/// and the identifier was never minted (both ends of the id space).
+#[tokio::test]
+async fn a_server_the_store_does_not_hold_is_refused_with_one_fixed_text_on_every_plane() {
+    let emulator = Emulator::new();
+    let (local, partner) = parties(&emulator).await;
+    let parties = (local.as_str(), partner.as_str());
+
+    // (case, the ServerId every operation below is addressed at)
+    let mut rows: Vec<(String, String)> = Vec::new();
+
+    for (case, with_agreement) in [
+        ("a server whose delete was served while an ACTIVE agreement referenced it", true),
+        ("a server whose delete was served with nothing written on it", false),
+    ] {
+        let server_id = emulator.create_server(json!({})).await;
+        if with_agreement {
+            create_agreement(
+                &emulator,
+                case,
+                &server_id,
+                parties,
+                &json!({"BaseDirectory": "/amzn-s3-demo-bucket/as2", "Status": "ACTIVE"}),
+            )
+            .await;
+        }
+        let deleted = emulator
+            .call("DeleteServer", json!({"ServerId": &server_id}))
+            .await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: expected DeleteServer 200, got {} with body {}",
+            deleted.status, deleted.body
+        );
+        rows.push((case.to_string(), server_id));
+    }
+    for server_id in [UNMINTED_SERVER_ID, NEVER_MINTED_SERVER] {
+        rows.push((
+            format!("the never-minted {server_id}"),
+            server_id.to_string(),
+        ));
+    }
+
+    for (case, server_id) in &rows {
+        for op in ["DescribeServer", "DeleteServer", "StartServer", "StopServer"] {
+            let answer = emulator.call(op, json!({"ServerId": server_id})).await;
+            assert_fixed_not_found(case, op, &answer, "Server", server_id, UNKNOWN_SERVER);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. A write of a web app's customization that lost the claim
+// ---------------------------------------------------------------------------
+
+/// The text the service states for an UPDATE of a web app's customization it could not
+/// carry out because another write of the same object was being applied.
+const UPDATE_CUSTOMIZATION_CONFLICT: &str = "Unable to update WebApp customization";
+
+/// The text it states for a DELETE of that one object, on the same basis: the sentence is
+/// the write's own, so the refusal describes the write that lost rather than some other
+/// one.
+const DELETE_CUSTOMIZATION_CONFLICT: &str = "Unable to delete WebApp customization";
+
+/// RULE: of writes of ONE web app's customization that overlap, every loser is refused
+/// with the modelled `ConflictException` (HTTP 409 for both writing operations,
+/// `smithy_query(query="operation",operation="UpdateWebAppCustomization,DeleteWebAppCustomization")`)
+/// whose whole `Message` is the service's fixed text for the OPERATION that lost —
+/// carrying nothing the request submitted, and the same text however many writers
+/// overlapped.
+///
+/// The rows differ along which operation lost, how many writers overlap, and whether the
+/// web app held a customization already.
+#[tokio::test]
+async fn a_customization_write_that_lost_the_claim_is_refused_with_one_fixed_text() {
+    let emulator = Emulator::new();
+
+    // (case, the operation every racer calls, how many overlap, whether the web app holds
+    // a customization when they arrive)
+    let rows: [(&str, &str, usize, bool); 6] = [
+        ("two overlapping deletes", "DeleteWebAppCustomization", 2, true),
+        ("four overlapping deletes", "DeleteWebAppCustomization", 4, true),
+        ("eight overlapping deletes", "DeleteWebAppCustomization", 8, true),
+        (
+            "eight overlapping deletes of a web app holding no customization",
+            "DeleteWebAppCustomization",
+            8,
+            false,
+        ),
+        ("two overlapping updates", "UpdateWebAppCustomization", 2, true),
+        ("eight overlapping updates", "UpdateWebAppCustomization", 8, true),
+    ];
+
+    for (case, op, racers, held) in rows {
+        let web_app_id = create_web_app(&emulator).await;
+        if held {
+            let seeded = emulator
+                .call(
+                    "UpdateWebAppCustomization",
+                    json!({"WebAppId": &web_app_id, "Title": "seeded"}),
+                )
+                .await;
+            assert_eq!(
+                seeded.status, 200,
+                "case {case:?}: expected the seeding update to be served, got {} with body {}",
+                seeded.status, seeded.body
+            );
+        }
+
+        // Every racer submits a value of its own where the operation takes one, so a
+        // refusal that echoed the request would differ between them.
+        let titles: Vec<String> = (0..racers).map(|index| format!("racer-{index}")).collect();
+        let calls = titles.iter().map(|title| {
+            let mut request = json!({"WebAppId": &web_app_id});
+            if op == "UpdateWebAppCustomization" {
+                request["Title"] = json!(title);
+            }
+            emulator.call(op, request)
+        });
+        let answers = futures_of(calls).await;
+
+        let served = answers.iter().filter(|answer| answer.status == 200).count();
+        assert_eq!(
+            served,
+            1,
+            "case {case:?}: expected exactly one winning write, got the statuses {:?}",
+            answers.iter().map(|answer| answer.status).collect::<Vec<_>>()
+        );
+
+        let expected = if op == "DeleteWebAppCustomization" {
+            DELETE_CUSTOMIZATION_CONFLICT
+        } else {
+            UPDATE_CUSTOMIZATION_CONFLICT
+        };
+        let mut refused = 0;
+        for (index, answer) in answers
+            .iter()
+            .enumerate()
+            .filter(|(_, answer)| answer.status != 200)
+        {
+            assert_eq!(
+                (answer.status, answer.error_code().as_str()),
+                (409, "ConflictException"),
+                "case {case:?} (racer {index} lost): expected 409 ConflictException, got {} \
+                 with body {}",
+                answer.status,
+                answer.body
+            );
+            let message = member_of(&answer.body, "Message")
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(
+                message, expected,
+                "case {case:?} (racer {index} lost): expected the service's fixed text \
+                 {expected:?}, got {message:?}"
+            );
+            for value in titles
+                .iter()
+                .map(String::as_str)
+                .chain([web_app_id.as_str()])
+            {
+                assert!(
+                    !message.contains(value),
+                    "case {case:?} (racer {index} lost): expected no request data in Message, \
+                     got {message:?} carrying {value:?}"
+                );
+            }
+            refused += 1;
+        }
+        assert_eq!(
+            refused,
+            racers - 1,
+            "case {case:?}: expected every writer but the winner to be refused"
+        );
+    }
 }
