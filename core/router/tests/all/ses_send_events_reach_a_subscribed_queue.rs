@@ -44,10 +44,10 @@ pub(crate) const REGION: &str = "us-west-2";
 
 /// The domain identity that authorises every send below, and the sender it covers.
 const SENDER_DOMAIN: &str = "senders.example.com";
-const SENDER: &str = "sender@senders.example.com";
+pub(crate) const SENDER: &str = "sender@senders.example.com";
 
 /// The configuration set the sends name, and the event destination hung off it.
-const SET: &str = "event-publication";
+pub(crate) const SET: &str = "event-publication";
 const DESTINATION: &str = "events";
 
 /// Every value of the SESv2 `EventType` enum, in the model's own order
@@ -242,12 +242,10 @@ pub(crate) async fn given_configuration_set(
 
 /// `SendEmail` to `recipient` through the configuration set, answering the `MessageId`.
 pub(crate) async fn send(router: &MultiServiceRouter, case: &str, recipient: &str) -> String {
-    let answered = sesv2_ok(
+    send_email(
         router,
         case,
-        "POST",
-        "/v2/email/outbound-emails",
-        Some(json!({
+        json!({
             "FromEmailAddress": SENDER,
             "ConfigurationSetName": SET,
             "Destination": {"ToAddresses": [recipient]},
@@ -255,7 +253,21 @@ pub(crate) async fn send(router: &MultiServiceRouter, case: &str, recipient: &st
                 "Subject": {"Data": "a message under test"},
                 "Body": {"Text": {"Data": "hello"}},
             }},
-        })),
+        }),
+    )
+    .await
+}
+
+/// One `SendEmail` whose whole `request` the caller states, answering the `MessageId` the
+/// accepted message was minted — what a suite varying the CONTENT of a send needs, where
+/// [`send`] is the one simple content these cases share.
+pub(crate) async fn send_email(router: &MultiServiceRouter, case: &str, request: Value) -> String {
+    let answered = sesv2_ok(
+        router,
+        case,
+        "POST",
+        "/v2/email/outbound-emails",
+        Some(request),
     )
     .await;
     let message_id = answered.text("/MessageId");

@@ -91,8 +91,13 @@ const MAX_HEADER_MESSAGE_TAGS: usize = 64;
 const MAX_MESSAGE_TAG_CHARS: usize = 256;
 
 /// The header names whose values make up the `commonHeaders` of a published document,
-/// matched without regard to case the way a mail header name compares.
-const COMMON_HEADER_NAMES: [&str; 3] = ["Subject", "Message-ID", "Date"];
+/// matched without regard to case the way a mail header name compares and reported under
+/// the name lowercased.
+///
+/// The message's own id is a member of `commonHeaders` too, and is NOT one of these: it is
+/// not read off a header line the caller wrote but is the id the message was accepted under
+/// ([`PublishedSend::common_headers`]).
+const COMMON_HEADER_NAMES: [&str; 2] = ["Subject", "Date"];
 
 /// The prefix a Reporting-MTA names its address type with in a delivery status report, as
 /// RFC 3464 writes the field: a bounce quotes the field, so it quotes the type too.
@@ -444,8 +449,17 @@ impl PublishedSend {
         headers
     }
 
-    /// The `commonHeaders` object: the addresses the message was accepted for, and the
-    /// headers of [`COMMON_HEADER_NAMES`] it carried.
+    /// The `commonHeaders` object: the addresses the message was accepted for, the id it was
+    /// accepted under, and the headers of [`COMMON_HEADER_NAMES`] it carried.
+    ///
+    /// The `messageId` member IDENTIFIES the message the event is about, so it is the id the
+    /// message was accepted under — the id the send answered with, which is what
+    /// `mail.messageId` reports too. It is there for every send, because the id belongs to
+    /// the acceptance and not to the submitted document: an accepted message has one whether
+    /// or not its own header block wrote a `Message-ID` line, and the two members a consumer
+    /// correlates an event back to its send through cannot disagree. A `Message-ID` line the
+    /// message did write is still reported among its headers, where the document reports the
+    /// header block as it was written.
     fn common_headers(&self, headers: &[(String, String)]) -> Value {
         let message = &self.message;
         let mut common = Map::new();
@@ -466,11 +480,10 @@ impl PublishedSend {
                 .find(|(written, _)| written.eq_ignore_ascii_case(name))
                 .map(|(_, value)| value.clone());
             if let Some(value) = written {
-                // `Message-ID` is reported under the member name a published document
-                // uses for it, which drops the separator.
-                common.insert(member_name(name), json!(value));
+                common.insert(name.to_ascii_lowercase(), json!(value));
             }
         }
+        common.insert("messageId".to_string(), json!(message.message_id));
         Value::Object(common)
     }
 
@@ -633,14 +646,6 @@ fn is_message_tag_part(part: &str) -> bool {
         && part
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-}
-
-/// The member name a published document reports the header `name` under.
-fn member_name(name: &str) -> String {
-    match name {
-        "Message-ID" => "messageId".to_string(),
-        other => other.to_ascii_lowercase(),
-    }
 }
 
 /// `instant` as a published document stamps one: RFC 3339, the format every timestamp of
