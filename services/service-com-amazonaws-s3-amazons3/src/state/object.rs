@@ -371,6 +371,43 @@ impl ObjectEncryption {
     }
 }
 
+/// How an object ANOTHER service writes into a bucket is encrypted at rest: under the KMS
+/// key that service's own configuration names, or the destination bucket's default where it
+/// names none.
+///
+/// A service integration that writes an object into Amazon S3 — a delivery stream's
+/// delivered object, a flow run's transferred records — is a writer like any other, so the
+/// two cases it settles are `PutObject`'s own: a write naming a KMS key is stored under
+/// SSE-KMS with that key, and a write naming none is stored under the bucket's default
+/// encryption configuration ([`Bucket::default_object_encryption`]), which is what makes
+/// every object in a bucket encrypted even when no writer ever asked. The single-layer
+/// `ServerSideEncryption` value is this service's own ([`KMS_SSE_ALGORITHMS`]), so no
+/// integration spells it for itself.
+///
+/// ONE place for the rule, so every service that writes an object here records the same
+/// configuration for the same key and every reader of such an object reports it the same
+/// way.
+pub fn written_object_encryption(
+    store: &ComAmazonawsS3Amazons3State,
+    bucket: &str,
+    kms_key_arn: Option<&str>,
+) -> ObjectEncryption {
+    match kms_key_arn {
+        Some(key) => ObjectEncryption {
+            sse_algorithm: Some(KMS_SSE_ALGORITHMS[0].to_string()),
+            kms_key_id: Some(key.to_string()),
+            // Such a write supplies no encryption context, no S3 Bucket Key and no
+            // customer-provided key: the writing service's configuration names a KMS key
+            // or nothing at all.
+            ..ObjectEncryption::default()
+        },
+        None => store
+            .bucket(bucket)
+            .map(Bucket::default_object_encryption)
+            .unwrap_or_default(),
+    }
+}
+
 /// The `ObjectLockLegalHoldStatus` value that means a legal hold IS in place on an object
 /// version — one of that enum's two values
 /// (`smithy_query(query="shape",shape="ObjectLockLegalHoldStatus")`, which

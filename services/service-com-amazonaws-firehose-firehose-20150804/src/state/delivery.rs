@@ -2468,11 +2468,6 @@ fn search_error_envelope(
     })
 }
 
-/// The `ServerSideEncryption` value an object encrypted with a KMS key is stored under:
-/// the single-layer one of the two values Amazon S3 publishes for KMS keys, read from that
-/// service's own set so the two can never drift.
-const SSE_KMS_ALGORITHM: &str = ::service_com_amazonaws_s3_amazons3::state::KMS_SSE_ALGORITHMS[0];
-
 /// How a delivered object is encrypted at rest.
 ///
 /// A destination whose `EncryptionConfiguration` names an encryption key
@@ -2481,25 +2476,21 @@ const SSE_KMS_ALGORITHM: &str = ::service_com_amazonaws_s3_amazons3::state::KMS_
 /// naming no key writes an object that asks for no encryption of its own, which is the case
 /// where the bucket's own default encryption configuration decides what it is stored under
 /// — the same rule every other write to that bucket follows.
+///
+/// WHICH configuration either case comes to is the object store's own rule, shared with
+/// every other service that writes an object into a bucket
+/// ([`::service_com_amazonaws_s3_amazons3::state::written_object_encryption`]), so a
+/// delivery's object and another integration's cannot be stored under different records of
+/// one key.
 fn object_encryption(
     store: &::service_com_amazonaws_s3_amazons3::state::ComAmazonawsS3Amazons3State,
     object: &DeliveredObject,
 ) -> ::service_com_amazonaws_s3_amazons3::state::ObjectEncryption {
-    match &object.kms_key_arn {
-        Some(key) => ::service_com_amazonaws_s3_amazons3::state::ObjectEncryption {
-            sse_algorithm: Some(SSE_KMS_ALGORITHM.to_string()),
-            kms_key_id: Some(key.clone()),
-            kms_encryption_context: None,
-            bucket_key_enabled: None,
-            // A delivery supplies no customer-provided key: the destination configuration
-            // names a KMS key or nothing at all.
-            ..Default::default()
-        },
-        None => store
-            .bucket(&object.bucket)
-            .map(|bucket| bucket.default_object_encryption())
-            .unwrap_or_default(),
-    }
+    ::service_com_amazonaws_s3_amazons3::state::written_object_encryption(
+        store,
+        &object.bucket,
+        object.kms_key_arn.as_deref(),
+    )
 }
 
 /// What the write of one delivery's objects did.

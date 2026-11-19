@@ -21,7 +21,10 @@ aws-smithy-types = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
-serde_json = { workspace = true }
+serde = { workspace = true }
+# `serde_json`'s `RawValue`, so an array of records is taken apart into the raw text of
+# each element and a record is only built once the run's allowances have admitted it.
+serde_json = { workspace = true, features = ["raw_value"] }
 tracing = { workspace = true }
 # The one object store in this emulator is the Amazon S3 service's: a flow whose source
 # and destination are Amazon S3 locations reads and writes its records there.
@@ -33,6 +36,9 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # `iam_authorization`: the one reading of a resource-based policy, shared with every other
 # service that asks whether a bucket policy admits what it is about to do.
 service-common = { path = "../common" }
+# The order-preserving map a record a run moves is held in, so the fields of each record
+# reach the destination file in the order the source presented them.
+indexmap = { version = "2.14", features = ["serde"] }
 # The `CSV` file type a flow's source and destination can declare, read and written by a
 # maintained CSV implementation rather than by hand.
 csv = "1.3"

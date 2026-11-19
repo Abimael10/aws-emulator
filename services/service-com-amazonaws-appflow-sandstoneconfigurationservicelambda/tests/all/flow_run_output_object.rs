@@ -18,7 +18,15 @@
 //!   of the bytes — and `ListObjectsV2` reports that algorithm (`Object$ChecksumAlgorithm`,
 //!   "the algorithm that was used to create a checksum of the object") and
 //!   `FULL_OBJECT` (`Object$ChecksumType`) for the entry, with the value a `PutObject` of
-//!   the same bytes reports.
+//!   the same bytes reports;
+//! * the bytes it stores present each transferred record's fields in the order the SOURCE
+//!   record presented them — a transfer hands the destination the records it read, so
+//!   nothing between the read and the write re-orders a record's fields, whichever file
+//!   type the destination declares;
+//! * that object is stored with KMS server-side encryption under the flow's own encryption
+//!   key — the key its definition named, or the key AppFlow manages for the account when
+//!   the definition named none — so a read of it reports `aws:kms` together with the key id
+//!   `DescribeFlow` reports for the flow.
 //!
 //! Both services are mounted on the ONE shared engine the router mounts them on, so every
 //! assertion is about what a client sees on the wire: the AppFlow calls as the `restJson1`
@@ -547,4 +555,416 @@ async fn each_run_of_a_flow_is_stored_at_its_own_execution_id() {
         vec![FULL_OBJECT.to_string(); expected_keys.len()],
         "expected every listed run output to report {FULL_OBJECT:?}, got body {listing:?}"
     );
+}
+
+/// The destination prefix every case below writes under.
+const OUTPUT_PREFIX: &str = "output";
+
+/// The source prefix every case below reads from.
+const SOURCE_PREFIX: &str = "inbound";
+
+/// The `ServerSideEncryption` value an object encrypted under a KMS key reports: one of the
+/// values the enum publishes (`smithy_query(query="shape",
+/// shape="com.amazonaws.s3#ServerSideEncryption")` lists `AES256`, `aws:kms` and
+/// `aws:kms:dsse` among them), and the single-layer one of its two KMS values.
+const SSE_KMS: &str = "aws:kms";
+
+/// The response header `GetObject`'s `SSEKMSKeyId` travels on
+/// (`@httpHeader("x-amz-server-side-encryption-aws-kms-key-id")`).
+const SSE_KMS_KEY_ID_HEADER: &str = "x-amz-server-side-encryption-aws-kms-key-id";
+
+/// The response header `GetObject`'s `ServerSideEncryption` travels on
+/// (`@httpHeader("x-amz-server-side-encryption")`).
+const SSE_HEADER: &str = "x-amz-server-side-encryption";
+
+/// A `Map_all` task: every field a record carries is written, and none is excluded.
+fn map_all_task() -> Value {
+    json!({ "taskType": "Map_all", "sourceFields": [] })
+}
+
+/// An Amazon S3 source naming `bucket`, the source prefix and the input file type the case
+/// declares (`None` for a source declaring none).
+fn source(bucket: &str, input_file_type: Option<&str>) -> Value {
+    let mut properties = json!({ "bucketName": bucket, "bucketPrefix": SOURCE_PREFIX });
+    if let Some(file_type) = input_file_type {
+        properties["s3InputFormatConfig"] = json!({ "s3InputFileType": file_type });
+    }
+    json!({
+        "connectorType": "S3",
+        "sourceConnectorProperties": { "S3": properties }
+    })
+}
+
+/// The flow one case defines and runs: the variable parts of its definition.
+struct Run<'case> {
+    case: &'case str,
+    flow_name: &'case str,
+    source_bucket: &'case str,
+    destination_bucket: &'case str,
+    input_file_type: Option<&'case str>,
+    output_file_type: Option<&'case str>,
+    /// The `kmsArn` the definition names, or `None` for a definition naming none.
+    kms_arn: Option<&'case str>,
+    tasks: Value,
+}
+
+/// Create the flow `run` describes, start it, wait for its run to settle, and answer the
+/// key the run's output object landed at.
+async fn stored_output_key(router: &MultiServiceRouter, run: &Run<'_>) -> String {
+    let case = run.case;
+    let mut definition = json!({
+        "flowName": run.flow_name,
+        "triggerConfig": on_demand_trigger(),
+        "sourceFlowConfig": source(run.source_bucket, run.input_file_type),
+        "destinationFlowConfigList": [destination(
+            run.destination_bucket, Some(OUTPUT_PREFIX), run.output_file_type)],
+        "tasks": run.tasks,
+    });
+    if let Some(kms_arn) = run.kms_arn {
+        definition["kmsArn"] = json!(kms_arn);
+    }
+    let created = call(router, "/create-flow", &definition).await;
+    assert!(
+        created.is_ok(),
+        "case {case:?}: expected CreateFlow to succeed, got {} {:?}",
+        created.status,
+        created.body
+    );
+    let started = call(router, "/start-flow", &json!({ "flowName": run.flow_name })).await;
+    assert!(
+        started.is_ok(),
+        "case {case:?}: expected StartFlow to succeed, got {} {:?}",
+        started.status,
+        started.body
+    );
+    let execution_id = started.string("executionId").to_string();
+    let runs = settled_runs(router, run.flow_name).await;
+    assert_eq!(
+        runs.first()
+            .and_then(|record| record.get("executionStatus"))
+            .and_then(Value::as_str),
+        Some("Successful"),
+        "case {case:?}: expected the run to succeed, got {runs:?}"
+    );
+    format!("{OUTPUT_PREFIX}/{}/{execution_id}", run.flow_name)
+}
+
+/// One row of the field-order table.
+struct Order {
+    case: &'static str,
+    /// The bytes the one source object holds.
+    source: &'static str,
+    input_file_type: Option<&'static str>,
+    output_file_type: Option<&'static str>,
+    tasks: Value,
+    /// The bytes the destination object is expected to hold, exactly.
+    expected: &'static str,
+}
+
+/// The field-order table. The rows differ along everything the rule generalises over: the
+/// shape of the source document (an array, one record per line, a single record), the
+/// source and destination file types, how many records there are and how many fields each
+/// carries, whether a record's fields are in alphabetical order to begin with, whether two
+/// records carry their fields in the SAME order, whether a field is renamed on the way, and
+/// whether a later record adds a field the first did not carry.
+fn orders() -> Vec<Order> {
+    vec![
+        Order {
+            case: "a json array whose records carry their fields out of alphabetical order",
+            source: r#"[{"id":"1","city":"lisbon","temp":"21"},{"id":"2","city":"oslo","temp":"4"}]"#,
+            input_file_type: Some("JSON"),
+            output_file_type: Some("JSON"),
+            tasks: json!([map_all_task()]),
+            expected: "{\"id\":\"1\",\"city\":\"lisbon\",\"temp\":\"21\"}\n\
+                       {\"id\":\"2\",\"city\":\"oslo\",\"temp\":\"4\"}\n",
+        },
+        Order {
+            case: "one record per line, fields in reverse alphabetical order",
+            source: "{\"z\":\"1\",\"m\":\"2\",\"a\":\"3\"}\n{\"z\":\"4\",\"m\":\"5\",\"a\":\"6\"}\n",
+            input_file_type: None,
+            output_file_type: None,
+            tasks: json!([map_all_task()]),
+            expected: "{\"z\":\"1\",\"m\":\"2\",\"a\":\"3\"}\n{\"z\":\"4\",\"m\":\"5\",\"a\":\"6\"}\n",
+        },
+        Order {
+            case: "a single record whose values are not all strings",
+            source: r#"{"name":"ada","amount":42,"paid":true}"#,
+            input_file_type: None,
+            output_file_type: None,
+            tasks: json!([map_all_task()]),
+            expected: "{\"name\":\"ada\",\"amount\":42,\"paid\":true}\n",
+        },
+        Order {
+            case: "two records that carry their fields in different orders",
+            source: r#"[{"b":"1","a":"2"},{"a":"3","b":"4"}]"#,
+            input_file_type: None,
+            output_file_type: None,
+            tasks: json!([map_all_task()]),
+            expected: "{\"b\":\"1\",\"a\":\"2\"}\n{\"a\":\"3\",\"b\":\"4\"}\n",
+        },
+        Order {
+            case: "a renamed field keeps the position the source record gave it",
+            source: r#"[{"id":"1","city":"lisbon","temp":"21"}]"#,
+            input_file_type: None,
+            output_file_type: None,
+            tasks: json!([map_all_task(), map_task("city", "town")]),
+            expected: "{\"id\":\"1\",\"town\":\"lisbon\",\"temp\":\"21\"}\n",
+        },
+        Order {
+            case: "a csv source read into a json destination",
+            source: "temp,city,id\n21,lisbon,1\n4,oslo,2\n",
+            input_file_type: Some("CSV"),
+            output_file_type: Some("JSON"),
+            tasks: json!([map_all_task()]),
+            expected: "{\"temp\":\"21\",\"city\":\"lisbon\",\"id\":\"1\"}\n\
+                       {\"temp\":\"4\",\"city\":\"oslo\",\"id\":\"2\"}\n",
+        },
+        Order {
+            case: "a csv destination takes its columns in the order the records carry them",
+            source: r#"[{"temp":"21","city":"lisbon","id":"1"}]"#,
+            input_file_type: None,
+            output_file_type: Some("CSV"),
+            tasks: json!([map_all_task()]),
+            expected: "temp,city,id\n21,lisbon,1\n",
+        },
+        Order {
+            case: "a later record adds a field the first did not carry",
+            source: r#"[{"b":"1"},{"b":"2","a":"3"}]"#,
+            input_file_type: None,
+            output_file_type: Some("CSV"),
+            tasks: json!([map_all_task()]),
+            expected: "b,a\n1,\n2,3\n",
+        },
+    ]
+}
+
+/// The destination object holds each transferred record with its fields in the order the
+/// SOURCE record presented them: a transfer hands on the records it read, so a client
+/// comparing the destination bytes (or a digest of them) against the source sees what AWS
+/// produces rather than an alphabetised re-serialization.
+#[tokio::test]
+async fn the_output_object_keeps_each_records_source_field_order() {
+    for (index, row) in orders().into_iter().enumerate() {
+        let case = row.case;
+        let router = appflow_and_object_store();
+        let source_bucket = "field-order-source";
+        let destination_bucket = "field-order-destination";
+        stand_up_bucket(&router, source_bucket).await;
+        stand_up_bucket(&router, destination_bucket).await;
+        let seeded = s3_request(
+            &router,
+            "PUT",
+            &format!("/{source_bucket}/{SOURCE_PREFIX}/records"),
+            &[],
+            row.source.as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            seeded.status,
+            200,
+            "case {case:?}: expected the source object to be stored, got {} {:?}",
+            seeded.status,
+            seeded.text()
+        );
+
+        let flow_name = format!("field-order-flow-{index}");
+        let key = stored_output_key(
+            &router,
+            &Run {
+                case,
+                flow_name: &flow_name,
+                source_bucket,
+                destination_bucket,
+                input_file_type: row.input_file_type,
+                output_file_type: row.output_file_type,
+                kms_arn: None,
+                tasks: row.tasks,
+            },
+        )
+        .await;
+
+        let read = s3_request(
+            &router,
+            "GET",
+            &format!("/{destination_bucket}/{key}"),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: expected GetObject of {key} to be served, got {} {:?}",
+            read.status,
+            read.text()
+        );
+        let served = String::from_utf8_lossy(&read.body).to_string();
+        assert_eq!(
+            served, row.expected,
+            "case {case:?}: expected the destination object to hold {:?}, got {served:?}",
+            row.expected
+        );
+    }
+}
+
+/// One row of the destination-encryption table.
+struct Encrypted {
+    case: &'static str,
+    /// The `kmsArn` the flow's definition names, or `None` for a definition naming none —
+    /// the case AppFlow settles with the key it manages for the account.
+    kms_arn: Option<&'static str>,
+}
+
+/// The encryption table. The rows differ along what the rule generalises over: whether the
+/// definition names a key at all, and which key it names — never which value is reported,
+/// because the reported key is the flow's own.
+fn encrypted() -> Vec<Encrypted> {
+    vec![
+        Encrypted {
+            case: "a flow naming no key, so AppFlow's own managed key encrypts the output",
+            kms_arn: None,
+        },
+        Encrypted {
+            case: "a flow naming a key of its own",
+            kms_arn: Some("arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555"),
+        },
+        Encrypted {
+            case: "a flow naming another key, so two flows report different keys",
+            kms_arn: Some("arn:aws:kms:us-east-1:000000000000:key/66666666-7777-8888-9999-aaaaaaaaaaaa"),
+        },
+    ]
+}
+
+/// A run's output object is stored with KMS server-side encryption under the flow's own
+/// encryption key, so a read of it reports `aws:kms` together with that key — the one
+/// `DescribeFlow` reports for the flow — rather than the bucket's SSE-S3 default with no key
+/// at all, and reports it to every reader of the object.
+#[tokio::test]
+async fn the_output_object_is_encrypted_under_the_flows_own_kms_key() {
+    for (index, row) in encrypted().into_iter().enumerate() {
+        let case = row.case;
+        let router = appflow_and_object_store();
+        let source_bucket = "encrypted-output-source";
+        let destination_bucket = "encrypted-output-destination";
+        stand_up_bucket(&router, source_bucket).await;
+        stand_up_bucket(&router, destination_bucket).await;
+        let seeded = s3_request(
+            &router,
+            "PUT",
+            &format!("/{source_bucket}/{SOURCE_PREFIX}/records"),
+            &[],
+            br#"[{"id":"1","city":"lisbon"}]"#,
+        )
+        .await;
+        assert_eq!(
+            seeded.status,
+            200,
+            "case {case:?}: expected the source object to be stored, got {} {:?}",
+            seeded.status,
+            seeded.text()
+        );
+
+        let flow_name = format!("encrypted-output-flow-{index}");
+        let key = stored_output_key(
+            &router,
+            &Run {
+                case,
+                flow_name: &flow_name,
+                source_bucket,
+                destination_bucket,
+                input_file_type: None,
+                output_file_type: None,
+                kms_arn: row.kms_arn,
+                tasks: json!([map_all_task()]),
+            },
+        )
+        .await;
+
+        // The key the FLOW records, which is the one its output has to be encrypted under:
+        // the definition's own, or the one AppFlow settled for a definition naming none.
+        let described = call(&router, "/describe-flow", &json!({ "flowName": flow_name })).await;
+        let flow_key = described.string("kmsArn").to_string();
+        assert!(
+            flow_key.starts_with("arn:aws:kms:"),
+            "case {case:?}: expected the flow to record a KMS key, got {:?}",
+            described.body
+        );
+        if let Some(named) = row.kms_arn {
+            assert_eq!(
+                flow_key, named,
+                "case {case:?}: expected the flow to keep the key it named, got {flow_key:?}"
+            );
+        }
+
+        let read = s3_request(
+            &router,
+            "GET",
+            &format!("/{destination_bucket}/{key}"),
+            &[("x-amz-checksum-mode", "ENABLED")],
+            b"",
+        )
+        .await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: expected GetObject of {key} to be served, got {} {:?}",
+            read.status,
+            read.text()
+        );
+        assert_eq!(
+            read.header(SSE_HEADER).as_deref(),
+            Some(SSE_KMS),
+            "case {case:?}: expected the read to report {SSE_KMS:?}, got {:?}",
+            read.header(SSE_HEADER)
+        );
+        assert_eq!(
+            read.header(SSE_KMS_KEY_ID_HEADER).as_deref(),
+            Some(flow_key.as_str()),
+            "case {case:?}: expected the read to report the flow's key {flow_key:?}, got {:?}",
+            read.header(SSE_KMS_KEY_ID_HEADER)
+        );
+        // The write recorded a full-object checksum of the bytes it stored, which the same
+        // read reports beside the encryption it was stored under.
+        assert!(
+            read.header(DEFAULT_CHECKSUM_HEADER)
+                .is_some_and(|value| !value.is_empty()),
+            "case {case:?}: expected the read to report {DEFAULT_CHECKSUM_HEADER}, got headers \
+             {:?}",
+            read.headers
+        );
+        assert_eq!(
+            read.header("x-amz-checksum-type").as_deref(),
+            Some(FULL_OBJECT),
+            "case {case:?}: expected a whole-object checksum, got {:?}",
+            read.header("x-amz-checksum-type")
+        );
+
+        // The same pair reaches the object's OTHER reader, from the one record the write
+        // left behind rather than from anything this read computed.
+        let headed = s3_request(
+            &router,
+            "HEAD",
+            &format!("/{destination_bucket}/{key}"),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(
+            headed.status,
+            200,
+            "case {case:?}: expected HeadObject of {key} to be served, got {}",
+            headed.status
+        );
+        assert_eq!(
+            (
+                headed.header(SSE_HEADER),
+                headed.header(SSE_KMS_KEY_ID_HEADER)
+            ),
+            (Some(SSE_KMS.to_string()), Some(flow_key.clone())),
+            "case {case:?}: expected HeadObject to report {SSE_KMS:?} under {flow_key:?}, got \
+             {:?} / {:?}",
+            headed.header(SSE_HEADER),
+            headed.header(SSE_KMS_KEY_ID_HEADER)
+        );
+    }
 }

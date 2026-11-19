@@ -29,10 +29,11 @@
 //!   encode, so one run cannot serialise every other object-store request behind it;
 //! * that read is capped by [`MAX_SOURCE_OBJECTS_PER_RUN`] and
 //!   [`MAX_SOURCE_BYTES_PER_RUN`], checked as the bodies are collected;
-//! * the records are capped by [`MAX_RECORDS_PER_RUN`], passed INTO the parse so no more
-//!   than that many are ever materialised, and the encode — which walks every field of
-//!   every record — is capped by [`MAX_FIELDS_PER_RUN`] and [`MAX_CELLS_PER_RUN`] over
-//!   their product, before it begins;
+//! * the records, the fields of each one and the cells they come to are capped by
+//!   [`MAX_RECORDS_PER_RUN`], [`MAX_FIELDS_PER_RUN`] and [`MAX_CELLS_PER_RUN`], spent
+//!   INSIDE the parse as each record is produced — so no source file expands into more of
+//!   them than one run moves, whatever it holds — and the names those cells stand under
+//!   are shared rather than copied per cell ([`FieldNames`]);
 //! * the destinations one run writes are capped by [`MAX_DESTINATIONS_PER_RUN`] and the
 //!   bytes they come to by [`MAX_OUTPUT_BYTES_PER_RUN`], so the per-destination work and
 //!   its output are bounded as well as the per-file factors;
@@ -53,8 +54,50 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
+use ::indexmap::{IndexMap, IndexSet};
+
 use super::{nothing_transferred, ExecutionOutcome, ExecutionStatus, Flow};
 use crate::ops::types::{ErrorInfo, ExecutionResult, S3DestinationProperties, S3SourceProperties, Task};
+
+/// One field NAME, shared by every record that carries it.
+///
+/// A record holds a handle rather than a copy of each name: a tabular source names its
+/// fields once, in its header row, and the records under that row can be very many — so a
+/// record owning its own copy of every name would cost a multiple of the file it was read
+/// from for the names alone. Interned per source file ([`FieldNames`]).
+type FieldName = ::std::sync::Arc<str>;
+
+/// The field names one source file's records are read under, each interned once.
+#[derive(Debug, Default)]
+struct FieldNames(::std::collections::HashSet<FieldName>);
+
+impl FieldNames {
+    /// The shared handle for `name`: the one already held for it, or a new one.
+    fn intern(&mut self, name: &str) -> FieldName {
+        if let Some(held) = self.0.get(name) {
+            return ::std::sync::Arc::clone(held);
+        }
+        let held: FieldName = ::std::sync::Arc::from(name);
+        self.0.insert(::std::sync::Arc::clone(&held));
+        held
+    }
+}
+
+/// One record a run moves, as it was READ: the fields the source record carries, each
+/// under the name it is written as, in the order the source presented them.
+///
+/// The order is part of the record: a transfer hands the destination the records it read,
+/// so the file a run writes presents each record's fields in the order the source file
+/// did, and nothing between the read and the write re-orders them. An order-preserving map
+/// is therefore what a record is held in from the moment it is parsed to the moment it is
+/// encoded — a map sorted by field name would make the bytes a destination holds differ
+/// from the source's for no reason a client can see.
+type Record = IndexMap<FieldName, ::serde_json::Value>;
+
+/// One record as the source document carries it, before this run's allowances have
+/// admitted it: the same order, with each field still under a name of its own ([`admitted`]
+/// is what spends the allowances and interns those names).
+type ReadRecord = IndexMap<String, ::serde_json::Value>;
 
 /// The service principal Amazon AppFlow reads a source bucket and writes a destination
 /// bucket AS, and so the principal a bucket policy has to grant those actions to. AppFlow
@@ -131,11 +174,12 @@ const EXCLUDE_SOURCE_FIELDS_PROPERTY: &str = "EXCLUDE_SOURCE_FIELDS_LIST";
 /// CHOSEN, not documented: AppFlow publishes no per-run ceiling of any of these, so they
 /// are this emulator's own. Each is applied BEFORE the work it caps, and together they
 /// bound the whole of one run rather than one factor of it: the byte ceiling bounds the
-/// bodies read, the record ceiling is passed into the parse so the expansion of those
-/// bytes into records is bounded, the field and cell ceilings bound the encode — which
-/// walks every field of every record, so its cost is their PRODUCT and not either alone —
-/// and the destination and output ceilings bound the per-destination work and the bytes it
-/// produces, which are multiplied by how many destinations the definition names.
+/// bodies read; the record, field and cell ceilings are spent inside the parse as each
+/// record is produced ([`Budget`]), so the expansion of those bytes into records — and of
+/// each record into the cells it holds, which is what a parse really allocates — is bounded
+/// as it happens rather than once every record is in hand; and the destination and output
+/// ceilings bound the per-destination work and the bytes it produces, which are multiplied
+/// by how many destinations the definition names.
 ///
 /// The destination ceiling is far above anything the API itself serves: "you can only
 /// transfer data to one item in this list at a time. Amazon AppFlow does not currently
@@ -146,7 +190,7 @@ const EXCLUDE_SOURCE_FIELDS_PROPERTY: &str = "EXCLUDE_SOURCE_FIELDS_LIST";
 const MAX_SOURCE_OBJECTS_PER_RUN: usize = 1_000;
 const MAX_SOURCE_BYTES_PER_RUN: usize = 8 * 1024 * 1024;
 const MAX_RECORDS_PER_RUN: usize = 100_000;
-const MAX_FIELDS_PER_RUN: usize = 1_000;
+pub const MAX_FIELDS_PER_RUN: usize = 1_000;
 const MAX_CELLS_PER_RUN: usize = 10_000_000;
 const MAX_OUTPUT_BYTES_PER_RUN: usize = 32 * 1024 * 1024;
 pub const MAX_DESTINATIONS_PER_RUN: usize = 16;
@@ -201,21 +245,26 @@ const RUN_TOOK_TOO_LONG: &str =
     "This flow run took longer than one run of this emulator is given and was abandoned.";
 
 /// What the caller-sized part of one run may spend: the instant it has to be finished by,
-/// and the output bytes it may produce in all.
+/// the records and cells it may materialise, and the output bytes it may produce in all.
 ///
 /// Checked INSIDE that work rather than around it, because the one thing an outer
 /// `tokio::time::timeout` cannot do is stop a blocking task that has already started: it
 /// abandons the result while the closure keeps running. So the closure carries its own
 /// deadline and stops itself, which is what makes [`RUN_WORK_BUDGET`] a bound on the CPU
-/// and the memory a request consumes rather than only on the caller's wait. The output
-/// allowance is spent the same way — as each row or column is produced, not once a whole
-/// file has been built — so an encode that would amplify its source past
+/// and the memory a request consumes rather than only on the caller's wait. The record and
+/// cell allowances are spent the same way — as each record is READ, before it is kept, so a
+/// source file that would expand into more records or more cells than one run moves is
+/// refused while it is being parsed rather than after its records are already held. The
+/// output allowance likewise, as each row or column is produced, not once a whole file has
+/// been built — so an encode that would amplify its source past
 /// [`MAX_OUTPUT_BYTES_PER_RUN`] is abandoned while it is building rather than after the
 /// bytes are already held.
 #[derive(Debug)]
 struct Budget {
     deadline: ::std::time::Instant,
     output_bytes_left: usize,
+    records_left: usize,
+    cells_left: usize,
 }
 
 impl Budget {
@@ -223,6 +272,8 @@ impl Budget {
         Self {
             deadline: ::std::time::Instant::now() + RUN_WORK_BUDGET,
             output_bytes_left: MAX_OUTPUT_BYTES_PER_RUN,
+            records_left: MAX_RECORDS_PER_RUN,
+            cells_left: MAX_CELLS_PER_RUN,
         }
     }
 
@@ -232,6 +283,30 @@ impl Budget {
         if ::std::time::Instant::now() > self.deadline {
             return Err(RUN_TOOK_TOO_LONG);
         }
+        Ok(())
+    }
+
+    /// Take ONE record out of this run's record allowance, the deadline asked first — so a
+    /// parse stops between records both when the run has read as many as it moves and when
+    /// its time is spent, rather than running on to the end of whatever the source holds.
+    fn take_record(&mut self) -> Result<(), &'static str> {
+        self.still_running()?;
+        self.records_left = self.records_left.checked_sub(1).ok_or(TOO_MANY_RECORDS)?;
+        Ok(())
+    }
+
+    /// Spend the cells of ONE record — one per field it carries — or `Err` when that record
+    /// carries more fields than one run moves, or when the records read hold more values
+    /// together than it moves.
+    ///
+    /// Spent as the record is read, before it is kept: a cell occupies memory the moment it
+    /// exists, so the allowance that bounds how many of them one run materialises is of no
+    /// use anywhere else.
+    fn spend_record_fields(&mut self, fields: usize) -> Result<(), &'static str> {
+        if fields > MAX_FIELDS_PER_RUN {
+            return Err(TOO_MANY_FIELDS);
+        }
+        self.cells_left = self.cells_left.checked_sub(fields).ok_or(TOO_MANY_CELLS)?;
         Ok(())
     }
 
@@ -278,6 +353,10 @@ pub struct RunPlan {
     source: S3SourceProperties,
     destinations: Vec<S3DestinationProperties>,
     tasks: Vec<Task>,
+    /// The ARN of the KMS key the flow's own definition records as the one its data is
+    /// encrypted under — see [`object_encryption`] — or `None` for a stored flow that
+    /// records no key at all.
+    encryption_key_arn: Option<String>,
     /// Whether a run of this flow PULLS a window of new or updated records from its
     /// source — see [`Flow::pulls_incrementally`].
     incremental_pull: bool,
@@ -316,6 +395,7 @@ impl Flow {
             source,
             destinations,
             tasks: self.tasks.clone(),
+            encryption_key_arn: self.kms_arn.clone(),
             incremental_pull: self.pulls_incrementally(),
         })
     }
@@ -428,7 +508,7 @@ pub async fn perform_run<Eng: ::std::marker::Send + ::std::marker::Sync + 'stati
     };
     let data_pull_end_time = SystemTime::now();
 
-    match write_output(engine, &read.written, prepared.files) {
+    match write_output(engine, plan, &read.written, prepared.files) {
         Ok(bytes_written) => ExecutionOutcome {
             status: ExecutionStatus::Successful,
             result: ExecutionResult {
@@ -579,23 +659,23 @@ fn prepare(
 ) -> Result<Prepared, &'static str> {
     let mut budget = Budget::new();
     let mapping = FieldMapping::of(tasks);
-    let mut records: Vec<BTreeMap<String, ::serde_json::Value>> = Vec::new();
+    // The field names this run's records stand under, interned as the files are read so no
+    // cell carries a copy of the name it is written under.
+    let mut names = FieldNames::default();
+    let mut records: Vec<Record> = Vec::new();
     for body in bodies {
         budget.still_running()?;
-        // One past the ceiling, so a source with more records than a run moves is
-        // DETECTED without the rest of it ever being allocated.
-        let remaining = MAX_RECORDS_PER_RUN - records.len() + 1;
-        let parsed = parse_records(body, input_file_type, remaining).ok_or(UNREADABLE_SOURCE)?;
-        for record in parsed {
-            if records.len() >= MAX_RECORDS_PER_RUN {
-                return Err(TOO_MANY_RECORDS);
-            }
-            records.push(mapping.applied_to(&record));
+        // The record, field and cell allowances are spent INSIDE the parse, as each record
+        // is produced, so a source holding more than one run moves is refused while it is
+        // being read rather than after all of it has been materialised.
+        for record in parse_records(body, input_file_type, &mut names, &mut budget)? {
+            records.push(mapping.applied_to(&record, &mut names));
         }
     }
 
-    // The encode walks every field of every record, so its cost is their PRODUCT: both
-    // are capped here, before any encoder runs.
+    // The encode walks every field of every record, so its cost is their PRODUCT: the
+    // distinct columns are counted here, over records whose own fields and cells the parse
+    // has already bounded one by one.
     let columns = columns_of(&records);
     if columns.len() > MAX_FIELDS_PER_RUN {
         return Err(TOO_MANY_FIELDS);
@@ -621,6 +701,7 @@ fn prepare(
 /// the bytes written in all. `Err` is the sentence the run reports.
 fn write_output<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     engine: &Eng,
+    plan: &RunPlan,
     written: &[Written],
     files: Vec<Vec<u8>>,
 ) -> Result<i64, &'static str> {
@@ -632,7 +713,12 @@ fn write_output<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     let mut bytes_written = 0i64;
     for (destination, body) in written.iter().zip(files) {
         bytes_written += body.len() as i64;
-        let object = stored_object(&store, &destination.bucket, body);
+        let object = stored_object(
+            &store,
+            &destination.bucket,
+            plan.encryption_key_arn.as_deref(),
+            body,
+        );
         if !matches!(
             store.put_object(&destination.bucket, &destination.key, object),
             Some(
@@ -832,17 +918,26 @@ fn missing_actions(
 /// The object a run writes at a destination location.
 ///
 /// Everything a stored object carries that a WRITE does not choose is left as a
-/// `PutObject` of the same bytes would leave it: the entity tag is computed from the bytes
-/// by the object store's own function, the checksum is the one Amazon S3 itself adds to a
-/// whole-object write that names no algorithm, and the encryption is the destination
-/// bucket's default, because that is what any other write to that bucket is stored under.
+/// `PutObject` of the same bytes would leave it: the entity tag is settled from the bytes
+/// and the encryption by the object store's own function, and the checksum is the one
+/// Amazon S3 itself adds to a whole-object write that names no algorithm. The encryption is
+/// the one the flow's definition settles for everything it moves ([`object_encryption`]).
 fn stored_object(
     store: &::service_com_amazonaws_s3_amazons3::state::ComAmazonawsS3Amazons3State,
     bucket: &str,
+    encryption_key_arn: Option<&str>,
     body: Vec<u8>,
 ) -> ::service_com_amazonaws_s3_amazons3::state::Object {
+    let encryption = object_encryption(store, bucket, encryption_key_arn);
     ::service_com_amazonaws_s3_amazons3::state::Object {
-        etag: ::service_com_amazonaws_s3_amazons3::state::object_etag(&body),
+        // The entity tag of the bytes stored, except for an object sealed with a KMS key,
+        // whose tag is not that digest — the object store's own rule for the encryption the
+        // write settled on, so the transferred object carries the tag a `PutObject` of the
+        // same bytes under the same encryption carries.
+        etag: ::service_com_amazonaws_s3_amazons3::state::stored_object_etag(
+            &::service_com_amazonaws_s3_amazons3::state::object_etag(&body),
+            &encryption,
+        ),
         // A run writes the file whole and names no checksum algorithm, so the object store
         // settles the checksum such a write carries — its default algorithm over all of
         // the bytes — through its own function for it, and a read or a listing of the
@@ -862,10 +957,7 @@ fn stored_object(
         website_redirect_location: None,
         metadata: ::std::collections::BTreeMap::new(),
         tags: Vec::new(),
-        encryption: store
-            .bucket(bucket)
-            .map(::service_com_amazonaws_s3_amazons3::state::Bucket::default_object_encryption)
-            .unwrap_or_default(),
+        encryption,
         // A transferred object carries no Object Lock retention, legal hold, restore,
         // annotation or ACL of its own, and is written whole: each of those is placed on a
         // stored object afterwards by Amazon S3's own operation for it.
@@ -877,6 +969,38 @@ fn stored_object(
         parts: Vec::new(),
         replication: None,
     }
+}
+
+/// How the object a run writes is encrypted at rest: under the flow's own encryption key.
+///
+/// A flow carries the key its data is encrypted under, and every stored flow has one: the
+/// key its definition named, or the key AppFlow manages for the account when the definition
+/// named none ("This is required if you do not want to use the Amazon AppFlow-managed KMS
+/// key. If you don't provide anything here, Amazon AppFlow uses the Amazon AppFlow-managed
+/// KMS key", `smithy_query(query="doc", shape="CreateFlowRequest", member="kmsArn")`). So
+/// the object a run writes is stored with KMS server-side encryption under THAT key, and a
+/// later read of it reports the mode it was stored under together with the key id that
+/// encrypted it — the same key `DescribeFlow` reports for the flow, so the two readings of
+/// one flow's encryption cannot disagree.
+///
+/// A flow recording no key at all asks for no encryption of its own, which is the case the
+/// destination bucket's own default encryption configuration decides, exactly as it decides
+/// for any other write to that bucket that names none.
+///
+/// WHICH configuration either case comes to is the object store's own rule, shared with
+/// every other service that writes an object into a bucket
+/// ([`::service_com_amazonaws_s3_amazons3::state::written_object_encryption`]), so a flow
+/// run's output and a delivery's cannot be stored under different records of one key.
+fn object_encryption(
+    store: &::service_com_amazonaws_s3_amazons3::state::ComAmazonawsS3Amazons3State,
+    bucket: &str,
+    encryption_key_arn: Option<&str>,
+) -> ::service_com_amazonaws_s3_amazons3::state::ObjectEncryption {
+    ::service_com_amazonaws_s3_amazons3::state::written_object_encryption(
+        store,
+        bucket,
+        encryption_key_arn,
+    )
 }
 
 /// The key a run writes its file at: the destination prefix, then the flow, then the run
@@ -918,8 +1042,10 @@ fn output_file_type(destination: &S3DestinationProperties) -> &str {
         .unwrap_or(DEFAULT_FILE_TYPE)
 }
 
-/// At most `budget` records out of one source file, or `None` when it is not that file
-/// type at all.
+/// The records of one source file, or the sentence the run reports: [`UNREADABLE_SOURCE`]
+/// when the file is not that file type at all, and the ceiling's own sentence when it holds
+/// more records, fields or cells than one run moves ([`Budget`], spent as the records are
+/// produced).
 ///
 /// A `JSON` file is read as the records it carries in any of the three shapes a record set
 /// is written in — one object, an array of them, or one object per line — because all
@@ -928,93 +1054,123 @@ fn output_file_type(destination: &S3DestinationProperties) -> &str {
 fn parse_records(
     body: &[u8],
     file_type: &str,
-    budget: usize,
-) -> Option<Vec<BTreeMap<String, ::serde_json::Value>>> {
+    names: &mut FieldNames,
+    budget: &mut Budget,
+) -> Result<Vec<Record>, &'static str> {
     match file_type {
-        FILE_TYPE_CSV => parse_csv(body, budget),
+        FILE_TYPE_CSV => parse_csv(body, names, budget),
         // Every other declared input type is JSON: `S3InputFileType` names only the two
         // (`smithy_query(query="shape", shape="S3InputFileType")`).
-        _ => parse_json(body, budget),
+        _ => parse_json(body, names, budget),
     }
 }
 
-/// At most `budget` records out of a JSON source file.
+/// The records of a JSON source file.
+///
+/// Each record is read into [`Record`], so the fields of every record come out in the
+/// order the source file wrote them — which is the order they are written back out in.
+/// Anything that is not a record, or a set of them, is not this file type at all.
+///
+/// An array is taken apart into the raw TEXT of each of its elements — a slice of the body
+/// rather than a record — and a record is built out of one element only once this run's
+/// allowances have admitted it, so a document holding more records than one run moves never
+/// has all of them materialised at once.
 fn parse_json(
     body: &[u8],
-    budget: usize,
-) -> Option<Vec<BTreeMap<String, ::serde_json::Value>>> {
-    if let Ok(value) = ::serde_json::from_slice::<::serde_json::Value>(body) {
-        return match value {
-            ::serde_json::Value::Array(entries) => entries
-                .into_iter()
-                .take(budget)
-                .map(as_record)
-                .collect::<Option<Vec<_>>>(),
-            ::serde_json::Value::Object(_) => as_record(value).map(|record| vec![record]),
-            _ => None,
-        };
+    names: &mut FieldNames,
+    budget: &mut Budget,
+) -> Result<Vec<Record>, &'static str> {
+    if let Ok(elements) = ::serde_json::from_slice::<Vec<&::serde_json::value::RawValue>>(body) {
+        let mut records = Vec::new();
+        for element in elements {
+            records.push(record_of(element.get().as_bytes(), names, budget)?);
+        }
+        return Ok(records);
+    }
+    // One record on its own: the whole document is that record.
+    if let Ok(read) = ::serde_json::from_slice::<ReadRecord>(body) {
+        return Ok(vec![admitted(read, names, budget)?]);
     }
     // One record per line: the shape a record set is written in when it is appended to
     // rather than built as one document.
-    String::from_utf8(body.to_vec())
-        .ok()?
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .take(budget)
-        .map(|line| {
-            ::serde_json::from_str::<::serde_json::Value>(line)
-                .ok()
-                .and_then(as_record)
-        })
-        .collect()
-}
-
-/// One JSON value as a record: a record is an object, so anything else is not one.
-fn as_record(value: ::serde_json::Value) -> Option<BTreeMap<String, ::serde_json::Value>> {
-    match value {
-        ::serde_json::Value::Object(members) => Some(members.into_iter().collect()),
-        _ => None,
+    let text = ::std::str::from_utf8(body).map_err(|_| UNREADABLE_SOURCE)?;
+    let mut records = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        records.push(record_of(line.as_bytes(), names, budget)?);
     }
+    Ok(records)
 }
 
-/// At most `budget` records out of a CSV source file, read by the `csv` crate: the first
-/// row names the fields and every later row is a record of string values.
+/// One record out of the JSON text `body`, admitted by this run's allowances.
+fn record_of(
+    body: &[u8],
+    names: &mut FieldNames,
+    budget: &mut Budget,
+) -> Result<Record, &'static str> {
+    let read: ReadRecord = ::serde_json::from_slice(body).map_err(|_| UNREADABLE_SOURCE)?;
+    admitted(read, names, budget)
+}
+
+/// `read` as a record this run KEEPS: its record and its cells spent from the run's
+/// allowances first — so a source expanding into more than one run moves is refused as its
+/// records are produced — and its field names interned, so the record shares them with
+/// every other record of the same file.
+fn admitted(
+    read: ReadRecord,
+    names: &mut FieldNames,
+    budget: &mut Budget,
+) -> Result<Record, &'static str> {
+    budget.take_record()?;
+    budget.spend_record_fields(read.len())?;
+    Ok(read
+        .into_iter()
+        .map(|(field, value)| (names.intern(&field), value))
+        .collect())
+}
+
+/// The records of a CSV source file, read by the `csv` crate: the first row names the
+/// fields — in the order it names them, which is the order the records it heads carry their
+/// fields in — and every later row is a record of string values.
+///
+/// The header row's names are interned ONCE for the file, so a row costs the values it
+/// carries and not a copy of every name it carries them under.
 fn parse_csv(
     body: &[u8],
-    budget: usize,
-) -> Option<Vec<BTreeMap<String, ::serde_json::Value>>> {
+    names: &mut FieldNames,
+    budget: &mut Budget,
+) -> Result<Vec<Record>, &'static str> {
     let mut reader = ::csv::Reader::from_reader(body);
-    let headers: Vec<String> = reader
+    let headers: Vec<FieldName> = reader
         .headers()
-        .ok()?
+        .map_err(|_| UNREADABLE_SOURCE)?
         .iter()
-        .map(::std::string::ToString::to_string)
+        .map(|field| names.intern(field))
         .collect();
     let mut records = Vec::new();
-    for row in reader.records().take(budget) {
-        let row = row.ok()?;
+    for row in reader.records() {
+        let row = row.map_err(|_| UNREADABLE_SOURCE)?;
+        budget.take_record()?;
+        budget.spend_record_fields(row.len().min(headers.len()))?;
         records.push(
             headers
                 .iter()
-                .zip(row.iter())
-                .map(|(field, value)| {
-                    (
-                        field.clone(),
-                        ::serde_json::Value::String(value.to_string()),
-                    )
-                })
+                .map(::std::sync::Arc::clone)
+                .zip(
+                    row.iter()
+                        .map(|value| ::serde_json::Value::String(value.to_string())),
+                )
                 .collect(),
         );
     }
-    Some(records)
+    Ok(records)
 }
 
 /// The bytes of the destination file holding `records`, in `file_type`, whose columns are
 /// `columns` — spending `budget` as it goes, so an encode stops as soon as the run's
 /// deadline has passed or its output allowance is gone instead of building the rest.
 fn encode_records(
-    records: &[BTreeMap<String, ::serde_json::Value>],
-    columns: &[String],
+    records: &[Record],
+    columns: &[FieldName],
     file_type: &str,
     budget: &mut Budget,
 ) -> Result<Vec<u8>, &'static str> {
@@ -1032,23 +1188,32 @@ fn encode_records(
 ///
 /// Each line is charged to the run's output allowance BEFORE it is appended, so the file
 /// this builds can never be larger than the allowance that was left.
-fn encode_json(
-    records: &[BTreeMap<String, ::serde_json::Value>],
-    budget: &mut Budget,
-) -> Result<Vec<u8>, &'static str> {
+fn encode_json(records: &[Record], budget: &mut Budget) -> Result<Vec<u8>, &'static str> {
     let mut body = String::new();
     for record in records {
         budget.still_running()?;
-        let object: ::serde_json::Map<String, ::serde_json::Value> = record
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        let line = ::serde_json::Value::Object(object).to_string();
+        // The record is written AS HELD, so its members land in the order the source
+        // record presented them rather than in any order of this encoder's choosing.
+        let line = ::serde_json::to_string(&JsonObject(record)).map_err(|_| RECORDS_NOT_ENCODED)?;
         budget.spend_output(line.len() + 1)?;
         body.push_str(&line);
         body.push('\n');
     }
     Ok(body.into_bytes())
+}
+
+/// One record as the JSON object a line of a JSON file carries: its fields in the order
+/// the record holds them, each under the name it is written as.
+///
+/// The adapter exists because a record's field names are SHARED handles ([`FieldName`]) and
+/// the serializer is given the name itself rather than the handle; the order is the record's
+/// own either way.
+struct JsonObject<'record>(&'record Record);
+
+impl ::serde::Serialize for JsonObject<'_> {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|(field, value)| (&**field, value)))
+    }
 }
 
 /// `records` as a CSV file, written by the `csv` crate: one header row naming every field
@@ -1059,14 +1224,14 @@ fn encode_json(
 /// actually produced, read back off its own buffer — so the file this builds can never be
 /// larger than the allowance that was left.
 fn encode_csv(
-    records: &[BTreeMap<String, ::serde_json::Value>],
-    columns: &[String],
+    records: &[Record],
+    columns: &[FieldName],
     budget: &mut Budget,
 ) -> Result<Vec<u8>, &'static str> {
     let mut writer = ::csv::Writer::from_writer(Vec::new());
     let mut charged = 0usize;
     writer
-        .write_record(columns)
+        .write_record(columns.iter().map(|column| column.as_bytes()))
         .map_err(|_| RECORDS_NOT_ENCODED)?;
     for record in records {
         budget.still_running()?;
@@ -1092,8 +1257,8 @@ fn encode_csv(
 /// Each column's values are charged to the run's output allowance before they are handed
 /// to the writer, so the bytes this holds can never exceed the allowance that was left.
 fn encode_parquet(
-    records: &[BTreeMap<String, ::serde_json::Value>],
-    columns: &[String],
+    records: &[Record],
+    columns: &[FieldName],
     budget: &mut Budget,
 ) -> Result<Vec<u8>, &'static str> {
     use ::parquet::basic::{ConvertedType, Repetition, Type as PhysicalType};
@@ -1162,17 +1327,19 @@ fn encode_parquet(
         .map(|buffer| buffer.to_vec())
 }
 
-/// Every field any record carries, in ascending field order — the columns of a tabular
-/// destination file. Ordered, so the same records always produce the same file.
-fn columns_of(records: &[BTreeMap<String, ::serde_json::Value>]) -> Vec<String> {
-    let mut columns: BTreeSet<&str> = BTreeSet::new();
+/// Every field any record carries, in the order the records present them — the columns of
+/// a tabular destination file.
+///
+/// First appearance first: the columns of a file are the fields of the records it holds, so
+/// they stand in the order those records carry them (see [`Record`]) and a record set whose
+/// later records carry a field the first did not have it appended. Deterministic, so the
+/// same records always produce the same file.
+fn columns_of(records: &[Record]) -> Vec<FieldName> {
+    let mut columns: IndexSet<&FieldName> = IndexSet::new();
     for record in records {
-        columns.extend(record.keys().map(String::as_str));
+        columns.extend(record.keys());
     }
-    columns
-        .into_iter()
-        .map(::std::string::ToString::to_string)
-        .collect()
+    columns.into_iter().map(::std::sync::Arc::clone).collect()
 }
 
 /// One field's value as the text a tabular file's cell holds: a string value as itself,
@@ -1249,23 +1416,28 @@ impl FieldMapping {
         mapping
     }
 
-    /// `record` as this mapping writes it.
-    fn applied_to(
-        &self,
-        record: &BTreeMap<String, ::serde_json::Value>,
-    ) -> BTreeMap<String, ::serde_json::Value> {
-        record
-            .iter()
-            .filter(|(field, _)| !self.excluded.contains(*field))
-            .filter(|(field, _)| {
-                self.projected
-                    .as_ref()
-                    .is_none_or(|projected| projected.contains(*field))
-            })
-            .map(|(field, value)| {
-                let written_as = self.renamed.get(field).unwrap_or(field);
-                (written_as.clone(), value.clone())
-            })
-            .collect()
+    /// `record` as this mapping writes it, field order kept: a mapping decides which field
+    /// is written under which name, never the order they are written in.
+    fn applied_to(&self, record: &Record, names: &mut FieldNames) -> Record {
+        let mut written = Record::new();
+        for (field, value) in record {
+            let name: &str = field;
+            if self.excluded.contains(name) {
+                continue;
+            }
+            if self
+                .projected
+                .as_ref()
+                .is_some_and(|projected| !projected.contains(name))
+            {
+                continue;
+            }
+            let written_as = match self.renamed.get(name) {
+                Some(destination) => names.intern(destination),
+                None => ::std::sync::Arc::clone(field),
+            };
+            written.insert(written_as, value.clone());
+        }
+        written
     }
 }

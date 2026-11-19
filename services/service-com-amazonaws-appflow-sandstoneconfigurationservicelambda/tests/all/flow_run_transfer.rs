@@ -363,7 +363,7 @@ fn transfers() -> Vec<Transfer> {
             output_file_type: Some("CSV"),
             tasks: json!([map_task("name", "full_name")]),
             records: 2,
-            expected: Expected::Csv("full_name,id\nada,1\nbob,2\n"),
+            expected: Expected::Csv("id,full_name\n1,ada\n2,bob\n"),
         },
         Transfer {
             case: "a filter task projects the one field the run reads",
@@ -1909,4 +1909,122 @@ async fn a_pattern_refusal_quotes_the_expression_the_service_validates() {
         !message.contains(r"^[\w/!@#+=.-]+$"),
         "expected no anchored expression in the refusal, got {message:?}"
     );
+}
+
+/// A source file whose records carry more fields than one run of this emulator moves is
+/// refused as those records are READ — the run ends in the modelled failure state naming
+/// the ceiling it met, and nothing is written at the destination — while a file carrying
+/// exactly as many fields as a run moves is transferred. Both sides of the ceiling, so the
+/// allowance is spent where the records are produced rather than counted afterwards.
+#[tokio::test]
+async fn a_source_past_the_field_ceiling_is_refused_as_its_records_are_read() {
+    let ceiling =
+        service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::state::MAX_FIELDS_PER_RUN;
+    for (case, fields, refused) in [
+        ("as many fields as a run moves", ceiling, false),
+        ("one field too many", ceiling + 1, true),
+    ] {
+        let emulator = Emulator::new();
+        let source_bucket = "field-ceiling-source";
+        let destination_bucket = "field-ceiling-destination";
+        emulator.stand_up(&[source_bucket, destination_bucket]).await;
+        // One CSV file: a header row naming `fields` fields, then one record under it.
+        let header: Vec<String> = (0..fields).map(|index| format!("f{index}")).collect();
+        let row: Vec<String> = (0..fields).map(|index| index.to_string()).collect();
+        let source = format!("{}\n{}\n", header.join(","), row.join(","));
+        emulator
+            .put_object(source_bucket, "inbound/wide.csv", &source)
+            .await;
+
+        let flow_name = "field-ceiling-flow";
+        let created = emulator
+            .appflow(
+                "/create-flow",
+                &json!({
+                    "flowName": flow_name,
+                    "triggerConfig": on_demand_trigger(),
+                    "sourceFlowConfig": s3_source_at(source_bucket, "inbound", Some("CSV")),
+                    "destinationFlowConfigList": [s3_destination_at(
+                        destination_bucket, "outbound", None)],
+                    "tasks": [map_all_task(&[])],
+                }),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected CreateFlow to succeed, got {} {:?}",
+            created.status,
+            created.json()
+        );
+        let started = emulator
+            .appflow("/start-flow", &json!({ "flowName": flow_name }))
+            .await;
+        assert_eq!(
+            started.status, 200,
+            "case {case:?}: expected StartFlow to succeed, got {} {:?}",
+            started.status,
+            started.json()
+        );
+        let execution_id = started.string("executionId");
+
+        std::thread::sleep(AFTER_RUN_SETTLES);
+        let records = emulator
+            .appflow(
+                "/describe-flow-execution-records",
+                &json!({ "flowName": flow_name }),
+            )
+            .await;
+        let run = records
+            .member("flowExecutions")
+            .as_array()
+            .and_then(|runs| runs.first())
+            .cloned()
+            .unwrap_or(Value::Null);
+        let result = run.get("executionResult").cloned().unwrap_or(Value::Null);
+        let key = format!("outbound/{flow_name}/{execution_id}");
+        let written = emulator.object(destination_bucket, &key).await;
+        if refused {
+            assert_eq!(
+                run.get("executionStatus").and_then(Value::as_str),
+                Some("Error"),
+                "case {case:?}: expected the run to fail, got {run:?}"
+            );
+            assert_eq!(
+                result
+                    .get("errorInfo")
+                    .and_then(|info| info.get("executionMessage"))
+                    .and_then(Value::as_str),
+                Some(
+                    "The records at the source location carry more fields than one run of this \
+                     emulator transfers."
+                ),
+                "case {case:?}: expected the run to name the ceiling it met, got {result:?}"
+            );
+            assert_eq!(
+                written.status, 404,
+                "case {case:?}: expected nothing at the destination, got {} {}",
+                written.status,
+                String::from_utf8_lossy(&written.body)
+            );
+        } else {
+            assert_eq!(
+                run.get("executionStatus").and_then(Value::as_str),
+                Some("Successful"),
+                "case {case:?}: expected the run to succeed, got {run:?}"
+            );
+            assert_eq!(
+                written.status, 200,
+                "case {case:?}: expected the run to have written {key}, got {}",
+                written.status
+            );
+            let line = String::from_utf8_lossy(&written.body).to_string();
+            let record: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+            assert_eq!(
+                record.as_object().map(serde_json::Map::len),
+                Some(fields),
+                "case {case:?}: expected the transferred record to carry {fields} fields, got \
+                 {record:?}"
+            );
+        }
+    }
 }
