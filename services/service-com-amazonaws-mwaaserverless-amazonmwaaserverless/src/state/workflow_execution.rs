@@ -14,7 +14,7 @@
 //! The plan is built ONCE, when the run is recorded, out of the definition that version
 //! snapshotted — a version is immutable, so what it holds IS what the run executes, and a
 //! plan built once is what makes two reads of the same run answer identically. Nothing is
-//! slept on: the plan says what happens and at which dependency LEVEL, and
+//! slept on: the plan says what happens, at which dependency LEVEL and for how long, and
 //! [`crate::state::WorkflowRun::settle`] materialises each level as the clock makes it
 //! due.
 //!
@@ -25,6 +25,12 @@
 //!   declared as dependencies have finished. The run finishes in the modelled `SUCCESS`
 //!   status with no `ErrorMessage`, which is the outcome `WorkflowRunDetail$ErrorMessage`
 //!   documents ("This value is null if the run completed successfully").
+//! * How LONG each task occupies, and so how long the run is executing: the span a task
+//!   runs for is the one its own declaration states ([`super::declared_runtime`]), and the
+//!   default span for a task that declares none ([`super::TASK_LEVEL_RUNS_FOR`]). The
+//!   tasks at one level run together, so a level occupies the longest of them
+//!   ([`ExecutionPlan::level_runs_for`]) and the run occupies the levels one after
+//!   another — which is the window its `StartedOn`, `CompletedOn` and `Duration` report.
 //! * Which of the values the definition DECLARES each instance reports: a value read out
 //!   of the caller's definition is reported only when it is one the modelled member that
 //!   carries it can hold, so an operator name outside that member is not reported at all
@@ -46,9 +52,10 @@
 //! instance reports the outcome of the orchestration it took part in.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use super::workflow_definition::{self, TaskDeclaration, MAX_DECLARED_TASKS};
-use super::{ConstrainedValue, M_OPERATOR_NAME, M_TASK_INSTANCE_ID};
+use super::{declared_runtime, ConstrainedValue, M_OPERATOR_NAME, M_TASK_INSTANCE_ID};
 
 /// The most characters a run's `ErrorMessage` carries: the modelled length of the
 /// `GenericString` it targets (`smithy_query(query="shape", shape="WorkflowRunDetail")`
@@ -73,6 +80,10 @@ pub struct PlannedTask {
     /// nothing, and otherwise one past the deepest task it waits for. Tasks at one level
     /// run together, because nothing between them has to wait.
     pub level: usize,
+    /// How long this task's instance is `RUNNING` for: the wait its own declaration
+    /// states ([`super::declared_runtime::declared_runtime`]), and the run's default span
+    /// ([`super::TASK_LEVEL_RUNS_FOR`]) for a task whose declaration states none.
+    pub runs_for: Duration,
 }
 
 /// What a run executes: the plan built from its version's definition.
@@ -123,6 +134,19 @@ impl ExecutionPlan {
     /// The tasks that run at `level`.
     pub fn tasks_at(&self, level: usize) -> impl Iterator<Item = &PlannedTask> {
         self.tasks.iter().filter(move |task| task.level == level)
+    }
+
+    /// How long `level` occupies: the longest span any task at it runs for, because the
+    /// tasks at one level run together and the level is done when the last of them is.
+    ///
+    /// A level the plan holds no task at — which is every level of a plan with no task at
+    /// all — occupies the default span, so a run with nothing to execute still passes
+    /// through `RUNNING` ([`super::TASK_LEVEL_RUNS_FOR`]).
+    pub fn level_runs_for(&self, level: usize) -> Duration {
+        self.tasks_at(level)
+            .map(|task| task.runs_for)
+            .max()
+            .unwrap_or(super::TASK_LEVEL_RUNS_FOR)
     }
 
     /// A plan for a definition whose graph could not be built: nothing runs, and `reason`
@@ -228,6 +252,11 @@ fn plan_tasks(declared: &[TaskDeclaration]) -> Result<Vec<PlannedTask>, String> 
                 .as_deref()
                 .and_then(reported_operator_name),
             level: level.unwrap_or_default(),
+            runs_for: task
+                .command
+                .as_deref()
+                .and_then(declared_runtime::declared_runtime)
+                .unwrap_or(super::TASK_LEVEL_RUNS_FOR),
         })
         .collect())
 }

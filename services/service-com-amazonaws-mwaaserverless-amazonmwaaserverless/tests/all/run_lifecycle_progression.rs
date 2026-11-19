@@ -26,6 +26,12 @@
 //!    one it EXECUTES with: the entry the service injects to name the run's workflow, with
 //!    whatever the start supplied merged over it.
 //!
+//! 3. The WINDOW a run reports — `StartedOn`, `CompletedOn` and the `Duration` derived
+//!    from them — spans the work the definition declared: each dependency level occupies
+//!    the longest wait its own tasks declare, so a run whose task declares a long wait is
+//!    observable executing for it and a run whose task declares a brief one reports a
+//!    brief window. The last two suites cover that rule.
+//!
 //! The first suite drives the schedule from SEEDED clock fields, so every state of the
 //! lifecycle (including the intermediate `QUEUED`) is asserted deterministically rather
 //! than raced against the wall clock; the second suite then walks one real run with the
@@ -33,6 +39,7 @@
 
 use std::time::{Duration, SystemTime};
 
+use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::declared_runtime::MAX_DECLARED_RUNTIME;
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
     WorkflowRun, RUN_ADMITTED_AFTER, RUN_DEQUEUED_AFTER, RUN_STATUS_FAILED, RUN_STATUS_QUEUED,
     RUN_STATUS_RUNNING, RUN_STATUS_STARTING, RUN_STATUS_SUCCESS, TASK_LEVEL_RUNS_FOR,
@@ -40,6 +47,9 @@ use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::ComAmazonawsMwaaserverlessAmazonmwaaserverlessState;
 
 use crate::task_instance_reads::{epoch_seconds, instance, seed};
+use crate::workflow_definition_snapshot::{
+    call, create_bucket, create_workflow, definition_router, definition_router_on, stage,
+};
 use crate::workflow_lifecycle::{role_arn, Harness};
 
 /// The `WorkflowRunStatus` values a run of a definition that declares no failing task
@@ -104,9 +114,18 @@ pub(crate) fn with_run<R>(
     run_id: &str,
     edit: impl FnOnce(&mut WorkflowRun) -> R,
 ) -> R {
-    let state = harness
-        .engine()
-        .state::<ComAmazonawsMwaaserverlessAmazonmwaaserverlessState>();
+    with_stored_run(harness.engine(), workflow_arn, run_id, edit)
+}
+
+/// The same edit against an engine the caller holds directly, for a suite that drives its
+/// requests through the assembled router rather than through [`Harness`].
+pub(crate) fn with_stored_run<R>(
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
+    workflow_arn: &str,
+    run_id: &str,
+    edit: impl FnOnce(&mut WorkflowRun) -> R,
+) -> R {
+    let state = engine.state::<ComAmazonawsMwaaserverlessAmazonmwaaserverlessState>();
     let mut store = state.lock();
     let run = store
         .workflows
@@ -617,4 +636,389 @@ async fn an_optional_run_member_is_reported_only_when_the_run_holds_it() {
             }
         }
     }
+}
+
+// === The window a run REPORTS is the window the work its definition declared occupies ===
+//
+// `StartedOn` is "The timestamp when the workflow run started execution", `CompletedOn`
+// "The timestamp when the workflow run completed execution" and `Duration` "The total
+// duration of the workflow run execution in seconds"
+// (`smithy_query(query="shape", shape="WorkflowRunDetail")`), so the window a run reports
+// describes the execution it performed: each dependency level of its plan occupies the
+// longest time its own tasks' declared command lines STATE they take — performed by the
+// workspace's one bounded POSIX/bash session, which states a program's time without
+// waiting for it — and the run is non-terminal for the levels one after another. A task
+// whose program states no time occupies the emulator's own default span
+// (`TASK_LEVEL_RUNS_FOR`).
+
+/// One row of the declared-window table: a definition, and the spans its dependency
+/// levels must therefore occupy, deepest level last.
+struct WindowRow {
+    case: &'static str,
+    /// The definition content staged in Amazon S3.
+    definition: &'static str,
+    /// The span each level of the run occupies, in the order the run executes them.
+    levels: Vec<Duration>,
+}
+
+/// The table. The rows differ along what the rule generalises over: whether a task
+/// declares a command at all, the UNIT the time it states is written in (a bare number of
+/// seconds and each suffix the waiting command accepts — `s`, `m`, `h`, `d`), whether that
+/// number is fractional, the shell FORM the line is written in (one command, an and-or list
+/// with and without spaces around the operator, a command list, a quoted operand, an
+/// assignment before the command, a nested `sh -c` program, a sequence of words), the SHAPE
+/// of the graph the waits sit in (one task, two at one level, a chain of two levels), the
+/// FORM the definition itself is written in (a mapping of tasks under the DAG id, a
+/// sequence at the root), a program written over several LINES — and the edges: a program
+/// that states no time at all, one the shell refuses, and a time past the longest this
+/// emulator holds a run for.
+fn window_rows() -> Vec<WindowRow> {
+    vec![
+        WindowRow {
+            case: "a task declaring no command at all",
+            definition: "tasks:\n  - id: only\n    operator: EmptyOperator\n",
+            levels: vec![TASK_LEVEL_RUNS_FOR],
+        },
+        WindowRow {
+            // The Apache Airflow YAML shape: the DAG's own id, its tasks one mapping in.
+            case: "one task waiting half a minute, declared as the DAG's own mapping",
+            definition: "lifecycle_dag:\n  start_date: \"2024-01-01\"\n  schedule: null\n  \
+                         tasks:\n    only_task:\n      operator: \
+                         airflow.providers.standard.operators.bash.BashOperator\n      \
+                         bash_command: \"sleep 25\"\n",
+            levels: vec![Duration::from_secs(25)],
+        },
+        WindowRow {
+            case: "a wait shorter than a second",
+            definition: "tasks:\n  - id: brief\n    bash_command: \"sleep 0.4\"\n",
+            levels: vec![Duration::from_millis(400)],
+        },
+        WindowRow {
+            case: "a wait in seconds, written with the explicit suffix",
+            definition: "tasks:\n  - id: explicit\n    bash_command: \"sleep 30s\"\n",
+            levels: vec![Duration::from_secs(30)],
+        },
+        WindowRow {
+            case: "a wait in minutes",
+            definition: "tasks:\n  - id: minutes\n    bash_command: \"sleep 2m\"\n",
+            levels: vec![Duration::from_secs(120)],
+        },
+        WindowRow {
+            case: "a wait in hours",
+            definition: "tasks:\n  - id: hours\n    bash_command: \"sleep 1h\"\n",
+            levels: vec![Duration::from_secs(60 * 60)],
+        },
+        WindowRow {
+            case: "a fractional wait in days",
+            definition: "tasks:\n  - id: days\n    bash_command: \"sleep 0.5d\"\n",
+            levels: vec![Duration::from_secs(12 * 60 * 60)],
+        },
+        WindowRow {
+            // The shell's own and-or list: both commands run, so the program states the
+            // time of both.
+            case: "two waits on one command line",
+            definition: "tasks:\n  - id: chained\n    bash_command: \"sleep 1 && sleep 2\"\n",
+            levels: vec![Duration::from_secs(3)],
+        },
+        WindowRow {
+            // The same list with no space around the operator, which is how one is
+            // ordinarily written: the grammar tokenizes the operator, so the words are the
+            // shell's rather than whitespace-separated text.
+            case: "an and-or list written without spaces around the operator",
+            definition: "tasks:\n  - id: unspaced\n    bash_command: \"sleep 1&&sleep 2\"\n",
+            levels: vec![Duration::from_secs(3)],
+        },
+        WindowRow {
+            case: "a command list, the wait first",
+            definition: "tasks:\n  - id: listed\n    bash_command: \"sleep 30; echo done\"\n",
+            levels: vec![Duration::from_secs(30)],
+        },
+        WindowRow {
+            case: "a quoted operand",
+            definition: "tasks:\n  - id: quoted\n    bash_command: 'sleep \"5\"'\n",
+            levels: vec![Duration::from_secs(5)],
+        },
+        WindowRow {
+            case: "an assignment written before the waiting command",
+            definition: "tasks:\n  assigned:\n    bash_command: TZ=UTC sleep 8\n",
+            levels: vec![Duration::from_secs(8)],
+        },
+        WindowRow {
+            case: "the wait carried by a nested program",
+            definition: "tasks:\n  - id: nested\n    bash_command: 'sh -c \"sleep 12\"'\n",
+            levels: vec![Duration::from_secs(12)],
+        },
+        WindowRow {
+            case: "a command declared as a sequence of words",
+            definition: "tasks:\n  - id: worded\n    operator: BashOperator\n    command:\n      \
+                         - sleep\n      - \"9\"\n",
+            levels: vec![Duration::from_secs(9)],
+        },
+        WindowRow {
+            // Two tasks that wait for nothing run together, so the level is done when the
+            // longer of them is.
+            case: "two tasks at one level, the longer wait deciding",
+            definition: "tasks:\n  - id: quick\n    bash_command: \"sleep 2\"\n  - id: slow\n    \
+                         bash_command: \"sleep 7\"\n",
+            levels: vec![Duration::from_secs(7)],
+        },
+        WindowRow {
+            case: "a chain of two levels, each adding its own wait",
+            definition: "tasks:\n  - id: extract\n    bash_command: \"sleep 3\"\n  - id: load\n    \
+                         dependencies: [extract]\n    bash_command: \"sleep 4\"\n",
+            levels: vec![Duration::from_secs(3), Duration::from_secs(4)],
+        },
+        WindowRow {
+            // A program written over several LINES states the time of each of them.
+            case: "a program written over several lines",
+            definition: "tasks:\n  - id: scripted\n    bash_command: |\n      echo starting\n      \
+                         sleep 2\n      sleep 3\n",
+            levels: vec![Duration::from_secs(5)],
+        },
+        WindowRow {
+            // A program that waits for nothing states no time of its own, and a command
+            // that merely CARRIES the word as an operand of another states none either.
+            case: "a command that waits for nothing",
+            definition: "tasks:\n  - id: prints\n    bash_command: \"echo sleep 30\"\n",
+            levels: vec![TASK_LEVEL_RUNS_FOR],
+        },
+        WindowRow {
+            // The waiting command with no operand is the utility's own usage failure, so
+            // the program states no time.
+            case: "the waiting command given no operand",
+            definition: "tasks:\n  - id: operandless\n    bash_command: \"sleep\"\n",
+            levels: vec![TASK_LEVEL_RUNS_FOR],
+        },
+        WindowRow {
+            // A wait of zero states no time either, so the default span covers it.
+            case: "a declared wait of zero",
+            definition: "tasks:\n  - id: immediate\n    bash_command: \"sleep 0\"\n",
+            levels: vec![TASK_LEVEL_RUNS_FOR],
+        },
+        WindowRow {
+            case: "a wait past the longest this emulator holds a run for",
+            definition: "tasks:\n  - id: forever\n    bash_command: \"sleep 2000000000\"\n",
+            levels: vec![MAX_DECLARED_RUNTIME],
+        },
+    ]
+}
+
+/// The whole window a run of `levels` occupies: the control plane's admission of the run,
+/// the wait for an executor, and then each dependency level.
+fn expected_window(levels: &[Duration]) -> Duration {
+    levels
+        .iter()
+        .fold(RUN_ADMITTED_AFTER + RUN_DEQUEUED_AFTER, |total, level| {
+            total + *level
+        })
+}
+
+/// `CompletedOn - StartedOn` as the report carries them, in seconds.
+fn reported_window(detail: &serde_json::Value, case: &str) -> f64 {
+    let started = epoch_seconds(&detail["StartedOn"]).unwrap_or_else(|| {
+        panic!("case {case:?}: an executed run reports StartedOn, got {detail:?}")
+    });
+    let completed = epoch_seconds(&detail["CompletedOn"]).unwrap_or_else(|| {
+        panic!("case {case:?}: a completed run reports CompletedOn, got {detail:?}")
+    });
+    completed - started
+}
+
+#[tokio::test]
+async fn the_window_a_run_reports_spans_the_work_its_definition_declared() {
+    let engine = std::sync::Arc::new(engine::InMemoryEngine::new());
+    let router = definition_router_on(std::sync::Arc::clone(&engine));
+    create_bucket(&router).await;
+
+    for (index, row) in window_rows().into_iter().enumerate() {
+        let case = row.case;
+        let key = format!("dags/declared-window-{index}.yaml");
+        stage(&router, &key, row.definition.as_bytes()).await;
+        let arn = create_workflow(&router, &format!("declaredWindow{index}"), &key).await;
+        let (status, started) = call(
+            &router,
+            "StartWorkflowRun",
+            serde_json::json!({"WorkflowArn": arn}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected StartWorkflowRun to succeed, got {status} {started:?}"
+        );
+        let run_id = started["RunId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: a started run has a RunId, got {started:?}"))
+            .to_string();
+
+        // The run is put back to the status its start reported, with its whole schedule
+        // already owed: one read then materialises every transition the clock owes, each
+        // dated from the instant it fell due, so the window below is an exact value
+        // rather than a race against the wall clock — and a declared wait of hours costs
+        // this test nothing.
+        let window = expected_window(&row.levels);
+        let started_on = SystemTime::now() - window - Duration::from_secs(1);
+        with_stored_run(&engine, &arn, &run_id, |run| {
+            run.status = RUN_STATUS_STARTING.to_string();
+            run.created_at = started_on;
+            run.started_on = started_on;
+            run.modified_at = started_on;
+            run.next_status_at = started_on + RUN_ADMITTED_AFTER;
+            run.completed_on = None;
+            run.duration = None;
+            run.error_message = None;
+            run.task_instances.clear();
+        });
+
+        let (status, answered) = call(
+            &router,
+            "GetWorkflowRun",
+            serde_json::json!({"WorkflowArn": arn, "RunId": run_id}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected GetWorkflowRun to succeed, got {status} {answered:?}"
+        );
+        let detail = &answered["RunDetail"];
+        assert_eq!(
+            detail["RunState"].as_str(),
+            Some(RUN_STATUS_SUCCESS),
+            "case {case:?}: every declared task finished, so the run completed \
+             successfully, got {:?}",
+            detail["RunState"]
+        );
+
+        let expected = window.as_secs_f64();
+        let reported = reported_window(detail, case);
+        assert!(
+            (reported - expected).abs() < 0.002,
+            "case {case:?}: expected the reported window to span the declared work \
+             ({expected} s), got {reported} s"
+        );
+        let expected_duration = i64::try_from(window.as_millis().div_ceil(1000))
+            .expect("a window of at most a day, in seconds");
+        assert_eq!(
+            detail["Duration"].as_i64(),
+            Some(expected_duration),
+            "case {case:?}: expected Duration {expected_duration} s, derived from the same \
+             window, got {:?}",
+            detail["Duration"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_run_of_a_declared_wait_is_observable_executing_and_its_window_tracks_that_wait() {
+    let router = definition_router();
+    create_bucket(&router).await;
+
+    // Two definitions of the same shape, differing only in the wait their one task
+    // declares: the window each run reports has to follow its own declaration, so the
+    // longer-declared run is observable in flight and the shorter-declared one reports a
+    // shorter window.
+    let declared = Duration::from_secs(2);
+    let brief = Duration::from_millis(100);
+    let long_key = "dags/observable-long.yaml";
+    let brief_key = "dags/observable-brief.yaml";
+    stage(
+        &router,
+        long_key,
+        b"observable_dag:\n  tasks:\n    only_task:\n      operator: BashOperator\n      \
+          bash_command: \"sleep 2\"\n",
+    )
+    .await;
+    stage(
+        &router,
+        brief_key,
+        b"observable_dag:\n  tasks:\n    only_task:\n      operator: BashOperator\n      \
+          bash_command: \"sleep 0.1\"\n",
+    )
+    .await;
+    let long_arn = create_workflow(&router, "observableLong", long_key).await;
+    let brief_arn = create_workflow(&router, "observableBrief", brief_key).await;
+
+    let mut runs = Vec::new();
+    for (case, arn) in [
+        ("the declared wait", &long_arn),
+        ("a briefer wait", &brief_arn),
+    ] {
+        let (status, started) = call(
+            &router,
+            "StartWorkflowRun",
+            serde_json::json!({"WorkflowArn": arn}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected StartWorkflowRun to succeed, got {status} {started:?}"
+        );
+        assert_eq!(
+            started["Status"], RUN_STATUS_STARTING,
+            "case {case:?}: a just-started run carries the documented initial status, got {:?}",
+            started["Status"]
+        );
+        runs.push((
+            case,
+            arn.clone(),
+            started["RunId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: a started run has a RunId"))
+                .to_string(),
+        ));
+    }
+
+    // Poll each run the way a client waiting for completion does, recording the states it
+    // passes through. The deadline is generous: what is asserted is the CONDITION the run
+    // reaches, never how fast the host got there.
+    let mut windows = Vec::new();
+    for (case, arn, run_id) in runs {
+        let request = serde_json::json!({"WorkflowArn": arn, "RunId": run_id});
+        let mut observed: Vec<String> = Vec::new();
+        let mut last = serde_json::Value::Null;
+        let deadline = SystemTime::now() + Duration::from_secs(120);
+        while SystemTime::now() < deadline {
+            let (status, answered) = call(&router, "GetWorkflowRun", request.clone()).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected GetWorkflowRun to succeed, got {status} {answered:?}"
+            );
+            let state = answered["RunDetail"]["RunState"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if observed.last() != Some(&state) {
+                observed.push(state.clone());
+            }
+            last = answered;
+            if state == RUN_STATUS_SUCCESS {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            observed.last().map(String::as_str),
+            Some(RUN_STATUS_SUCCESS),
+            "case {case:?}: the run must reach SUCCESS, got the states {observed:?}"
+        );
+        windows.push((case, reported_window(&last["RunDetail"], case), observed));
+    }
+
+    let (long_case, long_window, long_states) = &windows[0];
+    let (brief_case, brief_window, _) = &windows[1];
+    assert!(
+        long_states.iter().any(|state| state == RUN_STATUS_RUNNING),
+        "case {long_case:?}: a run whose task declares a wait is observable executing, got \
+         the states {long_states:?}"
+    );
+    assert!(
+        *long_window >= declared.as_secs_f64(),
+        "case {long_case:?}: expected a window of at least the declared {:?}, got \
+         {long_window} s",
+        declared
+    );
+    assert!(
+        *brief_window < declared.as_secs_f64(),
+        "case {brief_case:?}: expected the window to shrink with the declared wait of \
+         {brief:?}, got {brief_window} s against the {long_window} s of a {declared:?} wait"
+    );
 }

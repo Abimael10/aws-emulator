@@ -108,6 +108,15 @@ const TASK_OPERATOR_KEYS: &[&str] = &["operator", "operator_name", "type"];
 /// each of these keys names.
 const TASK_DEPENDENCY_KEYS: &[&str] = &["dependencies", "depends_on", "upstream"];
 
+/// The keys a task entry declares the COMMAND its operator runs under ("operator
+/// configurations"): `bash_command` is the parameter Apache Airflow's `BashOperator`
+/// takes the command line in, and `command` the shorter spelling a declaration carries it
+/// under. Written either as one command line or as a sequence of words.
+///
+/// What the command decides here is how long the task occupies, because a command line
+/// states the wait it asks for (`crate::state::declared_runtime`).
+const TASK_COMMAND_KEYS: &[&str] = &["bash_command", "command"];
+
 /// The most task declarations this reader takes out of ONE definition.
 ///
 /// A run materialises one task instance per declared task, so this is what bounds that
@@ -674,6 +683,10 @@ pub struct TaskDeclaration {
     /// The identifiers of the tasks this one waits for ([`TASK_DEPENDENCY_KEYS`]), in the
     /// order the definition lists them.
     pub dependencies: Vec<String>,
+    /// The command line the task's operator runs ([`TASK_COMMAND_KEYS`]), when it
+    /// declares one, with a command written as a sequence of words joined back into the
+    /// one line those words make up.
+    pub command: Option<String>,
 }
 
 /// What a definition declares about its tasks.
@@ -725,6 +738,8 @@ enum TaskField {
     Operator,
     /// One task this one waits for.
     Dependency,
+    /// The command line the task's operator runs, or one word of it.
+    Command,
 }
 
 /// The part of a task entry the key `key` declares, and `None` for a key this reader does
@@ -736,6 +751,8 @@ fn task_field(key: &str) -> Option<TaskField> {
         Some(TaskField::Operator)
     } else if TASK_DEPENDENCY_KEYS.contains(&key) {
         Some(TaskField::Dependency)
+    } else if TASK_COMMAND_KEYS.contains(&key) {
+        Some(TaskField::Command)
     } else {
         None
     }
@@ -830,6 +847,15 @@ impl TaskFinder {
                         TaskField::Id => task.task_id = Some(value),
                         TaskField::Operator => task.operator_name = Some(value),
                         TaskField::Dependency => task.dependencies.push(value),
+                        // A command written as a sequence of words is the one line
+                        // those words make up, so each word joins what is there.
+                        TaskField::Command => match task.command.as_mut() {
+                            Some(line) => {
+                                line.push(' ');
+                                line.push_str(&value);
+                            }
+                            None => task.command = Some(value),
+                        },
                     }
                 }
             }
@@ -858,18 +884,20 @@ impl TaskFinder {
 
     /// Which part of the entry being read the scalar now being read declares: a scalar in
     /// the entry's own mapping, under a key this reader knows, or one in a sequence that
-    /// entry's dependency key carries.
+    /// entry's dependency or command key carries.
     fn declared_field(&self) -> Option<TaskField> {
         let (at, _) = self.building.as_ref()?;
         let key = self.nodes.key_at(*at)?;
         if self.nodes.depth() == at + 1 {
             return task_field(key);
         }
-        if self.nodes.depth() == at + 2
-            && self.nodes.is_mapping_at(at + 1) == Some(false)
-            && TASK_DEPENDENCY_KEYS.contains(&key)
-        {
-            return Some(TaskField::Dependency);
+        if self.nodes.depth() == at + 2 && self.nodes.is_mapping_at(at + 1) == Some(false) {
+            if TASK_DEPENDENCY_KEYS.contains(&key) {
+                return Some(TaskField::Dependency);
+            }
+            if TASK_COMMAND_KEYS.contains(&key) {
+                return Some(TaskField::Command);
+            }
         }
         None
     }

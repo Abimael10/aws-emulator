@@ -72,6 +72,10 @@ pub mod configuration_dependencies;
 /// The task graph a run executes, built from the definition its version froze.
 pub mod workflow_execution;
 
+/// How long the work ONE task of a definition declares takes, read out of that
+/// declaration.
+pub mod declared_runtime;
+
 /// Exporting a run's own execution output to the CloudWatch Logs log group its
 /// workflow's `LoggingConfiguration` names.
 pub mod run_logs;
@@ -95,15 +99,18 @@ pub const RUN_ADMITTED_AFTER: Duration = Duration::from_millis(400);
 /// still observes `QUEUED`.
 pub const RUN_DEQUEUED_AFTER: Duration = Duration::from_millis(300);
 
-/// How long ONE dependency level of a run's task graph occupies: the span the task
-/// instances at that level are `RUNNING` for.
+/// How long ONE dependency level of a run's task graph occupies when nothing at that
+/// level declares how long its work takes: the span those task instances are `RUNNING`
+/// for.
 ///
-/// The tasks at one level run together — nothing between them waits — so a run occupies
-/// about this long per level of its graph
-/// ([`workflow_execution::ExecutionPlan::levels`]), and a run whose definition declares
-/// no task still occupies one. The length is the emulator's own choice, not a fidelity
-/// claim about how long any task takes, and it is deliberately non-zero so a caller that
-/// polls still observes `RUNNING` and the task instances that are running in it.
+/// The tasks at one level run together — nothing between them waits — so a level occupies
+/// the longest span its own tasks run for
+/// ([`workflow_execution::ExecutionPlan::level_runs_for`]), which is the wait each of them
+/// declares ([`declared_runtime`]) and this default for each that declares none. A run
+/// whose definition declares no task still occupies one. The length is the emulator's own
+/// choice, not a fidelity claim about how long an undeclared task takes, and it is
+/// deliberately non-zero so a caller that polls still observes `RUNNING` and the task
+/// instances that are running in it.
 pub const TASK_LEVEL_RUNS_FOR: Duration = Duration::from_millis(300);
 
 /// `WorkflowStatus` as the model spells it
@@ -557,13 +564,16 @@ impl WorkflowRun {
     /// * `QUEUED` -> `FAILED` instead, for a definition whose task graph could not
     ///   be built: that is a definition no run of it can execute, so the run fails
     ///   with the reason the plan recorded and holds no task instance.
-    /// * `RUNNING` -> `RUNNING`, one dependency level per [`TASK_LEVEL_RUNS_FOR`]:
-    ///   the level that was running finishes and the level that waited for it
-    ///   starts.
+    /// * `RUNNING` -> `RUNNING`, one dependency level at a time: the level that was
+    ///   running finishes once the span it occupies is up — the longest span its own
+    ///   tasks declare ([`workflow_execution::ExecutionPlan::level_runs_for`]) — and the
+    ///   level that waited for it starts, for the span ITS tasks declare.
     /// * `RUNNING` -> `SUCCESS` once no level is left: every task the definition
     ///   declared has finished, so the run is complete and carries the completion
     ///   instant and duration every finished run does, and no `ErrorMessage` —
-    ///   "This value is null if the run completed successfully".
+    ///   "This value is null if the run completed successfully". The window
+    ///   `StartedOn`/`CompletedOn` then span, and the `Duration` derived from it, are
+    ///   therefore the window the declared work occupies.
     /// * `STOPPING` -> `STOPPED` after [`RUN_STOPPED_AFTER`]: the shutdown a stop
     ///   started is complete, so the run is finished and carries the completion
     ///   instant and duration every finished run does. It records no `ErrorMessage`:
@@ -586,7 +596,7 @@ impl WorkflowRun {
                 RUN_STATUS_STARTING => {
                     self.status = RUN_STATUS_QUEUED.to_string();
                     self.modified_at = due;
-                    self.next_status_at = due + RUN_DEQUEUED_AFTER;
+                    self.next_status_at = deadline_after(due, RUN_DEQUEUED_AFTER);
                     self.log_status_reached(due);
                 }
                 RUN_STATUS_QUEUED => {
@@ -602,18 +612,22 @@ impl WorkflowRun {
                             self.status = RUN_STATUS_RUNNING.to_string();
                             self.log_status_reached(due);
                             self.start_declared_tasks(due);
-                            self.next_status_at = due + TASK_LEVEL_RUNS_FOR;
+                            // The level now running occupies the span its own tasks
+                            // declare.
+                            self.next_status_at =
+                                deadline_after(due, self.execution.level_runs_for(0));
                         }
                     }
                 }
                 RUN_STATUS_RUNNING => {
                     self.modified_at = due;
-                    if self.advance_declared_tasks(due) {
-                        self.status = RUN_STATUS_SUCCESS.to_string();
-                        self.complete_at(due);
-                        self.log_status_reached(due);
-                    } else {
-                        self.next_status_at = due + TASK_LEVEL_RUNS_FOR;
+                    match self.advance_declared_tasks(due) {
+                        Some(runs_for) => self.next_status_at = deadline_after(due, runs_for),
+                        None => {
+                            self.status = RUN_STATUS_SUCCESS.to_string();
+                            self.complete_at(due);
+                            self.log_status_reached(due);
+                        }
                     }
                 }
                 RUN_STATUS_STOPPING => {
@@ -770,16 +784,16 @@ impl WorkflowRun {
     /// Advance the run's execution by ONE dependency level at `at`: the level that was
     /// running finishes successfully and the level that waited for it starts.
     ///
-    /// Reports whether the execution is now COMPLETE — no level was left to start, which
-    /// is also the answer for a run whose definition declared no task at all.
+    /// Reports how long the level that just STARTED occupies — the longest span its own
+    /// tasks declare ([`workflow_execution::ExecutionPlan::level_runs_for`]) — and `None`
+    /// once the execution is COMPLETE: no level was left to start, which is also the
+    /// answer for a run whose definition declared no task at all.
     ///
     /// Each attempt that ends owes its own stream the outcome it ended with, and each
     /// attempt that starts names the stream it writes to and owes it the line saying so
     /// ([`Self::start_declared_tasks`]).
-    fn advance_declared_tasks(&mut self, at: SystemTime) -> bool {
-        let Some(level) = self.running_level() else {
-            return true;
-        };
+    fn advance_declared_tasks(&mut self, at: SystemTime) -> Option<Duration> {
+        let level = self.running_level()?;
         let run_id = self.run_id.clone();
         let exporting = self.log_group_name.is_some();
         let mut lines: Vec<(String, String)> = Vec::new();
@@ -798,7 +812,7 @@ impl WorkflowRun {
             for (stream, message) in lines {
                 self.queue_log_line(stream, at, message);
             }
-            return true;
+            return None;
         }
         for id in next {
             if let Some(instance) = self.task_instances.get_mut(&id) {
@@ -815,7 +829,7 @@ impl WorkflowRun {
         for (stream, message) in lines {
             self.queue_log_line(stream, at, message);
         }
-        false
+        Some(self.execution.level_runs_for(level + 1))
     }
 
     /// The dependency level the run is executing: the shallowest level whose task
@@ -1026,6 +1040,20 @@ pub const TASK_INSTANCE_STATUS_SUCCESS: &str = "SUCCESS";
 /// carries: the stop "terminates all running tasks", so the task ran to neither
 /// success nor failure.
 pub const TASK_INSTANCE_STATUS_CANCELLED: &str = "CANCELLED";
+
+/// The instant `span` after `at`, and `at` itself for a sum no clock can hold.
+///
+/// Why checked: part of a run's schedule is the time the work its definition declares
+/// states it takes ([`workflow_execution::ExecutionPlan::level_runs_for`]), which
+/// originates in caller-supplied definition content. That span is bounded where it is read
+/// ([`declared_runtime::MAX_DECLARED_RUNTIME`]), so the fallback is not reachable through
+/// any definition; it is here because every transition is materialised while this
+/// service's shared store is held ([`WorkflowRun::settle`]), where a panicking addition
+/// would be a failure for every later caller rather than for one call. A deadline past the
+/// end of time is one nothing can still be waiting for, so the change falls due at once.
+fn deadline_after(at: SystemTime, span: Duration) -> SystemTime {
+    at.checked_add(span).unwrap_or(at)
+}
 
 /// A run duration in whole seconds, rounded up so a sub-second run still reports
 /// the second it occupied, and clamped into the modelled `Integer`.
