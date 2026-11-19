@@ -219,7 +219,6 @@ type DerivedCase = (&'static str, Value, Vec<(&'static str, Value)>);
 #[tokio::test]
 async fn a_workgroup_reports_its_release_track_and_price_performance_target() {
     let router = emulator_with_ec2();
-    create_namespace(&router, "derived-ns").await;
     // `pricePerformanceTarget` levels from `PerformanceTarget$level`'s own documentation
     // ("valid values include 1, 25, 50, 75, and 100") and its `@range(min: 1, max: 100)`;
     // the track names from `CreateWorkgroup`'s `trackName` doc and the `TrackName` pattern.
@@ -267,10 +266,14 @@ async fn a_workgroup_reports_its_release_track_and_price_performance_target() {
 
     let mut releases: Vec<(String, String)> = Vec::new();
     for (index, (case, extra, expected)) in rows.into_iter().enumerate() {
+        // A namespace carries ONE workgroup, so every row stands up its own namespace to hold
+        // the workgroup the row creates.
+        let namespace_name = format!("derived-ns-{index}");
+        create_namespace(&router, &namespace_name).await;
         let workgroup_name = format!("derived-wg-{index}");
         let mut request = json!({
             "workgroupName": workgroup_name,
-            "namespaceName": "derived-ns",
+            "namespaceName": namespace_name,
         });
         for (member, value) in extra.as_object().cloned().unwrap_or_default() {
             request[member] = value;
@@ -463,7 +466,6 @@ async fn the_endpoint_reports_one_network_interface_per_subnet_of_the_workgroup(
 #[tokio::test]
 async fn a_workgroup_whose_subnets_resolve_to_nothing_reports_no_managed_endpoint() {
     let router = emulator_with_ec2();
-    create_namespace(&router, "unplaced-ns").await;
     // (case, the subnets the create names)
     let rows: [(&str, Value); 3] = [
         ("no subnet member at all", json!(null)),
@@ -474,10 +476,13 @@ async fn a_workgroup_whose_subnets_resolve_to_nothing_reports_no_managed_endpoin
         ),
     ];
     for (index, (case, subnet_ids)) in rows.into_iter().enumerate() {
+        // One workgroup per namespace, so each row gets a namespace of its own.
+        let namespace_name = format!("unplaced-ns-{index}");
+        create_namespace(&router, &namespace_name).await;
         let workgroup_name = format!("unplaced-wg-{index}");
         let mut request = json!({
             "workgroupName": workgroup_name,
-            "namespaceName": "unplaced-ns",
+            "namespaceName": namespace_name,
         });
         if !subnet_ids.is_null() {
             request["subnetIds"] = subnet_ids;

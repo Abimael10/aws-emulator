@@ -657,14 +657,17 @@ async fn a_created_workgroup_stores_each_members_value_and_the_documented_defaul
     ];
 
     let router = emulator();
-    create_namespace(&router, "wg-cases-ns").await;
     for (index, (case, request, expected)) in cases.iter().enumerate() {
+        // A namespace carries ONE workgroup, so each case stands up the namespace its own
+        // workgroup lives in.
+        let namespace = format!("wg-cases-ns-{index}");
+        create_namespace(&router, &namespace).await;
         let name = format!("wg-case-{index}");
         let (status, body) = call(
             &router,
             "CreateWorkgroup",
             merged(
-                json!({ "workgroupName": name, "namespaceName": "wg-cases-ns" }),
+                json!({ "workgroupName": name, "namespaceName": namespace }),
                 request,
             ),
         )
@@ -917,11 +920,15 @@ async fn a_port_outside_the_documented_ranges_is_refused() {
     create_workgroup(&router, "port-wg", "port-ns").await;
 
     for (index, (port, accepted)) in cases.iter().enumerate() {
+        // The create cases each need a namespace with no workgroup yet, because a namespace
+        // carries one; the update cases all drive the workgroup created above.
+        let namespace = format!("port-ns-{index:02}");
+        create_namespace(&router, &namespace).await;
         let name = format!("port-wg-{index}");
         let (status, body) = call(
             &router,
             "CreateWorkgroup",
-            json!({ "workgroupName": name, "namespaceName": "port-ns", "port": port }),
+            json!({ "workgroupName": name, "namespaceName": namespace, "port": port }),
         )
         .await;
         if *accepted {
@@ -1180,10 +1187,25 @@ async fn the_store_is_bounded_by_the_accounts_quota_for_each_resource() {
     assert_eq!(status, 200, "DeleteNamespace: got {status}");
     create_namespace(&router, "one-too-many").await;
 
-    // The workgroup store carries its own quota.
-    for index in 0..QUOTA {
-        create_workgroup(&router, &format!("quota-wg-{index:02}"), "one-too-many").await;
+    // The workgroup store carries its own quota — the same 25 — and the two quotas meet: a
+    // workgroup belongs to one namespace and a namespace carries one workgroup, so the 25
+    // namespaces this account may hold take exactly 25 workgroups between them.
+    let namespaces: Vec<String> = (1..QUOTA)
+        .map(|index| format!("quota-ns-{index:02}"))
+        .chain(::std::iter::once("one-too-many".to_string()))
+        .collect();
+    assert_eq!(
+        namespaces.len(),
+        QUOTA,
+        "the account holds its quota of namespaces, got {}",
+        namespaces.len()
+    );
+    for (index, namespace) in namespaces.iter().enumerate() {
+        create_workgroup(&router, &format!("quota-wg-{index:02}"), namespace).await;
     }
+
+    // Past that there is no namespace left to take another workgroup: every namespace the
+    // account holds already has its compute, which is a conflict …
     let (status, body) = call(
         &router,
         "CreateWorkgroup",
@@ -1192,8 +1214,20 @@ async fn the_store_is_bounded_by_the_accounts_quota_for_each_resource() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
+        (409, "ConflictException"),
+        "CreateWorkgroup into a namespace that already has one: got {status} with {body}"
+    );
+    // … and the namespace quota admits no further namespace to put one in.
+    let (status, body) = call(
+        &router,
+        "CreateNamespace",
+        json!({ "namespaceName": "ns-for-one-more-wg" }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
         (400, "ValidationException"),
-        "CreateWorkgroup at the workgroup quota: got {status} with {body}"
+        "CreateNamespace at the namespace quota: got {status} with {body}"
     );
 }
 

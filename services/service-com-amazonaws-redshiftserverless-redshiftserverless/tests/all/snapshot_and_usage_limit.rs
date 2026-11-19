@@ -765,12 +765,14 @@ async fn a_usage_limit_is_refused_unless_its_resource_arn_resolves() {
 
 #[tokio::test]
 async fn deleting_a_namespace_with_a_workgroup_attached_names_that_workgroup() {
-    // The rows differ along the names involved and how many workgroups are attached: the
-    // message names the workgroup that blocks the delete, whatever it is called.
+    // The rows differ along the names involved: the message names the workgroup that blocks
+    // the delete, whatever that workgroup is called. A namespace carries ONE workgroup, so
+    // each row attaches one, and they differ in its name — a plain one, the longest form and
+    // the shortest the model admits.
     let cases: [(&str, &[&str]); 3] = [
         ("teardown-ns", &["teardown-wg"]),
         ("ns-with-long-workgroup-name", &["a-rather-long-workgroup-name"]),
-        ("ns-with-two", &["wg-alpha", "wg-beta"]),
+        ("ns-with-short-workgroup-name", &["wg1"]),
     ];
 
     let router = emulator();

@@ -300,6 +300,33 @@ pub fn namespace_already_exists(name: &str) -> String {
     format!("The namespace {name} already exists.")
 }
 
+/// How this service states that a workgroup name is already taken: the modelled
+/// `ConflictException` at its own `@httpError` 409, worded from the name the request asked
+/// for.
+///
+/// The sentence is the service's own for this error class — a capitalized sentence ending in
+/// a period whose ONE variable slot is the requested `workgroupName` — because a client tells
+/// a name-already-taken conflict from the other conflicts this operation reports (a workgroup
+/// with an operation already running on it, a namespace that already has compute) by the text
+/// of the refusal. Every operation that takes a workgroup name for a NEW workgroup refuses a
+/// taken one this way, so the sentence lives here once.
+pub fn workgroup_already_exists(name: &str) -> String {
+    format!("The workgroup with name {name} already exists.")
+}
+
+/// How this service states that the namespace a create names already has compute attached.
+///
+/// A workgroup is the compute a namespace's database is served through and a namespace carries
+/// one, so a create for a namespace that already has a workgroup is the modelled
+/// `ConflictException`: the sentence names the workgroup already resident on the namespace,
+/// which is what the caller has to delete (or reuse) before another can take its place — the
+/// same remediation form this service words a blocked namespace delete with.
+pub fn namespace_already_has_workgroup(resident_workgroup_name: &str) -> String {
+    format!(
+        "There is already a workgroup {resident_workgroup_name} associated with the namespace."
+    )
+}
+
 /// How this service states that a namespace carries no compute to take a snapshot through.
 ///
 /// The sentence the recorded `CreateSnapshot` refusal carries is entirely FIXED: it ends at
@@ -822,14 +849,23 @@ impl ComAmazonawsRedshiftserverlessRedshiftserverlessState {
     /// The names of the workgroups attached to `namespace_name`, in list order. A
     /// namespace with any of these cannot be deleted, and a namespace with none of them
     /// holds no compute to take a snapshot through.
-    pub fn workgroups_in_namespace(&self, namespace_name: &str) -> Vec<&str> {
+    pub fn workgroups_in_namespace<'a>(&'a self, namespace_name: &'a str) -> Vec<&'a str> {
+        self.workgroup_names_in_namespace(namespace_name).collect()
+    }
+
+    /// [`Self::workgroups_in_namespace`] as an iterator, for a caller that only needs the
+    /// FIRST of those names — whether the namespace has compute at all — so it walks no
+    /// further than that one and collects nothing.
+    pub fn workgroup_names_in_namespace<'a>(
+        &'a self,
+        namespace_name: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
         self.workgroups
             .values()
-            .filter(|record| {
+            .filter(move |record| {
                 record.workgroup.namespace_name.as_deref() == Some(namespace_name)
             })
             .filter_map(|record| record.workgroup.workgroup_name.as_deref())
-            .collect()
     }
 }
 

@@ -9,6 +9,12 @@
 //! ([`crate::state::namespace_not_found`]), the answer this service gives for any
 //! unresolvable namespace name.
 //!
+//! A create that cannot be served answers the modelled error for the conflict it hit, worded
+//! by the sentence this service words that conflict with: a `workgroupName` another workgroup
+//! already holds is [`crate::state::workgroup_already_exists`], and a `namespaceName` whose
+//! compute already exists — a namespace carries ONE workgroup — is
+//! [`crate::state::namespace_already_has_workgroup`], which names the resident workgroup.
+//!
 //! The workgroup is created in `CREATING` status — one of the four `WorkgroupStatus`
 //! values — and reaches `AVAILABLE` on its own a moment later, with nobody calling; see
 //! [`crate::state::WorkgroupRecord::settle`].
@@ -239,10 +245,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A workgroup holds the compute for an existing namespace's database, the name is the
-        // workgroup's identity and the store grows one record per create, so the namespace,
-        // the name and the account's quota are all read FIRST — under the guard, and before
-        // the managed endpoint below is asked for, so a create that is going to be refused
-        // never stands an endpoint up.
+        // workgroup's identity, a namespace carries one workgroup and the store grows one
+        // record per create, so the namespace, the name, the compute it already has and the
+        // account's quota are all read FIRST — under the guard, and before the managed endpoint
+        // below is asked for, so a create that is going to be refused never stands an endpoint
+        // up.
         let refusal = {
             let mut state = state.lock();
             state.settle_due_transitions();
@@ -332,20 +339,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(str::to_string);
 
         // The insert, under the guard again: the admission above was read before the endpoint
-        // was asked for, so the name and the quota are read once more here — an occupied slot
-        // IS the conflict. The answer comes out of the STORED record, so what the caller reads
-        // is what a later GetWorkgroup reads.
+        // was asked for, so the name, the namespace's compute and the quota are read once more
+        // here — an occupied slot IS the conflict. The answer comes out of the STORED record, so
+        // what the caller reads is what a later GetWorkgroup reads.
         let inserted = {
             let mut state = state.lock();
             state.settle_due_transitions();
-            // Read before the `entry` below takes the borrow; it bounds only a NEW record.
+            // Both read before the `entry` below takes the borrow. The length bounds only a
+            // NEW record; the resident workgroup is the compute the namespace already has.
             let stored_workgroups = state.workgroups.len();
+            let resident = resident_workgroup(&state, &input.namespace_name);
             match state.workgroups.entry(input.workgroup_name) {
                 ::std::collections::btree_map::Entry::Occupied(occupied) => {
                     Err(name_already_taken(occupied.key()))
                 }
                 ::std::collections::btree_map::Entry::Vacant(slot) => {
-                    if stored_workgroups >= crate::state::MAX_WORKGROUPS {
+                    if let Some(resident) = resident {
+                        Err(namespace_already_has_workgroup(&resident))
+                    } else if stored_workgroups >= crate::state::MAX_WORKGROUPS {
                         Err(quota_reached())
                     } else {
                         Ok(slot.insert(record).workgroup.clone())
@@ -370,12 +381,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// Why this create cannot be served, read off the store before anything is written: a
-/// `namespaceName` that resolves to nothing, a `workgroupName` already taken, or an account
-/// already holding its quota of workgroups.
+/// `namespaceName` that resolves to nothing, a `workgroupName` already taken, a namespace that
+/// already has its workgroup, or an account already holding its quota of workgroups.
 ///
 /// Read FIRST so the managed VPC endpoint of a workgroup that will not exist is never created;
-/// the name and the quota are read again when the record is inserted, which is what decides
-/// them.
+/// the name, the namespace's compute and the quota are read again when the record is inserted,
+/// which is what decides them.
 fn admission(
     state: &crate::state::ComAmazonawsRedshiftserverlessRedshiftserverlessState,
     namespace_name: &str,
@@ -396,23 +407,61 @@ fn admission(
     if let Some((taken, _)) = state.workgroups.get_key_value(workgroup_name) {
         return Some(name_already_taken(taken));
     }
+    // A workgroup is the compute a namespace's databases are served through, and a namespace
+    // carries ONE: a create for a namespace that already has one is refused however the new
+    // workgroup is named. Read after the name, so a request repeating the resident
+    // workgroup's own name is answered as the name conflict it is.
+    if let Some(resident) = resident_workgroup(state, namespace_name) {
+        return Some(namespace_already_has_workgroup(&resident));
+    }
     if state.workgroups.len() >= crate::state::MAX_WORKGROUPS {
         return Some(quota_reached());
     }
     None
 }
 
+/// The name of the workgroup `namespace_name` already holds, if it has one — the compute that
+/// stands in the way of a second workgroup on the same namespace.
+fn resident_workgroup(
+    state: &crate::state::ComAmazonawsRedshiftserverlessRedshiftserverlessState,
+    namespace_name: &str,
+) -> Option<String> {
+    state
+        .workgroup_names_in_namespace(namespace_name)
+        .next()
+        .map(str::to_string)
+}
+
+/// How this operation refuses a create for a namespace whose compute already exists: the
+/// modelled `ConflictException` at its own `@httpError` 409, worded by this service's own
+/// sentence for that conflict ([`crate::state::namespace_already_has_workgroup`]), which names
+/// the workgroup already associated with the namespace.
+fn namespace_already_has_workgroup(resident_workgroup_name: &str) -> CreateWorkgroupError {
+    CreateWorkgroupErrorModeled::ConflictException(ConflictException {
+        message: crate::state::namespace_already_has_workgroup(resident_workgroup_name),
+    })
+    .into()
+}
+
 /// How this operation refuses a `workgroupName` another workgroup already holds: the modelled
-/// `ConflictException`, worded from the name the request asked for.
+/// `ConflictException` at its own `@httpError` 409, worded by this service's own sentence for
+/// a taken workgroup name ([`crate::state::workgroup_already_exists`]) — the text a client
+/// reads to tell this conflict from the other conflicts this operation reports.
 fn name_already_taken(workgroup_name: &str) -> CreateWorkgroupError {
     CreateWorkgroupErrorModeled::ConflictException(ConflictException {
-        message: format!("a workgroup named {workgroup_name} already exists"),
+        message: crate::state::workgroup_already_exists(workgroup_name),
     })
     .into()
 }
 
 /// How this operation refuses a create that would take the account past its documented
 /// workgroup quota ([`crate::state::MAX_WORKGROUPS`]).
+///
+/// A backstop on the store rather than a refusal a caller can reach through this API: a
+/// namespace carries one workgroup and the account's namespace quota equals its workgroup
+/// quota, so the namespaces an account may hold take exactly that many workgroups between
+/// them and the create that would be the next one is refused as the namespace's own conflict
+/// first.
 fn quota_reached() -> CreateWorkgroupError {
     CreateWorkgroupErrorModeled::ValidationException(ValidationException {
         message: format!(

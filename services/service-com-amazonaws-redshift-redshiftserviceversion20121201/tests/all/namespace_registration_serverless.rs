@@ -210,9 +210,12 @@ async fn a_serverless_pair_that_resolves_is_registered_and_released() {
     let emulator = Emulator::with_serverless();
     let alpha_id = create_namespace(&emulator, "nsreg-live-alpha").await;
     create_workgroup(&emulator, "nsreg-live-alpha-wg", "nsreg-live-alpha").await;
-    create_workgroup(&emulator, "nsreg-live-alpha-wg-two", "nsreg-live-alpha").await;
     create_namespace(&emulator, "nsreg-live-beta").await;
     create_workgroup(&emulator, "nsreg-live-beta-wg", "nsreg-live-beta").await;
+    // A serverless namespace carries ONE workgroup in the control plane that owns it, so
+    // each namespace seeded here stands up its own.
+    let gamma_id = create_namespace(&emulator, "nsreg-live-gamma").await;
+    create_workgroup(&emulator, "nsreg-live-gamma-wg", "nsreg-live-gamma").await;
 
     let cases: Vec<ResolvedCase> = vec![
         (
@@ -226,14 +229,14 @@ async fn a_serverless_pair_that_resolves_is_registered_and_released() {
             "444455556666",
         ),
         (
-            "another workgroup of the same namespace",
-            serverless("nsreg-live-alpha", "nsreg-live-alpha-wg-two"),
-            CONSUMER,
-        ),
-        (
             "a second namespace, through its own workgroup",
             serverless("nsreg-live-beta", "nsreg-live-beta-wg"),
             "123456789012",
+        ),
+        (
+            "a third namespace, by the id its service minted, through its own workgroup",
+            serverless(&gamma_id, "nsreg-live-gamma-wg"),
+            CONSUMER,
         ),
     ];
 
