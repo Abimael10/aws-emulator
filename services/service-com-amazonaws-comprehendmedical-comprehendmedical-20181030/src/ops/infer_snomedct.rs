@@ -12,8 +12,9 @@
 //!
 //! Every concept list is read off the stretch of text it is reported on: an entity links
 //! what ITS written form names, and an attribute links what its OWN written form names
-//! (the qualifier value of a modifier, the body structure of a site), so no span is ever
-//! reported with another span's concepts.
+//! (the qualifier value of a modifier, the body structure of a site) and then the
+//! ontology's neighbours of that form, so no span's list is ever the list ranked for
+//! another span.
 //!
 //! No maintained crates.io crate ships a clinical-text model that can be loaded
 //! in-process without an external runtime, so the engine here is rule- and
@@ -107,18 +108,18 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 // The generic clinical-text pass, stated once for every ontology-linking operation of
 // this service. See the module docs of `infer_icd10_cm` for why it lives there.
 use crate::ops::infer_icd10_cm::{
-    age_spans, candidate_scores, character_offset, character_starts, cue_governs, cue_trait_names,
-    first_family_cues, is_count, lexicon_matches, span_confidence, span_ids, split_leading,
-    subtype_qualifier_tokens, term_confidence, tokenize, Span, Token, ACUITY_MODIFIERS,
-    ATTRIBUTE_WINDOW_TOKENS, CONCEPT_CANDIDATE_LIMIT, DIRECTION_MODIFIERS, FIRST_ID,
-    QUALITY_MODIFIERS, RELATIONSHIP_DISTANCE_PENALTY, WEIGHT_CUE, WEIGHT_MODIFIER, WEIGHT_PATTERN,
-    WEIGHT_RELATIONSHIP,
+    age_spans, candidate_likelihoods, character_offset, character_starts, concept_words,
+    cue_governs, cue_trait_names, first_family_cues, is_count, lexicon_matches, span_confidence,
+    span_ids, split_leading, subtype_qualifier_tokens, term_confidence, tokenize, words_match,
+    Span, Token, ACUITY_MODIFIERS, ATTRIBUTE_WINDOW_TOKENS, CONCEPT_CANDIDATE_LIMIT,
+    DIRECTION_MODIFIERS, FIRST_ID, QUALITY_MODIFIERS, RELATIONSHIP_DISTANCE_PENALTY, WEIGHT_CUE,
+    WEIGHT_MODIFIER, WEIGHT_PATTERN, WEIGHT_RELATIONSHIP,
 };
 
 /// The version of the model THIS operation's analysis came from, which is what the
@@ -979,8 +980,10 @@ const CONCEPTS_QUALIFIER_POSTERIOR: &[Concept] = &[Concept {
 /// its own right.
 ///
 /// A written form this table does not name is still reported as the attribute it is, with
-/// no concept list rather than a concept the ontology does not hold: the table is the
-/// ontology data this pass carries, never a fallback onto another span's concepts.
+/// no concept list rather than a concept the ontology does not hold: a row here is what
+/// LINKS a written form to the ontology, and [`attribute_candidates`] ranks the rest of a
+/// linked form's candidate list out of the ontology itself, never out of another span's
+/// list.
 const ATTRIBUTE_CONCEPTS: &[(&str, &[Concept])] = &[
     // The subtype qualifiers split off a condition's name.
     ("type 1", CONCEPTS_QUALIFIER_TYPE_1),
@@ -2435,41 +2438,130 @@ fn attribute_traits(
         .collect()
 }
 
-/// The candidate list of one stretch of text: the concepts ITS OWN ontology rows name,
-/// with nothing repeated and the whole list cut at [`CONCEPT_CANDIDATE_LIMIT`].
+/// Every concept this pass's ontology data holds, each code once, in the order the data
+/// declares them, with the words of its own description prepared for comparison.
 ///
-/// A concept list answers what the stretch of text it is reported on could refer to — an
-/// entity's "the SNOMED-CT concepts that the entity could refer to", an attribute's "the
-/// SNOMED-CT concepts specific to an attribute" — so no span's list is ever continued
-/// with another span's concepts: a qualifier of a condition reports the qualifier values
-/// it names, and the condition reports the disorders it names.
-fn candidate_list(own: &'static [Concept]) -> Vec<&'static Concept> {
-    let mut candidates: Vec<&'static Concept> = Vec::with_capacity(CONCEPT_CANDIDATE_LIMIT);
+/// This is the ontology a stretch of text is SEARCHED against when the data links its
+/// written form to a concept but holds fewer candidates for it than a candidate list
+/// reports: the concepts whose own description names the same thing are the rest of the
+/// list a client disambiguates between.
+///
+/// The set is this crate's own static tables, so it is built once per process and no
+/// request can grow it; each description's words are prepared here, once, rather than on
+/// every comparison, so searching it costs one walk of two prepared word lists per concept
+/// and allocates nothing.
+fn inventory() -> &'static [(&'static Concept, Vec<String>)] {
+    static INVENTORY: OnceLock<Vec<(&'static Concept, Vec<String>)>> = OnceLock::new();
+    INVENTORY.get_or_init(|| {
+        let mut seen: HashSet<&'static str> = HashSet::new();
+        TERMS
+            .iter()
+            .flat_map(|term| term.concepts.iter())
+            .chain(
+                ATTRIBUTE_CONCEPTS
+                    .iter()
+                    .flat_map(|(_, concepts)| concepts.iter()),
+            )
+            .filter(|concept| seen.insert(concept.code))
+            .map(|concept| (concept, concept_words(concept.description)))
+            .collect()
+    })
+}
+
+/// The candidate list of a stretch of text whose written form the ontology data LINKS to
+/// `own`: those concepts, as the data ranks them, each code once and cut at
+/// [`CONCEPT_CANDIDATE_LIMIT`].
+fn linked_candidates(own: &'static [Concept]) -> Vec<(&'static Concept, bool)> {
+    let mut candidates: Vec<(&'static Concept, bool)> = Vec::with_capacity(CONCEPT_CANDIDATE_LIMIT);
     for concept in own {
         if candidates.len() == CONCEPT_CANDIDATE_LIMIT {
             break;
         }
         if candidates
             .iter()
-            .any(|placed| placed.code == concept.code)
+            .any(|(placed, _)| placed.code == concept.code)
         {
             continue;
         }
-        candidates.push(concept);
+        candidates.push((concept, true));
     }
     candidates
 }
 
-/// The SNOMED CT concepts a mention is linked to, most likely first.
+/// The candidate list of an ATTRIBUTE written as `written`, whose written form the
+/// ontology data links to `own`.
 ///
-/// The modelled `SNOMEDCTConcept$Score` reports the likelihood of the match, so the
-/// mention's confidence is divided between the candidates it could refer to (see
-/// [`candidate_scores`]) and the list is strictly descending.
-fn concepts(candidates: &[&'static Concept], score: f32) -> Vec<SNOMEDCTConcept> {
+/// A concept list answers what the stretch of text it is reported on could refer to — an
+/// entity's "the SNOMED-CT concepts that the entity could refer to", an attribute's "the
+/// SNOMED-CT concepts specific to an attribute" — and it is the whole product of this
+/// operation, so an attribute reports the same ranked list of candidates to disambiguate
+/// between that an entity does: the concepts its own written form NAMES first, then the
+/// concepts of the ontology whose own description names the same thing, ranked by how well
+/// each one names that form ([`words_match`]) and cut at the shared candidate limit.
+///
+/// An attribute the ontology data links to nothing — a value a test produced, the unit it
+/// was measured in — reports no candidates at all: the search answers with the neighbours
+/// of a form the ontology NAMES, never with a concept for a form it does not hold. Nor is
+/// the ontology searched for a form the data already names a full list for: the search
+/// answers what the links leave unanswered, so it runs over the words of this one written
+/// form, prepared once, and only where the list is short of the candidate limit.
+///
+/// Which is why an ENTITY is linked and not searched ([`linked_candidates`]): a lexicon
+/// entry names a CONDITION, a test or a procedure, and the ontology data ranks for it the
+/// codes a clinician picks between for that mention — the list is authored, so searching
+/// would displace a ranking that is already the answer. An attribute's row names the ONE
+/// qualifier value its written form is, so everything after that first candidate can only
+/// come from the ontology itself. A written form the data ranks fewer candidates for than
+/// a list reports (a medication whose entry names a single ingredient concept, say) is
+/// reported with the list it ranks: which concepts a release holds for a form is the
+/// release's content, not a rule this pass can derive.
+fn attribute_candidates(written: &str, own: &'static [Concept]) -> Vec<(&'static Concept, bool)> {
+    let mut candidates = linked_candidates(own);
+    if candidates.is_empty() || candidates.len() == CONCEPT_CANDIDATE_LIMIT {
+        return candidates;
+    }
+    let words = concept_words(written);
+    let mut neighbours: Vec<(&'static Concept, f32)> = inventory()
+        .iter()
+        .filter(|(concept, _)| {
+            candidates
+                .iter()
+                .all(|(placed, _)| placed.code != concept.code)
+        })
+        .map(|(concept, description)| (*concept, words_match(&words, description)))
+        .filter(|(_, matched)| *matched > 0.0)
+        .collect();
+    // `sort_by` keeps the order the ontology data declares them in, so two concepts whose
+    // descriptions name the written form equally well are ranked as the data ranks them.
+    neighbours.sort_by(|left, right| right.1.total_cmp(&left.1));
+    for (concept, _) in neighbours {
+        if candidates.len() == CONCEPT_CANDIDATE_LIMIT {
+            break;
+        }
+        candidates.push((concept, false));
+    }
+    candidates
+}
+
+/// The SNOMED CT concepts the stretch of text written as `written` could refer to, as the
+/// candidates were ranked for it.
+///
+/// The modelled `SNOMEDCTConcept$Score` reports the likelihood of the match, so each
+/// candidate reports how well its own fully specified name names that written form (see
+/// [`candidate_likelihoods`]) and the list is strictly descending.
+fn concepts(
+    written: &str,
+    candidates: &[(&'static Concept, bool)],
+    score: f32,
+) -> Vec<SNOMEDCTConcept> {
+    let descriptions: Vec<(&str, bool)> = candidates
+        .iter()
+        .map(|(concept, linked)| (concept.description, *linked))
+        .collect();
     candidates
         .iter()
-        .zip(candidate_scores(score, candidates.len()))
-        .map(|(concept, candidate_score)| SNOMEDCTConcept {
+        .zip(candidate_likelihoods(score, written, &descriptions))
+        .map(|((concept, _), candidate_score)| SNOMEDCTConcept {
             code: Some(concept.code.to_string()),
             description: Some(concept.description.to_string()),
             score: Some(candidate_score),
@@ -2651,8 +2743,9 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
                 let part = &text[attribute.span.start..attribute.span.end];
                 let attribute_score = span_confidence(attribute.score, part);
                 // The concepts specific to THIS attribute: the ones its own written form
-                // names in the ontology, never the ones the entity it modifies names.
-                let candidates = candidate_list(attribute.concepts);
+                // names in the ontology, then the ontology's neighbours of that form —
+                // never the candidates ranked for the entity it modifies.
+                let candidates = attribute_candidates(part, attribute.concepts);
                 SNOMEDCTAttribute {
                     category: Some(attribute.category.to_string()),
                     r#type: Some(attribute.attribute_type.to_string()),
@@ -2666,7 +2759,7 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
                     traits: Some(attribute_traits(&tokens, &attribute.span, &family_cues)),
                     // Only an attribute some lexicon of this pass placed names a concept.
                     snomedct_concepts: (!candidates.is_empty())
-                        .then(|| concepts(&candidates, attribute_score)),
+                        .then(|| concepts(part, &candidates, attribute_score)),
                 }
             })
             .collect();
@@ -2680,7 +2773,11 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
             end_offset: Some(character_offset(&starts, entity.span.end)),
             attributes: Some(attributes),
             traits: Some(traits),
-            snomedct_concepts: Some(concepts(&candidate_list(entity_concepts), score)),
+            snomedct_concepts: Some(concepts(
+                entity.term.term,
+                &linked_candidates(entity_concepts),
+                score,
+            )),
         });
     }
     reported

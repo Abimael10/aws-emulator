@@ -7,8 +7,10 @@
 //!
 //! * a linked mention reports the candidates of ITS OWN concept family, most likely
 //!   first, as many as the ontology offers up to five, with strictly descending scores
-//!   that divide the mention's own confidence between them — so a client can page the
-//!   candidates for review and tell a confident match from a long-tail one;
+//!   none of which is more than the mention's own confidence — so a client can page the
+//!   candidates for review and tell a confident match from a long-tail one (what each
+//!   score itself answers is pinned by
+//!   `a_candidate_reports_how_well_its_own_description_names_the_span` below);
 //! * a qualifier written as part of a condition's name carries the qualifier-value
 //!   concept it names in its own right, and not the concepts of the mention it
 //!   qualifies;
@@ -18,14 +20,28 @@
 //! * a span the pass placed but the operation reports no entity for still takes its place
 //!   in the response-wide `Id` sequence, and the ids rise with the offsets of the spans
 //!   they number;
+//! * every ontology candidate's score answers how well ITS OWN description names the
+//!   written form it is reported on, never the rank the ontology gives it;
 //! * every operation reports the version of its own model, in the documented n.n.n form,
 //!   and `InferSNOMEDCT` reports the revision of the ontology it linked against.
+//!
+//! What the model fixes about a candidate's score is what it ANSWERS — "the level of
+//! confidence that Amazon Comprehend Medical has that the entity is accurately linked to"
+//! that concept — not a number, so the properties asserted here are the invariants that
+//! follow from it: the score is above zero and never above the span's own confidence, the
+//! list descends, it varies with the candidate's OWN description rather than with its
+//! rank, and a span the ontology holds neighbours for reports more than one candidate. The
+//! exact product the rows compute is this pass's own rule for reading a description's
+//! overlap, stated here so a scorer that answers by rank alone cannot pass; a later
+//! refinement of that rule is free to change the product, and only these invariants are
+//! what the service promises.
 //!
 //! Each table spans a CLASS of input — several concept families, all three ontologies,
 //! both polarities of each rule — rather than one note. Every request goes over the wire
 //! the service actually speaks (awsJson1_1, `POST /` with
 //! `X-Amz-Target: ComprehendMedical_20181030.<Operation>`).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -37,6 +53,13 @@ const TARGET_PREFIX: &str = "ComprehendMedical_20181030";
 /// The most candidates one mention reports, which is what the ontology-linking answers
 /// page for review.
 const CANDIDATE_LIMIT: usize = 5;
+
+/// The least share of a span's confidence a candidate the service's ontology data LINKS
+/// the span's written form to is reported with, whatever its own description says.
+const LINKED_CANDIDATE_FLOOR: f64 = 0.2;
+
+/// How far two floats this suite computes the same value in different ways may differ.
+const TOLERANCE: f64 = 1.0e-4;
 
 /// A router carrying only this service, over its own engine.
 fn router() -> MultiServiceRouter {
@@ -108,8 +131,8 @@ fn score(span: &Value, member: &str) -> f64 {
 }
 
 /// Assert `list` is a ranked candidate list of the mention `span`: at least `least`
-/// candidates and never more than the limit, strictly descending scores in (0, 1), and
-/// the mention's own confidence divided between them.
+/// candidates and never more than the limit, strictly descending scores in (0, 1), and no
+/// candidate reported as a likelier match than the span's own detection is confident.
 fn assert_ranked_candidates(case: &str, span: &Value, list: &[Value], least: usize) {
     assert!(
         list.len() >= least && list.len() <= CANDIDATE_LIMIT,
@@ -126,12 +149,14 @@ fn assert_ranked_candidates(case: &str, span: &Value, list: &[Value], least: usi
         scores.windows(2).all(|pair| pair[0] > pair[1]),
         "case {case:?}: the candidates are ranked most likely first, got {scores:?}"
     );
-    let total: f64 = scores.iter().sum();
+    // A candidate's score reports the likelihood of THAT match, so it is bounded by how
+    // confident the detection of the span itself is: the ontology cannot be surer that the
+    // span refers to a concept than the pass is that the span is there at all.
     let confidence = score(span, "Score");
     assert!(
-        (total - confidence).abs() < 1.0e-4,
-        "case {case:?}: the candidates divide the mention's confidence {confidence} between \
-         them, got {total} from {scores:?}"
+        scores.iter().all(|value| *value <= confidence + TOLERANCE),
+        "case {case:?}: no candidate is likelier than the span's own confidence \
+         {confidence}, got {scores:?}"
     );
 }
 
@@ -327,17 +352,16 @@ async fn a_linked_mention_reports_the_ranked_candidates_of_its_own_family() {
     }
 }
 
-/// The candidates an ATTRIBUTE reports are the concepts its OWN written form names: the
-/// modelled `SNOMEDCTAttribute` carries "the SNOMED-CT concepts specific to an
-/// attribute", while the entity's list answers what the ENTITY could refer to — so a
-/// qualifier split off a condition's name reports the qualifier values it names and none
-/// of the disorders its entity reports.
+/// The candidates an ATTRIBUTE reports are ranked for its OWN written form: the modelled
+/// `SNOMEDCTAttribute` carries "the SNOMED-CT concepts specific to an attribute", while
+/// the entity's list answers what the ENTITY could refer to — so a qualifier split off a
+/// condition's name LEADS with the qualifier value it names, not with the disorder its
+/// entity is ranked to.
 ///
 /// The rows span the subtype qualifiers (the digit and the roman-numeral spelling) and
-/// the acuity, quality and direction modifiers, so a handler that continued an
-/// attribute's list with its entity's concepts — which turns a qualifier into the
-/// disorder it qualifies — fails here, as does one that left a modifier's own concepts
-/// out.
+/// the acuity, quality and direction modifiers, so a handler that ranked an attribute's
+/// list for its entity's written form — which turns a qualifier into the disorder it
+/// qualifies — fails here, as does one that left a modifier's own concepts out.
 #[tokio::test]
 async fn an_attribute_reports_the_concepts_its_own_text_names() {
     let router = router();
@@ -441,9 +465,22 @@ async fn an_attribute_reports_the_concepts_its_own_text_names() {
             .map(|concept| concept["Code"].as_str().unwrap_or_default().to_string())
             .collect();
         assert!(
-            reported.iter().all(|code| !entity_codes.contains(code)),
-            "case {case:?}: an attribute reports none of the concepts of the entity it \
-             modifies {entity_codes:?}, got {reported:?}"
+            entity_codes.first().is_some_and(|first| first != code),
+            "case {case:?}: the two lists answer different questions, so the qualifier the \
+             attribute names is not what the entity is ranked to, got {entity_codes:?} and \
+             {reported:?}"
+        );
+        // The concept the attribute's own form NAMES leads its list, so a concept its
+        // entity is ranked to as well can only have been reached by searching the
+        // ontology: a later candidate, never the leading one.
+        assert!(
+            reported
+                .iter()
+                .enumerate()
+                .filter(|(_, reported_code)| entity_codes.contains(reported_code))
+                .all(|(rank, _)| rank > 0),
+            "case {case:?}: a concept the entity is also ranked to is a later candidate of \
+             the attribute, got {reported:?} against {entity_codes:?}"
         );
     }
 }
@@ -670,4 +707,326 @@ async fn every_operation_reports_the_version_of_its_own_model() {
         "case InferSNOMEDCT: the revision reports the release date of the ontology, got \
          {version_date:?}"
     );
+}
+
+/// The words a written form and an ontology description are compared by: the alphanumeric
+/// runs each is written in, lowercased, counted once.
+///
+/// The suite states the comparison itself rather than calling the service's own: an
+/// integration test reaches the crate over the wire, and a check that asked the
+/// implementation what it computes could not tell a per-candidate likelihood from a rank
+/// ladder. Stated here it is the independent expectation the rows are measured against.
+fn concept_words(text: &str) -> BTreeSet<String> {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// How well the ontology description `description` names the written form `written`:
+/// twice the words the two share over the number of words they carry together, which is 1
+/// for a description naming the written form and nothing else and 0 for one repeating
+/// none of its words.
+fn concept_match(written: &str, description: &str) -> f64 {
+    let written = concept_words(written);
+    let description = concept_words(description);
+    if written.is_empty() || description.is_empty() {
+        return 0.0;
+    }
+    let shared = written.intersection(&description).count();
+    2.0 * shared as f64 / (written.len() + description.len()) as f64
+}
+
+/// Which level of the answer a row reads its span off.
+#[derive(Debug, Clone, Copy)]
+enum Level {
+    Entity,
+    Attribute,
+}
+
+/// The entity or the attribute of `answer` written exactly as `written`, whichever `level`
+/// names.
+fn level_span(case: &str, answer: &Value, level: Level, written: &str) -> Value {
+    let found = entities(case, answer);
+    let spans: Vec<Value> = match level {
+        Level::Entity => found,
+        Level::Attribute => found.iter().flat_map(attributes).collect(),
+    };
+    spans
+        .into_iter()
+        .find(|span| span["Text"].as_str() == Some(written))
+        .unwrap_or_else(|| panic!("case {case:?}: expected the span {written:?}, got {answer}"))
+}
+
+/// One likelihood row: the operation, the text, the level the span is reported at, the
+/// span as written, the member its candidate list is carried under, and how many
+/// candidates the ontology offers for that form at least.
+type LikelihoodRow = (
+    &'static str,
+    &'static str,
+    Level,
+    &'static str,
+    &'static str,
+    usize,
+);
+
+/// A candidate's score is how well its OWN description names the written form it is
+/// reported on, carried by the confidence of that span.
+///
+/// Every modelled ontology concept's `Score` reports "the likelihood of the match", which
+/// is an answer about THAT candidate — so a handler whose candidate scores are a function
+/// of rank alone (the span's confidence split between its candidates, each successive one
+/// keeping a fixed share of the one in front of it) reports the same ladder for every span
+/// with the same number of candidates, and fails on every row here whose leading
+/// description names its span to anything but that one share.
+///
+/// The rows span the three ontologies, the entity and the attribute level, and leading
+/// descriptions that name their span exactly ("metformin"), nearly ("Diabetes mellitus
+/// (disorder)") and only in part ("Essential (primary) hypertension"). The attribute rows
+/// are also where the whole product of the operation shows: an attribute reports the same
+/// ranked list an entity does, so a list truncated to the one concept its written form
+/// names fails them.
+#[tokio::test]
+async fn a_candidate_reports_how_well_its_own_description_names_the_span() {
+    let router = router();
+    let rows: &[LikelihoodRow] = &[
+        (
+            "InferICD10CM",
+            "Patient has diabetes mellitus.",
+            Level::Entity,
+            "diabetes mellitus",
+            "ICD10CMConcepts",
+            5,
+        ),
+        (
+            "InferICD10CM",
+            "Patient has hypertension.",
+            Level::Entity,
+            "hypertension",
+            "ICD10CMConcepts",
+            5,
+        ),
+        (
+            "InferSNOMEDCT",
+            "Patient has diabetes mellitus.",
+            Level::Entity,
+            "diabetes mellitus",
+            "SNOMEDCTConcepts",
+            5,
+        ),
+        (
+            "InferSNOMEDCT",
+            "Patient has asthma.",
+            Level::Entity,
+            "asthma",
+            "SNOMEDCTConcepts",
+            3,
+        ),
+        (
+            "InferRxNorm",
+            "He takes metformin 500 mg orally twice daily.",
+            Level::Entity,
+            "metformin",
+            "RxNormConcepts",
+            1,
+        ),
+        (
+            "InferRxNorm",
+            "He takes insulin glargine 20 units nightly.",
+            Level::Entity,
+            "insulin glargine",
+            "RxNormConcepts",
+            2,
+        ),
+        (
+            "InferSNOMEDCT",
+            "Patient has type 2 diabetes mellitus.",
+            Level::Attribute,
+            "type 2",
+            "SNOMEDCTConcepts",
+            2,
+        ),
+        (
+            "InferSNOMEDCT",
+            "Chronic cough with wheezing.",
+            Level::Attribute,
+            "Chronic",
+            "SNOMEDCTConcepts",
+            2,
+        ),
+        (
+            "InferSNOMEDCT",
+            "Left lung pneumonia.",
+            Level::Attribute,
+            "lung",
+            "SNOMEDCTConcepts",
+            2,
+        ),
+    ];
+
+    for (operation, text, level, written, member, least) in rows {
+        let case = format!("{operation} {text:?} {written:?}");
+        let answer = infer(&router, operation, text).await;
+        let span = level_span(&case, &answer, *level, written);
+        let list = candidates(&case, &span, member);
+        assert!(
+            list.len() >= *least && list.len() <= CANDIDATE_LIMIT,
+            "case {case:?}: expected {least}..={CANDIDATE_LIMIT} candidates, got {} in {span}",
+            list.len()
+        );
+        let confidence = score(&span, "Score");
+        assert!(
+            confidence > 0.0 && confidence < 1.0,
+            "case {case:?}: a span reports a confidence in (0, 1), got {confidence}"
+        );
+
+        // Nothing ranks ahead of the leading candidate, so its score is exactly what its
+        // own description answers about this written form.
+        let description = list[0]["Description"].as_str().unwrap_or_default();
+        let named = concept_match(written, description);
+        let expected = confidence * named;
+        let reported = score(&list[0], "Score");
+        assert!(
+            (reported - expected).abs() < TOLERANCE,
+            "case {case:?}: the leading candidate {description:?} names {written:?} to \
+             {named}, so it is reported at {expected}, got {reported}"
+        );
+
+        let mut previous = f64::INFINITY;
+        for candidate in &list {
+            let description = candidate["Description"].as_str().unwrap_or_default();
+            let reported = score(candidate, "Score");
+            assert!(
+                reported > 0.0 && reported < previous,
+                "case {case:?}: the candidates are ranked most likely first, got {reported} \
+                 after {previous} in {span}"
+            );
+            let bound =
+                confidence * concept_match(written, description).max(LINKED_CANDIDATE_FLOOR);
+            assert!(
+                reported <= bound + TOLERANCE,
+                "case {case:?}: {description:?} is reported at {reported}, above what its \
+                 own description answers about {written:?} ({bound})"
+            );
+            previous = reported;
+        }
+    }
+}
+
+/// A candidate the ontology data LINKS the written form to is reported whatever its own
+/// description says: a mention written as an abbreviation, and a brand name linked to the
+/// ingredient it delivers, share no word with the concept's own name, and the match is
+/// still not reported as impossible.
+///
+/// The rows are the written forms whose description overlap is zero — abbreviations of a
+/// generic name, a brand name and the ingredient behind it — in both ontologies that carry
+/// them, so a handler scoring a candidate by description overlap ALONE would report zero
+/// for them and fails here.
+#[tokio::test]
+async fn a_linked_candidate_is_reported_whatever_its_description_says() {
+    let router = router();
+    // (operation, text, the mention, the member, the code whose description names the
+    // mention in other words). Sources: the RxNorm ingredient and brand concepts, and the
+    // SNOMED CT disorder hierarchy.
+    let rows: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            "InferRxNorm",
+            "He takes ASA 81 mg daily.",
+            "ASA",
+            "RxNormConcepts",
+            "1191",
+        ),
+        (
+            "InferRxNorm",
+            "He takes HCTZ 25 mg daily.",
+            "HCTZ",
+            "RxNormConcepts",
+            "5487",
+        ),
+        (
+            "InferRxNorm",
+            "He takes Tylenol 500 mg as needed.",
+            "Tylenol",
+            "RxNormConcepts",
+            "161",
+        ),
+    ];
+
+    for (operation, text, written, member, code) in rows {
+        let case = format!("{operation} {text:?} {written:?}");
+        let answer = infer(&router, operation, text).await;
+        let span = level_span(&case, &answer, Level::Entity, written);
+        let list = candidates(&case, &span, member);
+        let confidence = score(&span, "Score");
+        let linked = list
+            .iter()
+            .find(|candidate| candidate["Code"].as_str() == Some(*code))
+            .unwrap_or_else(|| panic!("case {case:?}: expected the concept {code}, got {span}"));
+        let description = linked["Description"].as_str().unwrap_or_default();
+        assert_eq!(
+            concept_match(written, description),
+            0.0,
+            "case {case:?}: this row exists for a description sharing no word with the \
+             mention, got {description:?}"
+        );
+        let reported = score(linked, "Score");
+        assert!(
+            reported > 0.0 && reported <= confidence * LINKED_CANDIDATE_FLOOR + TOLERANCE,
+            "case {case:?}: a linked candidate whose description names the mention in other \
+             words is still reported, at most at the linked share of the confidence \
+             {confidence}, got {reported} in {span}"
+        );
+    }
+}
+
+/// Of two candidates the ontology was SEARCHED for, the one whose description names the
+/// span more fully is ranked ahead — an ordering, asserted without restating what any
+/// score is, so a handler that ranked the searched candidates by anything but how well
+/// they name the span (the order its tables happen to declare them in, for instance) fails
+/// here.
+///
+/// The rows are the attribute forms the ontology data holds several neighbours for: a
+/// subtype qualifier, where one neighbour repeats both of the form's words and the other
+/// only one, and an acuity modifier, where both repeat its one word but one spells out
+/// less beside it. Sources: the qualifier-value, disorder and body-structure hierarchies of
+/// the SNOMED CT US edition, as this crate's ontology data carries them.
+#[tokio::test]
+async fn a_searched_candidate_that_names_the_span_more_fully_is_ranked_ahead() {
+    let router = router();
+    // (text, the attribute as written, the nearer neighbour, the further one)
+    let rows: &[(&str, &str, &str, &str)] = &[
+        (
+            // "Diabetes mellitus type 2 (disorder)" repeats both "type" and "2";
+            // "Type 1 (qualifier value)" repeats only "type".
+            "Patient has type 2 diabetes mellitus.",
+            "type 2",
+            "44054006",
+            "258194007",
+        ),
+        (
+            // Both name "chronic"; "Chronic kidney disease (disorder)" spells out less
+            // beside it than "Chronic obstructive lung disease (disorder)".
+            "Chronic cough with wheezing.",
+            "Chronic",
+            "709044004",
+            "13645005",
+        ),
+    ];
+
+    for (text, written, nearer, further) in rows {
+        let case = format!("InferSNOMEDCT {text:?} {written:?}");
+        let answer = infer(&router, "InferSNOMEDCT", text).await;
+        let span = level_span(&case, &answer, Level::Attribute, written);
+        let list = candidates(&case, &span, "SNOMEDCTConcepts");
+        let rank = |code: &str| {
+            list.iter()
+                .position(|candidate| candidate["Code"].as_str() == Some(code))
+        };
+        let (near, far) = (rank(nearer), rank(further));
+        assert!(
+            near.is_some_and(|near| far.is_none_or(|far| near < far)),
+            "case {case:?}: {nearer} names {written:?} more fully than {further}, so it is \
+             ranked ahead of it, got {nearer} at {near:?} and {further} at {far:?} in {span}"
+        );
+    }
 }

@@ -104,3 +104,41 @@ Smithy citations: DetectPHI.Entities/ModelVersion required, Entity.Score Float "
 4. InferRxNorm: replay comprehendmedical-infer-rxnorm-medications step task#1. Entities[0] and Entities[1] come back with no RxNormConcepts member at all and with Ids restarted at 1 instead of continuing the response-wide numbering.
 5. InferSNOMEDCT: replay comprehendmedical-infer-snomedct-concepts step task#1. Attribute SNOMEDCTConcepts lists hold a single candidate instead of the recorded five, entity candidate codes differ, Entities[3] is reported with a different span/type/category, Entities[4] and Entities[5] are absent, and SNOMEDCTDetails.VersionDate is "2021-09-01".
 6. Re-replay all four fixtures after the fix: each must match the recorded body (entity set, attributes, full ranked concept lists and version metadata), not only the first one.
+
+## Resolution
+
+What the rule behind this report asked for is served; what the report asks for beyond a
+rule is recorded here as declined, so a later reader does not read this file as "the four
+fixtures match".
+
+Fixed. Every modelled ontology concept's `Score` reports the confidence that the span is
+accurately linked to THAT concept, so it is now read off how well the candidate's own
+description names the written form its candidates are linked by, bounded by the span's own
+confidence and by whether the ontology data links the form to it — not off the candidate's
+rank. The halving sequence (`candidate_scores`, a function of rank, count and confidence
+alone, normalised to sum to the span's confidence) is gone from all three linking passes.
+`SNOMEDCTAttribute$SNOMEDCTConcepts` is the same ranked list the entity member carries, so
+an attribute no longer reports the single qualifier value its written form names: the rest
+of its list is ranked out of the ontology this pass carries, and the member is never absent
+for a form the ontology names. Pinned by `tests/all/ontology_candidate_ranking.rs` and
+`tests/all/snomedct_attribute_concepts.rs`.
+
+Declined, with the reason each cannot be derived:
+
+* `DetectPHI` `$.Entities[*].Score` (cause 1) — the per-span float of a trained detector.
+  The spans, types, categories and `ModelVersion` already agree; the emulator reads each
+  span's confidence off the evidence that placed it and the extent of the form it spells
+  out. No modelled or documented rule fixes the float, and the replay withholds the
+  recorded ones.
+* The MEMBERSHIP of a candidate list, and the entities a recording carries that the
+  emulator does not (`$.Entities[*]`, `ICD10CMConcepts[*].Code`/`.Description`,
+  `SNOMEDCTConcepts[*].Code`/`.Description`) — the content of the CDC ICD-10-CM, NLM RxNorm
+  and SNOMED CT US Edition releases and of AWS's trained entity model. The emulator ranks
+  the ontology data it carries; adding a recorded code to a row would be a table entry
+  fitted to one recorded input.
+* `$.ModelVersion` and `$.SNOMEDCTDetails.VersionDate` — AWS's internal model release and
+  ontology revision strings, which the replay withholds and no model doc determines.
+  `Edition` "US" and `Language` "en" are the modelled values and agree.
+* The `Id` numbering of `InferRxNorm` — `Entity$Id`/`Attribute$Id` is modelled as "a
+  monotonically increasing id unique within this response rather than a global unique
+  identifier", which 1..n over the spans the response reports satisfies.

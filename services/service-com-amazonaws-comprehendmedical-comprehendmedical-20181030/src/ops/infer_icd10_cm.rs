@@ -175,13 +175,29 @@ pub(crate) const WEIGHT_RELATIONSHIP: f32 = 0.95;
 /// confidence: a modifier further from the mention is less likely to belong to it.
 pub(crate) const RELATIONSHIP_DISTANCE_PENALTY: f32 = 0.08;
 
-/// How much of the previous candidate's share of a mention the next candidate keeps.
+/// The least share of a span's confidence a candidate the pass's ontology data LINKS the
+/// span's written form to reports, whatever that candidate's own description says.
 ///
-/// The candidates of one mention are ordered most-likely-first and every modelled
-/// ontology concept's `Score` reports "the likelihood of the match", so the candidates
-/// divide the mention's confidence between them in this ratio — see
-/// [`candidate_scores`].
-pub(crate) const CONCEPT_RANK_DECAY: f32 = 0.5;
+/// A linked candidate is one the ontology data names FOR that written form, so the link
+/// itself is evidence for the match even where the concept's description repeats none of
+/// the form's words — an abbreviation, a brand name and the ingredient it delivers — and
+/// the match is never reported as impossible.
+pub(crate) const CONCEPT_LINK_FLOOR: f32 = 0.2;
+
+/// The share of its own description match a candidate found by SEARCHING the ontology's
+/// descriptions keeps.
+///
+/// Such a candidate shares words with the written form, but the pass's ontology data does
+/// not link the form to it: it is a neighbour of the mention in the ontology rather than a
+/// concept the mention names, which is weaker evidence than a link.
+pub(crate) const CONCEPT_SEARCH_SHARE: f32 = 0.2;
+
+/// How far below the candidate in front of it a candidate the ontology ranks later is
+/// reported when its own description matches the written form at least as well.
+///
+/// A candidate list is read as a ranking, so a candidate the ontology ranks later than
+/// another is never reported as the more likely of the two.
+pub(crate) const CONCEPT_RANK_MARGIN: f32 = 0.02;
 
 /// The most ontology candidates one entity reports.
 pub(crate) const CONCEPT_CANDIDATE_LIMIT: usize = 5;
@@ -228,13 +244,18 @@ pub(crate) const SUBTYPE_NUMERALS: &[&str] = &["i", "ii", "iii", "iv", "v"];
 /// The words a cue is written with in front of the mention it introduces.
 pub(crate) const CUE_FUNCTION_WORDS: &[&str] = &["of", "for", "with", "on", "a", "an", "the"];
 
+/// The alphanumeric runs `text` is written in — the parts of a written form, as the text
+/// itself separates them: what [`written_groups`] counts and [`concept_words`] collects,
+/// stated once so the two cannot drift on what a part of a written form is.
+fn written_runs(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|run| !run.is_empty())
+}
+
 /// The alphanumeric groups `matched` is written in — the parts of a written form, as the
 /// text itself separates them.
 pub(crate) fn written_groups(matched: &str) -> usize {
-    matched
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|group| !group.is_empty())
-        .count()
+    written_runs(matched).count()
 }
 
 /// The confidence of ONE detection whose evidence class weighs `base` and whose placed
@@ -264,28 +285,104 @@ pub(crate) fn raised(confidence: f32) -> f32 {
         .clamp(0.0, CONFIDENCE_CEILING)
 }
 
-/// The score each of the `count` ontology candidates of one mention reports, in rank
-/// order, for a mention whose own confidence is `confidence`.
+/// The words a written form and an ontology description are compared by: the alphanumeric
+/// runs each of them is written in, lowercased, sorted and counted once, so case,
+/// punctuation and a word repeated inside one description change nothing.
 ///
-/// Every modelled ontology concept's `Score` reports "the likelihood of the match", so a
-/// candidate's score answers how likely it is that the mention refers to THAT concept
-/// rather than to one of the others it could refer to: the mention's confidence is
-/// divided between its candidates, each successive one keeping [`CONCEPT_RANK_DECAY`] of
-/// the share in front of it. The list is therefore strictly descending, the whole list
-/// adds up to the mention's own confidence, and the leading candidate of a long list
-/// scores well below a mention the ontology leaves no choice about.
-pub(crate) fn candidate_scores(confidence: f32, count: usize) -> Vec<f32> {
-    let shares: Vec<f32> = (0..count)
-        .map(|rank| CONCEPT_RANK_DECAY.powi(i32::try_from(rank).unwrap_or(i32::MAX)))
-        .collect();
-    let total: f32 = shares.iter().sum();
-    if total <= 0.0 {
-        return vec![0.0; count];
+/// A caller that compares one written form against MANY descriptions prepares each side's
+/// words once and compares them with [`words_match`], so the cost of a comparison is the
+/// walk over two prepared lists rather than re-deriving them.
+pub(crate) fn concept_words(text: &str) -> Vec<String> {
+    let mut words: Vec<String> = written_runs(text).map(str::to_lowercase).collect();
+    words.sort_unstable();
+    words.dedup();
+    words
+}
+
+/// How well two sets of words, each already prepared by [`concept_words`], name the same
+/// thing, in 0..=1: twice the words they share over the number of words the two carry
+/// together.
+///
+/// Both lists are sorted and carry each word once, so the shared words are counted by
+/// walking the two in step — no allocation, and no scan of one list per word of the other.
+pub(crate) fn words_match(written: &[String], description: &[String]) -> f32 {
+    if written.is_empty() || description.is_empty() {
+        return 0.0;
     }
-    shares
-        .into_iter()
-        .map(|share| confidence * share / total)
-        .collect()
+    let mut shared = 0usize;
+    let mut left = written.iter();
+    let mut right = description.iter();
+    let mut next_left = left.next();
+    let mut next_right = right.next();
+    while let (Some(one), Some(other)) = (next_left, next_right) {
+        match one.cmp(other) {
+            std::cmp::Ordering::Equal => {
+                shared += 1;
+                next_left = left.next();
+                next_right = right.next();
+            }
+            std::cmp::Ordering::Less => next_left = left.next(),
+            std::cmp::Ordering::Greater => next_right = right.next(),
+        }
+    }
+    2.0 * shared as f32 / (written.len() + description.len()) as f32
+}
+
+/// How well the ontology description `description` names the written form `written`, in
+/// 0..=1.
+///
+/// The two are compared by the words they are written in (see [`words_match`]): the answer
+/// is 1 for a description that names the written form and nothing else, falls as the
+/// description spells out more that the mention does not say, and is 0 for one repeating
+/// none of the form's words.
+pub(crate) fn concept_match(written: &str, description: &str) -> f32 {
+    words_match(&concept_words(written), &concept_words(description))
+}
+
+/// The likelihood each ontology candidate of one span reports, in the order the ontology
+/// ranks them, for a span whose own written form is `written` and whose own confidence is
+/// `confidence`. Each candidate is its description and whether the pass's ontology data
+/// LINKS `written` to it.
+///
+/// `written` is the form the candidates are LINKED BY, which is the form the pass matched:
+/// for a mention that is the lexicon entry's own written form — the whole form, a subtype
+/// qualifier included, since that is what tells the subtype's codes from the unspecified
+/// ones even where the qualifier is reported as the entity's own attribute — and for an
+/// attribute it is the text the pass placed.
+///
+/// Every modelled ontology concept's `Score` reports "the likelihood of the match", which
+/// is an answer about THAT candidate: so a candidate's score is read off how well its own
+/// description names that written form ([`concept_match`]), carried by the confidence of
+/// the span itself and by whether the form is linked to it ([`CONCEPT_LINK_FLOOR`],
+/// [`CONCEPT_SEARCH_SHARE`]) — never off its rank, which says nothing about how well the
+/// candidate matches. A candidate the ontology ranks later is still never reported as the
+/// more likely of two ([`CONCEPT_RANK_MARGIN`]), so the list stays the ranking a client
+/// pages for review.
+///
+/// Every candidate therefore reports a likelihood above zero: a span the pass placed
+/// carries a confidence above zero, as does every share here — a linked candidate's by
+/// [`CONCEPT_LINK_FLOOR`], a searched one's because the search only reaches a concept
+/// whose description shares a word with the written form.
+pub(crate) fn candidate_likelihoods(
+    confidence: f32,
+    written: &str,
+    candidates: &[(&str, bool)],
+) -> Vec<f32> {
+    let confidence = confidence.clamp(0.0, CONFIDENCE_CEILING);
+    let mut ceiling = confidence;
+    let mut scores = Vec::with_capacity(candidates.len());
+    for (description, linked) in candidates {
+        let matched = concept_match(written, description);
+        let share = if *linked {
+            matched.max(CONCEPT_LINK_FLOOR)
+        } else {
+            matched * CONCEPT_SEARCH_SHARE
+        };
+        let score = (confidence * share).min(ceiling);
+        scores.push(score);
+        ceiling = score * (1.0 - CONCEPT_RANK_MARGIN);
+    }
+    scores
 }
 
 /// How many LEADING tokens of the normalized written form `term` are a subtype qualifier
@@ -2122,17 +2219,22 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
                         }
                     })
                     .collect();
-                // The candidates the mention could refer to, most likely first and cut at
-                // the candidate limit, each carrying its own share of the mention's
-                // confidence.
+                // The candidates the mention could refer to, as the ontology data ranks
+                // them for the written form they are LINKED BY — the lexicon entry's own
+                // form, qualifier included — and cut at the candidate limit, each
+                // reporting how well its own long description names that form.
                 let candidates: Vec<&Concept> = condition
                     .concepts
                     .iter()
                     .take(CONCEPT_CANDIDATE_LIMIT)
                     .collect();
+                let linked: Vec<(&str, bool)> = candidates
+                    .iter()
+                    .map(|concept| (concept.description, true))
+                    .collect();
                 let concepts = candidates
                     .iter()
-                    .zip(candidate_scores(score, candidates.len()))
+                    .zip(candidate_likelihoods(score, condition.term, &linked))
                     .map(|(concept, candidate_score)| ICD10CMConcept {
                         code: Some(concept.code.to_string()),
                         description: Some(concept.description.to_string()),

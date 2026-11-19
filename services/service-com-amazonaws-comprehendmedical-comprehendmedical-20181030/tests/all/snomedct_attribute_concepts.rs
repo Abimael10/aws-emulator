@@ -2,14 +2,14 @@
 
 //! End-to-end tests for the ATTRIBUTE-level ontology linking of `InferSNOMEDCT`.
 //!
-//! The rule under test: a concept list is read off the stretch of text it is reported on.
-//! The modelled `SNOMEDCTAttribute$SNOMEDCTConcepts` is "the SNOMED-CT concepts specific
-//! to an attribute", while `SNOMEDCTEntity$SNOMEDCTConcepts` is what the ENTITY could
-//! refer to — so an attribute reports the concepts ITS OWN written form names (the
-//! qualifier value of a modifier, the body structure of a site), never the concepts of the
-//! entity it modifies, and an attribute whose written form the ontology data this pass
-//! carries holds no row for reports no concept list at all rather than a borrowed or
-//! invented one.
+//! The rule under test: a concept list is ranked for the stretch of text it is reported
+//! on. The modelled `SNOMEDCTAttribute$SNOMEDCTConcepts` is "the SNOMED-CT concepts
+//! specific to an attribute", while `SNOMEDCTEntity$SNOMEDCTConcepts` is what the ENTITY
+//! could refer to — so an attribute LEADS with the concept its own written form names (the
+//! qualifier value of a modifier, the body structure of a site) and continues with the
+//! ontology's neighbours of that form, never with the list ranked for the entity it
+//! modifies, and an attribute whose written form the ontology data this pass carries holds
+//! no row for reports no concept list at all rather than a borrowed or invented one.
 //!
 //! Each table spans a CLASS of attribute rather than one document: every attribute type
 //! the pass can place, both polarities of the rule (a written form with an ontology row
@@ -105,8 +105,8 @@ fn concept_codes(span: &Value, member: &str) -> Vec<String> {
 /// concept id and fully specified name its own written form names.
 type LinkedAttribute = (&'static str, &'static str, &'static str, &'static str);
 
-/// An attribute reports the concepts its OWN written form names, and none of the concepts
-/// of the entity it modifies.
+/// An attribute LEADS with the concept its OWN written form names, and not with the
+/// concept the entity it modifies is ranked to.
 ///
 /// The rows cover every attribute type this pass links: the subtype qualifier it splits
 /// off a condition's name (digit and roman-numeral spelling), the acuity, quality and
@@ -205,17 +205,31 @@ async fn an_attribute_links_the_concepts_of_its_own_written_form() {
         );
         let entity_codes = concept_codes(&entity, "SNOMEDCTConcepts");
         assert!(
-            reported.iter().all(|code| !entity_codes.contains(code)),
-            "case {case:?}: an attribute reports none of the concepts of the entity it \
-             modifies {entity_codes:?}, got {reported:?}"
+            entity_codes.first().is_some_and(|leading| leading != code),
+            "case {case:?}: the two lists answer different questions, so the concept the \
+             attribute names is not what the entity is ranked to, got {entity_codes:?} and \
+             {reported:?}"
+        );
+        // A concept the ontology data LINKS the attribute's own written form to leads its
+        // list, so a concept the entity is ranked to as well can only ever have been
+        // reached by searching the ontology — a later candidate, never the leading one.
+        assert!(
+            reported
+                .iter()
+                .enumerate()
+                .filter(|(_, reported_code)| entity_codes.contains(reported_code))
+                .all(|(rank, _)| rank > 0),
+            "case {case:?}: the concept the attribute's own form names leads its list, so a \
+             concept its entity is also ranked to is a later candidate, got {reported:?} \
+             against {entity_codes:?}"
         );
 
         // Every concept of the list is a well-formed ontology row, the scores rank the
-        // candidates most likely first, and they divide the attribute's own confidence —
-        // the modelled `Score` of a concept reports "the likelihood of the match".
+        // candidates most likely first, and none of them reports a likelier match than the
+        // attribute's own detection is confident — the modelled `Score` of a concept
+        // reports "the likelihood of the match".
         let confidence = attribute["Score"].as_f64().unwrap_or_default();
         let mut previous = f64::INFINITY;
-        let mut total = 0.0;
         let mut seen = BTreeSet::new();
         for concept in attribute["SNOMEDCTConcepts"]
             .as_array()
@@ -248,14 +262,13 @@ async fn an_attribute_links_the_concepts_of_its_own_written_form() {
                 "case {case:?}: candidate scores descend, got {score} after {previous} in \
                  {attribute}"
             );
+            assert!(
+                score <= confidence + 1.0e-4,
+                "case {case:?}: no candidate is likelier than the attribute's own confidence \
+                 {confidence}, got {score} in {attribute}"
+            );
             previous = score;
-            total += score;
         }
-        assert!(
-            (total - confidence).abs() < 1.0e-4,
-            "case {case:?}: the candidates divide the attribute's confidence {confidence} \
-             between them, got {total}"
-        );
     }
 }
 
@@ -301,11 +314,11 @@ async fn an_attribute_the_ontology_does_not_name_reports_no_concepts() {
     }
 }
 
-/// Across a whole note, no attribute of any entity repeats a concept of the entity it
-/// modifies: the two lists answer different questions, so a handler that filled an
-/// attribute's list from its entity's fails here on every entity at once.
+/// Across a whole note, no attribute of any entity LEADS with the concept of the entity it
+/// modifies: the two lists answer different questions, so a handler that ranked an
+/// attribute's list for its entity's written form fails here on every entity at once.
 #[tokio::test]
-async fn no_attribute_of_a_note_borrows_its_entity_concepts() {
+async fn no_attribute_of_a_note_leads_with_its_entity_concept() {
     let router = router();
     let notes = [
         "Patient has type 2 diabetes mellitus with chronic kidney disease. \
@@ -326,8 +339,22 @@ async fn no_attribute_of_a_note_borrows_its_entity_concepts() {
             for attribute in attributes(&entity) {
                 let reported = concept_codes(&attribute, "SNOMEDCTConcepts");
                 assert!(
-                    reported.iter().all(|code| !entity_codes.contains(code)),
-                    "case {text:?}: the attribute {} reports a concept of its entity \
+                    reported.first().is_none_or(|leading| entity_codes
+                        .first()
+                        .is_none_or(|entity_leading| leading != entity_leading)),
+                    "case {text:?}: the attribute {} is ranked to the concept of its entity \
+                     {entity_codes:?}, got {reported:?}",
+                    attribute["Text"]
+                );
+                // Whatever the two lists share, the attribute's own form leads its list, so
+                // a concept of its entity is only ever a later candidate of it.
+                assert!(
+                    reported
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, code)| entity_codes.contains(code))
+                        .all(|(rank, _)| rank > 0),
+                    "case {text:?}: the attribute {} leads with a concept of its entity \
                      {entity_codes:?}, got {reported:?}",
                     attribute["Text"]
                 );
