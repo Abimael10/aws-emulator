@@ -3559,14 +3559,16 @@ fn wire_timestamp_of(instant: SystemTime) -> ::aws_smithy_types::DateTime {
 /// all, which is not true of any endpoint this service reports. Extend the table as
 /// published ids are cited.
 pub fn hosted_zone_id(region: &str, endpoint_domain: &str) -> String {
-    /// The published RDS hosted zone ids this emulator carries, as
+    /// The published hosted zone ids this emulator carries, as
     /// `(region, endpoint domain, hosted zone id)`, from the "Amazon Relational Database
-    /// Service (Amazon RDS)" row of "Service endpoints and quotas … hosted zone IDs"
-    /// (Amazon Route 53 Developer Guide, "Values that you specify when you create alias
-    /// resource record sets").
+    /// Service (Amazon RDS)" and "Amazon Neptune" rows of "Service endpoints and quotas …
+    /// hosted zone IDs" (Amazon Route 53 Developer Guide, "Values that you specify when you
+    /// create alias resource record sets"). One row per region AND domain, because the
+    /// control plane that owns the engine publishes its own zone for the region.
     const PUBLISHED: &[(&str, &str, &str)] = &[
         ("us-east-1", RDS_ENDPOINT_DOMAIN, "Z2R2ITUGPM61AM"),
         ("us-west-2", RDS_ENDPOINT_DOMAIN, "Z1PVIF0B656C1W"),
+        ("us-west-2", NEPTUNE_ENDPOINT_DOMAIN, "Z22EZDAJT6W257"),
     ];
 
     PUBLISHED
@@ -3807,12 +3809,14 @@ pub const DEFAULT_DOCDB_ANALYTICS_ENABLED: bool = false;
 /// any `CreateDBCluster` this front door serves supplies one.
 pub const DEFAULT_CUSTOM_DATA_GROUP_PRESENT: bool = false;
 
-/// `AutoMinorVersionUpgrade` for a cluster whose request named nothing:
-/// `CreateDBClusterMessage$AutoMinorVersionUpgrade` — "By default, minor engine upgrades
-/// are applied automatically." It is the control plane's default, so it holds for a
-/// cluster created through a sibling control plane whose own `CreateDBCluster` carries no
-/// such member too (`smithy_query(query="operation",operation="CreateDBCluster",model_path="services/service-com-amazonaws-docdb-amazonrdsv19/smithy-model/com-amazonaws-docdb-amazonrdsv19.json")`):
-/// the absent member leaves the default standing rather than turning it off.
+/// `AutoMinorVersionUpgrade` for a cluster whose request named nothing, for the engines the
+/// member applies to: `CreateDBClusterMessage$AutoMinorVersionUpgrade` — "By default, minor
+/// engine upgrades are applied automatically", "Valid for Cluster Type: Aurora DB clusters
+/// and Multi-AZ DB cluster".
+///
+/// Which engines take it is [`cluster_auto_minor_version_upgrade_default`]: a cluster of an
+/// engine whose own control plane neither publishes the member nor applies minor upgrades on
+/// its own is born with it OFF.
 pub const DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE: bool = true;
 
 /// The upgrade rollout order of an instance nothing configured one for:

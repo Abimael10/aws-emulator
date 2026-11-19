@@ -1074,15 +1074,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // What this call ANSWERS with: the cluster with every change written onto it, in the
         // status it carried when the call arrived. See the status block below for why that is
-        // the status the acknowledgement reports.
-        let db_cluster = store.cluster_to_wire(&record);
+        // the status the acknowledgement reports. The PROJECTION itself is taken further
+        // down, once the record is back in the store: the members a cluster reports from the
+        // records AROUND it — its members, its read replicas, its custom endpoints — are read
+        // through the store by the identifier the cluster has now, so a cluster projected
+        // while its own record is out of the store reports none of them.
+        let answered = record.clone();
 
         if changed && takes_the_cluster_out_of_service {
             // The cluster is out of service while this change is applied: RDS reports it
             // `modifying` from the next read on, and it settles back to `available` on its
             // own, until when no further modification is taken. The envelope this call
-            // answers with is projected ABOVE, from the cluster as it stands with the change
-            // written on it and the status it still carried: the modification's own
+            // answers with is projected from `answered` — the cluster as it stands with the
+            // change written on it and the status it still carried: the modification's own
             // transition is not in effect while the acknowledgement is written, which is
             // why the real service answers a modification with the status the cluster had.
             record.status = crate::state::DB_CLUSTER_STATUS_MODIFYING.to_string();
@@ -1097,6 +1101,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the listener a client is connected to stays the endpoint this cluster publishes,
         // whatever it is now called.
         store.move_cluster_engine_endpoint(&key, &renamed_key);
+        let db_cluster = store.cluster_to_wire(&answered);
 
         Ok(ModifyDBClusterOutput {
             db_cluster: Some(db_cluster),

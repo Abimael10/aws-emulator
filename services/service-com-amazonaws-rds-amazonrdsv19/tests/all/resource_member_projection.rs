@@ -82,9 +82,11 @@ const CLUSTER_CASES: &[ClusterCase] = &[
         // `CreateDBClusterMessage$MasterUsername` is "Not supported by Neptune", so the
         // control plane assigns the cluster's master user.
         master_username: Some("admin"),
-        // "By default, minor engine upgrades are applied automatically" — the control
-        // plane's default, which a request that cannot name the member leaves standing.
-        auto_minor_version_upgrade: "true",
+        // The graph control plane publishes no `AutoMinorVersionUpgrade` on its own
+        // `CreateDBCluster` and reports a cluster it created as not taking minor engine
+        // upgrades automatically, so the default of THAT engine is off
+        // (`state::cluster_auto_minor_version_upgrade_default`).
+        auto_minor_version_upgrade: "false",
         security_groups: &[],
     },
     ClusterCase {
@@ -96,7 +98,7 @@ const CLUSTER_CASES: &[ClusterCase] = &[
             ("VpcSecurityGroupIds.VpcSecurityGroupId.2", "sg-0a1b2c3d4e5f60722"),
         ],
         master_username: Some("admin"),
-        auto_minor_version_upgrade: "true",
+        auto_minor_version_upgrade: "false",
         security_groups: &["sg-0a1b2c3d4e5f60711", "sg-0a1b2c3d4e5f60722"],
     },
     ClusterCase {

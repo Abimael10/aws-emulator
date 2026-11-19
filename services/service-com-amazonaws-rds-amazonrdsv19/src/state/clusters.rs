@@ -479,14 +479,26 @@ impl DbClusterRecord {
         )
     }
 
-    /// The port a client connects to: the port the cluster's engine listener was assigned
-    /// where it has one, else the configured port.
+    /// The port the cluster's database engine listens on: the port its own engine listener
+    /// was assigned where it HAS one, else the configured port.
     ///
-    /// The core owns the port range the listener is bound in and takes no port from this
-    /// service (`vendor/server/src/listeners.rs`), so the configured port (what `Port` set,
-    /// which the record keeps) is what the cluster records and the port the listener landed
-    /// on is what it publishes; for a cluster with no listener the two are the same value.
+    /// The core owns the port range a listener is bound in and takes no port from this
+    /// service (`vendor/server/src/listeners.rs`), so for an engine whose native wire this
+    /// emulator speaks the configured port (what `Port` set, which the record keeps) is what
+    /// the cluster records and the port the listener landed on is what it publishes — an
+    /// engine endpoint whose port nothing answers on would be no endpoint at all.
+    ///
+    /// An engine whose data plane this emulator serves as an API
+    /// ([`engine_data_plane_is_an_api`]) has NO engine listener of its own: that plane is
+    /// addressed at the host the cluster publishes, on the endpoint the client is configured
+    /// with, and no socket of this process is the cluster's database engine. Such a cluster
+    /// therefore publishes the port its engine listens on — the one it was created with, the
+    /// engine's own default where the request named none — rather than the port this process
+    /// happens to be served on, which is a different number on every boot.
     pub fn published_port(&self) -> i32 {
+        if engine_data_plane_is_an_api(&self.engine) {
+            return self.port;
+        }
         self.served_endpoint
             .as_ref()
             .map_or(self.port, |served| served.port)

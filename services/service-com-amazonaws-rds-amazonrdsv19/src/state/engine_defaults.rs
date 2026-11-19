@@ -41,3 +41,29 @@ pub fn default_port(engine: &str) -> i32 {
         3306
     }
 }
+
+/// Whether a DB cluster of `engine` takes automatic minor engine upgrades when the request
+/// that made it named nothing.
+///
+/// `AutoMinorVersionUpgrade` is a property of the ENGINE's own control plane, so the default
+/// follows the engine rather than this front door:
+///
+/// * For the engines the member applies to — `CreateDBClusterMessage$AutoMinorVersionUpgrade`
+///   is "Valid for Cluster Type: Aurora DB clusters and Multi-AZ DB cluster" and "by default,
+///   minor engine upgrades are applied automatically" — a cluster takes them
+///   ([`DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE`]).
+/// * The graph control plane this door also serves publishes no such member on its own
+///   `CreateDBCluster` at all
+///   (`smithy_query(query="operation",operation="CreateDBCluster",model_path="services/service-com-amazonaws-neptune-amazonrdsv19/smithy-model/com-amazonaws-neptune-amazonrdsv19.json")`),
+///   and a cluster its front door creates does not take minor engine upgrades
+///   automatically, so one of that engine is born with the setting off.
+///
+/// It is the DEFAULT only: a request that names the member gets the value it asked for,
+/// whatever the engine, as does a cluster a later modification changes the setting on.
+pub fn cluster_auto_minor_version_upgrade_default(engine: &str) -> bool {
+    if engine.eq_ignore_ascii_case(NEPTUNE_ENGINE) {
+        false
+    } else {
+        DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE
+    }
+}

@@ -1024,9 +1024,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|_| multi_az_cluster),
             publicly_accessible: input.publicly_accessible,
             // `AutoMinorVersionUpgrade` is not a member of this operation either, so the
-            // restored cluster carries the control plane's own default, as a created cluster
-            // does.
-            auto_minor_version_upgrade: crate::state::DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE,
+            // restored cluster carries the default of its ENGINE's control plane, as a
+            // created cluster does
+            // ([`crate::state::cluster_auto_minor_version_upgrade_default`]).
+            auto_minor_version_upgrade: crate::state::cluster_auto_minor_version_upgrade_default(
+                &input.engine,
+            ),
             // `DeletionProtection` / `CopyTagsToSnapshot` /
             // `EnableIAMDatabaseAuthentication` / `EnablePerformanceInsights` each turn
             // something ON that the request asks for, so a cluster restored without them has

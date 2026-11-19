@@ -490,16 +490,24 @@ impl DbInstanceRecord {
         )
     }
 
-    /// The port a client connects to: the port the instance's engine listener was
-    /// assigned where it has one, else the configured port.
+    /// The port the instance's database engine listens on: the port its own engine listener
+    /// was assigned where it HAS one, else the configured port.
     ///
     /// The core owns the port range the listener is bound in and takes no port from this
     /// service (`vendor/server/src/listeners.rs`), so the configured port
     /// ([`Self::endpoint_port`], which `Port` and `DBPortNumber` set) is what the instance
-    /// records and the port the listener landed on is what it publishes — an endpoint whose
-    /// port nothing answers on would be no endpoint at all. For an instance with no
+    /// records and the port the listener landed on is what it publishes — an engine endpoint
+    /// whose port nothing answers on would be no endpoint at all. For an instance with no
     /// listener the two are the same value.
+    ///
+    /// An instance of an engine whose data plane this emulator serves as an API
+    /// ([`engine_data_plane_is_an_api`]) has no engine listener of its own, so it publishes
+    /// the port its engine listens on rather than the port this process is served on — the
+    /// same reading its cluster follows ([`DbClusterRecord::published_port`]).
     pub fn published_port(&self) -> i32 {
+        if engine_data_plane_is_an_api(&self.engine) {
+            return self.endpoint_port;
+        }
         self.served_endpoint
             .as_ref()
             .map_or(self.endpoint_port, |served| served.port)
