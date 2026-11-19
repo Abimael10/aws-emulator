@@ -40,6 +40,24 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
+//! ## Naming the request a response answers
+//!
+//! Every response AWS sends names the request it answered, in the response header this
+//! protocol reports that id in (`x-amzn-RequestId`) — on a success and on a failure alike,
+//! which is where an SDK reads a call's `ResponseMetadata.RequestId`. It is a property of
+//! the RESPONSE and of no modelled shape, so no handler can set it, and for THIS service
+//! that same id is the join key its audit surface is defined on — the `KmsRequestId` of a
+//! key's usage record and the `requestID` of the call's CloudTrail record are the one id
+//! the caller was answered under. Both halves are owned by the layers every call passes
+//! through, which this file wires and [`management_events`] states:
+//!
+//! * what an OPERATION answers — a success, a modelled error, a constraint refusal raised
+//!   while it was being served — is named by the audit layer
+//!   ([`management_events::KmsAudit::names_the_request`]);
+//! * what NO operation produced — a routing failure, a transport failure detected up
+//!   front, the pre-dispatch authentication refusal below — is named by the shared
+//!   definition wrapper ([`RequestIdEnvelopeDefinition::header_only`]).
+//!
 //! ## Credentials the account has withdrawn
 //!
 //! A long-term access key the account holds authenticates a request only while its stored
@@ -57,11 +75,15 @@
 //! `UpdateAccessKey` wrote — the same store this service's authorization reads its
 //! principal's documents from ([`crate::state::authorization`]).
 
+use service_common::query_error_envelope::RequestIdEnvelopeDefinition;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
+/// Every call this service serves, recorded as a management event of `kms.amazonaws.com`
+/// — and the ONE id each response names its request by.
+pub mod management_events;
 /// The response members this service renders that its model does not declare.
 pub mod recorded_response_members;
 /// Which members of this service a refusal states no value for, read from the model.
@@ -83,7 +105,13 @@ const UNUSABLE_CREDENTIAL_CODE: &str = "UnrecognizedClientException";
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with its three framework-level error renderers wrapped so a
+    /// response no operation produced still names the request it answers, and INSIDE that
+    /// the AUDITED routing table every request this service serves is resolved through
+    /// ([`management_events`]).
+    entry: RequestIdEnvelopeDefinition<
+        management_events::AuditedDefinition<crate::ServiceDefinition<Eng>>,
+    >,
     /// This service's wire protocol, built once: `override_protocol` borrows it from
     /// `&self` and must never build one per request.
     protocol: recorded_response_members::RecordedResponseJson,
@@ -101,8 +129,26 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        // The AUDITED table, built before the entry it is nested inside: every modelled
+        // operation, each constructed from this same shared engine and wrapped in the
+        // management-event recorder (see [`management_events`]).
+        let audited = management_events::audited_table(&engine);
         Self {
-            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            // The audited table is the INNERMOST wrapper, so every layer that resolves an
+            // operation for a request — the router, this service's own dispatch — reaches
+            // the audited operation, and no request can be served by a path that records
+            // nothing. Around it, the request-id report every response of this service
+            // carries, for the responses no operation produced: a routing failure, a
+            // transport failure detected up front, and the pre-dispatch authentication
+            // refusal below. What an OPERATION answers is named by the audit layer itself
+            // ([`management_events::KmsAudit::names_the_request`]), which is the one place
+            // that id and the id a usage record carries are the same value.
+            entry: RequestIdEnvelopeDefinition::header_only(
+                management_events::AuditedDefinition::new(
+                    crate::ServiceDefinition::new(Arc::clone(&engine)),
+                    audited,
+                ),
+            ),
             protocol: recorded_response_members::RecordedResponseJson::new(),
             engine,
             unusable_credential: UnusableCredential::stated_as(UNUSABLE_CREDENTIAL_CODE),

@@ -54,6 +54,7 @@ pub mod cloud_hsm;
 // re-exported here, so every `crate::state::…` path a handler uses is unchanged by
 // where the item lives.
 mod asymmetric;
+mod call_request_id;
 mod cryptography;
 mod ed25519ph;
 mod grants;
@@ -65,6 +66,7 @@ mod pagination;
 mod signatures;
 
 pub use asymmetric::*;
+pub use call_request_id::*;
 pub use cryptography::*;
 pub use grants::*;
 pub use import::*;
@@ -2229,10 +2231,14 @@ pub struct KeyUsage {
     pub operation: String,
     /// When it used the key.
     pub at: SystemTime,
-    /// "The CloudTrail event ID of the cryptographic operation": the identifier of
-    /// the CloudTrail event the call was recorded in, minted per call.
-    pub cloud_trail_event_id: String,
-    /// The id KMS gave the request that used the key, minted per call.
+    /// "The CloudTrail event ID of the cryptographic operation": the identifier of the
+    /// CloudTrail event the call WAS recorded in, named once that record exists
+    /// ([`ComAmazonawsKmsTrentserviceState::name_recorded_usage_event`]) — so it names an
+    /// event a lookup reports rather than an id of its own.
+    pub cloud_trail_event_id: Option<String>,
+    /// The id the response to the call that used the key named its request by — the one
+    /// value the caller's own `ResponseMetadata.RequestId` and this record share
+    /// ([`request_id_of_this_call`]).
     pub kms_request_id: String,
 }
 
@@ -2243,7 +2249,7 @@ impl KeyUsage {
         KeyLastUsageData {
             operation: Some(self.operation.clone()),
             timestamp: Some(date_time(self.at)),
-            cloud_trail_event_id: Some(self.cloud_trail_event_id.clone()),
+            cloud_trail_event_id: self.cloud_trail_event_id.clone(),
             kms_request_id: Some(self.kms_request_id.clone()),
         }
     }
@@ -2476,16 +2482,41 @@ impl Cmk {
     }
 
     /// Record that `operation` just used this key in a successful cryptographic
-    /// operation.
+    /// operation, as THIS SERVICE serving a call.
     ///
     /// "Returns usage information about the last successful cryptographic operation
     /// performed with a specified KMS key"
     /// (`smithy_query(query="doc",shape="GetKeyLastUsage")`), so what is reported is
     /// always the latest use the tracking has produced a record for, and only a call that
-    /// succeeded writes one: a refused call did not use the key. The CloudTrail event id
-    /// and the request id belong to the call that is being recorded, so each is minted
-    /// here rather than derived from the request.
+    /// succeeded writes one: a refused call did not use the key. The record is named by
+    /// the CALL it describes: its request id is the one the response to that call names
+    /// its request by ([`request_id_of_this_call`]) and its CloudTrail event id is named
+    /// once the record of the call exists
+    /// ([`ComAmazonawsKmsTrentserviceState::name_recorded_usage_event`]), so the three
+    /// surfaces a client joins — its own response, this record and event history — carry
+    /// one id each way rather than three ids of their own.
+    ///
+    /// A use another service's in-process call made has no response of this service to be
+    /// named by, so it states its own two ids
+    /// ([`ComAmazonawsKmsTrentserviceState::record_last_usage_of_service_call`]) instead of
+    /// reaching the served call's slot.
     pub fn record_last_usage(&mut self, operation: &str) {
+        // The CloudTrail event this call is recorded in does not exist yet: the record is
+        // written once the response that answers the call does, and this usage record is
+        // named from it then (see [`KeyUsage::cloud_trail_event_id`]).
+        self.record_last_usage_named(operation, crate::state::request_id_of_this_call(), None);
+    }
+
+    /// [`Self::record_last_usage`], with both ids of the call STATED rather than taken from
+    /// the call this service is serving — see
+    /// [`ComAmazonawsKmsTrentserviceState::record_last_usage_of_service_call`], the one
+    /// caller of this.
+    pub fn record_last_usage_named(
+        &mut self,
+        operation: &str,
+        kms_request_id: String,
+        cloud_trail_event_id: Option<String>,
+    ) {
         let now = SystemTime::now();
         // The FIRST use of a key is what starts the tracking recording it, and the
         // pipeline takes [`USAGE_TRACKING_LAG`] to come up: the instant its first record
@@ -2503,8 +2534,8 @@ impl Cmk {
         self.last_usage = Some(KeyUsage {
             operation: operation.to_string(),
             at: now,
-            cloud_trail_event_id: ::uuid::Uuid::new_v4().to_string(),
-            kms_request_id: ::uuid::Uuid::new_v4().to_string(),
+            cloud_trail_event_id,
+            kms_request_id,
         });
     }
 

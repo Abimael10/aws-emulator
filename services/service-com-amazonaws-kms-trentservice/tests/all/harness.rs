@@ -80,6 +80,25 @@ pub(crate) async fn call_as(
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
+    let response = respond(router, region, access_key_id, operation, body).await;
+    let status = response.status().as_u16();
+    let payload = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+    };
+    (status, payload)
+}
+
+/// [`call_as`], answering the response as the CLIENT receives it — status, headers and
+/// body — for a case about what a response reports beside its modelled members.
+pub(crate) async fn respond(
+    router: &MultiServiceRouter,
+    region: &str,
+    access_key_id: &str,
+    operation: &str,
+    body: &Value,
+) -> http::Response<bytes::Bytes> {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://kms.{region}.amazonaws.com/"))
@@ -98,14 +117,7 @@ pub(crate) async fn call_as(
         ))
         .expect("the request builds");
 
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, payload)
+    router.dispatch(request).await
 }
 
 /// Call one operation in [`REGION`], requiring success.

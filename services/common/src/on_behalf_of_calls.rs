@@ -66,11 +66,41 @@ pub struct OnBehalfOfCall {
 /// user agent it sent.
 ///
 /// `None` when the engine carries no event history, which records nothing.
+///
+/// The record is named by a request id of its own, because no id a client was answered
+/// under belongs to this call. A service that KNOWS the id the called service answered its
+/// in-process call under — because it goes on to report that id somewhere a caller can read
+/// it — states it through [`record_on_behalf_of_answered`] instead, so the two cannot name
+/// two different requests for one call.
 pub fn record_on_behalf_of<Eng: Send + Sync + 'static>(
     engine: &Eng,
     parts: &::http::request::Parts,
     call: OnBehalfOfCall,
     now: SystemTime,
+) -> Option<String> {
+    record_on_behalf_of_answered(
+        engine,
+        parts,
+        call,
+        now,
+        crate::query_error_envelope::new_request_id(),
+    )
+}
+
+/// [`record_on_behalf_of`], with `request_id` as the id the CALLED service answered this
+/// in-process call under — the record's `requestID`.
+///
+/// What a service reaches for when that id is reported somewhere else as well: the called
+/// service's own state may name the call by it (KMS's usage tracking reports the request id
+/// of the last cryptographic operation), and a reader joining the two surfaces has to find
+/// one request rather than two. Everything else — the identity resolution, `invokedBy`, the
+/// store and its bounds — is [`record_on_behalf_of`]'s.
+pub fn record_on_behalf_of_answered<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    parts: &::http::request::Parts,
+    call: OnBehalfOfCall,
+    now: SystemTime,
+    request_id: String,
 ) -> Option<String> {
     let log = management_event_log(engine)?;
     let caller = recorded_caller(parts);
@@ -121,12 +151,12 @@ pub fn record_on_behalf_of<Eng: Send + Sync + 'static>(
         error_code: None,
         error_message: None,
     };
-    // No id a client was answered under belongs to this call — the client's own response
-    // names the call the client made — so the record is named by an id of its own.
+    // The id the called service answered THIS call under — a client's own response names
+    // the call the client made, not this one.
     // The guard is BOUND rather than used as a temporary: a local is released before the
     // handle it borrows, which a temporary at the end of this block would not be.
     let mut recording = log.lock();
-    Some(recording.record(served, now))
+    Some(recording.record_answered(served, now, request_id))
 }
 
 /// The account's management-event log in the shared engine, or `None` for an engine that

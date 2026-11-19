@@ -61,7 +61,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use ::service_com_amazonaws_kms_trentservice::state as kms_store;
-use ::service_common::on_behalf_of_calls::{record_on_behalf_of, OnBehalfOfCall};
+use ::service_common::on_behalf_of_calls::{record_on_behalf_of_answered, OnBehalfOfCall};
+use ::service_common::query_error_envelope::new_request_id;
 
 use super::encryption::{
     relayed, KeyRefusal, QueueKey, DEFAULT_DATA_KEY_REUSE_PERIOD_SECONDS,
@@ -274,8 +275,8 @@ fn generate_data_key<Eng: Send + Sync + 'static>(
         return Ok(None);
     };
     let context = encryption_context(&key.queue_arn);
-    let sealed = {
-        let mut store = kms.lock();
+    let (key_id, sealed) = {
+        let store = kms.lock();
         let kms_store::KeyRef::Found(resolved) = store.resolve(region, &key.key_arn) else {
             // The key was resolved a moment ago by the authorization and is gone now, so
             // there is no key to generate a data key under: KMS's own sentence for an
@@ -299,12 +300,13 @@ fn generate_data_key<Eng: Send + Sync + 'static>(
                 "InvalidKeyUsageException",
             )));
         };
-        // The key was just used in a successful cryptographic operation, which is what
-        // `GetKeyLastUsage` reports for it.
-        store.record_last_usage(region, &key_id, GENERATE_DATA_KEY_OPERATION);
-        material
+        (key_id, material)
     };
-    record_kms_call(
+    // The call this service just made to KMS, recorded for the caller it was made for, and
+    // the use of the key it made — named by the ONE id that call was answered under, so the
+    // record in event history and the key's own usage record name one request.
+    let answered_as = new_request_id();
+    let recorded_as = record_kms_call(
         engine,
         ctx,
         region,
@@ -315,6 +317,16 @@ fn generate_data_key<Eng: Send + Sync + 'static>(
             "encryptionContext": {QUEUE_ENCRYPTION_CONTEXT_NAME: key.queue_arn},
         }),
         now,
+        answered_as.clone(),
+    );
+    // The key was used in a successful cryptographic operation, which is what
+    // `GetKeyLastUsage` reports for it.
+    kms.lock().record_last_usage_of_service_call(
+        region,
+        &key_id,
+        GENERATE_DATA_KEY_OPERATION,
+        answered_as,
+        recorded_as,
     );
     Ok(Some(MessageDataKey {
         key_arn: key.key_arn.clone(),
@@ -362,20 +374,17 @@ pub fn open_message_data_keys<Eng: Send + Sync + 'static>(
         }
         opened.push(&key.sealed);
         let context = encryption_context(&key.queue_arn);
-        let plaintext = {
-            let mut store = kms.lock();
+        let opened_key = {
+            let store = kms.lock();
             let kms_store::KeyRef::Found(resolved) = store.resolve(region, &key.key_arn) else {
                 continue;
             };
             let key_id = resolved.key_id.clone();
             let plaintext = kms_store::parse_envelope(&key.sealed)
                 .and_then(|envelope| kms_store::unseal(resolved, &envelope, Some(&context)));
-            if plaintext.is_some() {
-                store.record_last_usage(region, &key_id, DECRYPT_OPERATION);
-            }
-            plaintext
+            plaintext.map(|_| key_id)
         };
-        if plaintext.is_none() {
+        let Some(key_id) = opened_key else {
             // Not silent: a data key its own key cannot open is a store nothing produced,
             // and the receive goes on serving the messages it was allowed to serve.
             ::tracing::warn!(
@@ -384,8 +393,11 @@ pub fn open_message_data_keys<Eng: Send + Sync + 'static>(
                 "the data key of a message could not be opened by the queue's KMS key"
             );
             continue;
-        }
-        record_kms_call(
+        };
+        // One id for the call this service made to KMS: the record of it in event history
+        // and the key's own usage record name the same request (see [`generate_data_key`]).
+        let answered_as = new_request_id();
+        let recorded_as = record_kms_call(
             engine,
             ctx,
             region,
@@ -396,6 +408,14 @@ pub fn open_message_data_keys<Eng: Send + Sync + 'static>(
                 "encryptionContext": {QUEUE_ENCRYPTION_CONTEXT_NAME: key.queue_arn},
             }),
             now,
+            answered_as.clone(),
+        );
+        kms.lock().record_last_usage_of_service_call(
+            region,
+            &key_id,
+            DECRYPT_OPERATION,
+            answered_as,
+            recorded_as,
         );
     }
 }
@@ -463,7 +483,12 @@ fn live_data_keys<Eng: Send + Sync + 'static>(
         .collect()
 }
 
-/// Record one call this service made to KMS for the caller of `ctx`.
+/// Record one call this service made to KMS for the caller of `ctx`, answered under
+/// `answered_as`; answer the id of the event it was recorded in.
+///
+/// `answered_as` is the id KMS gave that in-process call, which this service also hands to
+/// the key's usage record, so event history and KMS's own usage tracking name ONE request
+/// for it.
 ///
 /// Best effort, like every recorder in this tree: an engine carrying no event history
 /// records nothing and the call it was made for is served exactly as it would be otherwise.
@@ -474,8 +499,9 @@ fn record_kms_call<Eng: Send + Sync + 'static>(
     operation: &str,
     request_parameters: ::serde_json::Value,
     now: SystemTime,
-) {
-    record_on_behalf_of(
+    answered_as: String,
+) -> Option<String> {
+    record_on_behalf_of_answered(
         engine,
         ctx.parts(),
         OnBehalfOfCall {
@@ -489,5 +515,6 @@ fn record_kms_call<Eng: Send + Sync + 'static>(
             response_elements: None,
         },
         now,
-    );
+        answered_as,
+    )
 }
