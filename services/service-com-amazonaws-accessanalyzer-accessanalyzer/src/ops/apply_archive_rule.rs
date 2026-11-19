@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ApplyArchiveRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ApplyArchiveRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ApplyArchiveRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Retroactively archives the findings an archive rule's criteria select: "Retroactively
+//! applies the archive rule to existing findings that meet the archive rule criteria".
+//!
+//! An apply changes no policy and derives no new finding. What it changes is the STATUS the
+//! analyzer reports for findings it has ALREADY reported: each finding the rule's stored
+//! `filter` selects keeps its id and everything it says about the access, with `status`
+//! `ARCHIVED` in place of `ACTIVE`, so `GetFinding`/`ListFindings` report the same finding
+//! archived rather than report it gone. The archive is recorded on the analyzer's own ledger
+//! of reported findings ([`crate::state::archive_reported_findings`]), which is where the
+//! rest of a finding's lifecycle lives, because which findings were archived is no more
+//! readable out of today's policies than which ones were reported.
+//!
+//! Which findings a rule selects is decided by the crate's ONE filter match
+//! ([`crate::state::finding_filter_criteria`]), the same one a findings listing reads its own
+//! `filter` with — so the findings a rule archives are exactly the findings a listing
+//! filtered by that rule's criteria reports.
+//!
+//! ## What this operation adds to it
+//!
+//! * `analyzerArn` must name a stored analyzer and `ruleName` one of THAT analyzer's archive
+//!   rules; either naming nothing is the modelled 404, rather than a success that applied no
+//!   rule.
+//! * The findings are the ones the analyzer reports right now, so the analysis it owes is
+//!   materialised first ([`crate::state::reconcile_reported_findings`]), exactly as a
+//!   listing materialises it: an access the account's policies no longer grant is resolved,
+//!   and a resolved finding is not archived.
+//! * Applying the same rule again archives nothing further, which is what makes a retry of
+//!   this `@idempotent` call indistinguishable from the first.
+//!
+//! An analyzer of the unused- or internal-access family reports no external access, so a
+//! rule applied to one selects nothing to archive and the call answers success having
+//! archived nothing — there is no finding of that family for this emulator to archive.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +95,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+// What bounds one call's analysis, shared with the findings listing so the two cannot
+// answer the same question differently.
+use crate::state::{Budget, Exhausted};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -168,18 +196,236 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ApplyArchiveRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ApplyArchiveRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ApplyArchiveRule"))
+        // A call that CHANGES what the analyzer reports leaves an audit record, the way
+        // every other state-changing operation of this service does: the record carries the
+        // presented access key id, the request target and the outcome, and nothing of the
+        // caller's own data ([`crate::state::audit`]). Which findings the criteria select is
+        // decided by the rule and the account's policies alone, so the caller's identity is
+        // read for the record and for nothing else.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::StoreUnavailable);
+            ApplyArchiveRuleErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+
+        // The analyzer and the rule it holds are read under this service's lock, which is
+        // RELEASED (the block ends here) before any other store is read or any analysis runs.
+        let (analyzer_arn, analyzer_created_at, filter) = {
+            let state = state.lock();
+
+            // Fixed text, the ARN the caller named in the modelled `resourceId`: every
+            // resource-scoped refusal in this service goes through `crate::state`'s
+            // constructors.
+            let analyzer = state.analyzer_by_arn(&input.analyzer_arn).ok_or_else(|| {
+                crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::NotFound);
+                ApplyArchiveRuleErrorModeled::ResourceNotFoundException(
+                    crate::state::analyzer_not_found(&input.analyzer_arn),
+                )
+            })?;
+
+            // An apply names an EXISTING rule of that analyzer: a rule name no create stored
+            // answers the modelled 404 rather than a success that applied nothing, which
+            // would tell a client its criteria had been applied to every finding.
+            let rule = analyzer
+                .archive_rules
+                .get(&input.rule_name)
+                .ok_or_else(|| {
+                    crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::NotFound);
+                    ApplyArchiveRuleErrorModeled::ResourceNotFoundException(
+                        crate::state::archive_rule_not_found(&input.rule_name),
+                    )
+                })?;
+
+            (
+                analyzer.arn.clone(),
+                analyzer.created_at,
+                rule.filter.clone(),
+            )
+        };
+
+        // The rule's criteria are read by the crate's ONE filter match, the same one a
+        // findings listing reads its own `filter` with, so this rule archives exactly the
+        // findings that listing reports for those criteria. A stored criterion naming no
+        // member of a finding can select no finding at all, so it is refused as the field
+        // validation it is rather than applied to nothing.
+        let criteria = crate::state::finding_filter_criteria(Some(&filter)).map_err(|refusal| {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
+            ApplyArchiveRuleErrorModeled::ValidationException(refusal)
+        })?;
+
+        // The zone of trust of an account analyzer is the account it monitors and the Region
+        // it monitors it in, both of which its own ARN names; the resources of that account
+        // are read out of the services that own them, each under its own lock and none of
+        // them held past the read.
+        let resources = crate::state::monitored_resources(&*self.engine, &analyzer_arn);
+
+        // Deriving the account's findings reads documents, allocates findings and copies
+        // strings, so it is CPU-bound: it runs on the blocking pool, the way `ListFindings`
+        // sends its own analysis there, under ONE budget of [`MAX_ANALYSIS_UNITS`] carried
+        // from the derivation into the match, with every store lock already released.
+        let analysis_arn = analyzer_arn.clone();
+        let derivation = ::tokio::task::spawn_blocking(move || {
+            let mut budget = Budget::new(MAX_ANALYSIS_UNITS);
+            crate::state::external_access_findings(
+                &analysis_arn,
+                analyzer_created_at,
+                &resources,
+                MAX_DERIVED_FINDINGS,
+                &mut budget,
+            )
+            .map(|findings| (findings, budget))
+        })
+        .await;
+        let (derived, mut budget) = match derivation {
+            Ok(Ok(derived)) => derived,
+            Ok(Err(exhausted)) => return Err(budget_refusal(Self::NAME, ctx, exhausted)),
+            Err(error) => return Err(analysis_fault(Self::NAME, ctx, &error)),
+        };
+
+        // The rule is applied to the findings the analyzer reports NOW, so the comparison of
+        // its last analysis with the account's policies as they are is materialised first,
+        // exactly as a listing materialises it: an access the policies no longer grant is
+        // resolved, and a resolved finding is not something an archive rule archives.
+        let reported = {
+            let mut state = state.lock();
+            let analyzer = state.analyzer_by_arn_mut(&analyzer_arn).ok_or_else(|| {
+                crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::NotFound);
+                ApplyArchiveRuleErrorModeled::ResourceNotFoundException(
+                    crate::state::analyzer_not_found(&input.analyzer_arn),
+                )
+            })?;
+            crate::state::reconcile_reported_findings(
+                &mut analyzer.reported_findings,
+                derived,
+                ::std::time::SystemTime::now(),
+            )
+        };
+
+        // Which findings the criteria select is the same findings-times-criteria work a
+        // listing charges to its budget, and it runs where that one runs.
+        let selected = ::tokio::task::spawn_blocking(move || {
+            let matching = crate::state::findings_matching_filter(reported, &criteria, &mut budget)?;
+            // Only the position each selected finding occupies in the analysis is kept: that
+            // key is what the analyzer's ledger records the archive against.
+            Ok::<_, Exhausted>(
+                matching
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect::<Vec<String>>(),
+            )
+        })
+        .await;
+        let selected = match selected {
+            Ok(Ok(selected)) => selected,
+            // The account's policies are analyzable, but selecting the findings this rule
+            // archives would cost more than this emulator spends on one call: refused,
+            // naming the member at fault, rather than archiving the first few.
+            Ok(Err(exhausted)) => return Err(budget_refusal(Self::NAME, ctx, exhausted)),
+            // A panic or a cancellation on the pool says nothing about the account's
+            // policies, so it is reported as the server fault it is rather than as an apply
+            // that archived nothing.
+            Err(error) => return Err(analysis_fault(Self::NAME, ctx, &error)),
+        };
+
+        // The archive itself: recorded on the analyzer's ledger, against the same derivation
+        // key the finding's id is derived from, so every later read of that finding — by id
+        // or in a listing — reports it archived. `clientToken` needs no idempotency record:
+        // the operation is `@idempotent` and applying the same rule again archives nothing
+        // further, so a retry is already indistinguishable from the first call.
+        let archived = {
+            let mut state = state.lock();
+            let analyzer = state.analyzer_by_arn_mut(&analyzer_arn).ok_or_else(|| {
+                crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::NotFound);
+                ApplyArchiveRuleErrorModeled::ResourceNotFoundException(
+                    crate::state::analyzer_not_found(&input.analyzer_arn),
+                )
+            })?;
+            crate::state::archive_reported_findings(
+                &mut analyzer.reported_findings,
+                selected,
+                ::std::time::SystemTime::now(),
+            )
+        };
+        ::tracing::info!(
+            operation = Self::NAME,
+            archived,
+            "archived the findings an archive rule's criteria select"
+        );
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::ArchiveRuleApplied,
+        );
+
+        Ok(ApplyArchiveRuleOutput)
     }
 }
+
+// ---------------------------------------------------------------------------
+// What a call that cannot be answered is refused with
+// ---------------------------------------------------------------------------
+
+/// The refusal for an analysis past one of this emulator's ceilings: the modelled
+/// `ValidationException`, naming the member a client narrows to get under it.
+///
+/// One constructor for both stages — deriving the analyzer's findings and selecting the ones
+/// the rule archives — so a refusal reads the same whichever of them ran out of budget.
+fn budget_refusal(
+    operation: &'static str,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    exhausted: Exhausted,
+) -> ApplyArchiveRuleError {
+    ::tracing::info!(
+        operation,
+        refusal = "budget",
+        "refused an archive-rule apply past this emulator's analysis ceiling"
+    );
+    crate::state::audit(operation, ctx, crate::state::AuditOutcome::ValidationRefused);
+    ApplyArchiveRuleErrorModeled::ValidationException(crate::state::field_validation_exception(
+        exhausted.member,
+        exhausted.detail,
+    ))
+    .into()
+}
+
+/// The refusal for an analysis that did not complete at all: a panic or a cancellation on
+/// the blocking pool says nothing about the account's policies, so it is the server fault it
+/// is rather than an apply reported as having archived the findings it never selected.
+fn analysis_fault(
+    operation: &'static str,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    error: &::tokio::task::JoinError,
+) -> ApplyArchiveRuleError {
+    ::tracing::error!(
+        operation,
+        error = %error,
+        "the external access analysis did not complete"
+    );
+    crate::state::audit(operation, ctx, crate::state::AuditOutcome::EvaluationFailed);
+    ApplyArchiveRuleErrorModeled::InternalServerException(InternalServerException {
+        message: "the external access analysis did not complete".to_string(),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+// ---------------------------------------------------------------------------
+// What one call of this operation may spend
+// ---------------------------------------------------------------------------
+
+/// How many findings this emulator will DERIVE while selecting the ones a rule archives.
+///
+/// A finding whose access is still granted is not stored, so every call re-derives it: this
+/// is the emulator's OWN ceiling on that work, the same one a findings listing applies to the
+/// whole account — the policy parser bounds each factor (document bytes, statements, element
+/// values) but not their PRODUCT, and it is the product that decides how many findings exist.
+const MAX_DERIVED_FINDINGS: usize = 1_000;
+
+/// How much work ONE call may spend: deriving the analyzer's findings AND matching them
+/// against the rule's criteria, under one ceiling.
+///
+/// A unit is one policy read, one statement visited, one principal considered, one string
+/// copied into a finding, or [`crate::state::FILTER_BYTES_PER_UNIT`] bytes compared by a
+/// criterion — so this bounds the allocation and the byte-level work of both stages in the
+/// PRODUCT of their factors rather than in each factor alone. The same ceiling `ListFindings`
+/// spends on the same two stages.
+const MAX_ANALYSIS_UNITS: u64 = 500_000;

@@ -45,6 +45,11 @@ pub use analyzed_trails::*;
 mod reported_findings;
 pub use reported_findings::*;
 
+/// Which findings a `filter` map selects — the ONE match a findings listing and an archive
+/// rule both read their criteria with, so the two cannot select differently.
+mod finding_filter;
+pub use finding_filter::*;
+
 use crate::ops::types::{
     AccessPreview, AccessPreviewStatusReason, AnalyzerConfiguration, AnalyzerSummary,
     ArchiveRuleSummary, CloudTrailProperties, Configuration, ConflictException, Criterion,
@@ -1959,6 +1964,8 @@ pub enum AuditOutcome {
     PolicyGenerationStarted,
     /// A running policy generation job was cancelled.
     PolicyGenerationCanceled,
+    /// An archive rule was applied to the findings its criteria select.
+    ArchiveRuleApplied,
     /// The request was refused as invalid (400).
     ValidationRefused,
     /// The caller may not perform the operation (403).
@@ -1988,6 +1995,7 @@ impl AuditOutcome {
             Self::ResourceScanStarted => "resource-scan-started",
             Self::PolicyGenerationStarted => "policy-generation-started",
             Self::PolicyGenerationCanceled => "policy-generation-canceled",
+            Self::ArchiveRuleApplied => "archive-rule-applied",
             Self::ValidationRefused => "validation-refused",
             Self::AccessDenied => "access-denied",
             Self::NotFound => "not-found",

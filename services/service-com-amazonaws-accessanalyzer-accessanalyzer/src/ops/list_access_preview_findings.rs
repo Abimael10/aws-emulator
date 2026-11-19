@@ -56,7 +56,9 @@
 //!   finding; `crate::state::proposed_policies` is the record of which configuration
 //!   members carry a policy at all.
 //! * Archive rules are not applied to preview findings, so a finding's `status` is never
-//!   `ARCHIVED` here (`ApplyArchiveRule` is itself still scaffolded).
+//!   `ARCHIVED` here: an apply archives findings an ANALYZER has reported
+//!   ([`crate::state::archive_reported_findings`]), and a preview's findings are derived
+//!   from a proposed configuration rather than reported by the analyzer.
 //! * A stored policy the shared parser cannot read is reported as ONE finding carrying
 //!   the modelled `error` member, never as "no external access": the analysis failed for
 //!   that document and says so.

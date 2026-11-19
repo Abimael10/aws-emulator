@@ -471,6 +471,603 @@ fn text(finding: &Value, name: &str) -> String {
         .to_string()
 }
 
+// ---------------------------------------------------------------------------
+// `ApplyArchiveRule`: which of the analyzer's findings a rule archives
+// ---------------------------------------------------------------------------
+
+/// The `FindingStatus` of a finding whose access is granted and which no archive rule has
+/// archived, from the model's `FindingStatus` enum ([`FINDING_STATUS_VALUES`], asserted
+/// against it below).
+const STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `FindingStatus` of a finding an archive rule has archived, from the same enum.
+const STATUS_ARCHIVED: &str = "ARCHIVED";
+
+/// The `FindingStatus` of a finding whose access the account's policies no longer grant.
+const STATUS_RESOLVED: &str = "RESOLVED";
+
+/// The condition key the fixture's organization-bound trust constrains its wildcard
+/// principal with, so a rule can select a finding by the condition it carries.
+const ORG_ID_CONDITION_KEY: &str = "aws:PrincipalOrgID";
+
+impl Emulator {
+    /// `PUT /analyzer/{analyzerName}/archive-rule`: create an archive rule carrying `filter`
+    /// on the analyzer `analyzer_name` names.
+    async fn create_archive_rule(
+        &self,
+        case: &str,
+        analyzer_name: &str,
+        rule_name: &str,
+        filter: Value,
+    ) -> Reply {
+        let reply = self
+            .send(
+                "PUT",
+                &format!("/analyzer/{analyzer_name}/archive-rule"),
+                Some(json!({"ruleName": rule_name, "filter": filter})),
+            )
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: CreateArchiveRule must succeed, got {reply:?}"
+        );
+        reply
+    }
+
+    /// `PUT /archive-rule`: apply the rule `rule_name` of the analyzer `analyzer_arn` names.
+    async fn apply_archive_rule(&self, analyzer_arn: &str, rule_name: &str) -> Reply {
+        self.apply(json!({"analyzerArn": analyzer_arn, "ruleName": rule_name}))
+            .await
+    }
+
+    /// `PUT /archive-rule` with the whole request body, for a case that carries a
+    /// `clientToken` or names something that does not exist.
+    async fn apply(&self, body: Value) -> Reply {
+        self.send("PUT", "/archive-rule", Some(body)).await
+    }
+}
+
+/// The resources every archive case analyzes, and the analyzer that reports them: one
+/// finding each, differing in the resource type, the principal form, `isPublic` and whether
+/// the statement carries a `Condition` — the finding members an archive rule's criteria read.
+struct ArchiveFixture {
+    /// The ARN of the analyzer the rules are applied to.
+    analyzer: String,
+    /// A role whose trust admits every principal: one public finding.
+    public_role: String,
+    /// A role trusting one external account.
+    peer_role: String,
+    /// A role whose wildcard principal is bound by a condition.
+    org_role: String,
+    /// A bucket whose bucket policy grants a second external account.
+    bucket: String,
+}
+
+/// The analyzer name every fixture creates; each case builds its own emulator, so the name
+/// and the resource names are the same in every one of them.
+const ARCHIVE_ANALYZER: &str = "archive-analyzer";
+
+/// The rule name every case applies.
+const ARCHIVE_RULE: &str = "archiveRule";
+
+impl ArchiveFixture {
+    /// Every resource ARN the analyzer reports a finding for, in the order a listing
+    /// sorted by resource reports them.
+    fn resources(&self) -> Vec<String> {
+        let mut resources = vec![
+            self.public_role.clone(),
+            self.peer_role.clone(),
+            self.org_role.clone(),
+            self.bucket.clone(),
+        ];
+        resources.sort();
+        resources
+    }
+}
+
+/// Create the fixture through each resource's OWN service, and answer what a rule's criteria
+/// can name.
+async fn archive_fixture(case: &str, emulator: &Emulator) -> ArchiveFixture {
+    let analyzer = emulator.analyzer(case, ARCHIVE_ANALYZER, "ACCOUNT").await;
+    let public_role = emulator
+        .create_role(case, "archive-public", &trust(json!("*")))
+        .await;
+    let peer_role = emulator
+        .create_role(
+            case,
+            "archive-peer",
+            &trust(json!({"AWS": format!("arn:aws:iam::{EXTERNAL_ACCOUNT}:root")})),
+        )
+        .await;
+    let org_role = emulator
+        .create_role(
+            case,
+            "archive-org",
+            &policy(
+                "Allow",
+                json!({"AWS": "*"}),
+                json!(ASSUME_ROLE),
+                None,
+                Some(json!({"StringEquals": {ORG_ID_CONDITION_KEY: "o-abc123"}})),
+            ),
+        )
+        .await;
+    let bucket = emulator
+        .create_bucket(
+            case,
+            "archive-bucket",
+            &policy(
+                "Allow",
+                json!({"AWS": OTHER_ACCOUNT}),
+                json!("s3:GetObject"),
+                Some("arn:aws:s3:::archive-bucket/*"),
+                None,
+            ),
+        )
+        .await;
+    ArchiveFixture {
+        analyzer,
+        public_role,
+        peer_role,
+        org_role,
+        bucket,
+    }
+}
+
+/// Every finding the analyzer reports, ordered by the resource it is about so two listings
+/// are compared row by row.
+async fn findings_by_resource(case: &str, emulator: &Emulator, analyzer: &str) -> Vec<Value> {
+    let listed = emulator
+        .list_findings(json!({"analyzerArn": analyzer}))
+        .await;
+    assert_eq!(
+        listed.status, 200,
+        "case {case:?}: ListFindings must succeed, got {listed:?}"
+    );
+    let mut findings = listed.findings();
+    findings.sort_by_key(|finding| text(finding, "resource"));
+    findings
+}
+
+/// One row of the archive table: the criteria a rule carries, and the resources whose
+/// findings it must archive.
+struct ArchiveCase {
+    case: &'static str,
+    /// Built from the fixture, so a criterion can name a stored resource's own ARN.
+    filter: fn(&ArchiveFixture) -> Value,
+    /// The resources whose findings the rule selects; every other finding stays active.
+    archived: fn(&ArchiveFixture) -> Vec<String>,
+}
+
+/// RULE: applying an archive rule archives exactly the findings the analyzer reports whose
+/// members satisfy that rule's stored `filter` — each keeping its id and everything it says
+/// about the access, with `status` `ARCHIVED` in place of `ACTIVE` — and leaves every other
+/// finding alone.
+///
+/// The rows span what the rule generalises over: which finding member a criterion reads (the
+/// resource, the resource type, `isPublic`, one principal, a condition key, the status), the
+/// operator it reads it with (`eq`, `neq`, `contains`, `exists`), how many criteria the
+/// filter holds (a conjunction), and how many findings the criteria select — all of them, a
+/// subset, exactly one, and none. The recorded case is the first row: one resource named by
+/// `eq`.
+#[tokio::test]
+async fn an_archive_rule_archives_the_findings_its_criteria_select() {
+    assert!(
+        [STATUS_ACTIVE, STATUS_ARCHIVED, STATUS_RESOLVED]
+            .iter()
+            .all(|status| FINDING_STATUS_VALUES.contains(status)),
+        "the statuses under test must be modelled FindingStatus values, got \
+         {FINDING_STATUS_VALUES:?}"
+    );
+
+    let cases: Vec<ArchiveCase> = vec![
+        ArchiveCase {
+            case: "the recorded shape: one resource named by eq",
+            filter: |fixture| json!({"resource": {"eq": [fixture.bucket]}}),
+            archived: |fixture| vec![fixture.bucket.clone()],
+        },
+        ArchiveCase {
+            case: "a resource type, which several findings share",
+            filter: |_| json!({"resourceType": {"eq": ["AWS::IAM::Role"]}}),
+            archived: |fixture| {
+                vec![
+                    fixture.public_role.clone(),
+                    fixture.peer_role.clone(),
+                    fixture.org_role.clone(),
+                ]
+            },
+        },
+        ArchiveCase {
+            case: "the public findings only",
+            filter: |_| json!({"isPublic": {"eq": ["true"]}}),
+            archived: |fixture| vec![fixture.public_role.clone()],
+        },
+        ArchiveCase {
+            case: "one principal, read at its principal type",
+            filter: |_| json!({"principal.AWS": {"eq": [EXTERNAL_ACCOUNT]}}),
+            archived: |fixture| vec![fixture.peer_role.clone()],
+        },
+        ArchiveCase {
+            case: "a substring of the resource, with contains",
+            filter: |_| json!({"resource": {"contains": ["archive-bucket"]}}),
+            archived: |fixture| vec![fixture.bucket.clone()],
+        },
+        ArchiveCase {
+            case: "every finding carrying a condition key",
+            filter: |_| {
+                let key = format!("condition.{ORG_ID_CONDITION_KEY}");
+                json!({key: {"exists": true}})
+            },
+            archived: |fixture| vec![fixture.org_role.clone()],
+        },
+        ArchiveCase {
+            case: "every finding but one resource type, with neq",
+            filter: |_| json!({"resourceType": {"neq": ["AWS::S3::Bucket"]}}),
+            archived: |fixture| {
+                vec![
+                    fixture.public_role.clone(),
+                    fixture.peer_role.clone(),
+                    fixture.org_role.clone(),
+                ]
+            },
+        },
+        ArchiveCase {
+            case: "two criteria are a conjunction",
+            filter: |_| {
+                json!({
+                    "resourceType": {"eq": ["AWS::IAM::Role"]},
+                    "isPublic": {"eq": ["true"]},
+                })
+            },
+            archived: |fixture| vec![fixture.public_role.clone()],
+        },
+        ArchiveCase {
+            case: "the status every reported finding carries, so the rule selects them all",
+            filter: |_| json!({"status": {"eq": [STATUS_ACTIVE]}}),
+            archived: |fixture| fixture.resources(),
+        },
+        ArchiveCase {
+            case: "criteria no finding of this analyzer satisfies",
+            filter: |_| json!({"resourceType": {"eq": ["AWS::SQS::Queue"]}}),
+            archived: |_| Vec::new(),
+        },
+    ];
+
+    for ArchiveCase {
+        case,
+        filter,
+        archived,
+    } in cases
+    {
+        // One emulator per row: an apply is recorded on the analyzer, so every row is
+        // applied to findings no earlier row has archived.
+        let emulator = Emulator::new();
+        let fixture = archive_fixture(case, &emulator).await;
+
+        let before = findings_by_resource(case, &emulator, &fixture.analyzer).await;
+        assert_eq!(
+            before
+                .iter()
+                .map(|finding| text(finding, "resource"))
+                .collect::<Vec<String>>(),
+            fixture.resources(),
+            "case {case:?}: the fixture must report one finding per resource, got {before:?}"
+        );
+        assert!(
+            before
+                .iter()
+                .all(|finding| text(finding, "status") == STATUS_ACTIVE),
+            "case {case:?}: every finding starts active, got {before:?}"
+        );
+
+        emulator
+            .create_archive_rule(case, ARCHIVE_ANALYZER, ARCHIVE_RULE, filter(&fixture))
+            .await;
+        let applied = emulator
+            .apply_archive_rule(&fixture.analyzer, ARCHIVE_RULE)
+            .await;
+        assert_eq!(
+            applied.status, 200,
+            "case {case:?}: ApplyArchiveRule must answer 200, got {applied:?}"
+        );
+        assert_eq!(
+            applied.body,
+            Value::Null,
+            "case {case:?}: the modelled Unit output carries no body, got {applied:?}"
+        );
+
+        let expected_archived = archived(&fixture);
+        let after = findings_by_resource(case, &emulator, &fixture.analyzer).await;
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "case {case:?}: an apply archives findings rather than removing them, got {after:?}"
+        );
+        for (was, now) in before.iter().zip(after.iter()) {
+            let resource = text(now, "resource");
+            let expected = if expected_archived.contains(&resource) {
+                STATUS_ARCHIVED
+            } else {
+                STATUS_ACTIVE
+            };
+            assert_eq!(
+                text(now, "status"),
+                expected,
+                "case {case:?}: expected {expected} for the finding about {resource:?}, got \
+                 {now:?}"
+            );
+            // Everything the finding says about the ACCESS is what the analysis derives, so
+            // an archive leaves all of it — and the finding's id above all — alone.
+            for member in [
+                "id",
+                "principal",
+                "action",
+                "resource",
+                "resourceType",
+                "isPublic",
+                "condition",
+                "sources",
+                "resourceOwnerAccount",
+                "createdAt",
+            ] {
+                assert_eq!(
+                    now.get(member),
+                    was.get(member),
+                    "case {case:?}: an archive must not change {member:?} of the finding \
+                     about {resource:?}, got {now:?} after {was:?}"
+                );
+            }
+            assert!(
+                crate::harness::timestamp_at_least(now.get("updatedAt"), now.get("createdAt")),
+                "case {case:?}: updatedAt must not precede createdAt for the finding about \
+                 {resource:?}, got {now:?}"
+            );
+            // The same finding, read by its own id: one status, whichever way it is read.
+            let id = text(now, "id");
+            let read = emulator.get_finding(&fixture.analyzer, &id).await;
+            assert_eq!(
+                read.member("finding"),
+                Some(now),
+                "case {case:?}: GetFinding must report the finding the listing reports for \
+                 {resource:?}, got {read:?}"
+            );
+        }
+
+        // And the status a filter reads is the status the analyzer reports, so a listing
+        // filtered by `ARCHIVED` reports exactly the findings the rule archived.
+        let archived_listing = emulator
+            .list_findings(json!({
+                "analyzerArn": fixture.analyzer,
+                "filter": {"status": {"eq": [STATUS_ARCHIVED]}},
+            }))
+            .await;
+        let mut selected: Vec<String> = archived_listing
+            .findings()
+            .iter()
+            .map(|finding| text(finding, "resource"))
+            .collect();
+        selected.sort();
+        let mut expected = expected_archived.clone();
+        expected.sort();
+        assert_eq!(
+            selected, expected,
+            "case {case:?}: a listing filtered by the archived status reports the findings \
+             the rule archived, got {archived_listing:?}"
+        );
+    }
+}
+
+/// RULE: applying the same rule again archives nothing further — the operation is
+/// `@idempotent`, so a retry (with or without its `clientToken`) answers success and reports
+/// the same findings, with the same statuses and the same instants.
+#[tokio::test]
+async fn applying_a_rule_again_archives_nothing_further() {
+    let case = "a replayed apply";
+    let emulator = Emulator::new();
+    let fixture = archive_fixture(case, &emulator).await;
+    emulator
+        .create_archive_rule(
+            case,
+            ARCHIVE_ANALYZER,
+            ARCHIVE_RULE,
+            json!({"resourceType": {"eq": ["AWS::S3::Bucket"]}}),
+        )
+        .await;
+
+    let first = emulator
+        .apply_archive_rule(&fixture.analyzer, ARCHIVE_RULE)
+        .await;
+    assert_eq!(
+        first.status, 200,
+        "case {case:?}: the first apply must succeed, got {first:?}"
+    );
+    let archived_once = findings_by_resource(case, &emulator, &fixture.analyzer).await;
+    assert_eq!(
+        archived_once
+            .iter()
+            .filter(|finding| text(finding, "status") == STATUS_ARCHIVED)
+            .map(|finding| text(finding, "resource"))
+            .collect::<Vec<String>>(),
+        vec![fixture.bucket.clone()],
+        "case {case:?}: the rule selects the bucket's finding, got {archived_once:?}"
+    );
+
+    // (what the retry carries) — an `@idempotencyToken` is optional, so both forms of the
+    // same retry are replayed.
+    let retries = [
+        (
+            "with a clientToken",
+            json!({
+                "analyzerArn": fixture.analyzer,
+                "ruleName": ARCHIVE_RULE,
+                "clientToken": "apply-token-1",
+            }),
+        ),
+        (
+            "without a clientToken",
+            json!({"analyzerArn": fixture.analyzer, "ruleName": ARCHIVE_RULE}),
+        ),
+    ];
+    for attempt in 1..=3 {
+        for (retry, body) in &retries {
+            let replayed = emulator.apply(body.clone()).await;
+            assert_eq!(
+                replayed.status, 200,
+                "case {retry:?} attempt {attempt}: a replayed apply must succeed, got \
+                 {replayed:?}"
+            );
+            let again = findings_by_resource(retry, &emulator, &fixture.analyzer).await;
+            assert_eq!(
+                again, archived_once,
+                "case {retry:?} attempt {attempt}: a replayed apply must report the same \
+                 findings, got {again:?} after {archived_once:?}"
+            );
+        }
+    }
+}
+
+/// RULE: an apply names an existing rule of an existing analyzer; either naming nothing is
+/// the modelled 404, and a refused apply archives nothing.
+///
+/// Rows differ along what does not exist: the analyzer, the rule, and a rule that exists on
+/// ANOTHER analyzer — a rule is scoped to the analyzer it was created under.
+#[tokio::test]
+async fn an_apply_that_names_no_rule_of_that_analyzer_is_refused_and_archives_nothing() {
+    let own = own_account();
+    let case = "refused applies";
+    let emulator = Emulator::new();
+    let fixture = archive_fixture(case, &emulator).await;
+    let other = emulator
+        .analyzer(case, "archive-other-analyzer", "ACCOUNT")
+        .await;
+    // A rule that would select every finding, created on the OTHER analyzer: applying it
+    // with this analyzer's ARN names no rule of this analyzer.
+    emulator
+        .create_archive_rule(
+            case,
+            "archive-other-analyzer",
+            "otherRule",
+            json!({"status": {"eq": [STATUS_ACTIVE]}}),
+        )
+        .await;
+    let missing = format!("arn:aws:access-analyzer:{REGION}:{own}:analyzer/never-created");
+
+    for (row, analyzer, rule, message) in [
+        (
+            "an analyzer this account never created",
+            missing.as_str(),
+            ARCHIVE_RULE,
+            "Analyzer not found",
+        ),
+        (
+            "a rule the analyzer does not hold",
+            fixture.analyzer.as_str(),
+            "neverCreated",
+            "Archive rule not found",
+        ),
+        (
+            "a rule of another analyzer",
+            fixture.analyzer.as_str(),
+            "otherRule",
+            "Archive rule not found",
+        ),
+    ] {
+        let reply = emulator.apply_archive_rule(analyzer, rule).await;
+        assert_eq!(
+            (reply.status, reply.code(), reply.message().as_str()),
+            (404, "ResourceNotFoundException", message),
+            "case {row:?}: expected HTTP 404 ResourceNotFoundException {message:?}, got \
+             {reply:?}"
+        );
+
+        // Nothing was archived by the refusal, on either analyzer.
+        for (whose, analyzer_arn) in [
+            ("the named analyzer", fixture.analyzer.as_str()),
+            ("the other analyzer", other.as_str()),
+        ] {
+            let findings = findings_by_resource(row, &emulator, analyzer_arn).await;
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| text(finding, "status") == STATUS_ACTIVE),
+                "case {row:?}: a refused apply must archive no finding of {whose}, got \
+                 {findings:?}"
+            );
+        }
+    }
+}
+
+/// RULE: an archive is a statement about the FINDING, not about the grant — so a finding the
+/// account's policies no longer grant is reported resolved whether or not a rule archived it,
+/// and it is archived again once the access it reports is granted again, because the rule
+/// that selected it still holds.
+#[tokio::test]
+async fn an_archived_finding_resolves_when_its_access_is_removed() {
+    let own = own_account();
+    let case = "an archived finding's lifecycle";
+    let emulator = Emulator::new();
+    let analyzer = emulator
+        .analyzer(case, "archive-lifecycle-analyzer", "ACCOUNT")
+        .await;
+    let external = trust(json!({"AWS": format!("arn:aws:iam::{EXTERNAL_ACCOUNT}:root")}));
+    emulator
+        .create_role(case, "archive-lifecycle-role", &external)
+        .await;
+
+    let reported = findings_by_resource(case, &emulator, &analyzer).await;
+    assert_eq!(
+        reported.len(),
+        1,
+        "case {case:?}: the trust grants one external account, got {reported:?}"
+    );
+    let id = text(&reported[0], "id");
+
+    emulator
+        .create_archive_rule(
+            case,
+            "archive-lifecycle-analyzer",
+            ARCHIVE_RULE,
+            json!({"principal.AWS": {"eq": [EXTERNAL_ACCOUNT]}}),
+        )
+        .await;
+    let applied = emulator.apply_archive_rule(&analyzer, ARCHIVE_RULE).await;
+    assert_eq!(
+        applied.status, 200,
+        "case {case:?}: the apply must succeed, got {applied:?}"
+    );
+
+    // (step, what the policy grants after it, the status the finding then carries)
+    let steps: [(&str, Option<&str>, &str); 3] = [
+        ("archived", None, STATUS_ARCHIVED),
+        ("the access removed", Some("own"), STATUS_RESOLVED),
+        ("the access granted again", Some("external"), STATUS_ARCHIVED),
+    ];
+    for (step, grant, expected) in steps {
+        if let Some(grant) = grant {
+            let document = match grant {
+                "own" => trust(json!({"AWS": format!("arn:aws:iam::{own}:root")})),
+                _ => external.clone(),
+            };
+            emulator
+                .update_trust(step, "archive-lifecycle-role", &document)
+                .await;
+        }
+        let read = emulator.get_finding(&analyzer, &id).await;
+        let finding = read
+            .member("finding")
+            .unwrap_or_else(|| panic!("case {step:?}: expected a finding, got {read:?}"))
+            .clone();
+        assert_eq!(
+            (
+                text(&finding, "id").as_str(),
+                text(&finding, "status").as_str()
+            ),
+            (id.as_str(), expected),
+            "case {step:?}: expected the same finding with status {expected}, got {finding:?}"
+        );
+    }
+}
+
 /// RULE: the findings of an external access analyzer are the external access the account's
 /// own resource-based policies grant.
 ///

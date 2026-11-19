@@ -22,9 +22,10 @@
 //! The analysis itself is unchanged: [`super::external_access_findings`] derives every
 //! finding the account's stored policies grant, and a finding whose access is still granted
 //! is reported exactly as that analysis derives it. What the ledger contributes is the
-//! answer for an access that is NO LONGER granted — the resolved finding — and the two
-//! instants no policy can state: when the record was created, and when an analysis last
-//! moved it between granted and resolved.
+//! answer for an access that is NO LONGER granted — the resolved finding — the finding an
+//! archive rule has archived ([`archive_reported_findings`]), and the two instants no policy
+//! can state: when the record was created, and when an analysis last moved it between
+//! granted and resolved.
 //!
 //! ## When it is written
 //!
@@ -50,6 +51,13 @@ use crate::ops::types::FindingSummary;
 /// The `FindingStatus` of a finding whose access the account's policies no longer grant, from
 /// the model's [`crate::ops::types::FINDING_STATUS_VALUES`].
 pub const FINDING_STATUS_RESOLVED: &str = "RESOLVED";
+
+/// The `FindingStatus` of a finding an archive rule has archived, from the same enum.
+///
+/// An archived finding is not gone and not resolved: the access it reports is still granted,
+/// and the analyzer has been told to stop treating it as something to act on — so it keeps
+/// its id and everything it says about the access, with this status in place of `ACTIVE`.
+pub const FINDING_STATUS_ARCHIVED: &str = "ARCHIVED";
 
 /// How many RESOLVED findings one analyzer's ledger keeps.
 ///
@@ -79,6 +87,14 @@ pub struct ReportedFinding {
     /// stopped (or started again) being granted, which is only observable by comparing an
     /// analysis with the one before it.
     pub changed_at: Option<SystemTime>,
+    /// The instant an archive rule archived this finding, and `None` for a finding no rule
+    /// has archived.
+    ///
+    /// Which findings are archived is no more readable out of today's policies than which
+    /// ones were reported: an archive rule archives the findings its criteria select, and
+    /// that decision outlives the call that made it — so it lives here, beside the rest of a
+    /// finding's lifecycle, and the analysis keeps deriving the access itself.
+    pub archived_at: Option<SystemTime>,
 }
 
 impl ReportedFinding {
@@ -89,15 +105,28 @@ impl ReportedFinding {
     /// of the analysis that resolved it as the instant the finding was analyzed and updated:
     /// that analysis is both what last looked at the resource and what last changed the
     /// finding.
+    ///
+    /// A finding an archive rule archived reports `ARCHIVED` instead of the `ACTIVE` the
+    /// analysis derives, with everything else it says about the access unchanged — the
+    /// archive is a statement about the FINDING, not about the grant. An access that is no
+    /// longer granted is reported resolved whether or not it was archived: the analyzer's
+    /// last word about a grant it can no longer find is that the grant is gone.
     pub fn reported(&self) -> FindingSummary {
         let mut finding = self.finding.clone();
-        if let Some(changed_at) = self.changed_at {
-            let at = ::aws_smithy_types::DateTime::from(changed_at);
-            finding.updated_at = at;
-            if !self.granted {
+        // An archive only speaks for a finding the analyzer still reports.
+        let archived_at = self.archived_at.filter(|_| self.granted);
+        // The finding was last updated by whichever came later: the analysis that moved it
+        // between granted and resolved, or the rule that archived it.
+        if let Some(updated_at) = [self.changed_at, archived_at].into_iter().flatten().max() {
+            finding.updated_at = ::aws_smithy_types::DateTime::from(updated_at);
+        }
+        if !self.granted {
+            if let Some(resolved_at) = self.changed_at {
                 finding.status = FINDING_STATUS_RESOLVED.to_string();
-                finding.analyzed_at = at;
+                finding.analyzed_at = ::aws_smithy_types::DateTime::from(resolved_at);
             }
+        } else if archived_at.is_some() {
+            finding.status = FINDING_STATUS_ARCHIVED.to_string();
         }
         finding
     }
@@ -145,6 +174,7 @@ pub fn reconcile_reported_findings(
                         finding,
                         granted: true,
                         changed_at: None,
+                        archived_at: None,
                     },
                 );
             }
@@ -166,6 +196,39 @@ pub fn reconcile_reported_findings(
         .iter()
         .map(|(key, record)| (key.clone(), record.reported()))
         .collect()
+}
+
+/// Record that an archive rule has archived the findings `keys` names — the derivation keys
+/// of the findings its criteria selected — as of `now`, and answer how many findings that
+/// archived.
+///
+/// What an apply changes is the STATUS the analyzer reports for a finding it already
+/// reported: the finding keeps its id and everything it says about the access, so the caller
+/// that reads it by that id is told it is archived rather than told it is gone. A key no
+/// record of this analyzer is about is left alone, so a rule selecting a finding of another
+/// analyzer archives nothing here.
+///
+/// Idempotent: a finding the rule already archived keeps the instant the first apply
+/// archived it, so applying the same rule twice reports the same finding both times. A
+/// finding whose access the account's policies no longer grant is not archived at all — it
+/// is `RESOLVED`, which is the analyzer's last word about a grant it can no longer find.
+pub fn archive_reported_findings(
+    reported: &mut BTreeMap<String, ReportedFinding>,
+    keys: impl IntoIterator<Item = String>,
+    now: SystemTime,
+) -> usize {
+    let mut archived = 0;
+    for key in keys {
+        let Some(record) = reported.get_mut(&key) else {
+            continue;
+        };
+        if !record.granted || record.archived_at.is_some() {
+            continue;
+        }
+        record.archived_at = Some(now);
+        archived += 1;
+    }
+    archived
 }
 
 /// Drop the least recently resolved records once an analyzer holds more than

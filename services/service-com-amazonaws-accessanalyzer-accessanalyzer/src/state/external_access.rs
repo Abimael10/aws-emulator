@@ -62,10 +62,10 @@ use crate::ops::types::{AnalyzedResource, Finding, FindingSource, FindingSummary
 /// reports is still granted: `ACTIVE`, the status of a finding no archive rule has archived.
 /// One of the model's [`crate::ops::types::FINDING_STATUS_VALUES`].
 ///
-/// `ARCHIVED` is what an archive rule produces (`ApplyArchiveRule` is itself still
-/// scaffolded, with an issue of its own) and `RESOLVED` what a finding whose access was
+/// `ARCHIVED` is what an archive rule produces ([`super::archive_reported_findings`], which
+/// is what an apply of a rule records) and `RESOLVED` what a finding whose access was
 /// removed carries: the analysis derives a finding only from a grant it can still read in a
-/// stored policy, so a resolved finding is reported from the analyzer's own record of the
+/// stored policy, so both are reported from the analyzer's own record of the
 /// finding it reported before ([`super::ReportedFinding`]) rather than from the policy.
 pub const FINDING_STATUS_ACTIVE: &str = "ACTIVE";
 
