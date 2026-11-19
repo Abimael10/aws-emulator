@@ -3718,9 +3718,11 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// later one over from the generation before it: that generation is frozen holding
     /// exactly the earlier periods, so a read of one of them still reports the item as
     /// it stood then, and this write opens a new generation at `now`. A write that names
-    /// no billing period to be applied from (`takes_effect_from` `None`) takes over
-    /// wherever the item applies, so it REPLACES the current generation and the item's
-    /// history is left as it was.
+    /// no billing period to be applied from (`takes_effect_from` `None`) is applied to
+    /// exactly the billing periods the generation in effect NOW holds — the periods
+    /// `updated` itself carries — so it REPLACES that one generation and takes no period
+    /// from any other: the frozen generations keep every period they hold, because such a
+    /// request names none of them.
     ///
     /// The kept history is bounded like every other store here, since a caller decides
     /// how many writes to make: past [`MAX_CUSTOM_LINE_ITEM_VERSIONS`] superseded
@@ -3741,11 +3743,24 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             )
         });
         if let Some((mut kept, mut replaced)) = previous {
-            // The billing periods this write takes over: the one it is applied from and
-            // every later one, which is every period at all when it names none.
-            let taken = BillingPeriodSpan::new(takes_effect_from.map(str::to_string), None);
-            for generation in kept.iter_mut().chain(std::iter::once(&mut replaced)) {
-                remove_billing_periods(&mut generation.spans, &taken);
+            match takes_effect_from {
+                // The billing periods a write APPLIED FROM a period takes over: that
+                // period and every later one. Whichever generation held one of them
+                // loses it and keeps the periods before the write, so the write's reach
+                // is BOUNDED by the period it is applied from.
+                Some(applied_from) => {
+                    let taken = BillingPeriodSpan::new(Some(applied_from.to_string()), None);
+                    for generation in kept.iter_mut().chain(std::iter::once(&mut replaced)) {
+                        remove_billing_periods(&mut generation.spans, &taken);
+                    }
+                }
+                // A write naming no billing period at all is applied to exactly the
+                // periods the generation in effect holds, which `updated` carries
+                // unchanged: that generation keeps none of them, and no other generation
+                // loses one — a request that named no billing period cannot take a
+                // period away from a generation already frozen holding it, so the
+                // earlier periods still report the item as it stood in them.
+                None => replaced.spans.clear(),
             }
             // A generation this write left no billing period to is not a version of the
             // item in any period, so there is nothing for a read to report it for.

@@ -7,7 +7,10 @@
 //! RULE: a write applied from a billing period on changes the item only for that period
 //! and the later ones — it opens a new version there — while every earlier billing period
 //! keeps the version that was in force in it, so a read scoped to a billing period
-//! reports the version in force in THAT period, whichever operation does the reading.
+//! reports the version in force in THAT period, whichever operation does the reading. A
+//! write that names NO billing period range is applied to exactly the periods the version
+//! in force now holds, so it takes no period from a version an earlier write already
+//! froze.
 //!
 //! The rows span what the rule generalises over rather than one recorded call: which
 //! member the update changes (`Name`, `Description`, the flat charge value, the
@@ -716,4 +719,318 @@ async fn a_write_naming_no_range_replaces_the_version_it_applies_in() {
         1,
         "case {case:?}: expected the item's one generation, got {reported:?}"
     );
+}
+
+/// One row of the no-range table: what the item is created as, the range-bearing writes
+/// that freeze a generation under it, the writes that name NO billing period range, and
+/// what every read then reports.
+struct NoRangeRow {
+    case: &'static str,
+    /// The `ChargeDetails` the item is CREATED with, which fix its charge kind.
+    create: Value,
+    /// The range-bearing update bodies, oldest first: each freezes the generation it
+    /// supersedes into the billing periods before the one it is applied from.
+    framed_writes: Vec<Value>,
+    /// The update bodies that name no `BillingPeriodRange` at all, in order.
+    no_range_writes: Vec<Value>,
+    /// The member path every probe compares, slash-separated.
+    path: &'static str,
+    /// `(the period read, the value at `path` the item reported for it carries)`, or
+    /// `None` where the read must report no item at all.
+    probes: Vec<(String, Option<Value>)>,
+    /// `(Name, StartBillingPeriod, EndBillingPeriod)` of every generation the history
+    /// must report, oldest first.
+    generations: Vec<(&'static str, String, Option<String>)>,
+    /// `(the offset of the billing period from the current one, the pro forma cost its
+    /// bill must carry)`, contiguous and ascending; empty for a row whose charge the cost
+    /// report prices from nothing the row sets up.
+    bills: Vec<(i64, f64)>,
+}
+
+/// THE RULE for a write that names NO billing period range: it is applied to exactly the
+/// billing periods the generation in effect holds, so it takes no period away from a
+/// generation an earlier write already froze — every such period still reports the item
+/// as it stood in it, the history still holds that generation, and the bill of that
+/// period still carries its charge.
+///
+/// The rows span what the rule generalises over rather than one recorded call: which
+/// member the no-range write changes (`Name`, `Description`, the flat charge value, the
+/// `LineItemFilters`, the percentage value), the charge kind of the item, whether the
+/// generation the write replaces is open-ended or bounded, how many no-range writes land
+/// (one, two), the spelling of the month the frozen generation ends at, and a no-range
+/// write that changes nothing at all.
+#[tokio::test]
+async fn a_write_naming_no_range_keeps_every_superseded_generation() {
+    let filter = line_item_filter("SERVICE", "EQUAL", "AWSCostExplorer");
+    let flat = json!({ "Type": "FEE", "Flat": { "ChargeValue": 10.0 } });
+    let rows: Vec<NoRangeRow> = vec![
+        NoRangeRow {
+            case: "the name, over one frozen generation",
+            create: flat.clone(),
+            framed_writes: vec![json!({
+                "Name": "second",
+                "ChargeDetails": { "Flat": { "ChargeValue": 20.0 } },
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(0) },
+            })],
+            no_range_writes: vec![json!({ "Name": "third" })],
+            path: "Name",
+            probes: vec![
+                (period(-2), None),
+                (period(-1), Some(json!("original"))),
+                (period(0), Some(json!("third"))),
+                (period(9), Some(json!("third"))),
+            ],
+            generations: vec![
+                ("original", period(-1), Some(period(0))),
+                ("third", period(0), None),
+            ],
+            bills: vec![(-1, 10.0), (0, 20.0), (1, 20.0)],
+        },
+        NoRangeRow {
+            case: "the description, over one frozen generation",
+            create: flat.clone(),
+            framed_writes: vec![json!({
+                "Name": "second",
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(0) },
+            })],
+            no_range_writes: vec![json!({ "Description": "a later description" })],
+            path: "Description",
+            probes: vec![
+                (period(-1), Some(json!("the original custom line item"))),
+                (period(0), Some(json!("a later description"))),
+                (period(31), Some(json!("a later description"))),
+            ],
+            generations: vec![
+                ("original", period(-1), Some(period(0))),
+                ("second", period(0), None),
+            ],
+            bills: vec![(-1, 10.0), (0, 10.0)],
+        },
+        NoRangeRow {
+            case: "the flat charge value, over a frozen generation and a bounded current one",
+            create: flat.clone(),
+            framed_writes: vec![json!({
+                "Name": "second",
+                "BillingPeriodRange": {
+                    "InclusiveStartBillingPeriod": period(0),
+                    "ExclusiveEndBillingPeriod": period(3),
+                },
+            })],
+            no_range_writes: vec![json!({ "ChargeDetails": { "Flat": { "ChargeValue": 55.0 } } })],
+            path: "ChargeDetails/Flat/ChargeValue",
+            probes: vec![
+                (period(-1), Some(json!(10.0))),
+                (period(0), Some(json!(55.0))),
+                (period(2), Some(json!(55.0))),
+                // The generation the no-range write replaced was bounded, and such a
+                // write claims no period beyond it.
+                (period(3), None),
+                (period(14), None),
+            ],
+            generations: vec![
+                ("original", period(-1), Some(period(0))),
+                ("second", period(0), Some(period(3))),
+            ],
+            bills: vec![(-1, 10.0), (0, 55.0), (1, 55.0), (2, 55.0), (3, 0.0)],
+        },
+        NoRangeRow {
+            case: "the line item filters, over one frozen generation",
+            create: flat.clone(),
+            framed_writes: vec![json!({
+                "Name": "second",
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(0) },
+            })],
+            no_range_writes: vec![json!({
+                "ChargeDetails": { "LineItemFilters": [filter.clone()] },
+            })],
+            path: "ChargeDetails/LineItemFilters",
+            probes: vec![
+                (period(-1), Some(Value::Null)),
+                (period(0), Some(json!([filter.clone()]))),
+            ],
+            generations: vec![
+                ("original", period(-1), Some(period(0))),
+                ("second", period(0), None),
+            ],
+            bills: vec![],
+        },
+        NoRangeRow {
+            case: "the percentage value of a percentage item, over one frozen generation",
+            create: json!({ "Type": "CREDIT", "Percentage": { "PercentageValue": 2.0 } }),
+            framed_writes: vec![json!({
+                "Name": "second",
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(0) },
+            })],
+            no_range_writes: vec![json!({
+                "ChargeDetails": { "Percentage": { "PercentageValue": 9.0 } },
+            })],
+            path: "ChargeDetails/Percentage/PercentageValue",
+            probes: vec![
+                (period(-1), Some(json!(2.0))),
+                (period(0), Some(json!(9.0))),
+                (period(6), Some(json!(9.0))),
+            ],
+            generations: vec![
+                ("original", period(-1), Some(period(0))),
+                ("second", period(0), None),
+            ],
+            bills: vec![],
+        },
+        NoRangeRow {
+            case: "two no-range writes in a row, over one frozen generation",
+            create: flat.clone(),
+            framed_writes: vec![json!({
+                "Name": "second",
+                "ChargeDetails": { "Flat": { "ChargeValue": 20.0 } },
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(0) },
+            })],
+            no_range_writes: vec![json!({ "Name": "third" }), json!({ "Name": "fourth" })],
+            path: "Name",
+            probes: vec![
+                (period(-1), Some(json!("original"))),
+                (period(0), Some(json!("fourth"))),
+                (period(23), Some(json!("fourth"))),
+            ],
+            generations: vec![
+                ("original", period(-1), Some(period(0))),
+                ("fourth", period(0), None),
+            ],
+            bills: vec![(-1, 10.0), (0, 20.0)],
+        },
+        NoRangeRow {
+            case: "a frozen generation ending at a month spelled without its leading zero",
+            create: flat.clone(),
+            framed_writes: vec![json!({
+                "Name": "second",
+                "BillingPeriodRange": {
+                    "InclusiveStartBillingPeriod": one_digit_month(&period(0)),
+                },
+            })],
+            no_range_writes: vec![json!({ "Description": "spelled either way" })],
+            path: "Description",
+            probes: vec![
+                (period(-1), Some(json!("the original custom line item"))),
+                (
+                    one_digit_month(&period(-1)),
+                    Some(json!("the original custom line item")),
+                ),
+                (period(0), Some(json!("spelled either way"))),
+                (
+                    one_digit_month(&period(0)),
+                    Some(json!("spelled either way")),
+                ),
+            ],
+            // Each bound is reported as the call that set it spelled it.
+            generations: vec![
+                ("original", period(-1), Some(one_digit_month(&period(0)))),
+                ("second", one_digit_month(&period(0)), None),
+            ],
+            bills: vec![(-1, 10.0), (0, 10.0)],
+        },
+        NoRangeRow {
+            case: "a no-range write that restates what the item already holds",
+            create: flat.clone(),
+            framed_writes: vec![json!({
+                "Name": "second",
+                "ChargeDetails": { "Flat": { "ChargeValue": 20.0 } },
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(0) },
+            })],
+            no_range_writes: vec![json!({ "Name": "second" })],
+            path: "Name",
+            probes: vec![
+                (period(-1), Some(json!("original"))),
+                (period(0), Some(json!("second"))),
+            ],
+            generations: vec![
+                ("original", period(-1), Some(period(0))),
+                ("second", period(0), None),
+            ],
+            bills: vec![(-1, 10.0), (0, 20.0)],
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let (emulator, group, item) =
+            fixture("original", json!({ "ChargeDetails": row.create })).await;
+        for write in row.framed_writes {
+            emulator.update_ok(case, &item, write).await;
+        }
+        for write in row.no_range_writes {
+            emulator.update_ok(case, &item, write).await;
+        }
+
+        for (probe, expected) in &row.probes {
+            let read = emulator.listed(case, &item, probe).await;
+            match expected {
+                Some(expected) => {
+                    let read = read.unwrap_or_else(|| {
+                        panic!("case {case:?}: expected the item to be reported for {probe}")
+                    });
+                    assert_eq!(
+                        at(&read, row.path),
+                        *expected,
+                        "case {case:?}: expected {probe} to report {expected} at {}, got {read}",
+                        row.path
+                    );
+                }
+                None => assert!(
+                    read.is_none(),
+                    "case {case:?}: expected no item at all for {probe}, got {read:?}"
+                ),
+            }
+        }
+
+        let reported = emulator.versions(case, &item).await;
+        assert_eq!(
+            reported.len(),
+            row.generations.len(),
+            "case {case:?}: expected {} generations, got {reported:?}",
+            row.generations.len()
+        );
+        for (version, (name, start, end)) in reported.iter().zip(&row.generations) {
+            assert_eq!(
+                at(version, "Name"),
+                json!(name),
+                "case {case:?}: expected the generation named {name:?}, got {version}"
+            );
+            assert_eq!(
+                at(version, "StartBillingPeriod"),
+                json!(start),
+                "case {case:?}: expected the {name:?} generation to start in {start}, got \
+                 {version}"
+            );
+            assert_eq!(
+                at(version, "EndBillingPeriod"),
+                end.as_ref().map_or(Value::Null, |end| json!(end)),
+                "case {case:?}: expected the {name:?} generation to end at {end:?}, got {version}"
+            );
+        }
+
+        if let (Some((first, _)), Some((last, _))) = (row.bills.first(), row.bills.last()) {
+            let reported = emulator
+                .proforma_by_period(case, &group, &period(*first), &period(last + 1))
+                .await;
+            assert_eq!(
+                reported.len(),
+                row.bills.len(),
+                "case {case:?}: expected one row per billing period, got {reported:?}"
+            );
+            for ((reported_period, proforma), (offset, expected_proforma)) in
+                reported.iter().zip(&row.bills)
+            {
+                let expected_period = period(*offset);
+                assert_eq!(
+                    reported_period.as_str(),
+                    expected_period.as_str(),
+                    "case {case:?}: expected the {expected_period} row, got {reported_period}"
+                );
+                assert!(
+                    (proforma - expected_proforma).abs() < TOLERANCE,
+                    "case {case:?}: expected the {expected_period} bill to be \
+                     {expected_proforma}, got {proforma}"
+                );
+            }
+        }
+    }
 }
