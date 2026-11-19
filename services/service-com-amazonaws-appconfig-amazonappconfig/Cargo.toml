@@ -64,6 +64,12 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # policy lets AppConfig assume it, and so whether the alarm can be monitored at all
 # (`state::alarm_monitors`).
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The Parameter Store a configuration profile whose `LocationUri` is
+# `ssm-parameter://<parameter name>` (or a parameter ARN) deploys its configuration from:
+# the content a reader of that deployed configuration serves is the named parameter
+# version's value, read through that service's own state accessors rather than from a
+# second copy of them here (`state::configuration_sources`).
+service-com-amazonaws-ssm-amazonssm = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

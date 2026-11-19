@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // block and the validators run after it. Nothing is written either way: this
         // operation reports a verdict about a configuration version, it does not change
         // one.
-        let (application_id, configuration_profile_id, validators, location_uri, content) = {
+        let (application_id, configuration_profile_id, validators, location_uri, hosted) = {
             let store = state.lock();
 
             // Each level of the path is addressed by the resource's id or by its name, the
@@ -195,28 +195,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input.configuration_profile_id,
                 ));
             };
-            // "The version of the configuration to validate", which names a hosted version
-            // by its version number or by its version label — resolved through the
-            // profile's own lookup, the one every reader of a configuration version uses.
-            // A profile whose configuration lives in S3, Parameter Store or Secrets
-            // Manager holds its bytes there, so this service has no document to check and
-            // answers the same way every other reader of bytes it does not hold does.
-            let Some(version) = profile.resolve_hosted_version(&input.configuration_version) else {
-                return Err(not_found(
-                    crate::state::configuration_version_not_hosted(
-                        &profile.id,
-                        &input.configuration_version,
-                    ),
-                    input.configuration_version,
-                ));
-            };
+            // "The version of the configuration to validate", which for a profile on the
+            // AppConfig hosted configuration store names a hosted version by its version
+            // number or by its version label — resolved through the profile's own lookup,
+            // the one every reader of a configuration version uses. A profile pointing at
+            // another store holds its versions THERE, so the document checked below is read
+            // out of that store instead, once this guard is released.
+            let hosted = profile
+                .resolve_hosted_version(&input.configuration_version)
+                .map(|version| profile.served_content(&version.content));
             (
                 profile.application_id.clone(),
                 profile.id.clone(),
                 profile.validators.clone(),
                 profile.location_uri.clone(),
-                profile.served_content(&version.content),
+                hosted,
             )
+        };
+
+        // WHICH STORE the version lives in is the profile's own `LocationUri`
+        // (`crate::state::configuration_sources`), so the hosted-store refusal answers only
+        // for a profile that uses the hosted store; a profile pointing elsewhere is checked
+        // against the content that source holds for the version, and reports the source it
+        // could not be read from when it holds no such version.
+        let external = !matches!(
+            crate::state::configuration_sources::source_of(&location_uri),
+            crate::state::configuration_sources::ConfigurationSource::Hosted
+        );
+        let content = if external {
+            match crate::state::configuration_sources::source_configuration(
+                &*self.engine,
+                &region,
+                &location_uri,
+                &input.configuration_version,
+            ) {
+                Ok(source) => source.content,
+                Err(unavailable) => {
+                    return Err(not_found(
+                        unavailable.refusal_message(
+                            &configuration_profile_id,
+                            &input.configuration_version,
+                            &location_uri,
+                        ),
+                        input.configuration_version,
+                    ))
+                }
+            }
+        } else {
+            let Some(hosted) = hosted else {
+                return Err(not_found(
+                    crate::state::configuration_version_not_hosted(
+                        &configuration_profile_id,
+                        &input.configuration_version,
+                    ),
+                    input.configuration_version,
+                ));
+            };
+            hosted
         };
 
         // "Uses the validators in a configuration profile to validate a configuration":

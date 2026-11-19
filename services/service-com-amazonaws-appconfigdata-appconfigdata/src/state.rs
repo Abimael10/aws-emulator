@@ -46,7 +46,7 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use ::service_com_amazonaws_appconfig_amazonappconfig::state::{
-    configuration_version_not_hosted, no_deployed_configuration,
+    configuration_sources, configuration_version_not_hosted, no_deployed_configuration,
     ComAmazonawsAppconfigAmazonappconfigState as AppConfigState, RolloutBucket,
 };
 
@@ -665,9 +665,11 @@ pub struct SessionBinding {
 /// lock, holds no other while it does, and hands back owned values — so it is called
 /// with NO guard of this service's own store held. Nothing is written: existence of a
 /// deployment record is not something the clock changes.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_deployed_triple<Eng: Send + Sync + 'static>(
     engine: &Eng,
     bindings: &NameBindings,
+    region: &str,
     application_identifier: &str,
     environment_identifier: &str,
     configuration_profile_identifier: &str,
@@ -711,7 +713,7 @@ pub fn resolve_deployed_triple<Eng: Send + Sync + 'static>(
     // What the triple has in force right now is what the session is bound to. A triple
     // that has been deployed into but has nothing in force binds no configuration, and
     // that is the one session a poll has nothing to serve for.
-    let configuration = served_in(
+    let pending = served_in(
         &store,
         &resolved,
         application_identifier,
@@ -720,8 +722,21 @@ pub fn resolve_deployed_triple<Eng: Send + Sync + 'static>(
         target,
         now,
     )
-    .and_then(Result::ok)
-    .map(Arc::new);
+    .and_then(Result::ok);
+    // The AppConfig guard is released before an EXTERNAL source is read, so the two stores
+    // are taken one at a time, never nested.
+    drop(store);
+    let configuration = pending
+        .and_then(|pending| {
+            source_content(
+                engine,
+                region,
+                configuration_profile_identifier,
+                pending,
+            )
+            .ok()
+        })
+        .map(Arc::new);
     Some(Ok(SessionBinding {
         learned_names,
         configuration,
@@ -748,14 +763,24 @@ pub fn resolve_deployed_triple<Eng: Send + Sync + 'static>(
 /// feature-flags profile stores an authoring document and serves the flag document
 /// resolved from it.
 ///
+/// WHERE those bytes live is the configuration profile's `LocationUri`: a profile on the
+/// AppConfig hosted configuration store has its versions in the control plane's own store,
+/// and one pointing at another source — a Parameter Store parameter, say — has the version
+/// the deployment named at that source, read out of the source's own store
+/// (`configuration_sources::source_configuration`) and served with the media type that
+/// source describes it by. `region` is the Region the reading request was signed for, which
+/// is the endpoint the source is resolved through.
+///
 /// Reporting-only: the environment is brought up to whatever state the CLOCK already
 /// owes it on a COPY, so a poll never writes to the control plane. The session's
 /// identifiers are resolved through `bindings` exactly as the session's own mint
 /// resolved them ([`resolve_deployed_triple`]), and a poll binds no name of its own: the
 /// names it resolves were bound when the session was started.
+#[allow(clippy::too_many_arguments)]
 pub fn served_configuration<Eng: Send + Sync + 'static>(
     engine: &Eng,
     bindings: &NameBindings,
+    region: &str,
     application_identifier: &str,
     environment_identifier: &str,
     configuration_profile_identifier: &str,
@@ -781,7 +806,7 @@ pub fn served_configuration<Eng: Send + Sync + 'static>(
         Err(unresolved) => return Some(Err(unresolved)),
         Ok(resolution) => resolution,
     };
-    served_in(
+    let pending = match served_in(
         &store,
         &resolved,
         application_identifier,
@@ -789,12 +814,103 @@ pub fn served_configuration<Eng: Send + Sync + 'static>(
         configuration_profile_identifier,
         target,
         now,
-    )
+    )? {
+        Err(unresolved) => return Some(Err(unresolved)),
+        Ok(pending) => pending,
+    };
+    // The AppConfig guard is released before an EXTERNAL source is read, so the two stores
+    // are taken one at a time, never nested.
+    drop(store);
+    Some(source_content(
+        engine,
+        region,
+        configuration_profile_identifier,
+        pending,
+    ))
+}
+
+/// What a triple has in force, before the content of an external source has been read.
+///
+/// A configuration profile's `LocationUri` says which store its configuration lives in,
+/// and only the AppConfig hosted store is one this service can read under the control
+/// plane's own guard; every other store is read by
+/// [`configuration_sources::source_configuration`] once that guard is released, which is
+/// what this carries the resolution to ([`source_content`]).
+#[derive(Debug, Clone)]
+enum PendingConfiguration {
+    /// The hosted version in force, already resolved out of AppConfig's own store.
+    Hosted(ServedConfiguration),
+    /// The configuration lives at an external source: the location the profile points at,
+    /// and the SOURCE version the in-force deployment named.
+    Source {
+        location_uri: String,
+        configuration_version: String,
+    },
+}
+
+/// The configuration a reader serves for `pending`, reading the external source when the
+/// profile's configuration lives in one.
+///
+/// A deployment of a profile whose `LocationUri` is not the hosted store names a version of
+/// that SOURCE, so the content served is the content that source holds for that version,
+/// described by that source's own media type — and the deployed version stays pinned, since
+/// a later write at the source mints a new version and leaves the deployed one where it
+/// was. A source that holds no such version has nothing for this read to serve, which is
+/// the same `Configuration` refusal a hosted version the store does not hold answers with.
+///
+/// Called with NO guard of the AppConfig store held: the source's own store is read
+/// one-directionally, exactly as the control plane is.
+fn source_content<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    configuration_profile_identifier: &str,
+    pending: PendingConfiguration,
+) -> Result<ServedConfiguration, UnresolvedResource> {
+    let (location_uri, configuration_version) = match pending {
+        PendingConfiguration::Hosted(served) => return Ok(served),
+        PendingConfiguration::Source {
+            location_uri,
+            configuration_version,
+        } => (location_uri, configuration_version),
+    };
+    match configuration_sources::source_configuration(
+        engine,
+        region,
+        &location_uri,
+        &configuration_version,
+    ) {
+        Ok(source) => Ok(ServedConfiguration {
+            content: source.content,
+            content_type: source.content_type,
+            // `VersionLabel` is "the user-defined label for the AppConfig hosted
+            // configuration version" (`smithy_query(query="shape",
+            // shape="GetLatestConfigurationResponse")`), so a version of another store
+            // carries none.
+            version_label: None,
+            // Which configuration version this is: the SOURCE version the deployment
+            // named, which is what a later deployment naming another version changes —
+            // and so what makes "the client already has the latest version" a comparison
+            // of two stored values for an external source too.
+            version: configuration_version,
+        }),
+        Err(unavailable) => Err(UnresolvedResource::configuration(
+            unavailable.refusal_message(
+                configuration_profile_identifier,
+                &configuration_version,
+                &location_uri,
+            ),
+        )),
+    }
 }
 
 /// The configuration a triple whose ids are already resolved has in force at `now`,
 /// inside an already-locked AppConfig store — the one read both the session's mint and
 /// its polls answer from, so neither decides what "in force" means for itself.
+///
+/// For a profile whose configuration lives in AppConfig's hosted store that is the
+/// version's content itself; for one that points at another store it is the SOURCE version
+/// the in-force deployment named, whose content is read once this guard is released
+/// ([`PendingConfiguration`], [`source_content`]).
 ///
 /// `None` only for ids the store does not hold, which cannot happen for a resolution
 /// this store itself produced.
@@ -807,7 +923,7 @@ fn served_in(
     configuration_profile_identifier: &str,
     target: RolloutBucket,
     now: SystemTime,
-) -> Option<Result<ServedConfiguration, UnresolvedResource>> {
+) -> Option<Result<PendingConfiguration, UnresolvedResource>> {
     let application = store.application(&resolved.application_id)?;
     let profile = application.profiles.get(&resolved.configuration_profile_id)?;
     let environment = application.environments.get(&resolved.environment_id)?;
@@ -829,6 +945,20 @@ fn served_in(
             ),
         )));
     };
+    // WHICH STORE the version lives in is the profile's own `LocationUri`: the hosted
+    // versions below are AppConfig's own store, and a profile pointing at any other source
+    // has its deployed version's content there instead, read once this store's guard is
+    // released ([`source_content`]). So the hosted-store refusal below answers only for a
+    // profile that uses the hosted store.
+    if !matches!(
+        configuration_sources::source_of(&profile.location_uri),
+        configuration_sources::ConfigurationSource::Hosted
+    ) {
+        return Some(Ok(PendingConfiguration::Source {
+            location_uri: profile.location_uri.clone(),
+            configuration_version: deployment.configuration_version.clone(),
+        }));
+    }
     let Some(version) = profile.resolve_hosted_version(&deployment.configuration_version) else {
         return Some(Err(UnresolvedResource::configuration(
             configuration_version_not_hosted(
@@ -837,14 +967,14 @@ fn served_in(
             ),
         )));
     };
-    Some(Ok(ServedConfiguration {
+    Some(Ok(PendingConfiguration::Hosted(ServedConfiguration {
         // What the profile's `Type` makes of the stored bytes: the control plane owns that
         // rule, so the data plane asks the profile rather than deciding here.
         content: profile.served_content(&version.content),
         content_type: version.content_type.clone(),
         version_label: version.version_label.clone(),
         version: version.version_number.to_string(),
-    }))
+    })))
 }
 
 /// The ids a triple resolves to inside an already-locked AppConfig store.

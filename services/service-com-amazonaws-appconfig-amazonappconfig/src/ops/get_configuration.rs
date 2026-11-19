@@ -242,12 +242,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal("AppConfig state is not reachable on this engine"));
         };
         let now = std::time::SystemTime::now();
+        // The Region this read was signed for, which is the endpoint a configuration
+        // profile's EXTERNAL source is resolved through (`crate::state::request_region`).
+        let region = crate::state::request_region(ctx.parts());
         // A deployment whose environment's monitored CloudWatch alarms have already made a
         // rollback due is rolled back before the configuration in force is read: that breach
         // fell due at an instant that has passed, so this materialises only what the clock
@@ -341,30 +344,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  configuration",
             ));
         };
+        // WHICH STORE the deployed bytes live in is the profile's own `LocationUri`: the
+        // hosted versions this service holds for a `hosted` profile, and the named source's
+        // own store for a profile pointing at one
+        // (`crate::state::configuration_sources`). Read here, so the answer below comes out
+        // of the store the profile actually uses.
+        let external = match crate::state::configuration_sources::source_of(&profile.location_uri)
+        {
+            crate::state::configuration_sources::ConfigurationSource::Hosted => None,
+            _ => Some(profile.location_uri.clone()),
+        };
         // The deployment records the version it deployed as the caller spelled it — a
         // hosted version number or that version's label — so it is resolved through the
         // profile's own lookup, the one every reader of a deployed configuration uses.
-        // A deployment of bytes AppConfig's hosted store does not hold — a profile whose
-        // `LocationUri` points outside it — serves no version here either, so it is the
-        // same deployment-level refusal rather than a claim about the profile, which
-        // resolved.
-        let Some(version) = profile.resolve_hosted_version(&deployed_version) else {
-            return Err(no_deployed_version(
-                &input.application,
-                &input.environment,
-                &input.configuration,
-            ));
-        };
+        //
         // `ConfigurationVersion` identifies the version this answer carries, and
         // `ClientConfigurationVersion` is "the configuration version returned in the most
         // recent GetConfiguration response", so the two are the same spelling: the stored
         // version number.
-        let configuration_version = version.version_number.to_string();
-        let content_type = version.content_type.clone();
+        //
         // What the stored bytes MEAN is the profile's `Type`, so the content served is the
         // profile's own projection of them rather than the bytes themselves — the same
         // projection the `appconfigdata` poll serves for the same deployment.
-        let content = profile.served_content(&version.content);
+        let hosted = profile.resolve_hosted_version(&deployed_version).map(|version| {
+            (
+                version.version_number.to_string(),
+                version.content_type.clone(),
+                profile.served_content(&version.content),
+            )
+        });
+        // This store's guard is released before any other is read, so the two are taken one
+        // at a time, never nested.
+        drop(store);
+        let (configuration_version, content_type, content) = match external {
+            // A `hosted` profile whose deployed version this store does not hold serves no
+            // version here, so it is the same deployment-level refusal rather than a claim
+            // about the profile, which resolved.
+            None => {
+                let Some(hosted) = hosted else {
+                    return Err(no_deployed_version(
+                        &input.application,
+                        &input.environment,
+                        &input.configuration,
+                    ));
+                };
+                hosted
+            }
+            // A profile pointing at another store is served the content THAT store holds
+            // for the version the deployment named, with the media type describing it; the
+            // deployed version stays pinned, because a later write at the source mints a
+            // new version and leaves the deployed one where it was. A source holding no such
+            // version has nothing in force to report, which is the same deployment-level
+            // refusal.
+            Some(location_uri) => {
+                let Ok(source) = crate::state::configuration_sources::source_configuration(
+                    &*self.engine,
+                    &region,
+                    &location_uri,
+                    &deployed_version,
+                ) else {
+                    return Err(no_deployed_version(
+                        &input.application,
+                        &input.environment,
+                        &input.configuration,
+                    ));
+                };
+                (deployed_version.clone(), source.content_type, source.content)
+            }
+        };
 
         // "The Content attribute only contains data if the system finds new or updated
         // configuration data. If there is no new or updated data and

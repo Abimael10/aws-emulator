@@ -41,6 +41,9 @@ use crate::ops::types::{
 /// The CloudWatch alarms an environment's `Monitors` name, and the rollback they owe a
 /// deployment in flight into that environment.
 pub mod alarm_monitors;
+/// Where a configuration profile's configuration LIVES, and the content a deployed
+/// version of it has when that location is not AppConfig's own hosted store.
+pub mod configuration_sources;
 pub mod extension_actions;
 /// The extension and extension-association records an account holds, with the store
 /// methods every operation reaches them through.

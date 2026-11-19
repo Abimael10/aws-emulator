@@ -282,6 +282,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = std::time::SystemTime::now();
         let token = input.configuration_token;
+        // The Region this poll was signed for, which is the endpoint a configuration
+        // profile's EXTERNAL source is resolved through: read the one way this pair of
+        // services reads it, out of the signed credential scope.
+        let region =
+            ::service_com_amazonaws_appconfig_amazonappconfig::state::request_region(ctx.parts());
 
         // STEP 0 — a request that supplies no usable value for the token member supplied
         // no token, and is refused as the validation failure it is BEFORE any lookup: the
@@ -401,9 +406,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every token of its poll chain): a deployment still rolling out is in force for
         // the targets it has reached, so a session it has not reached keeps being served
         // the previous version until the rollout grows past it.
+        //
+        // WHERE the version's bytes live is the configuration profile's own `LocationUri`:
+        // the control plane's hosted configuration store for a `hosted` profile, and the
+        // named source's own store — a Systems Manager parameter, say — for a profile
+        // pointing at one, which is read for the SOURCE version the deployment recorded
+        // (`crate::state::served_configuration`). Either way the bytes come out of
+        // persisted state, in the Region this poll was signed for.
         let Some(deployed) = crate::state::served_configuration(
             &*self.engine,
             &bindings,
+            &region,
             &session.application_identifier,
             &session.environment_identifier,
             &session.configuration_profile_identifier,

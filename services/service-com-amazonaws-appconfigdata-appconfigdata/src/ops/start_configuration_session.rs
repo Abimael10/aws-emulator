@@ -368,6 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(resolution) = crate::state::resolve_deployed_triple(
             &*self.engine,
             &bindings,
+            &::service_com_amazonaws_appconfig_amazonappconfig::state::request_region(ctx.parts()),
             &input.application_identifier,
             &input.environment_identifier,
             &input.configuration_profile_identifier,
