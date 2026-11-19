@@ -122,6 +122,9 @@ pub const LINK_STATUS_REQUESTED: &str = "REQUESTED";
 pub const LINK_STATUS_ACCEPTED: &str = "ACCEPTED";
 /// `LinkStatus` member: the link carries traffic.
 pub const LINK_STATUS_ACTIVE: &str = "ACTIVE";
+/// `LinkStatus` member: a configuration change the link has taken is being
+/// applied to it while it carries traffic.
+pub const LINK_STATUS_PENDING_UPDATE: &str = "PENDING_UPDATE";
 /// `LinkStatus` member: terminal, the peer declined the link request.
 pub const LINK_STATUS_REJECTED: &str = "REJECTED";
 /// `LinkStatus` member: terminal, the link could not be established.
@@ -247,13 +250,15 @@ pub struct Link {
 
 impl Link {
     /// The status the clock owes a link in `status`, if any: a request this
-    /// service has taken but not yet put to the peer is owed `REQUESTED`, and a
-    /// request the peer has accepted is owed `ACTIVE` once the link is up. Every
-    /// other status is settled, so nothing is owed on it.
+    /// service has taken but not yet put to the peer is owed `REQUESTED`, a
+    /// request the peer has accepted is owed `ACTIVE` once the link is up, and
+    /// a link applying a configuration change is owed `ACTIVE` again once that
+    /// change is in service. Every other status is settled, so nothing is owed
+    /// on it.
     fn owed_status(status: &str) -> Option<&'static str> {
         match status {
             LINK_STATUS_PENDING_REQUEST => Some(LINK_STATUS_REQUESTED),
-            LINK_STATUS_ACCEPTED => Some(LINK_STATUS_ACTIVE),
+            LINK_STATUS_ACCEPTED | LINK_STATUS_PENDING_UPDATE => Some(LINK_STATUS_ACTIVE),
             _ => None,
         }
     }
@@ -304,6 +309,14 @@ impl Link {
     /// this record rather than refused.
     pub fn request_accepted(&self) -> bool {
         self.status == LINK_STATUS_ACCEPTED || self.status == LINK_STATUS_ACTIVE
+    }
+
+    /// Whether this link is up: carrying traffic, or carrying traffic while a
+    /// configuration change it has already taken is applied. A further change
+    /// to a link in one of these statuses is applied to a live link, which is
+    /// what `PENDING_UPDATE` reports, so the clock owes it `ACTIVE` again.
+    pub fn is_up(&self) -> bool {
+        self.status == LINK_STATUS_ACTIVE || self.status == LINK_STATUS_PENDING_UPDATE
     }
 
     /// Whether this link has reached a status nothing moves it out of: the peer

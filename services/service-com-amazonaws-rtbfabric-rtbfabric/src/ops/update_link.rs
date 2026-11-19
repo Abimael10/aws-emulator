@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the configuration of a stored link: each optional member this call
+//! states replaces what the record holds, and every member it leaves out keeps
+//! the value the link already had, so the next reader of the link reports the
+//! merged configuration. A link that is up takes the change while it carries
+//! traffic, so it is answered `PENDING_UPDATE` and the clock owes it `ACTIVE`
+//! again; a link still moving through its own lifecycle keeps the status that
+//! lifecycle owes it. A link in a status nothing moves it out of cannot be
+//! configured -> `ConflictException` (409), and an id that names no link on the
+//! addressed gateway -> `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +162,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLink"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateLinkErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        let Some(link) = store.find_link_mut(&input.gateway_id, &input.link_id) else {
+            return Err(UpdateLinkErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        if link.terminal() {
+            // Nothing moves a link out of these statuses, so it has no
+            // configuration left to change.
+            return Err(UpdateLinkErrorModeled::ConflictException(ConflictException {
+                message: link.status_conflict_message(&input.gateway_id, "updated"),
+            })
+            .into());
+        }
+
+        // A member the caller states replaces what the record holds; one it
+        // leaves out is not a request to clear the stored value.
+        if let Some(log_settings) = &input.log_settings {
+            link.log_settings = log_settings.clone();
+        }
+        if input.timeout_in_millis.is_some() {
+            link.timeout_in_millis = input.timeout_in_millis;
+        }
+        link.updated_at = now;
+        if link.is_up() {
+            // The link is carrying traffic, so the change is applied to a live
+            // link: this call reports the update as pending, and the clock owes
+            // the link its way back up.
+            link.status = crate::state::LINK_STATUS_PENDING_UPDATE.to_string();
+            link.settles_at = Some(now + crate::state::PROVISIONING_DELAY);
+        }
+
+        Ok(UpdateLinkOutput {
+            link_id: link.link_id.clone(),
+            status: link.status.clone(),
+        })
     }
 }

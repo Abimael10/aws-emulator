@@ -16,6 +16,13 @@
 //! The decline's own consequence is covered here too: a link that has reached a
 //! terminal status occupies the gateway pair no longer, so the two gateways can
 //! be linked again.
+//!
+//! `UpdateLink` is covered here as well, because it is what happens next to a
+//! link an accept has brought up: it replaces the configuration members the
+//! call states, keeps every member it leaves out, and reports the status that
+//! change leaves the link in. Its table spans which of the two optional members
+//! the call states, the published bounds of the modelled timeout range, which
+//! end addresses the call, and every member of the modelled `LinkStatus` enum.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,8 +32,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_rtbfabric_rtbfabric::ops::types::LINK_STATUS_VALUES;
 use service_com_amazonaws_rtbfabric_rtbfabric::state::{
     ComAmazonawsRtbfabricRtbfabricState, LINK_STATUS_ACCEPTED, LINK_STATUS_ACTIVE,
-    LINK_STATUS_DELETED, LINK_STATUS_FAILED, LINK_STATUS_PENDING_REQUEST, LINK_STATUS_REJECTED,
-    LINK_STATUS_REQUESTED,
+    LINK_STATUS_DELETED, LINK_STATUS_FAILED, LINK_STATUS_PENDING_REQUEST,
+    LINK_STATUS_PENDING_UPDATE, LINK_STATUS_REJECTED, LINK_STATUS_REQUESTED,
 };
 use service_com_amazonaws_rtbfabric_rtbfabric::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -876,4 +883,396 @@ async fn only_a_live_link_occupies_the_gateway_pair_it_joins() {
             }
         }
     }
+}
+
+/// The configuration every update row starts from, stated on the accept that
+/// brings the link up. None of its values is one an update row states, so a row
+/// that changes a member and a row that leaves it alone cannot be confused.
+const UPDATE_BASELINE: AcceptRow = AcceptRow {
+    name: "the configuration an update row starts from",
+    from_peer: true,
+    settle_first: false,
+    customer_provided_id: Some("baseline-fabric"),
+    timeout_in_millis: Some(1000),
+    error_log: 75.0,
+};
+
+/// The `filterLog` sampling every stated `logSettings` carries: `logSettings` is
+/// one structure, so stating it replaces the whole of what the record holds,
+/// including the member the update does not care about.
+const UPDATE_FILTER_LOG: f64 = 25.0;
+
+/// One update row: which of `UpdateLink`'s two optional members the call states,
+/// and which end of the link addresses it.
+struct UpdateRow {
+    name: &'static str,
+    /// The `errorLog` sampling of the `logSettings` the update states, or `None`
+    /// to state no `logSettings` at all. The values are at and between the
+    /// published bounds of the modelled range (0..100).
+    error_log: Option<f64>,
+    /// A `timeoutInMillis`, or `None` to state none. The values are the
+    /// published bounds of the modelled range (100..5000) and one between them,
+    /// from `smithy_query(query="operation", operation="UpdateLink")`.
+    timeout_in_millis: Option<i64>,
+    /// `true` to address the update to the end the link request was put to,
+    /// `false` to address it to the end that opened the link.
+    from_peer: bool,
+}
+
+const UPDATE_ROWS: &[UpdateRow] = &[
+    UpdateRow {
+        name: "both members, the timeout at its lower bound",
+        error_log: Some(100.0),
+        timeout_in_millis: Some(100),
+        from_peer: true,
+    },
+    UpdateRow {
+        name: "both members, the timeout at its upper bound",
+        error_log: Some(0.0),
+        timeout_in_millis: Some(5000),
+        from_peer: false,
+    },
+    UpdateRow {
+        name: "the log settings only",
+        error_log: Some(12.5),
+        timeout_in_millis: None,
+        from_peer: false,
+    },
+    UpdateRow {
+        name: "the timeout only, between its bounds",
+        error_log: None,
+        timeout_in_millis: Some(2500),
+        from_peer: true,
+    },
+    UpdateRow {
+        name: "neither member",
+        error_log: None,
+        timeout_in_millis: None,
+        from_peer: true,
+    },
+];
+
+/// The body one update row sends: both of `UpdateLink`'s members are optional,
+/// so a row states only the ones it changes.
+fn update_body(row: &UpdateRow) -> Value {
+    let mut body = json!({});
+    if let Some(error_log) = row.error_log {
+        body["logSettings"] = json!({
+            "applicationLogs": {
+                "sampling": { "errorLog": error_log, "filterLog": UPDATE_FILTER_LOG }
+            }
+        });
+    }
+    if let Some(timeout_in_millis) = row.timeout_in_millis {
+        body["timeoutInMillis"] = json!(timeout_in_millis);
+    }
+    body
+}
+
+/// One sampling member of a link reading's `logSettings`.
+fn sampling(body: &Value, member: &str) -> f64 {
+    body["logSettings"]["applicationLogs"]["sampling"][member]
+        .as_f64()
+        .unwrap_or(f64::NAN)
+}
+
+#[tokio::test]
+async fn an_update_replaces_the_members_it_states_and_keeps_the_rest() {
+    for row in UPDATE_ROWS {
+        let case = row.name;
+        let fabric = Fabric::new();
+        let pair = fabric.linked_pair("token").await;
+        // Bring the link up first: an update is a change to a configuration the
+        // link already carries.
+        let (status, accepted) = fabric
+            .send(
+                "POST",
+                &format!("/gateway/{}/link/{}/accept", pair.responder_id, pair.link_id),
+                Some(accept_body(&UPDATE_BASELINE)),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the accept to answer 200, got {status} {accepted:?}"
+        );
+        let before = fabric
+            .poll_link_status(&pair.requester_id, &pair.link_id, LINK_STATUS_ACTIVE)
+            .await;
+
+        let (addressed, other) = if row.from_peer {
+            (&pair.responder_id, &pair.requester_id)
+        } else {
+            (&pair.requester_id, &pair.responder_id)
+        };
+        let (status, updated) = fabric
+            .send(
+                "PATCH",
+                &format!("/gateway/{addressed}/link/{}", pair.link_id),
+                Some(update_body(row)),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected UpdateLink to answer 200, got {status} {updated:?}"
+        );
+        assert_eq!(
+            text(&updated, "linkId"),
+            pair.link_id,
+            "case {case:?}: expected link {:?}, got {:?}",
+            pair.link_id,
+            updated["linkId"]
+        );
+        // The link was carrying traffic, so the change is applied to a live
+        // link: the update is reported as pending, and the clock owes the link
+        // its way back up.
+        assert_eq!(
+            text(&updated, "status"),
+            LINK_STATUS_PENDING_UPDATE,
+            "case {case:?}: expected the update to report PENDING_UPDATE, got {:?}",
+            updated["status"]
+        );
+
+        // What the update left, read back from BOTH ends once the clock has
+        // brought the link back up.
+        let expected_error_log = row.error_log.unwrap_or_else(|| sampling(&before, "errorLog"));
+        let expected_filter_log = if row.error_log.is_some() {
+            UPDATE_FILTER_LOG
+        } else {
+            sampling(&before, "filterLog")
+        };
+        let expected_timeout = row
+            .timeout_in_millis
+            .map_or_else(|| before["timeoutInMillis"].clone(), |value| json!(value));
+        for end in [addressed, other] {
+            let read_back = fabric
+                .poll_link_status(end, &pair.link_id, LINK_STATUS_ACTIVE)
+                .await;
+            assert_eq!(
+                sampling(&read_back, "errorLog"),
+                expected_error_log,
+                "case {case:?}: expected errorLog {expected_error_log} from {end}, got {:?}",
+                read_back["logSettings"]
+            );
+            assert_eq!(
+                sampling(&read_back, "filterLog"),
+                expected_filter_log,
+                "case {case:?}: expected filterLog {expected_filter_log} from {end}, got {:?}",
+                read_back["logSettings"]
+            );
+            assert_eq!(
+                read_back["timeoutInMillis"], expected_timeout,
+                "case {case:?}: expected timeoutInMillis {expected_timeout:?} from {end}, got {:?}",
+                read_back["timeoutInMillis"]
+            );
+            // Everything the update does not state is the record's, unchanged.
+            for member in ["attributes", "direction", "connectivityType", "createdAt"] {
+                assert_eq!(
+                    read_back[member], before[member],
+                    "case {case:?}: expected {member} to be left alone, was {:?}, got {:?}",
+                    before[member], read_back[member]
+                );
+            }
+            // The record did change, so it is dated at the instant it changed.
+            assert_ne!(
+                read_back["updatedAt"], before["updatedAt"],
+                "case {case:?}: expected the update to re-date the link, got {:?}",
+                read_back["updatedAt"]
+            );
+        }
+        // ACTIVE is where the update leaves the link: nothing further is owed.
+        assert!(
+            !fabric.settlement_owed(),
+            "case {case:?}: expected nothing further to be owed on an updated link"
+        );
+    }
+}
+
+#[tokio::test]
+async fn only_a_link_in_a_status_it_can_leave_can_be_configured() {
+    // The whole modelled catalog, from `LINK_STATUS_VALUES` (this service's
+    // `LinkStatus` enum), so a status no operation reaches yet is covered too.
+    for status_value in LINK_STATUS_VALUES {
+        let case = *status_value;
+        let fabric = Fabric::new();
+        let pair = fabric.linked_pair("token").await;
+        fabric.force_link_status(status_value);
+        let link = format!("/gateway/{}/link/{}", pair.responder_id, pair.link_id);
+        let (_, before) = fabric.send("GET", &link, None).await;
+
+        let (status, code, body) = fabric
+            .send_with_code("PATCH", &link, Some(json!({ "timeoutInMillis": 2500 })))
+            .await;
+
+        if [
+            LINK_STATUS_REJECTED,
+            LINK_STATUS_FAILED,
+            LINK_STATUS_DELETED,
+        ]
+        .contains(status_value)
+        {
+            assert_eq!(
+                status, 409,
+                "case {case:?}: expected a status nothing leaves to conflict with 409, got {status} {body:?}"
+            );
+            assert_eq!(
+                code, "ConflictException",
+                "case {case:?}: expected ConflictException, got {code:?}"
+            );
+            // The refusal names the link and the gateway the call addressed,
+            // and the status that refuses it.
+            let message = text(&body, "message");
+            for value in [pair.link_id.as_str(), pair.responder_id.as_str(), case] {
+                assert!(
+                    message.contains(value),
+                    "case {case:?}: expected the refusal to name {value:?}, got {message:?}"
+                );
+            }
+            let (_, read_back) = fabric.send("GET", &link, None).await;
+            assert_eq!(
+                read_back["timeoutInMillis"], before["timeoutInMillis"],
+                "case {case:?}: expected the refused update to store nothing, got {:?}",
+                read_back["timeoutInMillis"]
+            );
+            assert_eq!(
+                text(&read_back, "status"),
+                case,
+                "case {case:?}: expected the refused update to leave the status alone, got {:?}",
+                read_back["status"]
+            );
+        } else {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected UpdateLink to answer 200, got {status} {body:?}"
+            );
+            // A link that is up takes the change while it carries traffic; one
+            // still moving through its own lifecycle keeps the status that
+            // lifecycle owes it.
+            let expected = if [LINK_STATUS_ACTIVE, LINK_STATUS_PENDING_UPDATE].contains(status_value)
+            {
+                LINK_STATUS_PENDING_UPDATE
+            } else {
+                case
+            };
+            assert_eq!(
+                text(&body, "status"),
+                expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                body["status"]
+            );
+            assert_eq!(
+                text(&body, "linkId"),
+                pair.link_id,
+                "case {case:?}: expected link {:?}, got {:?}",
+                pair.link_id,
+                body["linkId"]
+            );
+            // Whatever the status, the configuration the update stated is what
+            // the next reader reports.
+            let (_, read_back) = fabric.send("GET", &link, None).await;
+            assert_eq!(
+                read_back["timeoutInMillis"],
+                json!(2500),
+                "case {case:?}: expected the stored timeout to be read back, got {:?}",
+                read_back["timeoutInMillis"]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_update_of_a_link_the_gateway_is_not_an_end_of_is_not_found() {
+    let fabric = Fabric::new();
+    let pair = fabric.linked_pair("token-a").await;
+    // A second pair, so there is a gateway that is no end of the first link.
+    let other = fabric.linked_pair("token-b").await;
+
+    for (case, gateway_id, link_id) in [
+        ("neither exists", "rtb-gw-unknown", "link-unknown"),
+        (
+            "a stored gateway, a link id nothing minted",
+            pair.requester_id.as_str(),
+            "link-unknown",
+        ),
+        (
+            "a stored link, addressed from a gateway that is not one of its ends",
+            other.responder_id.as_str(),
+            pair.link_id.as_str(),
+        ),
+    ] {
+        let (status, code, body) = fabric
+            .send_with_code(
+                "PATCH",
+                &format!("/gateway/{gateway_id}/link/{link_id}"),
+                Some(json!({ "timeoutInMillis": 2500 })),
+            )
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected UpdateLink to answer 404, got {status} {body:?}"
+        );
+        assert_eq!(
+            code, "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {code:?}"
+        );
+    }
+
+    // The link those calls could not address is untouched by them.
+    let (status, read_back) = fabric
+        .send(
+            "GET",
+            &format!("/gateway/{}/link/{}", pair.requester_id, pair.link_id),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected the untouched link to still be readable, got {status} {read_back:?}"
+    );
+    assert_eq!(
+        read_back["timeoutInMillis"],
+        Value::Null,
+        "expected a refused update to store nothing, got {:?}",
+        read_back["timeoutInMillis"]
+    );
+}
+
+#[tokio::test]
+async fn an_update_states_a_timeout_inside_the_modelled_range() {
+    // The published bounds of `LinkTimeoutInMillis` (range 100..5000), from
+    // `smithy_query(query="operation", operation="UpdateLink")`, and one past
+    // each of them.
+    let fabric = Fabric::new();
+    let pair = fabric.linked_pair("token").await;
+    let link = format!("/gateway/{}/link/{}", pair.requester_id, pair.link_id);
+
+    for (timeout_in_millis, expected) in [(99_i64, 400_u16), (100, 200), (5000, 200), (5001, 400)] {
+        let case = timeout_in_millis;
+        let (status, code, body) = fabric
+            .send_with_code(
+                "PATCH",
+                &link,
+                Some(json!({ "timeoutInMillis": timeout_in_millis })),
+            )
+            .await;
+        assert_eq!(
+            status, expected,
+            "case {case}: expected {expected}, got {status} {body:?}"
+        );
+        if expected == 400 {
+            assert_eq!(
+                code, "ValidationException",
+                "case {case}: expected ValidationException, got {code:?}"
+            );
+        }
+    }
+
+    // The last value inside the range is what the link reports: neither refusal
+    // stored anything.
+    let (_, read_back) = fabric.send("GET", &link, None).await;
+    assert_eq!(
+        read_back["timeoutInMillis"],
+        json!(5000),
+        "expected the last accepted timeout to be read back, got {:?}",
+        read_back["timeoutInMillis"]
+    );
 }
