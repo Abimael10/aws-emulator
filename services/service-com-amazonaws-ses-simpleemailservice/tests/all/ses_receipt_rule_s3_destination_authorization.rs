@@ -22,8 +22,14 @@
 //! action names a key, and which key it names (the Amazon Web Services managed key, a
 //! customer managed key that grants the service nothing, one that grants it the encryption,
 //! and an identifier KMS holds no key under).
+//!
+//! A second table spans the CONDITION forms a bucket policy may scope that grant by — no
+//! condition, each documented condition key alone, several of them together, and one matched
+//! by pattern — because a statement allowing the service principal the write is a grant
+//! whenever every clause it carries holds for the write Amazon SES performs, whichever key
+//! the clause names.
 
-use crate::harness::{call, element, error_envelope, field, Field, REGION};
+use crate::harness::{call, element, elements, error_envelope, field, Field, REGION};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
@@ -148,12 +154,22 @@ fn bucket_policy_denying_ses(bucket: &str) -> String {
     )
 }
 
+/// The `AllowSESPuts` grant the Amazon SES Developer Guide's own inbound-mail bucket policy
+/// is: Amazon SES's service principal allowed the object write on every object of `bucket`,
+/// under `condition` when the caller writes one and under none when it writes `None`.
+fn ses_puts_policy(bucket: &str, condition: Option<&str>) -> String {
+    let condition = condition
+        .map(|condition| format!(r#","Condition":{condition}"#))
+        .unwrap_or_default();
+    format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"AllowSESPuts","Effect":"Allow","Principal":{{"Service":"ses.amazonaws.com"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/*"{condition}}}]}}"#
+    )
+}
+
 /// The grant to Amazon SES under ONE condition clause of the caller's choosing, so a row can
 /// state what a clause this evaluation can and cannot decide means.
 fn bucket_policy_conditioned(bucket: &str, condition: &str) -> String {
-    format!(
-        r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"AllowSESPuts","Effect":"Allow","Principal":{{"Service":"ses.amazonaws.com"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/*","Condition":{condition}}}]}}"#
-    )
+    ses_puts_policy(bucket, Some(condition))
 }
 
 /// What the object store holds for the bucket one row names.
@@ -765,4 +781,225 @@ async fn an_update_is_held_to_the_same_destination_authorization() {
             element(&described, "KmsKeyArn")
         );
     }
+}
+
+/// The ARN of the receipt rule `rule_name` of [`RULE_SET`], which is the resource the write
+/// Amazon SES performs for that rule is made on behalf of, and therefore the value a grant
+/// scoped by the source-ARN condition key compares:
+/// `arn:aws:ses:<region>:<account>:receipt-rule-set/<set>:receipt-rule/<rule>`.
+fn rule_arn(rule_name: &str) -> String {
+    format!(
+        "arn:aws:ses:{REGION}:{}:receipt-rule-set/{RULE_SET}:receipt-rule/{rule_name}",
+        account()
+    )
+}
+
+/// A `StringEquals` condition block over `pairs`, the operator both documented inbound-mail
+/// bucket policies scope their grant with.
+fn string_equals(pairs: &[(&str, String)]) -> String {
+    let clauses: Vec<String> = pairs
+        .iter()
+        .map(|(key, value)| format!(r#""{key}":"{value}""#))
+        .collect();
+    format!(r#"{{"StringEquals":{{{}}}}}"#, clauses.join(","))
+}
+
+/// One condition FORM a bucket policy may scope its `AllowSESPuts` grant by.
+#[derive(Debug, Clone)]
+struct GrantForm {
+    /// What this row is called in every assertion it makes.
+    case: &'static str,
+    /// The rule (and bucket) name this row uses, so no two rows share state.
+    name: &'static str,
+    /// The statement's `Condition` block, or `None` for a grant carrying no condition.
+    condition: Option<String>,
+    /// Whether the write Amazon SES performs for this rule satisfies the clause.
+    accepted: bool,
+}
+
+/// The names of the rules `DescribeReceiptRuleSet` reports for [`RULE_SET`], in the order the
+/// set holds them — the reader the destination of a stored rule is read back through.
+async fn rule_set_rule_names(router: &MultiServiceRouter) -> Vec<String> {
+    let (status, body) = call(
+        router,
+        "DescribeReceiptRuleSet",
+        &[field("RuleSetName", RULE_SET)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "reading the rule set: expected 200, got {status} with {body}"
+    );
+    elements(&element(&body, "Rules").unwrap_or_default(), "Name")
+}
+
+/// A bucket-policy statement allowing the service principal the object write is a GRANT
+/// whenever every condition clause it carries holds for the write Amazon SES performs — a
+/// write that carries the account it acts for, in both the referer and the source-account
+/// spellings, and the ARN of the receipt rule it acts for. So a bucket granted under ANY of
+/// the condition forms the Developer Guide's inbound-mail policies are written in is writable
+/// and its rule is stored; only a clause that is decidably FALSE for that write leaves the
+/// statement about something else, and earns the one refusal reserved for a destination that
+/// grants Amazon SES nothing.
+///
+/// The table spans the forms rather than one of them: no condition at all, each of the three
+/// documented keys alone, the two keys of the newer form together, the two generations of the
+/// policy together, the source ARN matched by pattern — and, as the contrast, the same two
+/// keys carrying a value this write does not have.
+#[tokio::test]
+async fn a_bucket_granted_under_any_documented_condition_form_is_writable() {
+    let acct = account();
+    let forms = [
+        GrantForm {
+            case: "a grant carrying no condition at all",
+            name: "form-plain",
+            condition: None,
+            accepted: true,
+        },
+        GrantForm {
+            case: "the referer spelling of the account the write is made for",
+            name: "form-referer",
+            condition: Some(string_equals(&[("aws:Referer", acct.clone())])),
+            accepted: true,
+        },
+        GrantForm {
+            case: "the source-account spelling of the same account",
+            name: "form-source-account",
+            condition: Some(string_equals(&[("aws:SourceAccount", acct.clone())])),
+            accepted: true,
+        },
+        GrantForm {
+            case: "the ARN of the rule the write is made for",
+            name: "form-source-arn",
+            condition: Some(string_equals(&[(
+                "aws:SourceArn",
+                rule_arn("form-source-arn"),
+            )])),
+            accepted: true,
+        },
+        GrantForm {
+            case: "the account and the rule ARN together",
+            name: "form-account-and-arn",
+            condition: Some(string_equals(&[
+                ("aws:SourceAccount", acct.clone()),
+                ("aws:SourceArn", rule_arn("form-account-and-arn")),
+            ])),
+            accepted: true,
+        },
+        GrantForm {
+            case: "the referer spelling beside the source-account spelling",
+            name: "form-both-generations",
+            condition: Some(string_equals(&[
+                ("aws:Referer", acct.clone()),
+                ("aws:SourceAccount", acct.clone()),
+            ])),
+            accepted: true,
+        },
+        GrantForm {
+            case: "the rule ARN matched by a pattern over the rule set",
+            name: "form-arn-pattern",
+            condition: Some(format!(
+                r#"{{"ArnLike":{{"aws:SourceArn":"arn:aws:ses:{REGION}:{acct}:receipt-rule-set/{RULE_SET}:*"}}}}"#
+            )),
+            accepted: true,
+        },
+        GrantForm {
+            case: "the referer spelling of ANOTHER account",
+            name: "form-referer-elsewhere",
+            condition: Some(string_equals(&[(
+                "aws:Referer",
+                "999999999999".to_string(),
+            )])),
+            accepted: false,
+        },
+        GrantForm {
+            case: "the ARN of ANOTHER rule of the same set",
+            name: "form-arn-elsewhere",
+            condition: Some(string_equals(&[(
+                "aws:SourceArn",
+                rule_arn("some-other-rule"),
+            )])),
+            accepted: false,
+        },
+    ];
+
+    let router = emulator();
+    create_rule_set(&router).await;
+
+    for form in &forms {
+        let bucket = format!("{}-bucket", form.name);
+        s3(&router)
+            .create_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("case {}: creating {bucket}: {error}", form.case));
+        s3(&router)
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(ses_puts_policy(&bucket, form.condition.as_deref()))
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {}: publishing {bucket}'s policy: {error}", form.case)
+            });
+
+        let (status, body) = create_rule(&router, form.name, &bucket, None, None).await;
+        if form.accepted {
+            assert_eq!(
+                status, 200,
+                "case {}: expected the rule to be stored (200), got {status} with {body}",
+                form.case
+            );
+            let stored = rule_set_rule_names(&router).await;
+            assert!(
+                stored.iter().any(|name| name == form.name),
+                "case {}: expected {:?} among the rules the set reports, got {stored:?}",
+                form.case,
+                form.name
+            );
+            // The update half of the same pre-flight reads the same grant the same way.
+            let mut params = vec![field("RuleSetName", RULE_SET)];
+            params.extend(rule_fields(form.name, &bucket, None, None));
+            let (status, body) = call(&router, "UpdateReceiptRule", &params).await;
+            assert_eq!(
+                status, 200,
+                "case {}: expected the update naming the same bucket to be accepted (200), got \
+                 {status} with {body}",
+                form.case
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {}: expected HTTP 400, got {status} with {body}",
+                form.case
+            );
+            let expected = could_not_write_message(&bucket);
+            let (code, message) = error_envelope(&body);
+            assert_eq!(
+                code.as_deref(),
+                Some("InvalidS3Configuration"),
+                "case {}: expected InvalidS3Configuration, got {code:?} with {body}",
+                form.case
+            );
+            assert_eq!(
+                message.as_deref(),
+                Some(expected.as_str()),
+                "case {}: expected {expected:?}, got {message:?}",
+                form.case
+            );
+            let stored = rule_set_rule_names(&router).await;
+            assert!(
+                !stored.iter().any(|name| name == form.name),
+                "case {}: expected the refused rule not to be stored, got {stored:?}",
+                form.case
+            );
+        }
+    }
+}
+
+/// How the refusal of a destination Amazon SES may not write into is worded: the fixed
+/// sentence plus the `BucketName` the request carried.
+fn could_not_write_message(bucket: &str) -> String {
+    format!("Could not write to bucket: {bucket}")
 }
