@@ -33,6 +33,10 @@
 //! * [`RestoreTestingPlanRecord`] — the restore testing plan
 //!   `CreateRestoreTestingPlan` stores under its account-unique name, which
 //!   `GetRestoreTestingPlan` answers from (the `restore_testing` module).
+//! * [`RestoreTestingSelectionRecord`] — one restore testing selection of such
+//!   a plan, which `CreateRestoreTestingSelection` stores under the plan's name
+//!   and `GetRestoreTestingSelection` answers from (the
+//!   `restore_testing_selection` module).
 //!
 //! A vault's resource policy is one of [`BackupVault`]'s own members
 //! ([`BackupVault::access_policy`]): `PutBackupVaultAccessPolicy` stores it
@@ -126,6 +130,12 @@ pub use restore_metadata::*;
 /// Re-exported for the reason given on `events`.
 mod restore_testing;
 pub use restore_testing::*;
+
+/// The restore testing SELECTIONS one of those plans holds, the one read
+/// projection of one and the reading of a selection body every operation that
+/// stores one shares. Re-exported for the reason given on `events`.
+mod restore_testing_selection;
+pub use restore_testing_selection::*;
 
 /// The report plans this service stores, the one read projection of one and the
 /// reading of a report plan body every operation that stores one shares.
@@ -3394,6 +3404,14 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     /// testing plan is addressed by, so the map itself is what makes that name
     /// unique to the account. Bounded by [`MAX_RESTORE_TESTING_PLANS`].
     pub restore_testing_plans: BTreeMap<String, RestoreTestingPlanRecord>,
+    /// Restore testing selections by the (`RestoreTestingPlanName`,
+    /// `RestoreTestingSelectionName`) pair a selection is addressed by: a
+    /// selection belongs to ONE restore testing plan and its name identifies it
+    /// within that plan. Keyed plan-first, so one plan's selections are
+    /// contiguous and a read of them is a range of this one map rather than a
+    /// second index beside it. Bounded by
+    /// [`MAX_RESTORE_TESTING_SELECTIONS_PER_PLAN`] per plan.
+    pub restore_testing_selections: BTreeMap<(String, String), RestoreTestingSelectionRecord>,
     /// Tiering configurations by `TieringConfigurationName` — the name a
     /// tiering configuration is addressed by, so the map itself is what makes
     /// that name unique to the account. Bounded by
