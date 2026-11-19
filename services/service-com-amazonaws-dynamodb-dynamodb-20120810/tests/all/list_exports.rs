@@ -6,9 +6,9 @@
 //! store holds that the request SELECTS — the region the request reached, the table its
 //! `TableArn` names, and the documented window "within the past 90 days" — in "reverse
 //! alphanumeric order of ExportArn" (the operation's own doc), `MaxResults` entries at a
-//! time, with `NextToken` reported exactly when more remain and resuming strictly after
-//! the entry the page stopped on in that order. Every member of a summary is read from
-//! the record, so nothing is canned.
+//! time, with `NextToken` reported for a page that FILLED the page size and resuming
+//! strictly after the entry the page stopped on in that order. Every member of a summary is
+//! read from the record, so nothing is canned.
 //!
 //! Each rule is asserted over a SET of inputs: the records held, the table named, the
 //! region, the page size (on each bound the member publishes and one past it), the age of
@@ -113,13 +113,27 @@ fn running_export(region: &str, table: &str, started_at: SystemTime, export_type
     }
 }
 
-/// A `NextToken` carrying `cursor`, in the form this operation mints one.
+/// A `NextToken` carrying `cursor`, in the form this operation mints one: the cursor's
+/// bytes padded to whole eight-byte blocks, in hex, so the value takes the hexadecimal
+/// 16-character blocks the member is held to.
 ///
 /// A client never builds one — it copies the value a page reported — so this is only how
 /// a case here names a cursor the store holds no record after.
 fn token_for(cursor: &str) -> String {
-    cursor.bytes().map(|byte| format!("{byte:02x}")).collect()
+    let mut bytes = cursor.as_bytes().to_vec();
+    while !bytes.len().is_multiple_of(8) {
+        bytes.push(0);
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+
+/// The page size the listing reports when the request names none: the ceiling the member
+/// publishes (`ListExportsMaxLimit`, range 1..=25).
+const DEFAULT_PAGE: usize = 25;
+
+/// How many hexadecimal characters one block of a minted token carries
+/// (`([0-9a-f]{16})+`, the expression a refusal of a token states).
+const TOKEN_BLOCK: usize = 16;
 
 /// The `ExportSummaries` of a response, as a list.
 fn summaries(body: &Value) -> Vec<Value> {
@@ -400,9 +414,12 @@ async fn a_page_carries_max_results_records_and_a_token_that_resumes_after_it() 
     ];
 
     for (case, max_results) in cases {
+        // The size one page may carry: the one the request asked for, or the listing's own
+        // when it asked for none.
+        let page_size = max_results.map_or(DEFAULT_PAGE, |size| usize::try_from(size).unwrap_or(0));
         let mut walked: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
-        for _ in 0..=all.len() {
+        for _ in 0..=all.len() + 1 {
             let mut body = json!({});
             if let Some(size) = max_results {
                 body["MaxResults"] = json!(size);
@@ -413,30 +430,34 @@ async fn a_page_carries_max_results_records_and_a_token_that_resumes_after_it() 
             let answered = ok(&router, "ListExports", body.clone()).await;
             let page = listed_arns(&answered);
             let remaining = all.len() - walked.len();
-            let expected_page = max_results
-                .map_or(remaining, |size| usize::try_from(size).unwrap_or(0))
-                .min(remaining);
+            let expected_page = page_size.min(remaining);
             assert_eq!(
                 page.len(),
                 expected_page,
                 "case {case:?}: expected {expected_page} records on this page, got {answered}"
             );
-            walked.extend(page);
+            walked.extend(page.clone());
             token = next_token(&answered);
             match token.as_deref() {
                 Some(minted) => {
-                    assert!(
-                        walked.len() < all.len(),
-                        "case {case:?}: a NextToken is reported only while records remain, \
-                         got {answered}"
+                    // A cursor is reported for a page that FILLED the page size — the
+                    // place the walk carries on from — and for no other page.
+                    assert_eq!(
+                        page.len(),
+                        page_size,
+                        "case {case:?}: a cursor is reported only for a page that filled the \
+                         page size, got {answered}"
                     );
-                    // Opaque, and in the form this operation mints: a value a client may
-                    // send straight back without reading anything out of it.
+                    // Opaque, and in the form this operation mints: hexadecimal in whole
+                    // 16-character blocks, which a client may send straight back without
+                    // reading anything out of it.
                     assert!(
                         !minted.is_empty()
+                            && minted.len().is_multiple_of(TOKEN_BLOCK)
                             && minted.bytes().all(|byte| byte.is_ascii_digit()
                                 || (b'a'..=b'f').contains(&byte)),
-                        "case {case:?}: the minted token {minted:?} must be an opaque cursor"
+                        "case {case:?}: the minted token {minted:?} must be an opaque cursor \
+                         of {TOKEN_BLOCK}-character hexadecimal blocks"
                     );
                 }
                 None => break,
@@ -568,8 +589,9 @@ async fn a_request_outside_the_members_own_bounds_is_refused() {
     // Rows differ in which member is out of bounds: the page size either side of the
     // range the model publishes (`ListExportsMaxLimit`, range 1..=25), and a `NextToken`
     // that is not a token this operation mints — not hexadecimal, an odd number of hex
-    // digits, hex that denotes no text, and well-formed but standing for no cursor at all.
-    let cases: [(&str, Value); 7] = [
+    // digits, fewer digits than one block, no digits at all, and a whole block that
+    // denotes no text.
+    let cases: [(&str, Value); 8] = [
         (
             "a page smaller than the member allows",
             json!({"MaxResults": 0}),
@@ -581,8 +603,15 @@ async fn a_request_outside_the_members_own_bounds_is_refused() {
         ),
         ("a token that is not hexadecimal", json!({"NextToken": "zzzz"})),
         ("a token of odd length", json!({"NextToken": "abc"})),
-        ("a token that denotes no text", json!({"NextToken": "ff"})),
+        (
+            "a token shorter than one block",
+            json!({"NextToken": "ff"}),
+        ),
         ("a token carrying no cursor", json!({"NextToken": ""})),
+        (
+            "a block that denotes no text",
+            json!({"NextToken": "fffffffffffffffe"}),
+        ),
     ];
 
     for (case, body) in cases {
@@ -598,12 +627,14 @@ async fn a_request_outside_the_members_own_bounds_is_refused() {
         );
     }
 
-    // A token this operation did not mint is refused in the wording this service states
-    // for that case, rather than taken for the first page.
+    // A token this operation did not mint is refused as the constraint on the member it
+    // breaks — the value sent and the expression a token must satisfy — rather than taken
+    // for the first page.
     let (_, answered) = call(&router, "ListExports", json!({"NextToken": "zzzz"})).await;
     assert_eq!(
         message(&answered),
-        "Invalid NextToken",
-        "a token this operation did not mint is refused as an invalid NextToken, got {answered}"
+        "Invalid Request: 1 validation error detected: Value 'zzzz' at 'nextToken' failed to \
+         satisfy constraint: Member must satisfy regular expression pattern: ([0-9a-f]{16})+",
+        "a token this operation did not mint is refused by the form a token takes, got {answered}"
     );
 }

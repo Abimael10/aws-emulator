@@ -10,6 +10,11 @@
 //! (`crate::state::Export`) is the export catalogue's, so `DescribeExport` and
 //! `ListExports` report the very export this started.
 //!
+//! The members the request STATES are held to the rules this surface keeps for them before
+//! any of that ([`crate::state::check_export_request_members`]): the idempotency token the
+//! export is asked for under must be stated, and a destination prefix it names must take
+//! the length the member is held to.
+//!
 //! The export's own WRITE is the caller's: its objects are written into the destination
 //! bucket with the permissions of the principal that asked for the export
 //! ([`crate::state::export_write_denial`]), so an export whose write the policies in force
@@ -211,6 +216,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // The members this request STATES, held to the rules this surface keeps for them
+        // before anything is resolved or recorded: the idempotency token it must state, and
+        // the destination prefix it may ([`crate::state::check_export_request_members`]).
+        // First, because these are faults of the REQUEST rather than of the table it
+        // addresses or of the catalogue it would be recorded in.
+        crate::state::check_export_request_members(
+            input.client_token.as_deref(),
+            input.s3_prefix.as_deref(),
+        )
+        .map_err(bad_request)?;
         // "The Amazon Resource Name (ARN) associated with the table to export"
         // (`$TableArn`): an ARN-only member, so it is held to the form and the scope such
         // an ARN takes rather than taken for a table name.
@@ -233,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.apply_due_transitions(now);
             let table = store
                 .table(&region, &name)
-                .map_err(|error| lift(&name, error))?;
+                .map_err(|error| lift(&input.table_arn, error))?;
             // A caller the policies in force do not let export this table is refused
             // before any export is recorded.
             if let Some(denial) = crate::state::authorization::control_denial(
@@ -672,13 +687,17 @@ fn bad_request(error: crate::state::RequestError) -> ExportTableToPointInTimeErr
 /// table with the name TableName does not currently exist within the subscriber's account
 /// or the subscriber is operating in the wrong Amazon Web Services Region" — which is the
 /// miss this operation models, rather than the control plane's
-/// `ResourceNotFoundException`, which it does not. The message is built from the request:
-/// the table it asked for.
-fn lift(table_name: &str, error: crate::state::RequestError) -> ExportTableToPointInTimeError {
+/// `ResourceNotFoundException`, which it does not.
+///
+/// The variable part of the sentence is the table AS THE REQUEST NAMED IT
+/// ([`crate::state::table_not_found_message`]): this operation addresses its source table
+/// by ARN alone (`$TableArn`), so what a caller reads back is the ARN it sent rather than
+/// the name resolved out of it — the value it would have to correct.
+fn lift(addressed: &str, error: crate::state::RequestError) -> ExportTableToPointInTimeError {
     match error {
         crate::state::RequestError::NotFound(_) => {
             ExportTableToPointInTimeErrorModeled::TableNotFoundException(TableNotFoundException {
-                message: Some(crate::state::table_not_found_message(table_name)),
+                message: Some(crate::state::table_not_found_message(addressed)),
             })
             .into()
         }

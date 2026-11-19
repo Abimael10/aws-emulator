@@ -10,11 +10,11 @@
 //! The page is taken in DESCENDING `ExportArn` order — "in reverse alphanumeric order of
 //! ExportArn" (this operation's own doc), which the store walks back over the keys it
 //! holds exports by ([`crate::state::new_export_arn`]) — `MaxResults` entries at a time,
-//! and `NextToken` is reported exactly when more remain, so the next call resumes
-//! strictly after the entry this page stopped on in that same order. The token is that
-//! cursor in an opaque form (`ExportNextToken` publishes no pattern of its own), so a
-//! token this operation mints is one a client may send straight back and one it did not
-//! mint stands for no page.
+//! and a page that FILLED that size reports the cursor it stopped on, so the next call
+//! resumes strictly after that entry in the same order and the first short page ends the
+//! walk. The token is that cursor in an opaque form, in the hexadecimal blocks the member
+//! is held to ([`NEXT_TOKEN_PATTERN`]), so a token this operation mints is one a client may
+//! send straight back and one it did not mint stands for no page.
 //!
 //! A record that has not finished is still reported: "Export can be in one of the
 //! following states: IN_PROGRESS, COMPLETED, or FAILED" (`ExportSummary$ExportStatus`),
@@ -233,12 +233,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which the model bounds at 25 — the page size this reports when the request
         // names none.
         let limit = usize::try_from(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS)).unwrap_or(0);
-        let truncated = summaries.len() > limit;
         summaries.truncate(limit);
-        // "If this value is returned, there are additional results to be displayed"
-        // (`ListExportsOutput$NextToken`): reported only where entries remain beyond this
-        // page, and standing for the entry the page stopped on.
-        let next_token = truncated
+        // The page is RESUMABLE exactly when it FILLED the page size the request asked for:
+        // a listing that returned fewer entries than one page may carry has reached the end
+        // of the records it selects, and one that filled the page stopped where the page
+        // ended rather than where the records did. So a full page reports the cursor it
+        // stopped on — "call ListExports again, with NextToken set to this value"
+        // (`ListExportsOutput$NextToken`) — and the call that resumes it answers the
+        // remaining entries, with no cursor once that page is short. A cursor therefore
+        // means "there is a place to carry on from" rather than a promise of further
+        // entries, which is the same rule this service's item readers state for their own
+        // continuation (`Query`/`Scan`'s "The presence of LastEvaluatedKey ... does not
+        // mean that there is more data"), and the page after the last full one is the
+        // empty one that ends the walk.
+        let next_token = (limit > 0 && summaries.len() == limit)
             .then(|| {
                 summaries
                     .last()
@@ -262,31 +270,88 @@ const DEFAULT_MAX_RESULTS: i32 = 25;
 /// The IAM action this operation performs, which a refusal names.
 const ACTION: &str = "dynamodb:ListExports";
 
-/// The cursor a truncated page reports: the cursor's bytes in hex.
+/// The form a `NextToken` of this listing takes: hexadecimal in BLOCKS of sixteen
+/// characters.
 ///
-/// `ExportNextToken` publishes no pattern or length of its own, so the token carries
-/// nothing but the entry the page stopped on, in a form that is opaque to a client and
-/// that this operation can tell apart from a value it never minted.
+/// `ExportNextToken` publishes no pattern of its own, and the service holds the member to
+/// this one — it is the expression a refusal of a token quotes ([`invalid_next_token`]), so
+/// it is also the form a token this operation MINTS has to take: a client that sends back
+/// what it was given must not be refused by the rule that refuses everything else.
+const NEXT_TOKEN_PATTERN: &str = "([0-9a-f]{16})+";
+
+/// The bytes one block of that form carries: sixteen hexadecimal characters are eight
+/// bytes, so a cursor is padded up to a whole number of them before it is encoded
+/// ([`encode_token`]).
+const NEXT_TOKEN_BLOCK_BYTES: usize = 8;
+
+/// The padding byte a cursor shorter than a whole block is filled out with, and which is
+/// dropped again when the token is read back ([`decode_token`]). An `ExportArn` carries no
+/// NUL, so padding cannot be mistaken for part of the cursor.
+const NEXT_TOKEN_PAD: u8 = 0;
+
+/// The cursor a truncated page reports: the cursor's bytes, padded to a whole number of
+/// blocks, in hex.
+///
+/// The token carries nothing but the entry the page stopped on, in a form that is opaque to
+/// a client, that this operation can tell apart from a value it never minted, and that
+/// takes the form the member is held to ([`NEXT_TOKEN_PATTERN`]).
 fn encode_token(cursor: &str) -> String {
-    ::hex::encode(cursor.as_bytes())
+    let mut bytes = cursor.as_bytes().to_vec();
+    while !bytes.len().is_multiple_of(NEXT_TOKEN_BLOCK_BYTES) {
+        bytes.push(NEXT_TOKEN_PAD);
+    }
+    ::hex::encode(bytes)
 }
 
 /// The cursor a `NextToken` stands for, or the refusal for a token this operation did
 /// not mint.
+///
+/// The form is checked first ([`NEXT_TOKEN_PATTERN`]): a value outside it is no token of
+/// this listing at all, which is the constraint refusal that names the expression. A value
+/// that takes the form and still stands for no cursor is refused as the token it is not.
 fn decode_token(token: &str) -> Result<String, ListExportsError> {
-    let bytes = ::hex::decode(token).map_err(|_| invalid_next_token())?;
-    let cursor = String::from_utf8(bytes).map_err(|_| invalid_next_token())?;
+    if token.is_empty()
+        || !token.len().is_multiple_of(NEXT_TOKEN_BLOCK_BYTES * 2)
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid_next_token(token));
+    }
+    let bytes = ::hex::decode(token).map_err(|_| invalid_next_token(token))?;
+    let cursor = String::from_utf8(
+        bytes
+            .into_iter()
+            .filter(|byte| *byte != NEXT_TOKEN_PAD)
+            .collect(),
+    )
+    .map_err(|_| invalid_next_token(token))?;
     if cursor.is_empty() {
-        return Err(invalid_next_token());
+        return Err(invalid_next_token(token));
     }
     Ok(cursor)
 }
 
-/// How a `NextToken` that is not one of this operation's is refused: the wording this
-/// service states for that case wherever a reader pages by a token.
-fn invalid_next_token() -> ListExportsError {
-    crate::scaffolded::Scaffolded::validation("Invalid NextToken")
+/// How a `NextToken` that is not one of this operation's is refused: the constraint clause
+/// DynamoDB states for that member — the value the request sent and the expression a token
+/// must satisfy — inside the envelope that counts it and under the sentence this surface
+/// states its own request refusals with ([`crate::state::INVALID_REQUEST_PREFIX`]).
+fn invalid_next_token(token: &str) -> ListExportsError {
+    let clause = crate::state::constraint_clause(
+        NEXT_TOKEN_MEMBER_PATH,
+        Some(&crate::state::echoed_clause_value(token)),
+        &crate::state::pattern_requirement(NEXT_TOKEN_PATTERN),
+    );
+    let envelope = crate::state::validation_message([clause.clone()]).unwrap_or(clause);
+    crate::scaffolded::Scaffolded::validation(format!(
+        "{}{envelope}",
+        crate::state::INVALID_REQUEST_PREFIX
+    ))
 }
+
+/// How a refusal names the page cursor: the path the request validator reports a violation
+/// of the member against, as the model spells it on the wire (lowerCamel).
+const NEXT_TOKEN_MEMBER_PATH: &str = "nextToken";
 
 /// The modelled server error for a request that cannot reach this service's store.
 fn store_unavailable() -> ListExportsError {

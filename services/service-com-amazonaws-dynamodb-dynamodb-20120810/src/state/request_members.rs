@@ -36,8 +36,16 @@ pub const KEY_SCHEMA_MEMBER_PATH: &str = "keySchema";
 /// cannot drift apart. The clause states `Value null` — the absence itself — and names the
 /// member by the path that walk reports, which is the path a client reads out of the message.
 pub fn absent_member_message(path: &str) -> String {
+    format!("1 validation error detected: {}", absent_member_clause(path))
+}
+
+/// That clause on its own, outside the envelope that counts it: what a refusal stating
+/// SEVERAL violated members carries for the one the request states no value for, beside
+/// the clauses of the other members it is counted with.
+///
+/// The one wording for the absence, so the two readings of it cannot drift apart.
+pub fn absent_member_clause(path: &str) -> String {
     format!(
-        "1 validation error detected: Value null at '{path}' failed to satisfy constraint: \
-         Member must not be null"
+        "Value null at '{path}' failed to satisfy constraint: Member must not be null"
     )
 }

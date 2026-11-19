@@ -483,3 +483,61 @@ async fn a_table_that_does_not_exist_is_refused_by_both_operations() {
         "case the present table: it is served, got {served}"
     );
 }
+
+#[tokio::test]
+async fn both_operations_report_the_recovery_window_in_days_beside_the_period() {
+    let router = emulator();
+
+    // Rows differ in the period the enable asked for: none at all (the documented
+    // default), each published bound of the modelled 1..=35 range, and a value inside it.
+    // The window in days is the period in force, so the two members carry one value.
+    let cases: [(&str, Option<i64>, i64); 4] = [
+        ("no period named", None, 35),
+        ("the smallest period", Some(1), 1),
+        ("a period inside the range", Some(9), 9),
+        ("the largest period", Some(35), 35),
+    ];
+
+    for (case, asked, expected) in cases {
+        let name = format!("Windowed{}", case.replace(' ', ""));
+        create_table(&router, &name).await;
+        let updated = set_recovery(&router, &name, true, asked).await;
+        let described = ok(
+            &router,
+            "DescribeContinuousBackups",
+            json!({"TableName": name}),
+        )
+        .await;
+
+        for (operation, reported) in [
+            ("UpdateContinuousBackups", &updated),
+            ("DescribeContinuousBackups", &described),
+        ] {
+            assert_eq!(
+                recovery(reported)["PointInTimeRecoveryWindowDays"].clone(),
+                json!(expected),
+                "case {case} on {operation}: the window in days is the period in force, got \
+                 {reported}"
+            );
+            assert_eq!(
+                recovery(reported)["PointInTimeRecoveryWindowDays"].clone(),
+                recovery(reported)["RecoveryPeriodInDays"].clone(),
+                "case {case} on {operation}: the two members carry the one setting, got \
+                 {reported}"
+            );
+        }
+    }
+
+    // A table whose recovery is OFF has no window to report, so neither member is there.
+    create_table(&router, "Windowless").await;
+    let off = ok(
+        &router,
+        "DescribeContinuousBackups",
+        json!({"TableName": "Windowless"}),
+    )
+    .await;
+    assert!(
+        recovery(&off)["PointInTimeRecoveryWindowDays"].is_null(),
+        "case recovery off: a table with no window reports no window in days, got {off}"
+    );
+}

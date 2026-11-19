@@ -202,7 +202,13 @@ async fn every_export_time_outside_the_window_states_the_one_fixed_sentence() {
         let (status, answered) = call(
             &router,
             "ExportTableToPointInTime",
-            json!({"TableArn": table_arn, "S3Bucket": BUCKET, "ExportTime": instant}),
+            json!({
+                "TableArn": table_arn,
+                "S3Bucket": BUCKET,
+                "ExportTime": instant,
+                // The idempotency token every export is asked for under, one per row.
+                "ClientToken": format!("windowless-{}", case.replace(' ', "-")),
+            }),
         )
         .await;
         assert_eq!(
@@ -224,6 +230,7 @@ async fn every_export_time_outside_the_window_states_the_one_fixed_sentence() {
         "TableArn": table_arn,
         "S3Bucket": BUCKET,
         "ExportTime": (earliest + latest) / 2.0,
+        "ClientToken": "windowless-inside-the-window",
     });
     let served = ok(&router, "ExportTableToPointInTime", inside).await;
     assert!(

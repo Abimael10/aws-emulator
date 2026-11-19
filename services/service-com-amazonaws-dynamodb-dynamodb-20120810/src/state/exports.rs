@@ -439,8 +439,85 @@ impl Export {
 /// The `ExportNotFoundException` message an export-addressed operation answers an ARN it
 /// holds no export for with: built from the request — the ARN the caller addressed — and
 /// nothing about what the catalogue does hold.
+///
+/// The sentence states the miss TWICE over the ARN
+/// ([`EXPORT_NOT_FOUND_PREFIX`]), which is how DynamoDB words this refusal: the
+/// exception carries its own leading sentence over the one the lookup states, and the
+/// whole text is what a client matching the refusal reads. Only the ARN varies.
 pub fn export_not_found(export_arn: &str) -> RequestError {
-    RequestError::NotFound(format!("Export not found: {export_arn}"))
+    RequestError::NotFound(format!(
+        "{EXPORT_NOT_FOUND_PREFIX}{EXPORT_NOT_FOUND_PREFIX}{export_arn}"
+    ))
+}
+
+/// The leading sentence of the `ExportNotFoundException` message, which that refusal
+/// carries once for the lookup that could not resolve the ARN and once for the exception
+/// that reports it ([`export_not_found`]).
+pub const EXPORT_NOT_FOUND_PREFIX: &str = "Export not found: ";
+
+/// The fewest characters an `S3Prefix` an export is taken with may have.
+///
+/// The published `S3Prefix` shape carries only `@length min 0 max 1024`, and the service
+/// holds a prefix it is GIVEN to a floor of three characters on top of that — the same
+/// floor a resource name of this service carries — so a shorter prefix is refused as a
+/// length violation of that member rather than accepted at coordinates the service would
+/// never write to.
+pub const MIN_EXPORT_S3_PREFIX_LENGTH: usize = 3;
+
+/// How a refusal names the `S3Prefix` member: the path the request validator reports a
+/// violation of it against, as the model spells the member on the wire (lowerCamel).
+pub const EXPORT_S3_PREFIX_MEMBER_PATH: &str = "s3Prefix";
+
+/// How the same refusal names the member an export's idempotency token arrives in, in that
+/// same spelling.
+pub const EXPORT_CLIENT_TOKEN_MEMBER_PATH: &str = "clientToken";
+
+/// Hold the members an export is ASKED FOR to the rules this surface keeps for them, over
+/// the request as it stated them.
+///
+/// Two rules, both about the request alone and neither declared by the published model, so
+/// both are settled here before any export is recorded:
+///
+/// * the export's idempotency TOKEN must be stated. "Providing a ClientToken makes the call
+///   to ExportTableToPointInTimeInput idempotent" (`$ClientToken`) is what the token is
+///   FOR, and this surface requires it: the token is what tells one attempt from a retry of
+///   it, so an export asked for without one cannot be placed against the attempts that came
+///   before it at all. A request that states no value for the member — and one that states
+///   it as an explicit `null`, which is the same absence — earns the clause the validating
+///   walk states for a member that must carry a value ([`absent_member_clause`]);
+/// * the `S3Prefix` it is written under, where the request states one, must have at least
+///   [`MIN_EXPORT_S3_PREFIX_LENGTH`] characters, which is the length clause over the value
+///   the request sent. A request stating NO prefix asks for none, which is no violation:
+///   such an export is written under the destination's root ([`export_object_prefix`]).
+///
+/// Several violated members are ONE refusal, in the order the input declares the two
+/// members (`smithy_query(query="shape",
+/// shape="com.amazonaws.dynamodb#ExportTableToPointInTimeInput")` declares `ClientToken`
+/// before `S3Prefix`), inside the envelope that counts them and under the sentence this
+/// surface states its own request refusals with ([`INVALID_REQUEST_PREFIX`]).
+pub fn check_export_request_members(
+    client_token: Option<&str>,
+    s3_prefix: Option<&str>,
+) -> Result<(), RequestError> {
+    let mut clauses: Vec<String> = Vec::new();
+    if client_token.is_none() {
+        clauses.push(absent_member_clause(EXPORT_CLIENT_TOKEN_MEMBER_PATH));
+    }
+    if let Some(prefix) = s3_prefix {
+        if prefix.chars().count() < MIN_EXPORT_S3_PREFIX_LENGTH {
+            clauses.push(constraint_clause(
+                EXPORT_S3_PREFIX_MEMBER_PATH,
+                Some(&echoed_clause_value(prefix)),
+                &min_length_requirement(MIN_EXPORT_S3_PREFIX_LENGTH),
+            ));
+        }
+    }
+    match validation_message(clauses) {
+        Some(envelope) => Err(RequestError::Validation(format!(
+            "{INVALID_REQUEST_PREFIX}{envelope}"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Hold an ARN-addressed EXPORT operation's `ExportArn` to the form such an ARN takes in

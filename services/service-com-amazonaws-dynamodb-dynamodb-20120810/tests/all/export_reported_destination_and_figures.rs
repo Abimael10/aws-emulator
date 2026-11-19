@@ -111,14 +111,28 @@ async fn exportable_table(router: &MultiServiceRouter, name: &str, items: usize)
     .await;
 }
 
-/// An `ExportTableToPointInTime` body for `table` carrying the two required members and
-/// whatever else `extra` names.
+/// An `ExportTableToPointInTime` body for `table` carrying the two required members, the
+/// idempotency token every export is asked for under — a token of its own per call, so each
+/// body asks for a NEW export — and whatever else `extra` names.
 fn export_body(table: &str, bucket: &str, extra: &Value) -> Value {
-    let mut body = json!({"TableArn": state::table_arn(REGION, table), "S3Bucket": bucket});
+    let mut body = json!({
+        "TableArn": state::table_arn(REGION, table),
+        "S3Bucket": bucket,
+        "ClientToken": fresh_token(),
+    });
     for (member, value) in extra.as_object().cloned().unwrap_or_default() {
         body[member] = value;
     }
     body
+}
+
+/// One token no other call of this suite uses.
+fn fresh_token() -> String {
+    static NEXT: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
+    format!(
+        "reported-figures-{}",
+        NEXT.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 /// The `ExportDescription` of either operation's response.

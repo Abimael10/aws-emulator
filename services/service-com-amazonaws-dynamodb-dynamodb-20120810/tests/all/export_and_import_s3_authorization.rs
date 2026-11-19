@@ -592,6 +592,8 @@ async fn an_export_writes_its_objects_only_where_the_callers_policies_allow_the_
                 "TableArn": state::table_arn(REGION, &table),
                 "S3Bucket": bucket,
                 "ExportFormat": "DYNAMODB_JSON",
+                // The idempotency token every export is asked for under, one per row.
+                "ClientToken": format!("authorization-{case}"),
             }),
         )
         .await["ExportDescription"]
@@ -677,6 +679,7 @@ async fn the_accounts_own_credential_exports_without_an_identity_policy() {
         json!({
             "TableArn": state::table_arn(REGION, "ExportAuthAmbient"),
             "S3Bucket": bucket,
+            "ClientToken": "authorization-ambient-credential",
         }),
     )
     .await["ExportDescription"]

@@ -81,10 +81,25 @@ async fn recorded_exports(router: &MultiServiceRouter, name: &str) -> usize {
         .map_or(0, Vec::len)
 }
 
+/// One token no other call of this suite uses: every export is asked for under the
+/// idempotency token this surface requires, and a token of its own per call is what makes
+/// each row a NEW export rather than a replay of the row before it.
+fn fresh_token() -> String {
+    static NEXT: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
+    format!(
+        "recovery-precondition-{}",
+        NEXT.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 /// Assert `table` is SERVED an export asking for `extra`, and that the record the call
 /// answered is the one `DescribeExport` reports — the round trip through the reader.
 async fn assert_served(router: &MultiServiceRouter, case: &str, name: &str, extra: Value) -> String {
-    let mut body = json!({"TableArn": state::table_arn(REGION, name), "S3Bucket": BUCKET});
+    let mut body = json!({
+        "TableArn": state::table_arn(REGION, name),
+        "S3Bucket": BUCKET,
+        "ClientToken": fresh_token(),
+    });
     for (member, value) in extra.as_object().cloned().unwrap_or_default() {
         body[member] = value;
     }
@@ -116,7 +131,11 @@ async fn assert_served(router: &MultiServiceRouter, case: &str, name: &str, extr
 /// Assert `table` is REFUSED an export asking for `extra`, with the modelled refusal of a
 /// table that has no point in time to export from.
 async fn assert_refused(router: &MultiServiceRouter, case: &str, name: &str, extra: Value) {
-    let mut body = json!({"TableArn": state::table_arn(REGION, name), "S3Bucket": BUCKET});
+    let mut body = json!({
+        "TableArn": state::table_arn(REGION, name),
+        "S3Bucket": BUCKET,
+        "ClientToken": fresh_token(),
+    });
     for (member, value) in extra.as_object().cloned().unwrap_or_default() {
         body[member] = value;
     }

@@ -348,6 +348,7 @@ async fn an_export_reports_the_items_of_the_point_in_time_it_is_taken_at() {
             ),
             "S3Bucket": "pitr-export-snapshots",
             "ExportTime": earliest,
+            "ClientToken": "pitr-item-history-snapshot",
         }),
     )
     .await;

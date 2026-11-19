@@ -810,6 +810,18 @@ pub fn enum_value_requirement(values: &[&str]) -> String {
     format!("Member must satisfy enum value set: [{}]", values.join(", "))
 }
 
+/// The sentence this service's own request code states a refusal of a request's
+/// members UNDER, where the refusal is the operation's own rather than the
+/// boundary validator's: the operation says the request was not a valid one and
+/// then states what was wrong with it, which is the wording recorded for the
+/// refusals the handlers word themselves (an export's destination prefix, a
+/// replication precision that is already in force).
+///
+/// Named once here so the two surfaces that state it cannot drift apart; the
+/// clauses under it are the same ones every other refusal of this service is
+/// built from ([`constraint_clause`], [`validation_message`]).
+pub const INVALID_REQUEST_PREFIX: &str = "Invalid Request: ";
+
 /// A refusal of ONE input member: the envelope over a single clause.
 pub fn invalid_member(path: &str, echoed: Option<&str>, requirement: &str) -> RequestError {
     refused(constraint_clause(path, echoed, requirement))

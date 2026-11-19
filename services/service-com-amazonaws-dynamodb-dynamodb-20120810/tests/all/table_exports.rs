@@ -197,9 +197,21 @@ fn description(body: &Value) -> Value {
 }
 
 /// An `ExportTableToPointInTime` body for `table` with no member but the two required
-/// ones.
+/// ones and the idempotency token every export is asked for under
+/// (`state::EXPORT_CLIENT_TOKEN_MEMBER_PATH`): a token of its own per call, so each body
+/// this builds asks for a NEW export, and a test that asks the same body twice replays
+/// the token it already carries.
 fn export_body(table_arn: &str) -> Value {
-    json!({"TableArn": table_arn, "S3Bucket": BUCKET})
+    json!({"TableArn": table_arn, "S3Bucket": BUCKET, "ClientToken": fresh_token()})
+}
+
+/// One token no other call of this suite uses.
+fn fresh_token() -> String {
+    static NEXT: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
+    format!(
+        "table-exports-{}",
+        NEXT.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 #[tokio::test]
@@ -484,9 +496,11 @@ async fn an_accepted_export_is_recorded_and_read_back() {
                 "case {case:?}: a running export reports no {member}, got {reported}"
             );
         }
-        assert!(
-            reported["ClientToken"].is_null(),
-            "case {case:?}: a request that carried no client token reports none, got {reported}"
+        assert_eq!(
+            reported["ClientToken"],
+            body["ClientToken"],
+            "case {case:?}: the record echoes the client token the request asked under, got \
+             {reported}"
         );
 
         // The reader answers from that one record, and the description it gives while the
@@ -737,8 +751,9 @@ async fn a_table_arn_that_addresses_no_table_of_this_endpoint_is_refused() {
     );
     assert_eq!(
         message(&answered),
-        "Table not found: Absent",
-        "the refusal names the table the request asked for"
+        format!("Table not found: {}", state::table_arn(REGION, "Absent")),
+        "the refusal echoes the table as the request named it — this operation addresses its \
+         source table by ARN alone"
     );
 
     // Rows differ in HOW the value fails to be an ARN of this service naming a table of

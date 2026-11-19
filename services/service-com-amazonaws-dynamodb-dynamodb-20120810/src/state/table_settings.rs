@@ -327,6 +327,11 @@ impl PointInTimeRecovery {
         let recovery = match self.restorable_window(now) {
             Some((earliest, latest)) => PointInTimeRecoveryDescription {
                 point_in_time_recovery_status: Some(POINT_IN_TIME_RECOVERY_ENABLED.to_string()),
+                // The window in force, which the continuous-backups readers report BESIDE
+                // the period the public model names it by: the two members carry the one
+                // setting, so a client reading either learns how far back this table may be
+                // restored or exported from.
+                point_in_time_recovery_window_days: Some(self.recovery_period_in_days),
                 recovery_period_in_days: Some(self.recovery_period_in_days),
                 earliest_restorable_date_time: Some(super::reported_date(earliest)),
                 latest_restorable_date_time: Some(super::reported_date(latest)),

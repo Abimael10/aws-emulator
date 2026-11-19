@@ -293,6 +293,9 @@ async fn a_completed_exports_manifest_counts_and_names_the_items_it_wrote() {
                 "S3Bucket": BUCKET,
                 "S3Prefix": PREFIX,
                 "ExportFormat": "DYNAMODB_JSON",
+                // The idempotency token every export is asked for under, one per row so
+                // each row asks for an export of its own.
+                "ClientToken": format!("manifest-agreement-{}", row.table),
             }),
         )
         .await;

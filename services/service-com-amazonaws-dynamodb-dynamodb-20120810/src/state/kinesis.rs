@@ -24,7 +24,7 @@ pub fn kinesis_precision_unchanged(
     precision: &str,
 ) -> RequestError {
     RequestError::Validation(format!(
-        "Invalid Request: Precision is already set to the desired value of {precision} for \
+        "{INVALID_REQUEST_PREFIX}Precision is already set to the desired value of {precision} for \
          tableId: {table_id}, kdsArn: {stream_arn}"
     ))
 }

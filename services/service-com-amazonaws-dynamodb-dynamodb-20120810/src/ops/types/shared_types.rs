@@ -1090,6 +1090,10 @@ pub struct ContinuousBackupsDescription {
 #[derive(Debug, Clone, Default)]
 pub struct PointInTimeRecoveryDescription {
     pub point_in_time_recovery_status: Option<String>,
+    /// The recovery window DynamoDB reports the setting under, beside the member the
+    /// published model names the same setting by: both carry the number of preceding days
+    /// the table's continuous backups cover.
+    pub point_in_time_recovery_window_days: Option<i32>,
     pub recovery_period_in_days: Option<i32>,
     pub earliest_restorable_date_time: Option<::aws_smithy_types::DateTime>,
     pub latest_restorable_date_time: Option<::aws_smithy_types::DateTime>,
