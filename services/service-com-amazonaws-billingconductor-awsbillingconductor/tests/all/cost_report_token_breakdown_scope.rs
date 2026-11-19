@@ -249,7 +249,10 @@ fn bare_id(arn: &str) -> String {
 /// The same billing period with its month spelled without a leading zero, the other
 /// spelling the modelled `BillingPeriod` pattern `^\d{4}-(0?[1-9]|1[012])$` allows. A month
 /// from October on has only the one spelling.
-fn one_digit_month(billing_period: &str) -> String {
+///
+/// `pub(crate)` because the sibling suite `tests/all/pagination_token_opacity.rs` names the
+/// same two spellings of one month rather than re-spelling this.
+pub(crate) fn one_digit_month(billing_period: &str) -> String {
     let (year, month) = billing_period
         .split_once('-')
         .expect("a billing period is spelled YYYY-MM");

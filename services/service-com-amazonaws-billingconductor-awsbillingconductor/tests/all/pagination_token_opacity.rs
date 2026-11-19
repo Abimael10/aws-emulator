@@ -13,6 +13,13 @@
 //! truncated page. A token a listing DID mint resumes exactly where its page stopped, and
 //! carries neither an ARN nor an account id nor an index a caller could edit.
 //!
+//! A read ANSWERED FOR ONE BILLING PERIOD belongs to that month as well as to the listing,
+//! which [`a_period_scoped_token_is_refused_by_a_read_of_another_billing_period`] and
+//! [`a_period_scoped_token_resumes_every_request_naming_the_month_it_was_minted_for`] pin:
+//! the month decides which resources were in effect and what every reported element says
+//! about them, so each month is its own sequence, a token is refused by a read of any other
+//! month, and every spelling of the month it was minted for resumes it.
+//!
 //! The rows span what the rule generalises over rather than one reported call: EVERY
 //! paginated read this service implements (whether its cursor is a stored ARN, an account
 //! id, a fixed-width position or a composite report key, and whether its sequence is the
@@ -29,6 +36,7 @@
 
 use serde_json::{json, Value};
 
+use crate::cost_report_token_breakdown_scope::one_digit_month;
 use crate::payer_account_gate::{error_code, Emulator};
 
 /// How many pricing plans, pricing rules, billing groups and custom line items the
@@ -59,6 +67,11 @@ struct Read {
     /// `GetBillingGroupCostReport`'s is `@range(200..300)`, so neither mints a token over
     /// a fixture this size; their minted-token walks are
     /// `tests/all/billing_group_core_loop.rs` and `tests/all/billing_group_cost_report.rs`.
+    ///
+    /// In [`period_scoped_fixture`], whose rows ask for a page through [`page_request`],
+    /// this says whether the read's own `MaxResults` picks the page: a read that models
+    /// none is paged at the server's own page ([`SERVER_PAGE`]) instead, over a fixture
+    /// that holds one row more than that.
     mints: bool,
 }
 
@@ -693,5 +706,546 @@ async fn a_minted_next_token_is_opaque_and_resumes_the_listing_it_belongs_to() {
              order, got {walked:?}",
             read.operation
         );
+    }
+}
+
+// --- The month a period-scoped token belongs to --------------------------------------
+//
+// A read of this service that is ANSWERED FOR one billing period walks a sequence that
+// month decides: which resources were in effect then, and what every reported element says
+// about them (the generation in force then, the counts and memberships of that month, the
+// amounts that month was charged). So each month is its own sequence, and the month travels
+// in the scope of the token a truncated page mints — the rows below are every such read, and
+// per read every way a second request can name another month or the same one.
+
+/// The page the server itself cuts a listing at when the request asks for none — the page
+/// `ListAccountAssociations`, which models no `MaxResults`, is always cut at. Read from the
+/// service rather than re-spelled, so this suite cannot drift from the bound it pages over.
+const SERVER_PAGE: usize =
+    service_com_amazonaws_billingconductor_awsbillingconductor::state::DEFAULT_PAGE_SIZE as usize;
+
+/// How many linked accounts the fixture below puts in one billing group: one past
+/// [`SERVER_PAGE`], so the only page `ListAccountAssociations` can be asked for still leaves
+/// a remainder and hands back a `NextToken`.
+const ACCOUNTS_PAST_ONE_PAGE: usize = SERVER_PAGE + 1;
+
+/// How many of each other resource the fixture below creates: three, so a one-row page
+/// always leaves a remainder.
+const PERIOD_POPULATION: usize = 3;
+
+/// How many linked accounts ONE request may name: the maximum of the modelled
+/// `AccountIdList` length (0..30), which both `AccountGrouping.LinkedAccountIds` and
+/// `AssociateAccounts.AccountIds` target
+/// (`smithy_query(query="shape",shape="AccountIdList")`).
+const MAX_ACCOUNTS_PER_CALL: usize = 30;
+
+/// The linked account id of the `index`th account of the period-scoped fixture: twelve
+/// digits, as `AccountId`'s modelled `^[0-9]{12}$` requires, and distinct per account so no
+/// account is claimed twice.
+fn period_account(index: usize) -> String {
+    format!("{:012}", 200_000_000_000_u64 + index as u64)
+}
+
+/// The nearest billing period, from the current one on, whose month has TWO spellings — a
+/// month `1..=9`, which the modelled `BillingPeriod` pattern
+/// `^\d{4}-(0?[1-9]|1[012])$` admits both with and without its leading zero.
+///
+/// Read off the service's own clock, and never earlier than the current period, because
+/// every resource of this store stands in the period it was created in and in every later
+/// one: so the sequence this month holds is the same one the current month holds, whatever
+/// month the suite runs in.
+fn two_spelling_period() -> String {
+    (0..12)
+        .map(period)
+        .find(|billing_period| {
+            billing_period
+                .split_once('-')
+                .and_then(|(_, month)| month.parse::<u32>().ok())
+                .is_some_and(|month| month <= 9)
+        })
+        .expect("one of any twelve consecutive months is numbered 1..=9")
+}
+
+/// `body` answered FOR `billing_period` — the month named explicitly, or left to the current
+/// one, which is the month a request naming none is answered for.
+fn in_period(body: &Value, billing_period: Option<&str>) -> Value {
+    match billing_period {
+        Some(month) => request(body, json!({ "BillingPeriod": month })),
+        None => body.clone(),
+    }
+}
+
+/// The page `read` is asked for while paging: the one row a read whose `MaxResults` can
+/// name it is asked for, and the server's own page for the read that models no `MaxResults`
+/// at all.
+fn page_size(read: &Read) -> usize {
+    if read.mints {
+        1
+    } else {
+        SERVER_PAGE
+    }
+}
+
+/// `read`'s request for one page of the month `billing_period`, resuming from `token` when
+/// there is one.
+fn page_request(read: &Read, billing_period: Option<&str>, token: Option<&str>) -> Value {
+    let mut body = in_period(&read.body, billing_period);
+    if read.mints {
+        body["MaxResults"] = json!(page_size(read));
+    }
+    if let Some(token) = token {
+        body["NextToken"] = json!(token);
+    }
+    body
+}
+
+/// Every element `read` reports for `billing_period`, walked through its own pages — the
+/// sequence of THAT month, which a cursor minted while paging it points into.
+async fn walk_in_period(
+    em: &Emulator,
+    read: &Read,
+    case: &str,
+    billing_period: Option<&str>,
+) -> Vec<Value> {
+    let mut walked: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    for pages in 0..MAX_PAGES {
+        let body = page_request(read, billing_period, token.as_deref());
+        let (status, response, _) = em.call("POST", read.path, Some(&body)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected page {pages} of the month's sequence to be served, got \
+             {status} with {response}"
+        );
+        walked.extend(page(&response, read.member));
+        token = response
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if token.is_none() {
+            return walked;
+        }
+    }
+    panic!("case {case:?}: expected the walk to end, got {MAX_PAGES} pages");
+}
+
+/// The `NextToken` the first page of `read` for the month `billing_period` hands back.
+async fn minted_in_period(
+    em: &Emulator,
+    read: &Read,
+    case: &str,
+    billing_period: Option<&str>,
+) -> String {
+    let body = page_request(read, billing_period, None);
+    let (status, response, _) = em.call("POST", read.path, Some(&body)).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected a first page, got {status} with {response}"
+    );
+    assert_eq!(
+        page(&response, read.member).len(),
+        page_size(read),
+        "case {case:?}: expected the page asked for to be full, got {response}"
+    );
+    response
+        .get("NextToken")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected a NextToken for a page of a longer sequence, got \
+                 {response}"
+            )
+        })
+        .to_string()
+}
+
+/// Stand up a fixture every period-scoped read of this service pages over: three pricing
+/// plans with three rules on the first, three billing groups — the first holding
+/// [`ACCOUNTS_PAST_ONE_PAGE`] linked accounts — three custom line items in it, and a
+/// percentage item the group and two of those items are associated to.
+///
+/// Every resource is created NOW, so it stands in the current billing period and in every
+/// later one: the sequence each read walks is non-empty for the current month and for the
+/// months after it, which is what lets a token be minted for one month and handed back on
+/// another.
+async fn period_scoped_fixture() -> World {
+    let em = Emulator::payer();
+
+    let mut plans: Vec<String> = Vec::new();
+    for index in 0..PERIOD_POPULATION {
+        plans.push(
+            setup_arn(
+                &em,
+                "POST",
+                "/create-pricing-plan",
+                &json!({ "Name": format!("PeriodPlan{index}") }),
+                &format!("pricing plan {index}"),
+            )
+            .await,
+        );
+    }
+
+    let mut rules: Vec<String> = Vec::new();
+    for index in 0..PERIOD_POPULATION {
+        rules.push(
+            setup_arn(
+                &em,
+                "POST",
+                "/create-pricing-rule",
+                &json!({
+                    "Name": format!("PeriodRule{index}"),
+                    "Scope": "GLOBAL",
+                    "Type": "DISCOUNT",
+                    "ModifierPercentage": 5.0,
+                }),
+                &format!("pricing rule {index}"),
+            )
+            .await,
+        );
+    }
+    setup(
+        &em,
+        "PUT",
+        "/associate-pricing-rules",
+        &json!({ "Arn": plans[0], "PricingRuleArns": rules }),
+        "every rule on the first plan",
+    )
+    .await;
+
+    // The accounts go in the FIRST group, so the account listing holds more rows than the
+    // one page it can be asked for while every group still exists in the same months. A
+    // request may name at most [`MAX_ACCOUNTS_PER_CALL`] accounts, so they are added a
+    // chunk at a time: the create carries the first chunk and `AssociateAccounts` the rest.
+    let accounts: Vec<String> = (0..ACCOUNTS_PAST_ONE_PAGE).map(period_account).collect();
+    let mut chunks = accounts.chunks(MAX_ACCOUNTS_PER_CALL);
+    let first_chunk: Vec<String> = chunks.next().unwrap_or_default().to_vec();
+    let mut groups: Vec<String> = Vec::new();
+    for index in 0..PERIOD_POPULATION {
+        groups.push(
+            setup_arn(
+                &em,
+                "POST",
+                "/create-billing-group",
+                &json!({
+                    "Name": format!("PeriodGroup{index}"),
+                    "AccountGrouping": {
+                        "LinkedAccountIds":
+                            if index == 0 { first_chunk.clone() } else { Vec::new() },
+                    },
+                    "ComputationPreference": { "PricingPlanArn": plans[0] },
+                }),
+                &format!("billing group {index}"),
+            )
+            .await,
+        );
+    }
+    for (index, chunk) in chunks.enumerate() {
+        setup(
+            &em,
+            "POST",
+            "/associate-accounts",
+            &json!({ "Arn": groups[0], "AccountIds": chunk }),
+            &format!("account chunk {index} on the first group"),
+        )
+        .await;
+    }
+
+    let mut items: Vec<String> = Vec::new();
+    for index in 0..PERIOD_POPULATION {
+        items.push(
+            setup_arn(
+                &em,
+                "POST",
+                "/create-custom-line-item",
+                &json!({
+                    "Name": format!("PeriodItem{index}"),
+                    "Description": "an item of the period-scope fixture",
+                    "BillingGroupArn": groups[0],
+                    "ChargeDetails": { "Type": "FEE", "Flat": { "ChargeValue": 1.0 } },
+                }),
+                &format!("custom line item {index}"),
+            )
+            .await,
+        );
+    }
+
+    // Resources are associated to a PERCENTAGE item only, so the association listing needs
+    // one of those; the group and two items are three associations, one past a one-row page.
+    let percentage = setup_arn(
+        &em,
+        "POST",
+        "/create-custom-line-item",
+        &json!({
+            "Name": "PeriodPercentage",
+            "Description": "a percentage item of the period-scope fixture",
+            "BillingGroupArn": groups[0],
+            "ChargeDetails": { "Type": "FEE", "Percentage": { "PercentageValue": 10.0 } },
+        }),
+        "the percentage custom line item",
+    )
+    .await;
+    setup(
+        &em,
+        "PUT",
+        "/batch-associate-resources-to-custom-line-item",
+        &json!({
+            "TargetArn": percentage,
+            "ResourceArns": [groups[0].clone(), items[0].clone(), items[1].clone()],
+        }),
+        "the group and two of its items on the percentage item",
+    )
+    .await;
+
+    // Every paginated read of this service that is answered FOR one billing period. The
+    // `body` of each holds the members that pick the sequence MINUS the `BillingPeriod` the
+    // cases vary; `mints` says whether the read's own `MaxResults` can ask for a page
+    // smaller than the server's.
+    //
+    // The reads NOT here are the ones whose sequence no billing period shapes:
+    // `ListCustomLineItemVersions` (no `BillingPeriod` member at all) and
+    // `ListPricingRulesAssociatedToPricingPlan` /
+    // `ListPricingPlansAssociatedWithPricingRule`, whose elements are the associated ARNs
+    // themselves — the period selects which of them are reported without changing what one
+    // element is or what its cursor key spells.
+    let reads = vec![
+        Read {
+            operation: "ListBillingGroups",
+            path: "/list-billing-groups",
+            member: "BillingGroups",
+            body: json!({}),
+            other_parent: None,
+            mints: true,
+        },
+        Read {
+            operation: "ListPricingPlans",
+            path: "/list-pricing-plans",
+            member: "PricingPlans",
+            body: json!({}),
+            other_parent: None,
+            mints: true,
+        },
+        Read {
+            operation: "ListPricingRules",
+            path: "/list-pricing-rules",
+            member: "PricingRules",
+            body: json!({}),
+            other_parent: None,
+            mints: true,
+        },
+        Read {
+            operation: "ListCustomLineItems",
+            path: "/list-custom-line-items",
+            member: "CustomLineItems",
+            body: json!({}),
+            other_parent: None,
+            mints: true,
+        },
+        Read {
+            operation: "ListBillingGroupCostReports",
+            path: "/list-billing-group-cost-reports",
+            member: "BillingGroupCostReports",
+            body: json!({}),
+            other_parent: None,
+            mints: true,
+        },
+        Read {
+            operation: "ListResourcesAssociatedToCustomLineItem",
+            path: "/list-resources-associated-to-custom-line-item",
+            member: "AssociatedResources",
+            body: json!({ "Arn": percentage }),
+            other_parent: None,
+            mints: true,
+        },
+        Read {
+            operation: "ListAccountAssociations",
+            path: "/list-account-associations",
+            member: "LinkedAccounts",
+            body: json!({}),
+            other_parent: None,
+            mints: false,
+        },
+    ];
+
+    World {
+        em,
+        reads,
+        stored_arn: groups[0].clone(),
+        stored_account: period_account(0),
+    }
+}
+
+/// THE RULE, refusing side: a read answered for one billing period walks THAT month's
+/// sequence, so a `NextToken` minted while paging one month names no position in another
+/// month's sequence and is refused — never read as a cut point that silently drops every
+/// element sorting below it.
+#[tokio::test]
+async fn a_period_scoped_token_is_refused_by_a_read_of_another_billing_period() {
+    let world = period_scoped_fixture().await;
+    let current = period(0);
+    let next = period(1);
+    let previous = period(-1);
+    let two_spellings = two_spelling_period();
+
+    for read in &world.reads {
+        // The month's sequence before any of this, so the refusals can be shown to have
+        // changed nothing a later caller reads.
+        let before = walk_in_period(&world.em, read, read.operation, Some(&current)).await;
+        assert!(
+            before.len() > page_size(read),
+            "case {}: this fixture must hold more rows than one page for a token to be \
+             minted, got {} rows",
+            read.operation,
+            before.len()
+        );
+
+        // (case, the month the token is minted for, the month it is handed back on) — one
+        // row per way a second request can name a month the cursor points into nothing of:
+        // a later month, an earlier month, the month a request naming none is answered for,
+        // and a month named in the other spelling of a DIFFERENT month.
+        let crossings: Vec<(String, Option<&str>, Option<&str>)> = vec![
+            (
+                "the current month's token on the next month".to_string(),
+                Some(current.as_str()),
+                Some(next.as_str()),
+            ),
+            (
+                "the current month's token on the previous month".to_string(),
+                Some(current.as_str()),
+                Some(previous.as_str()),
+            ),
+            (
+                "the next month's token on the current month".to_string(),
+                Some(next.as_str()),
+                Some(current.as_str()),
+            ),
+            (
+                "the next month's token on the implicit current month".to_string(),
+                Some(next.as_str()),
+                None,
+            ),
+            (
+                "the implicit current month's token on the next month".to_string(),
+                None,
+                Some(next.as_str()),
+            ),
+        ];
+
+        for (crossing, minted_for, read_for) in crossings {
+            let case = format!("{} given {crossing}", read.operation);
+            let token = minted_in_period(&world.em, read, &case, minted_for).await;
+            let body = in_period(&read.body, read_for);
+            assert_refused(
+                &world.em,
+                read,
+                &case,
+                &request(&body, json!({ "NextToken": token })),
+            )
+            .await;
+        }
+
+        // The two spellings of ONE month name the same sequence, so a token minted for a
+        // month spelled either way is still refused by a read of ANOTHER month, however
+        // that month is spelled.
+        let case = format!(
+            "{} given a token minted for a month spelled without its leading zero, on \
+             another month",
+            read.operation
+        );
+        let token = minted_in_period(
+            &world.em,
+            read,
+            &case,
+            Some(&one_digit_month(&two_spellings)),
+        )
+        .await;
+        let body = in_period(&read.body, Some(&period(-2)));
+        assert_refused(
+            &world.em,
+            read,
+            &case,
+            &request(&body, json!({ "NextToken": token })),
+        )
+        .await;
+
+        let after = walk_in_period(&world.em, read, read.operation, Some(&current)).await;
+        assert_eq!(
+            after, before,
+            "case {}: a refused token must change nothing a later caller reads, got \
+             {after:?}",
+            read.operation
+        );
+    }
+}
+
+/// THE RULE, resuming side: every request that names the month a token was minted for
+/// resumes exactly where its page stopped, whichever of the two spellings of that month it
+/// names — and a request naming no month resumes a token minted for the current one, because
+/// that is the month it is itself answered for.
+#[tokio::test]
+async fn a_period_scoped_token_resumes_every_request_naming_the_month_it_was_minted_for() {
+    let world = period_scoped_fixture().await;
+    let current = period(0);
+    let two_spellings = two_spelling_period();
+    let padded_month = two_spellings.clone();
+    let bare_month = one_digit_month(&two_spellings);
+
+    for read in &world.reads {
+        // (case, the month the token is minted for, the month the next page is asked for) —
+        // every row names the SAME month twice, so every row resumes.
+        let same_month: Vec<(&str, Option<&str>, Option<&str>)> = vec![
+            (
+                "the same month, named the same way",
+                Some(current.as_str()),
+                Some(current.as_str()),
+            ),
+            (
+                "the current month, named explicitly after an implicit first page",
+                None,
+                Some(current.as_str()),
+            ),
+            (
+                "the current month, left implicit after an explicit first page",
+                Some(current.as_str()),
+                None,
+            ),
+            (
+                "the same month, resumed without the leading zero of its month",
+                Some(padded_month.as_str()),
+                Some(bare_month.as_str()),
+            ),
+            (
+                "the same month, resumed with the leading zero of its month",
+                Some(bare_month.as_str()),
+                Some(padded_month.as_str()),
+            ),
+        ];
+
+        for (spelling, minted_for, read_for) in same_month {
+            let case = format!("{} resumed on {spelling}", read.operation);
+            let whole = walk_in_period(&world.em, read, &case, minted_for).await;
+            let cut = page_size(read);
+            assert!(
+                whole.len() > cut,
+                "case {case:?}: this fixture must hold more rows than one page for a token \
+                 to be minted, got {} rows",
+                whole.len()
+            );
+            let token = minted_in_period(&world.em, read, &case, minted_for).await;
+            let body = request(
+                &in_period(&read.body, read_for),
+                json!({ "NextToken": token }),
+            );
+            let (status, response, _) = world.em.call("POST", read.path, Some(&body)).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the month's own token to resume its listing, got \
+                 {status} with {response}"
+            );
+            assert_eq!(
+                page(&response, read.member),
+                whole[cut..].to_vec(),
+                "case {case:?}: expected the elements the first page left out, got {response}"
+            );
+        }
     }
 }

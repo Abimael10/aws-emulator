@@ -209,6 +209,22 @@ fn billing_period_of_key(key: i64) -> String {
     format!("{year:04}-{month:02}")
 }
 
+/// The CANONICAL spelling of a billing period: the one `YYYY-MM` form of the month
+/// `value` names, whichever of the two spellings `BillingPeriod`'s pattern
+/// (`^\d{4}-(0?[1-9]|1[012])$`) the caller wrote it in.
+///
+/// A month has two spellings and one identity ([`billing_period_key`]), so a value that
+/// must name the SAME month for two requests that spelled it differently — the month a
+/// pagination token's scope carries ([`crate::state::page_scope_in_period`]) — is compared
+/// in this form rather than as the request wrote it. A value that is no billing period at
+/// all has no canonical month, so it is kept as it is: it names a month nothing of this
+/// store holds either way.
+pub fn canonical_billing_period(value: &str) -> String {
+    billing_period_key(value)
+        .map(billing_period_of_key)
+        .unwrap_or_else(|| value.to_string())
+}
+
 /// The billing periods of the half-open range `[inclusive_start, exclusive_end)`, in
 /// ascending order and each in the canonical `YYYY-MM` spelling — the periods a report
 /// over that range covers.

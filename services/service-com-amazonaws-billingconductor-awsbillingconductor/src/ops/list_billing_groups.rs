@@ -320,11 +320,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // page of groups — bounded by the request's `MaxResults`, or by
         // `DEFAULT_PAGE_SIZE` when it names none — in a single pass over the stored
         // memberships rather than one pass per stored group.
-        // The token is minted for THIS listing (`Self::NAME`), so a cursor the service
-        // never handed out — or one another listing handed out — is refused rather than
-        // read as a cut point into this sequence.
+        // The token is minted for THIS listing AND THAT MONTH
+        // (`crate::state::page_scope_in_period`): the period decides which groups were
+        // billing and which generation and membership each reported group carries, so a
+        // cursor the service never handed out — or one another listing, or this listing
+        // read for another month, handed out — is refused rather than read as a cut point
+        // into this sequence.
         let (page, next_token) = crate::state::paginate(
-            Self::NAME,
+            &crate::state::page_scope_in_period(Self::NAME, None, &billing_period),
             selected,
             input.next_token.as_deref(),
             input.max_results,

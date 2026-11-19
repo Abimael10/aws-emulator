@@ -273,10 +273,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This operation models no `MaxResults`, so the server chooses the page
         // size: `paginate` applies `crate::state::DEFAULT_PAGE_SIZE` and hands back
         // the modelled `NextToken` to continue from — the opaque token it minted for
-        // this listing, so a token it did not mint is refused.
-        let (linked_accounts, next_token) =
-            crate::state::paginate(Self::NAME, selected, input.next_token.as_deref(), None)
-                .map_err(ListAccountAssociationsErrorModeled::ValidationException)?;
+        // this listing AND the month it is answered for
+        // (`crate::state::page_scope_in_period`), the period deciding which billing group
+        // each reported account was in, so a token it did not mint for the month being
+        // read is refused.
+        let (linked_accounts, next_token) = crate::state::paginate(
+            &crate::state::page_scope_in_period(Self::NAME, None, &billing_period),
+            selected,
+            input.next_token.as_deref(),
+            None,
+        )
+        .map_err(ListAccountAssociationsErrorModeled::ValidationException)?;
 
         Ok(ListAccountAssociationsOutput {
             linked_accounts: Some(linked_accounts),

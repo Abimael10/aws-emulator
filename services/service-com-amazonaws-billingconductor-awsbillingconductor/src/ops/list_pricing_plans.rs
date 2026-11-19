@@ -232,8 +232,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(arn, plan)| (arn.clone(), plan))
             .collect();
 
+        // The token is minted for this listing AND the month it is answered for
+        // (`crate::state::page_scope_in_period`): the period decides which plans existed
+        // and which generation and rule count each reported plan carries, so a cursor
+        // minted while paging one month is refused rather than read as a cut point into
+        // another month's sequence.
         let (page, next_token) = crate::state::paginate(
-            Self::NAME,
+            &crate::state::page_scope_in_period(Self::NAME, None, &billing_period),
             selected,
             input.next_token.as_deref(),
             input.max_results,

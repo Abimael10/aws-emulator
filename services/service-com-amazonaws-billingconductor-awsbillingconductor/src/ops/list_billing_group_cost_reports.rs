@@ -217,8 +217,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (1..100) being the very bound `crate::state::paginate` clamps to — so the
         // charges are computed for at most one page of groups rather than for every group
         // the store holds.
+        //
+        // The sequence the page is cut out of is the one OF THAT MONTH: the period decides
+        // which groups were billing (and so which elements exist) and what every reported
+        // element's four amounts cover, so it travels in the scope of the token a truncated
+        // page mints (`crate::state::page_scope_in_period`) — a cursor minted while paging
+        // one month is refused rather than read as a cut point into another month's
+        // sequence.
         let (page, next_token) = crate::state::paginate(
-            Self::NAME,
+            &crate::state::page_scope_in_period(Self::NAME, None, &billing_period),
             selected,
             input.next_token.as_deref(),
             input.max_results,

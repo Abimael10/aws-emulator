@@ -237,8 +237,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names the same cut point on the next one however the associations grow.
         selected.sort_by(|(left, _), (right, _)| left.cmp(right));
 
+        // The token is minted for this item AND the month the read is answered for
+        // (`crate::state::page_scope_in_period`): the period decides which associations
+        // were in effect and what each reported element's `EndBillingPeriod` is, so a
+        // cursor minted while paging one month is refused rather than read as a cut point
+        // into another month's sequence.
         let (associated_resources, next_token) = crate::state::paginate(
-            &crate::state::page_scope_within(Self::NAME, &item.arn),
+            &crate::state::page_scope_in_period(Self::NAME, Some(&item.arn), &billing_period),
             selected,
             input.next_token.as_deref(),
             input.max_results,

@@ -22,10 +22,10 @@ pub const NEXT_TOKEN_MEMBER: &str = "NextToken";
 /// The separator between the SCOPE a pagination token was minted for and the cursor it
 /// carries, inside the bytes the token encodes.
 ///
-/// A unit separator occurs in no scope ([`page_scope_within`] and [`page_scope_shaped`]
-/// join with [`PAGE_SCOPE_SEPARATOR`] instead) and in none of the keys this service pages
-/// over (ARNs, account ids, fixed-width indices), and only the FIRST one is read as the
-/// separator, so a cursor is handed back exactly as it was minted.
+/// A unit separator occurs in no scope (every scope of this service is built by
+/// [`page_scope_of`], which joins with [`PAGE_SCOPE_SEPARATOR`] instead) and in none of the
+/// keys this service pages over (ARNs, account ids, fixed-width indices), and only the FIRST
+/// one is read as the separator, so a cursor is handed back exactly as it was minted.
 pub(super) const PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
 
 /// The separator between the parts of a SCOPE that names more than the operation, distinct
@@ -48,7 +48,8 @@ pub(super) const PAGE_TOKEN_TAG_BYTES: usize = 8;
 /// as the store key it is, and the scope travels with it: a token decodes to a cursor only
 /// under the scope it was minted for, which is what stops one listing's token from being a
 /// cursor into another's sequence. See [`page_scope_within`] for the scope of a listing
-/// read within one resource.
+/// read within one resource, and [`page_scope_in_period`] for the scope of one answered for
+/// a single billing period.
 ///
 /// The tag is what makes a token that was not minted whole DECIDABLE rather than read as
 /// some other cut point: a value that does not agree with its own tag was not produced
@@ -120,9 +121,55 @@ pub(super) fn page_token_tag(payload: &[u8]) -> Vec<u8> {
 /// sequence belongs to one parent resource (a plan's rules, an item's versions, a group's
 /// cost rows), so a cursor minted while paging one parent names no position in another's
 /// sequence. The filters a request narrows a sequence with are not part of it: they select
-/// which elements of the one sequence are reported, not which sequence is being read.
+/// which elements of the one sequence are reported, not which sequence is being read. A read
+/// ANSWERED FOR one billing period is scoped by [`page_scope_in_period`] instead, because the
+/// month it is answered for decides what each reported element is and so which sequence the
+/// read walks.
 pub fn page_scope_within(operation: &str, resource_arn: &str) -> String {
-    format!("{operation}{PAGE_SCOPE_SEPARATOR}{resource_arn}")
+    page_scope_of(operation, &[resource_arn])
+}
+
+/// A scope, in the ONE spelling every scope of this service has: the operation, then each
+/// value that identifies the sequence being read, joined with [`PAGE_SCOPE_SEPARATOR`].
+///
+/// Built in one place so a scope is spelled the same however many parts it has, and so the
+/// scope of a read is read back whole.
+fn page_scope_of(operation: &str, parts: &[&str]) -> String {
+    let mut scope = operation.to_string();
+    for part in parts {
+        scope.push(PAGE_SCOPE_SEPARATOR);
+        scope.push_str(part);
+    }
+    scope
+}
+
+/// The scope of the tokens a read ANSWERED FOR ONE BILLING PERIOD mints: the operation, the
+/// resource the read is within when its sequence belongs to one, and the canonical month the
+/// read is answered for.
+///
+/// A period-scoped read of this service answers for ONE month — the month the request names,
+/// or the current one when it names none — and that month decides what each reported element
+/// IS: the generation of a resource that was in force then, the associations and memberships
+/// it held then, and the amounts that month was charged. So it is exactly the kind of request
+/// value [`page_scope_shaped`] is the scope of: it names a different sequence for every month
+/// it takes, and a cursor into one month's sequence names no position in another's, so a
+/// token handed back under a different month is refused with [`invalid_next_token`] rather
+/// than read as a cut point into a keyspace it names nothing in.
+///
+/// `resource_arn` is the parent the read is within for the reads whose sequence belongs to
+/// one, and absent for a read of the account's own collection, exactly as
+/// [`page_scope_within`] separates the two. The month travels CANONICAL
+/// ([`canonical_billing_period`]), so the two spellings `BillingPeriod`'s pattern admits of
+/// one month name the one sequence and resume it.
+pub fn page_scope_in_period(
+    operation: &str,
+    resource_arn: Option<&str>,
+    billing_period: &str,
+) -> String {
+    let billing_period = canonical_billing_period(billing_period);
+    let mut parts: Vec<&str> = resource_arn.into_iter().collect();
+    parts.push(billing_period.as_str());
+    page_scope_of(operation, &parts)
 }
 
 /// The scope of the tokens a read WITHIN one resource mints when the REQUEST, and not that
@@ -143,12 +190,9 @@ pub fn page_scope_within(operation: &str, resource_arn: &str) -> String {
 /// values that merely order or repeat within it normalised away — so two requests that name
 /// the same sequence resume the same one however they spelled it.
 pub fn page_scope_shaped(operation: &str, resource_arn: &str, shaping: &[&str]) -> String {
-    let mut scope = page_scope_within(operation, resource_arn);
-    for value in shaping {
-        scope.push(PAGE_SCOPE_SEPARATOR);
-        scope.push_str(value);
-    }
-    scope
+    let mut parts: Vec<&str> = vec![resource_arn];
+    parts.extend_from_slice(shaping);
+    page_scope_of(operation, &parts)
 }
 
 /// The modelled refusal every paginated read of this service answers a `NextToken` it did
