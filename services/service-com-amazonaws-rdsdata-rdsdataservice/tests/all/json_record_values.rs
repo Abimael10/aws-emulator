@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What a successful `ExecuteStatement` result set CARRIES: the JSON form every
-//! value takes in `formattedRecords`, and the 200 envelope a PostgreSQL-typed
-//! projection is answered with.
+//! value takes in `formattedRecords`, the `resultSetOptions` both forms honour, and the
+//! 200 envelope a PostgreSQL-typed projection is answered with.
 //!
 //! Every call goes through the router, so routing, restJson1 deserialization, the
 //! handler and serialization are all exercised. The client harness is the one
@@ -534,4 +534,187 @@ async fn a_binary_column_is_the_base64_of_the_bytes_it_holds() {
             "case {case:?}: expected the JSON form {as_base64:?}, got {json_form}"
         );
     }
+}
+
+/// RULE: `resultSetOptions` says how a NUMBER is REPRESENTED, not which result member
+/// carries it, so both forms of one result set honour it the same way: a `LONG` asked for
+/// as a string is a `stringValue` in `records` and a JSON string in `formattedRecords`, and
+/// an exact number asked for as a number is a `longValue`/`doubleValue` there and a JSON
+/// number here — "a Long value if its scale is 0, or a Double value otherwise".
+///
+/// The rows differ along which option is asked for, along each of its declared values and
+/// along the column's own type and scale (`LongReturnType` is `LONG | STRING`,
+/// `DecimalReturnType` is `STRING | DOUBLE_OR_LONG`, whose documented defaults are `LONG`
+/// and `STRING`), and each row asserts BOTH forms of the same column.
+#[tokio::test]
+async fn the_result_set_options_are_honoured_in_both_forms_of_a_result_set() {
+    let api = DataApi::new();
+    // (case, the column's declared type, the value it holds, the resultSetOptions the
+    //  request carries, the JSON form, the `Field` the records form carries)
+    let cases: [(&str, &str, &str, Value, Value, Value); 11] = [
+        (
+            "a wide integer asked for as a string",
+            "BIGINT",
+            "9007199254740993",
+            json!({"longReturnType": "STRING"}),
+            json!("9007199254740993"),
+            json!({"stringValue": "9007199254740993"}),
+        ),
+        (
+            "a wide integer asked for as a long",
+            "BIGINT",
+            "9007199254740993",
+            json!({"longReturnType": "LONG"}),
+            json!(9_007_199_254_740_993_i64),
+            json!({"longValue": 9_007_199_254_740_993_i64}),
+        ),
+        (
+            "a wide integer with neither option set",
+            "BIGINT",
+            "9007199254740993",
+            json!({}),
+            json!(9_007_199_254_740_993_i64),
+            json!({"longValue": 9_007_199_254_740_993_i64}),
+        ),
+        (
+            "a narrow integer asked for as a string",
+            "INT",
+            "42",
+            json!({"longReturnType": "STRING"}),
+            json!("42"),
+            json!({"stringValue": "42"}),
+        ),
+        (
+            "an exact number asked for as a string",
+            "NUMERIC(10,4)",
+            "123.4567",
+            json!({"decimalReturnType": "STRING"}),
+            json!("123.4567"),
+            json!({"stringValue": "123.4567"}),
+        ),
+        (
+            "an exact number with a scale, asked for as a number",
+            "NUMERIC(10,4)",
+            "123.4567",
+            json!({"decimalReturnType": "DOUBLE_OR_LONG"}),
+            json!(123.4567),
+            json!({"doubleValue": 123.4567}),
+        ),
+        (
+            "an exact number of scale 0, asked for as a number",
+            "NUMERIC(10,0)",
+            "42",
+            json!({"decimalReturnType": "DOUBLE_OR_LONG"}),
+            json!(42),
+            json!({"longValue": 42}),
+        ),
+        (
+            "an exact number with neither option set",
+            "NUMERIC(10,4)",
+            "123.4567",
+            json!({}),
+            json!("123.4567"),
+            json!({"stringValue": "123.4567"}),
+        ),
+        (
+            // A `numeric` whose declaration gave no scale carries each VALUE's own, so
+            // the value is what decides whether its scale is 0.
+            "an exact number with no declared scale, asked for as a number",
+            "NUMERIC",
+            "123.4567",
+            json!({"decimalReturnType": "DOUBLE_OR_LONG"}),
+            json!(123.4567),
+            json!({"doubleValue": 123.4567}),
+        ),
+        (
+            "a whole exact number with no declared scale, asked for as a number",
+            "NUMERIC",
+            "42",
+            json!({"decimalReturnType": "DOUBLE_OR_LONG"}),
+            json!(42),
+            json!({"longValue": 42}),
+        ),
+        (
+            "an exact number with no declared scale, asked for as a string",
+            "NUMERIC",
+            "123.4567",
+            json!({"decimalReturnType": "STRING"}),
+            json!("123.4567"),
+            json!({"stringValue": "123.4567"}),
+        ),
+    ];
+
+    for (index, (case, declared, held, options, as_json, as_field)) in
+        cases.into_iter().enumerate()
+    {
+        let table = format!("options_{index}");
+        api.run(json!({"sql": format!("CREATE TABLE {table} (v {declared})")}))
+            .await;
+        api.run(json!({"sql": format!("INSERT INTO {table} (v) VALUES ({held})")}))
+            .await;
+
+        let records_form = api
+            .run(json!({
+                "sql": format!("SELECT v FROM {table}"),
+                "resultSetOptions": options.clone(),
+            }))
+            .await;
+        assert_eq!(
+            records_form["records"],
+            json!([[as_field]]),
+            "case {case:?}: expected the records form [[{as_field}]], got {records_form}"
+        );
+
+        let json_form = api
+            .run(json!({
+                "sql": format!("SELECT v FROM {table}"),
+                "resultSetOptions": options,
+                "formatRecordsAs": "JSON",
+            }))
+            .await;
+        let rendered = formatted(&json_form);
+        assert_eq!(
+            rendered,
+            json!([{"v": as_json}]),
+            "case {case:?}: expected the JSON form [{{\"v\":{as_json}}}], got {rendered}"
+        );
+    }
+
+    // Both options at once, over a projection carrying one column of each type: one
+    // reading of the request, applied to every value of the result set.
+    api.run(json!({
+        "sql": "CREATE TABLE together (num NUMERIC(10,4), big BIGINT)",
+    }))
+    .await;
+    api.run(json!({
+        "sql": "INSERT INTO together (num, big) VALUES (123.4567, 9007199254740993)",
+    }))
+    .await;
+    let both = json!({"decimalReturnType": "STRING", "longReturnType": "STRING"});
+    let json_form = api
+        .run(json!({
+            "sql": "SELECT num, big FROM together",
+            "resultSetOptions": both.clone(),
+            "formatRecordsAs": "JSON",
+        }))
+        .await;
+    assert_eq!(
+        json_form["formattedRecords"],
+        json!("[{\"num\":\"123.4567\",\"big\":\"9007199254740993\"}]"),
+        "case \"both options at once, in the JSON form\": got {json_form}"
+    );
+    let records_form = api
+        .run(json!({
+            "sql": "SELECT num, big FROM together",
+            "resultSetOptions": both,
+        }))
+        .await;
+    assert_eq!(
+        records_form["records"],
+        json!([[
+            {"stringValue": "123.4567"},
+            {"stringValue": "9007199254740993"},
+        ]]),
+        "case \"both options at once, in the records form\": got {records_form}"
+    );
 }

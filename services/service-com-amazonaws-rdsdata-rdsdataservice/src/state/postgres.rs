@@ -1285,9 +1285,78 @@ pub(super) fn wrong_type_for_column(
 /// What PostgreSQL tells a caller whose value is of the wrong type for its column.
 const REWRITE_OR_CAST_HINT: &str = "You will need to rewrite or cast the expression.";
 
-/// The type a value written as text arrives as, as PostgreSQL names it in that
-/// diagnostic.
-pub(super) const CHARACTER_VALUE_TYPE: &str = "text";
+/// Whether a value SENT as one type may be assigned to a column of another with no cast
+/// written anywhere.
+///
+/// PostgreSQL's implicit and assignment casts run WITHIN a family of related types and
+/// between no two of them: a number reaches any of the number types, a character value any
+/// of the character types, a document either spelling of a document, an instant a date or a
+/// timestamp — and a type with no family of its own takes only its own values. Everything
+/// else is the datatype mismatch the database refuses the statement with
+/// ([`wrong_type_for_column`]), which is what a client is told to rewrite or cast.
+pub(super) fn assignable_to(sent: &PgType, column: &PgType) -> bool {
+    match (assignment_of(sent), assignment_of(column)) {
+        // A type this front end cannot type settles nothing, so it refuses no value.
+        (Assignment::Untyped, _) | (_, Assignment::Untyped) => true,
+        (Assignment::Family(sent), Assignment::Family(column)) => sent == column,
+        (Assignment::OnlyItself(sent), Assignment::OnlyItself(column)) => sent == column,
+        _ => false,
+    }
+}
+
+/// What a type takes, for an assignment with no cast in it.
+enum Assignment<'a> {
+    /// A type the catalog does not name, which decides nothing about a value.
+    Untyped,
+    /// One of the families an assignment runs inside.
+    Family(AssignmentFamily),
+    /// A type the catalog names that has no family: it takes values of its own type and
+    /// nothing else, under the catalog name that is its own.
+    OnlyItself(&'a str),
+}
+
+/// The families PostgreSQL's implicit and assignment casts run inside.
+#[derive(PartialEq, Eq)]
+enum AssignmentFamily {
+    /// Every number type: the integers, the floating types and the exact numbers.
+    Number,
+    /// The character types.
+    Character,
+    Boolean,
+    /// A date and a timestamp, with or without a zone: a point on the calendar.
+    Instant,
+    /// A time of day, with or without a zone.
+    TimeOfDay,
+    /// Either spelling of a document (`json`, `jsonb`).
+    Document,
+    Binary,
+    /// An array of any element type: the element decides what the array holds, and an
+    /// array is assignable to no type that is not one.
+    Array,
+}
+
+/// Which of those a type belongs to, read off the catalog's own entry for it.
+fn assignment_of(pg: &PgType) -> Assignment<'_> {
+    match pg.class {
+        TypeClass::Integer | TypeClass::Float | TypeClass::Decimal => {
+            Assignment::Family(AssignmentFamily::Number)
+        }
+        TypeClass::Boolean => Assignment::Family(AssignmentFamily::Boolean),
+        TypeClass::Binary => Assignment::Family(AssignmentFamily::Binary),
+        TypeClass::Array => Assignment::Family(AssignmentFamily::Array),
+        TypeClass::Temporal => Assignment::Family(match pg.name.as_str() {
+            "time" | "timetz" => AssignmentFamily::TimeOfDay,
+            _ => AssignmentFamily::Instant,
+        }),
+        TypeClass::Text if pg.document => Assignment::Family(AssignmentFamily::Document),
+        // A type that takes a value written as TEXT is a character type, and the catalog
+        // marks the types the front end cannot type the same way ([`PgType::takes_text`]):
+        // the character types are the ones it NAMES.
+        TypeClass::Text if pg.takes_text => Assignment::Family(AssignmentFamily::Character),
+        _ if pg.takes_text => Assignment::Untyped,
+        _ => Assignment::OnlyItself(&pg.name),
+    }
+}
 
 /// What the DATABASE itself holds about the statement's own names, which its text
 /// does not carry and only a schema settles: the key an upsert conflicts on, and the
@@ -2512,6 +2581,14 @@ pub fn pg_type(declared: &str) -> PgType {
         // no member for one, so a result column of that type is refused rather
         // than reported as something it is not.
         "interval" => PgType::of("interval", TypeClass::Other, jdbc::OTHER, 49, 0).unreturnable(),
+        // And neither is a currency amount: `money` holds a fixed-point amount whose
+        // fractional digits and symbol come from the database's monetary locale, which no
+        // member of the union carries either — a `doubleValue` would be an inexact number
+        // with no currency — so that result is refused too. It is a type the catalog NAMES,
+        // so a value written as text is no value of it, any more than it is of a date.
+        "money" => {
+            PgType::of("money", TypeClass::Other, jdbc::OTHER, UNLIMITED_LENGTH, 0).unreturnable()
+        }
         // A type the catalog does not name is one this front end cannot type, so a
         // value written as text is not refused for it.
         _ => PgType::of(&name, TypeClass::Other, jdbc::OTHER, UNLIMITED_LENGTH, 0).takes_text(),

@@ -218,6 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
+        // WHICH transaction this batch is part of, read once: a `transactionId` carrying no
+        // characters names none, which is what leaving the member out says
+        // (`crate::state::named_transaction`), so the batch runs on its own — and the
+        // `database` member below is then the database it selects.
+        let transaction_id = crate::state::named_transaction(input.transaction_id.as_deref());
         // The same precondition chain every call of this service is admitted by: the
         // identity, the cluster, the secret, the login and the database, all resolved
         // before the batch reaches the engine.
@@ -229,14 +234,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 resource_arn: &input.resource_arn,
                 secret_arn: &input.secret_arn,
                 sql: Some(&input.sql),
-                database: match input.transaction_id {
+                database: match transaction_id {
                     Some(_) => None,
                     None => input.database.as_deref(),
                 },
                 // The same member the model documents as unsupported here too, refused for
                 // the same reason.
                 schema: input.schema.as_deref(),
-                transaction_id: input.transaction_id.as_deref(),
+                transaction_id,
             },
         )
         .await
@@ -335,6 +340,10 @@ fn execute_batch(
     // statement gets.
     let mut budget = crate::state::RequestBudget::new();
 
+    // The transaction this batch is part of, read the way the handler read it: an empty
+    // member names none.
+    let transaction_id = crate::state::named_transaction(input.transaction_id.as_deref());
+
     // A `transactionId` runs the batch inside that transaction, against the database
     // that transaction reads; without one the batch runs against the committed
     // database and auto-commits. A statement about the cluster's DATABASES is applied
@@ -347,7 +356,7 @@ fn execute_batch(
             // A call quoting a `transactionId` is served only while that transaction is
             // RUNNING, whatever its statement does; the statement itself still goes to
             // the cluster, which applies it outside any transaction block.
-            if let Some(transaction_id) = input.transaction_id.as_deref() {
+            if let Some(transaction_id) = transaction_id {
                 cluster.open_transaction_mut(transaction_id)?.touch();
             }
             let mut outcomes = Vec::with_capacity(runs.len());
@@ -356,7 +365,7 @@ fn execute_batch(
             }
             outcomes
         }
-        None => match input.transaction_id.as_deref() {
+        None => match transaction_id {
             Some(transaction_id) => {
                 let ran =
                     cluster.run_batch_in_transaction(transaction_id, &mut budget, &input.sql, &runs);
@@ -388,7 +397,7 @@ fn execute_batch(
     tracing::info!(
         resource_arn = %input.resource_arn,
         database = input.database.as_deref().unwrap_or(""),
-        in_transaction = input.transaction_id.is_some(),
+        in_transaction = transaction_id.is_some(),
         statements = update_results.len(),
         "rds-data executed a batch"
     );

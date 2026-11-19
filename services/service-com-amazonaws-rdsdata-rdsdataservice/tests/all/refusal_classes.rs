@@ -23,7 +23,11 @@
 //!   ([`a_refused_result_keeps_the_write_the_statement_made`]);
 //! * a batch is one unit of work: a statement of it that the database refuses refuses the
 //!   whole batch and leaves nothing behind
-//!   ([`a_batch_a_statement_of_it_fails_lands_nothing`]).
+//!   ([`a_batch_a_statement_of_it_fails_lands_nothing`]);
+//! * a result column of a type the `Field` union has no member for is refused by THAT
+//!   TYPE, in every form it can be read in, while the same cell cast to a type the union
+//!   carries is served
+//!   ([`a_result_of_a_type_no_field_member_carries_is_refused_by_its_type`]).
 //!
 //! These rules are about the data plane, so this suite drives the Data API alone: no
 //! control plane is mounted, and the cluster, secret and identity legs of the precondition
@@ -1077,5 +1081,161 @@ async fn a_batch_a_statement_of_it_fails_lands_nothing() {
         ids,
         vec![1, 40, 41],
         "case a batch that runs: expected every row landed, got {ids:?}"
+    );
+}
+
+/// What AWS tells a caller whose result carries a value of a type the `Field` union has no
+/// member for: the fixed sentence of the modelled `UnsupportedResultException` for that
+/// condition, closing with the offending type's own name in upper case.
+fn unsupported_type_message(named: &str) -> String {
+    format!("The result contains the unsupported data type {named}.")
+}
+
+/// RULE: a result column whose PostgreSQL type has no `Field` member to carry its values is
+/// refused with `UnsupportedResultException` naming THAT TYPE — in every form the column
+/// can be read in, `formatRecordsAs=JSON` included — while the same cell read through a
+/// cast to a type the union DOES carry is served: the refusal is a property of the type and
+/// not of the row. A value written as text is no value of such a type either, so a
+/// parameter carrying one is refused by the database's assignment rule instead.
+///
+/// The rows are the catalog's types whose values no member of the union holds: a currency
+/// amount, whose fractional digits and symbol come from the database's monetary locale, and
+/// a span of time. Each is read as a stored column, beside a column that IS carried, as a
+/// cast the statement writes, and in the JSON form.
+#[tokio::test]
+async fn a_result_of_a_type_no_field_member_carries_is_refused_by_its_type() {
+    let api = DataApi::new();
+
+    // (case, the declared type, the value the statement writes, the name the refusal names
+    //  the type by, the cast that rescues the cell, what that cast answers)
+    let types: &[(&str, &str, &str, &str, &str, Value)] = &[
+        (
+            "a currency amount",
+            "money",
+            "'12.34'::money",
+            "MONEY",
+            "numeric",
+            json!([[{"stringValue": "12.34"}]]),
+        ),
+        (
+            "a span of time",
+            "interval",
+            "interval '1 day'",
+            "INTERVAL",
+            "text",
+            json!([[{"stringValue": "1 day"}]]),
+        ),
+    ];
+    for (index, (case, declared, written, named, rescued_as, rescued)) in
+        types.iter().enumerate()
+    {
+        let table = format!("unreturnable_{index}");
+        api.run(json!({
+            "sql": format!("CREATE TABLE {table} (id INT PRIMARY KEY, value {declared})"),
+        }))
+        .await;
+        api.run(json!({
+            "sql": format!("INSERT INTO {table} (id, value) VALUES (1, {written})"),
+        }))
+        .await;
+
+        let expected = unsupported_type_message(named);
+        let forms = [
+            (
+                "the stored column on its own",
+                json!({"sql": format!("SELECT value FROM {table}")}),
+            ),
+            (
+                "the stored column beside one the union carries",
+                json!({
+                    "sql": format!("SELECT id, value FROM {table}"),
+                    "includeResultMetadata": true,
+                }),
+            ),
+            (
+                "the stored column under formatRecordsAs=JSON",
+                json!({
+                    "sql": format!("SELECT value FROM {table}"),
+                    "formatRecordsAs": "JSON",
+                }),
+            ),
+            (
+                "a cast the statement writes",
+                json!({"sql": format!("SELECT {written} AS value")}),
+            ),
+            (
+                "that cast under formatRecordsAs=JSON",
+                json!({
+                    "sql": format!("SELECT {written} AS value"),
+                    "formatRecordsAs": "JSON",
+                }),
+            ),
+        ];
+        for (form, members) in forms {
+            let (status, body) = api.execute(members).await;
+            assert_eq!(
+                (status, error_code(&body), body["message"].clone()),
+                (400, "UnsupportedResultException", json!(expected)),
+                "case {case} as {form}: expected the unsupported-type refusal, got {status} \
+                 {body}"
+            );
+        }
+
+        // The same cell, cast to a type the union carries, is served — which is what makes
+        // the refusals above the TYPE's and not the row's.
+        let served = api
+            .run(json!({
+                "sql": format!("SELECT value::{rescued_as} AS value FROM {table}"),
+            }))
+            .await;
+        assert_eq!(
+            &served["records"], rescued,
+            "case {case} cast to {rescued_as}: expected {rescued}, got {served}"
+        );
+
+        // And a value written as TEXT is no value of such a type: the database refuses the
+        // assignment rather than storing it, so the column cannot be filled around the
+        // refusal above.
+        let (status, body) = api
+            .execute(json!({
+                "sql": format!("INSERT INTO {table} (id, value) VALUES (2, :value)"),
+                "parameters": [parameter("value", json!({"stringValue": "12.34"}))],
+            }))
+            .await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "DatabaseErrorException"),
+            "case {case} assigned a value written as text: expected the database's refusal, \
+             got {status} {body}"
+        );
+        assert_eq!(
+            body["message"],
+            json!(format!(
+                "ERROR: column \"value\" is of type {declared} but expression is of type text; \
+                 Hint: You will need to rewrite or cast the expression.; Position: {}; \
+                 SQLState: 42804",
+                format!("INSERT INTO {table} (id, value) VALUES (2, ").len() + 1
+            )),
+            "case {case} assigned a value written as text: expected the assignment \
+             diagnostic, got {body}"
+        );
+    }
+
+    // The OTHER unsupported-result class keeps its own sentence: a floating value that is
+    // not a number is refused for the VALUE it is, not for its type, so the two sentences
+    // stay apart.
+    let (status, body) = api
+        .execute(json!({"sql": "SELECT 'inf'::float8 AS inf"}))
+        .await;
+    assert_eq!(
+        (status, error_code(&body), body["message"].clone()),
+        (400, "UnsupportedResultException", json!(NON_FINITE_MESSAGE)),
+        "case \"a non-finite float\": expected the non-finite sentence, got {status} {body}"
+    );
+    assert_ne!(
+        body["message"],
+        json!(unsupported_type_message("DOUBLE PRECISION")),
+        "case \"a non-finite float\": the two unsupported-result sentences must stay apart, \
+         got {body}"
     );
 }

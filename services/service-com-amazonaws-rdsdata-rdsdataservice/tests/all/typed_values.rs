@@ -629,3 +629,427 @@ async fn the_catalog_entry_of_a_date_or_time_column_is_its_own() {
         );
     }
 }
+
+/// The type the six `typeHint` values the model declares (`TypeHint`: DATE, DECIMAL, JSON,
+/// TIME, TIMESTAMP, UUID) send a string as, each the object type the member's own
+/// documentation names, as the database words it in a diagnostic.
+const HINTED_TYPES: &[(&str, &str)] = &[
+    ("DATE", "date"),
+    ("DECIMAL", "numeric"),
+    ("JSON", "jsonb"),
+    ("TIME", "time without time zone"),
+    ("TIMESTAMP", "timestamp without time zone"),
+    ("UUID", "uuid"),
+];
+
+/// One row of the table below: the case, the column's declaration, the value the parameter
+/// carries, the `typeHint` it carries, the type that value ARRIVES as, and whether the
+/// column takes it.
+type AssignmentCase = (
+    &'static str,
+    &'static str,
+    Value,
+    Option<&'static str>,
+    &'static str,
+    bool,
+);
+
+/// RULE: a parameter reaches the database as a value of ONE type — the one its `Field`
+/// member names, or, for a `stringValue` carrying a `typeHint`, the one that hint names —
+/// and the column it is assigned to takes it only where the engine has an implicit or
+/// assignment cast from that type: a number reaches any number type, a character value any
+/// character type, a document either spelling of one, a date a date or a timestamp, and
+/// nothing else is assignable. Otherwise the database refuses the statement with its
+/// datatype-mismatch diagnostic — naming the column, its declared type, the type the
+/// expression ARRIVED as and where the value is written — and the row does not land.
+///
+/// The rows differ along what decides the type the value is sent as (each `Field` member,
+/// each hint, a hint on a member that is not a string, where the member decides), along the
+/// family the column belongs to, and along whether the two are assignable.
+#[tokio::test]
+async fn an_assigned_parameter_must_be_a_value_its_column_takes() {
+    let api = DataApi::new();
+
+    // (case, the column's declaration, the value the parameter carries, the hint it
+    //  carries, the type the value ARRIVES as, whether the column takes it)
+    let cases: Vec<AssignmentCase> = vec![
+        // A hinted string is sent as the hint's type, so a column of another family
+        // refuses it.
+        (
+            "a JSON-hinted document into an integer column",
+            "INTEGER",
+            json!({"stringValue": r#"{"a":1}"#}),
+            Some("JSON"),
+            "jsonb",
+            false,
+        ),
+        (
+            "a DECIMAL-hinted number into a document column",
+            "JSONB",
+            json!({"stringValue": "12.5"}),
+            Some("DECIMAL"),
+            "numeric",
+            false,
+        ),
+        (
+            "a DATE-hinted date into a time-of-day column",
+            "TIME",
+            json!({"stringValue": "2026-10-22"}),
+            Some("DATE"),
+            "date",
+            false,
+        ),
+        (
+            "a TIMESTAMP-hinted instant into a binary column",
+            "BYTEA",
+            json!({"stringValue": "2026-10-22 18:30:00"}),
+            Some("TIMESTAMP"),
+            "timestamp without time zone",
+            false,
+        ),
+        // A hint on a member that is not a `stringValue` names nothing: the member already
+        // names the type, so THAT is the type the column judges.
+        (
+            "a UUID hint carried on a longValue, into a UUID column",
+            "UUID",
+            json!({"longValue": 7}),
+            Some("UUID"),
+            "bigint",
+            false,
+        ),
+        // And a member on its own, with no hint anywhere.
+        (
+            "a booleanValue into an integer column",
+            "INTEGER",
+            json!({"booleanValue": true}),
+            None,
+            "boolean",
+            false,
+        ),
+        (
+            "a longValue into a character column",
+            "VARCHAR(16)",
+            json!({"longValue": 7}),
+            None,
+            "bigint",
+            false,
+        ),
+        (
+            "a doubleValue into a UUID column",
+            "UUID",
+            json!({"doubleValue": 1.5}),
+            None,
+            "double precision",
+            false,
+        ),
+        (
+            "a blobValue into an integer column",
+            "INTEGER",
+            json!({"blobValue": "AQL/"}),
+            None,
+            "bytea",
+            false,
+        ),
+        (
+            "a stringValue with no hint into a boolean column",
+            "BOOLEAN",
+            json!({"stringValue": "true"}),
+            None,
+            "text",
+            false,
+        ),
+        // The same values where the column DOES take them: one row per family, including
+        // the two casts that cross a type (a date into a timestamp, an exact number into an
+        // integer) and the document type's other spelling.
+        (
+            "a longValue into an integer column",
+            "INTEGER",
+            json!({"longValue": 7}),
+            None,
+            "bigint",
+            true,
+        ),
+        (
+            "a longValue into an exact-number column",
+            "NUMERIC(12,4)",
+            json!({"longValue": 7}),
+            None,
+            "bigint",
+            true,
+        ),
+        (
+            "a doubleValue into a floating column",
+            "DOUBLE PRECISION",
+            json!({"doubleValue": 1.5}),
+            None,
+            "double precision",
+            true,
+        ),
+        (
+            "a booleanValue into a boolean column",
+            "BOOLEAN",
+            json!({"booleanValue": true}),
+            None,
+            "boolean",
+            true,
+        ),
+        (
+            "a blobValue into a binary column",
+            "BYTEA",
+            json!({"blobValue": "AQL/"}),
+            None,
+            "bytea",
+            true,
+        ),
+        (
+            "a stringValue with no hint into a character column",
+            "VARCHAR(16)",
+            json!({"stringValue": "plain"}),
+            None,
+            "text",
+            true,
+        ),
+        (
+            "a JSON-hinted document into the other document type",
+            "JSON",
+            json!({"stringValue": r#"{"a":1}"#}),
+            Some("JSON"),
+            "jsonb",
+            true,
+        ),
+        (
+            "a DATE-hinted date into a timestamp column",
+            "TIMESTAMP",
+            json!({"stringValue": "2026-10-22"}),
+            Some("DATE"),
+            "date",
+            true,
+        ),
+        (
+            "a DECIMAL-hinted number into an integer column",
+            "INTEGER",
+            json!({"stringValue": "7"}),
+            Some("DECIMAL"),
+            "numeric",
+            true,
+        ),
+        (
+            "a UUID-hinted uuid into a UUID column",
+            "UUID",
+            json!({"stringValue": "123e4567-e89b-12d3-a456-426614174000"}),
+            Some("UUID"),
+            "uuid",
+            true,
+        ),
+        (
+            "a TIME-hinted time of day into a time-of-day column",
+            "TIME",
+            json!({"stringValue": "18:30:00.500"}),
+            Some("TIME"),
+            "time without time zone",
+            true,
+        ),
+        // A NULL is a value of every type, so no column refuses it...
+        (
+            "a NULL into an integer column",
+            "INTEGER",
+            json!({"isNull": true}),
+            None,
+            "unknown",
+            true,
+        ),
+        // ...and a type the catalog does not name types nothing, so it refuses nothing.
+        (
+            "a longValue into a column of a type the catalog does not name",
+            "CITEXT",
+            json!({"longValue": 7}),
+            None,
+            "bigint",
+            true,
+        ),
+    ];
+
+    for (index, (case, declared, value, hint, arrives_as, takes_it)) in
+        cases.into_iter().enumerate()
+    {
+        let table = format!("assigned_{index}");
+        api.run(json!({
+            "sql": format!("CREATE TABLE {table} (id INT PRIMARY KEY, value {declared})"),
+        }))
+        .await;
+        let statement = format!("INSERT INTO {table} (id, value) VALUES (1, :value)");
+        // Where the value is written, which is the `Position` the database reports an error
+        // about it at: the characters before the placeholder, and then the one it starts at.
+        let position = statement.find(":value").expect("the statement binds it") + 1;
+        let mut parameter = parameter("value", value);
+        if let Some(hint) = hint {
+            parameter["typeHint"] = json!(hint);
+        }
+        let (status, body) = api
+            .execute(json!({"sql": statement, "parameters": [parameter]}))
+            .await;
+
+        if takes_it {
+            assert_eq!(
+                (status, number(&body, "numberOfRecordsUpdated")),
+                (200, 1),
+                "case {case:?}: the column takes a value of {arrives_as}, got {status} {body}"
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&body), body["message"].clone()),
+                (
+                    400,
+                    "DatabaseErrorException",
+                    json!(format!(
+                        "ERROR: column \"value\" is of type {} but expression is of type \
+                         {arrives_as}; Hint: You will need to rewrite or cast the \
+                         expression.; Position: {position}; SQLState: 42804",
+                        worded(declared)
+                    ))
+                ),
+                "case {case:?}: expected the database's datatype-mismatch diagnostic, got \
+                 {status} {body}"
+            );
+        }
+
+        // What the database holds either way: the row for a value the column took, and
+        // nothing at all for one it refused.
+        let stored = api
+            .run(json!({"sql": format!("SELECT id FROM {table}")}))
+            .await;
+        assert_eq!(
+            list(&stored, "records").len(),
+            usize::from(takes_it),
+            "case {case:?}: expected the row to {}, got {stored}",
+            if takes_it { "land" } else { "be absent" }
+        );
+    }
+
+    // The same rule serves `BatchExecuteStatement`: every set of it is judged the same way,
+    // and one set the column refuses refuses the whole batch.
+    api.run(json!({
+        "sql": "CREATE TABLE batched (id INT PRIMARY KEY, value INTEGER)",
+    }))
+    .await;
+    let insert = "INSERT INTO batched (id, value) VALUES (:id, :value)";
+    let (status, body) = api
+        .batch(json!({
+            "sql": insert,
+            "parameterSets": [
+                [parameter("id", json!({"longValue": 1})), parameter("value", json!({"longValue": 7}))],
+                [
+                    parameter("id", json!({"longValue": 2})),
+                    json!({
+                        "name": "value",
+                        "value": {"stringValue": r#"{"a":1}"#},
+                        "typeHint": "JSON",
+                    }),
+                ],
+            ],
+        }))
+        .await;
+    assert_eq!(
+        (status, error_code(&body)),
+        (400, "DatabaseErrorException"),
+        "case \"a batch one set of which the column refuses\": got {status} {body}"
+    );
+    let stored = api
+        .run(json!({"sql": "SELECT id FROM batched"}))
+        .await;
+    assert!(
+        list(&stored, "records").is_empty(),
+        "case \"a batch one set of which the column refuses\": nothing of it may land, got \
+         {stored}"
+    );
+    // And the batch whose every set the column takes lands every row.
+    let (status, body) = api
+        .batch(json!({
+            "sql": insert,
+            "parameterSets": [
+                [parameter("id", json!({"longValue": 1})), parameter("value", json!({"longValue": 7}))],
+                [
+                    parameter("id", json!({"longValue": 2})),
+                    json!({"name": "value", "value": {"stringValue": "8"}, "typeHint": "DECIMAL"}),
+                ],
+            ],
+        }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"a batch every set of which the column takes\": got {status} {body}"
+    );
+    let stored = api
+        .run(json!({"sql": "SELECT id FROM batched ORDER BY id"}))
+        .await;
+    assert_eq!(
+        stored["records"],
+        json!([[{"longValue": 1}], [{"longValue": 2}]]),
+        "case \"a batch every set of which the column takes\": expected both rows, got {stored}"
+    );
+
+    // Every hint the model declares names the type its own documentation says, which is
+    // what the diagnostic above reports the expression as: one refusal per hint, into a
+    // column of a family none of them belongs to.
+    for (hint, named) in HINTED_TYPES {
+        let table = format!("hint_{}", hint.to_ascii_lowercase());
+        api.run(json!({
+            "sql": format!("CREATE TABLE {table} (value BYTEA)"),
+        }))
+        .await;
+        let statement = format!("INSERT INTO {table} (value) VALUES (:value)");
+        let position = statement.find(":value").expect("the statement binds it") + 1;
+        // A string every one of the six reads as a value of its own type is not one string,
+        // so each hint is given the form its documentation names; what is asserted is the
+        // TYPE the diagnostic reports, not the value.
+        let sent = match *hint {
+            "DATE" => "2026-10-22",
+            "DECIMAL" => "12.5",
+            "JSON" => r#"{"a":1}"#,
+            "TIME" => "18:30:00",
+            "TIMESTAMP" => "2026-10-22 18:30:00",
+            _ => "123e4567-e89b-12d3-a456-426614174000",
+        };
+        let (status, body) = api
+            .execute(json!({
+                "sql": statement,
+                "parameters": [
+                    json!({"name": "value", "value": {"stringValue": sent}, "typeHint": hint}),
+                ],
+            }))
+            .await;
+        assert_eq!(
+            (status, error_code(&body), body["message"].clone()),
+            (
+                400,
+                "DatabaseErrorException",
+                json!(format!(
+                    "ERROR: column \"value\" is of type bytea but expression is of type \
+                     {named}; Hint: You will need to rewrite or cast the expression.; \
+                     Position: {position}; SQLState: 42804"
+                ))
+            ),
+            "case {hint} sent into a binary column: expected the expression type {named}, \
+             got {status} {body}"
+        );
+    }
+}
+
+/// The name the DATABASE words a declared type by in a diagnostic, which is the SQL name
+/// and not the catalog's own — as the tables above declare them.
+fn worded(declared: &str) -> &'static str {
+    match declared {
+        "INTEGER" => "integer",
+        "VARCHAR(16)" => "character varying",
+        "BOOLEAN" => "boolean",
+        "UUID" => "uuid",
+        "JSONB" => "jsonb",
+        "JSON" => "json",
+        "TIME" => "time without time zone",
+        "TIMESTAMP" => "timestamp without time zone",
+        "BYTEA" => "bytea",
+        "NUMERIC(12,4)" => "numeric",
+        "DOUBLE PRECISION" => "double precision",
+        other => panic!("the test declares no column of type {other}"),
+    }
+}

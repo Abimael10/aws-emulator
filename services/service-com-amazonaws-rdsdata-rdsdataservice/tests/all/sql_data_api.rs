@@ -1938,6 +1938,15 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
     api.run(json!({"sql": "CREATE TABLE hinted (hint VARCHAR(16), value TEXT)"}))
         .await;
 
+    // Every row below writes its hinted value into the character column through a CAST,
+    // because the hint names the type the string is SENT AS and a value of that type
+    // reaches a character column only where the statement casts it — the assignment rule
+    // `an_assigned_parameter_must_be_a_value_its_column_takes` pins. What this test is
+    // about is which STRINGS each hint accepts, which is decided before any column is
+    // reached.
+    const INSERT_HINTED: &str =
+        "INSERT INTO hinted (hint, value) VALUES (:hint, CAST(:value AS TEXT))";
+
     // One row per hint the model declares: a value of the documented form, one that is
     // the right shape for some OTHER hint (so a hint that was ignored would let it
     // through), and the sentence the refusal of that string carries — the hint and the
@@ -1985,7 +1994,7 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
     for (hint, accepted, refused, expected_message) in cases {
         let inserted = api
             .run(json!({
-                "sql": "INSERT INTO hinted (hint, value) VALUES (:hint, :value)",
+                "sql": INSERT_HINTED,
                 "parameters": [
                     parameter("hint", json!({"stringValue": hint})),
                     json!({"name": "value", "value": {"stringValue": accepted}, "typeHint": hint}),
@@ -2012,7 +2021,7 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
 
         let (status, body) = api
             .execute(json!({
-                "sql": "INSERT INTO hinted (hint, value) VALUES (:hint, :value)",
+                "sql": INSERT_HINTED,
                 "parameters": [
                     parameter("hint", json!({"stringValue": hint})),
                     json!({"name": "value", "value": {"stringValue": refused}, "typeHint": hint}),
@@ -2057,7 +2066,7 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
     for (hint, value, expected) in bounds {
         let (status, body) = api
             .execute(json!({
-                "sql": "INSERT INTO hinted (hint, value) VALUES (:hint, :value)",
+                "sql": INSERT_HINTED,
                 "parameters": [
                     parameter("hint", json!({"stringValue": hint})),
                     json!({"name": "value", "value": {"stringValue": value}, "typeHint": hint}),
@@ -2074,7 +2083,7 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
     // dropped.
     let (status, body) = api
         .execute(json!({
-            "sql": "INSERT INTO hinted (hint, value) VALUES (:hint, :value)",
+            "sql": INSERT_HINTED,
             "parameters": [
                 parameter("hint", json!({"stringValue": "unknown"})),
                 json!({"name": "value", "value": {"stringValue": "x"}, "typeHint": "INTERVAL"}),
@@ -2095,7 +2104,7 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
     ] {
         let inserted = api
             .run(json!({
-                "sql": "INSERT INTO hinted (hint, value) VALUES (:hint, :value)",
+                "sql": INSERT_HINTED,
                 "parameters": [
                     parameter("hint", json!({"stringValue": case})),
                     json!({"name": "value", "value": value, "typeHint": "DATE"}),

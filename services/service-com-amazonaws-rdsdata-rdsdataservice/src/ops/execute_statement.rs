@@ -257,6 +257,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 InternalServerErrorException::default(),
             ))
         })?;
+        // WHICH transaction this statement is part of, read once: a `transactionId`
+        // carrying no characters names none, which is what leaving the member out says
+        // (`crate::state::named_transaction`), so the statement runs on its own — and the
+        // `database` member below is then the database it selects.
+        let transaction_id = crate::state::named_transaction(input.transaction_id.as_deref());
         // The identity, the cluster, the secret, the login and the database the call
         // names, all resolved BEFORE the statement runs: a call the chain refuses must
         // not reach the engine, so nothing it would have written is written.
@@ -271,14 +276,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A statement inside a transaction runs against the database that
                 // transaction was opened for, so the member is not a database this call
                 // selects.
-                database: match input.transaction_id {
+                database: match transaction_id {
                     Some(_) => None,
                     None => input.database.as_deref(),
                 },
                 // The model's own note on this member is that the schema parameter isn't
                 // supported, so a call carrying one is refused rather than run.
                 schema: input.schema.as_deref(),
-                transaction_id: input.transaction_id.as_deref(),
+                transaction_id,
             },
         )
         .await
@@ -351,6 +356,10 @@ fn execute(
     // engine and by rendering them, so the request has a single output bound.
     let mut budget = crate::state::RequestBudget::new();
 
+    // The transaction this statement is part of, read the way the handler read it: an
+    // empty member names none.
+    let transaction_id = crate::state::named_transaction(input.transaction_id.as_deref());
+
     // With a `transactionId` the statement runs inside that transaction, against
     // the database that transaction READS: everything committed on it, plus the
     // transaction's own writes, which stay invisible to every other reader until it
@@ -367,12 +376,12 @@ fn execute(
             // the statement itself still goes to the cluster, because the engines
             // behind this API apply a statement about their databases outside any
             // transaction block.
-            if let Some(transaction_id) = input.transaction_id.as_deref() {
+            if let Some(transaction_id) = transaction_id {
                 cluster.open_transaction_mut(transaction_id)?.touch();
             }
             cluster.apply_namespace(&statement)?
         }
-        None => match input.transaction_id.as_deref() {
+        None => match transaction_id {
             Some(transaction_id) => {
                 let ran = cluster.run_in_transaction(
                     transaction_id,
@@ -406,7 +415,7 @@ fn execute(
         // `formattedRecords` "is only present when the formatRecordsAs parameter
         // is set to JSON", and `records` / `columnMetadata` are blank then.
         if as_json {
-            output.formatted_records = Some(outcome.formatted_records(&mut budget)?);
+            output.formatted_records = Some(outcome.formatted_records(&mut budget, returns)?);
         } else {
             output.records = Some(outcome.records(returns)?);
             if input.include_result_metadata {
@@ -428,7 +437,7 @@ fn execute(
     tracing::info!(
         resource_arn = %input.resource_arn,
         database = input.database.as_deref().unwrap_or(""),
-        in_transaction = input.transaction_id.is_some(),
+        in_transaction = transaction_id.is_some(),
         records_updated = outcome.records_updated,
         rows_returned = outcome.rows.len(),
         "rds-data executed a statement"

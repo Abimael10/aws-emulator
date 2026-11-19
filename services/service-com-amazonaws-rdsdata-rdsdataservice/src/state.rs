@@ -1966,19 +1966,20 @@ impl Database {
 
     /// Refuse a value the column the statement ASSIGNS it to does not take.
     ///
-    /// A parameter reaches the database as a value of the type its `Field` member
-    /// names, and a `stringValue` carrying no `typeHint` is a value written as TEXT:
-    /// PostgreSQL has no implicit cast from a character type to another type, so such a
-    /// value can be assigned to a character column and to no other — and the database
-    /// says so rather than storing it. Which is what `SqlParameter$typeHint` is for:
-    /// the model documents each hint as what "the corresponding String parameter value
-    /// is sent as", so a hinted value is sent as a value of THAT type and is not text
-    /// at all. A cast the statement writes is the other way of saying it, and is not an
-    /// assignment of the parameter (see [`postgres::Plan::assigned_values`]).
+    /// A parameter reaches the database as a value of ONE definite type — the type its
+    /// `Field` member names, or, for a `stringValue` carrying a `typeHint`, the type that
+    /// hint names, because the model documents each hint as what "the corresponding String
+    /// parameter value is sent as" ([`sent_type`]) — and the engine then applies its
+    /// ordinary assignment rules to it: the column takes the value only where PostgreSQL
+    /// has an implicit or assignment cast from that type to the column's declared one
+    /// ([`postgres::assignable_to`]), and says so rather than storing it otherwise. A cast
+    /// the statement writes is the other way of naming the type, and is not an assignment
+    /// of the parameter (see [`postgres::Plan::assigned_values`]).
     ///
-    /// Only where the statement and the schema BOTH settle the question: a placeholder
-    /// the statement assigns directly, to a column of a table this database holds, of a
-    /// type the catalog names and that does not take a value written as text.
+    /// Only where the statement and the schema BOTH settle the question: a placeholder the
+    /// statement assigns directly, to a column of a table this database holds, carrying a
+    /// value whose own type the request settles. A NULL is a value of every type, and a
+    /// type the catalog does not name types nothing, so neither is refused here.
     fn require_assignable_values(
         &self,
         plan: &Plan,
@@ -1988,23 +1989,24 @@ impl Database {
             return Ok(());
         };
         for assigned in &plan.assigned_values {
-            let sent_as_text = parameters.iter().any(|parameter| {
-                parameter.name.as_deref() == Some(assigned.placeholder.as_str())
-                    && parameter.type_hint.is_none()
-                    && matches!(parameter.value.as_ref(), Some(Field::stringValue(_)))
-            });
-            if !sent_as_text {
+            let sent = parameters
+                .iter()
+                .find(|parameter| {
+                    parameter.name.as_deref() == Some(assigned.placeholder.as_str())
+                })
+                .and_then(sent_type);
+            let Some(sent) = sent else {
                 continue;
-            }
+            };
             let Some(declared) = declared_type_in(&self.conn, table, &assigned.column) else {
                 continue;
             };
             let pg = postgres::pg_type(&declared);
-            if !pg.takes_text {
+            if !postgres::assignable_to(&sent, &pg) {
                 return Err(SqlError::Engine(postgres::wrong_type_for_column(
                     &assigned.column,
                     &pg,
-                    postgres::CHARACTER_VALUE_TYPE,
+                    sent.worded_name(),
                     assigned.position,
                 )));
             }
@@ -2591,6 +2593,26 @@ pub fn transaction_id_names_resource(transaction_id: &str, resource_arn: &str) -
         && transaction_id.ends_with(&::service_common::stable_hex_id(&[resource_arn]))
 }
 
+/// The transaction an OPTIONAL `transactionId` member names, and `None` where it names
+/// none.
+///
+/// The member is "the transaction ID of the transaction that you want to include the SQL
+/// statement in", and its own documentation says "If the SQL statement is not part of a
+/// transaction, don't set this parameter": a member carrying NO CHARACTERS names no
+/// transaction, so it says exactly what leaving it out says — the statement runs on its own
+/// and auto-commits. A value of any other form is an id, which the precondition chain then
+/// resolves against the resource the call names.
+///
+/// Read ONCE here, because the same reading has to decide the chain's transaction leg and
+/// whether the call's `database` member is the database this statement selects. It is for
+/// the two operations whose member is optional: `CommitTransaction` and
+/// `RollbackTransaction` REQUIRE a `transactionId`, so for them there is no transaction to
+/// be absent and an empty value stays an id no transaction of the resource answers to.
+#[must_use]
+pub fn named_transaction(member: Option<&str>) -> Option<&str> {
+    member.filter(|transaction_id| !transaction_id.is_empty())
+}
+
 /// How many hexadecimal digits the mixing of the resource ARN carries, which is the second
 /// part of a minted transaction id ([`::service_common::stable_hex_id`]'s own width).
 const RESOURCE_TAG_DIGITS: usize = 16;
@@ -2676,7 +2698,15 @@ impl StatementOutcome {
     /// `Err` when the body would pass the budget, or when a value has no JSON
     /// form at all (see [`json_for`]) — both answered with the modelled
     /// `UnsupportedResultException`.
-    pub fn formatted_records(&self, budget: &mut RequestBudget) -> Result<String, SqlError> {
+    ///
+    /// `returns` is the request's `resultSetOptions`, which this form honours exactly as
+    /// `records` does: the options are about how a NUMBER is represented, not about which
+    /// of the two result members carries it.
+    pub fn formatted_records(
+        &self,
+        budget: &mut RequestBudget,
+        returns: ReturnTypes,
+    ) -> Result<String, SqlError> {
         let mut formatted = String::from("[");
         for (index, row) in self.rows.iter().enumerate() {
             if index > 0 {
@@ -2687,7 +2717,7 @@ impl StatementOutcome {
                 // The label is rendered as a JSON string, so a label carrying a
                 // quote or a control character cannot break out of the key.
                 let key = serde_json::Value::String(column.label.clone()).to_string();
-                let rendered = json_for(value, column)?.to_string();
+                let rendered = json_for(value, column, returns)?.to_string();
                 // `+ 4` covers the punctuation this cell and its row still need:
                 // the ':' before the value, the ',' that may separate it from the
                 // next cell or row, and the '}' and ']' that must close them.
@@ -3217,6 +3247,55 @@ fn sql_value_for(parameter: &SqlParameter) -> Result<SqlValue, SqlError> {
     })
 }
 
+/// The PostgreSQL type a parameter's value is SENT AS, and `None` where the request
+/// settles none.
+///
+/// What a parameter reaches the database as is decided by the request alone: the `Field`
+/// member names the type for five of the six members — `booleanValue` a boolean,
+/// `longValue` a 64-bit integer, `doubleValue` a double, `blobValue` a binary value and
+/// `stringValue` a value written as TEXT — and a `typeHint` names it for a `stringValue`,
+/// which is what the model documents each hint as ("the corresponding `String` parameter
+/// value is sent as" an object of that type). A hint on any other member names nothing: the
+/// member already names the type, exactly as [`sql_value_for`] reads it.
+///
+/// `None` for the values that are of no one type: a NULL, which is a value of every type,
+/// an `arrayValue`, which is refused before the statement runs, and a hint the model does
+/// not declare, which [`hinted_text`] refuses as a fault of the call.
+fn sent_type(parameter: &SqlParameter) -> Option<PgType> {
+    match parameter.value.as_ref()? {
+        Field::isNull(_) | Field::arrayValue(_) => None,
+        Field::booleanValue(_) => Some(postgres::pg_type("bool")),
+        Field::longValue(_) => Some(postgres::pg_type("int8")),
+        Field::doubleValue(_) => Some(postgres::pg_type("float8")),
+        Field::blobValue(_) => Some(postgres::pg_type("bytea")),
+        Field::stringValue(_) => match parameter.type_hint.as_deref() {
+            Some(hint) => hinted_type(hint),
+            None => Some(postgres::pg_type("text")),
+        },
+    }
+}
+
+/// The type one of the model's `typeHint` values names, as the catalog holds it.
+///
+/// The six the model declares (`TypeHint`: DATE, DECIMAL, JSON, TIME, TIMESTAMP, UUID),
+/// each the object type its own documentation says the string is sent to the database as:
+/// an exact number for `DECIMAL`, and the document type the engine behind this API stores a
+/// JSON object in for `JSON`. `None` for a value the enum does not declare, which is a
+/// fault of the call rather than a type.
+fn hinted_type(hint: &str) -> Option<PgType> {
+    Some(postgres::pg_type(
+        match hint.to_ascii_uppercase().as_str() {
+            "DATE" => "date",
+            "TIME" => "time",
+            "TIMESTAMP" => "timestamp",
+            "DECIMAL" => "numeric",
+            "JSON" => "jsonb",
+            "UUID" => "uuid",
+            _ => return None,
+        },
+    ))
+}
+
 /// The value the statement ASSIGNED to one of its columns, as text — which is what the
 /// duplicate-key diagnostic of either engine names as the value that collided.
 ///
@@ -3494,7 +3573,10 @@ pub fn field_for(
                 if returns.decimal_as_number {
                     // "a Long value if its scale is 0, or a Double value otherwise",
                     // and a value no integer can hold stays a double.
-                    match (column.pg.scale == 0, in_integer_range(*number)) {
+                    match (
+                        exact_scale_is_zero(*number, column),
+                        in_integer_range(*number),
+                    ) {
                         (true, true) => Field::longValue(*number as i64),
                         _ => Field::doubleValue(*number),
                     }
@@ -3764,6 +3846,21 @@ fn in_integer_range(number: f64) -> bool {
     number.is_finite() && number >= -(2_f64.powi(63)) && number < 2_f64.powi(63)
 }
 
+/// Whether the SCALE of an exact number this result cell holds is ZERO — the question
+/// `decimalReturnType=DOUBLE_OR_LONG` decides the member by ("a Long value if its scale is
+/// 0, or a Double value otherwise").
+///
+/// A column whose DECLARATION gave a scale carries that scale whatever value it holds; a
+/// `numeric` with no declared scale carries each VALUE's own scale, so the value is what
+/// says whether it has fractional digits — the same reading [`exact_text`] renders such a
+/// value with.
+fn exact_scale_is_zero(number: f64, column: &ColumnInfo) -> bool {
+    match column.pg.declared_scale {
+        Some(scale) => scale == 0,
+        None => number.fract() == 0.0,
+    }
+}
+
 /// The non-finite floating value this result cell holds, as the DATABASE DISPLAYS it, and
 /// `None` for every other value.
 ///
@@ -3813,15 +3910,22 @@ fn holds_an_array(elements: &[serde_json::Value]) -> bool {
 ///
 /// The rule: a value is rendered in the JSON form of the `Field` member its
 /// COLUMN's type names, so a client reading the JSON string sees the same value,
-/// of the same JSON type, as it would in `records`. The `Field` union models
+/// of the same JSON type, as it would in `records` — `resultSetOptions` included, because
+/// those options are about how a NUMBER is represented and not about which result member
+/// carries it: a `LONG` asked for as a string is a JSON string here too, and an exact
+/// number asked for as a number is a JSON number. The `Field` union models
 /// `booleanValue` as a boolean and `blobValue` as a blob — which this protocol
 /// carries base64-encoded — so a boolean column is one of the JSON literals
 /// `true`/`false` and a binary column is its base64 text; an EXACT number is a JSON
-/// string, as `records` reports it, because neither form turns an exact number into a
-/// float; an inexact one is a JSON number, text and a date or time are JSON strings, a
-/// NULL is `null`, and an array column is a JSON array whose elements take the form
-/// their ELEMENT type names (see [`json_element`]).
-fn json_for(value: &SqlValue, column: &ColumnInfo) -> Result<serde_json::Value, SqlError> {
+/// string under the default `decimalReturnType`, as `records` reports it, because neither
+/// form turns an exact number into a float; an inexact one is a JSON number, text and a
+/// date or time are JSON strings, a NULL is `null`, and an array column is a JSON array
+/// whose elements take the form their ELEMENT type names (see [`json_element`]).
+fn json_for(
+    value: &SqlValue,
+    column: &ColumnInfo,
+    returns: ReturnTypes,
+) -> Result<serde_json::Value, SqlError> {
     // JSON has no NUMBER form for a value that is not a number, and the database renders
     // such a value in JSON as the STRING it displays it as — which is why asking for the
     // JSON form of a result set `records` cannot carry answers it instead of refusing it.
@@ -3834,7 +3938,20 @@ fn json_for(value: &SqlValue, column: &ColumnInfo) -> Result<serde_json::Value, 
             if column.is_boolean() {
                 serde_json::Value::Bool(*number != 0)
             } else if column.is_decimal() {
-                serde_json::Value::String(exact_integer_text(*number, column))
+                // "a Long value if its scale is 0, or a Double value otherwise", for a
+                // caller that asked for an exact number as a number; the text of its own
+                // digits otherwise, which is the documented default.
+                if returns.decimal_as_number {
+                    if column.pg.scale == 0 {
+                        serde_json::Value::from(*number)
+                    } else {
+                        serde_json::Value::from(*number as f64)
+                    }
+                } else {
+                    serde_json::Value::String(exact_integer_text(*number, column))
+                }
+            } else if returns.long_as_string {
+                serde_json::Value::String(number.to_string())
             } else {
                 serde_json::Value::from(*number)
             }
@@ -3842,7 +3959,17 @@ fn json_for(value: &SqlValue, column: &ColumnInfo) -> Result<serde_json::Value, 
         // An exact number keeps its digits and its scale, which is what the text form
         // is for.
         SqlValue::Real(number) if column.is_decimal() => {
-            serde_json::Value::String(exact_text(*number, column))
+            if returns.decimal_as_number {
+                match (
+                    exact_scale_is_zero(*number, column),
+                    in_integer_range(*number),
+                ) {
+                    (true, true) => serde_json::Value::from(*number as i64),
+                    _ => serde_json::Value::from(*number),
+                }
+            } else {
+                serde_json::Value::String(exact_text(*number, column))
+            }
         }
         SqlValue::Real(number) => serde_json::Number::from_f64(*number)
             .map(serde_json::Value::Number)

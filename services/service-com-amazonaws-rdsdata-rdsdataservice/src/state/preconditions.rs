@@ -234,6 +234,11 @@ pub struct Admitted {
 /// This is the LAST leg of the chain: the identity, the cluster and the secret a call names
 /// are resolved first, so a caller who may not call at all, or who addressed a cluster with
 /// no Data API endpoint, learns that rather than anything about the id it quoted.
+///
+/// What reaches this leg is the id the call really QUOTES: an operation whose
+/// `transactionId` is optional reads an empty member as naming no transaction at all
+/// ([`super::named_transaction`]) and passes `None`, so this leg only ever judges values
+/// presented as ids.
 fn require_a_transaction_id_of_the_resource(call: &Call<'_>) -> Result<(), Refusal> {
     let Some(transaction_id) = call.transaction_id else {
         return Ok(());

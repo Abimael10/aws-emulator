@@ -12,6 +12,11 @@
 //! `TransactionNotFoundException`. The two classes must not collapse onto one code: a
 //! caller that corrupted or truncated its id has to learn that its request is malformed,
 //! not that a previous call ended its transaction.
+//!
+//! An id with NO CHARACTERS is not one of those values where the member is OPTIONAL: it
+//! names no transaction at all, which the second rule here pins
+//! ([`an_empty_transaction_id_names_no_transaction`]) — the statement runs on its own and
+//! auto-commits, and the `database` member still selects the database it runs against.
 
 use serde_json::{json, Value};
 
@@ -90,7 +95,6 @@ async fn an_id_the_resource_could_not_have_issued_is_a_validation_fault() {
     not_hexadecimal.replace_range(3..4, "z");
 
     let malformed = [
-        ("an id that is empty", String::new()),
         (
             "a string that is no id at all",
             "no-such-transaction-id".to_string(),
@@ -134,6 +138,32 @@ async fn an_id_the_resource_could_not_have_issued_is_a_validation_fault() {
                 "case {case} on {operation}: expected the invalid-argument text, got {body}"
             );
         }
+    }
+
+    // An EMPTY `transactionId` is the member being ABSENT wherever the member is optional
+    // ([`an_empty_transaction_id_names_no_transaction`] pins what the two statement
+    // operations then do with it), so it is judged here only on the two operations whose
+    // `transactionId` is REQUIRED: there is no transaction for it to be absent, so it stays
+    // a value this resource could never have issued.
+    for (operation, (status, body)) in [
+        ("CommitTransaction", api.commit("").await),
+        ("RollbackTransaction", api.rollback("").await),
+    ] {
+        assert_eq!(
+            status, 400,
+            "case an id that is empty on {operation}: expected HTTP 400, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case an id that is empty on {operation}: expected ValidationException, got {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(INVALID_TRANSACTION_ID),
+            "case an id that is empty on {operation}: expected the invalid-argument text, got \
+             {body}"
+        );
     }
 
     // One past the modelled maximum: the model's own length constraint refuses it, which is
@@ -204,5 +234,121 @@ async fn an_id_the_resource_could_not_have_issued_is_a_validation_fault() {
         note_count(&api).await,
         1,
         "case after the commit: only the transaction's own row may be there"
+    );
+}
+
+/// RULE: where the `transactionId` member is OPTIONAL, a value carrying NO CHARACTERS names
+/// no transaction at all — the member's own documentation is "If the SQL statement is not
+/// part of a transaction, don't set this parameter" — so it says exactly what leaving the
+/// member out says: the statement runs on its own and auto-commits, the `database` member
+/// still selects the database it runs against, and nothing about the call is refused.
+///
+/// The rows differ along what the call asks for beside the empty member — a read, a write,
+/// a write on a database the call selects — and each is sent on both operations whose
+/// `transactionId` is optional, against the same call with the member left out, which is
+/// what the empty one has to answer like.
+#[tokio::test]
+async fn an_empty_transaction_id_names_no_transaction() {
+    let api = DataApi::new();
+    given_notes(&api).await;
+
+    // The recorded shape of it: a read with the member present and empty is served, and
+    // answers exactly what the standalone read answers.
+    for (case, members) in [
+        ("the member left out", json!({"sql": "SELECT 1 AS one"})),
+        (
+            "the member present and empty",
+            json!({"sql": "SELECT 1 AS one", "transactionId": ""}),
+        ),
+    ] {
+        let (status, body) = api.execute(members).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected the statement to run, got {status} {body}"
+        );
+        assert_eq!(
+            (body["records"].clone(), body["numberOfRecordsUpdated"].clone()),
+            (json!([[{"longValue": 1}]]), json!(0)),
+            "case {case}: expected the one row and no row changed, got {body}"
+        );
+    }
+
+    // A WRITE with the empty member auto-commits, so a later statement OUTSIDE any
+    // transaction sees it: it ran in no transaction at all, and there is none left to
+    // commit or roll back.
+    let (status, body) = api
+        .execute(json!({
+            "sql": "INSERT INTO notes (id) VALUES (7)",
+            "transactionId": "",
+        }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case a write with the member present and empty: got {status} {body}"
+    );
+    assert_eq!(
+        note_count(&api).await,
+        1,
+        "case a write with the member present and empty: the row must be committed"
+    );
+
+    // The batch form of the same reading.
+    let (status, body) = api
+        .batch(json!({
+            "sql": "INSERT INTO notes (id) VALUES (:id)",
+            "parameterSets": [
+                [parameter("id", json!({"longValue": 8}))],
+                [parameter("id", json!({"longValue": 9}))],
+            ],
+            "transactionId": "",
+        }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case a batch with the member present and empty: got {status} {body}"
+    );
+    assert_eq!(
+        note_count(&api).await,
+        3,
+        "case a batch with the member present and empty: both rows must be committed"
+    );
+
+    // And the `database` member still selects the database: a call inside a transaction
+    // runs against the database that transaction was opened for, so the member is read as
+    // the call's own exactly when no transaction is named. The table below exists in the
+    // selected database and in no other.
+    api.run(json!({
+        "sql": "CREATE TABLE picked (id INT PRIMARY KEY)",
+        "database": "selected",
+        "transactionId": "",
+    }))
+    .await;
+    let (status, body) = api
+        .execute(json!({
+            "sql": "INSERT INTO picked (id) VALUES (1)",
+            "database": "selected",
+            "transactionId": "",
+        }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case a write on a selected database with the member empty: got {status} {body}"
+    );
+    let selected = api
+        .run(json!({"sql": "SELECT id FROM picked", "database": "selected"}))
+        .await;
+    assert_eq!(
+        selected["records"],
+        json!([[{"longValue": 1}]]),
+        "case a read of the selected database: expected the row it holds, got {selected}"
+    );
+    let (status, elsewhere) = api
+        .execute(json!({"sql": "SELECT id FROM picked"}))
+        .await;
+    assert_eq!(
+        (status, error_code(&elsewhere)),
+        (400, "DatabaseErrorException"),
+        "case a read of the DEFAULT database: the table belongs to the selected one, got \
+         {status} {elsewhere}"
     );
 }
