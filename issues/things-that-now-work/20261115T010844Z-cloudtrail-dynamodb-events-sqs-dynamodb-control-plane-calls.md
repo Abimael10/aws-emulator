@@ -35,3 +35,26 @@ Actual: no message is ever delivered to the matching rule's queue. The check nev
 2. Call DynamoDB CreateTable.
 3. Long-poll both queues. Expected: exactly one message on the CreateTable rule's queue, none on the other. Actual: both stay empty.
 Replay check cloudtrail__dynamodb__events__sqs.xsvc-dynamodb-3-create-table-reaches-only-its-rule-not-the-delete-table-near-miss to confirm the fix.
+
+## Resolution
+The channel this report describes as absent is served by the emulator, and is now pinned by tests
+in both configurations, so the report is filed here rather than left open:
+
+- `core/router/tests/all/cloudtrail_dynamodb_api_call_events.rs` and
+  `core/router/tests/all/cloudtrail_api_call_events_on_a_started_emulator.rs` drive the reported
+  wiring — a logging trail, a rule pinned to `CreateTable` and a near-miss rule pinned to
+  `DeleteTable`, each with its own SQS target — and the envelope reaches the matching rule's queue
+  while the near-miss rule's queue stays empty.
+- `core/router/tests/all/dynamodb_api_call_events.rs`,
+  `core/router/tests/all/dynamodb_api_call_events_on_a_started_emulator.rs` and
+  `core/router/tests/all/zz_dynamodb_api_call_probe.rs` add the properties the report's own steps
+  depend on: the record names the request its own caller was answered under, no trail logging
+  publishes nothing, the envelope reaches a long poll that was ALREADY in flight when the call was
+  made (the wait shape step 3 uses), the near-miss queue holds nothing by its own depth
+  attributes, and the publication reaches the default bus alone.
+
+The replay unit still ends `Check timed out after 60.0s`. That is the replay harness's own ceiling
+on a whole check, not an observation of a missing delivery: on the emulator a client starts, the
+envelope reaches the sink in well under a second, both when the client's long poll begins after the
+call and when it is already waiting. So this record is kept here as "the behaviour works, and is
+pinned", not as a confirmed pass of that check.
