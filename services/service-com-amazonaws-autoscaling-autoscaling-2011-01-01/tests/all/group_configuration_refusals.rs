@@ -1311,11 +1311,11 @@ async fn a_force_delete_is_refused_while_the_retention_trigger_retains() {
     }
 }
 
-/// RULE: deletes of ONE group that race each other are all accepted — the delete is the same
-/// delete however many callers asked for it — and the group is gone afterwards. A name no
-/// group ever answered to is still refused.
+/// RULE: `AutoScalingGroupName` names the group a delete removes, so exactly ONE of a set of
+/// racing deletes of one group is served and every other is refused as a name that answers to
+/// nothing — the delete is not idempotent in its name — and the group is gone afterwards.
 #[tokio::test]
-async fn racing_deletes_of_one_group_are_all_accepted() {
+async fn racing_deletes_of_one_group_serve_exactly_one_caller() {
     // (case, whether the racers force the delete)
     for (case, force) in [("forced deletes", true), ("plain deletes", false)] {
         let (router, _engine) = emulator();
@@ -1345,11 +1345,28 @@ async fn racing_deletes_of_one_group_are_all_accepted() {
             answers.0, answers.1, answers.2, answers.3, answers.4, answers.5, answers.6,
             answers.7,
         ];
+        let served = answers
+            .iter()
+            .filter(|(status, _)| *status == 200)
+            .count();
+        assert_eq!(
+            served, 1,
+            "case {case:?}: exactly one racer removes the group, got {served} served answers in \
+             {answers:?}"
+        );
         for (racer, (status, body)) in answers.iter().enumerate() {
+            if *status == 200 {
+                continue;
+            }
             assert_eq!(
-                *status, 200,
-                "case {case:?}: racer {racer} asked for the same delete and must be accepted, \
-                 got {status}: {body}"
+                *status, 400,
+                "case {case:?}: racer {racer} asked for a group the first delete removed and \
+                 must be refused, got {status}: {body}"
+            );
+            assert_eq!(
+                tag_value(body, "Code"),
+                "ValidationError",
+                "case {case:?}: racer {racer} must be refused as an unknown group, got {body}"
             );
         }
         assert!(
@@ -1357,8 +1374,7 @@ async fn racing_deletes_of_one_group_are_all_accepted() {
             "case {case:?}: the group must be gone once the racing deletes are answered"
         );
 
-        // Idempotence is about a delete THIS account asked for: a name no group ever answered
-        // to is refused as it always was.
+        // A name no group ever answered to is refused in exactly the same terms.
         let (status, body) = query(
             &router,
             "DeleteAutoScalingGroup",

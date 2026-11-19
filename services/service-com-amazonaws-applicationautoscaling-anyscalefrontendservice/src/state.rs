@@ -349,16 +349,9 @@ pub struct ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
     ///
     /// `DeregisterScalableTarget` takes an ARN out of this index as it removes the target
     /// (`Self::retire_target_arn`), so an ARN whose target is no longer registered resolves to
-    /// nothing here — and is kept in [`Self::retired_target_arns`] as one this service DID
-    /// mint, which is what an ARN-addressed operation tells it apart from an ARN this service
-    /// never minted by (`tag_target_arns::TaggedTargetArn`).
+    /// nothing here — which is a scalable target reported ABSENT, exactly as an ARN of this
+    /// endpoint that nothing was ever minted for is (`tag_target_arns::TaggedTargetArn`).
     pub arn_index: BTreeMap<String, TargetKey>,
-    /// The ARNs this service minted for scalable targets it no longer holds: an ARN's
-    /// PROVENANCE, which outlives the target it was minted for.
-    ///
-    /// Written by `Self::retire_target_arn` and read through `Self::resolve_tagged_target_arn`;
-    /// bounded by `tag_target_arns::MAX_RETIRED_TARGET_ARNS`.
-    pub retired_target_arns: tag_target_arns::RetiredTargetArns,
     /// Scheduled actions, ordered by (target, action name). `DeregisterScalableTarget`
     /// cascades into this map, so a deregistered target leaves none behind.
     ///
@@ -1725,18 +1718,18 @@ pub const CAPACITY_RANGE_INVERTED_MESSAGE: &str =
 /// The message every operation of the tagging family carries for a `ResourceARN` this service
 /// MINTED for a scalable target it no longer holds.
 ///
-/// The resource a tag operation addresses is the scalable target its `ResourceARN` names, and
-/// an ARN this service minted names a target it either still holds or has lost: the refusal
-/// states exactly that, and the ARN asked about is reported in the modelled `ResourceName`
-/// member rather than spliced into the sentence. Entirely fixed text — no ARN, Region, account
-/// or tag key is interpolated. It is answered by the READ and by the two MUTATIONS alike, with
-/// the client-error status rather than with the 404 the shape's `@httpError` declares
-/// (`wire_refusals::WireRefusal::ScalableTargetNotFound`). A tag write to a target this service
-/// minted and lost is the resource reported absent, not a permission failure:
-/// `ResourceNotFoundException` is modelled on all three operations, and a client branches on
-/// the code to tell "the target is gone" from "your request may not be made". An ARN this
-/// service never minted earns the other refusal instead, since it names no resource this
-/// endpoint holds any record of (`tag_target_arns::TaggedTargetArn`).
+/// The resource a tag operation addresses is the scalable target its `ResourceARN` names, so an
+/// ARN of this endpoint that no REGISTERED target answers to is the resource reported absent:
+/// the refusal states exactly that, and the ARN asked about is reported in the modelled
+/// `ResourceName` member rather than spliced into the sentence. Entirely fixed text — no ARN,
+/// Region, account or tag key is interpolated. It is answered by the READ and by the two
+/// MUTATIONS alike, with the client-error status rather than with the 404 the shape's
+/// `@httpError` declares (`wire_refusals::WireRefusal::ScalableTargetNotFound`). A tag write to
+/// a target this endpoint does not hold is the resource reported absent, not a permission
+/// failure: `ResourceNotFoundException` is modelled on all three operations, and a client
+/// branches on the code to tell "the target is gone" from "your request may not be made". Only
+/// an ARN addressed to another partition, account or Region earns the other refusal, since no
+/// resource this endpoint holds can be named by it (`tag_target_arns::TaggedTargetArn`).
 pub const SCALABLE_TARGET_NOT_FOUND_MESSAGE: &str = "Scalable Target not found";
 
 // ---------------------------------------------------------------------------
@@ -3826,7 +3819,7 @@ pub fn apply_managed_target<Eng: Send + Sync + 'static>(
             // this is the same resource going away.
             None => {
                 if let Some(removed) = store.targets.remove(key) {
-                    store.retire_target_arn(&removed.arn, key);
+                    store.retire_target_arn(&removed.arn);
                     retired = store
                         .policies
                         .iter()

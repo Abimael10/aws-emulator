@@ -204,27 +204,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(&*self.engine, now);
 
         let Some(group) = state.groups.get(&name) else {
-            // A delete of a group whose delete is already IN FLIGHT is the same delete: the
-            // group is gone from the store and the call that removed it has not completed
-            // yet, so this one is accepted and nothing further is done. That is what makes a
-            // racing or retrying client's parallel deletes all succeed.
-            if state.delete_in_flight(&name, now) {
-                crate::state::audit(
-                    ctx.parts(),
-                    "DeleteAutoScalingGroup",
-                    &name,
-                    "accepted: the delete is already in flight",
-                );
-                return Ok(DeleteAutoScalingGroupOutput);
-            }
             crate::state::audit(
                 ctx.parts(),
                 "DeleteAutoScalingGroup",
                 &name,
                 "refused: no such group",
             );
-            // The detail THIS operation reports after the fixed text quotes the name it
-            // was asked for.
+            // `AutoScalingGroupName` names the group this call removes, so a name no group
+            // answers to is refused rather than answered as an empty success — a delete is not
+            // idempotent in its name, and a group this call already removed is a name that
+            // names nothing. The detail THIS operation reports after the fixed text quotes the
+            // name it was asked for.
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 crate::state::absent_group_message_quoting_name(&name),
             ));
@@ -336,10 +326,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         state.groups.remove(&name);
-        // The delete this call took runs to completion on the clock, and while it is in
-        // flight the same delete asked for again is accepted rather than refused as a name
-        // that answers to nothing — which is what a parallel or retrying client sends.
-        state.mark_group_deleting(&name, now);
         // A policy only exists against a group that exists, so the group's policies go
         // with it — and the CloudWatch alarms that would have executed them, which are
         // retired once this store's lock is released below.

@@ -5,9 +5,9 @@
 //!
 //! The rule under test: for the ARN of a registered scalable target the operation answers
 //! exactly the tag set persisted on that target — no more, no fewer, and unchanged by the
-//! read — and for an ARN no registered target carries it answers by that ARN's PROVENANCE:
-//! `ResourceNotFoundException` where this Region minted it for a target it no longer holds,
-//! and `ValidationException` where it never minted it.
+//! read — and for an ARN no registered target carries it answers by the ENDPOINT that ARN
+//! names: `ResourceNotFoundException` where the ARN names this account and Region,
+//! and `ValidationException` where it names another.
 //!
 //! The suite is a table, not a single call: its rows differ along what the rule
 //! generalises over — how many tags the target carries (zero, one, several) and the form
@@ -255,13 +255,13 @@ async fn list_tags_refuses_an_arn_no_registered_target_carries() {
     );
 
     // Every ARN below satisfies the modelled `ResourceARN` pattern, so each reaches the
-    // handler; none of them names a registered target. The flag is whether this Region MINTED
-    // it, which is what decides which refusal it earns.
+    // handler; none of them names a registered target. The flag is whether the ARN names THIS
+    // endpoint — its account and Region — which is what decides which refusal it earns.
     let unknown: Vec<(&str, String, bool)> = vec![
         (
             "an ARN this emulator never minted",
             format!("arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/0123456789abcdef"),
-            false,
+            true,
         ),
         ("a deregistered target's ARN", removed, true),
         (
@@ -276,7 +276,7 @@ async fn list_tags_refuses_an_arn_no_registered_target_carries() {
         ),
     ];
 
-    for (case, arn, minted_here) in &unknown {
+    for (case, arn, served_here) in &unknown {
         let (status, body) = emulator
             .call("ListTagsForResource", json!({"ResourceARN": arn}))
             .await;
@@ -284,7 +284,7 @@ async fn list_tags_refuses_an_arn_no_registered_target_carries() {
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} {body:?}"
         );
-        if *minted_here {
+        if *served_here {
             assert!(
                 error_code(&body).contains("ResourceNotFoundException"),
                 "case {case:?}: expected a ResourceNotFoundException, got {body:?}"

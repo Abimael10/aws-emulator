@@ -182,32 +182,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation(message));
         }
 
-        // An engine that holds no state has minted no scalable-target ARN either, so an ARN
-        // addressed to it is one this service never minted — which is the refusal below,
-        // rather than a server error this operation does not model.
+        // An engine that holds no state holds no scalable target either, so the target the
+        // ARN names is absent — which is the refusal below, rather than a server error this
+        // operation does not model.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(target_arn_never_minted());
+            return Err(target_not_found(&input.resource_arn));
         };
         let mut state = state.lock();
 
         // `ResourceARN` "identifies the Application Auto Scaling scalable target that you want
-        // to apply tags to", and the only ARNs that identify one are those this service
-        // minted. Which of the two refusals an ARN that identifies no REGISTERED target earns
-        // is decided by that ARN's PROVENANCE, once for the whole tagging family
-        // (`crate::state::tag_target_arns`): an ARN this service minted for a target it has
-        // since stopped holding names a resource it knows about and no longer has, and an ARN
-        // it never minted names no resource it holds any record of. A scalable target is
-        // regional, so an ARN of another Region is one this endpoint never minted either.
+        // to apply tags to", so an ARN of this endpoint that identifies no REGISTERED target is
+        // the scalable target reported ABSENT — whether this service minted that ARN or not —
+        // and only an ARN addressed to another partition, account or Region names no resource
+        // this endpoint could hold at all. One resolution for the whole tagging family
+        // (`crate::state::tag_target_arns`). A scalable target is regional, so an ARN of
+        // another Region is not one this endpoint answers for.
         let region = crate::state::request_region(ctx.parts());
         let resolved = state.resolve_tagged_target_arn(&input.resource_arn, &region);
         let record = match resolved {
             TaggedTargetArn::Registered(key) => state.targets.get_mut(&key),
-            TaggedTargetArn::Retired => return Err(target_not_found(&input.resource_arn)),
-            TaggedTargetArn::NeverMinted => return Err(target_arn_never_minted()),
+            TaggedTargetArn::Absent => return Err(target_not_found(&input.resource_arn)),
+            TaggedTargetArn::NotServedHere => return Err(target_arn_never_minted()),
         };
         // A resolution taken under this same lock named a target the store holds, so the
         // record is there; a store that does not hold it is one holding no such target,
-        // which is the same refusal as an ARN whose target was retired.
+        // which is the same absent-resource refusal.
         let Some(record) = record else {
             return Err(target_not_found(&input.resource_arn));
         };
@@ -249,26 +248,26 @@ fn validation(message: impl Into<String>) -> TagResourceError {
     .into()
 }
 
-/// The refusal of a `ResourceARN` this service minted for a scalable target it no longer holds.
+/// The refusal of a `ResourceARN` of this endpoint that names no registered scalable target.
 ///
-/// `ResourceARN` names the resource this call acts on, so an ARN whose target this service DID
-/// mint and no longer holds is the resource reported ABSENT — the modelled
-/// `ResourceNotFoundException` ("the specified resource doesn't exist") with the fixed sentence
-/// `crate::state::SCALABLE_TARGET_NOT_FOUND_MESSAGE` and the ARN asked about carried in the
-/// shape's own `ResourceName` member rather than spliced into the text. It is the same
-/// refusal `UntagResource` and the tag READ answer the same condition with, served at the
-/// client-error status this service answers it on
+/// `ResourceARN` names the resource this call acts on, so an ARN of this endpoint's own
+/// account and Region that no registered target answers to is the resource reported ABSENT —
+/// the modelled `ResourceNotFoundException` ("the specified resource doesn't exist") with the
+/// fixed sentence `crate::state::SCALABLE_TARGET_NOT_FOUND_MESSAGE` and the ARN asked about
+/// carried in the shape's own `ResourceName` member rather than spliced into the text. It is
+/// the same refusal `UntagResource` and the tag READ answer the same condition with, served at
+/// the client-error status this service answers it on
 /// (`crate::state::wire_refusals::WireRefusal::ScalableTargetNotFound`), so the three
 /// operations of the tagging family cannot word one condition three ways.
 fn target_not_found(resource_arn: &str) -> TagResourceError {
     crate::state::wire_refusals::WireRefusal::scalable_target_not_found(resource_arn).into()
 }
 
-/// The refusal of a `ResourceARN` this service never minted.
+/// The refusal of a `ResourceARN` addressed to another partition, account or Region.
 ///
-/// Such an ARN names no scalable target this endpoint holds any record of, so the tagging call
-/// is refused without the service disclosing whether a resource of that identity exists: the
-/// one fixed sentence, carrying nothing of the ARN it was asked about
+/// Such an ARN names no scalable target this endpoint could hold at all, so the tagging call
+/// is refused without the service speaking about the resource: the one fixed sentence, carrying
+/// nothing of the ARN it was asked about
 /// (`crate::state::wire_refusals::WireRefusal::TargetArnNeverMinted`), which the two mutations
 /// and the tag READ all answer this condition with.
 fn target_arn_never_minted() -> TagResourceError {

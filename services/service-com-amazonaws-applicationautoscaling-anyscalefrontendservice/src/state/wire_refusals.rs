@@ -8,11 +8,11 @@
 //! below the service answers something else, so they cannot be constructed as a plain
 //! variant of an operation's `#[operation_error]` enum:
 //!
-//! * the ARN-addressed tag operations answer an unresolvable `ResourceARN` with
-//!   `ResourceNotFoundException`'s own body at the 400 of a client error, not at the 404 its
-//!   `@httpError` declares ([`WireRefusal::ScalableTargetNotFound`]);
-//! * the same operations answer a `ResourceARN` this service never minted with
-//!   `ValidationException`'s body and the access-denied sentence
+//! * the ARN-addressed tag operations answer a `ResourceARN` that names no registered scalable
+//!   target with `ResourceNotFoundException`'s own body at the 400 of a client error, not at
+//!   the 404 its `@httpError` declares ([`WireRefusal::ScalableTargetNotFound`]);
+//! * the same operations answer a `ResourceARN` addressed to another partition, account or
+//!   Region with `ValidationException`'s body and the access-denied sentence
 //!   ([`WireRefusal::TargetArnNeverMinted`]) — which the tag READ does not model at all, and
 //!   which states nothing about the request's own shape;
 //! * an operation this service does not offer for the namespace addressed is refused
@@ -56,7 +56,7 @@ pub const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
 /// The status of such a refusal, as the same table publishes it: "HTTP Status Code: 400".
 pub const ACCESS_DENIED_STATUS: u16 = 400;
 
-/// The `__type` a `ResourceARN` this service never minted is refused under: the modelled
+/// The `__type` a `ResourceARN` of another endpoint is refused under: the modelled
 /// `ValidationException`, which the two tag MUTATIONS declare
 /// (`smithy_query(query="operation",operation="TagResource,UntagResource")`) and the tag READ
 /// does not — recorded behaviour, which answers that condition as a refusal of the tagging
@@ -130,15 +130,15 @@ impl SerializableStruct for NotSupported {
 /// the wire code, the HTTP status and the body it answers with.
 #[derive(Debug)]
 pub enum WireRefusal {
-    /// A `ResourceARN` a tag operation cannot resolve to a registered scalable target, which
-    /// this service DID mint for a target it has since stopped holding: the ARN names a
-    /// resource the service knows about and no longer has, so it is the resource reported
+    /// A `ResourceARN` a tag operation cannot resolve to a registered scalable target, while
+    /// naming this endpoint's own partition, account and Region: the ARN names a scalable
+    /// target of this account that the service does not hold, so it is the resource reported
     /// absent. The READ and the two MUTATIONS answer that condition alike.
     ScalableTargetNotFound(ResourceNotFoundException),
-    /// A `ResourceARN` of the tagging family this service never minted, so it names no resource
-    /// this endpoint holds any record of: the call is refused without the service disclosing
-    /// whether such a resource exists ([`TARGET_ARN_NEVER_MINTED_MESSAGE`]). The READ and the
-    /// two MUTATIONS answer that condition alike too.
+    /// A `ResourceARN` of the tagging family addressed to another partition, account or Region,
+    /// so it names no resource this endpoint could hold at all: the call is refused without the
+    /// service disclosing whether such a resource exists ([`TARGET_ARN_NEVER_MINTED_MESSAGE`]).
+    /// The READ and the two MUTATIONS answer that condition alike too.
     TargetArnNeverMinted(ValidationException),
     /// An operation this service does not offer for the resource addressed.
     NotSupported(NotSupported),
@@ -156,8 +156,8 @@ impl WireRefusal {
         })
     }
 
-    /// The refusal of a `resource_arn` this service never minted, which states the one fixed
-    /// sentence and nothing of the ARN it was asked about.
+    /// The refusal of a `resource_arn` addressed to another partition, account or Region, which
+    /// states the one fixed sentence and nothing of the ARN it was asked about.
     pub fn target_arn_never_minted() -> Self {
         Self::TargetArnNeverMinted(ValidationException {
             message: Some(TARGET_ARN_NEVER_MINTED_MESSAGE.to_string()),

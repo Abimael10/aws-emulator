@@ -19,8 +19,8 @@
 //!   `ObjectNotFoundException` template naming the triple for an identity nothing registered,
 //!   and the one naming the TARGET's own identifier for a scheduled action a registered target
 //!   does not hold; and, for an ARN, the `ResourceNotFoundException` body at the client-error
-//!   status where this Region MINTED that ARN for a target it no longer holds, and the recorded
-//!   `ValidationException` with the fixed access-denied sentence where it never minted it.
+//!   status where the ARN names this endpoint's own account and Region, and the
+//!   `ValidationException` with the fixed access-denied sentence where it names another.
 
 use serde_json::{json, Value};
 
@@ -447,23 +447,26 @@ async fn a_tag_operation_on_an_arn_naming_no_target_answers_the_recorded_refusal
         );
     }
 
-    // An ARN this service never minted resolves to no registered scalable target either, but
-    // names no resource this endpoint holds any record of, so each operation refuses the
-    // tagging call itself rather than reporting on a resource: the recorded answer for that
-    // class is HTTP 400 `ValidationException` with the fixed sentence "Access Denied". Over
-    // several ways an ARN can be one it never minted.
+    // An ARN of THIS endpoint that no registered target answers to is the same answer the
+    // deregistered ARN earns — the recorded answer for that class is HTTP 400
+    // `ResourceNotFoundException` with the fixed sentence "Scalable Target not found" — while an
+    // ARN of another account or Region names no resource this endpoint could hold, so each
+    // operation refuses the tagging call itself: HTTP 400 `ValidationException` with the fixed
+    // sentence "Access Denied". The flag says which endpoint the row's ARN names.
     const ACCESS_DENIED: &str = "Access Denied";
-    let never_minted: &[(&str, String)] = &[
+    let unresolvable: &[(&str, String, bool)] = &[
         (
             "an id this service never minted",
             format!(
                 "arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
+            true,
         ),
         (
             "an id of another shape",
             format!("arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/nothing"),
+            true,
         ),
         (
             "an ARN of another account",
@@ -471,6 +474,7 @@ async fn a_tag_operation_on_an_arn_naming_no_target_answers_the_recorded_refusal
                 "arn:aws:application-autoscaling:{REGION}:111122223333:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
+            false,
         ),
         (
             "an ARN of another Region",
@@ -478,29 +482,49 @@ async fn a_tag_operation_on_an_arn_naming_no_target_answers_the_recorded_refusal
                 "arn:aws:application-autoscaling:eu-west-1:{ACCOUNT}:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
+            false,
         ),
     ];
-    for (case, arn) in never_minted {
+    for (case, arn, served_here) in unresolvable {
         for (operation, request) in tag_requests(arn) {
             let (status, body) = emulator.call(operation, request).await;
             assert_eq!(
                 status, 400,
                 "case {case:?} on {operation}: expected HTTP 400, got {status} {body:?}"
             );
-            assert_eq!(
-                error_code(&body),
-                "ValidationException",
-                "case {case:?} on {operation}: expected a ValidationException, got {body:?}"
-            );
             let message = error_message(&body);
-            assert_eq!(
-                message, ACCESS_DENIED,
-                "case {case:?} on {operation}: expected {ACCESS_DENIED:?}, got {message:?}"
-            );
-            assert!(
-                body.get("ResourceName").is_none(),
-                "case {case:?} on {operation}: expected no resource to be named, got {body:?}"
-            );
+            if *served_here {
+                assert_eq!(
+                    error_code(&body),
+                    "ResourceNotFoundException",
+                    "case {case:?} on {operation}: expected a ResourceNotFoundException, got \
+                     {body:?}"
+                );
+                assert_eq!(
+                    message, TARGET_NOT_FOUND,
+                    "case {case:?} on {operation}: expected {TARGET_NOT_FOUND:?}, got {message:?}"
+                );
+                assert_eq!(
+                    body["ResourceName"],
+                    json!(arn),
+                    "case {case:?} on {operation}: expected the ARN asked about in ResourceName, \
+                     got {body:?}"
+                );
+            } else {
+                assert_eq!(
+                    error_code(&body),
+                    "ValidationException",
+                    "case {case:?} on {operation}: expected a ValidationException, got {body:?}"
+                );
+                assert_eq!(
+                    message, ACCESS_DENIED,
+                    "case {case:?} on {operation}: expected {ACCESS_DENIED:?}, got {message:?}"
+                );
+                assert!(
+                    body.get("ResourceName").is_none(),
+                    "case {case:?} on {operation}: expected no resource to be named, got {body:?}"
+                );
+            }
         }
     }
 }

@@ -702,7 +702,7 @@ async fn an_attach_outside_the_rules_attaches_nothing() {
             message: "AutoScalingGroup name not found - null".to_string(),
         },
         RefusalCase {
-            case: "a group whose delete is in flight",
+            case: "a group this account has deleted",
             group: Some(DELETED_GROUP),
             names: vec!["clb-a".to_string()],
             message: "AutoScalingGroup name not found - null".to_string(),

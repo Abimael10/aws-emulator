@@ -379,9 +379,22 @@ pub const SCHEDULING_POLICY_IN_USE: &str = JOB_QUEUE_RELATIONSHIP_DETAIL;
 /// exactly a deregistered one; the sentence states that and nothing else, and the one value
 /// it carries is the revision's own ARN — the identity AWS names a definition by here,
 /// whichever of name, `name:revision` or ARN the request reached it through. Told apart from
-/// a reference nothing is stored for, which is [`not_found_exception`].
+/// a reference nothing is stored for, which is [`job_definition_unresolved_message`].
 pub fn job_definition_not_active_message(job_definition_arn: &str) -> String {
     format!("JobDefinition {job_definition_arn} is not in ACTIVE status.")
+}
+
+/// What a submit answers for a `jobDefinition` reference the service holds NO revision for:
+/// the sentence AWS Batch words that condition with, naming the reference the request gave.
+///
+/// A submit resolves `jobDefinition` to the revision it would run, so a reference nothing
+/// answers to is reported as the reference the lookup failed on — AWS states both outcomes
+/// that lookup can miss on in the one sentence (no such definition, or no `ACTIVE` revision
+/// under it), because a caller holding only a reference cannot act on them differently.
+/// Told apart from a revision this service HOLDS and may not run, which names that stored
+/// revision by its own ARN ([`job_definition_not_active_message`]).
+pub fn job_definition_unresolved_message(reference: &str) -> String {
+    format!("JobDefinition name {reference} does not exist or is not in ACTIVE status.")
 }
 
 /// What AWS Batch answers when a `Create*` names an object it already holds: the bare

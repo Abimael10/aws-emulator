@@ -306,17 +306,6 @@ pub mod instance_requirements;
 /// short, fixed span (chosen, not documented) and never sleeps for it.
 pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 
-/// How long the DELETE of an Auto Scaling group takes to complete.
-///
-/// Deleting a group is a change the service takes and then finishes: the call is accepted,
-/// the group stops being one the account holds, and the delete runs to completion
-/// afterwards — which is why a second delete of the same group, racing the first, is
-/// accepted rather than refused as a name that answers to nothing. The span is this
-/// emulator's own (chosen, not documented) and is never slept for: it is stored as the
-/// instant the delete completes and retired by
-/// [`AutoScalingState::materialize_due`].
-pub const GROUP_DELETE_COMPLETION: Duration = Duration::from_secs(3);
-
 /// `DefaultCooldown` when the request omits it.
 ///
 /// From the model's own documentation for `CreateAutoScalingGroup$DefaultCooldown`:
@@ -1471,16 +1460,6 @@ pub struct ComAmazonawsAutoscalingAutoscaling20110101State {
     pub launch_configurations: BTreeMap<String, StoredLaunchConfiguration>,
     /// Auto Scaling groups, keyed by `AutoScalingGroupName`.
     pub groups: BTreeMap<String, StoredGroup>,
-    /// The groups whose delete is still IN FLIGHT, keyed by the name the group had and
-    /// carrying the instant the delete completes ([`GROUP_DELETE_COMPLETION`]).
-    ///
-    /// "Deleting an Auto Scaling group" is not instantaneous: the service takes the call,
-    /// reports the group's state as deleting, and finishes afterwards — so a delete of a
-    /// group whose delete is already in flight is the SAME delete, and is accepted. The
-    /// record is retired by [`AutoScalingState::materialize_due`] once the clock has made
-    /// the completion due, after which the name names nothing again and a delete of it is
-    /// refused as any unknown name is.
-    deleting_groups: BTreeMap<String, SystemTime>,
     /// The scaling policies of those groups, keyed by the group they belong to and their
     /// name within it ([`PolicyKey`]), so the collection iterates group by group and, in
     /// a group, policy name by policy name. A group's policies are removed with the
@@ -1538,38 +1517,6 @@ impl AutoScalingState {
     pub fn mint_activity_id(&mut self) -> String {
         self.next_activity_seq += 1;
         uuid_shaped(self.next_activity_seq)
-    }
-
-    /// Record that the delete of `name` is in flight, completing [`GROUP_DELETE_COMPLETION`]
-    /// after `now`.
-    ///
-    /// Called by the one handler that removes a group, so every delete this service takes
-    /// leaves the same trace of itself. The collection is bounded the way the groups
-    /// themselves are ([`MAX_GROUPS`]): a delete in flight stands for a group the account
-    /// held, so no run of calls can keep more of them than that, and the oldest completion
-    /// gives way first.
-    pub fn mark_group_deleting(&mut self, name: &str, now: SystemTime) {
-        self.deleting_groups
-            .insert(name.to_string(), now + GROUP_DELETE_COMPLETION);
-        while self.deleting_groups.len() > MAX_GROUPS {
-            let Some(oldest) = self
-                .deleting_groups
-                .iter()
-                .min_by_key(|(_, completes_at)| **completes_at)
-                .map(|(name, _)| name.clone())
-            else {
-                break;
-            };
-            self.deleting_groups.remove(&oldest);
-        }
-    }
-
-    /// Whether the delete of `name` is still in flight at `now`: the group is gone from the
-    /// store and the delete that removed it has not completed yet.
-    pub fn delete_in_flight(&self, name: &str, now: SystemTime) -> bool {
-        self.deleting_groups
-            .get(name)
-            .is_some_and(|completes_at| now < *completes_at)
     }
 
     /// Mint an opaque resource id: the segment an Auto Scaling ARN carries, and the
@@ -2042,10 +1989,6 @@ impl AutoScalingState {
                 activity.progress = 100;
             }
         }
-        // A delete the clock has carried to completion is no longer in flight, so the name
-        // it freed names nothing again.
-        self.deleting_groups
-            .retain(|_, completes_at| now < *completes_at);
     }
 
     /// Recompute the `HealthStatus` of the instances of every group that checks their health

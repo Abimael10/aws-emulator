@@ -669,7 +669,7 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
             status, 400,
             "case {case:?}: expected {operation} to refuse with HTTP 400, got {status} {body:?}"
         );
-        let expected = retired_arn_code(operation);
+        let expected = absent_target_code(operation);
         assert_eq!(
             error_code(&body),
             expected,
@@ -679,21 +679,23 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
 
     // Every ARN below satisfies the modelled `@pattern`
     // (^arn:.+:application-autoscaling:.+:[0-9]+:scalable-target\/[a-zA-Z0-9-]+$), so
-    // each one reaches the handler rather than the boundary validator — and none of them is
-    // one this service minted.
-    let unresolvable: &[(&str, String)] = &[
+    // each one reaches the handler rather than the boundary validator — and none of them names
+    // a registered target. The flag is whether the ARN names THIS endpoint.
+    let unresolvable: &[(&str, String, bool)] = &[
         (
             "a well-formed ARN of a target that was never registered",
             format!(
                 "arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
+            true,
         ),
         (
             "an ARN whose target id is not one this service mints",
             format!(
                 "arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/nonexistent"
             ),
+            true,
         ),
         (
             "an ARN scoped to another region",
@@ -701,6 +703,7 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
                 "arn:aws:application-autoscaling:eu-west-1:{ACCOUNT}:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
+            false,
         ),
         (
             "an ARN scoped to another account",
@@ -708,12 +711,14 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
                 "arn:aws:application-autoscaling:{REGION}:111122223333:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
+            false,
         ),
     ];
 
-    for (case, arn) in unresolvable {
-        // None of these ARNs is one this Region minted, so each operation refuses the tagging
-        // call itself rather than reporting on a resource it holds no record of.
+    for (case, arn, served_here) in unresolvable {
+        // An ARN of this endpoint is the resource reported absent; one of another account or
+        // Region names no resource this endpoint could hold, so the tagging call itself is
+        // refused.
         for (operation, request) in [
             ("TagResource", json!({"ResourceARN": arn, "Tags": {"a": "1"}})),
             (
@@ -727,7 +732,11 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
                 status, 400,
                 "case {case:?}: expected {operation} to refuse with HTTP 400, got {status} {body:?}"
             );
-            let expected = never_minted_arn_code(operation);
+            let expected = if *served_here {
+                absent_target_code(operation)
+            } else {
+                foreign_arn_code(operation)
+            };
             assert_eq!(
                 error_code(&body),
                 expected,
@@ -737,17 +746,18 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
     }
 }
 
-/// The error code every operation of the tagging family answers an ARN this Region MINTED for a
-/// scalable target it no longer holds with: `ResourceARN` names the resource the call addresses,
-/// so an ARN whose target the service knows about and has lost is the resource reported absent.
-fn retired_arn_code(_operation: &str) -> &'static str {
+/// The error code every operation of the tagging family answers an ARN of THIS endpoint that
+/// names no registered scalable target with: `ResourceARN` names the resource the call
+/// addresses, so an ARN of this account and Region that nothing answers to is the resource
+/// reported absent.
+fn absent_target_code(_operation: &str) -> &'static str {
     "ResourceNotFoundException"
 }
 
-/// The error code they answer an ARN this Region NEVER minted with: it names no resource this
-/// endpoint holds any record of, so the tagging call is refused without a report about the
-/// resource (recorded behaviour).
-fn never_minted_arn_code(_operation: &str) -> &'static str {
+/// The error code they answer an ARN of another account, Region or partition with: it names no
+/// resource this endpoint could hold, so the tagging call is refused without a report about the
+/// resource.
+fn foreign_arn_code(_operation: &str) -> &'static str {
     "ValidationException"
 }
 

@@ -169,18 +169,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Returns all the tags on the specified Application Auto Scaling scalable
         // target" — so an ARN no registered target carries is refused rather than answered
         // with an empty tag set: the two are different answers and a client tells them
-        // apart. WHICH refusal is decided by the ARN's PROVENANCE, by the one resolution the
-        // whole tagging family shares (see `tag_resource`): an ARN this service minted for a
-        // target it has since stopped holding is the resource reported ABSENT —
-        // `ResourceNotFoundException` ("the specified resource doesn't exist") with
-        // `crate::state::SCALABLE_TARGET_NOT_FOUND_MESSAGE` — and an ARN it never minted names
-        // no resource it holds any record of, so the call is refused without the service
-        // disclosing whether one exists. Both are what the two tag MUTATIONS answer the same
-        // conditions with.
+        // apart. An ARN of THIS endpoint that no registered target answers to is the resource
+        // reported ABSENT — `ResourceNotFoundException` ("the specified resource doesn't
+        // exist") with `crate::state::SCALABLE_TARGET_NOT_FOUND_MESSAGE` — and only an ARN of
+        // another partition, account or Region names no resource this endpoint could hold, so
+        // that call is refused without the service speaking about the resource. Both come from
+        // the one resolution the whole tagging family shares (see `tag_resource`), and both are
+        // what the two tag MUTATIONS answer the same conditions with.
         let record = match resolved {
             TaggedTargetArn::Registered(key) => state.targets.get(&key),
-            TaggedTargetArn::Retired => None,
-            TaggedTargetArn::NeverMinted => {
+            TaggedTargetArn::Absent => None,
+            TaggedTargetArn::NotServedHere => {
                 return Err(crate::state::wire_refusals::WireRefusal::target_arn_never_minted()
                     .into())
             }

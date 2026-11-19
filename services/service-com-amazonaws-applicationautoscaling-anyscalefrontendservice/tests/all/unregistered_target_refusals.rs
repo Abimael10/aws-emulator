@@ -13,10 +13,11 @@
 //!   dimension belonging to another namespace is one such triple: nothing could have
 //!   registered it, so it names no target either.
 //! * the ARN-addressed tag operations answer an ARN that resolves to no registered scalable
-//!   target at the client-error status, all three alike, by that ARN's PROVENANCE: an ARN this
-//!   Region MINTED for a target it no longer holds is the resource reported ABSENT
+//!   target at the client-error status, all three alike, by WHICH ENDPOINT the ARN names: an ARN
+//!   of this account and Region is the resource reported ABSENT
 //!   (`ResourceNotFoundException`, the fixed sentence "Scalable Target not found" and the ARN
-//!   asked about in `ResourceName`), and an ARN it never minted is refused without a report
+//!   asked about in `ResourceName`), whether this service minted it or not, and an ARN of
+//!   another account or Region is refused without a report
 //!   about the resource at all (`ValidationException` and the fixed sentence "Access Denied").
 //! * an operation this service does not offer for the namespace addressed is refused
 //!   outright, with `AccessDeniedException` and the fixed sentence naming the operation,
@@ -31,11 +32,11 @@ use service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::ops::t
 
 use crate::emulator::{error_code, error_message, resource_id_for, Emulator, ACCOUNT, REGION};
 
-/// The sentence every operation of the tagging family carries for an ARN this Region minted for
-/// a target it no longer holds, spelled out here rather than read from the implementation.
+/// The sentence every operation of the tagging family carries for an ARN of this endpoint that
+/// names no registered target, spelled out here rather than read from the implementation.
 const TARGET_NOT_FOUND: &str = "Scalable Target not found";
 
-/// The whole sentence they carry for an ARN this Region never minted.
+/// The whole sentence they carry for an ARN of another account or Region.
 const ACCESS_DENIED: &str = "Access Denied";
 
 /// The status a refusal of this class answers with. Both rules below answer the client-error
@@ -225,19 +226,19 @@ fn tag_requests(resource_arn: &str) -> [(&'static str, Value); 3] {
 }
 
 /// RULE: every tag operation answers an ARN that resolves to no registered scalable target at
-/// the client-error status, by that ARN's PROVENANCE in the Region serving the request — an ARN
-/// this Region minted for a target it no longer holds is the resource reported absent
+/// the client-error status, by WHICH ENDPOINT that ARN belongs to — an ARN of this account and
+/// Region is the resource reported absent, whether this service minted it or not
 /// (`ResourceNotFoundException`, the fixed sentence and the ARN asked about in `ResourceName`),
-/// and an ARN it never minted is a tagging call it refuses without reporting on the resource
-/// (`ValidationException` and the fixed access-denied sentence, which carries nothing of the
-/// request).
+/// and an ARN of another account or Region is a tagging call it refuses without reporting on the
+/// resource (`ValidationException` and the fixed access-denied sentence, which carries nothing
+/// of the request).
 ///
 /// Rows differ along HOW the ARN fails to resolve — an id this service never minted, an id of
 /// another form, another account, another Region, and the ARN of a target that WAS registered
 /// and has been deregistered — and along the operation, including both writes, so the two
 /// writes do not word the condition differently from each other.
 #[tokio::test]
-async fn every_tag_operation_answers_an_unresolvable_arn_by_its_provenance() {
+async fn every_tag_operation_answers_an_unresolvable_arn_by_the_endpoint_it_names() {
     let emulator = Emulator::empty();
     let target = emulator
         .given_target("dynamodb:table:ReadCapacityUnits", 1, 10)
@@ -264,8 +265,8 @@ async fn every_tag_operation_answers_an_unresolvable_arn_by_its_provenance() {
 
     // Every ARN below satisfies the modelled `@pattern` on `ResourceARN`
     // (^arn:.+:application-autoscaling:.+:[0-9]+:scalable-target\/[a-zA-Z0-9-]+$), so each
-    // reaches the handler rather than the boundary validator. The flag is whether this Region
-    // MINTED it, which is what decides which refusal it earns.
+    // reaches the handler rather than the boundary validator. The flag is whether the ARN names
+    // THIS endpoint — its account and Region — which is what decides which refusal it earns.
     let unresolvable: &[(&str, String, bool)] = &[
         (
             "the ARN of a target that has been deregistered",
@@ -278,12 +279,12 @@ async fn every_tag_operation_answers_an_unresolvable_arn_by_its_provenance() {
                 "arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
-            false,
+            true,
         ),
         (
             "an id of another form",
             format!("arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/nothing"),
-            false,
+            true,
         ),
         (
             "an ARN of another account",
@@ -303,7 +304,7 @@ async fn every_tag_operation_answers_an_unresolvable_arn_by_its_provenance() {
         ),
     ];
 
-    for (row, arn, minted_here) in unresolvable {
+    for (row, arn, served_here) in unresolvable {
         for (operation, request) in tag_requests(arn) {
             let case = format!("{row} on {operation}");
             let (status, body) = emulator.call(operation, request).await;
@@ -313,7 +314,7 @@ async fn every_tag_operation_answers_an_unresolvable_arn_by_its_provenance() {
             );
             let code = error_code(&body);
             let message = error_message(&body);
-            if *minted_here {
+            if *served_here {
                 assert_eq!(
                     code, "ResourceNotFoundException",
                     "case {case:?}: expected a ResourceNotFoundException, got {code:?} in {body:?}"

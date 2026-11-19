@@ -5,19 +5,22 @@
 //!
 //! RULE under test: `ResourceARN` "identifies the Application Auto Scaling scalable target"
 //! the call addresses, and which refusal an ARN identifying no REGISTERED target earns is
-//! decided by that ARN's PROVENANCE in the Region serving the request — the same answer
+//! decided by WHICH ENDPOINT that ARN names — the same answer
 //! whichever of the three operations asked:
 //!
-//! * an ARN this Region MINTED, for a target it no longer holds, is the resource reported
+//! * an ARN of the account and Region serving the request is the resource reported
 //!   ABSENT — the modelled `ResourceNotFoundException`, which
 //!   `smithy_query(query="operation",operation="TagResource,UntagResource,ListTagsForResource")`
 //!   declares on all three operations, carrying the fixed sentence "Scalable Target not found"
 //!   and the ARN asked about in the shape's own `ResourceName` member. It is served at the
 //!   client-error status this service answers that condition on, not at the 404 the shape's
-//!   `@httpError` declares;
-//! * an ARN this Region NEVER minted names no resource it holds any record of, so the call is
+//!   `@httpError` declares. Whether this service ever minted that ARN does not enter into it:
+//!   what the caller asked about is a scalable target of this account and Region, and the
+//!   answer is that there is none;
+//! * an ARN of another account, Region or partition names no resource this endpoint could hold,
+//!   so the call is
 //!   refused without the service reporting on the resource at all: the modelled
-//!   `ValidationException` and the fixed sentence "Access Denied" (recorded behaviour; the
+//!   `ValidationException` and the fixed sentence "Access Denied" (the
 //!   model says which error covers which condition for neither).
 //!
 //! The rows span what the rule generalises over: the OPERATION (the read and both mutations,
@@ -31,14 +34,15 @@ use serde_json::{json, Value};
 
 use crate::emulator::{error_code, error_message, Emulator, ACCOUNT, REGION};
 
-/// The sentence the refusal of a RETIRED ARN carries, written out here rather than read off the
+/// The sentence the refusal of an ARN of this endpoint that names no registered target carries,
+/// written out here rather than read off the
 /// code under test: the WORDING is part of what this suite holds the family to.
 const TARGET_NOT_FOUND: &str = "Scalable Target not found";
 
 /// The code that refusal carries.
 const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 
-/// The whole sentence the refusal of an ARN this Region never minted carries.
+/// The whole sentence the refusal of an ARN of another account, Region or partition carries.
 const ACCESS_DENIED: &str = "Access Denied";
 
 /// The code that refusal carries.
@@ -80,7 +84,7 @@ fn family(resource_arn: &str) -> Vec<(&'static str, Value)> {
 /// reaches the handler rather than the boundary validator, and none of them names a registered
 /// target. `deregistered` is the ARN this service minted for a target that has since been
 /// deregistered, so the table carries an ARN that WAS real beside ones that never were — and
-/// each row states whether this Region minted it, which is what decides its refusal.
+/// each row states whether the ARN names THIS endpoint, which is what decides its refusal.
 fn unresolvable(deregistered: &str) -> Vec<(String, String, bool)> {
     vec![
         (
@@ -94,19 +98,19 @@ fn unresolvable(deregistered: &str) -> Vec<(String, String, bool)> {
                 "arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
-            false,
+            true,
         ),
         (
             "an id of another form".to_string(),
             format!(
                 "arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/nothing-here"
             ),
-            false,
+            true,
         ),
         (
             "the shortest id the pattern admits".to_string(),
             format!("arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/a"),
-            false,
+            true,
         ),
         (
             "an ARN of another account".to_string(),
@@ -136,7 +140,7 @@ fn unresolvable(deregistered: &str) -> Vec<(String, String, bool)> {
 }
 
 #[tokio::test]
-async fn every_tag_operation_answers_an_unresolvable_arn_by_the_arns_provenance() {
+async fn every_tag_operation_answers_an_unresolvable_arn_by_the_endpoint_it_names() {
     let emulator = Emulator::empty();
 
     // One target that stays registered, so the rows below are about the ARN they name, and one
@@ -157,7 +161,7 @@ async fn every_tag_operation_answers_an_unresolvable_arn_by_the_arns_provenance(
         "case \"the deregistration\": expected HTTP 200, got {status} with {body:?}"
     );
 
-    for (reason, arn, minted_here) in unresolvable(&withdrawn_arn) {
+    for (reason, arn, served_here) in unresolvable(&withdrawn_arn) {
         for (operation, request) in family(&arn) {
             let case = format!("{reason} on {operation}");
             let (status, body) = emulator.call(operation, request).await;
@@ -167,7 +171,7 @@ async fn every_tag_operation_answers_an_unresolvable_arn_by_the_arns_provenance(
             );
             let code = error_code(&body);
             let message = error_message(&body);
-            if minted_here {
+            if served_here {
                 assert_eq!(
                     code, RESOURCE_NOT_FOUND,
                     "case {case:?}: expected {RESOURCE_NOT_FOUND}, got {code:?} in {body:?}"
@@ -182,8 +186,9 @@ async fn every_tag_operation_answers_an_unresolvable_arn_by_the_arns_provenance(
                     "case {case:?}: expected the ARN asked about in ResourceName, got {body:?}"
                 );
             } else {
-                // An ARN this Region never minted names no resource the service reports on,
-                // so the refusal states the access-denied sentence and names nothing.
+                // An ARN of another account, Region or partition names no resource this
+                // endpoint reports on, so the refusal states the access-denied sentence and
+                // names nothing.
                 assert_eq!(
                     code, VALIDATION,
                     "case {case:?}: expected {VALIDATION}, got {code:?} in {body:?}"

@@ -729,11 +729,11 @@ async fn a_policy_configuration_that_cannot_be_evaluated_states_the_documented_r
     }
 }
 
-/// The sentence every operation of the tagging family carries for an ARN this Region minted for
-/// a scalable target it no longer holds.
+/// The sentence every operation of the tagging family carries for an ARN of this endpoint that
+/// names no registered scalable target.
 const TARGET_NOT_FOUND: &str = "Scalable Target not found";
 
-/// The whole sentence they carry for an ARN this Region never minted.
+/// The whole sentence they carry for an ARN of another account, Region or partition.
 const ACCESS_DENIED: &str = "Access Denied";
 
 #[tokio::test]
@@ -777,16 +777,21 @@ async fn a_tag_operation_on_an_unregistered_target_answers_in_its_own_terms() {
         "case \"deregister\": expected 200, got {status} {body:?}"
     );
 
-    // Every ARN that names no registered target now is answered by its PROVENANCE: the one this
-    // Region minted and retired reports the resource absent, and the one it never minted is
+    // Every ARN that names no registered target now is answered by the ENDPOINT it names: one
+    // of this account and Region reports the resource absent, whether this service minted it or
+    // not, and one of another account or Region is
     // refused without a report about the resource at all.
     let never_minted =
         format!("arn:aws:application-autoscaling:{REGION}:000000000000:scalable-target/0123456789abcdef");
-    for (case, resource_arn, minted_here) in [
+    let another_account = format!(
+        "arn:aws:application-autoscaling:{REGION}:111122223333:scalable-target/0123456789abcdef"
+    );
+    for (case, resource_arn, served_here) in [
         ("a deregistered target's ARN", arn.clone(), true),
-        ("an ARN this emulator never minted", never_minted, false),
+        ("an ARN this emulator never minted", never_minted, true),
+        ("an ARN of another account", another_account, false),
     ] {
-        let (expected_code, expected_message) = if minted_here {
+        let (expected_code, expected_message) = if served_here {
             // `ResourceNotFoundException` ("the specified resource doesn't exist"), answered at
             // the client-error status rather than at the 404 the shape's `@httpError` declares.
             ("ResourceNotFoundException", TARGET_NOT_FOUND)
@@ -813,7 +818,7 @@ async fn a_tag_operation_on_an_unregistered_target_answers_in_its_own_terms() {
             message, expected_message,
             "case {case:?} on ListTagsForResource: expected {expected_message:?}, got {message:?}"
         );
-        if minted_here {
+        if served_here {
             assert_eq!(
                 body["ResourceName"],
                 json!(resource_arn),
@@ -830,8 +835,8 @@ async fn a_tag_operation_on_an_unregistered_target_answers_in_its_own_terms() {
 
         // The two writes answer the same condition the same way the read does: `ResourceARN`
         // names the resource the call addresses, so whether the service reports that resource
-        // absent or refuses to speak about it at all is the ARN's provenance and not the
-        // operation's. None of the three is the boundary validator's template.
+        // absent or refuses to speak about it at all is decided by the endpoint the ARN names
+        // and not by the operation. None of the three is the boundary validator's template.
         for (operation, request) in [
             (
                 "TagResource",
@@ -857,7 +862,7 @@ async fn a_tag_operation_on_an_unregistered_target_answers_in_its_own_terms() {
                 message, expected_message,
                 "case {case:?} on {operation}: expected {expected_message:?}, got {message:?}"
             );
-            if minted_here {
+            if served_here {
                 assert_eq!(
                     body["ResourceName"],
                     json!(resource_arn),

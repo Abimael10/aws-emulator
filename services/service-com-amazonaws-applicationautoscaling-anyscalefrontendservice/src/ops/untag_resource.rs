@@ -151,26 +151,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             check_tag_key("tagKeys", key).map_err(validation)?;
         }
 
-        // An engine that holds no state has minted no scalable-target ARN either, so an ARN
-        // addressed to it is one this service never minted: the same refusal as any other ARN
-        // it never minted (see `tag_resource`).
+        // An engine that holds no state holds no scalable target either, so the target the ARN
+        // names is absent: the same refusal as any other ARN of this endpoint that resolves to
+        // nothing (see `tag_resource`).
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(target_arn_never_minted());
+            return Err(target_not_found(&input.resource_arn));
         };
         let mut state = state.lock();
 
-        // Which refusal an ARN that names no REGISTERED target earns is decided by that ARN's
-        // PROVENANCE, by the one resolution the whole tagging family shares (see
-        // `tag_resource`): an ARN this service minted for a target it has since stopped holding
-        // is the resource reported absent, and an ARN it never minted — another Region's
-        // included, since a scalable target is regional — is a tagging call it refuses without
-        // speaking about the resource at all.
+        // An ARN of this endpoint that names no REGISTERED target is the resource reported
+        // absent, and only an ARN of another partition, account or Region — a scalable target
+        // is regional — is a tagging call this endpoint refuses without speaking about the
+        // resource at all, by the one resolution the whole tagging family shares (see
+        // `tag_resource`).
         let region = crate::state::request_region(ctx.parts());
         let resolved = state.resolve_tagged_target_arn(&input.resource_arn, &region);
         let record = match resolved {
             TaggedTargetArn::Registered(key) => state.targets.get_mut(&key),
-            TaggedTargetArn::Retired => return Err(target_not_found(&input.resource_arn)),
-            TaggedTargetArn::NeverMinted => return Err(target_arn_never_minted()),
+            TaggedTargetArn::Absent => return Err(target_not_found(&input.resource_arn)),
+            TaggedTargetArn::NotServedHere => return Err(target_arn_never_minted()),
         };
         // As in `tag_resource`: the resolution was taken under this same lock, so a store that
         // does not hold the record holds no such target either.
@@ -197,9 +196,9 @@ fn validation(message: impl Into<String>) -> UntagResourceError {
     .into()
 }
 
-/// The refusal of a `ResourceARN` this service minted for a scalable target it no longer holds:
-/// the ARN names the resource this call acts on, so one whose target this service DID mint and
-/// no longer holds is the resource reported ABSENT — the same modelled
+/// The refusal of a `ResourceARN` of this endpoint that names no registered scalable target:
+/// the ARN names the resource this call acts on, so one no registered target answers to is the
+/// resource reported ABSENT — the same modelled
 /// `ResourceNotFoundException`, with the same fixed sentence and the ARN in its `ResourceName`
 /// member, that `TagResource` and the tag READ answer the same condition with (see
 /// `tag_resource`).
@@ -207,9 +206,9 @@ fn target_not_found(resource_arn: &str) -> UntagResourceError {
     crate::state::wire_refusals::WireRefusal::scalable_target_not_found(resource_arn).into()
 }
 
-/// The refusal of a `ResourceARN` this service never minted: the same one fixed sentence, about
-/// the caller's reach rather than about the resource, that `TagResource` and the tag READ
-/// answer this condition with (see `tag_resource`).
+/// The refusal of a `ResourceARN` addressed to another partition, account or Region: the same
+/// one fixed sentence, about the caller's reach rather than about the resource, that
+/// `TagResource` and the tag READ answer this condition with (see `tag_resource`).
 fn target_arn_never_minted() -> UntagResourceError {
     crate::state::wire_refusals::WireRefusal::target_arn_never_minted().into()
 }

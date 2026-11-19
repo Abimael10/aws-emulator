@@ -23,8 +23,9 @@
 //! * `ListJobs` reports the selector condition that actually holds: NO selector is the
 //!   missing-`jobQueue` refusal and more than one is the mutual-exclusion refusal;
 //! * `SubmitJob` resolves the `jobDefinition` before the `jobQueue`, and a reference that
-//!   names no revision and one that names a revision which is not `ACTIVE` are the same
-//!   refusal;
+//!   names no revision and one that names a revision which is not `ACTIVE` are distinct
+//!   refusals — the first states that no such definition exists or none is `ACTIVE`, naming
+//!   the reference the request gave;
 //! * `CreateJobQueue` states the service-environment PRECONDITION for a
 //!   `serviceEnvironmentOrder` entry it cannot attach, instead of naming the resource;
 //! * `RegisterJobDefinition` validates each `nodeRangeProperties` entry's containers
@@ -550,7 +551,7 @@ async fn submit_job_resolves_the_job_definition_before_the_queue() {
     /// The refusal a row expects: the job definition's not-found (naming the reference),
     /// the not-`ACTIVE` refusal (naming the stored revision's ARN), or the queue's own.
     enum Expected {
-        /// `JobDefinition <reference> not found.`
+        /// `JobDefinition name <reference> does not exist or is not in ACTIVE status.`
         DefinitionAbsent,
         /// `JobDefinition <arn> is not in ACTIVE status.`, carrying the stored ARN.
         DefinitionInactive(String),
@@ -633,7 +634,7 @@ async fn submit_job_resolves_the_job_definition_before_the_queue() {
         match expected {
             Expected::DefinitionAbsent => assert_eq!(
                 message,
-                format!("JobDefinition {definition} not found."),
+                format!("JobDefinition name {definition} does not exist or is not in ACTIVE status."),
                 "case submit with {case}: expected the job-definition not-found refusal, got \
                  {message:?}"
             ),
@@ -664,6 +665,94 @@ async fn submit_job_resolves_the_job_definition_before_the_queue() {
     assert!(
         accepted["jobId"].as_str().is_some_and(|id| !id.is_empty()),
         "case submit with both resolvable: expected a jobId, got {accepted}"
+    );
+}
+
+/// RULE: the sentence a submit answers an unresolvable `jobDefinition` with states that no
+/// such definition exists or none is `ACTIVE` — the one lookup the submit makes can miss on
+/// either — and the reference it names is the one the REQUEST gave, verbatim, outside Batch's
+/// frontend envelope.
+///
+/// The rows differ along the reference's FORM (a bare name, `name:revision`, a full ARN, a name
+/// the service holds other revisions of) and along the queue named beside it, since the
+/// definition is resolved first.
+#[tokio::test]
+async fn submit_job_states_the_definition_lookup_condition_for_every_reference_form() {
+    let batch = Batch::new();
+    let environment = compute_environment(&batch, "ce-sentence").await;
+    job_queue(&batch, "q-sentence", &environment).await;
+    // A stored name, so a row may name a revision of it that was never registered.
+    job_definition(&batch, "jd-stored", container_properties()).await;
+
+    let rows: Vec<(&str, String, &str)> = vec![
+        ("a bare name", "jd-nothing".to_string(), "q-sentence"),
+        (
+            "a name:revision",
+            "jd-nothing:3".to_string(),
+            "q-sentence",
+        ),
+        (
+            "a full ARN",
+            arn("job-definition/jd-nothing:1"),
+            "q-sentence",
+        ),
+        (
+            "a revision of a stored name",
+            "jd-stored:9".to_string(),
+            "q-sentence",
+        ),
+        (
+            "a name with a queue that resolves to nothing either",
+            "jd-nothing".to_string(),
+            "q-absent",
+        ),
+    ];
+    for (case, definition, queue) in rows {
+        let (status, body) = batch
+            .call(
+                "/v1/submitjob",
+                json!({"jobName": "n", "jobQueue": queue, "jobDefinition": &definition}),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected 400, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ClientException",
+            "case {case}: expected the modelled ClientException, got {body}"
+        );
+        let message = error_message(&body);
+        assert_eq!(
+            message,
+            format!("JobDefinition name {definition} does not exist or is not in ACTIVE status."),
+            "case {case}: expected the definition-lookup sentence naming the reference given, \
+             got {message:?}"
+        );
+        // The service's own lookup miss is answered BARE: it is not one of the refusals Batch's
+        // frontend wraps.
+        assert!(
+            !message.starts_with(ENVELOPE_PREFIX),
+            "case {case}: expected the bare sentence, got the enveloped {message:?}"
+        );
+    }
+
+    // The definition that IS stored and ACTIVE resolves, so the same submit reaches the queue:
+    // no row above passed because the submit refuses everything.
+    let accepted = batch
+        .ok(
+            "/v1/submitjob",
+            json!({
+                "jobName": "n-sentence",
+                "jobQueue": "q-sentence",
+                "jobDefinition": "jd-stored",
+            }),
+        )
+        .await;
+    assert!(
+        accepted["jobId"].as_str().is_some_and(|id| !id.is_empty()),
+        "case \"the stored ACTIVE definition\": expected a jobId, got {accepted}"
     );
 }
 

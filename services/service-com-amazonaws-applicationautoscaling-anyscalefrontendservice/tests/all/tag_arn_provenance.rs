@@ -5,26 +5,28 @@
 //!
 //! RULE under test: `TagResource`, `UntagResource` and `ListTagsForResource` address a scalable
 //! target by the ARN this service minted for it, so what a `ResourceARN` naming no REGISTERED
-//! target earns is decided by that ARN's PROVENANCE in the Region serving the request, not by
-//! the lookup miss both cases share:
+//! target earns is decided by WHICH ENDPOINT that ARN names, not by the lookup miss both cases
+//! share:
 //!
-//! * an ARN this Region MINTED, for a target it no longer holds, names a resource the service
-//!   knows about and has lost, so the resource is reported ABSENT — the modelled
-//!   `ResourceNotFoundException`
+//! * an ARN of the partition, account and Region serving the request names a scalable target of
+//!   this endpoint, and the answer is that there is none — the resource is reported ABSENT, by
+//!   the modelled `ResourceNotFoundException`
 //!   (`smithy_query(query="operation",operation="TagResource,UntagResource,ListTagsForResource")`
 //!   declares it on all three), the fixed sentence "Scalable Target not found" and the ARN
-//!   asked about in the shape's own `ResourceName` member;
-//! * an ARN this Region NEVER minted names no resource it holds any record of, so the tagging
+//!   asked about in the shape's own `ResourceName` member. Whether this service ever minted
+//!   that ARN does not enter into it;
+//! * an ARN of another partition, account or Region names no resource this endpoint could hold,
+//!   so the tagging
 //!   call is refused without the service speaking about the resource at all: the modelled
 //!   `ValidationException`'s code at its 400, and the fixed sentence "Access Denied", which
 //!   carries nothing of the ARN, the account or the Region asked about.
 //!
-//! Recorded behaviour backs the second answer: the model lists both errors on the mutations but
-//! says which covers which condition for neither.
+//! The model lists both errors on the mutations but says which covers which condition for
+//! neither.
 //!
 //! The rows span what the rule generalises over: the OPERATION (the read and both mutations,
-//! each with payloads of its own) crossed with the ARN's provenance — several ways an ARN can
-//! be one this Region never minted (including one of exactly the form this service mints, so
+//! each with payloads of its own) crossed with the endpoint the ARN names — several ways an ARN
+//! can name no registered target here (including one of exactly the form this service mints, so
 //! the rule cannot be read off an id's shape), and several targets whose ARNs this Region
 //! minted and has since retired. A registered target stands beside every row and round-trips a
 //! tag through the same three operations, so no row passes because the family refuses
@@ -34,14 +36,14 @@ use serde_json::{json, Value};
 
 use crate::emulator::{error_code, error_message, Emulator, ACCOUNT, REGION};
 
-/// The sentence an ARN this Region minted for a target it no longer holds earns. Written out
+/// The sentence an ARN of this endpoint that names no registered target earns. Written out
 /// here rather than read off the code under test: the WORDING is part of the rule.
 const TARGET_NOT_FOUND: &str = "Scalable Target not found";
 
 /// The code that answer carries.
 const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 
-/// The whole sentence an ARN this Region never minted earns — fixed text, interpolating nothing
+/// The whole sentence an ARN of another endpoint earns — fixed text, interpolating nothing
 /// from the request or from state.
 const ACCESS_DENIED: &str = "Access Denied";
 
@@ -87,12 +89,15 @@ fn family(resource_arn: &str) -> Vec<(&'static str, Value)> {
 
 /// ARNs that satisfy the modelled `@pattern` on `ResourceARN`
 /// (`^arn:.+:application-autoscaling:.+:[0-9]+:scalable-target\/[a-zA-Z0-9-]+$`), so each one
-/// reaches the handler rather than the boundary validator, and that this Region never minted.
+/// reaches the handler rather than the boundary validator, and that name no registered target.
 ///
-/// `live` is the ARN of a target that IS registered here, which the last rows vary one field of:
-/// an ARN of the very form this service mints, differing from a minted one only in not having
-/// been minted, is what tells a provenance rule apart from one keyed on an id's shape.
-fn never_minted(live: &str) -> Vec<(String, String)> {
+/// `live` is the ARN of a target that IS registered here, which the last rows vary one field of.
+/// The flag is whether the ARN names THIS endpoint — its partition, account and Region — which
+/// is what decides which refusal it earns: an ARN of the very form this service mints, differing
+/// from a minted one only in not having been minted, earns the ABSENT answer just as a retired
+/// one does, which is what tells this rule apart from one keyed on an id's shape or on its
+/// provenance.
+fn unresolvable(live: &str) -> Vec<(String, String, bool)> {
     let twin = {
         let mut twin = live.to_string();
         twin.truncate(live.len() - 4);
@@ -106,6 +111,7 @@ fn never_minted(live: &str) -> Vec<(String, String)> {
                 "arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
+            true,
         ),
         (
             "an id in another form".to_string(),
@@ -113,10 +119,12 @@ fn never_minted(live: &str) -> Vec<(String, String)> {
                 "arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/\
                  00000000-0000-0000-0000-000000000000"
             ),
+            true,
         ),
         (
             "the shortest id the pattern admits".to_string(),
             format!("arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/a"),
+            true,
         ),
         (
             "an ARN of another account".to_string(),
@@ -124,6 +132,7 @@ fn never_minted(live: &str) -> Vec<(String, String)> {
                 "arn:aws:application-autoscaling:{REGION}:111122223333:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
+            false,
         ),
         (
             "an ARN of another Region".to_string(),
@@ -131,6 +140,7 @@ fn never_minted(live: &str) -> Vec<(String, String)> {
                 "arn:aws:application-autoscaling:eu-west-1:{ACCOUNT}:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
+            false,
         ),
         (
             "an ARN of another partition".to_string(),
@@ -138,23 +148,27 @@ fn never_minted(live: &str) -> Vec<(String, String)> {
                 "arn:aws-us-gov:application-autoscaling:us-gov-west-1:{ACCOUNT}:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
+            false,
         ),
         (
             "a registered target's ARN with another account in it".to_string(),
             live.replace(ACCOUNT, "111122223333"),
+            false,
         ),
         (
             "a registered target's ARN with another Region in it".to_string(),
             live.replace(REGION, "eu-west-1"),
+            false,
         ),
         (
             "an ARN of the form this service mints, that it did not mint".to_string(),
             twin,
+            true,
         ),
     ]
 }
 
-/// Assert `body` is the refusal of an ARN this Region never minted: the access-denied sentence,
+/// Assert `body` is the refusal of an ARN of another endpoint: the access-denied sentence,
 /// stating nothing about the resource asked about.
 fn assert_access_denied(case: &str, status: u16, body: &Value, arn: &str) {
     assert_eq!(
@@ -226,11 +240,14 @@ async fn tags_of(emulator: &Emulator, arn: &str, case: &str) -> Value {
     body["Tags"].clone()
 }
 
-/// RULE: an ARN this Region never minted is refused as a tagging call the service will not
-/// serve — the access-denied sentence, disclosing nothing about whether such a resource exists
-/// — by every operation of the family, and the refusal writes nothing.
+/// RULE: an ARN that names no registered scalable target is answered by the ENDPOINT it names:
+/// one of this account and Region is the resource reported absent, whether this service minted
+/// it or not, and one of another account, Region or partition is refused as a tagging call the
+/// service will not serve — the access-denied sentence, disclosing nothing about whether such a
+/// resource exists. Every operation of the family answers alike, and neither refusal writes
+/// anything.
 #[tokio::test]
-async fn an_arn_this_region_never_minted_is_refused_without_reporting_the_resource() {
+async fn an_unresolvable_arn_is_answered_by_the_endpoint_it_names() {
     let emulator = Emulator::empty();
 
     // One target that stays registered, so each row below is about the ARN it names.
@@ -249,7 +266,7 @@ async fn an_arn_this_region_never_minted_is_refused_without_reporting_the_resour
         "case \"tag the resident target\": expected HTTP 200, got {status} with {body:?}"
     );
 
-    for (reason, arn) in never_minted(&resident_arn) {
+    for (reason, arn, served_here) in unresolvable(&resident_arn) {
         assert_ne!(
             arn, resident_arn,
             "case {reason:?}: expected a row that is not the registered target's own ARN"
@@ -257,7 +274,11 @@ async fn an_arn_this_region_never_minted_is_refused_without_reporting_the_resour
         for (operation, request) in family(&arn) {
             let case = format!("{reason} on {operation}");
             let (status, body) = emulator.call(operation, request).await;
-            assert_access_denied(&case, status, &body, &arn);
+            if served_here {
+                assert_target_not_found(&case, status, &body, &arn);
+            } else {
+                assert_access_denied(&case, status, &body, &arn);
+            }
         }
     }
 
@@ -367,11 +388,11 @@ async fn an_arn_minted_for_a_target_that_is_gone_reports_the_absent_resource() {
     );
 }
 
-/// RULE: provenance is per REGION — an endpoint answers for the scalable targets of its own
-/// Region, so an ARN another Region minted is one it never minted, before and after that
+/// RULE: an endpoint answers for the scalable targets of its own Region, so an ARN of another
+/// Region is one it does not serve, before and after that
 /// target is deregistered.
 #[tokio::test]
-async fn an_arns_provenance_belongs_to_the_region_that_minted_it() {
+async fn an_arn_is_served_only_by_the_region_it_names() {
     // Region names are opaque to the rule, so the rows differ in the shape of the pair: two
     // Regions of one geography, and a pair whose home is not the Region an unscoped request
     // falls back to.
@@ -419,7 +440,7 @@ async fn an_arns_provenance_belongs_to_the_region_that_minted_it() {
             .unwrap_or_default()
             .to_string();
 
-        // The Region that minted it serves the tag write; the other Region never minted it.
+        // The Region that minted it serves the tag write; the other Region does not serve it.
         let (status, body) = emulator
             .call_in(
                 home,
@@ -442,8 +463,8 @@ async fn an_arns_provenance_belongs_to_the_region_that_minted_it() {
             );
         }
 
-        // Deregistering it in its own Region retires the ARN THERE: that Region reports the
-        // resource absent, and the other Region still never minted it.
+        // Deregistering it in its own Region stops it resolving THERE: that Region reports the
+        // resource absent, and the other Region still does not serve it.
         let (status, body) = emulator
             .call_in(home, "DeregisterScalableTarget", target.clone())
             .await;
@@ -466,6 +487,132 @@ async fn an_arns_provenance_belongs_to_the_region_that_minted_it() {
                 status,
                 &body,
                 &arn,
+            );
+        }
+    }
+}
+
+/// RULE: what this endpoint HOLDS decides, so an id of this account and Region that no
+/// registered target answers to is the resource reported absent whatever form that id takes and
+/// whoever wrote it — the same answer an ARN this endpoint issued earns once the target it named
+/// is gone.
+///
+/// The rows differ along the id's FORM, which is what a rule keyed on an identifier's shape
+/// would split on: the form this service's own mint draws from, a UUID, the shortest id the
+/// modelled pattern admits, and a long hyphenated name.
+#[tokio::test]
+async fn an_id_this_endpoint_never_issued_reports_the_target_absent() {
+    let emulator = Emulator::empty();
+
+    // A registered target stands beside the rows, so a refusal below is about the ARN it names
+    // and not about the family refusing everything.
+    let resident = emulator
+        .given_target("dynamodb:table:ReadCapacityUnits", 1, 10)
+        .await;
+    let resident_arn = emulator.target_arn(&resident).await;
+    let (status, body) = emulator
+        .call(
+            "TagResource",
+            json!({"ResourceARN": resident_arn, "Tags": {"env": "sim2real"}}),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"tag the resident target\": expected HTTP 200, got {status} with {body:?}"
+    );
+
+    for (case, id) in [
+        (
+            "an id of the form this service mints",
+            "0123456789abcdef0123456789abcdef0123",
+        ),
+        ("a UUID", "00000000-0000-0000-0000-000000000000"),
+        ("the shortest id the pattern admits", "a"),
+        (
+            "a long hyphenated name",
+            "probe-scalable-target-that-was-never-registered-0000",
+        ),
+    ] {
+        let arn =
+            format!("arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/{id}");
+        assert_ne!(
+            arn, resident_arn,
+            "case {case:?}: expected a row that is not the registered target's own ARN"
+        );
+        for (operation, request) in family(&arn) {
+            let (status, body) = emulator.call(operation, request).await;
+            assert_target_not_found(&format!("{case} on {operation}"), status, &body, &arn);
+        }
+    }
+
+    // None of those refusals touched the store: the resident target still carries the tag
+    // written before them.
+    let stored = tags_of(&emulator, &resident_arn, "the resident target's tags").await;
+    assert_eq!(
+        stored,
+        json!({"env": "sim2real"}),
+        "case \"the resident target's tags\": expected the refusals to change nothing, got \
+         {stored:?}"
+    );
+}
+
+/// RULE: registering a deregistered identity again is a NEW resource with a NEW ARN, and the
+/// superseded ARN keeps reporting the resource it names as absent — the store, not the ARN's
+/// history, is what decides.
+#[tokio::test]
+async fn a_superseded_arn_still_reports_the_target_absent() {
+    let emulator = Emulator::empty();
+    // Several identities, so the rule is not read off one dimension's spelling.
+    for dimension in [
+        "dynamodb:table:WriteCapacityUnits",
+        "ecs:service:DesiredCount",
+        "dynamodb:index:ReadCapacityUnits",
+    ] {
+        let target = emulator.given_target(dimension, 1, 10).await;
+        let first = emulator.target_arn(&target).await;
+        let (status, body) = emulator
+            .call("DeregisterScalableTarget", target.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {dimension:?}: expected DeregisterScalableTarget to answer 200, got {status} \
+             with {body:?}"
+        );
+
+        let mut registration = target.clone();
+        registration["MinCapacity"] = json!(1);
+        registration["MaxCapacity"] = json!(10);
+        let (status, body) = emulator
+            .call("RegisterScalableTarget", registration)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {dimension:?}: expected the re-registration to answer 200, got {status} with \
+             {body:?}"
+        );
+        let reissued = emulator.target_arn(&target).await;
+        assert_ne!(
+            reissued, first,
+            "case {dimension:?}: expected the re-registration to mint a new ARN"
+        );
+
+        // The new ARN answers, and every operation of the family reports the superseded one's
+        // resource as absent.
+        let (status, body) = emulator
+            .call("ListTagsForResource", json!({"ResourceARN": reissued}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {dimension:?}: expected the re-registered target to answer 200, got {status} \
+             with {body:?}"
+        );
+        for (operation, request) in family(&first) {
+            let (status, body) = emulator.call(operation, request).await;
+            assert_target_not_found(
+                &format!("the superseded ARN of {dimension} on {operation}"),
+                status,
+                &body,
+                &first,
             );
         }
     }

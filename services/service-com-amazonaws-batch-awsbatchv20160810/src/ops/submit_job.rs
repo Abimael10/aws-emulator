@@ -10,7 +10,9 @@
 //! carrying an id nothing stored. The `jobDefinition` is resolved FIRST, so a submit that
 //! names neither a stored definition nor a stored queue is refused on the DEFINITION, and
 //! a reference naming nothing and one naming a revision that is not `ACTIVE` are DISTINCT
-//! refusals: the first is the service layer's not-found naming the reference, the second
+//! refusals: the first states that no such definition exists or none is `ACTIVE`, naming
+//! the reference the request gave
+//! ([`crate::state::job_definition_unresolved_message`]), the second
 //! names the stored revision by its ARN
 //! ([`crate::state::job_definition_not_active_message`]). The job id is a fresh UUID, and
 //! the record keeps the queue ARN, the resolved
@@ -316,7 +318,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .cloned();
                     let Some(stored) = stored else {
                         return Err(SubmitJobErrorModeled::ClientException(
-                            batch::not_found_exception("JobDefinition", &input.job_definition),
+                            batch::client_exception(batch::job_definition_unresolved_message(
+                                &input.job_definition,
+                            )),
                         )
                         .into());
                     };

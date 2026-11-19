@@ -37,10 +37,10 @@ const DIMENSION_WITHOUT_RESOURCE_ID: &str =
     "Scalable dimension cannot be provided without a resource ID.";
 /// A `NextToken` this service did not issue.
 const INVALID_NEXT_TOKEN: &str = "The NextToken value is not valid";
-/// A tag operation addressed to an ARN this Region minted for a scalable target it no longer
-/// holds.
+/// A tag operation addressed to an ARN of this endpoint that names no registered scalable
+/// target.
 const TARGET_NOT_FOUND: &str = "Scalable Target not found";
-/// A tag operation addressed to an ARN this Region never minted.
+/// A tag operation addressed to an ARN of another account, Region or partition.
 const ACCESS_DENIED: &str = "Access Denied";
 /// A write to the reserved tag namespace.
 const SYSTEM_TAG_KEY_REFUSED: &str = "Caller is an end user and not allowed to mutate system tags";
@@ -823,8 +823,9 @@ fn generated_tags(count: usize) -> Value {
     Value::Object(tags)
 }
 
-/// RULE: the tagging refusals each carry their own sentence — an ARN this Region minted for a
-/// target it no longer holds is reported absent, an ARN it never minted is refused as a call
+/// RULE: the tagging refusals each carry their own sentence — an ARN of this endpoint that
+/// names no registered target is reported absent, an ARN of another account or Region is refused
+/// as a call
 /// about a resource the caller does not reach, a tag set over the per-resource maximum states
 /// that maximum, and a key in the reserved namespace is refused as a system tag — so a client
 /// can tell them apart by text as well as by code.
@@ -850,17 +851,10 @@ async fn the_tagging_refusals_are_distinct_sentences() {
         .expect("a ScalableTargetARN")
         .to_string();
 
-    // Every ARN below satisfies the modelled `@pattern`, so each reaches the handler. None of
-    // them is one this Region minted, so each is refused as a call about a resource the service
-    // holds no record of.
-    let never_minted: &[(&str, String)] = &[
-        (
-            "an ARN of a target that was never registered",
-            format!(
-                "arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/\
-                 0123456789abcdef0123456789abcdef0123"
-            ),
-        ),
+    // Every ARN below satisfies the modelled `@pattern`, so each reaches the handler. Each is
+    // addressed to another account, so none of them names a resource this endpoint could hold:
+    // the tagging call itself is refused.
+    let foreign: &[(&str, String)] = &[
         (
             "an ARN scoped to another account",
             format!(
@@ -868,9 +862,16 @@ async fn the_tagging_refusals_are_distinct_sentences() {
                  0123456789abcdef0123456789abcdef0123"
             ),
         ),
+        (
+            "an ARN scoped to another Region",
+            format!(
+                "arn:aws:application-autoscaling:eu-west-1:{ACCOUNT}:scalable-target/\
+                 0123456789abcdef0123456789abcdef0123"
+            ),
+        ),
     ];
-    for (case, unknown) in never_minted {
-        // Every operation of the family refuses an ARN this Region never minted alike, at the
+    for (case, unknown) in foreign {
+        // Every operation of the family refuses an ARN of another endpoint alike, at the
         // same client-error status.
         for (operation, request) in [
             (
@@ -896,7 +897,47 @@ async fn the_tagging_refusals_are_distinct_sentences() {
         }
     }
 
-    // The ARN of a target this Region DID mint and has since stopped holding carries the other
+    // An ARN of THIS endpoint that names no registered target carries the other
+    // sentence, whether this service minted it or not: the resource it names is reported absent.
+    let absent_here: &[(&str, String)] = &[
+        (
+            "an ARN of a target that was never registered",
+            format!(
+                "arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/\
+                 0123456789abcdef0123456789abcdef0123"
+            ),
+        ),
+        (
+            "an ARN whose id is in no form this service mints",
+            format!("arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/absent"),
+        ),
+    ];
+    for (case, unknown) in absent_here {
+        for (operation, request) in [
+            (
+                "TagResource",
+                json!({"ResourceARN": unknown, "Tags": {"team": "search"}}),
+            ),
+            (
+                "UntagResource",
+                json!({"ResourceARN": unknown, "TagKeys": ["team"]}),
+            ),
+            ("ListTagsForResource", json!({"ResourceARN": unknown})),
+        ] {
+            refused_with_status(
+                &emulator,
+                &format!("{operation} on {case}"),
+                operation,
+                request,
+                400,
+                "ResourceNotFoundException",
+                TARGET_NOT_FOUND,
+            )
+            .await;
+        }
+    }
+
+    // The ARN of a target this Region DID mint and has since stopped holding carries that same
     // sentence: the resource it names is reported absent.
     let withdrawn = emulator
         .given_target("dynamodb:table:WriteCapacityUnits", 1, 10)
