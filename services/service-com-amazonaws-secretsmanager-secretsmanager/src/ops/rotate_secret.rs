@@ -14,7 +14,10 @@
 //! (`crate::state::rotation`). The call ANSWERS while that is in flight, which is why
 //! it reports the id of a version the function has not created yet and why a second
 //! `RotateSecret` is refused while `AWSPENDING` names a version other than the
-//! `AWSCURRENT` one.
+//! `AWSCURRENT` one — until `CancelRotateSecret` has cancelled that rotation, after which
+//! the next call RESUMES the candidate it left rather than refusing. A call that asks not to
+//! rotate now starts no rotation and tests the configuration it applied instead, invoking
+//! the same function once with the `testSecret` step.
 //!
 //! ## Shape of an operation
 //!
@@ -345,13 +348,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is to create, and what makes a second RotateSecret refused while this rotation
         // is in flight.
         //
-        // With `RotateImmediately` false nothing is staked and no step runs: "Secrets
-        // Manager tests the rotation configuration by running the testSecret step of the
-        // Lambda rotation function. This test creates an AWSPENDING version of the secret
-        // and then removes it" — a test that leaves no version behind.
-        if planned.rotate_immediately {
-            secret.start_rotation(planned.version_id.clone(), now);
-        }
+        // With `RotateImmediately` false nothing is staked and no step of a rotation runs:
+        // "Secrets Manager tests the rotation configuration by running the testSecret step of
+        // the Lambda rotation function. This test creates an AWSPENDING version of the secret
+        // and then removes it" — a test that leaves no version behind, which is performed
+        // after this call has answered (`crate::state::rotation::test_configuration`).
+        //
+        // The start also takes the next GENERATION of this secret's rotations, which the task
+        // driving this one tells its own rotation by: a rotation taken over from a cancelled
+        // one is staked on the same version id, so the generation is what makes the cancelled
+        // one's task stop instead of driving alongside it.
+        //
+        // A call that RESUMES a cancelled candidate while asking not to rotate now starts no
+        // rotation, so that candidate stays outstanding and stays the one the next call
+        // resumes: it is reported, because it is the version this secret's rotation is staked
+        // on, and the test invocation carries it for the same reason — the configuration being
+        // tested is the one that rotation will run under.
+        let generation = if planned.rotate_immediately {
+            secret.start_rotation(planned.version_id.clone(), now)
+        } else {
+            secret.rotation_generation
+        };
         let answer = RotateSecretOutput {
             arn: Some(secret.arn.clone()),
             name: Some(secret.name.clone()),
@@ -362,19 +379,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The rotation itself is the rotation FUNCTION's work, invoked once per step. It
         // happens off the response path, because this call answers while the rotation is
         // still in flight — it reports the id of a version the function has not created
-        // yet (`crate::state::rotation`).
-        if planned.rotate_immediately {
-            if let Some(lambda_arn) = planned.lambda_arn {
+        // yet (`crate::state::rotation`). A call that asked NOT to rotate now has no rotation
+        // to drive, and tests the configuration it has just applied instead: one invocation
+        // of the same function, with the `testSecret` step.
+        if let Some(lambda_arn) = planned.lambda_arn {
+            let rotation = crate::state::rotation::Rotation {
+                region,
+                secret_arn: planned.arn,
+                version_id: planned.version_id,
+                lambda_arn,
+                generation,
+            };
+            if planned.rotate_immediately {
                 crate::state::rotation::drive(
                     ::std::sync::Arc::clone(&self.engine),
                     ctx.callback().clone(),
-                    crate::state::rotation::Rotation {
-                        region,
-                        secret_arn: planned.arn,
-                        version_id: planned.version_id,
-                        lambda_arn,
-                    },
+                    rotation,
                 );
+            } else {
+                crate::state::rotation::test_configuration(ctx.callback().clone(), rotation);
             }
         }
         Ok(answer)
@@ -448,7 +471,8 @@ struct Planned {
     /// The secret's own ARN.
     arn: String,
     /// The id of the version this rotation creates, which is the `ClientRequestToken` the
-    /// call carried or the one minted for it.
+    /// call carried or the one minted for it — or, where this call RESUMES the candidate a
+    /// cancelled rotation left outstanding, that candidate's own id.
     version_id: String,
     /// Whether the rotation starts now: "The default for RotateImmediately is true. If you
     /// don't specify this value, Secrets Manager rotates the secret immediately."
@@ -556,13 +580,14 @@ fn plan(
         .filter(|arn| !arn.is_empty());
     // A rotation is driven by INVOKING the function this member names, so the value has to
     // name one: a value that is not the ARN of a Lambda function states no function to
-    // invoke (`crate::state::rotation::names_a_function`).
+    // invoke (`crate::state::rotation::names_a_function`), which is a malformed parameter
+    // rather than a secret that has no rotation function at all.
     if configured_lambda_arn
         .as_deref()
         .is_some_and(|arn| !crate::state::rotation::names_a_function(arn))
     {
         return Err(invalid_request(
-            crate::state::rotation::not_a_function_message(),
+            crate::state::rotation::not_a_function_message(region),
         ));
     }
     let role_arn = input
@@ -587,7 +612,17 @@ fn plan(
     // returns an error." The sentence is AWS's own for that condition, and it is
     // fixed: it names no version, because what it reports is that a rotation of
     // this secret has not finished and will be tried again.
-    if secret.rotation_in_progress() {
+    //
+    // It is that reattempt the refusal stands for, so the one candidate it does NOT stand
+    // for is the one whose rotation was CANCELLED (`resumable_rotation_version_id`): nothing
+    // will reattempt that rotation, so this call RESUMES it instead — the rotation it starts
+    // is the cancelled one, staked on the id that rotation already holds, which is why the
+    // call reports that id rather than minting a version under the token it carried. Every
+    // other outstanding candidate keeps the refusal.
+    let resumed = secret
+        .resumable_rotation_version_id()
+        .map(str::to_string);
+    if resumed.is_none() && secret.rotation_in_progress() {
         return Err(invalid_request(crate::state::ROTATION_IN_PROGRESS_MESSAGE));
     }
     // A `ClientRequestToken` this secret already has a version under is NOT refused:
@@ -602,7 +637,9 @@ fn plan(
 
     Ok(Planned {
         arn: secret.arn.clone(),
-        version_id,
+        // A resumed rotation keeps working on the candidate it already staked, so the id is
+        // that one rather than the token this call carried.
+        version_id: resumed.unwrap_or(version_id),
         rotate_immediately,
         // The rotation is driven through the function in force for this secret once this
         // call's configuration is applied: the one it names, else the one already stored.

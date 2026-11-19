@@ -349,10 +349,11 @@ pub const NO_SECRET_VALUE_MESSAGE: &str =
 /// service's Smithy model).
 ///
 /// One fixed sentence, interpolating no secret, no ARN and no parameter value. It is the
-/// answer for every way a call leaves the secret without one: a call that names no
-/// `RotationLambdaARN` for a secret that stores none, and a call whose `RotationLambdaARN`
-/// names no Lambda function at all — a value that is not a function's ARN associates no
-/// rotation function with the secret.
+/// answer for a call that leaves the secret without a rotation function by naming none: a
+/// call with no `RotationLambdaARN` for a secret that stores none. A call that DOES name one
+/// which is no Lambda function's ARN is answered with the form such a value has to have
+/// ([`rotation::not_a_function_message`]) instead, since what that caller has to fix is the
+/// ARN it passed rather than the secret's missing rotation function.
 pub const NO_ROTATION_FUNCTION_MESSAGE: &str =
     "No Lambda rotation function ARN is associated with this secret.";
 
@@ -1927,6 +1928,34 @@ pub struct Secret {
     /// secret version" (`DescribeSecretResponse$VersionIdsToStages`, this
     /// service's Smithy model).
     pub pending_rotation_version_id: Option<String>,
+    /// The candidate a rotation CANCELLED by `CancelRotateSecret` left staged
+    /// `AWSPENDING`, which is the rotation the next `RotateSecret` resumes; `None`
+    /// for a secret no rotation of which has been cancelled, and from the moment a
+    /// rotation is started again ([`start_rotation`]).
+    ///
+    /// It is what tells the one state the in-progress refusal does NOT hold for
+    /// apart from every other outstanding candidate: "turns off automatic rotation,
+    /// and if a rotation is currently in progress, cancels the rotation"
+    /// (`CancelRotateSecret`, this service's Smithy model) ends the rotation this
+    /// service was reattempting, while a candidate nothing cancelled — one a caller
+    /// staged itself, one left by a deletion — is still "a previous rotation request
+    /// [that] is still in progress" ([`rotation_in_progress`]).
+    ///
+    /// [`start_rotation`]: Secret::start_rotation
+    /// [`rotation_in_progress`]: Secret::rotation_in_progress
+    pub cancelled_rotation_version_id: Option<String>,
+    /// How many rotations of this secret have been STARTED, which is the generation the
+    /// rotation in flight belongs to.
+    ///
+    /// A rotation is driven by a task of its own, and that task has to be able to tell its own
+    /// rotation from a LATER one on the same candidate: a rotation that was cancelled and then
+    /// resumed is staked on the very same version id, with rotation enabled again, so the id
+    /// alone cannot say which rotation the secret is waiting for. Every start takes the next
+    /// generation ([`start_rotation`]), and a task whose generation is no longer this one stops
+    /// — so a resumed rotation REPLACES the one it took over instead of running beside it.
+    ///
+    /// [`start_rotation`]: Secret::start_rotation
+    pub rotation_generation: u64,
     /// The replicas of this secret, in the order their Regions were first
     /// replicated to. Empty for a secret that does not participate in
     /// cross-region replication.
@@ -1984,6 +2013,8 @@ impl Secret {
             last_rotated_date: None,
             next_rotation_date: None,
             pending_rotation_version_id: None,
+            cancelled_rotation_version_id: None,
+            rotation_generation: 0,
             replicas: Vec::new(),
             replica_of: None,
             sealed_under: None,
@@ -2248,6 +2279,36 @@ impl Secret {
             }
             None => false,
         }
+    }
+
+    /// The candidate a rotation CANCELLED by `CancelRotateSecret` left outstanding, which the
+    /// next `RotateSecret` takes up again; `None` for every other candidate, and for a secret
+    /// with no candidate outstanding at all.
+    ///
+    /// The refusal a rotation in progress earns says what will happen to it — "a previous
+    /// rotation request is still in progress" (`RotateSecret`), and that rotation will be
+    /// reattempted — so it stands for as long as that rotation is this service's to reattempt.
+    /// `CancelRotateSecret` is what ends it: "turns off automatic rotation, and if a rotation
+    /// is currently in progress, cancels the rotation" (`CancelRotateSecret`, this service's
+    /// Smithy model), while the labels that rotation staked are kept — "you might need to
+    /// remove the staging label AWSPENDING from the partially created version". The candidate
+    /// of THAT rotation ([`cancelled_rotation_version_id`]) is therefore one nothing is driving
+    /// and nothing will reattempt, and a further `RotateSecret` resumes it: the rotation it
+    /// starts is the cancelled one, staked on the id that rotation already holds, so no version
+    /// is minted for the token the resuming call carried.
+    ///
+    /// Every other outstanding candidate keeps the refusal, because for it the sentence is
+    /// still true: a candidate a caller staged itself, or one a deletion left behind, is a
+    /// rotation this service has not been told to give up on.
+    ///
+    /// [`cancelled_rotation_version_id`]: Secret::cancelled_rotation_version_id
+    pub fn resumable_rotation_version_id(&self) -> Option<&str> {
+        let cancelled = self.cancelled_rotation_version_id.as_deref()?;
+        // Only while that candidate is still the outstanding one: a cancelled rotation whose
+        // labels have since been cleaned up, or whose candidate has become the current
+        // version, has nothing left to take up.
+        (self.rotation_in_progress() && self.pending_version_id() == Some(cancelled))
+            .then_some(cancelled)
     }
 
     /// The schedule the stored rules rotate the secret on, for computing the
@@ -2755,7 +2816,19 @@ impl Secret {
     /// label then goes ON that version, exactly as it does once a rotation
     /// function creates the version the label was reserved for: the reservation
     /// stands only while the id names a version this store does not hold.
-    pub fn start_rotation(&mut self, version_id: String, at: SystemTime) {
+    ///
+    /// Starting a rotation also ends whatever a previous CANCEL left to take up
+    /// ([`cancelled_rotation_version_id`]): from here the rotation of this secret is one this
+    /// service is driving again, which is the state the in-progress refusal is for. It takes
+    /// the next GENERATION too, and answers it: that is what the task driving this rotation
+    /// tells its own rotation by, so a rotation started while an earlier one's task is still
+    /// alive replaces it rather than running beside it ([`rotation_generation`]).
+    ///
+    /// [`cancelled_rotation_version_id`]: Secret::cancelled_rotation_version_id
+    /// [`rotation_generation`]: Secret::rotation_generation
+    pub fn start_rotation(&mut self, version_id: String, at: SystemTime) -> u64 {
+        self.cancelled_rotation_version_id = None;
+        self.rotation_generation = self.rotation_generation.saturating_add(1);
         for existing in &mut self.versions {
             existing.version_stages.retain(|held| held != STAGE_PENDING);
         }
@@ -2771,6 +2844,7 @@ impl Secret {
             None => self.pending_rotation_version_id = Some(version_id),
         }
         self.last_changed_date = at;
+        self.rotation_generation
     }
 
     /// Record that the rotation that was in flight COMPLETED, at `at`.
@@ -2823,6 +2897,14 @@ impl Secret {
             .rotation_in_progress()
             .then(|| self.pending_version_id().map(str::to_string))
             .flatten();
+        // The candidate of the rotation this call CANCELLED, which is the one a further
+        // `RotateSecret` takes up ([`resumable_rotation_version_id`]): the rotation it belonged
+        // to is no longer one this service will reattempt.
+        //
+        // [`resumable_rotation_version_id`]: Secret::resumable_rotation_version_id
+        if cancelled.is_some() {
+            self.cancelled_rotation_version_id = cancelled.clone();
+        }
         if self.rotation_enabled.is_some() {
             self.rotation_enabled = Some(false);
         }
@@ -3466,6 +3548,159 @@ mod tests {
             automatically_after_days: None,
             duration: None,
             schedule_expression: Some(expression.to_string()),
+        }
+    }
+
+    /// Where a row leaves the secret's ROTATION: never configured, configured and on,
+    /// configured and then cancelled, or configured and then turned off by a scheduled
+    /// deletion — which turns rotation off WITHOUT cancelling the rotation.
+    #[derive(Debug, Clone, Copy)]
+    enum Configured {
+        Never,
+        On,
+        Cancelled,
+        Deleted,
+    }
+
+    /// A secret holding `versions` (each with its staging labels), a candidate `reserved` by a
+    /// rotation that has started but whose version does not exist yet, and its rotation left
+    /// where `configured` says.
+    fn secret_with(
+        versions: &[HeldVersion],
+        reserved: Option<&str>,
+        configured: Configured,
+        at: SystemTime,
+    ) -> Secret {
+        let mut secret = secret_at(at);
+        if !matches!(configured, Configured::Never) {
+            secret.configure_rotation(config(after_days(30)), at);
+        }
+        for (version_id, stages) in versions {
+            secret.put_version(version(version_id, stages, at), at);
+        }
+        if let Some(reserved) = reserved {
+            secret.start_rotation(reserved.to_string(), at);
+        }
+        match configured {
+            Configured::Cancelled => {
+                secret.cancel_rotation(at);
+            }
+            Configured::Deleted => {
+                secret.schedule_deletion(at, at + Duration::from_secs(SECONDS_PER_DAY), at);
+            }
+            Configured::Never | Configured::On => {}
+        }
+        secret
+    }
+
+    /// One version held by a row's secret: its id and the staging labels on it.
+    type HeldVersion = (&'static str, &'static [&'static str]);
+
+    /// One row of [`the_candidate_of_a_cancelled_rotation_is_the_one_a_further_rotation_resumes`]:
+    /// the state the secret is in, and the candidate a further rotation resumes.
+    struct ResumeRow {
+        case: &'static str,
+        /// The versions the secret holds.
+        versions: &'static [HeldVersion],
+        /// The candidate a started rotation only RESERVED, whose version does not exist.
+        reserved: Option<&'static str>,
+        /// Where the row leaves the secret's rotation.
+        configured: Configured,
+        /// The candidate a further `RotateSecret` resumes.
+        resumed: Option<&'static str>,
+    }
+
+    /// The version a row's secret serves, and the candidate staged beside it.
+    const CURRENT_VERSION: &str = "11111111-1111-4111-8111-111111111111";
+    const CANDIDATE_VERSION: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// The three version layouts the rows are built from.
+    const ONLY_CURRENT: &[HeldVersion] = &[(CURRENT_VERSION, &[STAGE_CURRENT])];
+    const CURRENT_AND_CANDIDATE: &[HeldVersion] = &[
+        (CURRENT_VERSION, &[STAGE_CURRENT]),
+        (CANDIDATE_VERSION, &[STAGE_PENDING]),
+    ];
+    const PENDING_ON_CURRENT: &[HeldVersion] =
+        &[(CURRENT_VERSION, &[STAGE_CURRENT, STAGE_PENDING])];
+
+    /// RULE: the candidate of a rotation `CancelRotateSecret` CANCELLED is the one a further
+    /// `RotateSecret` resumes; every other outstanding candidate keeps the in-progress refusal,
+    /// and `AWSPENDING` sitting on the version `AWSCURRENT` names is no outstanding candidate
+    /// at all.
+    ///
+    /// The rows differ along what the rule turns on: what left the candidate outstanding (a
+    /// cancel, a rotation still being reattempted, a scheduled deletion, a caller staging it on
+    /// a secret rotation was never configured for), whether the candidate's version exists yet
+    /// or is only reserved, and whether `AWSPENDING` and `AWSCURRENT` name the same version.
+    #[test]
+    fn the_candidate_of_a_cancelled_rotation_is_the_one_a_further_rotation_resumes() {
+        let at = instant(1_700_000_000);
+        let rows: Vec<ResumeRow> = vec![
+            ResumeRow {
+                case: "no candidate outstanding at all",
+                versions: ONLY_CURRENT,
+                reserved: None,
+                configured: Configured::On,
+                resumed: None,
+            },
+            ResumeRow {
+                case: "a candidate the rotation is still being reattempted for",
+                versions: CURRENT_AND_CANDIDATE,
+                reserved: None,
+                configured: Configured::On,
+                resumed: None,
+            },
+            ResumeRow {
+                case: "a candidate a rotation that was cancelled left behind",
+                versions: CURRENT_AND_CANDIDATE,
+                reserved: None,
+                configured: Configured::Cancelled,
+                resumed: Some(CANDIDATE_VERSION),
+            },
+            ResumeRow {
+                case: "a candidate a cancelled rotation left before its version was created",
+                versions: ONLY_CURRENT,
+                reserved: Some(CANDIDATE_VERSION),
+                configured: Configured::Cancelled,
+                resumed: Some(CANDIDATE_VERSION),
+            },
+            ResumeRow {
+                case: "a candidate still reserved while the rotation is being reattempted",
+                versions: ONLY_CURRENT,
+                reserved: Some(CANDIDATE_VERSION),
+                configured: Configured::On,
+                resumed: None,
+            },
+            ResumeRow {
+                case: "AWSPENDING on the version AWSCURRENT names, which is a finished rotation",
+                versions: PENDING_ON_CURRENT,
+                reserved: None,
+                configured: Configured::Cancelled,
+                resumed: None,
+            },
+            ResumeRow {
+                case: "a candidate staged on a secret rotation was never configured for",
+                versions: CURRENT_AND_CANDIDATE,
+                reserved: None,
+                configured: Configured::Never,
+                resumed: None,
+            },
+            ResumeRow {
+                case: "a candidate a scheduled deletion left, which cancelled no rotation",
+                versions: CURRENT_AND_CANDIDATE,
+                reserved: None,
+                configured: Configured::Deleted,
+                resumed: None,
+            },
+        ];
+        for row in rows {
+            let secret = secret_with(row.versions, row.reserved, row.configured, at);
+            let read = secret.resumable_rotation_version_id();
+            assert_eq!(
+                read, row.resumed,
+                "case {:?}: expected {:?}, got {read:?} for {secret:?}",
+                row.case, row.resumed
+            );
         }
     }
 }

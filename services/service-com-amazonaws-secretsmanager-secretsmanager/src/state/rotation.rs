@@ -30,6 +30,24 @@
 //!   while it runs, which is what makes a second `RotateSecret` refused, and the secret is
 //!   stamped as rotated only once the last step has returned.
 //!
+//! * **A rotation that is not to start now is still TESTED.** "If you set RotateImmediately to
+//!   false, Secrets Manager tests the rotation configuration by running the testSecret step of
+//!   the Lambda rotation function. This test creates an AWSPENDING version of the secret and
+//!   then removes it" (`RotateSecretRequest$RotateImmediately`, this service's Smithy model) —
+//!   so such a call invokes the function once, off the response path too
+//!   ([`test_configuration`]), and leaves no version behind. The tasks of this module, the
+//!   rotations and the tests alike, are bounded ([`MAX_TASKS_IN_FLIGHT`]).
+//!
+//!   One half of that sentence is NOT reproduced: the candidate the test would create and
+//!   remove is never staged, so the event carries the id of a version that does not exist, and
+//!   a rotation function whose `testSecret` step reads that version raises instead of passing.
+//!   What a client learns is still what the test is for — its function was reached and ran —
+//!   and the secret is left exactly as this service's own pinned behaviour requires: a deferred
+//!   call stages no version and does not refuse the next one
+//!   (`tests/all/secret_rotation.rs::rotate_immediately_decides_whether_a_rotation_is_started`),
+//!   which a candidate staked for the length of an invocation would make untrue for any caller
+//!   acting meanwhile. Staging it would mean revisiting that behaviour first.
+//!
 //! Nothing here invents a rotation: every version a rotation produces is one the rotation
 //! function itself wrote through this service's own operations. A rotation whose function did
 //! not complete a step is driven again from the first step — "if rotation fails, Secrets
@@ -69,6 +87,12 @@ pub fn invoke_not_permitted_message() -> String {
 /// "Secrets Manager calls the Lambda rotation function four times, each time with a different
 /// value for the Step parameter" (Secrets Manager User Guide, *How rotation works*).
 pub const ROTATION_STEPS: [&str; 4] = ["createSecret", "setSecret", "testSecret", "finishSecret"];
+
+/// The step a rotation that is NOT to start now is tested with: "If you set RotateImmediately
+/// to false, Secrets Manager tests the rotation configuration by running the testSecret step
+/// of the Lambda rotation function" (`RotateSecretRequest$RotateImmediately`, this service's
+/// Smithy model) — one of the four above, invoked on its own.
+pub const TEST_SECRET_STEP: &str = "testSecret";
 
 /// The member of the rotation event naming the secret being rotated.
 const EVENT_SECRET_ID: &str = "SecretId";
@@ -156,19 +180,28 @@ pub fn names_a_function(arn: &str) -> bool {
     })
 }
 
-/// What this service answers for a `RotationLambdaARN` that names no Lambda function.
+/// The partition the ARN form this service states a malformed `RotationLambdaARN` against is
+/// spelled in, which is the one this emulator serves.
+const ARN_PARTITION: &str = "aws";
+
+/// What this service answers for a `RotationLambdaARN` that names no Lambda function: the
+/// FORM such a value has to have, so a caller reads back what it sent its ARN wrong against.
 ///
 /// `RotationLambdaARNType` states no pattern and a length of 0..2048 (this service's Smithy
-/// model), so which values name a rotation function is the handler's judgement — and a value
-/// that is not a Lambda function's ARN leaves the secret with no rotation function
-/// associated with it, which is the documented `InvalidRequestException` cause "You tried to
-/// enable rotation on a secret that doesn't already have a Lambda function ARN configured and
-/// you didn't include such an ARN as a parameter in this call." So the sentence is the one
-/// this service words that cause with, [`crate::state::NO_ROTATION_FUNCTION_MESSAGE`], rather
-/// than one of this emulator's own: fixed text, interpolating no part of the request.
+/// model), so which values name a rotation function is the service's judgement, and a value
+/// that is not a Lambda function's ARN is a malformed parameter rather than a secret with no
+/// rotation function: the two conditions travel under the same `InvalidRequestException`, so
+/// the sentence is the only thing that tells a caller to fix the ARN it passed instead of
+/// attaching a rotation function. The only part taken from the request is the REGION it was
+/// made in; the account and the function name are placeholders of the stated form rather than
+/// values read back out of the request.
 #[must_use]
-pub fn not_a_function_message() -> &'static str {
-    super::NO_ROTATION_FUNCTION_MESSAGE
+pub fn not_a_function_message(region: &str) -> String {
+    format!(
+        "Invalid rotation Lambda ARN. Ensure the ARN matches format \
+         arn:{ARN_PARTITION}:{LAMBDA_ARN_NAMESPACE}:{region}:<account>:\
+         {FUNCTION_RESOURCE_TYPE}:<functionName>."
+    )
 }
 
 /// Why this service cannot invoke the rotation function `lambda_arn` for the secret
@@ -254,14 +287,134 @@ const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
 /// must answer while the rotation is still in flight. The caller hands over its own clone of
 /// the in-process callback, so the invocations are made exactly where the starting call was
 /// made.
+///
+/// The number of tasks this module has in flight is bounded ([`MAX_TASKS_IN_FLIGHT`]). A
+/// rotation that finds no slot free is not driven, which leaves the secret in the state the
+/// real service leaves a rotation whose function it could not reach — the current value still
+/// readable, `AWSPENDING` staked and `LastRotatedDate` unset — and a client takes that rotation
+/// up again the documented way: `CancelRotateSecret`, then `RotateSecret`.
 pub fn drive<Eng: Send + Sync + 'static>(
     engine: Arc<Eng>,
     callback: EmbeddedEmulator,
     rotation: Rotation,
 ) {
+    let Some(slot) = TaskSlot::claim() else {
+        ::tracing::warn!(
+            secret = %rotation.secret_arn,
+            version = %rotation.version_id,
+            "{MAX_TASKS_IN_FLIGHT} rotation tasks are already in flight, so this rotation is \
+             not driven"
+        );
+        return;
+    };
     ::tokio::spawn(async move {
+        let _slot = slot;
         run(&engine, &callback, &rotation).await;
     });
+}
+
+/// Test the rotation CONFIGURATION a call that asked not to rotate now has just applied:
+/// invoke the configured rotation function once, with the `testSecret` step.
+///
+/// "If you set RotateImmediately to false, Secrets Manager tests the rotation configuration by
+/// running the testSecret step of the Lambda rotation function. This test creates an
+/// AWSPENDING version of the secret and then removes it"
+/// (`RotateSecretRequest$RotateImmediately`, this service's Smithy model) — so the function is
+/// reached once, which is how a client that schedules a rotation learns at configuration time
+/// that its function can be invoked and runs, and NOTHING of the test is left on the secret:
+/// the version it creates is removed again, and the only writer of a version here is the
+/// rotation function itself ([`drive`]).
+///
+/// Returns at once, for the same reason [`drive`] does: the call that configured the rotation
+/// answers while the test is still in flight. It takes one of the same bounded slots
+/// ([`MAX_TASKS_IN_FLIGHT`]): a call that finds none free configures the rotation exactly as it
+/// would have and leaves the test unperformed, which changes nothing about the secret.
+pub fn test_configuration(callback: EmbeddedEmulator, rotation: Rotation) {
+    let Some(slot) = TaskSlot::claim() else {
+        ::tracing::warn!(
+            secret = %rotation.secret_arn,
+            "{MAX_TASKS_IN_FLIGHT} rotation tasks are already in flight, so this configuration \
+             is not tested"
+        );
+        return;
+    };
+    ::tokio::spawn(async move {
+        let _slot = slot;
+        run_test(&callback, &rotation).await;
+    });
+}
+
+/// How many tasks this module may have in flight at once, over every secret: the rotations
+/// being driven and the configuration tests together.
+///
+/// Each is one task per request, so without a ceiling the number of them is whatever a caller
+/// asks for. Nothing else bounds it: a deferred call stakes no candidate, so the in-progress
+/// refusal does not serialise one secret's deferred calls, and a rotation taken up again after
+/// a cancel is served while the cancelled rotation's own task may still be ending.
+///
+/// The figure is this emulator's own, the same one its sibling services bound their one-shot
+/// tasks by: far above the few a developer's client has outstanding, and small enough that the
+/// tasks cannot grow without end.
+///
+/// The slot primitive below is the same one
+/// `services/service-com-amazonaws-elasticache-amazonelasticachev9/src/state/event_notifications.rs`
+/// and `services/service-com-amazonaws-cloudformation-cloudformation/src/state/stack_set_events.rs`
+/// hold: a counter raised only from below the ceiling and given back on drop. It is written
+/// here rather than reused because neither is reachable from this crate — a service crate does
+/// not depend on another service's internals — and it belongs in a crate every service can
+/// reach (`services/common`) rather than in a third copy; moving all three is its own change,
+/// since each of those two services' tasks are bounded by their own ceiling today.
+const MAX_TASKS_IN_FLIGHT: usize = 64;
+
+/// The slots [`MAX_TASKS_IN_FLIGHT`] bounds.
+static TASKS_IN_FLIGHT: ::std::sync::atomic::AtomicUsize =
+    ::std::sync::atomic::AtomicUsize::new(0);
+
+/// ONE of the [`MAX_TASKS_IN_FLIGHT`] slots, held for as long as the task that took it runs.
+///
+/// The slot is given back when this is DROPPED, so a task that ends early — or panics — cannot
+/// leak it.
+struct TaskSlot;
+
+impl TaskSlot {
+    /// Take one slot, or `None` when they are all taken: the count is only ever raised from
+    /// below the ceiling, so two callers cannot both take the last one.
+    fn claim() -> Option<Self> {
+        TASKS_IN_FLIGHT
+            .try_update(
+                ::std::sync::atomic::Ordering::SeqCst,
+                ::std::sync::atomic::Ordering::SeqCst,
+                |held| (held < MAX_TASKS_IN_FLIGHT).then_some(held + 1),
+            )
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for TaskSlot {
+    fn drop(&mut self) {
+        TASKS_IN_FLIGHT.fetch_sub(1, ::std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Invoke the rotation function once for the `testSecret` step, trying again only while the
+/// invocation did not REACH the function.
+///
+/// A function that ran and raised has been tested — that is the answer the test was for — so it
+/// is invoked once, as AWS invokes it once. An invocation that reached no function at all says
+/// nothing about it, and is retried on the same terms a rotation's steps are
+/// ([`ROTATION_ATTEMPTS`]): an obstacle in front of the function that clears by itself, such as
+/// a function still inside the provisioning window its creation opened.
+async fn run_test(callback: &EmbeddedEmulator, rotation: &Rotation) {
+    ::tokio::time::sleep(ROTATION_START_DELAY).await;
+    for attempt in 1..=ROTATION_ATTEMPTS {
+        if invoke_step(callback, rotation, TEST_SECRET_STEP).await != Invoked::Unreached {
+            return;
+        }
+        if attempt < ROTATION_ATTEMPTS {
+            ::tokio::time::sleep(ROTATION_RETRY_DELAY).await;
+        }
+    }
 }
 
 /// One rotation in flight: which secret, under which version id, through which function.
@@ -276,6 +429,13 @@ pub struct Rotation {
     pub version_id: String,
     /// The rotation function this rotation invokes.
     pub lambda_arn: String,
+    /// Which of the secret's STARTED rotations this is
+    /// ([`Secret::rotation_generation`]): a rotation cancelled and then resumed is staked on
+    /// the same version id with rotation enabled again, so this is what tells the task driving
+    /// it that the secret is still waiting for ITS rotation rather than for a later one.
+    ///
+    /// [`Secret::rotation_generation`]: super::Secret::rotation_generation
+    pub generation: u64,
 }
 
 /// Invoke each step in turn, stopping at the first one the function did not complete, and
@@ -305,7 +465,7 @@ async fn run<Eng: Send + Sync + 'static>(
             );
             return;
         }
-        if drive_steps(callback, rotation).await {
+        if drive_steps(engine, callback, rotation).await {
             // Every step returned, so the rotation COMPLETED: "LastRotatedDate — the last
             // date and time that Secrets Manager rotated the secret"
             // (`DescribeSecretResponse`, this service's Smithy model), and the schedule's
@@ -320,20 +480,40 @@ async fn run<Eng: Send + Sync + 'static>(
 }
 
 /// Invoke the four steps in order, and report whether every one of them completed.
-async fn drive_steps(callback: &EmbeddedEmulator, rotation: &Rotation) -> bool {
+///
+/// The secret is asked BEFORE every step whether it still awaits this rotation: "if a rotation
+/// is currently in progress, cancels the rotation" (`CancelRotateSecret`, this service's Smithy
+/// model), so a cancel takes effect at the next step rather than only at the next attempt — a
+/// cancelled rotation must not go on to move `AWSCURRENT` onto the candidate it left behind.
+async fn drive_steps<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+    callback: &EmbeddedEmulator,
+    rotation: &Rotation,
+) -> bool {
     for step in ROTATION_STEPS {
-        if !invoke_step(callback, rotation, step).await {
+        if !still_awaited(engine, rotation) {
+            ::tracing::debug!(
+                secret = %rotation.secret_arn,
+                version = %rotation.version_id,
+                step,
+                "this rotation is no longer the one the secret awaits, so this step is not run"
+            );
+            return false;
+        }
+        if invoke_step(callback, rotation, step).await != Invoked::Completed {
             return false;
         }
     }
     true
 }
 
-/// Whether the secret is still waiting for THIS rotation: it exists, rotation is on, and the
-/// version this rotation creates is the one `AWSPENDING` names.
+/// Whether the secret is still waiting for THIS rotation: it exists, rotation is on, the
+/// version this rotation creates is the one `AWSPENDING` names, and the rotation STARTED for it
+/// is still this one rather than a later one ([`Rotation::generation`]).
 ///
 /// Read under the store's guard, between invocations rather than across one, so a rotation
-/// cancelled while a step was in flight is not driven again.
+/// cancelled while a step was in flight is not driven again, and a rotation another call took
+/// over leaves its predecessor's task nothing to do.
 fn still_awaited<Eng: Send + Sync + 'static>(engine: &Arc<Eng>, rotation: &Rotation) -> bool {
     let Some(state) = super::service_state(&**engine) else {
         return false;
@@ -343,6 +523,7 @@ fn still_awaited<Eng: Send + Sync + 'static>(engine: &Arc<Eng>, rotation: &Rotat
         .get(&rotation.region, &rotation.secret_arn)
         .is_some_and(|secret| {
             secret.rotation_on()
+                && secret.rotation_generation == rotation.generation
                 && secret.pending_version_id() == Some(rotation.version_id.as_str())
         })
 }
@@ -359,13 +540,22 @@ fn stamp_rotated<Eng: Send + Sync + 'static>(engine: &Arc<Eng>, rotation: &Rotat
     }
 }
 
-/// Invoke the rotation function for one step, and report whether it completed.
-///
-/// `false` for an invocation that did not reach a function at all, and for one whose function
-/// raised: "if present, indicates that an error occurred during function execution"
-/// (`FunctionError`, Lambda's `Invoke` model), which is a step of the rotation that did not
-/// happen.
-async fn invoke_step(callback: &EmbeddedEmulator, rotation: &Rotation, step: &str) -> bool {
+/// What one invocation of the rotation function came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Invoked {
+    /// The function ran and returned, so the step it was invoked for happened.
+    Completed,
+    /// The function RAN and raised: "if present, indicates that an error occurred during
+    /// function execution" (`FunctionError`, Lambda's `Invoke` model), which is a step of the
+    /// rotation that did not happen.
+    Raised,
+    /// The invocation reached no running function at all — Lambda refused it, or no answer came
+    /// inside the budget — so nothing was said about the function.
+    Unreached,
+}
+
+/// Invoke the rotation function for one step, and report what that invocation came to.
+async fn invoke_step(callback: &EmbeddedEmulator, rotation: &Rotation, step: &str) -> Invoked {
     let event = ::serde_json::json!({
         EVENT_STEP: step,
         EVENT_SECRET_ID: rotation.secret_arn,
@@ -389,11 +579,11 @@ async fn invoke_step(callback: &EmbeddedEmulator, rotation: &Rotation, step: &st
             "the rotation function did not answer this step inside its budget, so the \
              rotation did not finish"
         );
-        return false;
+        return Invoked::Unreached;
     };
     match answered {
         Ok(output) => match output.function_error() {
-            None => true,
+            None => Invoked::Completed,
             Some(function_error) => {
                 ::tracing::warn!(
                     secret = %rotation.secret_arn,
@@ -401,7 +591,7 @@ async fn invoke_step(callback: &EmbeddedEmulator, rotation: &Rotation, step: &st
                     function_error,
                     "the rotation function raised on this step, so the rotation did not finish"
                 );
-                false
+                Invoked::Raised
             }
         },
         Err(error) => {
@@ -411,7 +601,7 @@ async fn invoke_step(callback: &EmbeddedEmulator, rotation: &Rotation, step: &st
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "the rotation function could not be invoked for this step"
             );
-            false
+            Invoked::Unreached
         }
     }
 }
@@ -571,6 +761,95 @@ mod tests {
             ROTATION_STEPS,
             ["createSecret", "setSecret", "testSecret", "finishSecret"],
             "case \"the rotation steps\": expected AWS's four steps in order, got {ROTATION_STEPS:?}"
+        );
+    }
+
+    /// RULE: the step a deferred rotation tests the configuration with is one of those four.
+    #[test]
+    fn the_test_step_is_one_of_the_documented_steps() {
+        assert!(
+            ROTATION_STEPS.contains(&TEST_SECRET_STEP),
+            "case \"the test step\": expected one of {ROTATION_STEPS:?}, got {TEST_SECRET_STEP:?}"
+        );
+    }
+
+    /// RULE: a `RotationLambdaARN` that names no function is answered with the FORM such a
+    /// value has to have, whose only variable part is the Region the call was made in.
+    ///
+    /// The rows run over Regions of different lengths, since the Region is what varies.
+    #[test]
+    fn a_malformed_rotation_arn_states_the_form_for_the_requests_region() {
+        for region in ["us-west-2", "eu-central-1", "ap-southeast-4"] {
+            let stated = not_a_function_message(region);
+            let expected = format!(
+                "Invalid rotation Lambda ARN. Ensure the ARN matches format \
+                 arn:aws:lambda:{region}:<account>:function:<functionName>."
+            );
+            assert_eq!(
+                stated, expected,
+                "case {region:?}: expected {expected:?}, got {stated:?}"
+            );
+        }
+    }
+
+    /// RULE: a value names a rotation function exactly when it is the ARN of a Lambda
+    /// function, which is what an invocation can be made against.
+    /// The rows run over the forms a caller sends: a function ARN, a function ARN with a
+    /// qualifier, ARNs of other Lambda resources and of other services, and values that are no
+    /// ARN at all.
+    #[test]
+    fn only_a_lambda_functions_arn_names_a_rotation_function() {
+        // (the value, whether it names a function)
+        let rows: &[(&str, bool)] = &[
+            ("arn:aws:lambda:us-west-2:000000000000:function:rotator", true),
+            (
+                "arn:aws:lambda:eu-central-1:111122223333:function:rotator:PROD",
+                true,
+            ),
+            ("arn:aws:lambda:us-west-2:000000000000:function:", false),
+            (
+                "arn:aws:lambda:us-west-2:000000000000:layer:shared:1",
+                false,
+            ),
+            (
+                "arn:aws:secretsmanager:us-west-2:000000000000:secret:db-AbCdEf",
+                false,
+            ),
+            ("not-a-lambda-arn-at-all", false),
+            ("", false),
+            ("arn:aws:lambda", false),
+        ];
+        for (value, names) in rows {
+            let read = names_a_function(value);
+            assert_eq!(
+                read, *names,
+                "case {value:?}: expected names_a_function={names}, got {read}"
+            );
+        }
+    }
+
+    /// RULE: the tasks in flight are bounded, and a slot is given back when the task that took
+    /// it ends.
+    #[test]
+    fn the_tasks_in_flight_are_bounded() {
+        let held: Vec<TaskSlot> = (0..MAX_TASKS_IN_FLIGHT)
+            .filter_map(|_| TaskSlot::claim())
+            .collect();
+        assert_eq!(
+            held.len(),
+            MAX_TASKS_IN_FLIGHT,
+            "case \"up to the ceiling\": expected {MAX_TASKS_IN_FLIGHT} slots to be free, got {}",
+            held.len()
+        );
+        assert!(
+            TaskSlot::claim().is_none(),
+            "case \"one past the ceiling\": expected no slot left, got one"
+        );
+        drop(held);
+        let after = TaskSlot::claim();
+        assert!(
+            after.is_some(),
+            "case \"after the tasks ended\": expected the slots to be free again, got none"
         );
     }
 }
