@@ -285,8 +285,9 @@ async fn every_instant_is_rendered_at_millisecond_precision() {
         assert_eq!(
             state::parse_millis(&end).unwrap_or_default()
                 - state::parse_millis(&start).unwrap_or_default(),
-            ONE_YEAR * 1000,
-            "case {case:?}: the term must be the offering's, got start {start:?} end {end:?}"
+            ONE_YEAR * 1000 - state::TERM_END_INCLUSIVE_MILLIS,
+            "case {case:?}: the term must be the offering's, reported by its last instant, got \
+             start {start:?} end {end:?}"
         );
     }
 }

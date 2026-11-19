@@ -13,8 +13,8 @@
 //!   not dimensioned by the property a filter names cannot satisfy it;
 //! * the card is paged in one stable order: paging yields it once, and a caller
 //!   that names no page size gets the service's own page and a cursor;
-//! * an id this account never purchased has no rate card — a 404, not an empty
-//!   one — and a cursor from another search is refused.
+//! * an id this account never purchased prices nothing — an empty card, not a
+//!   missing resource — and a cursor from another search is refused.
 //!
 //! Everything goes through the same `MultiServiceRouter` the emulator boots, so
 //! what is pinned is the HTTP behaviour. The harness (`Emulator`, `text`) is the
@@ -43,12 +43,17 @@ const OFFERING_RATES: &str = "DescribeSavingsPlansOfferingRates";
 const LARGEST_PAGE: i64 = 1000;
 
 /// What distinguishes one line item of a rate card from another: the product,
-/// the service that bills it, its usage type and its billing operation.
+/// the service that bills it, the region it is billed in, its usage type and its
+/// billing operation (which names the platform of an EC2 line item).
 fn key(rate: &Value) -> String {
     format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}",
         text(rate, "productType"),
         text(rate, "serviceCode"),
+        properties(rate)
+            .get(state::PROPERTY_REGION)
+            .cloned()
+            .unwrap_or_default(),
         text(rate, "usageType"),
         text(rate, "operation")
     )
@@ -125,10 +130,7 @@ async fn pages(
             "case {case:?}: the answer must name the plan the request asked about, got {:?}",
             answer.body
         );
-        next = answer
-            .get("nextToken")
-            .as_str()
-            .map(std::string::ToString::to_string);
+        next = answer.cursor();
         pages.push((answer.list("searchResults").to_vec(), next.clone()));
         assert!(
             pages.len() <= 400,
@@ -173,10 +175,7 @@ async fn offering_card(emulator: &Emulator, case: &str, offering_id: &str) -> Ve
             answer.status, answer.body
         );
         rows.extend(answer.list("searchResults").iter().cloned());
-        next = answer
-            .get("nextToken")
-            .as_str()
-            .map(std::string::ToString::to_string);
+        next = answer.cursor();
         if next.is_none() {
             return rows;
         }
@@ -289,10 +288,16 @@ async fn a_plans_rate_card_is_the_rate_card_of_its_offering() {
                 text(offering_rate, "rate"),
                 text(rate, "rate")
             );
+            let mut expected_properties = properties(offering_rate);
+            // The instance FAMILY is a dimension of the commitment's own scope,
+            // not of the usage a rate prices, so a plan rate reports the usage
+            // dimensions alone while the offering rate also carries the family.
+            expected_properties.remove(state::PROPERTY_INSTANCE_FAMILY);
             assert_eq!(
                 properties(rate),
-                properties(offering_rate),
-                "case {case:?} {line_item:?}: expected the offering's dimensions, got {:?}",
+                expected_properties,
+                "case {case:?} {line_item:?}: expected the offering's usage dimensions \
+                 {expected_properties:?}, got {:?}",
                 properties(rate)
             );
             assert_eq!(
@@ -328,19 +333,33 @@ async fn a_plans_rate_card_is_the_rate_card_of_its_offering() {
                 product_types(&plan),
                 text(rate, "productType")
             );
-            for (member, property) in [
-                ("region", state::PROPERTY_REGION),
-                ("ec2InstanceFamily", state::PROPERTY_INSTANCE_FAMILY),
-            ] {
-                let scope = text(&plan, member);
-                if !scope.is_empty() {
-                    assert_eq!(
-                        properties(rate).get(property).cloned().unwrap_or_default(),
-                        scope,
-                        "case {case:?} {line_item:?}: a plan scoped to {member} {scope:?} must price only that, got {:?}",
-                        properties(rate)
-                    );
-                }
+            let region = text(&plan, "region");
+            if !region.is_empty() {
+                assert_eq!(
+                    properties(rate)
+                        .get(state::PROPERTY_REGION)
+                        .cloned()
+                        .unwrap_or_default(),
+                    region,
+                    "case {case:?} {line_item:?}: a plan scoped to region {region:?} must price \
+                     only that region, got {:?}",
+                    properties(rate)
+                );
+            }
+            // A plan scoped to an instance family prices only instance types of
+            // that family: the family itself is not a dimension of the rate, so
+            // it shows through the instance type the rate prices.
+            let family = text(&plan, "ec2InstanceFamily");
+            if !family.is_empty() {
+                let instance_type = properties(rate)
+                    .get(state::RATE_PROPERTY_INSTANCE_TYPE)
+                    .cloned()
+                    .unwrap_or_default();
+                assert!(
+                    instance_type.starts_with(&format!("{family}.")),
+                    "case {case:?} {line_item:?}: a plan scoped to instance family {family:?} \
+                     must price only that family, got instance type {instance_type:?}"
+                );
             }
         }
 
@@ -678,7 +697,7 @@ async fn a_rate_card_is_paged_once_in_a_stable_order() {
             "case {case:?}: the service's page must be the first page of the card"
         );
         assert_eq!(
-            answer.get("nextToken").as_str().is_some(),
+            answer.cursor().is_some(),
             whole.len() > expected,
             "case {case:?}: expected a cursor only while results remain, got {:?}",
             answer.get("nextToken")
@@ -686,15 +705,16 @@ async fn a_rate_card_is_paged_once_in_a_stable_order() {
     }
 }
 
-/// An id this account never purchased has no rate card: a 404
-/// `ResourceNotFoundException` naming the id asked about, never an empty card.
+/// A rate card is resolved as a SEARCH over the rates this account holds, so an
+/// id this account holds no plan for prices nothing: a 200 that echoes the id
+/// asked about and an EMPTY card, never the modelled missing-resource refusal.
 ///
 /// The rows differ along what the id looks like — an id no purchase minted, the
 /// id of a plan's ARN rather than the plan, an offering id, and a word that is
 /// no id at all — because the rule is about what the store holds, not about the
 /// spelling of the id.
 #[tokio::test]
-async fn an_unsold_plan_has_no_rate_card() {
+async fn an_unsold_plan_prices_nothing() {
     let emulator = Emulator::new();
     let (savings_plan_id, offering, plan) = buy(
         &emulator,
@@ -715,24 +735,32 @@ async fn an_unsold_plan_has_no_rate_card() {
             .call(OPERATION, json!({ "savingsPlanId": unknown }))
             .await;
         assert_eq!(
-            answer.status, 404,
-            "case {case:?}: expected 404 for {unknown:?}, got {} {:?}",
+            answer.status, 200,
+            "case {case:?}: expected 200 for {unknown:?}, got {} {:?}",
             answer.status, answer.body
         );
-        assert!(
-            answer.code.ends_with("ResourceNotFoundException"),
-            "case {case:?}: expected ResourceNotFoundException, got {:?}",
-            answer.code
+        assert_eq!(
+            text(&answer.body, "savingsPlanId"),
+            unknown,
+            "case {case:?}: the answer must echo the id asked about, got {:?}",
+            answer.body
         );
-        assert!(
-            text(&answer.body, "message").contains(&unknown),
-            "case {case:?}: the refusal must name the id asked about, got {:?}",
-            text(&answer.body, "message")
+        assert_eq!(
+            answer.list("searchResults"),
+            &[] as &[Value],
+            "case {case:?}: an id this account holds no plan for prices nothing, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.cursor(),
+            None,
+            "case {case:?}: an empty card has nothing to resume, got {:?}",
+            answer.get("nextToken")
         );
     }
 
-    // The plan that WAS sold still answers, so the rows above refuse the id and
-    // nothing else.
+    // The plan that WAS sold still answers with its own card, so the rows above
+    // report the empty card of the id they named and nothing else.
     let answer = emulator
         .call(OPERATION, json!({ "savingsPlanId": savings_plan_id }))
         .await;
@@ -740,6 +768,11 @@ async fn an_unsold_plan_has_no_rate_card() {
         answer.status, 200,
         "case the purchased plan: expected 200, got {} {:?}",
         answer.status, answer.body
+    );
+    assert!(
+        !answer.list("searchResults").is_empty(),
+        "case the purchased plan: expected its rate card, got {:?}",
+        answer.body
     );
 }
 

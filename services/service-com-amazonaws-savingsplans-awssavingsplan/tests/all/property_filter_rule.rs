@@ -122,10 +122,7 @@ async fn walk(emulator: &Emulator, case: &str, operation: &str, request: &Value)
             answer.status, answer.body
         );
         rows.extend(answer.list("searchResults").iter().cloned());
-        next = answer
-            .get("nextToken")
-            .as_str()
-            .map(std::string::ToString::to_string);
+        next = answer.cursor();
         pages += 1;
         assert!(
             pages <= 100,

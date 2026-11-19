@@ -278,10 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 CreateSavingsPlanErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "no Savings Plan offering with id '{}'",
-                            input.savings_plan_offering_id
-                        ),
+                        // The one sentence this service states an unresolvable
+                        // offering id with, which names nothing from the
+                        // request.
+                        message: crate::state::OFFERING_NOT_FOUND_MESSAGE.to_string(),
                     },
                 )
             })?;

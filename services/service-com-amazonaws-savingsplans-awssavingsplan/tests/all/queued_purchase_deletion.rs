@@ -196,10 +196,12 @@ async fn a_deletion_is_accepted_only_from_a_purchase_whose_term_has_not_begun() 
                 answer.body
             );
             let message = text(&answer.body, "message");
-            assert!(
-                message.contains(state_before),
-                "case {case:?}: the refusal must name the state it refused ({state_before:?}), \
-                 got {message:?}"
+            assert_eq!(
+                message,
+                state::NOT_QUEUED_MESSAGE,
+                "case {case:?}: the refusal must state the one sentence this service words it \
+                 with ({:?}), got {message:?}",
+                state::NOT_QUEUED_MESSAGE
             );
             assert_eq!(
                 state_after, state_before,
@@ -301,7 +303,8 @@ async fn an_id_that_names_no_plan_is_not_found() {
 
 /// A cancelled purchase round-trips: `DescribeSavingsPlans` reports it as
 /// `queued-deleted`, a `states` filter finds it under that state and not under
-/// its old one, it keeps no return window, and it can no longer be returned.
+/// its old one, it still reports the close of the window its purchase opened,
+/// and it can no longer be returned.
 #[tokio::test]
 async fn a_cancelled_purchase_round_trips_through_describe() {
     let emulator = Emulator::new();
@@ -343,12 +346,17 @@ async fn a_cancelled_purchase_round_trips_through_describe() {
         Some(ONE_YEAR),
         "a cancellation must not rewrite the term, got {plan:?}"
     );
-    // A cancelled purchase has no return window left, so `returnableUntil`
-    // falls back to the plan's start.
+    // The window belongs to the purchase, so a cancelled queued purchase still
+    // reports the instant it closes: one return window after the plan's start.
+    let start = state::parse_millis(&text(&plan, "start")).unwrap_or_default();
+    let returnable_until =
+        state::parse_millis(&text(&plan, "returnableUntil")).unwrap_or_default();
     assert_eq!(
-        text(&plan, "returnableUntil"),
-        text(&plan, "start"),
-        "a cancelled purchase must report no open return window, got {plan:?}"
+        returnable_until,
+        start + state::RETURN_WINDOW_MILLIS,
+        "a cancelled purchase must report its return-window close ({} ms after start {start} ms), \
+         got {returnable_until} ms in {plan:?}",
+        state::RETURN_WINDOW_MILLIS
     );
 
     for (case, states, expected) in [

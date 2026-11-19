@@ -79,13 +79,19 @@ fn field(rate: &Value, locator: &str) -> String {
 
 /// What distinguishes one rate from another: the offering it is priced under and
 /// the line item it prices.
+///
+/// A usage type names the usage alone, so the line item is identified by the
+/// region it is billed in and the billing operation (which names the platform of
+/// an EC2 line item) alongside it.
 fn key(rate: &Value) -> String {
     format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}",
         text(parent(rate), "offeringId"),
         text(rate, "productType"),
         text(rate, "serviceCode"),
-        text(rate, "usageType")
+        property(rate, state::PROPERTY_REGION),
+        text(rate, "usageType"),
+        text(rate, "operation")
     )
 }
 
@@ -133,10 +139,7 @@ async fn pages(
             "case {case:?}: expected 200 for {page_request}, got {} {:?}",
             answer.status, answer.body
         );
-        next = answer
-            .get("nextToken")
-            .as_str()
-            .map(std::string::ToString::to_string);
+        next = answer.cursor();
         pages.push((answer.list("searchResults").to_vec(), next.clone()));
         assert!(
             pages.len() <= 400,
@@ -293,7 +296,7 @@ async fn every_rate_names_its_parent_offering_and_the_dimension_it_prices() {
             );
 
             // The dimensions, each a modelled property key, each reported once,
-            // and the usage type naming the region the line item is billed in.
+            // and the region the line item is billed in reported as one of them.
             let mut seen: BTreeSet<String> = BTreeSet::new();
             for entry in rate.get("properties").and_then(Value::as_array).unwrap_or(&Vec::new()) {
                 let name = text(entry, "name");
@@ -316,9 +319,12 @@ async fn every_rate_names_its_parent_offering_and_the_dimension_it_prices() {
                 !region.is_empty(),
                 "case {row:?}: a line item is billed in a region, got no region property"
             );
+            // The region is a dimension of the rate, not part of the usage it
+            // prices: a usage type names the usage alone, so it joins against a
+            // usage record however the record's region is reported.
             assert!(
-                usage_type.starts_with(&format!("{region}-")),
-                "case {row:?}: a usage type billed in {region:?} must name it, got {usage_type:?}"
+                !usage_type.starts_with(&format!("{region}-")),
+                "case {row:?}: a usage type must not carry the region prefix, got {usage_type:?}"
             );
             // An offering scoped to a region or an instance family prices only
             // what it is scoped to.
@@ -364,7 +370,8 @@ async fn every_rate_names_its_parent_offering_and_the_dimension_it_prices() {
 /// commits to more.
 ///
 /// The rows are two usage dimensions that differ in region and in instance size,
-/// each priced by every offering that sells it.
+/// each narrowed to ONE platform (EC2 prices a line item per platform) and
+/// priced by every offering that sells it.
 #[tokio::test]
 async fn a_deeper_commitment_prices_the_same_usage_lower() {
     let emulator = Emulator::new();
@@ -380,6 +387,7 @@ async fn a_deeper_commitment_prices_the_same_usage_lower() {
                 "filters": [
                     { "name": "instanceType", "values": [instance_type] },
                     { "name": "region", "values": [region] },
+                    { "name": "productDescription", "values": [state::PRODUCT_DESCRIPTION_LINUX] },
                 ],
                 "maxResults": 1000,
             }),
@@ -549,12 +557,11 @@ async fn each_filter_narrows_the_search() {
         ),
         (
             "usageTypes one EC2 line item",
-            json!({ "usageTypes": ["us-east-1-BoxUsage:c5.xlarge"], "maxResults": 1000 }),
+            json!({ "usageTypes": ["BoxUsage:c5.xlarge"], "maxResults": 1000 }),
             &[
-                ("usageType", "us-east-1-BoxUsage:c5.xlarge"),
+                ("usageType", "BoxUsage:c5.xlarge"),
                 ("productType", "EC2"),
                 ("property.instanceType", "c5.xlarge"),
-                ("property.region", "us-east-1"),
             ],
         ),
         (
@@ -663,7 +670,7 @@ async fn each_filter_narrows_the_search() {
         ),
         (
             "usageTypes a line item nothing prices",
-            json!({ "usageTypes": ["us-east-1-BoxUsage:zz9.mega"], "maxResults": 50 }),
+            json!({ "usageTypes": ["BoxUsage:zz9.mega"], "maxResults": 50 }),
         ),
         (
             "savingsPlanOfferingIds an offering the catalog does not sell",
@@ -682,17 +689,17 @@ async fn each_filter_narrows_the_search() {
         );
         assert_eq!(
             walked.len(),
-            2,
-            "case {case:?}: the first answer carries a cursor and resuming it ends the walk: expected two pages, got {}",
+            1,
+            "case {case:?}: a page that exhausted the matches ends the walk: expected one page, got {}",
             walked.len()
         );
     }
 }
 
-/// The rate search answers with a resumable cursor: its first answer always
-/// carries one, each page is a distinct window of the result, resuming loses and
-/// repeats nothing, and the walk ends on the resumed page with no more results
-/// to return.
+/// The rate search answers with a resumable cursor: it carries one while matches
+/// remain past the page it served, each page is a distinct window of the result,
+/// resuming loses and repeats nothing, and the walk ends on the page with no
+/// more results to return.
 #[tokio::test]
 async fn the_rate_search_answers_with_a_resumable_cursor() {
     let emulator = Emulator::new();
@@ -719,7 +726,7 @@ async fn the_rate_search_answers_with_a_resumable_cursor() {
         ("a line item per database product, at the model's largest page", json!({ "savingsPlanOfferingIds": [database.clone()] }), 1000),
         ("one instance family, one at a time", json!({ "savingsPlanOfferingIds": [instance.clone()] }), 1),
         ("one instance family, two at a time", json!({ "savingsPlanOfferingIds": [instance.clone()] }), 2),
-        ("one instance family, exactly its size", json!({ "savingsPlanOfferingIds": [instance.clone()] }), 3),
+        ("one instance family, exactly one page of it", json!({ "savingsPlanOfferingIds": [instance.clone()] }), 3),
         ("one product of one offering", json!({ "savingsPlanOfferingIds": [database.clone()], "products": ["DynamoDB"] }), 1),
         ("a search nothing satisfies", json!({ "savingsPlanOfferingIds": [instance.clone()], "products": ["Lambda"] }), 5),
     ];
@@ -787,14 +794,21 @@ async fn the_rate_search_answers_with_a_resumable_cursor() {
             );
         }
         let first = walked.first().expect("a walk answers at least one page");
-        assert!(
+        let expected_pages = expected.len().div_ceil(usize::try_from(max_results).unwrap_or(1)).max(1);
+        assert_eq!(
             first.1.is_some(),
-            "case {case:?}: the first answer of a search must carry the cursor to resume at, got {:?}",
+            expected_pages > 1,
+            "case {case:?}: a first answer carries the cursor to resume at only while matches \
+             remain past its page ({} matches at {max_results} a page), got {:?}",
+            expected.len(),
             first.1
         );
-        assert!(
-            walked.len() >= 2,
-            "case {case:?}: a walk that always hands back its first cursor takes at least two calls, got {}",
+        assert_eq!(
+            walked.len(),
+            expected_pages,
+            "case {case:?}: a walk that ends on the page exhausting its {} matches takes \
+             {expected_pages} calls at {max_results} a page, got {}",
+            expected.len(),
             walked.len()
         );
     }
@@ -809,15 +823,27 @@ async fn successive_rows_quote_the_same_usage_under_different_offerings() {
 
     // One EC2 line item: every offering that would cover that usage prices it —
     // a Compute plan and the EC2 Instance plan of its family, at each term and
-    // payment option — and the walk lists them one after another.
+    // payment option — and the walk lists them one after another. Each request
+    // narrows the catalog to ONE line item (a usage type is priced in every
+    // region, and EC2 usage once per platform), so what is walked is the
+    // offerings pricing it.
     for (case, request) in [
         (
             "one EC2 line item",
-            json!({ "usageTypes": ["us-east-1-BoxUsage:m5.large"] }),
+            json!({
+                "usageTypes": ["BoxUsage:m5.large"],
+                "filters": [
+                    { "name": "region", "values": ["us-east-1"] },
+                    { "name": "productDescription", "values": [state::PRODUCT_DESCRIPTION_LINUX] },
+                ],
+            }),
         ),
         (
             "one database line item",
-            json!({ "usageTypes": ["eu-west-1-ReadCapacityUnit-Hrs"] }),
+            json!({
+                "usageTypes": ["ReadCapacityUnit-Hrs"],
+                "filters": [{ "name": "region", "values": ["eu-west-1"] }],
+            }),
         ),
     ] {
         for page_size in [1, 2, 5] {
@@ -892,10 +918,7 @@ async fn successive_rows_quote_the_same_usage_under_different_offerings() {
             rows.len()
         );
         seen.push(text(parent(&rows[0]), "offeringId"));
-        next = answer
-            .get("nextToken")
-            .as_str()
-            .map(std::string::ToString::to_string);
+        next = answer.cursor();
         assert!(
             next.is_some(),
             "case the whole catalog, one at a time, page {page}: the walk has more to return, so it must carry a cursor"
@@ -943,13 +966,12 @@ async fn a_search_that_names_no_page_size_gets_the_services_own_page() {
             state::DEFAULT_OFFERINGS_PAGE_SIZE,
             rows.len()
         );
-        let token = answer
-            .get("nextToken")
-            .as_str()
-            .map(std::string::ToString::to_string)
-            .unwrap_or_else(|| {
-                panic!("case {case:?}: a truncated page must carry a cursor, got {:?}", answer.body)
-            });
+        let token = answer.cursor().unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: a truncated page must carry a cursor, got {:?}",
+                answer.body
+            )
+        });
         assert!(
             is_pagination_token(&token),
             "case {case:?}: {token:?} must satisfy PaginationToken"
@@ -990,9 +1012,7 @@ async fn a_request_this_search_cannot_serve_is_refused() {
             json!({ "maxResults": 1 }),
         )
         .await
-        .get("nextToken")
-        .as_str()
-        .map(std::string::ToString::to_string);
+        .cursor();
     let mut tokens: Vec<String> = vec![
         "zzzz".to_string(),
         "AAAA".to_string(),

@@ -93,10 +93,7 @@ async fn walk(emulator: &Emulator, case: &str, request: &Value) -> Vec<(Vec<Stri
             .iter()
             .map(|offering| text(offering, "offeringId"))
             .collect();
-        next = answer
-            .get("nextToken")
-            .as_str()
-            .map(std::string::ToString::to_string);
+        next = answer.cursor();
         pages.push((ids, next.clone()));
         assert!(
             pages.len() <= 2_000,
@@ -330,9 +327,9 @@ async fn catalog_rows_run_in_lexicographic_payment_option_order() {
     );
 }
 
-/// The offerings search answers with a resumable cursor: its first answer
-/// always carries one, resuming it loses and repeats nothing, and the walk ends
-/// on the resumed page that has no more results to return.
+/// The offerings search answers with a resumable cursor: it carries one while
+/// matches remain past the page it served, resuming it loses and repeats
+/// nothing, and the walk ends on the page with no more results to return.
 #[tokio::test]
 async fn the_offerings_search_answers_with_a_resumable_cursor() {
     let emulator = Emulator::new();
@@ -424,28 +421,38 @@ async fn the_offerings_search_answers_with_a_resumable_cursor() {
             expected.len(),
             catalog.len()
         );
-        // The FIRST answer always carries a cursor, so a walk is at least two
-        // calls long and ends on the resumed page that has nothing more to
-        // return.
+        // A cursor comes back only while matches remain past the page served,
+        // so the walk is exactly the pages its matches fill.
+        let page_size = if max_results > 0 {
+            usize::try_from(max_results).unwrap_or(1)
+        } else {
+            state::DEFAULT_OFFERINGS_PAGE_SIZE
+        };
+        let expected_pages = expected.len().div_ceil(page_size).max(1);
         let first = pages.first().expect("a walk answers at least one page");
-        assert!(
+        assert_eq!(
             first.1.is_some(),
-            "case {case:?}: the first answer of a search must carry the cursor to resume at, got {:?}",
+            expected_pages > 1,
+            "case {case:?}: a first answer carries the cursor to resume at only while matches \
+             remain past its page ({} matches at {page_size} a page), got {:?}",
+            expected.len(),
             first.1
         );
-        assert!(
-            pages.len() >= 2,
-            "case {case:?}: a walk that always hands back its first cursor takes at least two calls, got {}",
+        assert_eq!(
+            pages.len(),
+            expected_pages,
+            "case {case:?}: a walk that ends on the page exhausting its {} matches takes \
+             {expected_pages} calls at {page_size} a page, got {}",
+            expected.len(),
             pages.len()
         );
     }
 }
 
-/// A search whose filters admit nothing still answers with a cursor: the first
-/// answer of a search carries one whatever its page held, and the walk
-/// terminates on the next call.
+/// A search whose filters admit nothing answers one empty page and no cursor:
+/// the page already held every match there was, so there is nothing to resume.
 #[tokio::test]
-async fn a_search_whose_filters_admit_nothing_still_answers_with_a_cursor() {
+async fn a_search_whose_filters_admit_nothing_ends_the_walk() {
     let emulator = Emulator::new();
     // Rows differ along WHY nothing matched: a plan type crossed with a
     // property it is not scoped to, a property value the catalog carries for no
@@ -493,21 +500,13 @@ async fn a_search_whose_filters_admit_nothing_still_answers_with_a_cursor() {
         );
         assert_eq!(
             pages.len(),
-            2,
-            "case {case:?}: the first answer carries a cursor and resuming it ends the walk: expected two pages, got {pages:?}"
+            1,
+            "case {case:?}: a page that held every match ends the walk: expected one page, got {pages:?}"
         );
-        let (_, first_token) = &pages[0];
-        let token = first_token
-            .as_deref()
-            .unwrap_or_else(|| panic!("case {case:?}: a page that admitted nothing must still carry the cursor to resume at, got {pages:?}"));
-        assert!(
-            is_pagination_token(token),
-            "case {case:?}: {token:?} must satisfy PaginationToken"
-        );
-        assert!(
-            pages[1].1.is_none(),
-            "case {case:?}: a resumed answer with no more results to return must answer no token, got {:?}",
-            pages[1].1
+        assert_eq!(
+            pages[0].1, None,
+            "case {case:?}: a page that admitted everything there was carries no cursor, got {:?}",
+            pages[0].1
         );
     }
 }
@@ -559,13 +558,12 @@ async fn a_search_that_names_no_page_size_gets_the_services_own_page() {
                 .collect::<Vec<String>>()[..],
             "case {case:?}: the page must be the first page of the catalog"
         );
-        let token = answer
-            .get("nextToken")
-            .as_str()
-            .map(std::string::ToString::to_string)
-            .unwrap_or_else(|| {
-                panic!("case {case:?}: a truncated page must carry a cursor, got {:?}", answer.body)
-            });
+        let token = answer.cursor().unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: a truncated page must carry a cursor, got {:?}",
+                answer.body
+            )
+        });
         assert!(
             is_pagination_token(&token),
             "case {case:?}: {token:?} must satisfy PaginationToken"
@@ -596,9 +594,7 @@ async fn a_token_this_search_did_not_issue_is_refused() {
     let plans_token = emulator
         .call("DescribeSavingsPlans", json!({ "maxResults": 1 }))
         .await
-        .get("nextToken")
-        .as_str()
-        .map(std::string::ToString::to_string);
+        .cursor();
     let mut cases: Vec<String> = vec![
         "zzzz".to_string(),
         "AAAA".to_string(),

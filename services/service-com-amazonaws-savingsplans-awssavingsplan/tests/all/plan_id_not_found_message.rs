@@ -3,12 +3,13 @@
 //! The sentence this service answers with when an operation is pointed at a
 //! Savings Plan id this store does not hold.
 //!
-//! The rule: every operation whose input names a plan by `savingsPlanId`
-//! answers an id the store does not hold with a 404 `ResourceNotFoundException`
-//! whose message is `SavingsPlan can't be found. Savings Plan Id: <id>.` — the
-//! fixed text, the `savingsPlanId` taken verbatim from the request, and a
-//! terminating period. The id's spelling does not enter the sentence's form and
-//! does not change the answer: not being in the store is what makes it a 404.
+//! The rule: every operation whose input names a plan by `savingsPlanId` and
+//! resolves it as a resource answers an id the store does not hold with a 404
+//! `ResourceNotFoundException` whose message is `SavingsPlan can't be found.
+//! Savings Plan Id: <id>.` — the fixed text, the `savingsPlanId` taken verbatim
+//! from the request, and a terminating period. The id's spelling does not enter
+//! the sentence's form and does not change the answer: not being in the store is
+//! what makes it a 404.
 //!
 //! The table below spans both axes the rule generalises over — WHICH operation
 //! is pointed at the plan, and WHAT the id looks like — so each row is one
@@ -60,15 +61,12 @@ async fn a_plan_id_the_store_does_not_hold_is_refused_with_aws_s_sentence() {
         .await;
     let arn = text(&emulator.plan(&mine).await, "savingsPlanArn");
 
-    // Every operation whose input names a plan by `savingsPlanId`
-    // (OPERATIONS.md: DeleteQueuedSavingsPlan, DescribeSavingsPlanRates,
-    // ReturnSavingsPlan). `DescribeSavingsPlans` takes a LIST of ids and
-    // filters by it, so an unknown id there is an empty page, not a refusal.
-    let operations = [
-        "DeleteQueuedSavingsPlan",
-        "DescribeSavingsPlanRates",
-        "ReturnSavingsPlan",
-    ];
+    // Every operation whose input names a plan by `savingsPlanId` and RESOLVES
+    // it as a resource (OPERATIONS.md: DeleteQueuedSavingsPlan,
+    // ReturnSavingsPlan). `DescribeSavingsPlans` takes a LIST of ids and filters
+    // by it, and `DescribeSavingsPlanRates` resolves its rate card as a search,
+    // so an unknown id is an empty page in both rather than a refusal.
+    let operations = ["DeleteQueuedSavingsPlan", "ReturnSavingsPlan"];
 
     // (case, the id to point the operation at)
     let ids: [(&str, String); 6] = [

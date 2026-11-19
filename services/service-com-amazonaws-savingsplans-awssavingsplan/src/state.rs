@@ -74,6 +74,10 @@ pub const ACTIVATION_DELAY_MILLIS: i64 = 500;
 /// `SavingsPlan.returnableUntil` reports.
 pub const RETURN_WINDOW_MILLIS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+/// How long before `start` plus the term duration a term's reported `end` falls:
+/// one second, so `end` is the last instant the term covers.
+pub const TERM_END_INCLUSIVE_MILLIS: i64 = 1_000;
+
 /// Wall-clock now, in milliseconds since the Unix epoch.
 ///
 /// Total by construction: a clock before 1970, or one too far past it to fit in
@@ -439,7 +443,11 @@ pub fn decode_page_token(kind: &str, token: &str) -> Option<usize> {
 /// `ValidationException` variant, so the default, the error and the wording
 /// cannot drift between the operations that page.
 pub fn page_offset(kind: &str, next_token: Option<&str>) -> Result<usize, String> {
-    match next_token {
+    // An EMPTY token is the service's own way of saying "no continuation" (see
+    // [`search_next_token`]), so a caller that echoes the token a finished walk
+    // handed it back asks for the first result rather than for a cursor this
+    // service never minted.
+    match next_token.filter(|token| !token.is_empty()) {
         Some(token) => decode_page_token(kind, token)
             .ok_or_else(|| "nextToken is not a token this operation issued".to_string()),
         None => Ok(0),
@@ -486,29 +494,37 @@ pub fn page_window<T>(
 }
 
 /// One page of a SEARCH over a catalog this service owns: the window
-/// [`page_window`] serves, plus the cursor that answer carries — `resumed` says
-/// whether the request arrived with a `nextToken`.
+/// [`page_window`] serves, plus the cursor that answer carries.
 ///
-/// The cursor rule, in one place for every such search. The FIRST answer always
-/// carries the cursor its walk reached, even when its page already held every
-/// match the filters admitted: a search reports where its walk of the catalog got
-/// to, not whether another match exists, and the recorded answers show a token
-/// beside a page carrying the complete set of matches. A caller learns the walk
-/// is over by resuming it: a RESUMED answer carries a cursor only while results
-/// remain past its page, so the walk ends on the first resumed page with nothing
-/// more to return, which is what `nextToken` being "null when there are no more
-/// results to return" means for these searches. One extra call at most, and never
-/// a loop.
+/// The cursor rule, in one place for every such search: an answer carries a
+/// cursor only while matches remain PAST the page it served, so the answer that
+/// exhausts the matches carries no continuation — which is what `nextToken`
+/// being "null when there are no more results to return" says. A page that
+/// already held every match therefore ends the walk, whether or not it was the
+/// first answer, so the standard paginator stops on it instead of issuing an
+/// extra call per search against a cursor that cannot advance.
 pub fn search_page<T>(
     items: impl Iterator<Item = T>,
     offset: usize,
     page_size: usize,
-    resumed: bool,
 ) -> (Vec<T>, Option<usize>) {
     let (page, more_remain) = page_window(items, offset, page_size);
     let reached = offset.saturating_add(page.len());
-    let next = (more_remain || !resumed).then_some(reached);
+    let next = more_remain.then_some(reached);
     (page, next)
+}
+
+/// The `nextToken` a catalog search's answer reports for the cursor
+/// [`search_page`] handed back: the token that resumes the walk at `next`, or
+/// the EMPTY token when the page served exhausted the matches.
+///
+/// One spelling of "no continuation" for every search of this service's
+/// catalogs, which is how the recorded answers spell it: the member is present
+/// and empty rather than absent, and [`page_offset`] reads that empty token back
+/// as the first result, so echoing it is harmless.
+pub fn search_next_token(kind: &str, next: Option<usize>) -> String {
+    next.map(|offset| encode_page_token(kind, offset))
+        .unwrap_or_default()
 }
 
 /// The page the offering and offering-rate searches serve when the caller names
@@ -770,6 +786,24 @@ pub fn resource_not_found_message(resource_arn: &str) -> String {
 pub fn savings_plan_not_found_message(savings_plan_id: &str) -> String {
     format!("SavingsPlan can't be found. Savings Plan Id: {savings_plan_id}.")
 }
+
+/// How this service states that the OFFERING a purchase named does not exist.
+///
+/// AWS words this refusal as a fixed sentence plus the remediation hint that
+/// follows it, and builds nothing into it from the request: the submitted
+/// offering id is not echoed, and the two sentences are separated by two
+/// spaces, which is part of the text. One constant, so the operation that buys
+/// an offering cannot word it differently from any other that resolves one.
+pub const OFFERING_NOT_FOUND_MESSAGE: &str =
+    "Offering ID not found.  Insert a valid offering ID and try again.";
+
+/// How this service refuses an operation that only a QUEUED purchase accepts.
+///
+/// A fixed sentence as well: it states the state the plan had to be in, and
+/// never the state it is in, so every state the call is refused from — one
+/// already cancelled, one being paid for, one active, retired or returned — is
+/// refused with the one sentence.
+pub const NOT_QUEUED_MESSAGE: &str = "Savings Plan is not in Queued State.";
 
 // ---------------------------------------------------------------------------
 // The offering catalog
@@ -1233,14 +1267,94 @@ pub const RATE_PROPERTY_PRODUCT_DESCRIPTION: &str = "productDescription";
 /// See [`RATE_PROPERTY_INSTANCE_TYPE`].
 pub const RATE_PROPERTY_TENANCY: &str = "tenancy";
 
-/// The EC2 product description every priced EC2 line item carries.
-///
-/// A rate is priced for ONE product description and tenancy per instance type,
-/// so both dimensions are reported and filterable without the catalog carrying a
-/// row per operating system and tenancy.
+/// The EC2 product description of an unlicensed Linux line item: the first row
+/// of [`EC2_PLATFORMS`], and the description every EC2 usage carries no
+/// operating-system or database licence for.
 pub const PRODUCT_DESCRIPTION_LINUX: &str = "Linux/UNIX";
 /// See [`PRODUCT_DESCRIPTION_LINUX`].
 pub const TENANCY_SHARED: &str = "shared";
+
+/// Every EC2 platform a Savings Plan rate card prices, as `(productDescription,
+/// operation, licence units per vCPU-hour)`.
+///
+/// EC2 bills one line item per PLATFORM — the operating system and database
+/// licence the instance runs — and reports which one through the usage-operation
+/// code of that line item, so the rate card of a commitment that covers EC2
+/// carries one rate per platform per instance type rather than a single
+/// unlicensed row. The `productDescription`/`operation` pairs are AWS's own
+/// published platform-details-to-usage-operation table (EC2 User Guide,
+/// "Platform details and usage operation"; AWS Billing's usage-operation
+/// values), so `RunInstances` is unlicensed Linux, `RunInstances:0006` is
+/// Windows with SQL Server Standard, `RunInstances:0200` is Linux with SQL
+/// Server Web, and so on.
+///
+/// The licence column is what the platform adds to the price of one vCPU-hour of
+/// the instance family ([`EC2_INSTANCE_FAMILIES`]), in [`AMOUNT_SCALE`] units.
+/// Those magnitudes are the catalog's own; the ORDERING is AWS's published one —
+/// usage that brings its own licence (BYOL) costs no more than unlicensed Linux,
+/// a paid operating system costs more than that, and a database licence costs
+/// more the larger its edition, Enterprise above Standard above Web.
+pub const EC2_PLATFORMS: [(&str, &str, i128); 19] = [
+    (PRODUCT_DESCRIPTION_LINUX, "RunInstances", 0),
+    ("Red Hat BYOL Linux", "RunInstances:00g0", 0),
+    ("Red Hat Enterprise Linux", "RunInstances:0010", 1_500_000),
+    ("Red Hat Enterprise Linux with HA", "RunInstances:1010", 3_000_000),
+    (
+        "Red Hat Enterprise Linux with HA and SQL Server Standard",
+        "RunInstances:1014",
+        7_600_000,
+    ),
+    (
+        "Red Hat Enterprise Linux with HA and SQL Server Enterprise",
+        "RunInstances:1110",
+        20_600_000,
+    ),
+    (
+        "Red Hat Enterprise Linux with SQL Server Web",
+        "RunInstances:0210",
+        2_600_000,
+    ),
+    (
+        "Red Hat Enterprise Linux with SQL Server Standard",
+        "RunInstances:0014",
+        6_100_000,
+    ),
+    (
+        "Red Hat Enterprise Linux with SQL Server Enterprise",
+        "RunInstances:0110",
+        19_100_000,
+    ),
+    ("SUSE Linux", "RunInstances:000g", 1_000_000),
+    ("Ubuntu Pro", "RunInstances:0g00", 500_000),
+    ("Windows", "RunInstances:0002", 4_600_000),
+    ("Windows BYOL", "RunInstances:0800", 0),
+    (
+        "Windows with SQL Server Web",
+        "RunInstances:0202",
+        5_700_000,
+    ),
+    (
+        "Windows with SQL Server Standard",
+        "RunInstances:0006",
+        9_200_000,
+    ),
+    (
+        "Windows with SQL Server Enterprise",
+        "RunInstances:0102",
+        22_200_000,
+    ),
+    ("Linux with SQL Server Web", "RunInstances:0200", 1_100_000),
+    (
+        "Linux with SQL Server Standard",
+        "RunInstances:0004",
+        4_600_000,
+    ),
+    (
+        "Linux with SQL Server Enterprise",
+        "RunInstances:0100",
+        17_600_000,
+    ),
+];
 
 /// Seconds in a 365-day year: the unit a Savings Plans term is sold in, so the
 /// terms the catalog sells ([`TERMS`]) are one and three of these.
@@ -1361,9 +1475,9 @@ const SAGEMAKER_INSTANCE_TYPES: [(&str, i128); 3] = [
 ///
 /// `service_codes` are the `SavingsPlanRateServiceCode`s that bill the product,
 /// `unit` the `SavingsPlanRateUnit` it is billed in, `usage_token` the
-/// usage-type token of its line item (the region it is billed in is prefixed to
-/// it), `operation` the billing operation, and `on_demand_units` the on-demand
-/// price of ONE `unit` in [`AMOUNT_SCALE`] units.
+/// usage-type of its line item, `operation` the billing operation, and
+/// `on_demand_units` the on-demand price of ONE `unit` in [`AMOUNT_SCALE`]
+/// units.
 struct PricedProduct {
     product_type: &'static str,
     service_codes: &'static [&'static str],
@@ -1568,10 +1682,17 @@ impl RateLineItem {
 ///
 /// One exists for each product type the model declares, in each region the
 /// catalog sells in, and for each dimension that product is priced along: an
-/// instance type for EC2 and SageMaker, a single line item for every other
-/// product. The outer order is the model's own `SavingsPlanProductType` value
-/// set ([`crate::ops::types::SAVINGS_PLAN_PRODUCT_TYPE_VALUES`]), then region,
-/// then the dimension, so page N of a search is the same rows on every call.
+/// instance type and platform for EC2, an instance type for SageMaker, a single
+/// line item for every other product. The outer order is the model's own
+/// `SavingsPlanProductType` value set
+/// ([`crate::ops::types::SAVINGS_PLAN_PRODUCT_TYPE_VALUES`]), then region, then
+/// the dimensions, so page N of a search is the same rows on every call.
+///
+/// A line item's `usageType` names the usage alone and carries no region prefix:
+/// the region it is billed in is one of the dimensions the line item is priced
+/// along ([`PROPERTY_REGION`]), so it is reported there rather than built into
+/// the usage type, and a usage record's unprefixed usage type joins against the
+/// rate that prices it.
 ///
 /// Derived from the model's value set rather than written out by hand, so a
 /// product type the model gains is a product type the catalog is asked to price.
@@ -1593,21 +1714,25 @@ fn build_rate_line_items() -> Vec<RateLineItem> {
                     for (family, vcpu_units) in EC2_INSTANCE_FAMILIES {
                         for (size, vcpus) in EC2_SIZES {
                             let instance_type = format!("{family}.{size}");
-                            items.push(line_item(
-                                product_type,
-                                "AmazonEC2",
-                                format!("{region}-BoxUsage:{instance_type}"),
-                                "RunInstances",
-                                "Hrs",
-                                vcpu_units.saturating_mul(vcpus),
-                                vec![
-                                    (PROPERTY_INSTANCE_FAMILY, family),
-                                    (RATE_PROPERTY_INSTANCE_TYPE, &instance_type),
-                                    (RATE_PROPERTY_PRODUCT_DESCRIPTION, PRODUCT_DESCRIPTION_LINUX),
-                                    (PROPERTY_REGION, region),
-                                    (RATE_PROPERTY_TENANCY, TENANCY_SHARED),
-                                ],
-                            ));
+                            for (product_description, operation, licence_units) in EC2_PLATFORMS {
+                                items.push(line_item(
+                                    product_type,
+                                    "AmazonEC2",
+                                    format!("BoxUsage:{instance_type}"),
+                                    operation,
+                                    "Hrs",
+                                    vcpu_units
+                                        .saturating_add(licence_units)
+                                        .saturating_mul(vcpus),
+                                    vec![
+                                        (PROPERTY_INSTANCE_FAMILY, family),
+                                        (RATE_PROPERTY_INSTANCE_TYPE, &instance_type),
+                                        (RATE_PROPERTY_PRODUCT_DESCRIPTION, product_description),
+                                        (PROPERTY_REGION, region),
+                                        (RATE_PROPERTY_TENANCY, TENANCY_SHARED),
+                                    ],
+                                ));
+                            }
                         }
                     }
                 }
@@ -1621,7 +1746,7 @@ fn build_rate_line_items() -> Vec<RateLineItem> {
                         items.push(line_item(
                             product_type,
                             "AmazonSageMaker",
-                            format!("{region}-Hosting:{instance_type}"),
+                            format!("Hosting:{instance_type}"),
                             "RunInstance",
                             "Hrs",
                             hourly_units,
@@ -1644,7 +1769,7 @@ fn build_rate_line_items() -> Vec<RateLineItem> {
                         items.push(line_item(
                             product_type,
                             service_code,
-                            format!("{region}-{}", priced.usage_token),
+                            priced.usage_token.to_string(),
                             priced.operation,
                             priced.unit,
                             priced.on_demand_units,
@@ -1733,7 +1858,8 @@ pub struct SavingsPlanRecord {
     pub description: String,
     /// The plan's term start, epoch millis: the purchase time.
     pub start_millis: i64,
-    /// The plan's term end, epoch millis: `start` plus the term duration.
+    /// The plan's term end, epoch millis: the LAST instant of the term, which is
+    /// one second before `start` plus the term duration.
     pub end_millis: i64,
     pub state: String,
     /// When the clock owes this plan its move out of `queued`.
@@ -1780,19 +1906,17 @@ impl SavingsPlanRecord {
         ) && now_millis <= self.return_window_closes_millis()
     }
 
-    /// Whether this plan still HAS a return window: its state has not foreclosed
-    /// a return (it has not been returned, cancelled or retired) and the window
-    /// has not run out.
+    /// Whether this plan still HAS a return window: its purchase has not already
+    /// been returned, and the window its start opened has not run out.
     ///
-    /// Wider than [`Self::is_returnable`] by one state: a plan that has not
-    /// started yet still has the window its start opens, which is what
-    /// `returnableUntil` reports even though a return cannot be requested until
-    /// the plan starts.
+    /// Wider than [`Self::is_returnable`]: the window is a property of the
+    /// PURCHASE, which is why a plan that has not started yet — and one whose
+    /// queued purchase was cancelled — still reports the instant its window
+    /// closes even though a return cannot be requested for it. Only a plan whose
+    /// return was already accepted has consumed the window; for every other
+    /// state the clock closes it.
     pub fn has_return_window(&self, now_millis: i64) -> bool {
-        matches!(
-            self.state.as_str(),
-            STATE_QUEUED | STATE_PAYMENT_PENDING | STATE_ACTIVE
-        ) && now_millis <= self.return_window_closes_millis()
+        self.state != STATE_RETURNED && now_millis <= self.return_window_closes_millis()
     }
 
     /// The instant this plan's return window closes. Saturating: `start_millis`
@@ -2190,7 +2314,7 @@ impl ComAmazonawsSavingsplansAwssavingsplanState {
                 plan.state = STATE_ACTIVE.to_string();
             }
             if matches!(plan.state.as_str(), STATE_PAYMENT_PENDING | STATE_ACTIVE)
-                && now_millis >= plan.end_millis
+                && now_millis > plan.end_millis
             {
                 plan.state = STATE_RETIRED.to_string();
             }
@@ -2224,7 +2348,15 @@ pub fn purchase(
         start_millis,
         // Saturating throughout: `start_millis` carries a caller-supplied
         // purchase time, so none of this arithmetic may be partial.
-        end_millis: start_millis.saturating_add(offering.duration_seconds.saturating_mul(1000)),
+        //
+        // A term is reported by the LAST instant it covers, not by the first
+        // instant after it: a one-year term that starts at `T` ends at
+        // `T + 1 year - 1s`, so two consecutive terms of one commitment do not
+        // both claim the instant between them and term arithmetic over `start`
+        // and `end` spans exactly `termDurationInSeconds`.
+        end_millis: start_millis
+            .saturating_add(offering.duration_seconds.saturating_mul(1000))
+            .saturating_sub(TERM_END_INCLUSIVE_MILLIS),
         state: if queued {
             STATE_QUEUED.to_string()
         } else {

@@ -49,9 +49,9 @@ fn stored_plan(
 }
 
 /// The return window closes exactly [`state::RETURN_WINDOW_MILLIS`] after the
-/// plan's start, for every state that has a window at all: the close is reported
-/// up to and including that instant, and the plan's start from the millisecond
-/// after it.
+/// plan's start, for every plan whose window has not already been consumed by an
+/// accepted return: the close is reported up to and including that instant, and
+/// the plan's start from the millisecond after it.
 ///
 /// Driven through the stored record rather than the wire, so the instant the
 /// window turns over is pinned without a suite racing its own clock. The rows
@@ -67,10 +67,13 @@ fn the_window_turns_over_one_window_after_the_start() {
     let start = 1_777_000_000_000_i64;
     let close = start + state::RETURN_WINDOW_MILLIS;
 
-    // (state, whether the state has a return window, whether a return may be
-    //  requested from it while the window is open). Every state a plan of this
-    //  service reaches, from the members of the model enum `SavingsPlanState`
-    //  (`smithy_query(query="shape", shape="SavingsPlanState")`).
+    // (state, whether the state still has a return window, whether a return may
+    //  be requested from it while the window is open). Every state a plan of
+    //  this service reaches, from the members of the model enum
+    //  `SavingsPlanState` (`smithy_query(query="shape",
+    //  shape="SavingsPlanState")`). The window belongs to the PURCHASE, so only
+    //  a plan whose return was already accepted has consumed it; for every other
+    //  state the clock is what closes it.
     let states: [(&str, bool, bool); 6] = [
         // Not started yet: the window its start will open is still ahead of it,
         // but a return is not how a queued purchase is cancelled.
@@ -78,8 +81,10 @@ fn the_window_turns_over_one_window_after_the_start() {
         (state::STATE_PAYMENT_PENDING, true, true),
         (state::STATE_ACTIVE, true, true),
         (state::STATE_RETURNED, false, false),
-        (state::STATE_QUEUED_DELETED, false, false),
-        (state::STATE_RETIRED, false, false),
+        // A cancelled queued purchase and a plan whose term ran out are not
+        // returnable, yet both still report when the purchase's window closes.
+        (state::STATE_QUEUED_DELETED, true, false),
+        (state::STATE_RETIRED, true, false),
     ];
 
     // (case, the instant the answer is computed as of)
@@ -123,9 +128,9 @@ fn the_window_turns_over_one_window_after_the_start() {
     }
 }
 
-/// And that is the member `DescribeSavingsPlans` reports: a plan in a state that
-/// has a window reports when the window closes, and one in a state that has none
-/// reports its start.
+/// And that is the member `DescribeSavingsPlans` reports: a plan whose window is
+/// still open reports when it closes — a cancelled queued purchase included —
+/// and one whose window is gone reports its start.
 ///
 /// The rows span the states that decide whether a window exists, reached the way
 /// a caller reaches them, and each sits a whole window away from its own close so
@@ -156,7 +161,7 @@ async fn describe_reports_the_window_of_the_state_the_plan_is_in() {
             "cancelled before its term began",
             Some(86_400),
             Some("DeleteQueuedSavingsPlan"),
-            false,
+            true,
         ),
         // Past the end of its one-year term, so the clock retired it.
         ("past the end of its term", Some(-2 * 365 * 86_400), None, false),

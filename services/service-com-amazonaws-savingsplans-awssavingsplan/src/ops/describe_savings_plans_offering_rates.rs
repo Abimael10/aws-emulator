@@ -211,7 +211,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }),
                 offset,
                 page_size,
-                input.next_token.is_some(),
             );
             let page: Vec<SavingsPlanOfferingRate> = window
                 .into_iter()
@@ -222,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(DescribeSavingsPlansOfferingRatesOutput {
             search_results: Some(page),
-            next_token: next.map(|offset| crate::state::encode_page_token(PAGE_KIND, offset)),
+            next_token: Some(crate::state::search_next_token(PAGE_KIND, next)),
         })
     }
 }

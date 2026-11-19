@@ -9,10 +9,9 @@
 //!
 //! * a page never exceeds the size the caller asked for, and paging yields the
 //!   result set exactly once, in one order, however the set is cut into pages;
-//! * a SEARCH always answers its first call with the cursor its walk reached —
-//!   even when that page already held every match, and even when nothing
-//!   matched — and a resumed call carries a cursor only while results remain
-//!   past its page;
+//! * a SEARCH carries a cursor only while matches remain PAST the page it
+//!   served, so the answer that exhausted the matches ends the walk — a page
+//!   holding every match (nothing included) carries no continuation;
 //! * a plan's rate card, which reports a cursor only while results remain, keeps
 //!   that answer: sharing the window changed no cursor.
 //!
@@ -93,7 +92,7 @@ async fn walk(
             answer.status, answer.body
         );
         let rows: Vec<Value> = answer.list(RESULTS).to_vec();
-        next = answer.get("nextToken").as_str().map(ToString::to_string);
+        next = answer.cursor();
         if let Some(token) = &next {
             assert!(
                 is_pagination_token(token),
@@ -150,12 +149,10 @@ fn page_sizes(n: usize) -> Vec<i64> {
 
 /// How many calls a SEARCH's walk takes to serve `n` rows at `page_size`.
 ///
-/// The walk serves the set in pages of `page_size`, and the first answer always
-/// carries a cursor — so a set that fits in one page (`n == 0` included) costs
-/// one more call to learn the walk is over, and a set that does not ends on the
-/// page that reaches it.
+/// The walk serves the set in pages of `page_size` and ends on the page that
+/// exhausts it, so a set that fits in one page (`n == 0` included) is one call.
 fn expected_search_pages(n: usize, page_size: usize) -> usize {
-    n.div_ceil(page_size).max(2)
+    n.div_ceil(page_size).max(1)
 }
 
 /// Assert one walk served `whole` once, in order, in pages no larger than asked
@@ -199,10 +196,9 @@ fn assert_cursor_ends_the_walk(case: &str, pages: &[(Vec<Value>, Option<String>)
     }
 }
 
-/// Both catalog searches page by the one shared rule: the first answer always
-/// carries the cursor its walk reached, a resumed one carries it only while
-/// results remain past its page, and the set comes back once in order whatever
-/// page size cuts it.
+/// Both catalog searches page by the one shared rule: an answer carries the
+/// cursor its walk reached only while matches remain past the page it served,
+/// and the set comes back once in order whatever page size cuts it.
 #[tokio::test]
 async fn both_catalog_searches_page_by_the_same_cursor_rule() {
     let emulator = Emulator::new();
@@ -282,10 +278,13 @@ async fn both_catalog_searches_page_by_the_same_cursor_rule() {
             let size = usize::try_from(page_size).unwrap_or(1);
             let pages = walk(&emulator, &case, operation, &request, page_size).await;
 
-            assert!(
+            assert_eq!(
                 pages[0].1.is_some(),
-                "case {case:?}: the first answer of a search always carries the cursor to \
-                 resume at, got none beside {} rows",
+                whole.len() > size,
+                "case {case:?}: a first answer carries a cursor only while matches remain past \
+                 its page ({} matches in all), got {:?} beside {} rows",
+                whole.len(),
+                pages[0].1,
                 pages[0].0.len()
             );
             assert_cursor_ends_the_walk(&case, &pages);

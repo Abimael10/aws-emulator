@@ -157,13 +157,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only a plan whose term has not begun HAS a queued purchase to delete.
         // Every other state — one already cancelled, one being paid for, one
-        // active, retired or returned — is refused, naming the state it refused,
-        // so the one sentence covers every state a deletion is not accepted from.
+        // active, retired or returned — is refused with the one sentence this
+        // service states the required state with; the state the plan is in is
+        // not part of it.
         if plan.state != STATE_QUEUED {
-            return Err(validation(format!(
-                "Savings Plans in {} state cannot be deleted.",
-                plan.state
-            )));
+            return Err(validation(crate::state::NOT_QUEUED_MESSAGE.to_string()));
         }
         plan.state = STATE_QUEUED_DELETED.to_string();
 

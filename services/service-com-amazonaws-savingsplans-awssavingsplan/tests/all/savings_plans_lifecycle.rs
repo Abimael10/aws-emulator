@@ -40,6 +40,21 @@ impl Answer {
     pub(crate) fn list(&self, name: &str) -> &[Value] {
         self.get(name).as_array().map_or(&[], Vec::as_slice)
     }
+
+    /// The cursor this answer carries to resume its walk at, or `None` when the
+    /// walk is over.
+    ///
+    /// A catalog search reports "no more results" as the EMPTY token, and
+    /// `PaginationToken` admits no empty value as an INPUT (pattern
+    /// `^[A-Za-z0-9/=\+]+$`), so an empty cursor ends a walk exactly as an
+    /// absent one does — which is what a paginator looping "while nextToken is
+    /// non-empty" does with it.
+    pub(crate) fn cursor(&self) -> Option<String> {
+        self.get("nextToken")
+            .as_str()
+            .filter(|token| !token.is_empty())
+            .map(std::string::ToString::to_string)
+    }
 }
 
 /// The emulator, with this one service mounted on the production router.
@@ -118,10 +133,7 @@ impl Emulator {
                 answer.status, answer.body
             );
             found.extend(answer.list("searchResults").iter().cloned());
-            next = answer
-                .get("nextToken")
-                .as_str()
-                .map(std::string::ToString::to_string);
+            next = answer.cursor();
             if next.is_none() {
                 return found;
             }
@@ -478,16 +490,17 @@ async fn offering_search_pages_the_catalog() {
                 answer.status, answer.body
             );
             let results = answer.list("searchResults");
-            next = answer
-                .get("nextToken")
-                .as_str()
-                .map(std::string::ToString::to_string);
-            // The search answers with the cursor to resume at: every answer
-            // carries one until a resumed one has no more results to return.
+            next = answer.cursor();
+            // The search carries the cursor to resume at only while matches
+            // remain past the page it served, so the answer that exhausts them
+            // ends the walk.
             if pages == 0 {
-                assert!(
+                assert_eq!(
                     next.is_some(),
-                    "case page size {page_size}: the first answer must carry a cursor, got {next:?}"
+                    catalog.len() > page_size,
+                    "case page size {page_size}: a first answer carries a cursor only while \
+                     matches remain past its page ({} offerings in the catalog), got {next:?}",
+                    catalog.len()
                 );
             }
             assert!(
@@ -1757,10 +1770,7 @@ async fn describe_plans_filters_and_pages() {
                     .iter()
                     .map(|p| text(p, "savingsPlanId")),
             );
-            next = answer
-                .get("nextToken")
-                .as_str()
-                .map(std::string::ToString::to_string);
+            next = answer.cursor();
             if next.is_none() {
                 break;
             }
@@ -1784,10 +1794,8 @@ async fn describe_plans_filters_and_pages() {
             json!({ "maxResults": 1 }),
         )
         .await
-        .get("nextToken")
-        .as_str()
-        .expect("the offering search pages")
-        .to_string();
+        .cursor()
+        .expect("the offering search pages");
     for bad in [offerings_token.as_str(), "zzzz", "abcd"] {
         let answer = emulator
             .call(
@@ -1887,12 +1895,13 @@ fn a_purchase_becomes_active_only_once_the_clock_owes_it() {
         );
 
         // And the clock owes it one more transition: the term ends, so the plan
-        // retires — the instant before, it is still active.
+        // retires — at the last instant the term covers (`end`), it is still
+        // active.
         let end = store
             .plan(&savings_plan_id)
             .map(|plan| plan.end_millis)
             .expect("the plan is stored");
-        store.materialize_due(end - 1);
+        store.materialize_due(end);
         let before_end = store
             .plan(&savings_plan_id)
             .map(|plan| plan.state.clone())
@@ -1900,10 +1909,10 @@ fn a_purchase_becomes_active_only_once_the_clock_owes_it() {
         assert_eq!(
             before_end,
             state::STATE_ACTIVE,
-            "case {case:?}: the plan must still be active one millisecond before {end}, \
-             got {before_end:?}"
+            "case {case:?}: the plan must still be active at the last instant of its term \
+             ({end}), got {before_end:?}"
         );
-        store.materialize_due(end);
+        store.materialize_due(end + 1);
         let at_end = store
             .plan(&savings_plan_id)
             .map(|plan| plan.state.clone())
@@ -1911,7 +1920,8 @@ fn a_purchase_becomes_active_only_once_the_clock_owes_it() {
         assert_eq!(
             at_end,
             state::STATE_RETIRED,
-            "case {case:?}: the plan must be retired once its term ends at {end}, got {at_end:?}"
+            "case {case:?}: the plan must be retired once its term has ended at {end}, \
+             got {at_end:?}"
         );
     }
 }

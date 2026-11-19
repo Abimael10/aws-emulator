@@ -181,34 +181,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (page, next) = {
             let store = state.lock();
-            // The rates belong to a plan this store sold; an id it never minted
-            // has no rate card, which is the 404 this operation models.
-            let plan = store.plan(&input.savings_plan_id).ok_or_else(|| {
-                DescribeSavingsPlanRatesErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::savings_plan_not_found_message(
-                            &input.savings_plan_id,
-                        ),
-                    },
-                )
-            })?;
-            // The card is walked LAZILY through the shared page window, and only
-            // one page of it is priced: a line item past the page is never
-            // projected, so the work and the allocation one request can ask for
-            // are the page it asked for.
-            let (window, more_remain) = crate::state::page_window(
-                crate::state::rate_line_items()
-                    .iter()
-                    .filter(|item| plan.prices(item) && admits(&input, item)),
-                offset,
-                page_size,
-            );
-            // `nextToken` "is null when there are no more results to return",
-            // so a cursor comes back only while the walk has more to serve.
-            let next = more_remain.then(|| offset.saturating_add(window.len()));
-            let page: Vec<SavingsPlanRate> =
-                window.into_iter().map(|item| project(plan, item)).collect();
-            (page, next)
+            // The rate card is resolved as a SEARCH over the rates this account
+            // holds, not as a lookup of a resource: an id this account holds no
+            // plan for prices no usage, which is an EMPTY result set rather than
+            // a missing resource.
+            match store.plan(&input.savings_plan_id) {
+                None => (Vec::new(), None),
+                Some(plan) => {
+                    // The card is walked LAZILY through the shared page window,
+                    // and only one page of it is priced: a line item past the
+                    // page is never projected, so the work and the allocation
+                    // one request can ask for are the page it asked for.
+                    let (window, more_remain) = crate::state::page_window(
+                        crate::state::rate_line_items()
+                            .iter()
+                            .filter(|item| plan.prices(item) && admits(&input, item)),
+                        offset,
+                        page_size,
+                    );
+                    // `nextToken` "is null when there are no more results to
+                    // return", so a cursor comes back only while the walk has
+                    // more to serve.
+                    let next = more_remain.then(|| offset.saturating_add(window.len()));
+                    let page: Vec<SavingsPlanRate> =
+                        window.into_iter().map(|item| project(plan, item)).collect();
+                    (page, next)
+                }
+            }
         };
 
         Ok(DescribeSavingsPlanRatesOutput {
@@ -237,8 +236,14 @@ fn admits(input: &DescribeSavingsPlanRatesInput, item: &crate::state::RateLineIt
 }
 
 /// Project one line item of a plan's rate card onto the wire shape: the line
-/// item's own billing dimensions and the properties it is priced along, at the
-/// rate THIS plan charges for it.
+/// item's own billing dimensions and the dimensions of the USAGE it prices, at
+/// the rate THIS plan charges for it.
+///
+/// A plan rate reports the dimensions that identify the usage being priced — the
+/// region it is billed in, the instance type, the platform (`productDescription`)
+/// and the tenancy. The instance FAMILY is a dimension of the commitment's own
+/// scope rather than of the usage, and it is implied by the instance type, so it
+/// is not repeated on the rate.
 fn project(
     plan: &crate::state::SavingsPlanRecord,
     item: &crate::state::RateLineItem,
@@ -256,6 +261,7 @@ fn project(
         properties: Some(
             item.properties
                 .iter()
+                .filter(|(name, _)| name != crate::state::PROPERTY_INSTANCE_FAMILY)
                 .map(|(name, value)| SavingsPlanRateProperty {
                     name: Some(name.clone()),
                     value: Some(value.clone()),
