@@ -42,7 +42,10 @@
 //! A property whose shape or spelling differs that way is TRANSLATED into the API's member
 //! rather than passed through: a member a template never states is a member the owning
 //! service refuses the call for, which fails a resource whose declaration is valid
-//! CloudFormation.
+//! CloudFormation. The translation serves BOTH calls: `UpdateTable` takes
+//! `SSESpecification` and `StreamSpecification` as members of its own, so a deployment that
+//! changes one of them is applied to the table that already exists rather than reported as a
+//! change with no in-place path ([`update_request`], [`stream_steps`]).
 //!
 //! Every other property of the type is a DIFFERENT DynamoDB call made on the table after it
 //! exists (`UpdateTimeToLive`, `UpdateContinuousBackups`, `UpdateContributorInsights`, the
@@ -609,6 +612,13 @@ pub(super) async fn update(
 /// `declared` asks for, beside the member that addresses the call — or `None` where one of
 /// those changes has no in-place path, which the deployment reports as not applied.
 ///
+/// Every property of the type that `UpdateTable` takes as a member of its own is carried
+/// here, under the member's own spelling where the two sides differ: the ones named
+/// identically ([`UPDATE_MEMBERS`]), and the encryption settings, whose flag the template and
+/// the API spell differently ([`sse_change`]). The table's stream is a member of the same
+/// call whose change can need more than one of them, so it travels as its own step
+/// ([`stream_steps`]).
+///
 /// Only the members that really CHANGED are carried: `UpdateTable` refuses a request that
 /// re-states a value the table already has, so re-stating an unchanged member would turn a
 /// change to one property into a refusal of the whole deployment.
@@ -652,6 +662,13 @@ fn update_request(in_force: &Value, declared: &Value) -> Option<Map<String, Valu
             BILLING_MODE_PROPERTY.to_string(),
             Value::String(mode.to_string()),
         );
+    }
+    // The server-side-encryption settings are a member of the same call, under the API's own
+    // spelling of the flag ([`sse_change`]), so a declaration that turns encryption on, moves
+    // it to another key, or asks for the Amazon Web Services owned key again is applied in
+    // place rather than reported as a change with no path.
+    if let Some(specification) = sse_change(in_force, declared) {
+        request.insert(SSE_SPECIFICATION_PROPERTY.to_string(), specification);
     }
     Some(request)
 }
@@ -1112,6 +1129,47 @@ fn asks_for_a_stream(specification: &Value) -> bool {
     specification.get(STREAM_ENABLED_MEMBER) != Some(&Value::Bool(false))
 }
 
+/// Whether a specification asks for the table to be encrypted with a KMS key: the API's own
+/// flag stated TRUE.
+///
+/// "If enabled (true), server-side encryption type is set to `KMS` … If disabled (false) or
+/// not specified, server-side encryption is set to Amazon Web Services owned key"
+/// (`smithy_query(query="doc",shape="SSESpecification",member="Enabled")`), so a
+/// specification that states the flag otherwise — and a declaration that states no
+/// specification at all — asks for the owned key.
+fn asks_for_encryption(specification: Option<&Value>) -> bool {
+    specification.and_then(|specification| specification.get(SSE_ENABLED_MEMBER))
+        == Some(&Value::Bool(true))
+}
+
+/// The `SSESpecification` that takes the table's server-side encryption from the one in force
+/// to the declared one, or `None` where the table already has what the declaration asks for.
+///
+/// `SSESpecification` IS a member of `UpdateTable`
+/// (`smithy_query(query="operation",operation="UpdateTable")`), under the API's own spelling
+/// of the flag ([`sse_specification`]), so a deployment that changes the property is applied
+/// in place: the key a declaration names travels into the call as written, and a declaration
+/// the deployment DROPPED asks for the Amazon Web Services owned key, which the same member
+/// expresses as the flag turned off.
+///
+/// A declaration that asks for the owned key over a table that already has it is nothing to
+/// call, exactly as an unchanged specification is: only the member that really CHANGED is
+/// carried.
+fn sse_change(in_force: &Value, declared: &Value) -> Option<Value> {
+    let before = sse_specification(in_force);
+    let after = sse_specification(declared);
+    if before == after {
+        return None;
+    }
+    if !asks_for_encryption(after.as_ref()) {
+        // The owned key: asked for by the flag turned off, and already in force on a table
+        // whose own specification asks for no KMS key either.
+        return asks_for_encryption(before.as_ref())
+            .then(|| serde_json::json!({ SSE_ENABLED_MEMBER: false }));
+    }
+    after
+}
+
 /// The `StreamSpecification` of each `UpdateTable` that takes the table's stream from the
 /// specification in force to the declared one, in the order the calls must be made.
 ///
@@ -1216,6 +1274,9 @@ fn changed_outside_update_members(in_force: &Value, declared: &Value) -> bool {
         // The stream configuration IS a member `UpdateTable` takes — under the API's own
         // spelling of it ([`stream_specification`]) — so [`update`] carries a change to it.
         .filter(|property| *property != STREAM_SPECIFICATION_PROPERTY)
+        // So are the server-side-encryption settings, under the API's own spelling of their
+        // flag ([`sse_change`]).
+        .filter(|property| *property != SSE_SPECIFICATION_PROPERTY)
         .any(|property| declared_in(declared, property) != declared_in(in_force, property))
 }
 
@@ -1630,6 +1691,18 @@ mod tests {
                 serde_json::json!({}),
                 true,
             ),
+            (
+                "the encryption settings changed: UpdateTable takes them",
+                serde_json::json!({ "SSESpecification": { "SSEEnabled": true } }),
+                serde_json::json!({ "SSESpecification": { "SSEEnabled": false } }),
+                false,
+            ),
+            (
+                "the encryption settings dropped: the same member expresses the owned key",
+                serde_json::json!({ "SSESpecification": { "SSEEnabled": true } }),
+                serde_json::json!({}),
+                false,
+            ),
         ];
         for (case, in_force, declared_now, expected) in cases {
             let outside = changed_outside_update_members(in_force, declared_now);
@@ -1724,6 +1797,96 @@ mod tests {
                 request.as_ref(),
                 expected.as_ref(),
                 "case {case:?}: expected the UpdateTable body {expected:?}, got {request:?}"
+            );
+        }
+    }
+
+    /// The `SSESpecification` an in-place update carries: the declared one as the API spells
+    /// it, the flag turned off where the declaration asks for the Amazon Web Services owned
+    /// key, and nothing at all where the table already has what the declaration asks for.
+    ///
+    /// The rows differ along what the rule generalises over: which way the flag moves, whether
+    /// the declaration states the specification or DROPS it, a key identifier changed while
+    /// encryption stays on, and both spellings of "the owned key" on either side.
+    #[test]
+    fn the_encryption_settings_are_carried_by_the_in_place_update() {
+        let on = serde_json::json!({ "SSESpecification": { "SSEEnabled": true } });
+        let off = serde_json::json!({ "SSESpecification": { "SSEEnabled": false } });
+        let none = serde_json::json!({ "BillingMode": "PAY_PER_REQUEST" });
+        let cases: &[(&str, Value, Value, Option<Value>)] = &[
+            (
+                "encryption turned off: the API's own flag, turned off",
+                on.clone(),
+                off.clone(),
+                Some(serde_json::json!({ "Enabled": false })),
+            ),
+            (
+                "the specification dropped: the owned key, asked for the same way",
+                on.clone(),
+                none.clone(),
+                Some(serde_json::json!({ "Enabled": false })),
+            ),
+            (
+                "encryption turned on: the declared specification, renamed",
+                off.clone(),
+                on.clone(),
+                Some(serde_json::json!({ "Enabled": true })),
+            ),
+            (
+                "encryption turned on over a named key: the key travels as written",
+                none.clone(),
+                serde_json::json!({ "SSESpecification": {
+                    "SSEEnabled": true, "SSEType": "KMS",
+                    "KMSMasterKeyId": "alias/orders-table" } }),
+                Some(serde_json::json!({
+                    "Enabled": true, "SSEType": "KMS",
+                    "KMSMasterKeyId": "alias/orders-table" })),
+            ),
+            (
+                "the key moved while encryption stays on",
+                serde_json::json!({ "SSESpecification": {
+                    "SSEEnabled": true, "KMSMasterKeyId": "alias/aws/dynamodb" } }),
+                serde_json::json!({ "SSESpecification": {
+                    "SSEEnabled": true, "KMSMasterKeyId": "alias/orders-table" } }),
+                Some(serde_json::json!({
+                    "Enabled": true, "KMSMasterKeyId": "alias/orders-table" })),
+            ),
+            (
+                "the same specification: nothing to carry",
+                on.clone(),
+                on.clone(),
+                None,
+            ),
+            (
+                "the owned key, spelled two ways: already in force, nothing to carry",
+                off.clone(),
+                none.clone(),
+                None,
+            ),
+            (
+                "a table with no specification, declared with the flag off: nothing to carry",
+                none.clone(),
+                off.clone(),
+                None,
+            ),
+        ];
+        for (case, in_force, declared_now, expected) in cases {
+            let specification = sse_change(in_force, declared_now);
+            assert_eq!(
+                specification.as_ref(),
+                expected.as_ref(),
+                "case {case:?}: expected the SSESpecification {expected:?}, got \
+                 {specification:?}"
+            );
+            // And the same specification is what the call's body carries, which is what makes
+            // the change an in-place update rather than one with no path.
+            let request = update_request(in_force, declared_now)
+                .expect("the encryption settings have an in-place path");
+            assert_eq!(
+                request.get(SSE_SPECIFICATION_PROPERTY),
+                expected.as_ref(),
+                "case {case:?}: expected the UpdateTable body to carry {expected:?}, got \
+                 {request:?}"
             );
         }
     }
