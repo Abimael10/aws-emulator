@@ -26,6 +26,18 @@
 //! certificate store, while a Cognito identity is resolved no further than its form,
 //! because identity pools live in another service and this one holds no record of them.
 //!
+//! SYNTAX and EXISTENCE are separate questions, asked in that order
+//! ([`ThingPrincipalLookup`]): a value that is no principal ADDRESS at all names no
+//! principal in any account and is a request to be FIXED, while a well-formed address this
+//! account holds no principal under is an ordinary lookup MISS — including an ARN of a
+//! resource that is no principal of a thing, which addresses something and simply resolves
+//! to no principal.
+//!
+//! Each refusal is worded after the CALL that failed and not after the resource family it
+//! could not resolve ([`ThingPrincipalRefusal::message`], [`listing_missing_thing_message`]):
+//! the sentence names the action the caller asked for, the principal it named and the thing
+//! it addressed.
+//!
 //! The relation is also what two DELETES read before they remove anything, because AWS IoT
 //! requires detach-before-delete at BOTH ends: a thing that still has a principal attached
 //! ([`attached_principals_thing_deletion_message`]), and a certificate that still has a
@@ -118,50 +130,193 @@ pub struct ResolvedThingPrincipal {
 ///
 /// Each variant names the modelled error class the refusal answers with, so every operation
 /// that reads or writes the relation refuses one principal for one reason, in one wording,
-/// with one status.
+/// with one status. What the sentence SAYS is the answering operation's own
+/// ([`Self::message`]), so each variant carries the parts of the request its sentences name
+/// rather than a sentence of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThingPrincipalRefusal {
-    /// The request named a thing the registry does not hold, carrying the name:
+    /// The request named a thing the registry does not hold:
     /// `ResourceNotFoundException` (HTTP 404).
-    MissingThing(String),
-    /// The value is none of the forms a thing principal takes: `InvalidRequestException`
-    /// (HTTP 400).
-    Invalid(String),
-    /// A well-formed principal naming a resource this account does not hold:
+    MissingThing {
+        /// The principal the request carried, as it carried it.
+        principal: String,
+        /// The `thingName` the request addressed.
+        thing_name: String,
+    },
+    /// The value is no principal ADDRESS at all, so it names no principal in any account
+    /// and there is nothing to look for: `InvalidRequestException` (HTTP 400).
+    InvalidPrincipalType {
+        /// The value the request carried, as it carried it.
+        principal: String,
+    },
+    /// A well-formed principal address naming no principal this account holds:
     /// `ResourceNotFoundException` (HTTP 404).
-    NotFound(String),
-    /// The thing already holds [`MAX_PRINCIPALS_PER_THING`] principals, carrying the
-    /// thing's name: `InvalidRequestException` (HTTP 400).
-    TooManyPrincipals(String),
+    MissingPrincipal {
+        /// The principal the request carried, as it carried it.
+        principal: String,
+        /// The `thingName` the request addressed.
+        thing_name: String,
+    },
+    /// The thing already holds [`MAX_PRINCIPALS_PER_THING`] principals:
+    /// `InvalidRequestException` (HTTP 400).
+    TooManyPrincipals {
+        /// The `thingName` the request addressed.
+        thing_name: String,
+    },
+}
+
+/// Which WRITE of the relation is answering a refusal of it.
+///
+/// The two writes state a refusal in the same sentence less one verb and one preposition —
+/// a principal is attached TO a thing and detached FROM it — so which operation is
+/// answering is all the wording needs to be the operation's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThingPrincipalWrite {
+    /// `AttachThingPrincipal`.
+    Attach,
+    /// `DetachThingPrincipal`.
+    Detach,
+}
+
+impl ThingPrincipalWrite {
+    /// The verb this write's sentences name the action with.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Attach => "attach",
+            Self::Detach => "detach",
+        }
+    }
+
+    /// The preposition this write's sentences name the THING with: the direction the write
+    /// moves the principal in.
+    fn preposition(self) -> &'static str {
+        match self {
+            Self::Attach => "to",
+            Self::Detach => "from",
+        }
+    }
 }
 
 impl ThingPrincipalRefusal {
-    /// What the refusal reports, in the wording this service states each of these in.
-    pub fn message(&self) -> String {
+    /// What the refusal reports, in the wording the operation answering it states it in.
+    ///
+    /// The two ends of the relation are refused in the two sentences the WRITE words them
+    /// in: a `thingName` the registry does not hold says the action failed because the
+    /// thing does not exist in the account, and a principal the account holds none of says
+    /// the same of the principal. Both name the principal the request carried and the thing
+    /// it addressed; neither qualifies a name with the account id, and neither ends in a
+    /// period. The recorded wording is `AttachThingPrincipal`'s; the detach states the same
+    /// class in its own action's words.
+    pub fn message(&self, write: ThingPrincipalWrite) -> String {
+        let verb = write.verb();
+        let preposition = write.preposition();
         match self {
-            Self::MissingThing(thing_name) => super::not_found::missing_thing_message(thing_name),
-            Self::Invalid(message) | Self::NotFound(message) => message.clone(),
-            Self::TooManyPrincipals(thing_name) => format!(
+            Self::MissingThing {
+                principal,
+                thing_name,
+            } => format!(
+                "Failed to {verb} the principal {principal} {preposition} thing {thing_name} \
+                 because the thing does not exist in your account"
+            ),
+            Self::MissingPrincipal {
+                principal,
+                thing_name,
+            } => format!(
+                "Can't {verb} the principal {principal} {preposition} thing {thing_name} \
+                 because the principal does not exist in your account"
+            ),
+            Self::InvalidPrincipalType { principal } => invalid_principal_type_message(principal),
+            Self::TooManyPrincipals { thing_name } => format!(
                 "Thing {thing_name} cannot have more than {MAX_PRINCIPALS_PER_THING} \
                  attached principals"
             ),
         }
     }
+
+    /// Whether the refusal is the modelled `ResourceNotFoundException` (HTTP 404) — one end
+    /// of the relation names a resource this account does not hold — rather than
+    /// `InvalidRequestException` (HTTP 400), a request to be fixed before it is retried.
+    pub fn is_missing_resource(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingThing { .. } | Self::MissingPrincipal { .. }
+        )
+    }
 }
 
-/// How this service states that a value is none of the forms a thing principal takes.
+/// How this service states that a value bound where it takes a thing principal is no
+/// principal ADDRESS at all.
 ///
-/// `AttachThingPrincipal` documents them — "A principal can be X.509 certificates, Amazon
-/// Cognito identities or federated identities" — and they are named in the forms a policy
-/// target is named in ([`super::parse_policy_target`]) less the thing group. AWS publishes
-/// no sentence for this refusal and no recorded call names one, so the fixed text is this
-/// emulator's rendering of that documented rule; the variable part is the value the request
-/// sent.
-pub fn unsupported_thing_principal_message(principal: &str) -> String {
+/// `AttachThingPrincipal$principal` is "The principal, which can be a certificate ARN (as
+/// returned from the CreateCertificate operation) or an Amazon Cognito ID", so a value in
+/// neither form names no KIND of principal at all — which is what the sentence says. The
+/// fixed text names that, and the only variable part is the value the request sent, echoed
+/// verbatim.
+pub fn invalid_principal_type_message(principal: &str) -> String {
+    format!("Invalid principal type: {principal}")
+}
+
+/// How `ListThingPrincipals` states that the thing whose principals it was asked for is one
+/// the registry does not hold.
+///
+/// The LISTING words the miss after the call that failed too, the way the two writes do
+/// ([`ThingPrincipalRefusal::message`]), so the sentence names the listing rather than the
+/// thing family: fixed text, with the `thingName` the URI label carried as its only variable
+/// part, no account qualification and no trailing period. AWS leaves NO space between
+/// `thing` and the name, so the template carries none either.
+pub fn listing_missing_thing_message(thing_name: &str) -> String {
     format!(
-        "Invalid principal: {principal}. A thing principal is a certificate ARN or an \
-         Amazon Cognito identity of the form region:id"
+        "Failed to list principals for thing{thing_name} because the thing does not exist \
+         in your account"
     )
+}
+
+/// Why a value bound where this service takes a thing principal names no principal of this
+/// account: the question the RELATION asks of the value, before any operation words it
+/// ([`ThingPrincipalRefusal`]).
+///
+/// Two outcomes, because they are two different conditions for a caller: a value that is no
+/// address cannot name a principal however the account grows, while an address the account
+/// holds no principal under names one that could be created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThingPrincipalLookup {
+    /// The value is no principal address at all: neither an ARN nor the `<region>:<id>`
+    /// form an Amazon Cognito identity is named in.
+    InvalidType,
+    /// A well-formed address naming no principal this account holds.
+    Missing,
+}
+
+impl ThingPrincipalLookup {
+    /// The refusal a write of the relation answers this lookup failure with: the value the
+    /// request carried and the thing it addressed are what the sentences name.
+    pub fn refusal(self, principal: &str, thing_name: &str) -> ThingPrincipalRefusal {
+        match self {
+            Self::InvalidType => ThingPrincipalRefusal::InvalidPrincipalType {
+                principal: principal.to_string(),
+            },
+            Self::Missing => ThingPrincipalRefusal::MissingPrincipal {
+                principal: principal.to_string(),
+                thing_name: thing_name.to_string(),
+            },
+        }
+    }
+}
+
+/// Which lookup failure a value that reads as no principal of this account is.
+///
+/// A well-formed ARN ADDRESSES a resource, so a principal the account holds none of under
+/// it is a lookup miss — whatever resource type the ARN names, since none of them is a
+/// principal of a thing unless the account holds it — while a value that is no ARN and no
+/// Cognito identity addresses nothing at all. The fields are read through the one ARN parse
+/// the services share (`service_common::arn`), so what counts as an address here is what
+/// counts as one everywhere else.
+fn principal_address_lookup(principal: &str) -> ThingPrincipalLookup {
+    if ::service_common::arn::parse(principal).is_some() {
+        ThingPrincipalLookup::Missing
+    } else {
+        ThingPrincipalLookup::InvalidType
+    }
 }
 
 /// The message a delete of a THING that still has a principal attached is refused with.
@@ -181,7 +336,7 @@ impl super::ComAmazonawsIotAwsiotserviceState {
     pub fn resolve_thing_principal(
         &self,
         principal: &str,
-    ) -> Result<ResolvedThingPrincipal, ThingPrincipalRefusal> {
+    ) -> Result<ResolvedThingPrincipal, ThingPrincipalLookup> {
         let named = match super::parse_policy_target(principal) {
             Ok(super::PolicyTarget::Certificate(certificate_id)) => {
                 ThingPrincipal::Certificate(certificate_id)
@@ -190,19 +345,18 @@ impl super::ComAmazonawsIotAwsiotserviceState {
                 ThingPrincipal::CognitoIdentity(identity)
             }
             // A thing GROUP is a target a policy attaches to and no principal a thing is
-            // reached through, so its ARN is refused here exactly as an unreadable value is.
+            // reached through, and an ARN of any other resource names no principal of this
+            // account either — but each of them ADDRESSES something, so what separates the
+            // two refusals is whether the value is an address at all and not which resource
+            // type it names.
             Ok(super::PolicyTarget::ThingGroup(_)) | Err(_) => {
-                return Err(ThingPrincipalRefusal::Invalid(
-                    unsupported_thing_principal_message(principal),
-                ))
+                return Err(principal_address_lookup(principal))
             }
         };
         let reported = match &named {
             ThingPrincipal::Certificate(certificate_id) => {
                 let Some(certificate) = self.certificates.get(certificate_id) else {
-                    return Err(ThingPrincipalRefusal::NotFound(
-                        super::missing_certificate_target_message(),
-                    ));
+                    return Err(ThingPrincipalLookup::Missing);
                 };
                 certificate.certificate_arn.clone()
             }
@@ -236,8 +390,11 @@ impl super::ComAmazonawsIotAwsiotserviceState {
         if thing.principals.contains_key(&principal.key) {
             return None;
         }
-        (thing.principals.len() >= MAX_PRINCIPALS_PER_THING)
-            .then(|| ThingPrincipalRefusal::TooManyPrincipals(thing_name.to_string()))
+        (thing.principals.len() >= MAX_PRINCIPALS_PER_THING).then(|| {
+            ThingPrincipalRefusal::TooManyPrincipals {
+                thing_name: thing_name.to_string(),
+            }
+        })
     }
 
     /// Record that the already resolved `principal` is attached to the thing `thing_name`:
@@ -255,7 +412,13 @@ impl super::ComAmazonawsIotAwsiotserviceState {
         thing_principal_type: Option<&str>,
     ) -> Result<(), ThingPrincipalRefusal> {
         if !self.things.contains_key(thing_name) {
-            return Err(ThingPrincipalRefusal::MissingThing(thing_name.to_string()));
+            // This writer is handed the principal already RESOLVED, so the form it names in
+            // the sentence is the one the relation reports; its callers resolve the thing
+            // first, so a request's own value is what a caller actually sees named.
+            return Err(ThingPrincipalRefusal::MissingThing {
+                principal: principal.reported.clone(),
+                thing_name: thing_name.to_string(),
+            });
         }
         if let Some(refusal) = self.thing_principal_refusal_for(thing_name, principal) {
             return Err(refusal);
@@ -292,9 +455,14 @@ impl super::ComAmazonawsIotAwsiotserviceState {
         thing_principal_type: Option<&str>,
     ) -> Result<ResolvedThingPrincipal, ThingPrincipalRefusal> {
         if !self.things.contains_key(thing_name) {
-            return Err(ThingPrincipalRefusal::MissingThing(thing_name.to_string()));
+            return Err(ThingPrincipalRefusal::MissingThing {
+                principal: principal.to_string(),
+                thing_name: thing_name.to_string(),
+            });
         }
-        let resolved = self.resolve_thing_principal(principal)?;
+        let resolved = self
+            .resolve_thing_principal(principal)
+            .map_err(|lookup| lookup.refusal(principal, thing_name))?;
         self.record_thing_principal(thing_name, &resolved, thing_principal_type)?;
         Ok(resolved)
     }
@@ -312,9 +480,14 @@ impl super::ComAmazonawsIotAwsiotserviceState {
         principal: &str,
     ) -> Result<bool, ThingPrincipalRefusal> {
         if !self.things.contains_key(thing_name) {
-            return Err(ThingPrincipalRefusal::MissingThing(thing_name.to_string()));
+            return Err(ThingPrincipalRefusal::MissingThing {
+                principal: principal.to_string(),
+                thing_name: thing_name.to_string(),
+            });
         }
-        let resolved = self.resolve_thing_principal(principal)?;
+        let resolved = self
+            .resolve_thing_principal(principal)
+            .map_err(|lookup| lookup.refusal(principal, thing_name))?;
         Ok(self
             .things
             .get_mut(thing_name)

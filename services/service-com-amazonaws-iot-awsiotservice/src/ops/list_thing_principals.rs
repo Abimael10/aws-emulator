@@ -181,12 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         // The thing is the resource the listing is OF, so a name the registry does not hold
-        // is the modelled 404 in this family's own wording ([`crate::state::not_found`]) and
-        // never an empty page.
+        // is the modelled 404 in THIS LISTING's own wording
+        // ([`crate::state::listing_missing_thing_message`]) and never an empty page.
         if !store.things.contains_key(&input.thing_name) {
             return Err(ListThingPrincipalsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::missing_thing_message(&input.thing_name)),
+                    message: Some(crate::state::listing_missing_thing_message(
+                        &input.thing_name,
+                    )),
                 },
             )
             .into());

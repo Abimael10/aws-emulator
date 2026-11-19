@@ -344,7 +344,9 @@ pub fn provision_template(
         if let Some(refusal) =
             store.thing_principal_refusal_for(&thing.thing_name, &certificate.principal)
         {
-            return Err(ProvisioningRefusal::Resource(refusal.message()));
+            return Err(ProvisioningRefusal::Resource(
+                refusal.message(super::ThingPrincipalWrite::Attach),
+            ));
         }
     }
 
@@ -390,7 +392,9 @@ pub fn provision_template(
         // refuse until the caller detaches the certificate, exactly as AWS IoT refuses it.
         store
             .record_thing_principal(&thing_name, &certificate.principal, None)
-            .map_err(|refusal| ProvisioningRefusal::Resource(refusal.message()))?;
+            .map_err(|refusal| {
+                ProvisioningRefusal::Resource(refusal.message(super::ThingPrincipalWrite::Attach))
+            })?;
 
         // Recorded in the one relation `AttachPolicy` writes and `ListAttachedPolicies`
         // reads; the plan has read its ceilings, so this cannot refuse either.
@@ -542,9 +546,13 @@ fn planned_certificate(
 
     // It is also the principal the provisioned THING is reached through, so what it is in
     // the thing-principal relation ([`super::thing_principals`]) is resolved here beside it.
+    // The ARN is the one the record just read carries, so the only way the relation does not
+    // resolve it is the certificate not being held — which is what this path states.
     let principal = store
         .resolve_thing_principal(&record.certificate_arn)
-        .map_err(|refusal| ProvisioningRefusal::Resource(refusal.message()))?;
+        .map_err(|_| {
+            ProvisioningRefusal::Resource(unheld_certificate_message(named_id.as_deref()))
+        })?;
 
     Ok(PlannedCertificate {
         logical_id: resource.logical_id.clone(),

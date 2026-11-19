@@ -7,11 +7,12 @@
 //! ([`crate::state::thing_principals`]), so `ListThingPrincipals` of that thing stops
 //! reporting it and the deletes that relation gates stop refusing.
 //!
-//! A `thingName` the registry does not hold, and a principal this account holds no
-//! certificate for, are each the modelled `ResourceNotFoundException` (404); a value that
-//! is no principal address at all is the modelled `InvalidRequestException` (400). A
-//! principal that is NOT attached removes nothing and succeeds — the detach names no
-//! identity, so the thing holds the same attachments afterwards however often it is called.
+//! A `thingName` the registry does not hold, and a well-formed principal address this
+//! account holds no principal under, are each the modelled `ResourceNotFoundException`
+//! (404); a value that is no principal address at all is the modelled
+//! `InvalidRequestException` (400). A principal that is NOT attached removes nothing and
+//! succeeds — the detach names no identity, so the thing holds the same attachments
+//! afterwards however often it is called.
 //!
 //! "This call is asynchronous. It might take several seconds for the detachment to
 //! propagate" is about AWS's own propagation and not about the registry: the record this
@@ -172,20 +173,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .detach_thing_principal(&input.thing_name, &input.principal);
 
         if let Err(refusal) = detached {
-            let message = Some(refusal.message());
-            return Err(match refusal {
-                crate::state::ThingPrincipalRefusal::MissingThing(_)
-                | crate::state::ThingPrincipalRefusal::NotFound(_) => {
-                    DetachThingPrincipalErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException { message },
-                    )
-                }
-                crate::state::ThingPrincipalRefusal::Invalid(_)
-                | crate::state::ThingPrincipalRefusal::TooManyPrincipals(_) => {
-                    DetachThingPrincipalErrorModeled::InvalidRequestException(
-                        InvalidRequestException { message },
-                    )
-                }
+            let message = Some(refusal.message(crate::state::ThingPrincipalWrite::Detach));
+            // Which class the refusal is, is the relation's own answer
+            // ([`crate::state::ThingPrincipalRefusal::is_missing_resource`]), so the two
+            // writes of the relation cannot split one condition two ways.
+            return Err(if refusal.is_missing_resource() {
+                DetachThingPrincipalErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException { message },
+                )
+            } else {
+                DetachThingPrincipalErrorModeled::InvalidRequestException(
+                    InvalidRequestException { message },
+                )
             }
             .into());
         }

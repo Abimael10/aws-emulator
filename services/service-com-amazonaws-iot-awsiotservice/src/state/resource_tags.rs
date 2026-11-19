@@ -285,10 +285,15 @@ impl TaggedResource {
 
     /// How the tag plane states that this ARN names no resource the account holds: the
     /// sentence the resource's OWN family refuses a lookup miss with, so a tag call and a
-    /// describe of the same missing resource are told the same thing.
+    /// describe of the same missing resource are told the same thing — less the families
+    /// the service itself words the two planes differently for, where this plane's half is
+    /// the one named here ([`super::not_found`]).
     pub fn missing_message(&self) -> String {
         match self {
-            Self::ThingGroup(name) => super::missing_thing_group_message(name),
+            // The THING GROUP family is one AWS words the two planes apart for: a tag call
+            // addressing a group by ARN is told this plane's sentence and not the one a
+            // reader or writer of the group itself is told.
+            Self::ThingGroup(name) => super::tagged_thing_group_not_found_message(name),
             Self::ThingType(name) => super::missing_thing_type_message(name),
             Self::Policy(name) => super::missing_policy_message(name),
             Self::Authorizer(name) => super::missing_authorizer_message(name),

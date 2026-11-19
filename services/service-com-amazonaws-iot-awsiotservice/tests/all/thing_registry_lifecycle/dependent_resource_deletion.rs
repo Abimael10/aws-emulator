@@ -421,9 +421,32 @@ fn missing_group_message(thing_group_name: &str) -> String {
     format!("ThingGroup {ACCOUNT_ID}:{thing_group_name} not found.")
 }
 
-/// The same sentence for the thing family.
-fn missing_thing_message(thing_name: &str) -> String {
-    format!("Thing {ACCOUNT_ID}:{thing_name} not found.")
+/// The sentence `AttachThingPrincipal` states a `thingName` the registry does not hold
+/// with: the action that failed, the principal the request carried and the thing it
+/// addressed, with no account qualification and no trailing period.
+fn attach_missing_thing_message(principal: &str, thing_name: &str) -> String {
+    format!(
+        "Failed to attach the principal {principal} to thing {thing_name} because the thing \
+         does not exist in your account"
+    )
+}
+
+/// The sentence `ListThingPrincipals` states a `thingName` the registry does not hold with.
+/// AWS leaves no space between `thing` and the name.
+fn list_principals_missing_thing_message(thing_name: &str) -> String {
+    format!(
+        "Failed to list principals for thing{thing_name} because the thing does not exist in \
+         your account"
+    )
+}
+
+/// The sentence `AttachThingPrincipal` states a well-formed principal address this account
+/// holds no principal under with.
+fn attach_missing_principal_message(principal: &str, thing_name: &str) -> String {
+    format!(
+        "Can't attach the principal {principal} to thing {thing_name} because the principal \
+         does not exist in your account"
+    )
 }
 
 /// The sentence this family states a thing-group version conflict with: the group the
@@ -610,9 +633,9 @@ async fn a_listing_of_a_things_principals_pages_and_refuses_an_unregistered_thin
         );
         assert_eq!(
             missing.message(),
-            missing_thing_message(unregistered),
+            list_principals_missing_thing_message(unregistered),
             "case {unregistered:?}: expected {:?}, got {missing:?}",
-            missing_thing_message(unregistered)
+            list_principals_missing_thing_message(unregistered)
         );
     }
 }
@@ -639,20 +662,41 @@ async fn attaching_a_principal_nothing_holds_is_refused() {
             Some("ResourceNotFoundException"),
             "case {principal:?}: expected ResourceNotFoundException, got {refused:?}"
         );
+        assert_eq!(
+            refused.message(),
+            attach_missing_principal_message(&principal, thing_name),
+            "case {principal:?}: expected {:?}, got {refused:?}",
+            attach_missing_principal_message(&principal, thing_name)
+        );
     }
 
-    // A value that is no principal address at all — and a thing-group ARN, which is a target
-    // a POLICY attaches to and no principal a thing is reached through — is the modelled 400.
+    // An ARN of any OTHER resource addresses something too, and this account holds no
+    // principal under it either, so it is the same modelled 404 and not a syntax refusal.
     for principal in [
-        "not-an-arn".to_string(),
         format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thinggroup/factory"),
         format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thing/{thing_name}"),
     ] {
         let refused = emulator.attach_principal(thing_name, &principal, None).await;
         assert_eq!(
-            refused.status, 400,
-            "case {principal:?}: attaching a value that is no principal must be refused 400, \
-             got {refused:?}"
+            (refused.status, refused.message()),
+            (
+                404,
+                attach_missing_principal_message(&principal, thing_name)
+            ),
+            "case {principal:?}: a well-formed address naming no principal must be refused \
+             404, got {refused:?}"
+        );
+    }
+
+    // A value that is no principal address at all names no principal in any account, so it
+    // is the modelled 400.
+    for principal in ["not-an-arn".to_string(), "f".repeat(64)] {
+        let refused = emulator.attach_principal(thing_name, &principal, None).await;
+        assert_eq!(
+            (refused.status, refused.message()),
+            (400, format!("Invalid principal type: {principal}")),
+            "case {principal:?}: attaching a value that is no principal address must be \
+             refused 400, got {refused:?}"
         );
     }
 
@@ -667,9 +711,9 @@ async fn attaching_a_principal_nothing_holds_is_refused() {
     );
     assert_eq!(
         missing.message(),
-        missing_thing_message("never-created"),
+        attach_missing_thing_message(COGNITO_IDENTITIES[0], "never-created"),
         "case \"an unregistered thing\": expected {:?}, got {missing:?}",
-        missing_thing_message("never-created")
+        attach_missing_thing_message(COGNITO_IDENTITIES[0], "never-created")
     );
 
     // Nothing above was recorded: the thing still holds no principal.

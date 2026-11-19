@@ -23,14 +23,20 @@
 //! cannot word the same miss three ways — which is the whole reason these sentences live
 //! here rather than in each handler.
 //!
-//! ONE family is SPLIT, because the service itself words its halves differently, and a
-//! split one is stated here too so both halves stay in this one place: the FLEET METRIC
-//! family, whose read states the registry families' account-qualified sentence
-//! ([`missing_fleet_metric_message`]) while its write states the name alone
-//! ([`fleet_metric_write_not_found_message`]) — `FleetMetric <metricName> doesn't exist`,
-//! which is what `UpdateFleetMetric` answers. A family is split here only on that
-//! evidence, never to let a handler phrase a miss its own way: a handler names the half
-//! it answers with and words nothing itself.
+//! TWO families are SPLIT, because the service itself words their halves differently, and a
+//! split one is stated here too so both halves stay in this one place:
+//!
+//! * the FLEET METRIC family, whose read states the registry families' account-qualified
+//!   sentence ([`missing_fleet_metric_message`]) while its write states the name alone
+//!   ([`fleet_metric_write_not_found_message`]) — `FleetMetric <metricName> doesn't exist`,
+//!   which is what `UpdateFleetMetric` answers;
+//! * the THING GROUP family, whose operations addressing the GROUP state the registry
+//!   families' sentence ([`missing_thing_group_message`]) while the operations addressing a
+//!   resource by ARN alone — the tagging plane — state
+//!   [`tagged_thing_group_not_found_message`].
+//!
+//! A family is split here only on that evidence, never to let a handler phrase a miss its
+//! own way: a handler names the half it answers with and words nothing itself.
 
 /// The sentence a REGISTRY family states a missing resource with: the resource noun, the
 /// account the call was made for, `:`, the name the request asked about, and a
@@ -60,6 +66,17 @@ pub fn missing_thing_message(thing_name: &str) -> String {
 /// holds — for a reader of one, a writer of one, and for a job whose target named it.
 pub fn missing_thing_group_message(thing_group_name: &str) -> String {
     registry_not_found("ThingGroup", thing_group_name)
+}
+
+/// How the TAG plane states that a `resourceArn` names no thing group this account holds.
+///
+/// The operations that address a resource by ARN ALONE — `TagResource`, `UntagResource`
+/// and `ListTagsForResource` — state this family's miss in their own sentence: the family
+/// noun as TWO words, the name the ARN carried, and ` does not exist.` The account is not
+/// named, unlike the sentence the operations addressing the GROUP state
+/// ([`missing_thing_group_message`]), and the sentence ends in a period.
+pub fn tagged_thing_group_not_found_message(thing_group_name: &str) -> String {
+    format!("Thing Group {thing_group_name} does not exist.")
 }
 
 /// How this service states that a `metricName` names no fleet metric this account

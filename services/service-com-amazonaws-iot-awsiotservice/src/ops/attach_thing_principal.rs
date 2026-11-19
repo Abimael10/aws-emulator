@@ -7,10 +7,12 @@
 //! `ListThingPrincipals` of that thing reports it afterwards and the two deletes the
 //! relation gates — of the thing and of the certificate — refuse while it stands.
 //!
-//! Both ends have to exist: a `thingName` the registry does not hold and a principal this
-//! account holds no certificate for are each the modelled `ResourceNotFoundException`
-//! (404), while a value that is no principal address at all, and a thing already holding as
-//! many principals as the relation takes, are the modelled `InvalidRequestException` (400).
+//! Both ends have to exist: a `thingName` the registry does not hold and a well-formed
+//! principal address this account holds no principal under are each the modelled
+//! `ResourceNotFoundException` (404), while a value that is no principal address at all,
+//! and a thing already holding as many principals as the relation takes, are the modelled
+//! `InvalidRequestException` (400). Each is stated in this call's own wording, naming the
+//! principal the request carried and the thing it addressed.
 //! The attach is IDEMPOTENT: the pair is keyed by the resource the principal names, so
 //! repeating it leaves the same one attachment.
 //!
@@ -175,23 +177,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.thing_principal_type.as_deref(),
         );
 
-        // Each refusal is answered as the error class the model declares for it, with the one
-        // sentence the state words it in, rather than as a hollow success.
+        // Each refusal is answered as the error class the relation declares for it
+        // ([`crate::state::ThingPrincipalRefusal::is_missing_resource`]: a resource one end
+        // names and this account does not hold is the modelled 404, and everything else the
+        // relation refuses is a request to be fixed), with the one sentence it words that in
+        // FOR THIS CALL, rather than as a hollow success.
         if let Err(refusal) = recorded {
-            let message = Some(refusal.message());
-            return Err(match refusal {
-                crate::state::ThingPrincipalRefusal::MissingThing(_)
-                | crate::state::ThingPrincipalRefusal::NotFound(_) => {
-                    AttachThingPrincipalErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException { message },
-                    )
-                }
-                crate::state::ThingPrincipalRefusal::Invalid(_)
-                | crate::state::ThingPrincipalRefusal::TooManyPrincipals(_) => {
-                    AttachThingPrincipalErrorModeled::InvalidRequestException(
-                        InvalidRequestException { message },
-                    )
-                }
+            let message = Some(refusal.message(crate::state::ThingPrincipalWrite::Attach));
+            return Err(if refusal.is_missing_resource() {
+                AttachThingPrincipalErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException { message },
+                )
+            } else {
+                AttachThingPrincipalErrorModeled::InvalidRequestException(
+                    InvalidRequestException { message },
+                )
             }
             .into());
         }

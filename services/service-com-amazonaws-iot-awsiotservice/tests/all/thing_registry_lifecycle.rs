@@ -38,6 +38,14 @@ use smithy_server_runtime::MultiServiceRouter;
 #[path = "thing_registry_lifecycle/dependent_resource_deletion.rs"]
 mod dependent_resource_deletion;
 
+/// HOW the thing-principal relation and the tag plane WORD a refusal — the sentence each
+/// call states a missing thing, an unresolvable principal and a missing thing group in, and
+/// which of the two modelled classes each condition is. A child of THIS suite for the reason
+/// the deletions are: it is coverage of the same registry resources, and the `#[path]` is
+/// what keeps it one.
+#[path = "thing_registry_lifecycle/principal_refusal_wording.rs"]
+mod principal_refusal_wording;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.

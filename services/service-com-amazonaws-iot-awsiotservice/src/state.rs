@@ -3203,8 +3203,9 @@ pub use thing_update::{AttributeUpdate, ThingUpdate, ThingUpdateRefusal};
 // re-exported here so a handler reaches them as `crate::state::<name>`.
 pub mod thing_principals;
 pub use thing_principals::{
-    attached_principals_thing_deletion_message, unsupported_thing_principal_message,
-    ResolvedThingPrincipal, ThingPrincipal, ThingPrincipalAttachment, ThingPrincipalRefusal,
+    attached_principals_thing_deletion_message, invalid_principal_type_message,
+    listing_missing_thing_message, ResolvedThingPrincipal, ThingPrincipal,
+    ThingPrincipalAttachment, ThingPrincipalLookup, ThingPrincipalRefusal, ThingPrincipalWrite,
     DEFAULT_THING_PRINCIPAL_TYPE, MAX_PRINCIPALS_PER_THING,
 };
 
@@ -3349,8 +3350,9 @@ pub use not_found::{
     missing_audit_task_message, missing_authorizer_message, missing_command_message,
     missing_fleet_metric_message, missing_job_execution_job_message, missing_job_execution_message,
     missing_job_message, missing_job_template_message, missing_thing_group_message,
-    missing_thing_message, missing_thing_type_message, unauthorized_topic_rule_message,
-    unrecognized_index_name_message, MISSING_THING_REGISTRATION_TASK_MESSAGE,
+    missing_thing_message, missing_thing_type_message, tagged_thing_group_not_found_message,
+    unauthorized_topic_rule_message, unrecognized_index_name_message,
+    MISSING_THING_REGISTRATION_TASK_MESSAGE,
 };
 
 // How a create whose name is already taken is REFUSED — the fixed sentence each resource

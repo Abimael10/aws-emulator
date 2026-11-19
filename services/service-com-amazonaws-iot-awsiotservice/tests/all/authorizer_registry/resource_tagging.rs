@@ -269,7 +269,7 @@ fn families() -> Vec<Family> {
             arn: iot_arn("thinggroup/fleet-alpha"),
             created: vec![("stage", Some("test"))],
             absent_value: None,
-            missing: format!("ThingGroup {ACCOUNT_ID}:fleet-alpha not found."),
+            missing: "Thing Group fleet-alpha does not exist.".to_string(),
         },
         Family {
             label: "thing type",
