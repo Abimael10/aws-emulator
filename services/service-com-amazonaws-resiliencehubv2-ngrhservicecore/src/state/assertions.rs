@@ -15,9 +15,9 @@
 
 use std::time::SystemTime;
 
-use crate::ops::types::Assertion;
+use crate::ops::types::{Assertion, ResourceNotFoundException};
 
-use super::{to_date_time, ServiceRecord};
+use super::{not_found_message, to_date_time, ServiceRecord};
 
 /// `AssertionSource`'s value for an assertion a CALLER created, as opposed to the
 /// `AI_GENERATED` one the assessment pipeline produces — the two values
@@ -92,6 +92,24 @@ impl ServiceRecord {
         let mut assertions: Vec<&AssertionRecord> = self.assertions.values().collect();
         assertions.sort_by_key(|assertion| assertion.sequence);
         assertions
+    }
+}
+
+/// `resourceType` for an assertion — the `Assertion` shape's own name, which is what the
+/// type member of a refusal reports. The prose a refusal's MESSAGE names the resource with
+/// is the same word here, so one constant serves both.
+pub const ASSERTION_RESOURCE_TYPE: &str = "Assertion";
+
+/// The refusal for an `assertionId` that names no stored assertion of its service.
+///
+/// An assertion is identified by that id within its service rather than by an ARN of its
+/// own, so the id is both the `resourceId` and what the message names — the same shape the
+/// refusal for a service function or a user journey takes.
+pub fn assertion_not_found(assertion_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: not_found_message(ASSERTION_RESOURCE_TYPE, assertion_id),
+        resource_id: Some(assertion_id.to_string()),
+        resource_type: Some(ASSERTION_RESOURCE_TYPE.to_string()),
     }
 }
 

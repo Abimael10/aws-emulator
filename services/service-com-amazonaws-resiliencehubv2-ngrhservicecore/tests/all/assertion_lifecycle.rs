@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The `Assertion` lifecycle, end to end over HTTP: `CreateAssertion` -> `ListAssertions`,
-//! and the cascade `DeleteService` performs over the assertions a service holds.
+//! The `Assertion` lifecycle, end to end over HTTP: `CreateAssertion` -> `UpdateAssertion`
+//! -> `ListAssertions`, and the cascade `DeleteService` performs over the assertions a
+//! service holds.
 //!
 //! The rule under test: a resilience assertion is a child of exactly one service, so a
 //! create stores it under that service's record and every member of the `Assertion` it
@@ -12,6 +13,14 @@
 //! no stored service is refused `ResourceNotFoundException`, a replayed `clientToken`
 //! answers the assertion the first call created, and deleting the service removes its
 //! assertions with it.
+//!
+//! An EDIT follows from the same rule: `UpdateAssertion` replaces the addressed record's
+//! stored `text` with the text the request supplied and stamps `updatedAt`, leaving its
+//! `assertionId`, `source` and `createdAt` where they were, and `DeleteAssertion` removes
+//! the addressed record and answers its id — so every later read of that assertion, the
+//! listing included, reports the edit and no longer reports the removed one; a `serviceArn`
+//! or an `assertionId` naming nothing stored is refused `ResourceNotFoundException` and
+//! changes nothing.
 //!
 //! Every suite drives the real wire path (`MultiServiceRouter::dispatch`), so the modelled
 //! constraints, the restJson1 (de)serializers and the HTTP status codes are exercised
@@ -34,6 +43,8 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The modelled routes this suite drives.
 const CREATE_SERVICE: &str = "/v2/create-service";
 const CREATE_ASSERTION: &str = "/v2/create-assertion";
+const UPDATE_ASSERTION: &str = "/v2/update-assertion";
+const DELETE_ASSERTION: &str = "/v2/delete-assertion";
 const DELETE_SERVICE: &str = "/v2/delete-service";
 const LIST_ASSERTIONS: &str = "/v2/list-assertions";
 
@@ -115,6 +126,24 @@ async fn create_service(router: &MultiServiceRouter, name: &str) -> String {
 
 async fn create_assertion(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
     call(router, "POST", CREATE_ASSERTION, Some(body)).await
+}
+
+async fn update_assertion(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
+    call(router, "POST", UPDATE_ASSERTION, Some(body)).await
+}
+
+async fn delete_assertion(
+    router: &MultiServiceRouter,
+    service_arn: &str,
+    assertion_id: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        DELETE_ASSERTION,
+        Some(json!({"serviceArn": service_arn, "assertionId": assertion_id})),
+    )
+    .await
 }
 
 async fn list_assertions(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
@@ -704,6 +733,538 @@ async fn deleting_a_service_cascades_to_the_assertions_it_holds() {
         assert!(
             assertions.is_empty(),
             "case {case:?}: a freshly created service holds no assertions, got {assertions:?}"
+        );
+    }
+}
+
+/// The text an assertion under edit carries before the edit: one row of the create class,
+/// so the replacement is what every edit suite varies.
+const TEXT_BEFORE_THE_EDIT: &str = "Survives the loss of one Availability Zone.";
+
+/// A well-formed `Uuid` that identifies no assertion of any service in a fresh emulator.
+///
+/// SOURCE: `smithy_query(query="operation", operation="UpdateAssertion")` reports
+/// `assertionId` targeting `Uuid` with `length {min: 36, max: 36}` and pattern
+/// `^[0-9a-f]{8}-[0-9a-f]{4}-[0-5][0-9a-f]{3}-[089ab][0-9a-f]{3}-[0-9a-f]{12}$`, which this
+/// value satisfies — so it reaches the handler rather than being refused at the boundary.
+const UNUSED_ASSERTION_ID: &str = "0ac1f2e3-4b5d-4c6e-8f90-1a2b3c4d5e6f";
+
+/// Assert that `edited` is the assertion `at_create` created, now carrying `text`.
+///
+/// An edit replaces the stored text and stamps the instant of the edit; everything that
+/// says WHICH assertion this is and where it came from — its id, its parent service, its
+/// `source` and its `createdAt` — is left exactly where the create put it.
+fn assert_edited(case: &str, text: &str, service_arn: &str, at_create: &Value, edited: &Value) {
+    assert_eq!(
+        edited["text"].as_str(),
+        Some(text),
+        "case {case:?}: expected the text the edit supplied, got {:?}",
+        edited["text"]
+    );
+    for member in ["assertionId", "source", "createdAt"] {
+        assert_eq!(
+            edited[member], at_create[member],
+            "case {case:?}: an edit leaves {member} where the create put it, expected {:?}, got \
+             {:?}",
+            at_create[member], edited[member]
+        );
+    }
+    assert_eq!(
+        edited["serviceArn"].as_str(),
+        Some(service_arn),
+        "case {case:?}: expected the parent service's ARN, got {:?}",
+        edited["serviceArn"]
+    );
+    assert!(
+        edited["updatedAt"].as_f64() >= edited["createdAt"].as_f64(),
+        "case {case:?}: updatedAt must not precede createdAt, got {:?} and {:?}",
+        edited["updatedAt"],
+        edited["createdAt"]
+    );
+}
+
+/// The assertion carrying `assertion_id` in `service_arn`'s listing.
+async fn listed_assertion(
+    router: &MultiServiceRouter,
+    case: &str,
+    service_arn: &str,
+    assertion_id: &str,
+) -> Value {
+    let (status, body) = list_assertions(router, &format!("serviceArn={service_arn}")).await;
+    let assertions = listed(case, status, &body);
+    assertions
+        .iter()
+        .find(|assertion| assertion["assertionId"].as_str() == Some(assertion_id))
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: no assertion {assertion_id} in the listing {assertions:?}")
+        })
+        .clone()
+}
+
+/// Create one assertion carrying [`TEXT_BEFORE_THE_EDIT`] under `service_arn` and answer
+/// the `Assertion` the create projected.
+async fn create_one(router: &MultiServiceRouter, case: &str, service_arn: &str) -> Value {
+    let (status, body) = create_assertion(
+        router,
+        json!({"serviceArn": service_arn, "text": TEXT_BEFORE_THE_EDIT}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from CreateAssertion, got {status} {body:?}"
+    );
+    body["assertion"].clone()
+}
+
+#[tokio::test]
+async fn an_edit_replaces_the_stored_text_for_every_later_read() {
+    let router = emulator();
+    let service_arn = create_service(&router, "Edited").await;
+
+    // The rows differ along the shape and length of the REPLACEMENT text across
+    // `AssertionText`'s modelled range (the same class the create table spans), plus an
+    // edit to the text the assertion already carries — still an edit, and still readable
+    // back.
+    let mut rows = text_rows();
+    rows.push((
+        "the text it already carries",
+        TEXT_BEFORE_THE_EDIT.to_string(),
+    ));
+
+    for (case, replacement) in &rows {
+        let at_create = create_one(&router, case, &service_arn).await;
+        let assertion_id = at_create["assertionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no assertionId in {at_create:?}"))
+            .to_string();
+
+        let (status, body) = update_assertion(
+            &router,
+            json!({
+                "serviceArn": service_arn,
+                "assertionId": assertion_id,
+                "text": replacement,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from UpdateAssertion, got {status} {body:?}"
+        );
+        let edited = body["assertion"].clone();
+        assert!(
+            !edited.is_null(),
+            "case {case:?}: the @required assertion member is absent from {body:?}"
+        );
+        assert_edited(case, replacement, &service_arn, &at_create, &edited);
+
+        // The ROUND TRIP: the listing projects what the edit stored, not what the create
+        // did, and a second read answers the same thing — the edit is in the store.
+        let from_list = listed_assertion(&router, case, &service_arn, &assertion_id).await;
+        assert_eq!(
+            from_list, edited,
+            "case {case:?}: the listing must project the record the edit wrote, got \
+             {from_list:?}"
+        );
+        let again = listed_assertion(&router, case, &service_arn, &assertion_id).await;
+        assert_eq!(
+            again, from_list,
+            "case {case:?}: two reads of an edited assertion must answer identically, got \
+             {again:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_edit_that_omits_text_leaves_the_stored_text_where_it_was() {
+    let router = emulator();
+    let service_arn = create_service(&router, "Untouched").await;
+
+    // `text` is the one optional member of the request, so an edit that omits it asks for
+    // no new text: the stored text stays, whatever it is, and the call still reports the
+    // stored assertion. The rows differ along the text that was stored before the edit —
+    // the same class the create table spans.
+    for (case, stored) in text_rows() {
+        let (status, body) = create_assertion(
+            &router,
+            json!({"serviceArn": service_arn, "text": stored}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from CreateAssertion, got {status} {body:?}"
+        );
+        let at_create = body["assertion"].clone();
+        let assertion_id = at_create["assertionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no assertionId in {at_create:?}"))
+            .to_string();
+
+        let (status, body) = update_assertion(
+            &router,
+            json!({"serviceArn": service_arn, "assertionId": assertion_id}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from UpdateAssertion, got {status} {body:?}"
+        );
+        assert_edited(case, &stored, &service_arn, &at_create, &body["assertion"]);
+
+        let from_list = listed_assertion(&router, case, &service_arn, &assertion_id).await;
+        assert_eq!(
+            from_list["text"].as_str(),
+            Some(stored.as_str()),
+            "case {case:?}: the stored text must survive an edit that supplied none, got {:?}",
+            from_list["text"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_edit_reaches_only_the_assertion_it_names() {
+    let router = emulator();
+    let other_service = create_service(&router, "Bystander").await;
+
+    // The rows differ along how many assertions the edited service holds beside the one
+    // under edit, and which position in creation order the edit lands on.
+    for (case, sibling_count, position) in [
+        ("the only assertion", 0usize, 0usize),
+        ("the first of three", 2, 0),
+        ("the last of three", 2, 2),
+    ] {
+        let service_arn = create_service(&router, &case.replace(' ', "-")).await;
+        let mut ids: Vec<String> = Vec::new();
+        for _ in 0..=sibling_count {
+            let created = create_one(&router, case, &service_arn).await;
+            ids.push(
+                created["assertionId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        let elsewhere = create_one(&router, case, &other_service).await;
+        let before: Vec<Value> = {
+            let (status, body) = list_assertions(&router, &format!("serviceArn={service_arn}")).await;
+            listed(case, status, &body)
+        };
+
+        let target = ids[position].clone();
+        let replacement = "Fails over to a second Region within the stated RTO.";
+        let (status, body) = update_assertion(
+            &router,
+            json!({"serviceArn": service_arn, "assertionId": target, "text": replacement}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from UpdateAssertion, got {status} {body:?}"
+        );
+
+        let after: Vec<Value> = {
+            let (status, body) = list_assertions(&router, &format!("serviceArn={service_arn}")).await;
+            listed(case, status, &body)
+        };
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "case {case:?}: an edit creates and removes nothing, got {after:?}"
+        );
+        for (index, (was, now)) in before.iter().zip(after.iter()).enumerate() {
+            assert_eq!(
+                now["assertionId"], was["assertionId"],
+                "case {case:?}: an edit keeps creation order, position {index} changed from \
+                 {was:?} to {now:?}"
+            );
+            if index == position {
+                assert_edited(case, replacement, &service_arn, was, now);
+            } else {
+                assert_eq!(
+                    now, was,
+                    "case {case:?}: the assertion at position {index} was not edited, got {now:?}"
+                );
+            }
+        }
+
+        // Another service's assertion is a different record, so the edit did not reach it.
+        let untouched = listed_assertion(
+            &router,
+            case,
+            &other_service,
+            elsewhere["assertionId"].as_str().unwrap_or_default(),
+        )
+        .await;
+        assert_eq!(
+            untouched, elsewhere,
+            "case {case:?}: an unrelated service's assertion must be untouched, got {untouched:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_edit_naming_nothing_stored_is_refused_and_changes_nothing() {
+    let router = emulator();
+    let service_arn = create_service(&router, "Stable").await;
+    let other_service = create_service(&router, "Neighbour").await;
+    let stored = create_one(&router, "the stored assertion", &service_arn).await;
+    let assertion_id = stored["assertionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    // An assertion of ANOTHER service: its id is well-formed and stored, just not here.
+    let foreign = create_one(&router, "another service's assertion", &other_service).await;
+    let foreign_id = foreign["assertionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let deleted = create_service(&router, "Retired").await;
+    let (status, body) = delete_service(&router, &deleted).await;
+    assert_eq!(status, 200, "deleting the service: got {status} {body:?}");
+
+    // The rows differ along WHICH half of the pair that addresses an assertion names
+    // nothing: the service, or the assertion within it.
+    for (case, target_service, target_assertion) in [
+        (
+            "a service never created",
+            format!("{service_arn}-absent"),
+            assertion_id.clone(),
+        ),
+        (
+            "a service created then deleted",
+            deleted.clone(),
+            assertion_id.clone(),
+        ),
+        (
+            "an assertionId no service holds",
+            service_arn.clone(),
+            UNUSED_ASSERTION_ID.to_string(),
+        ),
+        (
+            "another service's assertionId",
+            service_arn.clone(),
+            foreign_id.clone(),
+        ),
+    ] {
+        let (status, body) = update_assertion(
+            &router,
+            json!({
+                "serviceArn": target_service,
+                "assertionId": target_assertion,
+                "text": "An edit that must not be stored.",
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404 from UpdateAssertion, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+    }
+
+    // A refused edit wrote nothing: both assertions still read back exactly as created.
+    for (case, service, assertion) in [
+        ("the addressed service", &service_arn, &stored),
+        ("the neighbouring service", &other_service, &foreign),
+    ] {
+        let from_list = listed_assertion(
+            &router,
+            case,
+            service,
+            assertion["assertionId"].as_str().unwrap_or_default(),
+        )
+        .await;
+        assert_eq!(
+            &from_list, assertion,
+            "case {case:?}: a refused edit must leave the stored assertion untouched, got \
+             {from_list:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_assertion_leaves_the_store_and_every_later_read() {
+    let router = emulator();
+    let other_service = create_service(&router, "Neighbour").await;
+    let elsewhere = create_one(&router, "another service's assertion", &other_service).await;
+
+    // The rows differ along how many assertions the service held and which position in
+    // creation order the delete removed.
+    for (case, count, position) in [
+        ("the only assertion", 1usize, 0usize),
+        ("the first of three", 3, 0),
+        ("the middle of three", 3, 1),
+        ("the last of three", 3, 2),
+    ] {
+        let service_arn = create_service(&router, &case.replace(' ', "-")).await;
+        let mut ids: Vec<String> = Vec::new();
+        for _ in 0..count {
+            let created = create_one(&router, case, &service_arn).await;
+            ids.push(
+                created["assertionId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+
+        let removed = ids[position].clone();
+        let (status, body) = delete_assertion(&router, &service_arn, &removed).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DeleteAssertion, got {status} {body:?}"
+        );
+        assert_eq!(
+            body["assertionId"].as_str(),
+            Some(removed.as_str()),
+            "case {case:?}: expected the deleted assertion's id, got {body:?}"
+        );
+
+        // The listing no longer holds the removed record, holds every other one, and keeps
+        // creation order; the service's only assertion gone leaves the @required member as
+        // an empty list rather than absent.
+        let (status, body) = list_assertions(&router, &format!("serviceArn={service_arn}")).await;
+        let assertions = listed(case, status, &body);
+        let listed_ids: Vec<&str> = assertions
+            .iter()
+            .map(|assertion| assertion["assertionId"].as_str().unwrap_or_default())
+            .collect();
+        let expected: Vec<&str> = ids
+            .iter()
+            .filter(|id| *id != &removed)
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            listed_ids, expected,
+            "case {case:?}: expected the surviving assertions in creation order, got {body:?}"
+        );
+
+        // Deleting it again names nothing stored: the first delete removed it.
+        let (status, body) = delete_assertion(&router, &service_arn, &removed).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404 from a repeated DeleteAssertion, got {status} \
+             {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+
+        // And neither does editing it: a removed assertion cannot be edited.
+        let (status, body) = update_assertion(
+            &router,
+            json!({
+                "serviceArn": service_arn,
+                "assertionId": removed,
+                "text": "An edit of an assertion that is gone.",
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404 editing a deleted assertion, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+    }
+
+    // The deletes reached only the assertions they named: another service's is still there.
+    let untouched = listed_assertion(
+        &router,
+        "the neighbouring service",
+        &other_service,
+        elsewhere["assertionId"].as_str().unwrap_or_default(),
+    )
+    .await;
+    assert_eq!(
+        untouched, elsewhere,
+        "an unrelated service's assertion must survive another service's deletes, got \
+         {untouched:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_naming_nothing_stored_is_refused_and_removes_nothing() {
+    let router = emulator();
+    let service_arn = create_service(&router, "Keeper").await;
+    let other_service = create_service(&router, "Elsewhere").await;
+    let stored = create_one(&router, "the stored assertion", &service_arn).await;
+    let assertion_id = stored["assertionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let foreign = create_one(&router, "another service's assertion", &other_service).await;
+    let foreign_id = foreign["assertionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let deleted_service = create_service(&router, "Retired").await;
+    let (status, body) = delete_service(&router, &deleted_service).await;
+    assert_eq!(status, 200, "deleting the service: got {status} {body:?}");
+
+    // The rows differ along WHICH half of the pair that addresses an assertion names
+    // nothing: the service, or the assertion within it.
+    for (case, target_service, target_assertion) in [
+        (
+            "a service never created",
+            format!("{service_arn}-absent"),
+            assertion_id.clone(),
+        ),
+        (
+            "a service created then deleted",
+            deleted_service.clone(),
+            assertion_id.clone(),
+        ),
+        (
+            "an assertionId no service holds",
+            service_arn.clone(),
+            UNUSED_ASSERTION_ID.to_string(),
+        ),
+        (
+            "another service's assertionId",
+            service_arn.clone(),
+            foreign_id.clone(),
+        ),
+    ] {
+        let (status, body) = delete_assertion(&router, &target_service, &target_assertion).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404 from DeleteAssertion, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+    }
+
+    // A refused delete removed nothing: both assertions still read back as created.
+    for (case, service, assertion) in [
+        ("the addressed service", &service_arn, &stored),
+        ("the neighbouring service", &other_service, &foreign),
+    ] {
+        let from_list = listed_assertion(
+            &router,
+            case,
+            service,
+            assertion["assertionId"].as_str().unwrap_or_default(),
+        )
+        .await;
+        assert_eq!(
+            &from_list, assertion,
+            "case {case:?}: a refused delete must leave the stored assertion untouched, got \
+             {from_list:?}"
         );
     }
 }

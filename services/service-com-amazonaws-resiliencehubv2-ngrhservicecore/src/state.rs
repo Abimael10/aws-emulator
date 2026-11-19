@@ -55,8 +55,8 @@ mod tagging;
 mod user_journeys;
 
 pub use assertions::{
-    mint_assertion_id, AssertionIdempotencyRecord, AssertionRecord, ASSERTION_SOURCE_USER,
-    MAX_ASSERTIONS_PER_SERVICE,
+    assertion_not_found, mint_assertion_id, AssertionIdempotencyRecord, AssertionRecord,
+    ASSERTION_RESOURCE_TYPE, ASSERTION_SOURCE_USER, MAX_ASSERTIONS_PER_SERVICE,
 };
 pub use conflicts::{name_already_exists_message, two_requests_one_token_message};
 pub use input_sources::{

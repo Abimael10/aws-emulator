@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAssertion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAssertion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAssertion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Edits a resilience assertion IN PLACE in the store: the record the request names keeps
+//! its id, its source and its `createdAt`, takes the `text` the request supplied and is
+//! stamped with this instant, so every later read of that assertion — `ListAssertions`
+//! included — reports the edit. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +143,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAssertion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAssertionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAssertion"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateAssertionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An assertion lives inside its service's record, so the parent is resolved first:
+        // a `serviceArn` naming no service is a 404, not an edit of nothing.
+        let Some(service) = store.services.get_mut(&input.service_arn) else {
+            return Err(UpdateAssertionErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::SERVICE_RESOURCE_TYPE,
+                    &input.service_arn,
+                ),
+            )
+            .into());
+        };
+        // An `assertionId` the addressed service does not hold names nothing to edit — a
+        // 404 rather than a 200 that would claim an edit the store never took.
+        let Some(record) = service.assertions.get_mut(&input.assertion_id) else {
+            return Err(UpdateAssertionErrorModeled::ResourceNotFoundException(
+                crate::state::assertion_not_found(&input.assertion_id),
+            )
+            .into());
+        };
+
+        // `text` is the one member of this request beyond the pair that addresses the
+        // assertion, and it is optional: the "updated text content" the caller sent REPLACES
+        // the stored text, and a request that omits it leaves the text where it was. The
+        // modelled `length 1..1000` is already enforced at the boundary, so any text
+        // reaching here is a storable one.
+        if let Some(text) = input.text {
+            record.text = text;
+        }
+        // This call is the instant the assertion was last updated. `createdAt` stays where
+        // it was — the assertion was not created again — and so do `assertionId` and
+        // `source`, which say which assertion this is and which side produced it.
+        record.updated_at = now;
+
+        // The response is projected through the same path every later read answers from, so
+        // what this call reports and what `ListAssertions` reports cannot drift.
+        Ok(UpdateAssertionOutput {
+            assertion: record.to_assertion(&input.service_arn),
+        })
     }
 }
