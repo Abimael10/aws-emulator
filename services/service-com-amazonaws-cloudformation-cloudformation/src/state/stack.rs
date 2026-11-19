@@ -2930,6 +2930,10 @@ impl StoredStack {
     /// Nothing else about a barrier moves here: a SIGNAL is what satisfies one
     /// ([`Self::release_wait_conditions`]), and a barrier left behind by an operation that
     /// has already concluded belongs to no operation and is dropped.
+    ///
+    /// A failed CREATE is the one failure this cannot conclude at all: its rollback REMOVES
+    /// what the create had made in the services that own those resources, which is a call,
+    /// so the failure is left to the path that can make it ([`Self::fail_expired_wait`]).
     pub(super) fn settle_wait_conditions(&mut self, now: SystemTime) {
         if self.wait_conditions.is_empty() {
             return;
@@ -2948,6 +2952,18 @@ impl StoredStack {
         else {
             return;
         };
+        // A failed CREATE that is ROLLED BACK owes the services that own the resources it had
+        // already made the REMOVAL of them — "ROLLBACK — Roll back the stack creation. This is
+        // the default" — and such a call cannot be made from under this lock. So its failure
+        // is left to the path that CAN make it ([`Self::fail_expired_wait`], driven for every
+        // request of this service before its handler runs), rather than being concluded here:
+        // concluding it here would park the create in `CREATE_FAILED`, a status a create whose
+        // rollback is the default never rests in, with the resources it had made left standing
+        // and no operation left to remove them. A create whose caller asked for the failed
+        // state to be kept owes those services nothing and rests in it below.
+        if self.status == status::CREATE_IN_PROGRESS && !self.disable_rollback {
+            return;
+        }
         let failed_status = failed_status_of(&self.status);
         let updating = self.status == status::UPDATE_IN_PROGRESS;
         // The RESOURCE the wait was for is what the operation could not get through, recorded
