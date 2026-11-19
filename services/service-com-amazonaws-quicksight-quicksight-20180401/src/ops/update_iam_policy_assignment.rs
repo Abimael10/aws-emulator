@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for UpdateIAMPolicyAssignment<Eng>
 {
     type Input = UpdateIAMPolicyAssignmentInput;
-    type Output = UpdateIAMPolicyAssignmentOutput;
+    type Output = ReportedIamPolicyAssignmentUpdate;
     type Error = UpdateIAMPolicyAssignmentError;
 
     const NAME: &'static str = "UpdateIAMPolicyAssignment";
@@ -232,14 +232,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.identities = Some(identities);
         }
 
-        Ok(UpdateIAMPolicyAssignmentOutput {
-            assignment_name: Some(record.assignment_name.clone()),
-            assignment_id: Some(record.assignment_id.clone()),
-            policy_arn: record.policy_arn.clone(),
-            identities: record.identities.clone(),
-            assignment_status: Some(record.assignment_status.clone()),
-            request_id: Some(request_id),
-            status: 200,
+        Ok(ReportedIamPolicyAssignmentUpdate {
+            response: UpdateIAMPolicyAssignmentOutput {
+                assignment_name: Some(record.assignment_name.clone()),
+                assignment_id: Some(record.assignment_id.clone()),
+                policy_arn: record.policy_arn.clone(),
+                // The identities the assignment holds, and nothing at all when it holds
+                // none: an update reports the map it has entries for, so a client can
+                // tell "no identity is declared" from "these identities are".
+                //
+                // This is the UPDATE's rule, not the store's: the stored map is left
+                // exactly as the request left it, and `DescribeIAMPolicyAssignment`
+                // reports it as it stands — an assignment whose map was emptied is
+                // described with the empty map, which is what the recorded describe of
+                // such an assignment carries. Normalising the record would change that
+                // read as well.
+                identities: record
+                    .identities
+                    .clone()
+                    .filter(|identities| !identities.is_empty()),
+                assignment_status: Some(record.assignment_status.clone()),
+                request_id: Some(request_id),
+                status: 200,
+            },
+            // The updated assignment's own ARN, derived from the account that owns it
+            // and the name that identifies it there.
+            arn: record.arn(),
         })
     }
 }

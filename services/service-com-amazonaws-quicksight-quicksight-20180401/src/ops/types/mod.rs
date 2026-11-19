@@ -14,6 +14,11 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+// The structures this service reports a member the on-disk model does not declare in —
+// see that module's own note. Declared beside the generated `*_types` modules and
+// re-exported with them, so `use super::types::*` resolves these shapes too.
+pub mod recorded_members;
+
 pub mod batch_create_topic_reviewed_answer_types;
 pub mod batch_delete_knowledge_base_types;
 pub mod batch_delete_topic_reviewed_answer_types;
@@ -737,6 +742,8 @@ pub use list_vpc_connections_types::*;
 pub use predict_qa_results_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use put_data_set_refresh_properties_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use recorded_members::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use register_user_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

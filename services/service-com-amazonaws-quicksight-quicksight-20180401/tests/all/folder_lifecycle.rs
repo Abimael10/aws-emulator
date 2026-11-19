@@ -265,9 +265,9 @@ async fn create_folder_persists_it_and_describe_reports_it() {
         );
         assert_eq!(
             reported["FolderPath"],
-            Value::Null,
+            json!([]),
             "case {case:?}: a folder created with no ParentFolderArn is root-level, so \
-             it has no ancestor path: {body}"
+             its ancestor path is reported as the empty list: {body}"
         );
         let created_time = reported["CreatedTime"].as_f64().unwrap_or_else(|| {
             panic!("case {case:?}: describe reported no CreatedTime: {body}");
@@ -440,13 +440,11 @@ async fn a_parent_folder_arn_nests_the_new_folder_under_it() {
             status, 200,
             "case {case:?}: describe expected 200, got {status} with {response}"
         );
-        let expected_path = if ancestors.is_empty() {
-            Value::Null
-        } else {
-            json!(ancestors)
-        };
+        // The ancestor path is always reported, so a client walking the hierarchy reads
+        // the empty list at the root rather than a missing member.
         assert_eq!(
-            response["Folder"]["FolderPath"], expected_path,
+            response["Folder"]["FolderPath"],
+            json!(ancestors),
             "case {case:?}: the ancestor path must be every folder above this one, \
              outermost first: {response}"
         );
@@ -573,7 +571,7 @@ async fn a_parent_folder_arn_naming_no_folder_is_not_found() {
     assert_eq!(status, 200, "describe expected 200, got {status} with {body}");
     assert_eq!(
         body["Folder"]["FolderPath"],
-        Value::Null,
-        "a root-level folder has no ancestor path: {body}"
+        json!([]),
+        "a root-level folder reports the empty ancestor path: {body}"
     );
 }

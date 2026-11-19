@@ -75,6 +75,12 @@ async fn describe_data_source(harness: &Harness, account: &str, id: &str) -> (u1
         .await
 }
 
+async fn list_data_sources(harness: &Harness, account: &str) -> (u16, Value) {
+    harness
+        .call("GET", &format!("/accounts/{account}/data-sources"), None)
+        .await
+}
+
 /// A `Credentials` structure carrying [`SECRET_PASSWORD`].
 fn credentials() -> Value {
     json!({ "CredentialPair": { "Username": "analyst", "Password": SECRET_PASSWORD } })
@@ -224,6 +230,17 @@ fn expected(update: &Value, member: &str) -> Value {
     update.get(member).cloned().unwrap_or(Value::Null)
 }
 
+/// The `SslProperties` the updated data source must report: the submitted ones, or the
+/// service's own default for an update that submitted none. Source:
+/// `smithy_query(query="shape", shape="SslProperties")` — `DisableSsl` is `@default
+/// false`.
+fn expected_ssl_properties(update: &Value) -> Value {
+    update
+        .get("SslProperties")
+        .cloned()
+        .unwrap_or_else(|| json!({ "DisableSsl": false }))
+}
+
 #[tokio::test]
 async fn an_update_replaces_the_stored_configuration_and_reads_back() {
     let harness = Harness::new();
@@ -311,17 +328,21 @@ async fn an_update_replaces_the_stored_configuration_and_reads_back() {
             expected(&update, "Name"),
             "case {label:?}: describe returned the wrong Name: {body}"
         );
-        for member in [
-            "DataSourceParameters",
-            "SslProperties",
-            "VpcConnectionProperties",
-        ] {
+        for member in ["DataSourceParameters", "VpcConnectionProperties"] {
             assert_eq!(
                 source[member],
                 expected(&update, member),
                 "case {label:?}: expected {member} to be exactly what the update carried, got {body}"
             );
         }
+        // `SslProperties` is the one member the service fills in: every data source has
+        // an SSL setting in force, so an update that submits none leaves the default
+        // (`SslProperties$DisableSsl` is `@default false`) rather than no setting at all.
+        assert_eq!(
+            source["SslProperties"],
+            expected_ssl_properties(&update),
+            "case {label:?}: expected the SSL properties in force, got {body}"
+        );
         assert_eq!(
             source["Status"],
             json!(UPDATE_SUCCESSFUL),
@@ -533,4 +554,153 @@ async fn a_name_outside_the_models_length_is_refused_and_changes_nothing() {
             "case {label:?}: expected the last accepted Name to be the stored one, got {described}"
         );
     }
+}
+
+/// One row of the SSL table: the `SslProperties` the create submits, and the setting the
+/// data source then has in force.
+struct SslRow {
+    label: &'static str,
+    account: &'static str,
+    id: &'static str,
+    kind: &'static str,
+    /// What the create's `SslProperties` member carries, or `None` for a create that
+    /// submits the member not at all.
+    submitted: Option<Value>,
+    /// The `DisableSsl` the data source then reports.
+    expected_disable_ssl: bool,
+}
+
+fn ssl_rows() -> Vec<SslRow> {
+    vec![
+        SslRow {
+            // No SslProperties at all: the service applies the member's own default.
+            label: "the create submits no SslProperties",
+            account: ACCOUNT,
+            id: "ssl-defaulted",
+            kind: "REDSHIFT",
+            submitted: None,
+            expected_disable_ssl: false,
+        },
+        SslRow {
+            // The default stated explicitly.
+            label: "the create states DisableSsl false",
+            account: ACCOUNT,
+            id: "ssl-stated-false",
+            kind: "MYSQL",
+            submitted: Some(json!({ "DisableSsl": false })),
+            expected_disable_ssl: false,
+        },
+        SslRow {
+            // SSL off: the submitted setting is what the reads report.
+            label: "the create turns SSL off",
+            account: ACCOUNT,
+            id: "ssl-disabled",
+            kind: "POSTGRESQL",
+            submitted: Some(json!({ "DisableSsl": true })),
+            expected_disable_ssl: true,
+        },
+        SslRow {
+            // Another account, and the empty SslProperties structure: `DisableSsl` is
+            // `@default false`, so an SslProperties that states nothing is SSL on.
+            label: "another account, SslProperties stating nothing",
+            account: OTHER_ACCOUNT,
+            id: "ssl-empty-structure",
+            kind: "S3",
+            submitted: Some(json!({})),
+            expected_disable_ssl: false,
+        },
+    ]
+}
+
+/// Every data source this service reports carries the SSL setting in force and the two
+/// feature flags it has.
+///
+/// The rule: a read of a data source reports the SSL properties the data source has —
+/// the submitted ones, or `DisableSsl` defaulted to false, which the model declares
+/// (`smithy_query(query="shape", shape="SslProperties")`) — and the catalog and TIP flags
+/// every data source of this service carries, so a client reading either gets the
+/// service's own value rather than null. The rows vary what the rule generalises over:
+/// whether the create submitted the member and with which value, the source kind, the
+/// account, and whether a later update dropped it; and each row is read back through BOTH
+/// reads that report a data source, the describe and the list.
+#[tokio::test]
+async fn every_data_source_read_reports_the_ssl_setting_in_force_and_the_feature_flags() {
+    let harness = Harness::new();
+
+    for row in ssl_rows() {
+        let label = row.label;
+        let mut create = json!({
+            "DataSourceId": row.id,
+            "Name": row.id,
+            "Type": row.kind,
+        });
+        if let Some(submitted) = &row.submitted {
+            create["SslProperties"] = submitted.clone();
+        }
+        let (status, body) = create_data_source(&harness, row.account, create).await;
+        assert_eq!(
+            status, 202,
+            "case {label:?}: create expected 202, got {status} with {body}"
+        );
+        harness.settle_data_source(row.account, row.id);
+
+        let (status, body) = describe_data_source(&harness, row.account, row.id).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: describe expected 200, got {status} with {body}"
+        );
+        assert_reported_members(label, "describe", &body["DataSource"], row.expected_disable_ssl);
+
+        // The same data source in the list that reports it.
+        let (status, listed) = list_data_sources(&harness, row.account).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: list expected 200, got {status} with {listed}"
+        );
+        let entry = listed["DataSources"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {label:?}: list reported no DataSources: {listed}"))
+            .iter()
+            .find(|entry| entry["DataSourceId"] == json!(row.id))
+            .unwrap_or_else(|| panic!("case {label:?}: the list lost the data source: {listed}"))
+            .clone();
+        assert_reported_members(label, "list", &entry, row.expected_disable_ssl);
+
+        // An update that drops the member leaves the data source with the service's
+        // default rather than with no SSL setting at all.
+        let (status, body) =
+            update_data_source(&harness, row.account, row.id, json!({ "Name": row.id })).await;
+        assert_eq!(
+            status, 202,
+            "case {label:?}: update expected 202, got {status} with {body}"
+        );
+        harness.settle_data_source(row.account, row.id);
+        let (status, body) = describe_data_source(&harness, row.account, row.id).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: describe after the update expected 200, got {status} with {body}"
+        );
+        assert_reported_members(label, "describe after an update", &body["DataSource"], false);
+    }
+}
+
+/// The members every reported data source carries: its SSL setting, and the two feature
+/// flags, which no operation of this model revision sets and which every data source
+/// therefore reports as off.
+fn assert_reported_members(label: &str, read: &str, source: &Value, expected_disable_ssl: bool) {
+    assert_eq!(
+        source["SslProperties"],
+        json!({ "DisableSsl": expected_disable_ssl }),
+        "case {label:?}: {read} must report the SSL setting in force, got {source}"
+    );
+    assert_eq!(
+        source["CatalogEnabled"],
+        json!(false),
+        "case {label:?}: {read} must report the catalog flag, got {source}"
+    );
+    assert_eq!(
+        source["TIPEnabled"],
+        json!(false),
+        "case {label:?}: {read} must report the TIP flag, got {source}"
+    );
 }

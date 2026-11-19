@@ -22,7 +22,10 @@ pub struct ListDataSourcesInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.quicksight#ListDataSourcesResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct ListDataSourcesOutput {
-    pub data_sources: Option<Vec<DataSource>>,
+    /// Each data source as this service reports it — see [`DescribeDataSourceOutput`] and
+    /// [`super::recorded_members`]: a listed data source carries the same members a
+    /// described one does.
+    pub data_sources: Option<Vec<ReportedDataSource>>,
     pub next_token: Option<String>,
     pub request_id: Option<String>,
     pub status: i32,

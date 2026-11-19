@@ -46,6 +46,7 @@ use crate::ops::types::{
     GroupMember,
     IAMPolicyAssignment, InputColumn, LogicalTable, NamespaceInfoV2, OutputColumn,
     PerformanceConfiguration, PhysicalTable, RefreshFrequency, RefreshSchedule,
+    ReportedDataSource, ReportedIamPolicyAssignment,
     ResourcePermission,
     RowLevelPermissionDataSet, RowLevelPermissionTagConfiguration, SemanticModelConfiguration,
     SslProperties, Tag, Theme, ThemeAlias, ThemeConfiguration, ThemeVersion, TopicDetails,
@@ -848,7 +849,12 @@ pub struct DataSourceRecord {
     pub last_updated_time: DateTime,
     pub data_source_parameters: Option<DataSourceParameters>,
     pub vpc_connection_properties: Option<VpcConnectionProperties>,
-    pub ssl_properties: Option<SslProperties>,
+    /// The SSL properties in FORCE for this data source: the ones the create or the
+    /// update submitted, or the service's own default for a write that submitted none.
+    /// `SslProperties$DisableSsl` is `@default false`
+    /// (`smithy_query(query="shape", shape="SslProperties")`), so a data source nothing
+    /// configured connects over SSL — and reports that rather than nothing at all.
+    pub ssl_properties: SslProperties,
     pub permissions: Vec<ResourcePermission>,
     pub tags: Vec<Tag>,
     /// The failure [`Self::settled_status`] carries, and `None` when that status is a
@@ -894,35 +900,53 @@ impl DataSourceRecord {
         )
     }
 
-    /// The modelled `DataSource` structure this record describes, as of `now` — the
-    /// instant that decides which side of the lifecycle transition its status is on.
-    pub fn to_data_source(&self, now: SystemTime) -> DataSource {
-        DataSource {
-            arn: Some(self.arn.clone()),
-            data_source_id: Some(self.data_source_id.clone()),
-            name: Some(self.name.clone()),
-            r#type: Some(self.r#type.clone()),
-            status: Some(self.status_at(now).to_string()),
-            created_time: Some(self.created_time),
-            last_updated_time: Some(self.last_updated_time),
-            data_source_parameters: self.data_source_parameters.clone(),
-            // The allow list of alternate parameter sets a shared credential may be
-            // used with. It reaches the service only inside the `@sensitive`
-            // `Credentials` structure, which neither the create nor the update keeps,
-            // so no stored data source carries one — and the model documents a null
-            // list as allowing the parameters the credentials were used with.
-            alternate_data_source_parameters: None,
-            vpc_connection_properties: self.vpc_connection_properties.clone(),
-            ssl_properties: self.ssl_properties.clone(),
-            error_info: self.error_info_at(now).cloned(),
-            // Secret-based credentials are a separate feature of CreateDataSource's
-            // `Credentials` member (`SecretArn`); nothing stores one yet.
-            secret_arn: None,
-            credential_status: None,
-            last_credential_verified_at: None,
+    /// The `DataSource` structure this record describes, as of `now` — the instant that
+    /// decides which side of the lifecycle transition its status is on — and as this
+    /// service reports it: the modelled members, and the two feature flags beside them.
+    pub fn to_data_source(&self, now: SystemTime) -> ReportedDataSource {
+        ReportedDataSource {
+            data_source: DataSource {
+                arn: Some(self.arn.clone()),
+                data_source_id: Some(self.data_source_id.clone()),
+                name: Some(self.name.clone()),
+                r#type: Some(self.r#type.clone()),
+                status: Some(self.status_at(now).to_string()),
+                created_time: Some(self.created_time),
+                last_updated_time: Some(self.last_updated_time),
+                data_source_parameters: self.data_source_parameters.clone(),
+                // The allow list of alternate parameter sets a shared credential may be
+                // used with. It reaches the service only inside the `@sensitive`
+                // `Credentials` structure, which neither the create nor the update keeps,
+                // so no stored data source carries one — and the model documents a null
+                // list as allowing the parameters the credentials were used with.
+                alternate_data_source_parameters: None,
+                vpc_connection_properties: self.vpc_connection_properties.clone(),
+                // The SSL properties in force, which every data source has: the submitted
+                // ones, or the service-applied default.
+                ssl_properties: Some(self.ssl_properties.clone()),
+                error_info: self.error_info_at(now).cloned(),
+                // Secret-based credentials are a separate feature of CreateDataSource's
+                // `Credentials` member (`SecretArn`); nothing stores one yet.
+                secret_arn: None,
+                credential_status: None,
+                last_credential_verified_at: None,
+            },
+            catalog_enabled: DATA_SOURCE_CATALOG_ENABLED,
+            tip_enabled: DATA_SOURCE_TIP_ENABLED,
         }
     }
 }
+
+/// Whether the catalog feature is on for a data source of this service.
+///
+/// No operation of this model revision takes or changes the flag — neither
+/// `CreateDataSource` nor `UpdateDataSource` declares a member for it — so every data
+/// source carries the service's own value for it, which is the off position.
+pub const DATA_SOURCE_CATALOG_ENABLED: bool = false;
+
+/// Whether the TIP feature is on for a data source of this service. Same standing as
+/// [`DATA_SOURCE_CATALOG_ENABLED`]: nothing in this model revision sets it.
+pub const DATA_SOURCE_TIP_ENABLED: bool = false;
 
 /// A stored data set.
 #[derive(Debug, Clone)]
@@ -1408,14 +1432,11 @@ impl FolderRecord {
             arn: Some(self.arn.clone()),
             name: self.name.clone(),
             folder_type: Some(self.folder_type.clone()),
-            // `Path` is a list of at least one ARN, so a root-level folder — which has
-            // no ancestor to name — reports no path at all rather than an empty list
-            // the model does not admit.
-            folder_path: if self.ancestor_arns.is_empty() {
-                None
-            } else {
-                Some(self.ancestor_arns.clone())
-            },
+            // `FolderPath` is the folder's ancestor ARNs, outermost first, and a
+            // described folder always reports it: a folder with no parent reports the
+            // empty list, which is what tells a client walking the hierarchy "this is a
+            // root folder" rather than "the path is unknown".
+            folder_path: Some(self.ancestor_arns.clone()),
             created_time: Some(self.created_time),
             last_updated_time: Some(self.last_updated_time),
             sharing_model: Some(self.sharing_model.clone()),
@@ -1430,9 +1451,9 @@ impl FolderRecord {
 /// the name unique per account: the namespace is the address a later call must present
 /// to reach this assignment.
 ///
-/// The assignment carries no ARN and no timestamps: the modelled
-/// `IAMPolicyAssignment` structure declares neither, so nothing is stored that no
-/// read can report.
+/// The assignment carries no stored ARN and no timestamps: its ARN is derived from the
+/// account that owns it and the name that identifies it there ([`Self::arn`]), and the
+/// model declares no timestamp on it, so nothing is stored that no read can report.
 #[derive(Debug, Clone)]
 pub struct IamPolicyAssignmentRecord {
     pub aws_account_id: String,
@@ -1448,15 +1469,26 @@ pub struct IamPolicyAssignmentRecord {
 }
 
 impl IamPolicyAssignmentRecord {
-    /// The modelled `IAMPolicyAssignment` structure this record describes.
-    pub fn to_iam_policy_assignment(&self) -> IAMPolicyAssignment {
-        IAMPolicyAssignment {
-            aws_account_id: Some(self.aws_account_id.clone()),
-            assignment_id: Some(self.assignment_id.clone()),
-            assignment_name: Some(self.assignment_name.clone()),
-            policy_arn: self.policy_arn.clone(),
-            identities: self.identities.clone(),
-            assignment_status: Some(self.assignment_status.clone()),
+    /// This assignment's own ARN: the account that owns it and the name that identifies
+    /// it there, in the region-less form QuickSight reports
+    /// ([`iam_policy_assignment_arn`]).
+    pub fn arn(&self) -> String {
+        iam_policy_assignment_arn(&self.aws_account_id, &self.assignment_name)
+    }
+
+    /// The `IAMPolicyAssignment` structure this record describes, as this service reports
+    /// it: the modelled members, and the assignment's own ARN beside them.
+    pub fn to_iam_policy_assignment(&self) -> ReportedIamPolicyAssignment {
+        ReportedIamPolicyAssignment {
+            assignment: IAMPolicyAssignment {
+                aws_account_id: Some(self.aws_account_id.clone()),
+                assignment_id: Some(self.assignment_id.clone()),
+                assignment_name: Some(self.assignment_name.clone()),
+                policy_arn: self.policy_arn.clone(),
+                identities: self.identities.clone(),
+                assignment_status: Some(self.assignment_status.clone()),
+            },
+            arn: self.arn(),
         }
     }
 }

@@ -22,7 +22,10 @@ pub struct DescribeIAMPolicyAssignmentInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.quicksight#DescribeIAMPolicyAssignmentResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeIAMPolicyAssignmentOutput {
-    pub iam_policy_assignment: Option<IAMPolicyAssignment>,
+    /// The assignment as this service reports it: the modelled [`IAMPolicyAssignment`]
+    /// below, and the assignment's own ARN, which this model revision does not declare on
+    /// it — see [`super::recorded_members`].
+    pub iam_policy_assignment: Option<ReportedIamPolicyAssignment>,
     pub request_id: Option<String>,
     pub status: i32,
 }

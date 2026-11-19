@@ -575,7 +575,7 @@ fn the_data_source_transition_is_due_within_the_chosen_span() {
         last_updated_time: qs_state::now_timestamp(accepted_at),
         data_source_parameters: None,
         vpc_connection_properties: None,
-        ssl_properties: None,
+        ssl_properties: Default::default(),
         permissions: Vec::new(),
         tags: Vec::new(),
         error_info: None,

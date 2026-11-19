@@ -21,7 +21,10 @@ pub struct DescribeDataSourceInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.quicksight#DescribeDataSourceResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeDataSourceOutput {
-    pub data_source: Option<DataSource>,
+    /// The data source as this service reports it: the modelled [`DataSource`], and the
+    /// two feature flags this model revision does not declare on it — see
+    /// [`super::recorded_members`].
+    pub data_source: Option<ReportedDataSource>,
     pub request_id: Option<String>,
     pub status: i32,
 }

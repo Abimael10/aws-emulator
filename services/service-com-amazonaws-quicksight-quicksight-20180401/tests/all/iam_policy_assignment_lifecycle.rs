@@ -1040,3 +1040,235 @@ async fn racing_creates_of_one_name_commit_exactly_one_assignment() {
         );
     }
 }
+
+/// The ARN the service reports for one assignment: `arn:aws:quicksight::<account>:
+/// assignment/<AssignmentName>`.
+///
+/// The region field is EMPTY — an assignment is addressed by its account and its name
+/// alone — so the two variable parts are the account that owns it and the name that
+/// identifies it there.
+fn assignment_arn(account: &str, assignment_name: &str) -> String {
+    format!("arn:aws:quicksight::{account}:assignment/{assignment_name}")
+}
+
+/// One row of the table below: an assignment, the identities it is created with, and the
+/// identities an update of it submits.
+struct ReportedRow {
+    case: &'static str,
+    account: &'static str,
+    namespace: &'static str,
+    assignment_name: &'static str,
+    /// The `IdentityMap` the create submits, if any.
+    identities: Option<Value>,
+    /// The `IdentityMap` the update submits, if any.
+    update_identities: Option<Value>,
+    /// What the update's response must carry under `Identities`: the map the assignment
+    /// holds, and JSON null — the member absent — when it holds none.
+    expected_update_identities: Value,
+}
+
+fn reported_rows() -> Vec<ReportedRow> {
+    vec![
+        ReportedRow {
+            // The identities the create set survive an update that names none.
+            case: "identities-survive-an-update-that-names-none",
+            account: ACCOUNT,
+            namespace: DEFAULT_NAMESPACE,
+            assignment_name: "reported-with-identities",
+            identities: Some(json!({ "user": ["analyst"] })),
+            update_identities: None,
+            expected_update_identities: json!({ "user": ["analyst"] }),
+        },
+        ReportedRow {
+            // An assignment that never had an identity: the update has none to report.
+            case: "never-had-an-identity",
+            account: ACCOUNT,
+            namespace: DEFAULT_NAMESPACE,
+            assignment_name: "reported.no-identities",
+            identities: None,
+            update_identities: None,
+            expected_update_identities: Value::Null,
+        },
+        ReportedRow {
+            // An update that submits an empty map leaves the assignment holding no
+            // identity, so the response reports none rather than an empty map.
+            case: "an-update-empties-the-map",
+            account: ACCOUNT,
+            namespace: DEFAULT_NAMESPACE,
+            assignment_name: "reported-emptied",
+            identities: Some(json!({ "group": ["auditors"] })),
+            update_identities: Some(json!({})),
+            expected_update_identities: Value::Null,
+        },
+        ReportedRow {
+            // Another account, another namespace, both identity kinds, and a name using
+            // the punctuation the model's pattern admits.
+            case: "another-account-and-namespace",
+            account: OTHER_ACCOUNT,
+            namespace: OTHER_NAMESPACE,
+            assignment_name: "Rule_9:tier=gold+eu@team",
+            identities: Some(json!({ "user": ["first", "second"], "group": ["auditors"] })),
+            update_identities: Some(json!({ "group": ["auditors"] })),
+            expected_update_identities: json!({ "group": ["auditors"] }),
+        },
+        ReportedRow {
+            // The shortest name the model's pattern admits.
+            case: "shortest-name",
+            account: ACCOUNT,
+            namespace: OTHER_NAMESPACE,
+            assignment_name: "ab",
+            identities: Some(json!({ "user": [] })),
+            update_identities: None,
+            expected_update_identities: json!({ "user": [] }),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn every_assignment_response_reports_the_assignment_arn() {
+    let harness = Harness::new();
+
+    for row in reported_rows() {
+        let case = row.case;
+        let arn = json!(assignment_arn(row.account, row.assignment_name));
+
+        let mut create_body = json!({
+            "AssignmentName": row.assignment_name,
+            "AssignmentStatus": "ENABLED",
+            "PolicyArn": READ_ONLY_POLICY,
+        });
+        if let Some(identities) = &row.identities {
+            create_body["Identities"] = identities.clone();
+        }
+        let (status, body) =
+            create_assignment(&harness, row.account, row.namespace, create_body).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: create expected 201, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Arn"], arn,
+            "case {case:?}: create must report the assignment's own ARN: {body}"
+        );
+
+        // The describe reports the ARN inside the assignment structure.
+        let (status, body) =
+            describe_assignment(&harness, row.account, row.namespace, row.assignment_name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: describe expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["IAMPolicyAssignment"]["Arn"], arn,
+            "case {case:?}: describe must report the assignment's own ARN: {body}"
+        );
+
+        // The update reports the same ARN at the top level, and the identities the
+        // assignment holds — nothing at all when it holds none.
+        let mut update_body = json!({ "AssignmentStatus": "DISABLED" });
+        if let Some(identities) = &row.update_identities {
+            update_body["Identities"] = identities.clone();
+        }
+        let (status, body) =
+            update_assignment(&harness, row.account, row.namespace, row.assignment_name, update_body)
+                .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: update expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Arn"], arn,
+            "case {case:?}: update must report the assignment's own ARN: {body}"
+        );
+        assert_eq!(
+            body["Identities"], row.expected_update_identities,
+            "case {case:?}: update must report the identities the assignment holds, and \
+             none at all when it holds none: {body}"
+        );
+
+        // The STORE is left as the request left it, and the describe reports the stored
+        // map as it stands: the update's rule is about what an update reports, so an
+        // assignment whose map the update emptied is still described with that map.
+        let stored_identities = row
+            .update_identities
+            .clone()
+            .or_else(|| row.identities.clone())
+            .unwrap_or(Value::Null);
+        let (status, body) =
+            describe_assignment(&harness, row.account, row.namespace, row.assignment_name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: describe after the update expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["IAMPolicyAssignment"]["Identities"], stored_identities,
+            "case {case:?}: describe must report the stored identity map as it stands: {body}"
+        );
+        assert_eq!(
+            body["IAMPolicyAssignment"]["Arn"], arn,
+            "case {case:?}: describe after the update must still report the ARN: {body}"
+        );
+
+        // The delete reports the ARN of the assignment it removed.
+        let (status, body) =
+            delete_assignment(&harness, row.account, row.namespace, row.assignment_name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: delete expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Arn"], arn,
+            "case {case:?}: delete must report the ARN of the assignment it removed: {body}"
+        );
+
+        // And it really removed it: the ARN was reported for a delete that happened.
+        let (status, body) =
+            describe_assignment(&harness, row.account, row.namespace, row.assignment_name).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: the deleted assignment must be gone, got {status} with {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_assignment_arn_names_no_region_whichever_region_the_caller_signs_for() {
+    let harness = Harness::new();
+    let name = "cross-region-rule";
+    let arn = json!(assignment_arn(ACCOUNT, name));
+
+    let (status, body) = create_assignment(
+        &harness,
+        ACCOUNT,
+        DEFAULT_NAMESPACE,
+        json!({ "AssignmentName": name, "AssignmentStatus": "ENABLED" }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "the fixture create expected 201, got {status} with {body}"
+    );
+
+    // Every other QuickSight ARN carries the caller's region; an assignment's does not,
+    // so a read signed for another region reports the very same ARN.
+    for region in ["us-west-2", "eu-central-1", "ap-southeast-1"] {
+        let (status, body) = harness
+            .call_in_region(
+                region,
+                "GET",
+                &format!(
+                    "/accounts/{ACCOUNT}/namespaces/{DEFAULT_NAMESPACE}/iam-policy-assignments/{name}"
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {region:?}: describe expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["IAMPolicyAssignment"]["Arn"], arn,
+            "case {region:?}: the assignment ARN names no region: {body}"
+        );
+    }
+}

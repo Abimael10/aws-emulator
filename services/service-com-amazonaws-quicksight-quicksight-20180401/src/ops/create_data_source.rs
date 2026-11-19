@@ -311,7 +311,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 last_updated_time: created_time,
                 data_source_parameters: input.data_source_parameters,
                 vpc_connection_properties: input.vpc_connection_properties,
-                ssl_properties: input.ssl_properties,
+                // The SSL properties in force from now on: the submitted ones, or the
+                // service's own default — `SslProperties$DisableSsl` is `@default
+                // false`, so a create that configures nothing still connects over SSL
+                // and every read of this data source reports that setting.
+                ssl_properties: input.ssl_properties.unwrap_or_default(),
                 permissions: input.permissions.unwrap_or_default(),
                 tags: input.tags.unwrap_or_default(),
                 // The error the settled status carries, which a read reports as

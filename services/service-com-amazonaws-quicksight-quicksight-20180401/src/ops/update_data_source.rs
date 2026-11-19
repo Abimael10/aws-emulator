@@ -229,7 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.name = input.name;
         record.data_source_parameters = input.data_source_parameters;
         record.vpc_connection_properties = input.vpc_connection_properties;
-        record.ssl_properties = input.ssl_properties;
+        // As on create: an update that submits no `SslProperties` leaves this data source
+        // with the service's own default rather than with no SSL setting at all.
+        record.ssl_properties = input.ssl_properties.unwrap_or_default();
         record.last_updated_time = updated_time;
         // The call starts the update rather than completing it, so the data source
         // carries the non-terminal status this response reports and reaches the

@@ -145,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DeleteIAMPolicyAssignment<Eng>
 {
     type Input = DeleteIAMPolicyAssignmentInput;
-    type Output = DeleteIAMPolicyAssignmentOutput;
+    type Output = ReportedIamPolicyAssignmentDeletion;
     type Error = DeleteIAMPolicyAssignmentError;
 
     const NAME: &'static str = "DeleteIAMPolicyAssignment";
@@ -198,10 +198,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        Ok(DeleteIAMPolicyAssignmentOutput {
-            assignment_name: Some(record.assignment_name),
-            request_id: Some(request_id),
-            status: 200,
+        Ok(ReportedIamPolicyAssignmentDeletion {
+            // The ARN of the assignment this call removed, derived from the account that
+            // owned it and the name that identified it there, so a caller reconciling on
+            // the ARN has the one it just deleted.
+            arn: record.arn(),
+            response: DeleteIAMPolicyAssignmentOutput {
+                assignment_name: Some(record.assignment_name),
+                request_id: Some(request_id),
+                status: 200,
+            },
         })
     }
 }
