@@ -2760,9 +2760,10 @@ pub use event_source_mapping::{EventSourceMappingRecord, ShardCursor, ShardSourc
 pub mod event_source_request;
 pub use event_source_request::{
     absent_event_source_message, event_source_arn_refusal, filter_criteria_refusal,
-    names_fifo_queue, queue_batch_window_refusal, unrecognized_event_source,
-    ABSENT_BROKER_MESSAGE, FIFO_BATCHING_WINDOW_MESSAGE, INVALID_FILTER_PATTERN_MESSAGE,
-    MAX_QUEUE_BATCH_SIZE_WITHOUT_WINDOW, QUEUE_BATCH_WINDOW_MESSAGE,
+    names_fifo_queue, propagated_queue_read_failure, queue_batch_window_refusal,
+    queue_event_source_read_refusal, unrecognized_event_source, ABSENT_BROKER_MESSAGE,
+    FIFO_BATCHING_WINDOW_MESSAGE, INVALID_FILTER_PATTERN_MESSAGE,
+    MAX_QUEUE_BATCH_SIZE_WITHOUT_WINDOW, QUEUE_BATCH_WINDOW_MESSAGE, QUEUE_SOURCE_READ_CALL,
 };
 
 /// WHICH destinations such a mapping may hand a record of a failed batch to lives in

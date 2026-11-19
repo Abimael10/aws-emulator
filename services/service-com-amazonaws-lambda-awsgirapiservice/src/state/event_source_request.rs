@@ -289,6 +289,60 @@ pub fn named_broker(event_source_arn: &str) -> Option<&str> {
 pub const ABSENT_BROKER_MESSAGE: &str =
     "The broker resource: eventSourceArn you requested does not exist.";
 
+/// The Amazon SQS call Lambda reads a QUEUE event source with: a mapping on a queue consumes
+/// it by receiving its messages, so that is the call whose failure refuses the mapping.
+pub const QUEUE_SOURCE_READ_CALL: &str = "ReceiveMessage";
+
+/// How Lambda reports a failure the queue service answered its read of a queue event source
+/// with: the call it attempted, and the error `code` and `message` it got back, verbatim.
+///
+/// Lambda wires a mapping onto a queue by READING that queue rather than by judging the
+/// fields of the ARN that names it, so what refuses such a mapping is the queue service's own
+/// answer. The sentence propagates that answer instead of restating it: a caller branches on
+/// the queue service's error code, and reads out of its message the address or the queue the
+/// read failed on — neither of which a refusal worded by Lambda itself would carry.
+#[must_use]
+pub fn propagated_queue_read_failure(code: &str, message: &str) -> String {
+    format!(
+        "Error occurred while {QUEUE_SOURCE_READ_CALL}. SQS Error Code: {code}. \
+         SQS Error Message: {message}"
+    )
+}
+
+/// Why the queue the event source `arn` names cannot be READ from here — `None` when the
+/// address it resolves to is one this endpoint serves, and for every source that is no queue.
+///
+/// The ARN is resolved to the queue's ADDRESS, in the queue service's own url form
+/// ([`::service_com_amazonaws_sqs_amazonsqs::state::queue_url_of_account`]) for the account
+/// and the queue name the ARN carries, in the Region it carries — a queue belongs to one
+/// Region's namespace, and an address of another Region names a different queue. Whether that
+/// address is one anything here answers for is the queue service's own decision over the
+/// address ([`::service_com_amazonaws_sqs_amazonsqs::state::queue_name_from_url`]), so a
+/// mapping is held to what the address resolves to rather than to a comparison of the ARN's
+/// account field: an address of another account is served by nothing here, which is the
+/// invalid address that service refuses, and Lambda answers with that refusal reported as the
+/// read it came from ([`propagated_queue_read_failure`]).
+///
+/// What this does NOT decide is whether the queue at an address this endpoint does serve
+/// EXISTS: that is the queue's own absence, answered by the read of the queue itself.
+#[must_use]
+pub fn queue_event_source_read_refusal(arn: &::service_common::arn::Arn<'_>) -> Option<String> {
+    use ::service_com_amazonaws_sqs_amazonsqs as sqs;
+
+    if arn.vendor != super::EVENT_SOURCE_VENDOR_QUEUE {
+        return None;
+    }
+    let address = sqs::state::queue_url_of_account(arn.region, arn.account, arn.resource);
+    sqs::state::queue_name_from_url(&address)
+        .is_none()
+        .then(|| {
+            propagated_queue_read_failure(
+                sqs::state::INVALID_ADDRESS_CODE,
+                &sqs::state::invalid_address_for_endpoint_message(&address),
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

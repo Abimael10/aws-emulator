@@ -3440,10 +3440,35 @@ const ENDPOINT_DNS_SUFFIX: &str = "amazonaws.com";
 /// endpoint about a queue of the emulator's own account, which holds nothing of that
 /// caller's to read or to change.
 pub fn queue_url(region: &str, name: &str) -> String {
-    format!(
-        "https://{ARN_SERVICE}.{region}.{ENDPOINT_DNS_SUFFIX}/{}/{name}",
-        ::engine::emulator_account_id()
-    )
+    queue_url_of_account(region, ::engine::emulator_account_id(), name)
+}
+
+/// The same address written for the queue called `name` of the account `account` holds in
+/// `region`, whichever account that is: the FORM of a queue address, which carries the
+/// owning account in its path.
+///
+/// Every url this service hands out is its own account's ([`queue_url`], which is this with
+/// that account filled in). The form is stated separately because an address is also what
+/// another account's queue is NAMED by: a caller holding a queue ARN resolves it to the
+/// address `/<accountId>/<QueueName>` of the account the ARN carries, and this endpoint
+/// answers for exactly one account's addresses ([`queue_name_from_url`]) — so an address of
+/// any other account is one it does not serve ([`invalid_address_for_endpoint_message`]).
+pub fn queue_url_of_account(region: &str, account: &str, name: &str) -> String {
+    format!("https://{ARN_SERVICE}.{region}.{ENDPOINT_DNS_SUFFIX}/{account}/{name}")
+}
+
+/// The error code Amazon SQS refuses an address it does not serve under, from the model's
+/// `awsQueryError` for `InvalidAddress` ("The specified ID is invalid.").
+pub const INVALID_ADDRESS_CODE: &str = "InvalidAddress";
+
+/// How Amazon SQS words the refusal of a queue address this endpoint does not serve — an
+/// address whose account segment is not the account the endpoint answers for.
+///
+/// The address is the ONE variable part: the fixed text states that this endpoint is not
+/// where that address is served, and the address names which one to go look at, which is
+/// what the caller has to fix or re-address.
+pub fn invalid_address_for_endpoint_message(address: &str) -> String {
+    format!("The address {address} is not valid for this endpoint.")
 }
 
 /// The `QueueName` the value supplied for a `QueueUrl` addresses, or `None` for a value

@@ -10,13 +10,20 @@
 //! (see [`crate::state::created_event_source_mapping_state`]).
 //!
 //! The event source has to be one `EventSourceArn` names: a resource of one of the
-//! vendors and resource types that member enumerates, in this account (see
-//! [`crate::state::names_event_source`] and
-//! [`crate::state::event_source_is_mappable_by_this_account`]). Anything else is refused
+//! vendors and resource types that member enumerates (see
+//! [`crate::state::names_event_source`]). Anything else is refused
 //! with the modelled `InvalidParameterValueException` rather than stored as a mapping of
 //! a source nothing could poll — stating the ARN format the source service the value names
 //! is polled through where it names one at all, and otherwise that the source ARN sent is
 //! unsupported (see [`crate::state::unrecognized_event_source`]).
+//!
+//! A source the mapping could not READ is refused with that same modelled 400: a mapping on
+//! an Amazon SQS queue consumes it by receiving from the address the ARN resolves to, so a
+//! value addressing a queue of an account this endpoint does not answer for is refused with
+//! the failure the queue service answers that address with, reported as the read it came from
+//! (see [`crate::state::queue_event_source_read_refusal`]). Every other source a mapping
+//! polls is one of this account's own resources, the one documented cross-account form
+//! aside (see [`crate::state::event_source_is_mappable_by_this_account`]).
 //!
 //! A source that IS one of those resources has to exist, too: an Amazon MQ broker is
 //! consumed by connecting to the endpoints of the named broker, so a value naming a broker
@@ -493,6 +500,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      Member must be the Amazon Resource Name of an event source"
                 )));
             };
+            // A mapping onto a QUEUE is wired up by RECEIVING from the queue the ARN
+            // addresses, so the value is resolved to that queue's address rather than
+            // compared field by field: an address nothing here answers for is refused with
+            // the failure the queue service answers that address with, reported as the read
+            // it came from, which is the only refusal that names the address to go look at
+            // (see [`crate::state::queue_event_source_read_refusal`]).
+            if let Some(message) = crate::state::queue_event_source_read_refusal(&parsed) {
+                return Err(invalid_parameter(message));
+            }
+            // Every OTHER source a mapping polls is one of the caller's own resources: the
+            // one cross-account form `EventSourceArn` documents is the Amazon MSK VPC
+            // connection, so an ARN of any other source carrying another account's id names
+            // a resource this account cannot map at all.
             if !crate::state::event_source_is_mappable_by_this_account(&parsed) {
                 return Err(invalid_parameter(format!(
                     "The event source '{event_source}' belongs to account '{}' rather than to \
