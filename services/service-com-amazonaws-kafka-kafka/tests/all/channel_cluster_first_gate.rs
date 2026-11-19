@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_kafka_kafka::state::RESOURCE_NOT_FOUND_MESSAGE;
 
 use crate::kafka_harness::{
-    pct, sleep_past_channel_activation, sleep_past_channel_update, ClusterRequest, Emulator, Reply,
+    pct, sleep_past_channel_activation, ClusterRequest, Emulator, Reply,
     ACCOUNT, REGION,
 };
 
@@ -566,7 +566,6 @@ async fn every_channel_write_separates_a_bad_reference_from_a_removed_channel() 
                 "case {case:?}: expected the update of a held channel to be accepted, got {} {}",
                 updated.status, updated.body
             );
-            sleep_past_channel_update();
         }
         let accepted = delete_channel(&emulator, &owner, &arn).await;
         assert_eq!(

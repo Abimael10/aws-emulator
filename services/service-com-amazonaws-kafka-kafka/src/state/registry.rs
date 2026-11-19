@@ -1843,8 +1843,10 @@ impl ComAmazonawsKafkaKafkaState {
     /// `cluster_arn`, as an endpoint for `region` sees it, handing back the
     /// record as the caller must now see it: the new
     /// `DataFreshnessInSeconds` written onto the destination it was created with,
-    /// `UPDATING`, with the instant the clock owes it `ACTIVE` again and the
-    /// update's own cluster operation filed.
+    /// the channel still `ACTIVE`, and the update's own cluster operation filed as
+    /// finished — the change is applied by this call
+    /// ([`Channel::begin_update`]), so the operation that carries it ended at the
+    /// same instant and the two cannot disagree about whether the work is done.
     ///
     /// Answers `None` when this region holds no such channel under that cluster,
     /// resolved exactly as every channel reader resolves it. The STATUS gate is
@@ -1860,15 +1862,12 @@ impl ComAmazonawsKafkaKafkaState {
     ) -> Option<&Channel> {
         self.settled_channel_in(region, cluster_arn, channel_arn, now)?;
         let channel = self.channels.get_mut(channel_arn)?;
-        let operation_arn = channel
-            .begin_update(now, data_freshness_in_seconds)
-            .to_string();
-        let end_due = channel.active_due;
+        let operation_arn = channel.begin_update(data_freshness_in_seconds).to_string();
         self.file_channel_operation(
             channel_arn,
             operation_arn,
             OPERATION_TYPE_UPDATE_CHANNEL,
-            end_due,
+            now,
             now,
         );
         self.channels.get(channel_arn)

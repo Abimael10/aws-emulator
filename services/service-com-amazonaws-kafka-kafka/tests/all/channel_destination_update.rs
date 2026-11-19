@@ -17,8 +17,8 @@ use service_com_amazonaws_kafka_kafka::state::{
 };
 
 use crate::kafka_harness::{
-    pct, sleep_past_activation, sleep_past_channel_activation, sleep_past_channel_update,
-    ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
+    pct, sleep_past_activation, sleep_past_channel_activation, ClusterRequest, Emulator, Reply,
+    ACCOUNT, REGION,
 };
 
 /// The role a channel assumes to write to its destination; any role ARN does.
@@ -231,8 +231,9 @@ fn invariant_members(reply: &Reply, destination: Destination) -> Value {
 /// RULE: an accepted `UpdateChannel` writes the submitted
 /// `DataFreshnessInSeconds` onto the destination the channel was created with and
 /// changes NOTHING else about the channel — every other stored member comes back
-/// byte-identical, non-ASCII text included — while the channel reports the
-/// non-terminal `UPDATING` until the clock owes it `ACTIVE` again.
+/// byte-identical, non-ASCII text included — and it is the call that applies it,
+/// so the FIRST independent read after it reports the new value on a channel that
+/// never left `ACTIVE`.
 #[tokio::test]
 async fn an_update_writes_the_submitted_freshness_and_leaves_every_other_member_untouched() {
     let emulator = Emulator::new();
@@ -334,30 +335,22 @@ async fn an_update_writes_the_submitted_freshness_and_leaves_every_other_member_
             );
             operations.push(operation.clone());
 
-            // Read back INSIDE the clock-owed span: the change is applied and the
-            // channel is reported as still being updated.
-            let inflight = emulator.describe_channel(&cluster, &arn).await;
-            assert_eq!(
-                inflight.at("/status").as_str(),
-                Some("UPDATING"),
-                "case {case}: expected UPDATING straight after the update, got {}",
-                inflight.body
-            );
-            assert_eq!(
-                inflight.at("/clusterOperationArn").as_str(),
-                Some(operation.as_str()),
-                "case {case}: the reader disagrees with the update about the in-flight \
-                 operation, got {}",
-                inflight.at("/clusterOperationArn")
-            );
-
-            sleep_past_channel_update();
+            // Read back on the very next call: the change is applied by the
+            // update itself, so there is no window in which a reader reports the
+            // old value or a non-terminal status.
             let after = emulator.describe_channel(&cluster, &arn).await;
             assert_eq!(
                 after.at("/status").as_str(),
                 Some("ACTIVE"),
-                "case {case}: expected ACTIVE once the clock owed it, got {}",
+                "case {case}: expected ACTIVE straight after the update, got {}",
                 after.body
+            );
+            assert_eq!(
+                after.at("/clusterOperationArn").as_str(),
+                Some(operation.as_str()),
+                "case {case}: the reader disagrees with the update about the operation \
+                 that carried it, got {}",
+                after.at("/clusterOperationArn")
             );
             assert_eq!(
                 reported_freshness(&after, row.destination),
@@ -383,8 +376,9 @@ async fn an_update_writes_the_submitted_freshness_and_leaves_every_other_member_
 }
 
 /// RULE: the `ClusterOperationArn` a channel lifecycle call answers names a
-/// cluster operation the cluster-operation readers resolve — non-terminal until the
-/// clock owes the channel transition it carries out, and complete after it.
+/// cluster operation the cluster-operation readers resolve, reporting the state the
+/// work it carries has actually reached: non-terminal while the channel transition
+/// behind it is still owed, complete as soon as the change is applied.
 #[tokio::test]
 async fn a_channel_operation_resolves_through_the_cluster_operation_readers() {
     let emulator = Emulator::new();
@@ -400,6 +394,31 @@ async fn a_channel_operation_resolves_through_the_cluster_operation_readers() {
         .as_str()
         .unwrap()
         .to_string();
+    // The create leaves the channel's pipeline being stood up, so its operation is
+    // still running until that span is out.
+    for (case, uri) in [
+        ("v1", format!("/v1/operations/{}", pct(&create_operation))),
+        ("v2", format!("/api/v2/operations/{}", pct(&create_operation))),
+    ] {
+        let reply = emulator.call("GET", &uri, None).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case}: expected the create's operation to resolve, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.at("/clusterOperationInfo/operationState").as_str(),
+            Some("UPDATE_IN_PROGRESS"),
+            "case {case}: expected the create's operation to be in progress, got {}",
+            reply.body
+        );
+        assert_eq!(
+            reply.at("/clusterOperationInfo/operationType").as_str(),
+            Some("CREATE_CHANNEL"),
+            "case {case}: expected operationType CREATE_CHANNEL, got {}",
+            reply.body
+        );
+    }
     sleep_past_channel_activation();
 
     let updated = update_channel(
@@ -418,8 +437,8 @@ async fn a_channel_operation_resolves_through_the_cluster_operation_readers() {
         .as_str()
         .unwrap()
         .to_string();
-    // Read before the span is out, so the operation the caller polls is observable
-    // while it is still running.
+    // The destination change is applied by the call itself, so the operation that
+    // carried it is finished on the caller's very first read of it.
     for (case, uri) in [
         ("v1", format!("/v1/operations/{}", pct(&update_operation))),
         ("v2", format!("/api/v2/operations/{}", pct(&update_operation))),
@@ -432,8 +451,8 @@ async fn a_channel_operation_resolves_through_the_cluster_operation_readers() {
         );
         assert_eq!(
             reply.at("/clusterOperationInfo/operationState").as_str(),
-            Some("UPDATE_IN_PROGRESS"),
-            "case {case}: expected the update's operation to be in progress, got {}",
+            Some("UPDATE_COMPLETE"),
+            "case {case}: expected the update's operation to be finished, got {}",
             reply.body
         );
         assert_eq!(
@@ -443,7 +462,6 @@ async fn a_channel_operation_resolves_through_the_cluster_operation_readers() {
             reply.body
         );
     }
-    sleep_past_channel_update();
 
     let deleted = emulator
         .call(
@@ -488,8 +506,8 @@ async fn a_channel_operation_resolves_through_the_cluster_operation_readers() {
             reply.body
         );
     }
-    // The create's and the update's spans are both out by now, so both report the
-    // completion the channel transition they carried already reached.
+    // The create's span is out by now, and the update was applied when it was
+    // accepted, so both report the completion the work behind them reached.
     for (case, operation) in [
         ("create", &create_operation),
         ("update", &update_operation),
@@ -514,12 +532,14 @@ async fn only_an_active_channel_is_updatable() {
     let emulator = Emulator::new();
     let cluster = emulator.create_ok(&ClusterRequest::named("guarded")).await;
 
-    // The rows are the three non-`ACTIVE` statuses a channel of this service
-    // reaches, each produced by the call that puts it there.
-    for status in ["CREATING", "UPDATING", "DELETING"] {
+    // The rows are the non-`ACTIVE` statuses a channel of this service reaches,
+    // each produced by the call that puts it there: the create leaves its pipeline
+    // being stood up, and the delete leaves it being torn down. A destination
+    // change is applied by the call that accepts it, so no channel is ever read in
+    // `UPDATING` and there is no row for it.
+    for status in ["CREATING", "DELETING"] {
         let row = ChannelRow::s3(match status {
             "CREATING" => "guard-creating",
-            "UPDATING" => "guard-updating",
             _ => "guard-deleting",
         });
         let created = emulator.create_channel(&cluster, row.to_json()).await;
@@ -527,17 +547,6 @@ async fn only_an_active_channel_is_updatable() {
         match status {
             // Read straight after the create, inside the activation span.
             "CREATING" => {}
-            "UPDATING" => {
-                sleep_past_channel_activation();
-                let accepted =
-                    update_channel(&emulator, &cluster, &arn, update_body(Destination::S3, 600))
-                        .await;
-                assert_eq!(
-                    accepted.status, 200,
-                    "case {status}: the first update must be accepted, got {} {}",
-                    accepted.status, accepted.body
-                );
-            }
             _ => {
                 sleep_past_channel_activation();
                 let accepted = emulator
@@ -642,7 +651,6 @@ async fn the_submitted_freshness_must_lie_inside_the_documented_range() {
                     "case {case}: a value inside the range must be accepted, got {} {}",
                     reply.status, reply.body
                 );
-                sleep_past_channel_update();
                 let after = emulator.describe_channel(&cluster, &arn).await;
                 assert_eq!(
                     reported_freshness(&after, destination),

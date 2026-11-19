@@ -3,11 +3,12 @@
 //! @op UpdateChannel
 //! Applies a destination change to a channel of the cluster named in the request path:
 //! the `DataFreshnessInSeconds` the update payload carries is written onto the
-//! destination the channel was created with, the channel reports the non-terminal
-//! `UPDATING` until the clock owes it `ACTIVE` again
-//! ([`crate::state::CHANNEL_UPDATE_DELAY`]), and the cluster operation carrying the
-//! change out is filed so the `ClusterOperationArn` this call answers names a record
-//! `DescribeClusterOperation`/`DescribeClusterOperationV2` resolve.
+//! destination the channel was created with BY THIS CALL, so the channel keeps its
+//! terminal `ACTIVE` status and the new value is what every independent reader
+//! reports from its first read, and the cluster operation carrying the change is
+//! filed as finished so the `ClusterOperationArn` this call answers names a record
+//! `DescribeClusterOperation`/`DescribeClusterOperationV2` resolve and report
+//! complete ([`crate::state::Channel::begin_update`] says why nothing is deferred).
 //!
 //! Nothing else about the channel moves: its name, its tags, its topic list and the
 //! rest of its destination configuration are the stored record's, byte for byte, both
@@ -32,7 +33,7 @@
 //! ([`crate::state::channel_not_updatable`]).
 //!
 //! The operation is modelled `@idempotent`, so a repeat of an accepted update writes
-//! the same value again; it is nonetheless a new asynchronous change, so it files its
+//! the same value again; it is nonetheless its own accepted change, so it files its
 //! own cluster operation rather than re-reporting an earlier one.
 //!
 //! Authentication is NOT this handler's business: the emulator verifies every
@@ -356,9 +357,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|channel| {
                 (
                     channel.arn.clone(),
-                    // The operation carrying the change out, which the channel
-                    // stores, so this answer and a `DescribeChannel` inside the
-                    // `UPDATING` window report the same in-flight operation.
+                    // The operation that carried the change out, which the channel
+                    // stores, so this answer and a `DescribeChannel` taken straight
+                    // afterwards report the same operation for the same change.
                     channel.update_operation_arn.clone(),
                 )
             });

@@ -25,7 +25,7 @@ use service_com_amazonaws_kafka_kafka::state::state_gate::{
     CLUSTER_STATES_A_CHANGE_IS_ACCEPTED_FROM,
 };
 use service_com_amazonaws_kafka_kafka::state::{
-    BROKER_REBOOT_DELAY, CHANNEL_ACTIVATION_DELAY, CHANNEL_UPDATE_DELAY, CLUSTER_ACTIVATION_DELAY,
+    BROKER_REBOOT_DELAY, CHANNEL_ACTIVATION_DELAY, CLUSTER_ACTIVATION_DELAY,
     CLUSTER_UPDATE_DELAY, CONFIGURATION_ARN_NOT_FOUND_MESSAGE, CONFIGURATION_DELETION_DELAY,
     CONFIGURATION_STATES_A_CHANGE_IS_ACCEPTED_FROM, VPC_CONNECTION_ACTIVATION_DELAY,
     VPC_CONNECTION_REJECTION_DELAY,
@@ -1249,12 +1249,6 @@ pub async fn poll_until_active(emulator: &Emulator, arn: &str, case: &str) -> St
 /// cluster ones.
 pub fn sleep_past_channel_activation() {
     std::thread::sleep(CHANNEL_ACTIVATION_DELAY + Duration::from_millis(250));
-}
-
-/// Sleep past the emulator's own `UPDATING` -> `ACTIVE` span for a CHANNEL, which
-/// is the span an accepted `UpdateChannel` leaves the channel in.
-pub fn sleep_past_channel_update() {
-    std::thread::sleep(CHANNEL_UPDATE_DELAY + Duration::from_millis(250));
 }
 
 /// One row of a `CreateConfiguration` table: the member values one request

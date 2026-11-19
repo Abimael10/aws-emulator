@@ -642,19 +642,6 @@ pub const TOPIC_ALREADY_EXISTS_MESSAGE: &str = "Topic already exists.";
 /// `CREATING` while a caller that waits sees `ACTIVE`.
 pub const CHANNEL_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
-/// How long after an accepted `UpdateChannel` the channel leaves `UPDATING`.
-///
-/// CHOSEN, not documented, and set to the SAME span as
-/// [`CHANNEL_ACTIVATION_DELAY`] and [`CHANNEL_DELETION_DELAY`]: the destination
-/// change is applied asynchronously, so the channel reports the non-terminal
-/// `UPDATING` for a span and a caller that waits sees it `ACTIVE` again, and the
-/// project fixes an emulated clock-owed transition at 250–750 ms. Kept at the
-/// bottom of that band deliberately: a client polling a channel at an
-/// AWS-appropriate cadence pays its poll interval, not this span, for each
-/// transition, so the shorter this is the less of its budget the emulator's own
-/// asynchrony can consume.
-pub const CHANNEL_UPDATE_DELAY: Duration = Duration::from_millis(500);
-
 /// How long after `DeleteChannel` a channel marked `DELETING` is actually gone.
 ///
 /// CHOSEN, not documented, for the same reason: `DeleteChannel` is documented to
@@ -665,14 +652,15 @@ pub const CHANNEL_DELETION_DELAY: Duration = Duration::from_millis(500);
 
 /// The `ChannelStatus` values this emulator reports, spelled as the model's enum
 /// declares them. Named here so every channel operation reports the same
-/// spellings. (`FAILED`, `SUSPENDING` and `SUSPENDED`, the model's other values,
-/// belong to failures and to a suspend surface this emulator does not serve.)
+/// spellings.
+///
+/// (`FAILED`, `SUSPENDING` and `SUSPENDED`, the model's other values, belong to
+/// failures and to a suspend surface this emulator does not serve, and `UPDATING`
+/// to a destination change this service applies on the call that accepts it
+/// ([`Channel::begin_update`]) — so no stored channel is ever in one of them.)
 pub const CHANNEL_STATUS_CREATING: &str = "CREATING";
 /// The status of a channel whose delivery pipeline is up.
 pub const CHANNEL_STATUS_ACTIVE: &str = "ACTIVE";
-/// The status of a channel an accepted destination change is still being applied
-/// to.
-pub const CHANNEL_STATUS_UPDATING: &str = "UPDATING";
 /// The status of a channel whose deletion has been accepted but not completed.
 pub const CHANNEL_STATUS_DELETING: &str = "DELETING";
 
@@ -2075,9 +2063,9 @@ pub struct Channel {
     /// `DescribeChannel` both report it: minted once with the channel and stored,
     /// so the two readers never disagree about it.
     pub cluster_operation_arn: String,
-    /// The cluster operation carrying out the destination change the most recent
-    /// accepted `UpdateChannel` asked for. `None` until one is accepted, so a
-    /// channel nobody has updated reports its create as its in-flight operation.
+    /// The cluster operation that carried out the destination change the most
+    /// recent accepted `UpdateChannel` asked for. `None` until one is accepted, so
+    /// a channel nobody has updated reports its create as its latest operation.
     pub update_operation_arn: Option<String>,
     /// How many destination changes this channel has accepted. Seeds the id of
     /// each update's own cluster operation, so two updates of one channel are

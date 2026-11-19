@@ -32,7 +32,7 @@ use service_com_amazonaws_kafka_kafka::state::{
 
 use crate::kafka_harness::{
     given_iam_role_trusting, pct, sleep_past_activation, sleep_past_channel_activation,
-    sleep_past_channel_update, sleep_past_configuration_deletion, sleep_past_update,
+    sleep_past_configuration_deletion, sleep_past_update,
     sleep_past_vpc_connection_activation, sleep_past_vpc_connection_rejection, trust_policy_for,
     ClusterRequest, ConnectionRequest, Emulator, Reply, ACCOUNT,
 };
@@ -678,9 +678,10 @@ fn channel_body(name: &str, topic_arn: &str, freshness: i64) -> Value {
 
 /// RULE, for the channel family: a created channel reaches `ACTIVE` within one
 /// channel span and the create's own cluster operation finishes at that same
-/// instant, an accepted `UpdateChannel` is back to `ACTIVE` with the new
-/// destination within one update span (its operation likewise), and a deleted
-/// channel disappears — each on the FIRST read after its own span, with the
+/// instant, an accepted `UpdateChannel` carries the new destination on the FIRST
+/// read after it with the channel still `ACTIVE` (its operation already complete),
+/// and a deleted channel disappears — each on the FIRST read after its own span,
+/// with the
 /// wrong-state refusal on the same path.
 #[tokio::test]
 async fn the_channel_sequence_settles_at_every_step() {
@@ -794,7 +795,8 @@ async fn the_channel_sequence_settles_at_every_step() {
         listed.body
     );
 
-    // Step 2: the destination change, which the client polls back to ACTIVE.
+    // Step 2: the destination change, which the accepting call applies, so the
+    // client's next read already carries it.
     let updated = emulator
         .call(
             "PUT",
@@ -812,14 +814,6 @@ async fn the_channel_sequence_settles_at_every_step() {
         updated.status, updated.body
     );
     let update_operation = operation_arn(&updated, "UpdateChannel");
-    assert_operation_state(
-        &emulator,
-        &update_operation,
-        "UPDATE_IN_PROGRESS",
-        "the channel update inside its span",
-    )
-    .await;
-    sleep_past_channel_update();
     let reported = emulator.describe_channel(&cluster, &channel).await;
     assert_eq!(
         (
@@ -827,7 +821,7 @@ async fn the_channel_sequence_settles_at_every_step() {
             reported.at("/s3DestinationConfiguration/dataFreshnessInSeconds").as_i64(),
         ),
         (Some("ACTIVE"), Some(900)),
-        "the first read after the update span must report ACTIVE with the new destination, \
+        "the first read after the update must report ACTIVE with the new destination, \
          got {}",
         reported.body
     );
@@ -835,7 +829,7 @@ async fn the_channel_sequence_settles_at_every_step() {
         &emulator,
         &update_operation,
         "UPDATE_COMPLETE",
-        "the channel update once its span is over",
+        "the channel update, which its own call applied",
     )
     .await;
 

@@ -87,30 +87,36 @@ impl Channel {
     /// [`Self::active_due`]. Idempotent, and a no-op for every other status: only
     /// a transition the clock already owed is materialised here.
     ///
-    /// The two non-terminal statuses a channel of this emulator leaves on a clock
-    /// are `CREATING`, after the create, and `UPDATING`, after an accepted
-    /// destination change — both of them end in `ACTIVE`, and both are owed at the
-    /// instant the call that started them recorded. A channel that is `DELETING`
-    /// never goes back to `ACTIVE`.
+    /// The one non-terminal status a channel of this emulator leaves on a clock is
+    /// `CREATING`: standing a delivery pipeline up is work the create leaves
+    /// behind, owed at the instant that call recorded. A channel that is `DELETING`
+    /// never goes back to `ACTIVE`, and a destination change needs no span at all
+    /// ([`Self::begin_update`]).
     pub fn settle(&mut self, now: SystemTime) {
-        let settling =
-            self.status == CHANNEL_STATUS_CREATING || self.status == CHANNEL_STATUS_UPDATING;
-        if settling && now >= self.active_due {
+        if self.status == CHANNEL_STATUS_CREATING && now >= self.active_due {
             self.status = CHANNEL_STATUS_ACTIVE.to_string();
         }
     }
 
-    /// Accept a destination change at `now`: write
-    /// `data_freshness_in_seconds` onto the destination this channel was created
-    /// with, move the channel to `UPDATING`, record the instant the clock owes it
-    /// `ACTIVE` again, and mint the cluster operation carrying the change out —
-    /// whose ARN is handed back, since that is what the caller polls.
+    /// Accept a destination change: write `data_freshness_in_seconds` onto the
+    /// destination this channel was created with and mint the cluster operation
+    /// that carries it — whose ARN is handed back, since that is what the caller
+    /// polls.
+    ///
+    /// APPLIED BY THIS CALL, so the channel keeps the terminal status it already
+    /// had and no reader ever sees a value the change has not reached. A span is
+    /// owed where the service has work left to finish — a channel's pipeline being
+    /// stood up ([`Self::settle`]), a deleted channel's teardown
+    /// ([`Self::begin_deletion`]) — and a destination change has none: the whole
+    /// change is the one stored buffering parameter this writes, so deferring it
+    /// would only hide the new value from the reader the caller has to confirm it
+    /// through.
     ///
     /// Only the member the request named is written: every other stored attribute
     /// of the channel — its name, its tags, its topic list, the rest of its
     /// destination configuration — is left exactly as it was, so an update of one
     /// member cannot rewrite another.
-    pub fn begin_update(&mut self, now: SystemTime, data_freshness_in_seconds: i32) -> &str {
+    pub fn begin_update(&mut self, data_freshness_in_seconds: i32) -> &str {
         // Each accepted update is its own operation, so the ordinal that seeds the
         // id advances with it: the seed is the channel's identity plus that ordinal,
         // which makes the ARN distinct from the create's, from the delete's and from
@@ -132,8 +138,6 @@ impl Channel {
         if let Some(destination) = self.iceberg_destination_configuration.as_mut() {
             destination.data_freshness_in_seconds = Some(data_freshness_in_seconds);
         }
-        self.status = CHANNEL_STATUS_UPDATING.to_string();
-        self.active_due = now + CHANNEL_UPDATE_DELAY;
         self.update_operation_arn.as_deref().unwrap_or_default()
     }
 
