@@ -436,10 +436,11 @@ async fn task_definition_compatibilities_follow_network_mode_and_task_size() {
     // The rule: a revision is compatible with EC2 always, with FARGATE only when the
     // network mode is `awsvpc` AND task-level cpu and memory are set ("For Amazon ECS
     // tasks on Fargate, the awsvpc network mode is required"; cpu/memory "required for
-    // Fargate"), with EXTERNAL only when the network mode is not `awsvpc`, and with
-    // MANAGED_INSTANCES — whose capacity gives each task its own network interface — only
-    // when it is (tabled in [`crate::task_definition_compatibility_validation`]). The list
-    // is reported in the launch-type order ECS reports, EXTERNAL, EC2, FARGATE,
+    // Fargate"), and with EXTERNAL only when the network mode is not `awsvpc`. No network
+    // mode derives MANAGED_INSTANCES, which only a registration that asks to be validated
+    // against it reports (tabled in
+    // [`crate::task_definition_compatibility_validation`]), and none of these rows asks.
+    // The list is reported in the launch-type order ECS reports, EXTERNAL, EC2, FARGATE,
     // MANAGED_INSTANCES, so a positional read names the same launch type the real service
     // named. `networkMode` is the closed `NetworkMode` enum (bridge, host, awsvpc, none)
     // plus the documented default: "If no network mode is specified, the default is
@@ -494,14 +495,14 @@ async fn task_definition_compatibilities_follow_network_mode_and_task_size() {
             network_mode: Some("awsvpc"),
             task_size: false,
             expected_mode: "awsvpc",
-            expected: &["EC2", "MANAGED_INSTANCES"],
+            expected: &["EC2"],
         },
         Row {
             case: "awsvpc with task size",
             network_mode: Some("awsvpc"),
             task_size: true,
             expected_mode: "awsvpc",
-            expected: &["EC2", "FARGATE", "MANAGED_INSTANCES"],
+            expected: &["EC2", "FARGATE"],
         },
     ];
 

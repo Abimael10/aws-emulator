@@ -9,14 +9,15 @@
 //! whether or not the registration asked to be validated against it in its
 //! `requiresCompatibilities` ("The task launch type that Amazon ECS validates the task
 //! definition against"), which is reported separately and unchanged. Managed-instances
-//! capacity gives each task its own network interface, so it is reported for the `awsvpc`
-//! network mode and for no other.
+//! capacity has no documented task-definition requirement of its own and no placement
+//! reaches it by naming it, so no parameter derives it: it is reported only for a
+//! revision whose `requiresCompatibilities` named it.
 //!
 //! Which of those launch types a PLACEMENT may name is the narrower question: a
 //! `launchType` names the infrastructure outright, and managed-instances capacity is not
 //! reachable that way (`CreateService$launchType`: "If you want to use Amazon ECS Managed
 //! Instances, you must use the capacityProviderStrategy request parameter and omit the
-//! launchType request parameter"), so the second suite drives `RunTask` through the gate
+//! launchType request parameter"), so the last suite drives `RunTask` through the gate
 //! the same derived list feeds.
 //!
 //! Every case goes through the HTTP front door, so a list that is not derived from the
@@ -108,11 +109,11 @@ async fn compatibilities_report_only_the_launch_types_the_revision_supports() {
             expected: &["EXTERNAL", "EC2"],
         },
         Row {
-            case: "bridge asking for managed instances, which needs awsvpc",
+            case: "bridge asking for managed instances",
             network_mode: Some("bridge"),
             task_size: false,
             requires: &["EC2", "MANAGED_INSTANCES"],
-            expected: &["EXTERNAL", "EC2"],
+            expected: &["EXTERNAL", "EC2", "MANAGED_INSTANCES"],
         },
         Row {
             case: "host with a task size",
@@ -133,21 +134,21 @@ async fn compatibilities_report_only_the_launch_types_the_revision_supports() {
             network_mode: Some("awsvpc"),
             task_size: false,
             requires: &[],
-            expected: &["EC2", "MANAGED_INSTANCES"],
+            expected: &["EC2"],
         },
         Row {
             case: "awsvpc with a task size, asking for nothing",
             network_mode: Some("awsvpc"),
             task_size: true,
             requires: &[],
-            expected: &["EC2", "FARGATE", "MANAGED_INSTANCES"],
+            expected: &["EC2", "FARGATE"],
         },
         Row {
             case: "awsvpc with a task size, asking for Fargate",
             network_mode: Some("awsvpc"),
             task_size: true,
             requires: &["FARGATE"],
-            expected: &["EC2", "FARGATE", "MANAGED_INSTANCES"],
+            expected: &["EC2", "FARGATE"],
         },
         Row {
             case: "awsvpc without a task size, asking for managed instances",
@@ -207,6 +208,121 @@ async fn compatibilities_report_only_the_launch_types_the_revision_supports() {
 }
 
 #[tokio::test]
+async fn the_derived_list_ignores_the_shape_of_the_container_list() {
+    let router = service();
+
+    // One Fargate-shaped revision per container list, each registered twice: once asking
+    // to be validated against Fargate alone, once asking for managed instances as well.
+    // The rows differ along the container COUNT and the members the containers carry — a
+    // log driver that delivers to the task's log router, the router that serves it
+    // (`FirelensConfiguration`), a task volume with a mount point — none of which is a
+    // launch-type requirement, so every row derives the same pair and gains managed
+    // instances only where the registration asked for it.
+    let app_image = IMAGE;
+    let rows: [(&str, Value, Value); 4] = [
+        (
+            "one plain container",
+            json!([container("app", app_image)]),
+            json!([]),
+        ),
+        (
+            "an awsfirelens app beside a fluent-bit router",
+            json!([
+                {
+                    "name": "app",
+                    "image": app_image,
+                    "memory": 128,
+                    "logConfiguration": { "logDriver": "awsfirelens" },
+                },
+                {
+                    "name": "log-router",
+                    "image": "public.ecr.aws/aws-observability/aws-for-fluent-bit:stable",
+                    "memory": 128,
+                    "firelensConfiguration": { "type": "fluentbit" },
+                },
+            ]),
+            json!([]),
+        ),
+        (
+            "two containers sharing a task volume",
+            json!([
+                {
+                    "name": "writer",
+                    "image": app_image,
+                    "memory": 128,
+                    "mountPoints": [{ "sourceVolume": "scratch", "containerPath": "/scratch" }],
+                },
+                {
+                    "name": "reader",
+                    "image": app_image,
+                    "memory": 128,
+                    "mountPoints": [
+                        { "sourceVolume": "scratch", "containerPath": "/scratch", "readOnly": true },
+                    ],
+                },
+            ]),
+            json!([{ "name": "scratch" }]),
+        ),
+        (
+            "three containers, one of them not essential",
+            json!([
+                container("app", app_image),
+                container("sidecar", app_image),
+                { "name": "optional", "image": app_image, "memory": 128, "essential": false },
+            ]),
+            json!([]),
+        ),
+    ];
+
+    // (what the registration asks to be validated against, what the revision must report).
+    let asks: [(&[&str], &[&str]); 2] = [
+        (&["FARGATE"], &["EC2", "FARGATE"]),
+        (
+            &["FARGATE", "MANAGED_INSTANCES"],
+            &["EC2", "FARGATE", "MANAGED_INSTANCES"],
+        ),
+    ];
+
+    for (index, (shape, containers, volumes)) in rows.iter().enumerate() {
+        for (ask_index, (requires, expected)) in asks.iter().enumerate() {
+            let case = format!("{shape} asking for {requires:?}");
+            let case = case.as_str();
+            let family = format!("shapefam{index}x{ask_index}");
+            let mut request = json!({
+                "family": family,
+                "networkMode": "awsvpc",
+                "cpu": TASK_CPU,
+                "memory": TASK_MEMORY,
+                "containerDefinitions": containers,
+                "requiresCompatibilities": requires,
+            });
+            if !volumes.as_array().is_some_and(|list| list.is_empty()) {
+                request["volumes"] = volumes.clone();
+            }
+            let registered = ok(&router, "RegisterTaskDefinition", request, case).await;
+            let described = ok(
+                &router,
+                "DescribeTaskDefinition",
+                json!({ "taskDefinition": family }),
+                case,
+            )
+            .await;
+            for (source, definition) in [
+                ("RegisterTaskDefinition", &registered["taskDefinition"]),
+                ("DescribeTaskDefinition", &described["taskDefinition"]),
+            ] {
+                let actual = compatibilities(definition, case);
+                assert_eq!(
+                    actual, *expected,
+                    "case {case:?}: {source} expected compatibilities {expected:?}, got \
+                     {actual:?} in {definition}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_placement_may_name_only_a_launch_type_the_revision_reports() {
     let router = service();
     let case = "setup";
@@ -214,15 +330,15 @@ async fn a_placement_may_name_only_a_launch_type_the_revision_reports() {
 
     // Two revisions of the SAME shape — `awsvpc` at a legal Fargate task size — that
     // differ only in whether the registration asked to be validated against
-    // managed-instances capacity: both report it among their compatibilities, and neither
-    // may be placed by NAMING that launch type, which is the narrower question the gate
-    // puts.
+    // managed-instances capacity: only the second reports it among its compatibilities, and
+    // neither may be placed by NAMING that launch type, which is the narrower question the
+    // gate puts.
     let plain = Row {
         case: "asking for nothing",
         network_mode: Some("awsvpc"),
         task_size: true,
         requires: &[],
-        expected: &["EC2", "FARGATE", "MANAGED_INSTANCES"],
+        expected: &["EC2", "FARGATE"],
     };
     let validated = Row {
         case: "asking for managed instances",

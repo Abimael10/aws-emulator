@@ -661,12 +661,12 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
         (
             "awsvpc without task size",
             json!({ "networkMode": "awsvpc" }),
-            vec!["EC2", "MANAGED_INSTANCES"],
+            vec!["EC2"],
         ),
         (
             "awsvpc with task size",
             json!({ "networkMode": "awsvpc", "cpu": "256", "memory": "512" }),
-            vec!["EC2", "FARGATE", "MANAGED_INSTANCES"],
+            vec!["EC2", "FARGATE"],
         ),
         (
             "fargate requested",
@@ -676,10 +676,11 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
                 "memory": "1024",
                 "requiresCompatibilities": ["FARGATE"],
             }),
-            vec!["EC2", "FARGATE", "MANAGED_INSTANCES"],
+            vec!["EC2", "FARGATE"],
         ),
         // What the registration ASKED to be validated against does not reorder the derived
-        // list, nor add to it: the same shape asking for both reads back the same order.
+        // list: the launch type it adds (managed instances, which no parameter derives)
+        // still reads back in the same position.
         (
             "fargate and managed instances requested",
             json!({

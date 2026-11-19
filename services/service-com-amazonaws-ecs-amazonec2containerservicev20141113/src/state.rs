@@ -1411,7 +1411,7 @@ pub const DYNAMIC_HOST_PORT: i32 = 0;
 /// `EC2`, `FARGATE`, `EXTERNAL`, `MANAGED_INSTANCES`); the ORDER is the one recorded ECS
 /// responses carry, so a client that reads the list positionally reads the same launch
 /// type the real service named. [`TaskDefinitionRecord::compatibilities`] filters it by
-/// what the stored revision's parameters support.
+/// what the stored revision was validated against.
 pub const COMPATIBILITY_ORDER: [&str; 4] = [
     "EXTERNAL",
     "EC2",
@@ -3760,20 +3760,25 @@ impl TaskDefinitionRecord {
     /// type is reported when the revision's parameters meet that launch type's documented
     /// requirements — Fargate needs `awsvpc` ("For Amazon ECS tasks on Fargate, the awsvpc
     /// network mode is required") plus task-level `cpu` and `memory` ("This field is
-    /// required for Fargate"); ECS Managed Instances place tasks on AWS-managed capacity
-    /// that gives each task its own network interface, so they likewise need `awsvpc`;
-    /// `awsvpc` is in turn not available to the external (on-premises) launch type; EC2
-    /// supports every network mode; and Fargate additionally needs a principal for every
-    /// image fetch the revision's containers need authenticating
+    /// required for Fargate"); `awsvpc` is in turn not available to the external
+    /// (on-premises) launch type; EC2 supports every network mode ("For Amazon ECS tasks on
+    /// Amazon EC2 Linux instances, any network mode can be used"); and Fargate additionally
+    /// needs a principal for every image fetch the revision's containers need authenticating
     /// ([`TaskDefinitionRecord::pull_needs_execution_role`]), because a Fargate task runs
     /// on capacity Amazon ECS owns and so has no container instance whose own role the
     /// agent could pull under.
     ///
+    /// Managed-instances capacity is the one launch type with no documented task-definition
+    /// parameter requirement to meet, and no placement reaches it by naming it
+    /// ([`PLACEMENT_LAUNCH_TYPES`]), so no combination of a revision's parameters implies
+    /// it: it is reported only for a revision whose own `requiresCompatibilities` asked
+    /// Amazon ECS to validate it against that launch type.
+    ///
     /// What the REGISTRATION asked to be validated against (`requiresCompatibilities`) is
-    /// reported separately and unchanged: it neither adds a launch type the parameters rule
-    /// out nor withholds one they support. Which of these launch types a PLACEMENT may name
-    /// outright is a further question, decided where a `launchType` is checked
-    /// ([`validate_launch_type`]).
+    /// reported separately and unchanged: for a launch type whose requirements are
+    /// documented it neither adds one the parameters rule out nor withholds one they
+    /// support. Which of these launch types a PLACEMENT may name outright is a further
+    /// question, decided where a `launchType` is checked ([`validate_launch_type`]).
     pub fn compatibilities(&self) -> Vec<String> {
         let awsvpc = self.network_mode == NETWORK_MODE_AWSVPC;
         COMPATIBILITY_ORDER
@@ -3781,7 +3786,10 @@ impl TaskDefinitionRecord {
             .filter(|launch_type| match **launch_type {
                 "EC2" => true,
                 "EXTERNAL" => !awsvpc,
-                "MANAGED_INSTANCES" => awsvpc,
+                "MANAGED_INSTANCES" => self
+                    .requires_compatibilities
+                    .iter()
+                    .any(|required| required == LAUNCH_TYPE_MANAGED_INSTANCES),
                 "FARGATE" => {
                     awsvpc
                         && self.cpu.is_some()
