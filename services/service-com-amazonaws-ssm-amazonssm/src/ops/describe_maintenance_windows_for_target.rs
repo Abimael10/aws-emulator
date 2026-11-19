@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMaintenanceWindowsForTarget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMaintenanceWindowsForTarget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMaintenanceWindowsForTarget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports "the maintenance window targets or tasks that a managed node is associated with":
+//! the windows one target belongs to, each as the id and the name a
+//! `CreateMaintenanceWindow` persisted. A window is one of them when a
+//! `RegisterTargetWithMaintenanceWindow` of that window registered the stated
+//! `MaintenanceWindowResourceType` against criteria covering the `Targets` this read asks
+//! about
+//! ([`crate::state::maintenance_window_targets::MaintenanceWindowTargetRecord::covers`]) —
+//! the same reading the sibling schedule report of this crate narrows by, so the two can
+//! never disagree about which windows a node is associated with.
+//!
+//! Each window is reported ONCE however many of its registrations cover the target, in the
+//! order the windows were created, and a page holds at most `MaxResults` of them with the
+//! `NextToken` naming the window the next page starts at. A target no registration of this
+//! endpoint covers belongs to no window, which is reported as none rather than refused. This
+//! is a REPORTING operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +154,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMaintenanceWindowsForTarget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMaintenanceWindowsForTargetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMaintenanceWindowsForTarget"))
+        use crate::state::maintenance_windows::{
+            is_maintenance_window_id, windows_for_target_page_size, MaintenanceWindowRecord,
+        };
+        use crate::state::INVALID_NEXT_TOKEN;
+
+        // `ResourceType`'s enum, `Targets`'s presence and length (0..5) and `MaxResults`'s
+        // lower bound are MODELLED constraints the centralized request walk has already
+        // refused anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeMaintenanceWindowsForTargetErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the maintenance window store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let page_size = windows_for_target_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this operation hands out is the id of the window the next page starts at,
+        // so a token that is not shaped like a window id was not one of ours, and neither is
+        // one that is but names no window of this result: a token this read did not hand out
+        // is refused rather than served the first page over again, the rule every paged
+        // maintenance window read of this crate takes
+        // (`crate::ops::describe_maintenance_windows`). This operation models no token error,
+        // so it is a 400 `ValidationException`.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if is_maintenance_window_id(token) => Some(token.to_string()),
+            Some(_) => return Err(crate::scaffolded::Scaffolded::validation(INVALID_NEXT_TOKEN)),
+        };
+
+        // A window lives in the Region its endpoint names, which is the signed credential
+        // scope's, so the windows a target is associated with are that Region's.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+
+        // "The managed node ID or key-value pair to retrieve information about", of "the type
+        // of resource you want to retrieve information about": a window is one the target
+        // belongs to when one of its registrations was made for that resource type and its
+        // criteria cover the target asked about. Several registrations of one window may do
+        // so, and the window is still one window, so it is reported once.
+        let criteria = input.targets.as_slice();
+        let matching: Vec<&MaintenanceWindowRecord> = store
+            .maintenance_windows_in(&region)
+            .into_iter()
+            .filter(|window| {
+                store
+                    .maintenance_window_targets_of(&region, &window.window_id)
+                    .into_iter()
+                    .any(|registered| {
+                        registered.resource_type == input.resource_type
+                            && registered.covers(criteria)
+                    })
+            })
+            .collect();
+
+        let start = match resume_from.as_deref() {
+            None => 0,
+            Some(token) => match matching.iter().position(|window| window.window_id == token) {
+                Some(at) => at,
+                // Shaped like a window id, but no window of this result: not a page of it to
+                // resume.
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(INVALID_NEXT_TOKEN))
+                }
+            },
+        };
+        // `start` is a position in `matching`, so the page is a suffix of it; `get` keeps that
+        // in-bounds without indexing on a value the request steers.
+        let page = matching.get(start..).unwrap_or_default();
+        let window_identities = page
+            .iter()
+            .take(page_size)
+            .map(|window| window.to_maintenance_window_identity_for_target())
+            .collect();
+        // A window is still waiting past this page: hand the caller the id it resumes at, so
+        // the next request continues where this one stopped.
+        let next_token = page.get(page_size).map(|window| window.window_id.clone());
+
+        Ok(DescribeMaintenanceWindowsForTargetOutput {
+            window_identities: Some(window_identities),
+            next_token,
+        })
     }
 }
+

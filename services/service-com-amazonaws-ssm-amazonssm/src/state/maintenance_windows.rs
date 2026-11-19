@@ -45,7 +45,9 @@ use std::time::{Duration, SystemTime};
 
 use ::chrono::{Offset, TimeZone};
 
-use crate::ops::types::{MaintenanceWindowIdentity, PatchOrchestratorFilter};
+use crate::ops::types::{
+    MaintenanceWindowIdentity, MaintenanceWindowIdentityForTarget, PatchOrchestratorFilter,
+};
 
 use super::{ComAmazonawsSsmAmazonssmState, NANOS_PER_MILLISECOND};
 
@@ -207,6 +209,34 @@ pub const MAX_WINDOW_PAGE_SIZE: i32 = super::maintenance_window_targets::MAX_TAR
 /// The page size a window describe serves (see `super::page_size`).
 pub fn window_page_size(max_results: Option<i32>) -> Result<usize, String> {
     super::page_size(max_results, MIN_WINDOW_PAGE_SIZE, MAX_WINDOW_PAGE_SIZE)
+}
+
+/// The smallest page a report of the windows one target belongs to serves, from the modelled
+/// `MaintenanceWindowSearchMaxResults` (`range 1..`), which is the member
+/// `DescribeMaintenanceWindowsForTargetRequest$MaxResults` carries.
+pub const MIN_WINDOWS_FOR_TARGET_PAGE_SIZE: i32 = 1;
+
+/// The page size a report of the windows one target belongs to serves.
+///
+/// That modelled member states a lower bound and NO maximum, and such a report can never name
+/// more windows than this store holds ([`MAX_MAINTENANCE_WINDOWS`]): a request naming no
+/// `MaxResults` is served up to that many — "the maximum number of items to return for this
+/// call" bounds a page the caller asked to be bounded — and one naming a larger figure is
+/// served every window there is rather than refused against a bound the service does not
+/// model. A figure below the modelled bound is refused the way the protocol's boundary
+/// validator already refuses it, so that arm is a backstop rather than the first line of
+/// defence.
+pub fn windows_for_target_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    let Some(requested) = max_results else {
+        return Ok(MAX_MAINTENANCE_WINDOWS);
+    };
+    if requested < MIN_WINDOWS_FOR_TARGET_PAGE_SIZE {
+        return Err(format!(
+            "Value '{requested}' at 'maxResults' failed to satisfy constraint: Member must have \
+             value greater than or equal to {MIN_WINDOWS_FOR_TARGET_PAGE_SIZE}"
+        ));
+    }
+    Ok(usize::try_from(requested).unwrap_or(MAX_MAINTENANCE_WINDOWS))
 }
 
 /// The filter keys a report of a window's UPCOMING executions may narrow by: "you can limit
@@ -1145,6 +1175,19 @@ impl MaintenanceWindowRecord {
             end_date: self.end_date.clone(),
             start_date: self.start_date.clone(),
             next_execution_time: self.next_execution_time(now),
+        }
+    }
+
+    /// The modelled `MaintenanceWindowIdentityForTarget` for this record: "the maintenance
+    /// window to which the specified target belongs"
+    /// (`smithy_query(query="shape",shape="MaintenanceWindowIdentityForTarget")`), which names
+    /// the window and nothing about the registration that made it one of the target's — the
+    /// stored id and the name the create persisted.
+    #[must_use]
+    pub fn to_maintenance_window_identity_for_target(&self) -> MaintenanceWindowIdentityForTarget {
+        MaintenanceWindowIdentityForTarget {
+            window_id: Some(self.window_id.clone()),
+            name: Some(self.name.clone()),
         }
     }
 
