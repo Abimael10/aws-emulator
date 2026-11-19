@@ -666,6 +666,18 @@ pub const MAX_IMPORT_TASKS: usize = 1_000;
 pub const IMPORT_SOURCE_NOT_ACTIVE_MESSAGE: &str =
     "The specified source must be in an ACTIVE state.";
 
+/// The refusal `CreateImportTask` answers when the `importSourceArn` it is given resolves to
+/// no CloudTrail Lake event data store — a value that is no event data store ARN at all as
+/// much as one no store answers to.
+///
+/// CloudWatch Logs reads that member as an event data store ARN and states what it could not
+/// make of the value handed to it, so the refusal is about the REQUEST's parameter: the text
+/// is fixed for the condition and the one value it interpolates is the caller's own
+/// `importSourceArn`, echoed verbatim, so an operator can see which ARN was rejected.
+pub fn invalid_event_data_store_arn_message(source_arn: &str) -> String {
+    format!("Invalid Event Data Store ARN: {source_arn}")
+}
+
 /// The refusal `CreateImportTask` answers when the `importFilter` it is given bounds the
 /// event time at both ends in the wrong order: the operation documents the constraint as a
 /// sentence of its own — "the startEventTime must be less than or equal to endEventTime" —

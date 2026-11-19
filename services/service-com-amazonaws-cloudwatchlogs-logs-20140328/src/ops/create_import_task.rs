@@ -203,16 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
 
-        // Both ARN-typed members are read as ARNs before anything else is decided, the way
-        // every ARN-typed member of this service is: a value that is not an ARN at all names
-        // no resource, and the refusal states which member could not be parsed.
-        for (member, value) in [
-            ("importSourceArn", input.import_source_arn.as_str()),
-            ("importRoleArn", input.import_role_arn.as_str()),
-        ] {
-            if let Some(message) = crate::state::unparsable_arn_message(member, value) {
-                return Err(invalid(message));
-            }
+        // The role is read as an ARN before anything else is decided, the way every ARN-typed
+        // member of this service is: a value that is not an ARN at all names no resource, and
+        // the refusal states which member could not be parsed. The SOURCE is not read that
+        // way: it is the one member this operation reads as an event data store ARN
+        // specifically, and every value that is not one is refused in those terms below.
+        if let Some(message) =
+            crate::state::unparsable_arn_message("importRoleArn", &input.import_role_arn)
+        {
+            return Err(invalid(message));
         }
 
         // "The startEventTime must be less than or equal to endEventTime": the window is a
@@ -235,14 +234,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // id the caller would then poll for data nothing will move. `ctx` carries the
         // credential scope the resolution is addressed in; nothing else about the request
         // enters into it.
+        //
+        // A source the owning service holds no store under is a defect in the VALUE the
+        // request carried, not a missing resource of this API: `importSourceArn` is read as an
+        // event data store ARN, so a value that resolves to no store — one in no form a store
+        // is named by as much as one no store answers to — is refused as the parameter it is,
+        // echoing the value back so the caller can see which ARN was rejected.
+        // `ResourceNotFoundException` stays for the resources this service itself owns and
+        // the request named (log group, log stream, policy), which a caller may yet create.
         match crate::state::import_source::resolve(ctx, &region, &input.import_source_arn).await {
             crate::state::import_source::ImportSource::Absent => {
-                return Err(CreateImportTaskErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::resource_not_found_message("import source")),
-                    },
-                )
-                .into());
+                return Err(invalid(crate::state::invalid_event_data_store_arn_message(
+                    &input.import_source_arn,
+                )));
             }
             // "The specified source must be in an ACTIVE state": the source is there, but not
             // in a state its events can be read from, which is a refusal about the resource

@@ -10,9 +10,11 @@
 //! CloudWatch Logs.
 //!
 //! The rule under test: `CreateImportTask` starts an import only from a data source the
-//! service that OWNS it holds in a state it can be read from — a source no event data store
-//! answers to is `ResourceNotFoundException`, one queued for deletion is
-//! `InvalidOperationException` — and an accepted create persists the import `IN_PROGRESS`
+//! service that OWNS it holds in a state it can be read from — an `importSourceArn` that
+//! resolves to no event data store is a defect in that parameter
+//! (`InvalidParameterException`, `Invalid Event Data Store ARN: <the value sent>`), a store
+//! queued for deletion is `InvalidOperationException` — and an accepted create persists the
+//! import `IN_PROGRESS`
 //! with the managed destination log group it reports, so every value it hands back
 //! (`importId`, `importDestinationArn`, `creationTime`) is read back through
 //! `DescribeImportTasks` and `DescribeLogGroups`. The account runs at most the documented
@@ -25,8 +27,9 @@
 //! The table spans what the rule generalises over rather than one request: each form an
 //! `importFilter` takes (absent, one bound, both bounds, both equal), several sources, a role
 //! ARN of either form, and — for the refusals — a source ARN that names no store, one that
-//! names a resource of another service, one that is not an ARN at all, and a store that is on
-//! its way out.
+//! names another resource kind of the owning service, one that names a resource of another
+//! service, one that names a resource of this service, one carrying no store id at all, one
+//! that is not an ARN at all, an empty one, and a store that is on its way out.
 
 use std::sync::Arc;
 
@@ -481,10 +484,12 @@ struct Refused {
     message: String,
 }
 
-/// The refusal a source no event data store answers to carries, in the sentence form this
-/// service states a missing resource in.
-fn source_not_found() -> String {
-    "The specified import source does not exist.".to_string()
+/// The refusal an `importSourceArn` that resolves to no CloudTrail Lake event data store
+/// carries: the fixed sentence CloudWatch Logs states an unusable event data store ARN in,
+/// with the caller's own value echoed verbatim. Spelled out here rather than read from the
+/// crate, so the wording is pinned by the test.
+fn invalid_source(source_arn: &str) -> String {
+    format!("Invalid Event Data Store ARN: {source_arn}")
 }
 
 /// The refusal a member that is not an ARN at all carries, which is the validation-error
@@ -513,8 +518,41 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
                      11111111-1111-1111-1111-111111111111",
                 "importRoleArn": ROLE_ARN,
             }),
-            code: "ResourceNotFoundException",
-            message: source_not_found(),
+            code: "InvalidParameterException",
+            message: invalid_source(
+                "arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/\
+                 11111111-1111-1111-1111-111111111111",
+            ),
+        },
+        Refused {
+            case: "an event data store ARN of another account and Region no store answers to",
+            request: json!({
+                "importSourceArn":
+                    "arn:aws:cloudtrail:ap-southeast-1:210987654321:eventdatastore/elsewhere",
+                "importRoleArn": ROLE_ARN,
+            }),
+            code: "InvalidParameterException",
+            message: invalid_source(
+                "arn:aws:cloudtrail:ap-southeast-1:210987654321:eventdatastore/elsewhere",
+            ),
+        },
+        Refused {
+            case: "a source ARN naming another resource kind of the owning service",
+            request: json!({
+                "importSourceArn": "arn:aws:cloudtrail:eu-west-2:123456789012:trail/management",
+                "importRoleArn": ROLE_ARN,
+            }),
+            code: "InvalidParameterException",
+            message: invalid_source("arn:aws:cloudtrail:eu-west-2:123456789012:trail/management"),
+        },
+        Refused {
+            case: "a source ARN carrying no event data store id at all",
+            request: json!({
+                "importSourceArn": "arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/",
+                "importRoleArn": ROLE_ARN,
+            }),
+            code: "InvalidParameterException",
+            message: invalid_source("arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/"),
         },
         Refused {
             case: "a source ARN naming a resource of another service",
@@ -522,8 +560,8 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
                 "importSourceArn": "arn:aws:s3:::import-source-bucket",
                 "importRoleArn": ROLE_ARN,
             }),
-            code: "ResourceNotFoundException",
-            message: source_not_found(),
+            code: "InvalidParameterException",
+            message: invalid_source("arn:aws:s3:::import-source-bucket"),
         },
         Refused {
             case: "a source ARN naming a log group of this service",
@@ -532,8 +570,10 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
                     "arn:aws:logs:eu-west-2:123456789012:log-group:/aws/cloudtrail/not-a-source",
                 "importRoleArn": ROLE_ARN,
             }),
-            code: "ResourceNotFoundException",
-            message: source_not_found(),
+            code: "InvalidParameterException",
+            message: invalid_source(
+                "arn:aws:logs:eu-west-2:123456789012:log-group:/aws/cloudtrail/not-a-source",
+            ),
         },
         Refused {
             case: "a source that is not an ARN at all",
@@ -542,7 +582,16 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
                 "importRoleArn": ROLE_ARN,
             }),
             code: "InvalidParameterException",
-            message: unparsable("importSourceArn", "lake-store-present"),
+            message: invalid_source("lake-store-present"),
+        },
+        Refused {
+            case: "an empty source",
+            request: json!({
+                "importSourceArn": "",
+                "importRoleArn": ROLE_ARN,
+            }),
+            code: "InvalidParameterException",
+            message: invalid_source(""),
         },
         Refused {
             case: "a role that is not an ARN at all",
