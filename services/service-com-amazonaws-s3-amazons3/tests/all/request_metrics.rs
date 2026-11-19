@@ -42,6 +42,17 @@ use super::bucket_lifecycle::{create_bucket, send, send_bytes, Answer};
 use super::bucket_metrics_configuration::{put_metrics, Filter, ACCESS_POINT_ARN};
 use super::object_and_tagging_roundtrip::{get_object, put_object};
 
+/// The other half of the same publication rule: that each counted request is exactly ONE
+/// sample of every series the configuration publishes, the two per-request latencies
+/// included, so a window's counters and latencies reconcile against the requests made.
+///
+/// Declared here rather than in `tests/all.rs`, which declares the suites directly under
+/// `tests/all/`: a file deeper than that is declared by its own parent module, which this
+/// suite is. The `#[path]` is relative to this file's own directory, and is needed because
+/// `tests/all.rs` pulled this file in with a `#[path]` of its own.
+#[path = "request_metrics/verb_accounting.rs"]
+mod verb_accounting;
+
 /// The `X-Amz-Target` prefix the CloudWatch model declares.
 const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
 
@@ -69,22 +80,46 @@ const ALARM_PERIOD_SECS: i64 = 60;
 const ALARM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ALARM_POLL_ATTEMPTS: usize = 1_500;
 
+/// The body a write carries: the literal bytes a row spells, or a body of a given SIZE, which
+/// is how a row spans the byte counters and the request types without spelling out thousands
+/// of bytes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Body {
+    Text(&'static str),
+    Sized(usize),
+}
+
+impl Body {
+    /// The bytes a write of this body puts on the wire.
+    pub(crate) fn bytes(self) -> Vec<u8> {
+        match self {
+            Self::Text(text) => text.as_bytes().to_vec(),
+            Self::Sized(bytes) => vec![b'x'; bytes],
+        }
+    }
+}
+
 /// One request a row's client makes.
+///
+/// `pub(crate)`, with [`drive`] and [`Body`]: the verb-accounting suite in this suite's own
+/// module drives S3's wire through this one table of calls rather than a second copy of it,
+/// so the two halves of the same publication rule cannot disagree about what a request was.
 #[derive(Debug)]
-enum Call {
+pub(crate) enum Call {
     /// A read of an object, and the status it must be answered with.
     Get {
         key: &'static str,
         status: u16,
     },
-    /// A read of an object's metadata alone.
+    /// A read of an object's metadata alone, and the status it must be answered with.
     Head {
         key: &'static str,
+        status: u16,
     },
     /// A write of an object, with the tag set it carries on the write.
     Put {
         key: &'static str,
-        body: &'static str,
+        body: Body,
         tags: &'static str,
     },
     /// A delete of an object.
@@ -125,12 +160,12 @@ fn rows() -> Vec<Row> {
             calls: vec![
                 Call::Put {
                     key: "loud/present",
-                    body: "loud-bytes",
+                    body: Body::Text("loud-bytes"),
                     tags: "",
                 },
                 Call::Put {
                     key: "quiet/present",
-                    body: "quiet",
+                    body: Body::Text("quiet"),
                     tags: "",
                 },
                 Call::Get {
@@ -173,14 +208,17 @@ fn rows() -> Vec<Row> {
             calls: vec![
                 Call::Put {
                     key: "loud/one",
-                    body: "x",
+                    body: Body::Text("x"),
                     tags: "",
                 },
                 Call::Get {
                     key: "loud/one",
                     status: 200,
                 },
-                Call::Head { key: "loud/one" },
+                Call::Head {
+                    key: "loud/one",
+                    status: 200,
+                },
                 Call::List,
                 Call::Delete { key: "loud/one" },
             ],
@@ -209,7 +247,7 @@ fn rows() -> Vec<Row> {
             calls: vec![
                 Call::Put {
                     key: "data/one",
-                    body: "hello world",
+                    body: Body::Text("hello world"),
                     tags: "",
                 },
                 Call::Get {
@@ -234,12 +272,12 @@ fn rows() -> Vec<Row> {
             calls: vec![
                 Call::Put {
                     key: "gold/one",
-                    body: "g",
+                    body: Body::Text("g"),
                     tags: "tier=gold",
                 },
                 Call::Put {
                     key: "plain/one",
-                    body: "p",
+                    body: Body::Text("p"),
                     tags: "",
                 },
                 Call::Get {
@@ -269,17 +307,17 @@ fn rows() -> Vec<Row> {
             calls: vec![
                 Call::Put {
                     key: "reports/gold",
-                    body: "a",
+                    body: Body::Text("a"),
                     tags: "tier=gold",
                 },
                 Call::Put {
                     key: "reports/silver",
-                    body: "b",
+                    body: Body::Text("b"),
                     tags: "tier=silver",
                 },
                 Call::Put {
                     key: "other/gold",
-                    body: "c",
+                    body: Body::Text("c"),
                     tags: "tier=gold",
                 },
                 Call::Get {
@@ -312,7 +350,7 @@ fn rows() -> Vec<Row> {
             calls: vec![
                 Call::Put {
                     key: "a/one",
-                    body: "a",
+                    body: Body::Text("a"),
                     tags: "",
                 },
                 Call::Get {
@@ -425,9 +463,18 @@ async fn datapoints(
 
 /// The `Sum` of every datapoint of a span, which is what the series accounts for over it.
 fn total(points: &[Value]) -> f64 {
+    total_of(points, "Sum")
+}
+
+/// The total of ONE statistic over a span's datapoints — the `Sum` the series accounts for,
+/// or the `SampleCount` of the observations it folded.
+///
+/// `pub(crate)`, like the harness above it: the verb-accounting suite beside this one reads
+/// both totals through this same fold rather than spelling a second one.
+pub(crate) fn total_of(points: &[Value], statistic: &str) -> f64 {
     points
         .iter()
-        .filter_map(|point| point.get("Sum").and_then(Value::as_f64))
+        .filter_map(|point| point.get(statistic).and_then(Value::as_f64))
         .sum()
 }
 
@@ -475,7 +522,7 @@ async fn indexed_filter_ids(router: &MultiServiceRouter, bucket: &str) -> Vec<St
 }
 
 /// Drive one of a row's calls through S3's own wire, requiring the status it must answer.
-async fn drive(router: &MultiServiceRouter, bucket: &str, call: &Call) {
+pub(crate) async fn drive(router: &MultiServiceRouter, bucket: &str, call: &Call) {
     let answer: Answer = match call {
         Call::Get { key, status } => {
             let read = get_object(router, bucket, key, "", &[]).await;
@@ -487,14 +534,22 @@ async fn drive(router: &MultiServiceRouter, bucket: &str, call: &Call) {
             );
             return;
         }
-        Call::Head { key } => send_bytes(router, "HEAD", &format!("/{bucket}/{key}"), &[], b"").await,
+        Call::Head { key, status } => {
+            let read = send_bytes(router, "HEAD", &format!("/{bucket}/{key}"), &[], b"").await;
+            assert_eq!(
+                read.status, *status,
+                "the metadata read of {key:?} must answer {status}, got {}",
+                read.status
+            );
+            return;
+        }
         Call::Put { key, body, tags } => {
             let headers: Vec<(&str, &str)> = if tags.is_empty() {
                 Vec::new()
             } else {
                 vec![("x-amz-tagging", tags)]
             };
-            put_object(router, bucket, key, body.as_bytes(), &headers).await
+            put_object(router, bucket, key, &body.bytes(), &headers).await
         }
         Call::Delete { key } => {
             send_bytes(router, "DELETE", &format!("/{bucket}/{key}"), &[], b"").await
