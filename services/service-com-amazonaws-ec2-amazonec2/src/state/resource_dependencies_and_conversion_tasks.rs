@@ -355,6 +355,72 @@ impl ComAmazonawsEc2Amazonec2State {
         self.instance_vpc_id(instance).as_deref() == Some(vpc_id)
     }
 
+    /// Whether the VPC `vpc_id` still has a PUBLIC address mapped in it — the dependency a
+    /// detach of its internet gateway is held by.
+    ///
+    /// Such an address reaches the internet THROUGH that gateway, so the gateway cannot be
+    /// taken away while one is mapped: "the VPC must not contain any running instances with
+    /// Elastic IP addresses or public IPv4 addresses" (`DetachInternetGateway`). An INSTANCE
+    /// is not the only thing an address of this store is mapped onto, though — it is mapped
+    /// onto a NETWORK INTERFACE, on the interface's own `NetworkInterface$Association`, by the
+    /// two writers that hand one out ([`Self::assign_amazon_public_ipv4`] and
+    /// [`Self::associate_elastic_ip`]) — so whoever holds the interface, the address is in
+    /// this VPC: a node of another service's resource placed here (an interface marked
+    /// `NetworkInterface$RequesterManaged`) maps one exactly as an instance's interface does.
+    /// So the reading is over the interfaces of the VPC, with the instance's own report beside
+    /// it for an instance this store holds no interface for.
+    ///
+    /// What makes an address MAPPED rather than merely allocated is that the thing holding it
+    /// is up. An interface nothing holds ([`Self::network_interface_is_held`] — the
+    /// `available` of `NetworkInterface$Status`) carries traffic for nothing, and an instance
+    /// that is not running answers nothing at its address, which is what the operation's own
+    /// doc says by naming RUNNING instances. Both are released by the caller — a stop, a
+    /// disassociate, a delete of the resource whose node it is — never by the detach.
+    pub fn vpc_has_mapped_public_address(&self, vpc_id: &str) -> bool {
+        // An instance's public address is the one member either kind of address is reported
+        // in (`Instance$PublicIpAddress`), so one reading covers an Elastic IP and an
+        // Amazon-assigned address alike.
+        let mapped_onto_a_running_instance = self.instances.values().any(|instance| {
+            instance.state == InstanceStateName::Running
+                && instance.public_ip.is_some()
+                && self.instance_is_in_vpc(instance, vpc_id)
+        });
+        mapped_onto_a_running_instance
+            || self
+                .network_interfaces
+                .iter()
+                .any(|(network_interface_id, interface)| {
+                    interface.vpc_id.as_deref() == Some(vpc_id)
+                        && interface
+                            .association
+                            .as_ref()
+                            .is_some_and(|association| association.public_ip.is_some())
+                        && self.interface_maps_its_public_address(network_interface_id)
+                })
+    }
+
+    /// Whether the public address the interface `network_interface_id` holds is mapped onto
+    /// something that is USING it, which is what [`Self::vpc_has_mapped_public_address`] asks
+    /// of each interface of the VPC.
+    ///
+    /// An interface attached to an INSTANCE maps its address for as long as that instance is
+    /// running, which is the dependency `DetachInternetGateway` documents. Any other interface
+    /// something holds — one a service manages for a resource of the account
+    /// (`NetworkInterface$RequesterManaged`), one attached to nothing of this store — maps it
+    /// for as long as it is held, and one nothing holds maps it onto nothing at all.
+    fn interface_maps_its_public_address(&self, network_interface_id: &str) -> bool {
+        match self
+            .network_interface_attachment(network_interface_id)
+            .and_then(|attachment| attachment.instance_id.as_deref())
+        {
+            Some(instance_id) => self
+                .instances
+                .get(instance_id)
+                .is_some_and(|instance| instance.state == InstanceStateName::Running),
+            None => self.network_interface_is_held(network_interface_id),
+        }
+    }
+
     /// Remove the subnet `subnet_id` and answer it as it was last reported, or `None` when
     /// the store holds no such subnet. The bytes the record held go back to the store's
     /// budget, and every transition the clock may still owe it — its `available` move, its

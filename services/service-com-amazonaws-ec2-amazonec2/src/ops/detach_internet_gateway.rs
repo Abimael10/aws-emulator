@@ -187,16 +187,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The VPC must not contain any running instances with Elastic IP addresses or public
-        // IPv4 addresses" (this operation's own doc): such an instance reaches the internet
+        // IPv4 addresses" (this operation's own doc): such an address reaches the internet
         // THROUGH this gateway, so it is the dependency that holds the attachment — and it is
-        // cleared by releasing the address or terminating the instance, never by this detach.
-        // An instance's public address is the one member either kind of address is reported
-        // in (`Instance$PublicIpAddress`), so one reading covers both.
-        if store.instances.values().any(|instance| {
-            instance.state == state::InstanceStateName::Running
-                && instance.public_ip.is_some()
-                && store.instance_is_in_vpc(instance, vpc_id)
-        }) {
+        // cleared by unmapping the address (releasing it, stopping the instance, deleting the
+        // resource whose node holds it), never by this detach. A running instance is not the
+        // only thing an address is mapped onto: every mapped public address of this VPC is
+        // read through the ONE reading of that ([`state::ComAmazonawsEc2Amazonec2State::
+        // vpc_has_mapped_public_address`]), so the nodes another service placed here — the
+        // interfaces of an internet-facing load balancer, which carry public addresses of
+        // this VPC — hold the attachment exactly as an instance's interface does.
+        if store.vpc_has_mapped_public_address(vpc_id) {
             return Err(state::dependency_violation(format!(
                 "Network {vpc_id} has some mapped public address(es). Please unmap those \
                  public address(es) before detaching the gateway."
