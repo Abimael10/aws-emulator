@@ -24,7 +24,8 @@
 //! at all when the delivery is performed, which resource its delivery statement covers (the
 //! whole bucket, this account's Config path, this Region's objects alone, another Region's,
 //! another account's), which principal the grant names, whether Config is denied outright,
-//! and whether the channel delivers under a key prefix.
+//! whether the channel delivers under a key prefix, and which CONDITION the delivery
+//! statement carries.
 
 use std::time::{Duration, Instant};
 
@@ -65,19 +66,35 @@ fn bucket_arn() -> String {
     format!("arn:aws:s3:::{DELIVERY_BUCKET}")
 }
 
-/// A policy granting Config the bucket-level calls on the bucket and the object write on
-/// `objects` — the documented delivery policy with its delivery statement pointed wherever
-/// a row points it.
-fn policy_writing(objects: String) -> String {
+/// The ONE place a row's policy is built: Config granted the bucket-level calls on the
+/// bucket and the object write on `objects`, with `condition` in place of the condition the
+/// documented policy gives its delivery statement where a row replaces it — the documented
+/// delivery policy with its `AWSConfigBucketDelivery` statement pointed and conditioned
+/// wherever a row points and conditions it.
+fn delivery_policy(objects: String, condition: Option<Value>) -> String {
     let bucket = bucket_arn();
+    let mut delivery = allow(
+        CONFIG_PRINCIPAL,
+        &[PUT_OBJECT],
+        std::slice::from_ref(&objects),
+    );
+    if let Some(condition) = condition {
+        delivery["Condition"] = condition;
+    }
     policy(vec![
         allow(
             CONFIG_PRINCIPAL,
             &[GET_BUCKET_ACL, LIST_BUCKET],
             std::slice::from_ref(&bucket),
         ),
-        allow(CONFIG_PRINCIPAL, &[PUT_OBJECT], &[objects]),
+        delivery,
     ])
+}
+
+/// A policy whose delivery statement covers `objects`, conditioned the way the documented
+/// policy conditions it.
+fn policy_writing(objects: String) -> String {
+    delivery_policy(objects, None)
 }
 
 /// Create the delivery bucket carrying the documented delivery policy, put the recorder and
@@ -488,6 +505,198 @@ async fn a_delivery_denied_by_a_removed_policy_fails_and_the_next_one_succeeds_o
         assert!(
             !keys.iter().any(|key| key.contains(&denied_id)),
             "case {case:?}: the denied delivery is still not in the bucket, got {keys:?}"
+        );
+    }
+}
+
+/// An account that is not this one, which a row conditions a grant on to point it away from
+/// the delivery actually being made.
+const ANOTHER_ACCOUNT: &str = "999999999999";
+
+/// A policy whose delivery statement covers every object of the bucket, carrying `condition`
+/// in place of the condition the documented policy gives that statement.
+fn policy_conditioned(condition: Value) -> String {
+    delivery_policy(format!("{}/*", bucket_arn()), Some(condition))
+}
+
+/// The ARN Config assigned the customer managed configuration recorder a delivery is made
+/// for, read back through `DescribeConfigurationRecorders` — the value a delivery statement
+/// conditioned on `AWS:SourceArn` is compared against, which is minted per recorder and so
+/// cannot be written into a row.
+async fn described_recorder_arn(case: &str, emulator: &Emulator) -> String {
+    let described = emulator
+        .config("DescribeConfigurationRecorders", &json!({}))
+        .await;
+    described["ConfigurationRecorders"][0]["arn"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected the recorder's arn, got {described}")
+        })
+        .to_string()
+}
+
+/// One row: the `Condition` the bucket's delivery statement carries when the delivery is
+/// performed, and whether the rule says the object has to be written.
+struct ConditionRow {
+    case: &'static str,
+    /// The condition the delivery statement carries, built from the ARN of the recorder the
+    /// delivery is made for.
+    condition: fn(&str) -> Value,
+    /// Whether the write that delivery makes is allowed under that condition.
+    delivered: bool,
+}
+
+/// The CONDITION on the delivery statement decides the same thing its resource and principal
+/// do: a snapshot delivery writes its object only while the statement that grants
+/// `s3:PutObject` to `config.amazonaws.com` holds for the delivery actually being made, and
+/// a delivery whose condition does not hold writes nothing and is reported as a failure.
+///
+/// The three keys the rows condition on are the ones a Config delivery carries, which the
+/// delivery bucket policy AWS documents for a delivery channel constrains: the delivering
+/// account (`AWS:SourceAccount`), the resource of Config's the delivery is made for
+/// (`AWS:SourceArn`) and the canned ACL Config writes a delivered object with
+/// (`s3:x-amz-acl`). A row also conditions on a key no delivery carries, which decides
+/// nothing and so grants nothing.
+#[tokio::test]
+async fn the_delivery_statements_condition_decides_whether_a_snapshot_is_delivered() {
+    let rows: Vec<ConditionRow> = vec![
+        ConditionRow {
+            case: "the delivering account, as the documented policy conditions it",
+            condition: |_| json!({ "StringEquals": { "AWS:SourceAccount": ACCOUNT_ID } }),
+            delivered: true,
+        },
+        ConditionRow {
+            case: "the canned ACL Config writes a delivered object with",
+            condition: |_| {
+                json!({ "StringEquals": { "s3:x-amz-acl": "bucket-owner-full-control" } })
+            },
+            delivered: true,
+        },
+        ConditionRow {
+            case: "the delivering account and the canned ACL together",
+            condition: |_| {
+                json!({
+                    "StringEquals": {
+                        "AWS:SourceAccount": ACCOUNT_ID,
+                        "s3:x-amz-acl": "bucket-owner-full-control",
+                    }
+                })
+            },
+            delivered: true,
+        },
+        ConditionRow {
+            case: "the recorder the delivery is made for, as the source ARN",
+            condition: |recorder| json!({ "StringEquals": { "AWS:SourceArn": recorder } }),
+            delivered: true,
+        },
+        ConditionRow {
+            case: "any configuration recorder of this account, as a source ARN pattern",
+            condition: |_| {
+                json!({
+                    "ArnLike": {
+                        "AWS:SourceArn":
+                            format!("arn:aws:config:{REGION}:{ACCOUNT_ID}:configuration-recorder/*")
+                    }
+                })
+            },
+            delivered: true,
+        },
+        ConditionRow {
+            case: "another account as the delivering account",
+            condition: |_| json!({ "StringEquals": { "AWS:SourceAccount": ANOTHER_ACCOUNT } }),
+            delivered: false,
+        },
+        ConditionRow {
+            case: "a canned ACL other than the one a delivered object is written with",
+            condition: |_| json!({ "StringEquals": { "s3:x-amz-acl": "private" } }),
+            delivered: false,
+        },
+        ConditionRow {
+            case: "another account's recorder as the source ARN",
+            condition: |_| {
+                json!({
+                    "ArnLike": {
+                        "AWS:SourceArn":
+                            format!(
+                                "arn:aws:config:{REGION}:{ANOTHER_ACCOUNT}:\
+                                 configuration-recorder/*"
+                            )
+                    }
+                })
+            },
+            delivered: false,
+        },
+        ConditionRow {
+            case: "this account's recorder with one character of its ARN changed",
+            condition: |recorder| {
+                json!({ "StringEquals": { "AWS:SourceArn": format!("{recorder}x") } })
+            },
+            delivered: false,
+        },
+        ConditionRow {
+            case: "a condition key a Config delivery carries no value for",
+            condition: |_| {
+                json!({ "StringEquals": { "s3:x-amz-server-side-encryption": "aws:kms" } })
+            },
+            delivered: false,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let emulator = Emulator::new();
+        channel_through(&emulator, None).await;
+
+        // The condition is compared against the delivery being made, so the row's statement
+        // is written against the recorder this account really holds.
+        let recorder = described_recorder_arn(case, &emulator).await;
+        put_policy(case, &emulator, policy_conditioned((row.condition)(&recorder))).await;
+
+        let snapshot_id = deliver(case, &emulator).await;
+        let info = await_settled_delivery(case, &emulator).await;
+        let keys = delivered_keys(case, &emulator).await;
+
+        if row.delivered {
+            assert_eq!(
+                info["lastStatus"],
+                json!(SUCCESS),
+                "case {case:?}: a delivery whose condition holds reports {SUCCESS}, got {info}"
+            );
+            for member in ["lastErrorCode", "lastErrorMessage"] {
+                assert!(
+                    info.get(member).is_none(),
+                    "case {case:?}: a delivery that succeeded reports no {member}, got {info}"
+                );
+            }
+            assert!(
+                keys.iter().any(|key| key.contains(&snapshot_id)),
+                "case {case:?}: expected an object naming {snapshot_id}, got {keys:?}"
+            );
+            continue;
+        }
+
+        let expected = denied_message(None);
+        assert_eq!(
+            (
+                info["lastStatus"].as_str(),
+                info["lastErrorCode"].as_str(),
+                info["lastErrorMessage"].as_str(),
+            ),
+            (
+                Some(FAILURE),
+                Some(INSUFFICIENT_POLICY),
+                Some(expected.as_str()),
+            ),
+            "case {case:?}: expected {FAILURE} {INSUFFICIENT_POLICY} and {expected:?}, got \
+             {info}"
+        );
+        assert!(
+            info.get("lastSuccessfulTime").is_none(),
+            "case {case:?}: a delivery that wrote nothing claims no success, got {info}"
+        );
+        assert!(
+            keys.is_empty(),
+            "case {case:?}: a delivery the condition withholds writes no object, got {keys:?}"
         );
     }
 }
