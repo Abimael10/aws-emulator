@@ -22,7 +22,11 @@
 //!   the whole window exactly once, newest step first;
 //! * a token naming a page the requested window is not served in, or no page at
 //!   all, is refused with the service's one wording for an uninterpretable
-//!   pagination token.
+//!   pagination token;
+//! * and because every one of those is read from the REQUESTED window and from
+//!   the summaries it holds, translating a whole query — its window and the
+//!   traces that window covers — across an absolute hour boundary answers it
+//!   identically, member for member of the envelope.
 //!
 //! The rows differ along what the rule generalises over: the WIDTH of the window
 //! (nothing, a second, part of an hour, an hour, several hours, the widest window
@@ -36,7 +40,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_xray_awsxray::ops::get_trace_summaries::TRACE_SUMMARIES_PAGE_SIZE;
 
 use super::xray_wire::{
-    reported, reported_trace_ids, root_document, trace_id, Answer, Xray, ALIGNED, HOUR,
+    close, reported, reported_trace_ids, root_document, summaries_body, trace_id, Answer, Xray,
+    ALIGNED, HOUR,
 };
 
 /// The refusal message of an answer, or the empty string.
@@ -754,6 +759,194 @@ async fn the_steps_are_cut_on_the_instant_the_request_windows_on() {
             found_on.is_some_and(|at| (at - step_start).abs() < 1e-6),
             "case {range_type:?}: the trace must be served on the page of the step at \
              {step_start}, got {found_on:?}"
+        );
+    }
+}
+
+// =============================================================================
+// 8. The envelope is a function of the requested window and of the results it
+//    holds, so translating a whole query across an hour boundary answers it
+//    identically
+// =============================================================================
+
+/// How far one query — its window and every trace that window covers — is
+/// translated from the absolute hour boundary [`ALIGNED`] falls on, with the
+/// label the assertions name that placement by.
+///
+/// The rows differ along where the translated window then sits relative to that
+/// boundary: anchored on it, a second past it, astride it by a single second,
+/// starting exactly on it, wholly inside one hour, ending a second short of the
+/// next boundary, and inside the hour before it. The answer is read from the
+/// window asked about rather than from the clock, so every row must answer the
+/// same — which is also what makes the answer reproducible: the same logical
+/// query asked minutes later, on the other side of a boundary, reports the same
+/// envelope.
+const TRANSLATIONS: [(&str, f64); 7] = [
+    ("anchored on an hour boundary", 0.0),
+    ("a second past the boundary", 1.0),
+    ("astride the boundary by a second", SHORT_HALF - 1.0),
+    ("starting exactly on the boundary", SHORT_HALF),
+    ("wholly inside one hour", 1_234.0),
+    ("ending a second short of the next boundary", HOUR - SHORT_HALF - 1.0),
+    ("inside the hour before the boundary", -1_800.0),
+];
+
+/// Half the width of the short window the translated cases ask about: minutes
+/// wide, and far shorter than one step, so the rule answers it in one page.
+const SHORT_HALF: f64 = 300.0;
+
+#[tokio::test]
+async fn a_translated_short_window_answers_identically_whatever_the_grid() {
+    for (label, offset) in TRANSLATIONS {
+        let xray = Xray::new();
+        // One trace at the case's anchor, asked about over the ten minutes
+        // around it: shorter than one step, so the window is ONE page carrying
+        // that trace, reporting the requested `StartTime` and no token —
+        // wherever the anchor sits relative to the top of an hour.
+        let stored = seed(&xray, &[offset]).await;
+        let start = ALIGNED + offset - SHORT_HALF;
+        let end = ALIGNED + offset + SHORT_HALF;
+
+        let answered = xray.summaries(start, end, None).await;
+        assert_eq!(
+            answered.status, 200,
+            "case {label:?}: the window [{start}, {end}) must be answered, got {answered:?}"
+        );
+        assert_eq!(
+            reported(&answered),
+            stored,
+            "case {label:?}: the window holds {stored:?}, got {answered:?}"
+        );
+        assert!(
+            next_token(&answered).is_none(),
+            "case {label:?}: the complete answer to a window shorter than one step carries no \
+             token, got {answered:?}"
+        );
+        let at = approximate_time(&answered);
+        assert!(
+            at.is_some_and(|at| close(at, start)),
+            "case {label:?}: expected ApproximateTime {start} (the requested StartTime), got \
+             {at:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_translated_multi_step_window_pages_identically_whatever_the_grid() {
+    for (label, offset) in TRANSLATIONS {
+        let xray = Xray::new();
+        // One trace in each step of a three-step window, the whole query
+        // translated by the case's offset: which page a trace falls on follows
+        // from the window's own end, so each page carries the trace of its own
+        // step and reports that step's start however many hour boundaries the
+        // window happens to cross.
+        let stored = seed(
+            &xray,
+            &[
+                offset + 10.0,
+                offset + HOUR + 10.0,
+                offset + 2.0 * HOUR + 10.0,
+            ],
+        )
+        .await;
+        let start = ALIGNED + offset;
+        let end = start + 3.0 * HOUR;
+
+        let pages = xray.trace_summary_pages(&summaries_body(start, end, None)).await;
+        assert_eq!(
+            pages.len(),
+            3,
+            "case {label:?}: a three-step window is served in three pages, got {pages:?}"
+        );
+        for (index, page) in pages.iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let step_start = end - HOUR * (index as f64 + 1.0);
+            let at = approximate_time(page);
+            assert!(
+                at.is_some_and(|at| close(at, step_start)),
+                "case {label:?}: page {index} must report its own step start {step_start}, got \
+                 {at:?}"
+            );
+            assert_eq!(
+                reported(page),
+                vec![stored[2 - index].clone()],
+                "case {label:?}: page {index} carries the trace of the step at {step_start}, got \
+                 {page:?}"
+            );
+            assert_eq!(
+                next_token(page).is_some(),
+                index + 1 < pages.len(),
+                "case {label:?}: page {index}: a token is due only while the query has something \
+                 left to serve, got {page:?}"
+            );
+        }
+        assert_eq!(
+            reported_trace_ids(&pages),
+            vec![stored[2].clone(), stored[1].clone(), stored[0].clone()],
+            "case {label:?}: the walk must yield every trace of the window exactly once, newest \
+             step first, got {pages:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_short_window_pages_on_its_results_rather_than_on_an_hour_boundary() {
+    // Two traces more than one page carries ([`TRACE_SUMMARIES_PAGE_SIZE`]), all
+    // inside a window shorter than one step: a token is due here because
+    // RESULTS remain, so the window astride an hour boundary and the one wholly
+    // inside an hour must page the same way, and every page of the one step
+    // reports that step's start — the requested `StartTime`.
+    let rows: [(&str, f64); 2] = [
+        ("astride an hour boundary", 0.0),
+        ("wholly inside one hour", 1_200.0),
+    ];
+
+    for (label, offset) in rows {
+        let xray = Xray::new();
+        let total = TRACE_SUMMARIES_PAGE_SIZE + 2;
+        let offsets: Vec<f64> = (0..total)
+            .map(|index| {
+                #[allow(clippy::cast_precision_loss)]
+                let index = index as f64;
+                offset - 200.0 + index
+            })
+            .collect();
+        let stored = seed(&xray, &offsets).await;
+        let start = ALIGNED + offset - SHORT_HALF;
+        let end = ALIGNED + offset + SHORT_HALF;
+
+        let pages = xray.trace_summary_pages(&summaries_body(start, end, None)).await;
+        assert_eq!(
+            pages.len(),
+            2,
+            "case {label:?}: {total} summaries are served in two pages of \
+             {TRACE_SUMMARIES_PAGE_SIZE}, got {pages:?}"
+        );
+        for (index, page) in pages.iter().enumerate() {
+            let at = approximate_time(page);
+            assert!(
+                at.is_some_and(|at| close(at, start)),
+                "case {label:?}: page {index} must report the requested StartTime {start}, got \
+                 {at:?}"
+            );
+            assert_eq!(
+                next_token(page).is_some(),
+                index + 1 < pages.len(),
+                "case {label:?}: page {index}: a token is due while summaries remain, got \
+                 {page:?}"
+            );
+        }
+        assert_eq!(
+            reported(&pages[0]).len(),
+            TRACE_SUMMARIES_PAGE_SIZE,
+            "case {label:?}: the first page carries a full page of summaries, got {:?}",
+            reported(&pages[0])
+        );
+        assert_eq!(
+            reported_trace_ids(&pages),
+            stored,
+            "case {label:?}: the pages must yield every trace the window holds exactly once, got \
+             {pages:?}"
         );
     }
 }
