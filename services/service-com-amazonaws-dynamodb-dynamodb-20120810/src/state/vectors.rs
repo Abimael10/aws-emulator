@@ -41,6 +41,42 @@ pub fn vector_component(element: &AttributeValue) -> Option<f32> {
     }
 }
 
+/// The vector attribute as an INDEX HOLDS it, or `None` when the value is no vector.
+///
+/// "Each element is a 32-bit IEEE-754 floating point number" (`SearchVectors$SearchVector`),
+/// so what the index stores for a coordinate is the float that type can hold, not the
+/// decimal the request spelled it with: a number a 32-bit float cannot represent exactly is
+/// held as the one it rounds to, and a read of the index reports THAT. A table's own item
+/// keeps the decimal it was written with, which is what the item store holds and what a
+/// `GetItem` of it answers — the two differ exactly where the rounding does.
+pub fn stored_vector(value: &AttributeValue) -> Option<AttributeValue> {
+    Some(AttributeValue::L(
+        vector_values(value)?
+            .into_iter()
+            .map(|component| AttributeValue::N(rendered_vector_component(component)))
+            .collect(),
+    ))
+}
+
+/// One held coordinate as the decimal a response carries it in: the shortest decimal that
+/// reads back as the same 32-bit float, carrying a fractional part so a coordinate whose
+/// float is a whole number still reads as the floating-point value it is.
+///
+/// NOT the canonical `N` text the ITEM store keeps a number in
+/// (`super::canonical_number_text`, which trims a whole number's fractional part): what
+/// the index holds is a FLOAT, and the recorded answers of a search report it as one — a
+/// coordinate whose float is a whole number comes back with its `.0`, where the same number
+/// read off the table's own item comes back without it. The two renderings differ because
+/// the two stores hold different things, which is the whole of this module's rule.
+///
+/// It is the shortest round-trip rendering of that float and nothing else, so the exponent
+/// form it takes at the magnitudes where a positional decimal would be longer is this
+/// renderer's own: no recorded answer of this service reaches that magnitude, so there is
+/// nothing to pin it to and nothing is invented for it.
+fn rendered_vector_component(component: f32) -> String {
+    format!("{component:?}")
+}
+
 /// What one dimension of a STORED vector costs: a vector attribute is a list of 32-bit
 /// IEEE-754 floats ([`vector_values`]), so each dimension is four bytes once it is held as
 /// the index holds it rather than as the decimal text the request sent.

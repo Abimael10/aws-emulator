@@ -262,7 +262,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|keys| keys.keys.len())
             .sum();
         if requested > crate::state::MAX_BATCH_GET_KEYS {
-            return Err(lift(crate::state::too_many_batch_items("BatchGetItem")));
+            return Err(lift(crate::state::too_many_batch_items(
+                crate::state::BATCH_GET_CALL,
+            )));
         }
         // The tables are walked in name order, so which refusal a bad batch earns does
         // not depend on the request map's iteration order.

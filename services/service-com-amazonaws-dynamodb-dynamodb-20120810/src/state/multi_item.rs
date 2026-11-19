@@ -122,13 +122,22 @@ pub const MIN_BATCH_WRITE_REQUESTS: usize = 1;
 /// How a `BatchWriteItem` whose `RequestItems` carries a number of write requests outside
 /// its declared bound is refused.
 ///
-/// The bound is the `@length` 1..25 the model gives that member
-/// (`smithy_query(query="operation", operation="BatchWriteItem")`), counted over the
-/// OPERATIONS the map carries across every table it groups them under — which is the
-/// count the recorded refusals of that member report against. The clause is the request
-/// validator's own: the member named by the lowerCamel path that validator builds
-/// ([`REQUEST_ITEMS_MEMBER_PATH`]) and the requirement for the bound that was broken,
-/// inside the envelope that counts the clauses ([`validation_message`]).
+/// TWO BOUNDS, TWO REFUSALS, because they are broken by two different things. The `@length`
+/// 1..25 the model declares is on the write-request LIST one table was given, and on the
+/// map's own entries (`smithy_query(query="shape",
+/// shape="com.amazonaws.dynamodb#BatchWriteItemRequestMap")`): a list outside it is a
+/// violation of a member the request sent, reported as the request validator's own clause —
+/// the member named by the lowerCamel path that validator builds
+/// ([`REQUEST_ITEMS_MEMBER_PATH`]) and the requirement for the bound that was broken, inside
+/// the envelope that counts the clauses ([`validation_message`]).
+///
+/// The ceiling on the OPERATIONS, "up to 25 item put or delete operations" counted across
+/// every table the request grouped them under, is the CALL's own quota rather than a bound
+/// on any one member it carries, so a request whose every list is inside its bound and whose
+/// operations still sum past that ceiling is refused with the fixed sentence this service
+/// states for a batch that asks for more than one call may carry
+/// ([`too_many_batch_items`]) — which is how the batched READ refuses its own aggregate
+/// ceiling, and which echoes nothing of the request.
 ///
 /// The rejected value is quoted for a map that HAS entries and withheld for one that has
 /// none, because what the clause echoes is the map the request sent
@@ -148,10 +157,15 @@ pub fn batch_write_requests_outside_bound(
     request_items: &HashMap<String, Vec<WriteRequest>>,
     requested: usize,
 ) -> Option<RequestError> {
+    // The longest list one table was given: the bound the model declares is on THAT list,
+    // whichever table carries it.
+    let longest = request_items.values().map(Vec::len).max().unwrap_or(0);
     let requirement = if requested < MIN_BATCH_WRITE_REQUESTS {
         min_length_requirement(MIN_BATCH_WRITE_REQUESTS)
-    } else if requested > MAX_BATCH_WRITE_REQUESTS {
+    } else if longest > MAX_BATCH_WRITE_REQUESTS {
         max_length_requirement(MAX_BATCH_WRITE_REQUESTS)
+    } else if requested > MAX_BATCH_WRITE_REQUESTS {
+        return Some(too_many_batch_items(BATCH_WRITE_CALL));
     } else {
         return None;
     };
@@ -667,6 +681,12 @@ fn rendered_json_member(name: &str, rendered_value: &str) -> String {
 pub fn too_many_batch_items(call: &str) -> RequestError {
     RequestError::Validation(format!("Too many items requested for the {call} call"))
 }
+
+/// The name the sentence above calls the batched WRITE by, which is the operation's own.
+pub const BATCH_WRITE_CALL: &str = "BatchWriteItem";
+
+/// The same for the batched READ.
+pub const BATCH_GET_CALL: &str = "BatchGetItem";
 
 /// How a member that must carry exactly one of a set of operations — a `WriteRequest`
 /// (`PutRequest` or `DeleteRequest`) or a `TransactWriteItem` (`ConditionCheck`,

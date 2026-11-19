@@ -39,10 +39,11 @@
 //! (`UpdateExpression` and the legacy `AttributeUpdates`) and `ReturnValues`.
 //!
 //! RULE 5 — `BatchWriteItem` holds the WRITE REQUESTS its `RequestItems` carries to the
-//! 1..25 bound the model declares for that member, counted across every table the map
-//! groups them under, and reports a violation of it over the member path the request
-//! validator builds. The rows span both ends of the bound, the bound itself, and how the
-//! requests are spread over tables.
+//! 1..25 bound the model declares for the list one table is given, reported over the member
+//! path the request validator builds, and holds the whole CALL to the ceiling of 25
+//! operations counted across every table the map groups them under, refused with the fixed
+//! sentence that quota states. The rows span both ends of the bound, the bound itself, and
+//! how the requests are spread over tables.
 //!
 //! RULE 6 — a `Key` member's value is held to the documented rules of its own TYPE before
 //! it is held to the key schema, and the clause that rule states takes the form RULE 3
@@ -644,28 +645,35 @@ async fn a_batched_write_holds_its_request_map_to_the_declared_bound() {
 
     // The member path the request validator builds for that map, which its clauses name.
     let member = "requestItems";
-    // The bound the model declares for it (`smithy_query(query="operation",
-    // operation="BatchWriteItem")` gives RequestItems @length min 1 max 25).
+    // The bound the model declares for the list one table is given
+    // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#WriteRequests")` gives
+    // @length min 1 max 25, and `BatchWriteItemRequestMap` the same for its entries).
     let (least, most) = (1usize, 25usize);
 
-    // Each row: the case, the map the request sends, and the requirement the clause must
-    // state — `None` for a map inside the bound, which is served. The rows span both ends
-    // of the bound, the bound itself, and how the requests are spread over tables.
-    let rows: Vec<(&str, Value, Option<String>)> = vec![
+    // Each row: the case, the map the request sends, and the refusal it must earn — `None`
+    // for a map inside both the bound and the ceiling, which is served. The rows span both
+    // ends of the bound, the bound itself, and how the requests are spread over tables.
+    let rows: Vec<(&str, Value, Option<Refusal>)> = vec![
         (
             "a map naming no table at all",
             json!({}),
-            Some(format!("Member must have length greater than or equal to {least}")),
+            Some(Refusal::Clause(format!(
+                "Member must have length greater than or equal to {least}"
+            ))),
         ),
         (
             "a map whose one table was given no request",
             json!({"Bounded": []}),
-            Some(format!("Member must have length greater than or equal to {least}")),
+            Some(Refusal::Clause(format!(
+                "Member must have length greater than or equal to {least}"
+            ))),
         ),
         (
             "a map whose two tables were both given no request",
             json!({"Bounded": [], "Bounded2": []}),
-            Some(format!("Member must have length greater than or equal to {least}")),
+            Some(Refusal::Clause(format!(
+                "Member must have length greater than or equal to {least}"
+            ))),
         ),
         (
             "one request for one table, at the bound's minimum",
@@ -678,30 +686,46 @@ async fn a_batched_write_holds_its_request_map_to_the_declared_bound() {
             None,
         ),
         (
+            "the bound filled by two tables together",
+            json!({"Bounded": write_requests(most - 1), "Bounded2": write_requests(1)}),
+            None,
+        ),
+        (
             "one request past the bound for one table",
             json!({"Bounded": write_requests(most + 1)}),
-            Some(format!("Member must have length less than or equal to {most}")),
+            Some(Refusal::Clause(format!(
+                "Member must have length less than or equal to {most}"
+            ))),
         ),
         (
             "half again past the bound for one table",
             json!({"Bounded": write_requests(most + most / 2)}),
-            Some(format!("Member must have length less than or equal to {most}")),
+            Some(Refusal::Clause(format!(
+                "Member must have length less than or equal to {most}"
+            ))),
         ),
         (
-            "the bound spread over two tables, one request past it",
+            // Every list inside its own bound, and the operations summed past the call's
+            // ceiling: the CALL's quota, not a member's bound.
+            "the ceiling spread over two tables, one request past it",
             json!({"Bounded": write_requests(most), "Bounded2": write_requests(1)}),
-            Some(format!("Member must have length less than or equal to {most}")),
+            Some(Refusal::Whole(AGGREGATE_CEILING_MESSAGE)),
+        ),
+        (
+            "the ceiling passed by two tables of equal share",
+            json!({"Bounded": write_requests(13), "Bounded2": write_requests(13)}),
+            Some(Refusal::Whole(AGGREGATE_CEILING_MESSAGE)),
         ),
     ];
 
-    for (case, request_items, requirement) in rows {
+    for (case, request_items, refusal) in rows {
         let (status, answered) = call(
             &router,
             "BatchWriteItem",
             json!({"RequestItems": request_items.clone()}),
         )
         .await;
-        let Some(requirement) = requirement else {
+        let Some(refusal) = refusal else {
             assert_eq!(
                 (status, answered["UnprocessedItems"].clone()),
                 (200, json!({})),
@@ -716,15 +740,36 @@ async fn a_batched_write_holds_its_request_map_to_the_declared_bound() {
             "case {case:?}: expected 400 ValidationException, got {status} with {answered}"
         );
         let stated = message(&answered);
-        assert!(
-            stated.starts_with("1 validation error detected: ")
-                && stated.contains(&format!("at '{member}' failed to satisfy constraint: "))
-                && stated.ends_with(&requirement),
-            "case {case:?}: expected one clause naming {member:?} and {requirement:?}, got \
-             {stated:?}"
-        );
+        match refusal {
+            Refusal::Clause(requirement) => assert!(
+                stated.starts_with("1 validation error detected: ")
+                    && stated.contains(&format!("at '{member}' failed to satisfy constraint: "))
+                    && stated.ends_with(&requirement),
+                "case {case:?}: expected one clause naming {member:?} and {requirement:?}, got \
+                 {stated:?}"
+            ),
+            Refusal::Whole(expected) => assert_eq!(
+                stated, expected,
+                "case {case:?}: expected the message {expected:?}, got {stated:?}"
+            ),
+        }
     }
 }
+
+/// What a refused batched write's message must be.
+enum Refusal {
+    /// One clause about the `RequestItems` member, stating this requirement: a list the
+    /// request sent that is outside the bound the model declares for it.
+    Clause(String),
+    /// The whole message, fixed text: the call's own aggregate ceiling, which names no
+    /// member and echoes nothing of the request.
+    Whole(&'static str),
+}
+
+/// The sentence a batch asking for more operations than one call may carry is refused with,
+/// counted across every table in the call — the same sentence the batched READ states for
+/// its own aggregate ceiling, with this call's name in it.
+const AGGREGATE_CEILING_MESSAGE: &str = "Too many items requested for the BatchWriteItem call";
 
 /// The attribute-value frame the refusals of that member render a value in: every field of
 /// the service's own attribute value object, in its order, `field` carrying `value` and

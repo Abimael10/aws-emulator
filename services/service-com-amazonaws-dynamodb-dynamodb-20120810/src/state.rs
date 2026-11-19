@@ -18,7 +18,9 @@ use bigdecimal::BigDecimal;
 
 use crate::ops::types::{
     AttributeDefinition, AttributeValue, AttributeValueUpdate, BackupDescription, BackupDetails,
-    BackupSummary, BillingModeSummary, CancellationReason, Capacity, Condition,
+    BackupSummary, BillingModeSummary, BulkOperationDescription, BulkOperationSummary,
+    BulkPutInputS3Configuration, BulkPutOutputS3Configuration, CancellationReason, Capacity,
+    Condition,
     ConsumedCapacity, ContinuousBackupsDescription, ContributorInsightsSummary,
     CsvOptions,
     ExpectedAttributeValue,
@@ -1373,15 +1375,26 @@ impl VectorIndex {
     /// one entry serves every question about what the index holds for an item: what a
     /// search reports, and what a write of it meters
     /// ([`Table::vector_write_request_bytes`]).
+    ///
+    /// The vector itself is held as the index holds it rather than as the item does
+    /// ([`stored_vector`]): "each element is a 32-bit IEEE-754 floating point number"
+    /// (`SearchVectors$SearchVector`), so a coordinate no such float represents exactly is
+    /// held — and reported, and compared, and metered — as the float it rounds to.
     pub fn index_entry(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> Item {
-        match self.stored_attributes(table_key_schema) {
+        let mut entry: Item = match self.stored_attributes(table_key_schema) {
             None => item.clone(),
             Some(stored) => item
                 .iter()
                 .filter(|(name, _)| stored.contains(name.as_str()))
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
+        };
+        if let Some(value) = entry.get_mut(&self.vector_attribute.attribute_name) {
+            if let Some(held) = stored_vector(value) {
+                *value = held;
+            }
         }
+        entry
     }
 
     /// The bytes this index stores for one covered item: the size of the entry it holds
@@ -3076,6 +3089,19 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
     /// `DescribeImport` and `ListImports`, so an account that has run no import holds
     /// none and the listing reports none.
     pub imports: BTreeMap<String, Import>,
+    /// Every bulk operation this emulator holds, keyed by its own ARN.
+    ///
+    /// ONE map rather than one per region, for the reason [`Self::imports`] is one: the
+    /// ARN already carries the region the operation lives in, and each record remembers
+    /// that region, which is what scopes a listing to the region its request reached.
+    /// Ordered by that ARN, so the `NextToken` cursor a listing pages through is a
+    /// comparison over the keys rather than a sort per request
+    /// ([`new_bulk_operation_arn`]).
+    ///
+    /// A record is written by the BULK surface — `StartBulkPutItems` — and read by
+    /// `ListBulkOperations`, so an account that has started no bulk operation holds none
+    /// and the listing reports none.
+    pub bulk_operations: BTreeMap<String, BulkOperation>,
     /// Every export of table data this emulator holds, keyed by its own `ExportArn`.
     ///
     /// ONE map rather than one per region, for the reason [`Self::backups`] is one: an
@@ -3661,6 +3687,28 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             Ok(table)
         } else {
             Err(item_resource_not_found())
+        }
+    }
+
+    /// The table by that name in that region, which must be `ACTIVE`, reported by NAME
+    /// where it is not there.
+    ///
+    /// The same resolution [`Self::active_table`] makes, with the CONTROL plane's refusal:
+    /// an operation that addresses a table to start a resource OF ITS OWN against it — a
+    /// bulk operation, whose ARN and status the account then holds — names the table it
+    /// could not find, exactly as every other operation that answers about a named table
+    /// does, rather than withholding it the way the item operations do.
+    pub fn active_table_named(
+        &self,
+        region: &str,
+        name: &str,
+        now: SystemTime,
+    ) -> Result<&Table, RequestError> {
+        let table = self.table(region, name)?;
+        if table.status(now).serves_items() {
+            Ok(table)
+        } else {
+            Err(not_found(name))
         }
     }
 
@@ -4651,6 +4699,12 @@ pub use exports::*;
 /// names them `crate::state::…`.
 mod imports;
 pub use imports::*;
+
+/// The bulk-operation catalogue: the records `StartBulkPutItems` writes, their ARNs and
+/// the status every bulk-operation reader derives from the clock. Re-exported below, so
+/// every caller still names them `crate::state::…`.
+mod bulk_operations;
+pub use bulk_operations::*;
 
 /// The source objects one import READS out of Amazon S3, and the items it makes of them.
 /// Re-exported below, so every caller still names them `crate::state::…`.

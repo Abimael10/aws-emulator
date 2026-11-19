@@ -45,6 +45,7 @@ pub mod get_item_types;
 pub mod get_resource_policy_types;
 pub mod import_table_types;
 pub mod list_backups_types;
+pub mod list_bulk_operations_types;
 pub mod list_contributor_insights_types;
 pub mod list_exports_types;
 pub mod list_global_tables_types;
@@ -59,6 +60,7 @@ pub mod restore_table_to_point_in_time_types;
 pub mod scan_types;
 pub mod search_vectors_types;
 pub mod shared_types;
+pub mod start_bulk_put_items_types;
 pub mod tag_resource_types;
 pub mod transact_get_items_types;
 pub mod transact_write_items_types;
@@ -136,6 +138,8 @@ pub use import_table_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_backups_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
+pub use list_bulk_operations_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_contributor_insights_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_exports_types::*;
@@ -163,6 +167,8 @@ pub use scan_types::*;
 pub use search_vectors_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use start_bulk_put_items_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use tag_resource_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

@@ -371,8 +371,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetItemOutput {
             // "Item - A map of attribute names to AttributeValue objects, as specified
             // by ProjectionExpression": what the request asked for of the item it found,
-            // and the whole item when it asked for no projection at all.
-            item: crate::state::reported_item(item, projected.as_deref()),
+            // and the whole item when it asked for no projection at all. A projection that
+            // matches no location of that item reports the member not at all
+            // ([`crate::state::reported_item_member`]).
+            item: crate::state::reported_item_member(item, projected.as_deref()),
             consumed_capacity: crate::state::consumed_capacity(
                 input.return_consumed_capacity.as_deref(),
                 &name,
