@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLinks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLinks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLinks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the links one gateway is an end of, a page at a time.
+//!
+//! The listing is scoped by the gateway in the URI: it reports every record of
+//! [`crate::state::ComAmazonawsRtbfabricRtbfabricState::links`] that gateway is an
+//! end of, each rendered from the stored record exactly as `GetLink` renders it, so
+//! the listing and the single-link reader never disagree. Its only write is the
+//! status transition the clock had already made due at the same instant, which is
+//! what `GetLink` materialises too.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +161,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLinks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLinksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLinks"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListLinksErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // Reporting only: the sole write is the status transition the clock had
+        // already made due at this instant, owed whether or not anybody listed.
+        store.settle_all(now);
+
+        // The listing is addressed to a gateway, so a gateway this service never
+        // stored is the not-found every other read of this service answers with —
+        // not an empty page, which would claim the gateway exists and has no links.
+        if !store.gateway_exists(&input.gateway_id) {
+            return Err(ListLinksErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_next_token(Self::NAME, token, now).map_err(|refusal| {
+                    ListLinksErrorModeled::ValidationException(ValidationException {
+                        message: refusal.message(Self::NAME),
+                    })
+                })?,
+            ),
+            None => None,
+        };
+
+        // The model bounds `maxResults` neither above nor below and gives it no
+        // default, so nothing is refused before this handler runs: a stated upper
+        // limit is honoured as stated, and a request that states none — or states a
+        // page of no results, which asks for nothing a walk could continue from —
+        // takes [`DEFAULT_PAGE_SIZE`]. What a page can hold is bounded whatever a
+        // caller asks for: a page carries records, and the store holds at most
+        // [`crate::state::LINK_QUOTA`] of them.
+        let page_size = match input.max_results {
+            Some(requested) if requested > 0 => {
+                usize::try_from(requested).unwrap_or(DEFAULT_PAGE_SIZE)
+            }
+            _ => DEFAULT_PAGE_SIZE,
+        };
+
+        // Ordered by `linkId`. An id is unique, so that is a total order over the
+        // records this gateway is an end of: a page boundary is stable across
+        // calls, and a walk neither repeats a link nor skips one.
+        let mut mine: Vec<&crate::state::Link> = store
+            .links
+            .values()
+            .filter(|link| link.has_end(&input.gateway_id))
+            .collect();
+        mine.sort_unstable_by(|left, right| left.link_id.cmp(&right.link_id));
+
+        let start = match resume_after.as_deref() {
+            Some(cursor) => mine.partition_point(|link| link.link_id.as_str() <= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(mine.len());
+        let page: Vec<ListLinksResponseStructure> =
+            mine[start..end].iter().copied().map(described).collect();
+
+        // A token only when links remain after this page, so a caller stops paging
+        // exactly when the enumeration is exhausted.
+        let next_token = (end < mine.len())
+            .then(|| {
+                page.last()
+                    .map(|last| crate::state::encode_next_token(Self::NAME, &last.link_id, now))
+            })
+            .flatten();
+
+        Ok(ListLinksOutput {
+            links: Some(page),
+            next_token,
+        })
+    }
+}
+
+/// The page a request that states no `maxResults` gets.
+///
+/// The model gives this operation's `maxResults` no default and no range, so this
+/// is the emulator's own choice: the page every other listing of this service
+/// hands out, whose `maxResults` the model does bound (`range(min: 1, max: 10)`,
+/// default 10), so one walk of this service does not page unlike the next.
+pub const DEFAULT_PAGE_SIZE: usize = 10;
+
+/// One stored link as the listing describes it.
+///
+/// Every member is read back out of the record, exactly as `GetLink` reads it, so
+/// a listed entry and that link's own reading report one resource rather than two
+/// renderings of it.
+fn described(link: &crate::state::Link) -> ListLinksResponseStructure {
+    ListLinksResponseStructure {
+        gateway_id: link.gateway_id.clone(),
+        peer_gateway_id: link.peer_gateway_id.clone(),
+        status: link.status.clone(),
+        created_at: crate::state::timestamp(link.created_at),
+        updated_at: crate::state::timestamp(link.updated_at),
+        direction: Some(link.direction.clone()),
+        flow_modules: Some(link.flow_modules.clone()),
+        pending_flow_modules: Some(link.pending_flow_modules.clone()),
+        attributes: link.attributes.clone(),
+        log_settings: Some(link.log_settings.clone()),
+        connectivity_type: Some(link.connectivity_type.clone()),
+        link_id: link.link_id.clone(),
+        tags: (!link.tags.is_empty()).then(|| link.tags.clone()),
+        // A public endpoint belongs to an outbound external link, which only
+        // `CreateOutboundExternalLink` mints; no link this store holds has one, so
+        // nothing is reported for it rather than a synthesised address.
+        public_endpoint: None,
     }
 }

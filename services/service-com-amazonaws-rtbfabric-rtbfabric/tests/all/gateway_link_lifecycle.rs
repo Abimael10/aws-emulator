@@ -2,8 +2,8 @@
 
 //! End-to-end cover for the gateway-pair + link lifecycle: `CreateRequesterGateway`,
 //! `CreateResponderGateway`, `GetRequesterGateway`, `GetResponderGateway`,
-//! `CreateLink`, `GetLink` and `DeleteLink`, driven over the wire through the
-//! router the production emulator uses.
+//! `CreateLink`, `GetLink`, `ListLinks` and `DeleteLink`, driven over the wire
+//! through the router the production emulator uses.
 //!
 //! Every assertion here is about state, not about one recorded request: a create is
 //! only correct if a later read returns what it stored, and a delete is only correct
@@ -1299,3 +1299,561 @@ async fn a_pending_resource_settles_once_the_clock_has_made_the_transition_due()
         read_responder["linksRequestedCount"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// `ListLinks`: enumerating the links one gateway is an end of.
+//
+// The rule under test is about state, not about one recorded request: the
+// listing reports exactly the stored links the addressed gateway is an end of,
+// each rendered as that link's own reader renders it, in a stable total order, a
+// page of at most `maxResults` at a time, handing out a `nextToken` only while
+// links remain and resuming exactly after the page that issued it.
+// ---------------------------------------------------------------------------
+
+/// The page a `ListLinks` request that states no `maxResults` gets, as the
+/// handler documents it; the model bounds neither a default nor a maximum for
+/// that member.
+const LIST_LINKS_DEFAULT_PAGE: usize =
+    service_com_amazonaws_rtbfabric_rtbfabric::ops::list_links::DEFAULT_PAGE_SIZE;
+
+/// How long a poll waits for a status the clock owes before it gives up. Far
+/// above any span this service owes a transition, so a slow or loaded host
+/// changes how many times the loop looks, never whether it succeeds.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a poll waits between two looks.
+const SETTLE_POLL: Duration = Duration::from_millis(20);
+
+/// The status the clock owes a link whose request this service has taken.
+const SETTLED_LINK_STATUS: &str = "REQUESTED";
+
+/// The members `ListLinksResponseStructure` and `GetLinkResponse` share, from
+/// `smithy_query(query="shape", shape="ListLinksResponseStructure")`: a listed
+/// entry and that link's own reading describe ONE resource, so each of these must
+/// agree.
+const SHARED_LINK_MEMBERS: &[&str] = &[
+    "gatewayId",
+    "peerGatewayId",
+    "status",
+    "createdAt",
+    "updatedAt",
+    "direction",
+    "flowModules",
+    "pendingFlowModules",
+    "attributes",
+    "logSettings",
+    "connectivityType",
+    "linkId",
+    "tags",
+];
+
+/// A gateway and the links it is an end of, over the wire.
+struct Hub {
+    /// The requester gateway every link was opened from.
+    gateway_id: String,
+    /// Every link's `(linkId, peerGatewayId)`, sorted by link id — the order the
+    /// listing must enumerate them in.
+    links: Vec<(String, String)>,
+}
+
+impl Hub {
+    fn link_ids(&self) -> Vec<String> {
+        self.links.iter().map(|(id, _)| id.clone()).collect()
+    }
+}
+
+impl Fabric {
+    /// A requester gateway and `count` links opened from it, each to a responder
+    /// gateway of its own: only one live link joins a pair, so a gateway with
+    /// several links has several peers.
+    async fn hub_with_links(&self, case: &str, row: &Row, count: usize, token: &str) -> Hub {
+        let (status, requester) = self
+            .send(
+                "POST",
+                "/requester-gateway",
+                Some(row.requester_body(&format!("{token}-requester"))),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected CreateRequesterGateway to answer 200, got {status} {requester:?}"
+        );
+        let gateway_id = text(&requester, "gatewayId");
+
+        let mut links = Vec::new();
+        for n in 0..count {
+            let (status, responder) = self
+                .send(
+                    "POST",
+                    "/responder-gateway",
+                    Some(row.responder_body(&format!("{token}-responder-{n}"))),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected CreateResponderGateway #{n} to answer 200, got {status} {responder:?}"
+            );
+            let peer_id = text(&responder, "gatewayId");
+
+            let (status, link) = self
+                .send(
+                    "POST",
+                    &format!("/gateway/{gateway_id}/create-link"),
+                    Some(row.link_body(&peer_id)),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected CreateLink #{n} to answer 200, got {status} {link:?}"
+            );
+            links.push((text(&link, "linkId"), peer_id));
+        }
+        links.sort();
+        Hub { gateway_id, links }
+    }
+
+    /// Read a link through `GetLink` until it reports the status the clock owes
+    /// it, and answer with that reading.
+    ///
+    /// The test waits for the CONDITION rather than for a span: it looks again
+    /// until the status holds, giving up only once [`SETTLE_DEADLINE`] passed.
+    /// Comparing a listing against this reading is only meaningful once nothing
+    /// is owed, because a settle moves `status` and `updatedAt` together.
+    async fn poll_settled_link(&self, case: &str, gateway_id: &str, link_id: &str) -> Value {
+        let path = format!("/gateway/{gateway_id}/link/{link_id}");
+        let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+        loop {
+            let (status, body) = self.send("GET", &path, None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected GetLink on {path:?} to answer 200, got {status} {body:?}"
+            );
+            if text(&body, "status") == SETTLED_LINK_STATUS {
+                return body;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case {case:?}: expected {path:?} to reach {SETTLED_LINK_STATUS:?}, got {:?}",
+                body["status"]
+            );
+            tokio::time::sleep(SETTLE_POLL).await;
+        }
+    }
+
+    /// One `ListLinks` call, as `(the entries, the nextToken)`.
+    async fn list_links(
+        &self,
+        case: &str,
+        gateway_id: &str,
+        max_results: Option<i64>,
+        token: Option<&str>,
+    ) -> (Vec<Value>, Option<String>) {
+        let mut query: Vec<String> = Vec::new();
+        if let Some(max_results) = max_results {
+            query.push(format!("maxResults={max_results}"));
+        }
+        if let Some(token) = token {
+            query.push(format!("nextToken={token}"));
+        }
+        let path = match query.is_empty() {
+            true => format!("/gateway/{gateway_id}/links/"),
+            false => format!("/gateway/{gateway_id}/links/?{}", query.join("&")),
+        };
+
+        let (status, body) = self.send("GET", &path, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListLinks to answer 200 for {path:?}, got {status} {body:?}"
+        );
+        let entries = body["links"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected links to be a list for {path:?}, got {body:?}")
+            })
+            .clone();
+        (entries, body["nextToken"].as_str().map(str::to_string))
+    }
+
+    /// Walk the whole listing of `gateway_id` at `max_results` per call.
+    async fn walk_links(
+        &self,
+        case: &str,
+        gateway_id: &str,
+        max_results: Option<i64>,
+    ) -> Vec<(Vec<Value>, Option<String>)> {
+        let mut pages = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = self
+                .list_links(case, gateway_id, max_results, token.as_deref())
+                .await;
+            token = page.1.clone();
+            pages.push(page);
+            if token.is_none() {
+                break;
+            }
+            assert!(
+                pages.len() <= 64,
+                "case {case:?}: the walk did not terminate, {} page(s) so far",
+                pages.len()
+            );
+        }
+        pages
+    }
+}
+
+/// One row of the `ListLinks` pagination table: how many links the addressed
+/// gateway is an end of, the page size the walk asks for, and which shape of
+/// request built the resources.
+struct ListRow {
+    name: &'static str,
+    links: usize,
+    /// `None` exercises the page a request that states no `maxResults` gets. The
+    /// model declares no range for the member, so a value the other listings of
+    /// this service could not carry reaches the handler here.
+    max_results: Option<i64>,
+    /// An index into [`ROWS`], so the listed entries differ in content as well as
+    /// in number: tags, attributes and the optional link members present or not.
+    shape: usize,
+}
+
+/// The rows differ along what the rule generalises over: how many links the
+/// gateway holds relative to a page (none, fewer, exactly one page, several
+/// pages with a short last one), the page size (unstated, one, a divisor, far
+/// above the store, and a page of no results at all) and the shape of the links
+/// themselves.
+const LIST_ROWS: &[ListRow] = &[
+    ListRow {
+        name: "a gateway with no links",
+        links: 0,
+        max_results: None,
+        shape: 0,
+    },
+    ListRow {
+        name: "fewer links than the default page",
+        links: 3,
+        max_results: None,
+        shape: 1,
+    },
+    ListRow {
+        name: "exactly the default page",
+        links: LIST_LINKS_DEFAULT_PAGE,
+        max_results: None,
+        shape: 0,
+    },
+    ListRow {
+        name: "several default pages with a short last one",
+        links: LIST_LINKS_DEFAULT_PAGE + 3,
+        max_results: None,
+        shape: 2,
+    },
+    ListRow {
+        name: "one link per page",
+        links: 4,
+        max_results: Some(1),
+        shape: 1,
+    },
+    ListRow {
+        name: "a page size that divides the store exactly",
+        links: 6,
+        max_results: Some(3),
+        shape: 2,
+    },
+    ListRow {
+        name: "a page far larger than the store, which no modelled maximum caps",
+        links: 2,
+        max_results: Some(500),
+        shape: 1,
+    },
+    ListRow {
+        name: "a page of no results, which asks for nothing to continue from",
+        links: 3,
+        max_results: Some(0),
+        shape: 0,
+    },
+];
+
+impl ListRow {
+    /// The page this row's request really gets: its own `maxResults` when that
+    /// states a page at all, else the default.
+    fn page_size(&self) -> usize {
+        self.max_results
+            .filter(|requested| *requested > 0)
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(LIST_LINKS_DEFAULT_PAGE)
+    }
+}
+
+#[tokio::test]
+async fn the_link_listing_reports_every_link_of_the_gateway_exactly_once_in_pages() {
+    for list_row in LIST_ROWS {
+        let case = list_row.name;
+        let fabric = Fabric::new();
+        let row = &ROWS[list_row.shape];
+        let hub = fabric
+            .hub_with_links(case, row, list_row.links, "list")
+            .await;
+
+        // Nothing is owed before the comparison: a settle moves `status` and
+        // `updatedAt`, so a listing taken across one would differ from the
+        // reading for a reason that is not this rule.
+        let mut readings = Vec::new();
+        for (link_id, _) in &hub.links {
+            readings.push(
+                fabric
+                    .poll_settled_link(case, &hub.gateway_id, link_id)
+                    .await,
+            );
+        }
+
+        let page_size = list_row.page_size();
+        let pages = fabric
+            .walk_links(case, &hub.gateway_id, list_row.max_results)
+            .await;
+
+        let expected_pages = list_row.links.div_euclid(page_size)
+            + usize::from(list_row.links.rem_euclid(page_size) != 0 || list_row.links == 0);
+        assert_eq!(
+            pages.len(),
+            expected_pages,
+            "case {case:?}: expected {expected_pages} page(s) for {} link(s) at {page_size} per page, got {}",
+            list_row.links,
+            pages.len()
+        );
+
+        let mut seen = 0usize;
+        for (index, (entries, token)) in pages.iter().enumerate() {
+            assert!(
+                entries.len() <= page_size,
+                "case {case:?}: page {index} holds {} entries, more than the {page_size} the request allows: {entries:?}",
+                entries.len()
+            );
+            seen += entries.len();
+            let remaining = list_row.links.saturating_sub(seen);
+            assert_eq!(
+                token.is_some(),
+                remaining > 0,
+                "case {case:?}: with {remaining} of {} link(s) still unread, expected a nextToken present={}, got {token:?}",
+                list_row.links,
+                remaining > 0
+            );
+        }
+
+        let walked: Vec<Value> = pages
+            .iter()
+            .flat_map(|(entries, _)| entries.iter().cloned())
+            .collect();
+        let walked_ids: Vec<String> = walked.iter().map(|entry| text(entry, "linkId")).collect();
+        assert_eq!(
+            walked_ids,
+            hub.link_ids(),
+            "case {case:?}: expected the walk to report every stored link exactly once in id order, got {walked_ids:?}"
+        );
+
+        // Every entry describes the stored record, member for member, as that
+        // link's own reader describes it — so the listing reports state rather
+        // than a second rendering of it.
+        for (entry, reading) in walked.iter().zip(readings.iter()) {
+            for member in SHARED_LINK_MEMBERS {
+                assert_eq!(
+                    entry[member], reading[member],
+                    "case {case:?}: expected the listed {member:?} to be what GetLink reports ({:?}), got {:?}",
+                    reading[member], entry[member]
+                );
+            }
+            assert!(
+                entry["publicEndpoint"].is_null(),
+                "case {case:?}: a link opened through CreateLink has no public endpoint, got {:?}",
+                entry["publicEndpoint"]
+            );
+        }
+        for ((link_id, peer_id), entry) in hub.links.iter().zip(walked.iter()) {
+            assert_eq!(
+                text(entry, "peerGatewayId"),
+                *peer_id,
+                "case {case:?}: expected the link {link_id:?} to report its stored peer, got {entry:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_link_listing_is_scoped_to_the_gateway_addressed_and_changes_nothing() {
+    let case = "a store holding two gateways' links";
+    let fabric = Fabric::new();
+    let row = &ROWS[0];
+    let hub = fabric.hub_with_links(case, row, 3, "scoped-hub").await;
+    let other = fabric.hub_with_links(case, row, 2, "scoped-other").await;
+
+    let (entries, token) = fabric.list_links(case, &hub.gateway_id, None, None).await;
+    let listed: Vec<String> = entries.iter().map(|e| text(e, "linkId")).collect();
+    assert_eq!(
+        listed,
+        hub.link_ids(),
+        "case {case:?}: expected only the addressed gateway's links, got {listed:?}"
+    );
+    assert!(
+        token.is_none(),
+        "case {case:?}: a page that exhausts the enumeration hands out no token, got {token:?}"
+    );
+    for (foreign_id, _) in &other.links {
+        assert!(
+            !listed.contains(foreign_id),
+            "case {case:?}: expected another gateway's link {foreign_id:?} to be absent, got {listed:?}"
+        );
+    }
+
+    // A link joins two gateways, so it is listed from either end: each peer is an
+    // end of exactly the one link it was created with.
+    for (link_id, peer_id) in &hub.links {
+        let (from_peer, _) = fabric.list_links(case, peer_id, None, None).await;
+        let peer_ids: Vec<String> = from_peer.iter().map(|e| text(e, "linkId")).collect();
+        assert_eq!(
+            peer_ids,
+            vec![link_id.clone()],
+            "case {case:?}: expected the peer {peer_id:?} to list exactly its own link, got {peer_ids:?}"
+        );
+    }
+
+    // A stored gateway that is an end of no link answers an empty list, never a
+    // refusal: the gateway exists and holds nothing.
+    let (status, lone) = fabric
+        .send(
+            "POST",
+            "/requester-gateway",
+            Some(row.requester_body("scoped-lone")),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected CreateRequesterGateway to answer 200, got {status} {lone:?}"
+    );
+    let lone_id = text(&lone, "gatewayId");
+    let (empty, token) = fabric.list_links(case, &lone_id, None, None).await;
+    assert!(
+        empty.is_empty() && token.is_none(),
+        "case {case:?}: expected an empty page and no token for a gateway with no links, got {empty:?} {token:?}"
+    );
+
+    // A gateway this service never stored is the not-found every other read of
+    // this service answers with, not an empty page.
+    let (status, refused) = fabric
+        .send("GET", "/gateway/rtb-gw-unknown/links/", None)
+        .await;
+    assert_eq!(
+        status, 404,
+        "case {case:?}: expected an unknown gateway to be refused with 404, got {status} {refused:?}"
+    );
+
+    // The listing is a read: the same call answers the same body, and what it
+    // reported is still readable afterwards.
+    let (again, _) = fabric.list_links(case, &hub.gateway_id, None, None).await;
+    assert_eq!(
+        again, entries,
+        "case {case:?}: expected a repeated listing to answer identically, got {again:?} after {entries:?}"
+    );
+
+    // What the store releases, the listing stops reporting — and only that.
+    let (dropped_id, _) = hub.links[1].clone();
+    let (status, deleted) = fabric
+        .send(
+            "DELETE",
+            &format!("/gateway/{}/link/{dropped_id}", hub.gateway_id),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected DeleteLink to answer 200, got {status} {deleted:?}"
+    );
+    let (after, _) = fabric.list_links(case, &hub.gateway_id, None, None).await;
+    let after_ids: Vec<String> = after.iter().map(|e| text(e, "linkId")).collect();
+    let expected: Vec<String> = hub
+        .link_ids()
+        .into_iter()
+        .filter(|id| *id != dropped_id)
+        .collect();
+    assert_eq!(
+        after_ids, expected,
+        "case {case:?}: expected the released link {dropped_id:?} to be gone and the rest kept, got {after_ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_link_listing_token_this_operation_never_issued_is_refused() {
+    let case = "an unrecognised pagination token";
+    let fabric = Fabric::new();
+    let row = &ROWS[0];
+    let hub = fabric.hub_with_links(case, row, 4, "token").await;
+
+    // A token another listing of this service issued is not this walk's to
+    // resume from: the issuing operation travels inside the token. Two requester
+    // gateways are stored, so a page of one leaves that listing more to report.
+    let (status, second_requester) = fabric
+        .send(
+            "POST",
+            "/requester-gateway",
+            Some(row.requester_body("token-second-requester")),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected a second CreateRequesterGateway to answer 200, got {status} {second_requester:?}"
+    );
+    let (status, requester_page) = fabric
+        .send("GET", "/requester-gateways?maxResults=1", None)
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected ListRequesterGateways to answer 200, got {status} {requester_page:?}"
+    );
+    let foreign_token = text(&requester_page, "nextToken");
+    assert!(
+        !foreign_token.is_empty(),
+        "case {case:?}: expected ListRequesterGateways to hand out a token with gateways left, got {requester_page:?}"
+    );
+
+    for (token_case, token) in [
+        ("not hex at all", "not-a-token".to_string()),
+        ("an odd number of hex digits", "abc".to_string()),
+        ("hex carrying no cursor", "6162".to_string()),
+        // Hex of "link-0000000000000001" alone: a cursor with no issuing
+        // operation and no issuing instant is not a token this listing hands out.
+        (
+            "hex of a bare link id",
+            "6c696e6b2d30303030303030303030303030303031".to_string(),
+        ),
+        ("far longer than any issued token", "61".repeat(256)),
+        ("another listing's token", foreign_token),
+    ] {
+        let (status, body) = fabric
+            .send(
+                "GET",
+                &format!("/gateway/{}/links/?nextToken={token}", hub.gateway_id),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {token_case:?}: expected {token:?} to be refused with 400, got {status} {body:?}"
+        );
+    }
+
+    // Its own token still resumes the walk, exactly after the page that issued it.
+    let (first, token) = fabric.list_links(case, &hub.gateway_id, Some(2), None).await;
+    let token = token.unwrap_or_else(|| panic!("case {case:?}: expected a token after a short page"));
+    let (second, _) = fabric
+        .list_links(case, &hub.gateway_id, Some(2), Some(&token))
+        .await;
+    let walked: Vec<String> = first
+        .iter()
+        .chain(second.iter())
+        .map(|entry| text(entry, "linkId"))
+        .collect();
+    assert_eq!(
+        walked,
+        hub.link_ids(),
+        "case {case:?}: expected the two pages to cover every link once, got {walked:?}"
+    );
+}
+
