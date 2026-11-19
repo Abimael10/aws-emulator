@@ -1,0 +1,35 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: s3tables-table-replication
+Issue-Step: teardown#14
+Issue-Severity: HIGH
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: s3tables-table-replication
+Issue-Shape-Id: com.amazonaws.s3tables#S3TableBuckets
+Issue-Key: s3tables|DeleteTableBucket|2xx->4xx|status
+Issue-Commit: c439b0c06ad4c0c74cea84caf475018e0421a0f9
+
+# s3tables DeleteTableBucket refuses a recorded successful bucket delete with 400 BadRequestException instead of 204
+
+> _Note: this issue was identified against the code base at commit `c439b0c06ad4c0c74cea84caf475018e0421a0f9`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DeleteTableBucket
+
+## Description
+One net-new s3tables wire divergence, in the DeleteTableBucket lifecycle path: the teardown of the table-replication fixture deletes the table bucket it set up and AWS accepts the delete, while the emulator refuses the same request with HTTP 400 BadRequestException. 1 cause, in the DeleteTableBucket handler's emptiness precondition (and the state it reads).
+
+Related open issues (the replay reports this cluster unowned, so none of them covers it): 20261118T155030Z-s3tables-table-replication-diverges-puttablereplication-versiontoken-form-and.md carries the earlier task#6/task#10 clusters of this same fixture (PutTableReplication token form, GetTableReplication missing-configuration 404) and carries no replay key for this teardown step; 20261118T151519Z-s3tables-2-net-new-causes-deletetablereplication-s-stale.md and 20261118T151519Z-s3tables-deletetablereplication-stub.md concern DeleteTableReplication's refusal paths, not DeleteTableBucket.
+
+Cause 1 of 1: DeleteTableBucket refuses a delete AWS performs, answering 400 BadRequestException instead of the modeled empty 204.
+AWS: Smithy — DeleteTableBucket is DELETE /buckets/{tableBucketARN} with success code 204 and an empty (Unit) output; its modeled errors are BadRequestException (400, 'The request is invalid or malformed.'), ConflictException (409, 'The request failed because there is a conflict with a previous write. You can retry the request.'), ForbiddenException (403), NotFoundException (404), TooManyRequestsException (429), InternalServerErrorException (500). The model says nothing about an emptiness precondition, so what the service does at this point in the sequence is recorded behavior only: at the end of the recorded table-replication scenario — after the scenario's own table/replication cleanup — DeleteTableBucket on that table bucket answers HTTP 204 with no body and no error fields. A 204 here is the requirement; the request is well-formed (the tableBucketARN matches the modeled pattern) so BadRequestException's 'invalid or malformed request' class does not describe it. Hypothesis: the emulator's state still holds a child of the bucket at this point (an empty namespace left behind, or replication state the recording has already removed — the same stale-replication-state symptom the task#10 cluster of this fixture shows), and the handler's precondition turns that into a refusal AWS does not make.
+Emulator: the same step answers HTTP 400. The handler refuses whenever the bucket still has any namespace entry, and it refuses with BadRequestException carrying the service's fixed not-empty sentence: see services/service-com-amazonaws-s3tables-s3tablebuckets/src/ops/delete_table_bucket.rs lines 184-199 (`if !bucket.namespaces.is_empty() { ... BadRequestException { message: BUCKET_NOT_EMPTY_MESSAGE } }`). Replay detail for the step is a bare status divergence: 'status: expected 204, got 400' (divergence key service=s3tables|DeleteTableBucket|status=204->400|keys=status).
+Why: the delete is the terminal step of a resource lifecycle. A client that follows AWS's sequence cannot delete its table bucket against the emulator: the bucket, its namespaces and its ARN leak, a scenario cannot be re-run from a clean slate, and the refusal is reported as a malformed-request error (400) so retry/backoff logic treats a well-formed request as a client bug instead of a state condition. Any teardown or IaC delete that asserts 204 fails.
+Fix: the DeleteTableBucket handler in services/service-com-amazonaws-s3tables-s3tablebuckets/src/ops/delete_table_bucket.rs and the s3tables bucket state it reads — the delete must succeed with an empty 204 at the point the recording shows it succeeding, which means the state must not still hold children the recorded cleanup removed (namespace/table removal and replication-configuration removal must actually clear them) and the handler's precondition must not refuse on leftovers AWS tolerates. Where a refusal genuinely applies, the class is the state-conflict error, not the malformed-request one — Hypothesis: AWS states a non-empty table bucket as ConflictException (409); the model documents BadRequestException only as 'The request is invalid or malformed.', which a correctly-formed ARN delete is not.
+Traces: s3tables-table-replication#teardown#14 (DeleteTableBucket, expected 204, got 400).
+
+## Evidence
+Cause 1 — fixture s3tables-table-replication, step teardown#14, operation DeleteTableBucket. Expected status 204 (modeled success code, empty Unit body); actual status 400. Divergence key: service=s3tables|DeleteTableBucket|status=204->400|keys=status. Replay detail (verbatim): 'status: expected 204, got 400'. Affected: s3tables-table-replication#teardown#14 (1 step). The recorded response is an empty 204 — no body, no x-amzn-errortype header; the emulator's answer is a modeled client error at 400, produced by the non-empty-bucket branch at services/service-com-amazonaws-s3tables-s3tablebuckets/src/ops/delete_table_bucket.rs:192-199 which emits BadRequestException with the fixed sentence crate::state::BUCKET_NOT_EMPTY_MESSAGE (fixed text for that error class; it interpolates nothing from the request). No message assertion diverged because the recorded 204 has no body at all — the whole divergence is that a refusal was produced where AWS performed the delete.
+
+## Steps to Reproduce
+Replay fixture s3tables-table-replication to completion (it is the recorded table-replication scenario: create source and destination table buckets, a namespace and an ICEBERG table, PutTableReplication at task#6, remove the replication configuration, GetTableReplication at task#10) and let its teardown run. At teardown#14 the fixture issues DELETE /buckets/{tableBucketARN} for the scenario's table bucket. AWS answers HTTP 204 with an empty body; the emulator answers HTTP 400 BadRequestException with the fixed not-empty message, so the bucket is never deleted. To see the branch directly: create a table bucket, create a namespace in it, delete the namespace's tables and then the namespace, then DELETE the bucket — and compare with the same sequence that leaves an empty namespace or a removed-but-still-stored replication configuration behind, which is what the handler's `!bucket.namespaces.is_empty()` check refuses.
