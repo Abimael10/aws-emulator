@@ -1068,6 +1068,45 @@ pub const INCLUDE_ROOT_NEEDS_THE_ACCOUNT_CATALOG: &str =
 pub const CATALOG_NAME_NOT_ALLOWED: &str =
     "Only lowercase letters, numbers, underscores and hyphens are allowed for catalog name";
 
+/// The member a catalog-name constraint clause names: the catalog's own name, lower-camel
+/// cased the way every clause of this envelope spells a member.
+const CATALOG_NAME_MEMBER: &str = "name";
+
+/// An operation that addresses ONE catalog resource by its `CatalogId` (`GetCatalog`,
+/// `DeleteCatalog`) whose id carries a path segment that is no catalog NAME
+/// ([`super::malformed_catalog_path_segment`]).
+///
+/// RECORDED template, and nothing of its wording is spelled here: the envelope is the
+/// cross-service constraint-report one
+/// ([`::service_common::validation_message::envelope_over`]) and the clause is the
+/// framework's own rendering of a `@pattern` violation
+/// (`aws_smithy_schema_server::Violation::message`), so this refusal reads exactly as one
+/// the validating walk could have reported. Two fixed parts are decided here: the member
+/// the clause names is the catalog's own `name` — the part of the id that failed, not the
+/// wire member the id travelled in — and the requirement it states is
+/// `CatalogNameString`'s expression as the model spells it
+/// ([`super::CATALOG_NAME_PATTERN`]), anchors included, so a client that re-applies the
+/// echoed expression matches what the service matched. The one variable part is the
+/// rejected name, taken from the request.
+pub fn catalog_name_outside_its_pattern(name: &str) -> String {
+    let clause = ::aws_smithy_schema_server::Violation {
+        path: CATALOG_NAME_MEMBER.to_string(),
+        kind: ::aws_smithy_schema_server::ViolationKind::Pattern(
+            super::CATALOG_NAME_PATTERN.to_string(),
+        ),
+        // The clause quotes the name the request addressed; a `CatalogId` carries no
+        // `@sensitive`, so there is nothing to withhold.
+        value: Some(name.to_string()),
+        sensitive: false,
+    }
+    .message();
+    // `envelope_over` answers `None` only for NO clause at all, and there is exactly one
+    // here, so the fallback is unreachable; it is spelled rather than panicked on because a
+    // refusal is not worth a panic, and the clause alone still states the requirement.
+    ::service_common::validation_message::envelope_over(std::slice::from_ref(&clause))
+        .unwrap_or(clause)
+}
+
 /// A READ that addresses ONE connection definition by name (`GetConnection`) for a
 /// name the addressed Data Catalog holds none under. Recorded template: it names the
 /// connection the request addressed and the account whose catalog was searched, both

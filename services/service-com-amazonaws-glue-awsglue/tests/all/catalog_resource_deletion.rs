@@ -303,34 +303,37 @@ async fn deleting_an_unknown_catalog_is_refused() {
     }
 }
 
-/// An id ADDRESSES a catalog, so it is resolved against the store and answered with the
-/// modelled `EntityNotFoundException` when nothing is stored under it — on both the delete
-/// and the read — even for an id outside the grammar a create's `Name` has to satisfy
-/// (`CatalogNameString`'s pattern, which forbids the three path separators and the `aws:`
-/// prefix). Such an id is an address like any other: `CatalogIdString` admits it, and the
-/// nested ids the Data Catalog itself publishes (`s3tablescatalog/<bucket>`) are spelled
-/// with exactly those characters.
+/// An id ADDRESSES a catalog by the path of catalog NAMES leading to it, so the NESTING
+/// separator is part of the address and not of a name: an id carrying it resolves and is
+/// answered with the modelled `EntityNotFoundException` when nothing is stored under it —
+/// on both the delete and the read — because the nested ids the Data Catalog itself
+/// publishes (`s3tablescatalog/<bucket>`) are spelled that way. A SEGMENT outside the name
+/// grammar is a malformed address instead, which `tests/all/catalog_id_grammar.rs` pins.
 ///
-/// The rows differ along which character takes the id outside the name grammar and where
-/// the id carries it, and along whether the id names this account explicitly.
+/// The rows differ along how deep the path nests, whether the id names this account
+/// explicitly and with which separator, and along the near misses the name grammar admits.
 #[tokio::test]
-async fn an_id_outside_the_name_grammar_is_a_miss_and_not_a_malformed_request() {
+async fn a_nested_id_nothing_was_stored_under_is_a_miss() {
     let router = emulator();
     create(&router, &create_request("stored-catalog", json!({}))).await;
 
     for (case, catalog_id) in [
-        ("a dot inside the id", "my.catalog".to_string()),
-        ("a dot at the end", "catalog.".to_string()),
-        ("a dot at the start", ".catalog".to_string()),
         (
             "the nested form the Data Catalog publishes",
             "s3tablescatalog/analytics".to_string(),
         ),
-        ("a backslash", "my\\catalog".to_string()),
-        ("the reserved prefix", "aws:catalog".to_string()),
         (
-            "this account and a nested name",
+            "this account and that nested form",
             format!("{ACCOUNT_ID}:s3tablescatalog/analytics"),
+        ),
+        (
+            "this account as the holder of a nested name",
+            format!("{ACCOUNT_ID}/no-such-nested-catalog"),
+        ),
+        ("three levels of nesting", "holder/middle/leaf".to_string()),
+        (
+            "a colon that is not the account prefix",
+            "my-aws:catalog".to_string(),
         ),
     ] {
         for (surface, (status, body)) in [

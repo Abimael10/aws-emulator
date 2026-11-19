@@ -21,7 +21,7 @@
 
 use serde_json::{json, Value};
 
-use crate::wire::{call, emulator, error_code, error_message, ok, REGION};
+use crate::wire::{call, constraint_message, emulator, error_code, error_message, ok, REGION};
 
 /// The sentence a read refuses an id no run is stored under with: fixed text naming the
 /// member the request addressed the run by, with the value withheld. Written here
@@ -52,16 +52,6 @@ fn expected_clause(value: &str) -> String {
         // rendering `service_common::validation::unanchored` owns for every service here.
         ::service_common::validation::unanchored(RUN_ID_PATTERN)
     )
-}
-
-/// The wording of a constraint refusal, which the awsJson protocols carry in the error
-/// shape's lowercase `message` member — the member the boundary validator's own refusals
-/// come back in.
-fn constraint_message(body: &Value) -> String {
-    body.get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("<no message>")
-        .to_string()
 }
 
 /// Read one run id and answer the HTTP status and body.

@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::wire::{call, emulator, error_code, error_message, ok, ACCOUNT_ID};
+use crate::wire::{call, constraint_message, emulator, error_code, error_message, ok, ACCOUNT_ID};
 
 /// `NameString`'s modelled `@length` maximum ("length 1..255",
 /// `smithy_query(query="shape",shape="NameString")`), which every database-name and
@@ -90,15 +90,6 @@ pub(crate) fn one_clause(value: &str, member_path: &str, requirement: &str) -> S
         "1 validation error detected: Value '{value}' at '{member_path}' failed to satisfy \
          constraint: {requirement}"
     )
-}
-
-/// The wording of a constraint refusal, which the awsJson protocols carry in the lowercase
-/// `message` member the boundary validator's own refusals come back in.
-fn constraint_message(body: &Value) -> String {
-    body.get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("<no message>")
-        .to_string()
 }
 
 /// Assert that `body` is the constraint refusal carrying exactly `expected`.
@@ -369,13 +360,19 @@ async fn a_catalog_name_the_surface_forbids_earns_the_catalogs_own_sentence() {
     const NOT_ALLOWED: &str =
         "Only lowercase letters, numbers, underscores and hyphens are allowed for catalog name";
 
-    for (case, name) in [
-        ("a dot inside the name", "my.catalog"),
-        ("a dot at the end", "catalog."),
-        ("a dot at the start", ".catalog"),
-        ("a forward slash", "s3tablescatalog/analytics"),
-        ("a backslash", "my\\catalog"),
-        ("the reserved prefix", "aws:catalog"),
+    for (case, name, read_code) in [
+        ("a dot inside the name", "my.catalog", "ValidationException"),
+        ("a dot at the end", "catalog.", "ValidationException"),
+        ("a dot at the start", ".catalog", "ValidationException"),
+        // The one value of this table that is a well-formed catalog ADDRESS: a forward
+        // slash nests one catalog name under another, so the read resolves it.
+        (
+            "a forward slash",
+            "s3tablescatalog/analytics",
+            "EntityNotFoundException",
+        ),
+        ("a backslash", "my\\catalog", "ValidationException"),
+        ("the reserved prefix", "aws:catalog", "ValidationException"),
     ] {
         let (status, body) = call(
             &router,
@@ -403,17 +400,19 @@ async fn a_catalog_name_the_surface_forbids_earns_the_catalogs_own_sentence() {
             "case {case}: unexpected wording for {name:?}"
         );
 
-        // The same value as a catalog ID is an ADDRESS, not a name the surface accepts:
-        // the read resolves it against the store and reports the entity it does not hold,
-        // rather than judging the id against the name grammar.
+        // The same value as a catalog ID is an ADDRESS: each name between the nesting
+        // separators is a catalog name, so a value that is one such name and is outside the
+        // grammar is a malformed address (the constraint report `tests/all/
+        // catalog_id_grammar.rs` pins), while the nested form resolves and reports the
+        // entity the store does not hold.
         let (status, body) = call(&router, "GetCatalog", &json!({ "CatalogId": name })).await;
         assert_eq!(
             status, 400,
             "case {case}: expected 400 reading {name:?}, got {status} with {body}"
         );
         assert!(
-            error_code(&body).ends_with("EntityNotFoundException"),
-            "case {case}: expected EntityNotFoundException reading {name:?}, got {} in {body}",
+            error_code(&body).ends_with(read_code),
+            "case {case}: expected {read_code} reading {name:?}, got {} in {body}",
             error_code(&body)
         );
     }

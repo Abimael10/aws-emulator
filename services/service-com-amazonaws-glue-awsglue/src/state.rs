@@ -291,6 +291,7 @@ mod job_run_events;
 mod job_script;
 mod jobs;
 mod lookups;
+mod materialized_views;
 mod ml_transforms;
 mod pagination;
 mod partition_predicate;
@@ -336,6 +337,7 @@ pub use job_run_events::*;
 pub use job_script::*;
 pub use jobs::*;
 pub use lookups::*;
+pub use materialized_views::*;
 pub use ml_transforms::*;
 pub use pagination::*;
 pub use partition_predicate::*;
@@ -396,7 +398,7 @@ use crate::ops::types::{
     ExportEncryptionConfiguration,
     ExecutionAttempt, ExecutionProperty, FederatedCatalog, FederatedDatabase,
     FederatedTable, GlueTable, GrokClassifier, IcebergOptimizationPropertiesOutput, Job,
-    JsonClassifier, LastCrawlInfo, MLTransform,
+    JsonClassifier, LastCrawlInfo, MLTransform, MaterializedViewRefreshTaskRun,
     CreateUsageProfileInput,
     JobCommand, JobNodeDetails, JobRun, JobUpdate, LakeFormationConfiguration,
     LineageConfiguration,
@@ -1222,6 +1224,25 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// `ListColumnStatisticsTaskRuns` has one deterministic order to page over, and
     /// bounded by [`MAX_COLUMN_STATISTICS_TASK_RUNS`].
     pub column_statistics_task_runs: Vec<ColumnStatisticsTaskRunEntry>,
+    /// Every materialized view refresh task run this emulator holds, oldest first.
+    ///
+    /// A run lives BESIDE the catalog tree rather than on the view it refreshes, for the
+    /// reason a column statistics task run does:
+    /// `GetMaterializedViewRefreshTaskRun` addresses one by the
+    /// `MaterializedViewRefreshTaskRunId` a start minted, so the id is the whole address and
+    /// the view a run refreshes is recorded ON the run
+    /// ([`MaterializedViewRefreshTaskRunEntry`]). Kept in start order, so a listing of runs
+    /// has one deterministic order to page over.
+    ///
+    /// A run is written by the START of a refresh task
+    /// (`StartMaterializedViewRefreshTaskRun`), which is still a scaffold, so this account
+    /// holds no run yet and every well-formed id a read addresses is a miss
+    /// ([`Self::materialized_view_refresh_task_run`]) — the answer this store computes, and
+    /// not one its reader states on its own. The start that begins writing runs bounds this
+    /// list the way the column statistics task runs beside it are bounded
+    /// ([`MAX_COLUMN_STATISTICS_TASK_RUNS`]), since a caller can ask for runs without end;
+    /// no ceiling is stated before there is a write to enforce it on.
+    pub materialized_view_refresh_task_runs: Vec<MaterializedViewRefreshTaskRunEntry>,
     /// Every data quality rule recommendation run this emulator holds, oldest first.
     ///
     /// A run lives BESIDE the catalog tree rather than on the table it covers, for the

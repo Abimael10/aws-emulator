@@ -195,6 +195,20 @@ pub fn error_message(body: &Value) -> String {
         .to_string()
 }
 
+/// The wording of a CONSTRAINT refusal, which the awsJson protocols carry in the error
+/// shape's lowercase `message` member — the member the boundary validator's own refusals
+/// and every refusal stated in AWS's validation wording come back in, where a MODELLED Glue
+/// error carries its `Message` ([`error_message`]).
+///
+/// One copy, shared: every suite that reads a constraint refusal's wording reads the same
+/// member.
+pub fn constraint_message(body: &Value) -> String {
+    body.get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+        .to_string()
+}
+
 /// The `Id` a READ of the business-catalog asset type registered under `name` reports: the
 /// catalog-qualified form `glue_<accountId>::<name>`, where the put that registered it
 /// reports the bare `name`.

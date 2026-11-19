@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMaterializedViewRefreshTaskRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMaterializedViewRefreshTaskRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMaterializedViewRefreshTaskRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE materialized view refresh task run of the addressed catalog: the run
+//! recorded under the requested `MaterializedViewRefreshTaskRunId`
+//! ([`crate::state::MaterializedViewRefreshTaskRunEntry`]), projected into the modelled
+//! `MaterializedViewRefreshTaskRun` shape. A reporting operation — it reads the store and
+//! writes nothing.
+//!
+//! An id this account holds no run under is the operation's own `EntityNotFoundException`
+//! ([`RUN_NOT_FOUND`]); an id outside the member's modelled `@pattern` is refused by the
+//! boundary validator before this handler runs, so a malformed id is never reported as a
+//! miss. A `CatalogId` the caller may not read is refused before the run is looked up
+//! ([`crate::state::catalog_refusal`]).
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +78,13 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The sentence this read refuses an id no refresh task run of this account carries with.
+///
+/// RECORDED constant: the whole sentence is fixed text, naming the RESOURCE the request
+/// addressed and nothing of the id it sent — and it closes without a full stop, which is
+/// how the recording words it.
+const RUN_NOT_FOUND: &str = "Materialized view refresh task run not found";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -147,18 +157,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMaterializedViewRefreshTaskRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMaterializedViewRefreshTaskRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMaterializedViewRefreshTaskRun"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported as
+            // the operation's own timeout error, the way the other run reads report it.
+            return Err(
+                GetMaterializedViewRefreshTaskRunErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(Some(&input.catalog_id));
+        let region = crate::state::request_region(ctx.parts());
+        // Whether the caller may read this catalog at all is decided BEFORE the run lookup
+        // (see `crate::state::catalog_refusal`).
+        let catalog_refusal =
+            crate::state::catalog_refusal(&state.lock(), &catalog_id, &region, Self::NAME);
+        match catalog_refusal {
+            None => {}
+            Some(crate::state::CatalogRefusal::NotFound(message)) => {
+                return Err(
+                    GetMaterializedViewRefreshTaskRunErrorModeled::EntityNotFoundException(
+                        EntityNotFoundException {
+                            message: Some(message),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Some(crate::state::CatalogRefusal::NotAuthorized(message)) => {
+                return Err(
+                    GetMaterializedViewRefreshTaskRunErrorModeled::AccessDeniedException(
+                        AccessDeniedException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        }
+
+        let store = state.lock();
+        // `MaterializedViewRefreshTaskRunId` is `@required` and carries the `UUIDv4`
+        // `@pattern`, which the boundary validator compiles and enforces: reaching here, the
+        // only question left is whether the catalog this request addressed holds a run under
+        // that id — a run of another catalog is no answer to this one.
+        let Some(run) = store.materialized_view_refresh_task_run(
+            &catalog_id,
+            &input.materialized_view_refresh_task_run_id,
+        ) else {
+            return Err(
+                GetMaterializedViewRefreshTaskRunErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(RUN_NOT_FOUND.to_string()),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetMaterializedViewRefreshTaskRunOutput {
+            materialized_view_refresh_task_run: Some(
+                run.to_materialized_view_refresh_task_run(),
+            ),
+        })
     }
 }

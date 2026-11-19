@@ -38,6 +38,27 @@ pub fn is_catalog_name(name: &str) -> bool {
     !name.contains(['.', '/', '\\']) && !name.starts_with(RESERVED_NAME_PREFIX)
 }
 
+/// The separator a `CatalogId` spells a NESTED catalog with: the Data Catalog publishes a
+/// catalog held inside another one under the holder's name and this separator
+/// (`s3tablescatalog/<bucket>`), which is why `CatalogIdString`'s pattern admits it while a
+/// catalog's own `Name` may carry none of the path separators ([`CATALOG_NAME_PATTERN`]).
+pub const CATALOG_PATH_SEPARATOR: char = '/';
+
+/// The first segment of the catalog path `name` that is no catalog NAME at all, or `None`
+/// when every segment is one.
+///
+/// A `CatalogId` addresses a catalog by the path of catalog NAMES leading to it, so the
+/// grammar a create's `Name` has to satisfy ([`CATALOG_NAME_PATTERN`]) is what each SEGMENT
+/// of that path has to satisfy too: the nesting separator is the only character of the id
+/// that is not part of a name. A segment outside it names no catalog that could ever have
+/// been created, so it is a malformed address rather than a miss
+/// ([`messages::catalog_name_outside_its_pattern`]), and the segment answered here is the
+/// one that failed — the value the refusal reports at the catalog's `name`.
+pub fn malformed_catalog_path_segment(name: &str) -> Option<&str> {
+    name.split(CATALOG_PATH_SEPARATOR)
+        .find(|segment| !is_catalog_name(segment))
+}
+
 /// Whether the connection `name` is one of the federation connections AWS's OWN managed
 /// integrations use, rather than one an account creates for itself.
 ///

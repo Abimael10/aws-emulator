@@ -8,6 +8,13 @@
 //! id that is the account's number ([`crate::state::account_data_catalog`]). A reporting
 //! operation — it reads the store and writes nothing.
 //!
+//! A `CatalogId` whose catalog-name part carries a character no catalog name may
+//! ([`crate::state::malformed_catalog_path_segment`]) is a MALFORMED address, not a miss:
+//! it is refused with the constraint report the boundary validator answers a value outside
+//! a `@pattern` with (HTTP 400, `ValidationException`), naming the catalog's own `name`
+//! ([`crate::state::messages::catalog_name_outside_its_pattern`]), before the store is
+//! read.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -162,12 +169,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
-        // The id names the catalog, and may name the account whose Data Catalog holds it;
-        // a bare name is a catalog of the account this endpoint serves. An id is RESOLVED
-        // against the store rather than measured against the catalog NAME grammar: that
-        // grammar is what a create's `Name` has to satisfy, and an id outside it simply
-        // addresses a catalog nothing was ever stored under, which is the miss below.
+        // The id names the catalog, and may name the account whose Data Catalog holds it
+        // and the catalog that holds it; a bare name is a catalog of the account this
+        // endpoint serves.
         let reference = crate::state::parse_catalog_reference(&input.catalog_id);
+        // Every segment of that path is a catalog NAME, so a segment outside the grammar a
+        // name has to satisfy (`CatalogNameString`'s `@pattern`) addresses no catalog that
+        // could ever have been created: the request is MALFORMED rather than a miss, and it
+        // is refused with the constraint report the boundary validator answers a value
+        // outside a `@pattern` with — naming the catalog's own `name` and echoing that
+        // expression as the model spells it. Decided from the request alone, so it comes
+        // before authorization and before the store is read at all. The nesting separator
+        // itself is part of the ADDRESS and not of a name
+        // (`crate::state::CATALOG_PATH_SEPARATOR`), so the nested ids the Data Catalog
+        // publishes resolve and report their own miss below.
+        if let Some(segment) = crate::state::malformed_catalog_path_segment(&reference.name) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::messages::catalog_name_outside_its_pattern(segment),
+            ));
+        }
         // Authorization comes BEFORE the entity lookup: a catalog in another account's
         // Data Catalog is reachable on the real service only through that catalog's own
         // resource-based policy, and this store can hold no such grant, so the request is

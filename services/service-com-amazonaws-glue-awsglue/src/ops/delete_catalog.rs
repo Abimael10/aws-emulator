@@ -11,10 +11,14 @@
 //! have access to the databases, tables ... and the user-defined functions in the deleted
 //! catalog").
 //!
-//! An id this account holds no catalog under is `EntityNotFoundException` — including an id
-//! outside the catalog NAME grammar, which no create could have stored anything under: the
-//! grammar constrains the `Name` a create accepts, not the id a request addresses a catalog
-//! by. An id that is the served account's own number addresses the account's own Data
+//! An id this account holds no catalog under is `EntityNotFoundException`, and an id whose
+//! catalog-name part carries a character no catalog name may is instead a MALFORMED
+//! address: the constraint report naming the catalog's own `name`
+//! ([`crate::state::messages::catalog_name_outside_its_pattern`]), refused before anything
+//! is read or removed, exactly as the read path refuses it. The NESTING separator is part
+//! of the address rather than of a name, so the nested ids the Data Catalog publishes
+//! resolve and report their own miss. An id that is the served account's own number
+//! addresses the account's own Data
 //! Catalog — the
 //! CONTAINER the registered catalogs live in, which no create wrote — and that catalog is
 //! never deletable: the request is refused with `InvalidInputException` stating the rule a
@@ -179,12 +183,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
-        // The id names the catalog, and may name the account whose Data Catalog holds it;
-        // a bare name is a catalog of the account this endpoint serves. An id is RESOLVED
-        // against the store rather than measured against the catalog NAME grammar: that
-        // grammar is what a create's `Name` has to satisfy, and an id outside it simply
-        // addresses a catalog nothing was ever stored under, which is the miss below.
+        // The id names the catalog, and may name the account whose Data Catalog holds it
+        // and the catalog that holds it; a bare name is a catalog of the account this
+        // endpoint serves.
         let reference = crate::state::parse_catalog_reference(&input.catalog_id);
+        // A path segment that is no catalog NAME is a MALFORMED address and not a miss,
+        // exactly as it is on the read path (`crate::ops::get_catalog`): no catalog could
+        // ever have been created under it, so the request is refused with the constraint
+        // report naming the catalog's own `name`, from the request alone and before
+        // anything is read or removed.
+        if let Some(segment) = crate::state::malformed_catalog_path_segment(&reference.name) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::messages::catalog_name_outside_its_pattern(segment),
+            ));
+        }
         // Authorization comes BEFORE the entity lookup, exactly as it does on the read
         // path: a catalog in another account's Data Catalog is reachable on the real
         // service only through that catalog's own resource-based policy, and this store
