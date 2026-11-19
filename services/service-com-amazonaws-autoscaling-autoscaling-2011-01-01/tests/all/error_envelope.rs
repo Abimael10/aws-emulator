@@ -14,13 +14,16 @@
 //!    server-side records. The table below is therefore keyed on the CLASS of failure,
 //!    not on the operation, and each row names the status and wire code it expects as
 //!    well, so a row cannot pass by failing for a different reason.
-//! 2. EVERY problem with a request's ARGUMENTS is answered with HTTP 400, `<Type>Sender`
-//!    and the one error code this service names for that class, `ValidationError` — the
-//!    awsQuery common client error, because no operation of this service models an
-//!    input-validation fault. Whether the front door could READ the offending value or
-//!    not parts no answer: it is one bad-argument refusal to a client, which branches on
-//!    that one code. The table for it spans the operations, the member types and the
-//!    texts that reach the unreadable half of the class.
+//! 2. EVERY problem with a request's ARGUMENTS the front door READ is answered with HTTP
+//!    400, `<Type>Sender` and the one error code this service names for that class,
+//!    `ValidationError` — the awsQuery common client error, because no operation of this
+//!    service models an input-validation fault. A member whose TEXT is no value of its wire
+//!    type at all is the other layer, and which value it was decides the code: a BOOLEAN's
+//!    text outside the lexical space the Query wire carries one in answers that same
+//!    `ValidationError`, every other type's keeps the front door's own `MalformedInput`.
+//!    Neither states the reader's diagnostic. The tables for it span the operations, the
+//!    member types and the texts that reach the unreadable layer (see
+//!    `unreadable_argument_values.rs` for the lexical space itself).
 //! 3. a paginated read handed a cursor it never issued answers `InvalidNextToken` with a
 //!    message BUILT FROM THE REQUEST: it quotes the rejected token back, because that is
 //!    the only thing that says which of a caller's cursors went stale. The last table
@@ -56,10 +59,10 @@ struct ErrorCase {
 /// this service answers an unsatisfiable request with, the launch-configuration surface
 /// its `UnsupportedOperation`, a scaffolded operation `NotImplemented`, and an `Action`
 /// naming no modelled operation `InvalidAction`. EVERY problem with a request's
-/// arguments — a value outside a declared set, an absent required member and a value the
-/// codec could not read at all — answers the one `ValidationError`, which is this
-/// service's whole client-error vocabulary for that class (the second table below spans
-/// it).
+/// arguments the front door READ — a value outside a declared set, an absent required
+/// member — answers the one `ValidationError`, which is this service's whole client-error
+/// vocabulary for that class; a member whose text it could not read at all answers the code
+/// that unreadable class carries (the tables below span both).
 const ERROR_CASES: &[ErrorCase] = &[
     ErrorCase {
         case: "a modelled error: a NextToken the service never issued",
@@ -158,15 +161,26 @@ const ERROR_CASES: &[ErrorCase] = &[
         code: "ValidationError",
     },
     ErrorCase {
-        case: "a member whose text is not a value of its wire type, which the codec could \
-               not read at all",
+        case: "an integer member whose text is not a value of its wire type, which the codec \
+               could not read at all",
         action: "SetDesiredCapacity",
         params: &[
             ("AutoScalingGroupName", "no-such-group"),
             ("DesiredCapacity", "not-an-integer"),
         ],
         status: 400,
-        code: "ValidationError",
+        code: UNREADABLE_VALUE_CODE,
+    },
+    ErrorCase {
+        case: "a boolean member whose text spells no boolean, the one unreadable class this \
+               service states as an argument refusal",
+        action: "DeleteAutoScalingGroup",
+        params: &[
+            ("AutoScalingGroupName", "no-such-group"),
+            ("ForceDelete", "yes"),
+        ],
+        status: 400,
+        code: ARGUMENT_REFUSAL_CODE,
     },
     ErrorCase {
         case: "a scaffolded operation, which answers the 501 channel",
@@ -302,12 +316,23 @@ async fn each_error_response_carries_its_own_request_id() {
 /// common client error, and this is it.
 const ARGUMENT_REFUSAL_CODE: &str = "ValidationError";
 
+/// The code the front door's own refusal of a value it could not READ carries — every
+/// member type but a boolean's, whose refusal belongs to the value layer and is stated as
+/// an argument refusal above.
+///
+/// A request the front door could not read is a different class to a client (its own
+/// serialization is wrong) from one that was read and refused, so the two codes are not
+/// merged; this is the one recorded behaviour names for the unreadable layer.
+const UNREADABLE_VALUE_CODE: &str = "MalformedInput";
+
 /// A text that is no value of the wire type the member it is sent for carries, so the
 /// front door cannot READ it at all.
 ///
-/// One row per member TYPE a request of this service carries a scalar of — boolean,
-/// integer, double and timestamp — each at an operation that carries one, so the rule is
-/// exercised where each type is read rather than at one operation.
+/// One row per member TYPE a request of this service carries a scalar of OTHER than a
+/// boolean — integer, double and timestamp — each at an operation that carries one, so the
+/// rule is exercised where each type is read rather than at one operation. A boolean's text
+/// is read from a wider space and its refusal is the one this service restates, so the table
+/// above spans that type on its own.
 struct UnreadableCase {
     /// What class of value this row sends.
     case: &'static str,
@@ -449,10 +474,10 @@ const UNREADABLE_SCALARS: &[UnreadableCase] = &[
     },
 ];
 
-/// The answer to an argument this service could not read: HTTP 400, `<Type>Sender`, the
-/// one argument-refusal code — never the framework's own code for a body it could not
-/// read — and a request id, with no reader's diagnostic in the envelope.
-fn assert_argument_refusal(case: &str, status: u16, body: &str) {
+/// The answer to a value this service could not read: HTTP 400, `<Type>Sender`, `code` —
+/// the one that class carries — and a request id, with no reader's diagnostic in the
+/// envelope.
+fn assert_unreadable_refusal(case: &str, code: &str, status: u16, body: &str) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected HTTP 400, got {status} with {body:?}"
@@ -462,13 +487,8 @@ fn assert_argument_refusal(case: &str, status: u16, body: &str) {
             tag_value(body, "Type").as_str(),
             tag_value(body, "Code").as_str()
         ),
-        ("Sender", ARGUMENT_REFUSAL_CODE),
-        "case {case:?}: expected a Sender {ARGUMENT_REFUSAL_CODE}, got {body:?}"
-    );
-    assert!(
-        !body.contains("MalformedInput"),
-        "case {case:?}: the answer must name no code outside this service's vocabulary, got \
-         {body:?}"
+        ("Sender", code),
+        "case {case:?}: expected a Sender {code}, got {body:?}"
     );
     assert_eq!(
         tag_value(body, "Message"),
@@ -491,20 +511,20 @@ async fn an_unreadable_boolean_answers_the_argument_refusal_code() {
             let mut params: Vec<(&str, &str)> = vec![(member, text)];
             params.extend_from_slice(extra);
             let (status, body) = query(&router, action, &params).await;
-            assert_argument_refusal(&case, status, &body);
+            assert_unreadable_refusal(&case, ARGUMENT_REFUSAL_CODE, status, &body);
         }
     }
 }
 
-/// The same for every other scalar type a request carries, and for a request carrying
-/// SEVERAL unreadable values at once.
+/// Every other scalar type a request carries, sent a text that is no value of it, keeps the
+/// front door's own code — and so does a request carrying SEVERAL such values at once.
 #[tokio::test]
-async fn an_unreadable_value_of_any_type_answers_the_argument_refusal_code() {
+async fn an_unreadable_value_of_any_other_type_keeps_the_front_doors_code() {
     let router = router_with(new_engine());
 
     for case in UNREADABLE_SCALARS {
         let (status, body) = query(&router, case.action, case.params).await;
-        assert_argument_refusal(case.case, status, &body);
+        assert_unreadable_refusal(case.case, UNREADABLE_VALUE_CODE, status, &body);
     }
 
     let (status, body) = query(
@@ -514,13 +534,17 @@ async fn an_unreadable_value_of_any_type_answers_the_argument_refusal_code() {
             ("AutoScalingGroupName", "asg-several"),
             LAUNCH_SOURCE,
             ("MinSize", "none"),
-            ("MaxSize", "1"),
-            ("NewInstancesProtectedFromScaleIn", "yes"),
+            ("MaxSize", "also-none"),
             ("AvailabilityZones.member.1", "us-west-2a"),
         ],
     )
     .await;
-    assert_argument_refusal("a create carrying two unreadable values", status, &body);
+    assert_unreadable_refusal(
+        "a create carrying two unreadable integers",
+        UNREADABLE_VALUE_CODE,
+        status,
+        &body,
+    );
 }
 
 /// The other half of the class is unmoved: a value the front door DID read and then

@@ -26,6 +26,9 @@
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
+//! - `override_protocol` — the codec this service reads a request with and answers in.
+//!   The default returns `None`, keeping the framework's model-derived one. Taken here
+//!   for the lexical space of a boolean member's text (see [`xsd_boolean`]).
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -70,10 +73,12 @@ pub mod decimal_floats;
 pub mod enum_value_sets;
 pub mod malformed_input;
 pub mod query_error_envelope;
+pub mod xsd_boolean;
 
 use query_error_envelope::{AutoScalingDefinition, RequestIdEnvelopeOperation};
+use service_common::query_boolean_values::QueryBooleanValues;
 use smithy_server_runtime::{
-    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, ServerHttpProtocol, Service,
 };
 use std::sync::Arc;
 
@@ -81,14 +86,15 @@ use std::sync::Arc;
 /// with.
 ///
 /// One code for the whole class: a request whose values do not satisfy the rules the model
-/// declares, whichever rule and whichever member — and a request whose values the front
-/// door could not read at all, which is the same bad-argument refusal to a caller. None of
-/// this service's operations models an input-validation fault, so this is the awsQuery
-/// common client error every one of them reports an argument problem through. The handlers
-/// in `src/ops/` answer it through `crate::scaffolded::Scaffolded::validation_error`, the
-/// framework's own constraint walk answers it through
-/// [`EmulatedService::override_refusal`] below, and a body the codec could not read answers
-/// it through [`malformed_input`].
+/// declares, whichever rule and whichever member. None of this service's operations models
+/// an input-validation fault, so this is the awsQuery common client error every one of them
+/// reports an argument problem through. The handlers in `src/ops/` answer it through
+/// `crate::scaffolded::Scaffolded::validation_error`, and the framework's own constraint
+/// walk answers it through [`EmulatedService::override_refusal`] below.
+///
+/// A member whose TEXT the front door could not read at all is a different layer, and only
+/// one of its classes is stated under this code — the boolean one, as recorded behaviour
+/// has it (see [`malformed_input`]).
 pub(crate) const VALIDATION_ERROR_CODE: &str = "ValidationError";
 
 /// The `com-amazonaws-autoscaling-autoscaling-2011-01-01` emulated service: the generated [`ServiceDefinition`] plus
@@ -101,6 +107,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The envelope wrapper every routable request is served through. Held in a field,
     /// built once, because `override_operation` hands back a reference to it.
     envelope: RequestIdEnvelopeOperation<Eng>,
+    /// The protocol this service reads a request with: the framework's `awsQuery`, reading a
+    /// boolean member's text in the lexical space the Query wire carries one in (see
+    /// [`xsd_boolean`]). Held in a field, built once, because `override_protocol` hands back
+    /// a reference to it.
+    protocol: QueryBooleanValues,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -111,6 +122,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: AutoScalingDefinition::new(Arc::clone(&engine)),
             envelope: RequestIdEnvelopeOperation::new(engine),
+            protocol: xsd_boolean::protocol(),
         }
     }
 }
@@ -147,15 +159,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         self.entry.routes(req).then_some(&self.envelope as _)
     }
 
+    fn override_protocol(&self) -> Option<&dyn ServerHttpProtocol> {
+        // The one thing this service reads differently from the framework's own `awsQuery`
+        // codec: the TEXT of a boolean member, whose lexical space on this wire is wider
+        // than the two words that codec reads. Everything else about the protocol — routing,
+        // the response envelope, the error envelope, the namespace — is the framework's
+        // unchanged. See [`xsd_boolean`].
+        Some(&self.protocol)
+    }
+
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // Amazon EC2 Auto Scaling answers EVERY problem with a request's arguments under
-        // one error code: `ValidationError`. An absent required member is one of them — the
-        // recorded refusal of a request omitting `ShouldDecrementDesiredCapacity` carries
-        // that code — so the layer the framework distinguishes (a body it could not read at
-        // all against one it read and then refused) decides nothing about the code: a
-        // client of this service branches on `ValidationError` for both, which is why the
-        // answer for the other layer is completed in [`malformed_input`] under this same
-        // code. This hook is called for the layer that WAS read.
+        // Amazon EC2 Auto Scaling answers EVERY problem with a request's arguments it READ
+        // under one error code: `ValidationError`. An absent required member is one of them
+        // — the recorded refusal of a request omitting `ShouldDecrementDesiredCapacity`
+        // carries that code — and absence reaches this hook as a refusal of the value layer,
+        // so it is stated here with every other rule the model declares. A member whose text
+        // could not be READ at all does not reach this hook: that layer is answered in
+        // [`malformed_input`], where the recorded code of each of its classes is stated.
         //
         // The message stays the framework's own: its constraint envelope
         // (`N validation error(s) detected: <clause>`) is the wording this service states
