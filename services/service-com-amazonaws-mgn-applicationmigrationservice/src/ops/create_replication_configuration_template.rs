@@ -11,12 +11,20 @@
 //! The gate is evaluated AFTER the modelled field constraints (which the framework
 //! refuses at the boundary, ahead of this handler) and ahead of every other check.
 //!
-//! The operation is not `@idempotent` and models no idempotency token, so every call
-//! mints a template of its own: two identical requests answer two different ids.
+//! The operation is not `@idempotent` and models no idempotency token, so a repeat is
+//! not replayed: it meets the account's quota instead. The service admits
+//! `crate::state::REPLICATION_CONFIGURATION_TEMPLATES_PER_ACCOUNT` templates per
+//! account, so a create in an account that already holds that many is refused with
+//! `ServiceQuotaExceededException` (402) — the shape the SERVICE models, widened in
+//! through `extra_errors` because this operation's own error list does not name it —
+//! and the quota's fixed sentence. Deleting a template frees the account's place again.
 //!
-//! The store is bounded by `crate::state::REPLICATION_CONFIGURATION_TEMPLATE_QUOTA` and
-//! refuses past it with the modelled `ValidationException` (400) — this operation models
-//! no quota error — so a caller cannot grow the emulator's heap without end.
+//! Behind that, the store as a whole is bounded by
+//! `crate::state::REPLICATION_CONFIGURATION_TEMPLATE_QUOTA` over every account and
+//! refuses past it with the modelled `ValidationException` (400), so a caller cannot
+//! grow the emulator's heap without end. That bound is the emulator's own, not a service
+//! quota, and with one template admitted per account a caller meets the account quota
+//! long before it.
 //!
 //! ## Shape of an operation
 //!
@@ -164,15 +172,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // `extra_errors` widens the accepted set with a shape the SERVICE models but this
 // operation does not list: `InternalServerException` (HTTP 500) is the only honest
 // answer when the engine carries no store for this service.
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service, and
+// `ServiceQuotaExceededException` (HTTP 402) is the shape the service refuses a
+// per-account template quota with.
 #[smithy_macros::operation_error(
     "com.amazonaws.mgn#CreateReplicationConfigurationTemplate",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ServiceQuotaExceededException"]
 )]
 #[derive(Debug)]
 pub enum CreateReplicationConfigurationTemplateErrorModeled {
     AccessDeniedException(AccessDeniedException),
     UninitializedAccountException(UninitializedAccountException),
     ValidationException(ValidationException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     InternalServerException(InternalServerException),
 }
 
@@ -257,8 +271,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The store is bounded over every account, which bounds each account's count with
-        // it: see `crate::state::REPLICATION_CONFIGURATION_TEMPLATE_QUOTA`.
+        // The service's own quota, evaluated after the account gate and ahead of minting
+        // anything: an account holds at most
+        // `crate::state::REPLICATION_CONFIGURATION_TEMPLATES_PER_ACCOUNT` templates, so a
+        // create for an account already holding that many meets the quota rather than
+        // adding a second one. Counted from the account's own records, so a delete frees
+        // the place again.
+        if store.replication_configuration_template_account_quota_reached(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                "",
+                "refused: ServiceQuotaExceededException",
+            );
+            return Err(
+                CreateReplicationConfigurationTemplateErrorModeled::ServiceQuotaExceededException(
+                    crate::state::replication_configuration_template_quota_exceeded(),
+                )
+                .into(),
+            );
+        }
+
+        // The emulator's own heap backstop behind that quota: the store is bounded over
+        // every account, so a full store refuses rather than growing without end. See
+        // `crate::state::REPLICATION_CONFIGURATION_TEMPLATE_QUOTA`.
         if store.replication_configuration_template_store_is_full() {
             crate::state::audit(
                 ctx.parts(),
@@ -269,7 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(
                 CreateReplicationConfigurationTemplateErrorModeled::ValidationException(
-                    crate::state::replication_configuration_template_quota_exceeded(&account),
+                    crate::state::replication_configuration_template_store_full(&account),
                 )
                 .into(),
             );

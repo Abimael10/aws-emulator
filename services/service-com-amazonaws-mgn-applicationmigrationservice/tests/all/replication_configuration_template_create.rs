@@ -9,13 +9,15 @@
 //!   and the template's ARN, stores every replication setting the request supplied, and
 //!   answers the stored record — which `DescribeReplicationConfigurationTemplates`
 //!   reports unchanged afterwards.
-//! * The operation is not `@idempotent` and models no idempotency token, so two
-//!   identical requests mint two templates with two different ids, both of them listed
-//!   in creation order.
+//! * The operation is not `@idempotent` and models no idempotency token, so a repeat is
+//!   not replayed: an account holds one template at a time, and the create that would be
+//!   its second meets the quota (`replication_configuration_template_account_quota.rs`
+//!   pins that rule).
 //! * Until `InitializeService` has run for the account, the operation is the modelled
 //!   `UninitializedAccountException` and stores nothing.
-//! * Past the emulator's own store bound the operation is the modelled
-//!   `ValidationException` and stores nothing.
+//! * Past the emulator's own store bound — a backstop behind the account quota, over
+//!   every account — the operation is the modelled `ValidationException` and stores
+//!   nothing.
 //!
 //! The harness (`Mgn`, `error_code`, the region and account constants) is the one
 //! `application_lifecycle.rs` defines.
@@ -261,23 +263,17 @@ async fn a_create_stores_the_supplied_settings_and_reads_back_the_same_record() 
     }
 }
 
-/// The operation is not idempotent: every call mints a template of its own, and the
-/// account lists them in creation order.
+/// The operation is not idempotent and replays nothing: each call that serves mints a
+/// template of its own, and since an account holds one at a time the next call serves
+/// only once the held one is removed. The ids are distinct, and the account lists the one
+/// it holds.
 #[tokio::test]
-async fn every_call_mints_a_template_of_its_own() {
+async fn every_call_that_serves_mints_a_template_of_its_own() {
     let mgn = Mgn::new();
     mgn.initialize().await;
 
-    let cases = creation_cases();
-    let (first_case, first_request) = cases[0].clone();
-    // The same request three times, then each of the other rows once.
-    let repeats = vec![
-        (first_case, first_request.clone()),
-        (first_case, first_request.clone()),
-        (first_case, first_request),
-    ];
     let mut minted: Vec<String> = Vec::new();
-    for (case, request) in repeats.into_iter().chain(cases.into_iter().skip(1)) {
+    for (case, request) in creation_cases() {
         let (status, created) = mgn
             .call("CreateReplicationConfigurationTemplate", &request)
             .await;
@@ -291,29 +287,41 @@ async fn every_call_mints_a_template_of_its_own() {
             "case {case:?}: {template_id:?} was already minted for an earlier call; got \
              {minted:?}"
         );
-        minted.push(template_id);
-    }
+        minted.push(template_id.clone());
 
-    let (status, listed) = mgn
-        .call("DescribeReplicationConfigurationTemplates", &json!({}))
-        .await;
-    let reported: Vec<String> = listed["items"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|item| {
-            item["replicationConfigurationTemplateID"]
-                .as_str()
-                .unwrap_or("<absent>")
-                .to_string()
-        })
-        .collect();
-    assert_eq!(
-        (status, reported),
-        (200, minted.clone()),
-        "every minted template must be listed once, in creation order, got {listed:?}"
-    );
+        let (status, listed) = mgn
+            .call("DescribeReplicationConfigurationTemplates", &json!({}))
+            .await;
+        let reported: Vec<String> = listed["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|item| {
+                item["replicationConfigurationTemplateID"]
+                    .as_str()
+                    .unwrap_or("<absent>")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            (status, reported),
+            (200, vec![template_id.clone()]),
+            "case {case:?}: the account must list the template it holds, got {listed:?}"
+        );
+
+        // The account's one place is freed again, so the next row's call serves.
+        let (status, _, body) = mgn
+            .call_reporting_error_type(
+                "DeleteReplicationConfigurationTemplate",
+                &json!({"replicationConfigurationTemplateID": &template_id}),
+            )
+            .await;
+        assert_eq!(
+            status, 204,
+            "case {case:?}: the delete expected 204, got {status} with {body:?}"
+        );
+    }
 }
 
 /// Until `InitializeService` has run for the account, the create is the modelled
@@ -345,6 +353,11 @@ async fn an_uninitialized_account_is_refused_and_stores_nothing() {
 
 /// Past the store bound the create is the modelled `ValidationException` and stores
 /// nothing: the emulator refuses rather than growing its heap without end.
+///
+/// The bound is over every account and sits BEHIND the per-account quota, so reaching it
+/// takes one template for each of as many accounts as the bound itself — a precondition
+/// no sequence of calls of one account can reach, hence the seeding. The caller's own
+/// account holds none, so the account quota is not what refuses here.
 #[tokio::test]
 async fn a_full_store_is_refused_and_stores_nothing() {
     let mgn = Mgn::new();
@@ -355,11 +368,14 @@ async fn a_full_store_is_refused_and_stores_nothing() {
         let mut state = store.lock();
         for index in 0..REPLICATION_CONFIGURATION_TEMPLATE_QUOTA {
             let template_id = format!("rct-{index:017x}");
+            // One template per account, the most the service admits an account, so the
+            // store fills without any account holding two.
+            let account = format!("{:012}", index + 1);
             let stored = state.insert_replication_configuration_template(
                 ReplicationConfigurationTemplate {
                     arn: replication_configuration_template_arn(REGION, &template_id),
                     replication_configuration_template_id: template_id.clone(),
-                    account_id: EMULATOR_ACCOUNT.to_string(),
+                    account_id: account,
                     ..ReplicationConfigurationTemplate::default()
                 },
             );
@@ -382,7 +398,7 @@ async fn a_full_store_is_refused_and_stores_nothing() {
         .replication_configuration_templates_of(EMULATOR_ACCOUNT)
         .len();
     assert_eq!(
-        held, REPLICATION_CONFIGURATION_TEMPLATE_QUOTA,
+        held, 0,
         "case {case:?}: a refused create must store nothing, got {held} templates"
     );
 }

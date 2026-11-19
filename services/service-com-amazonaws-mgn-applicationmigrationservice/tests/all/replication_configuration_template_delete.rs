@@ -18,8 +18,10 @@
 //! Every assertion goes through the router's `dispatch`, so it exercises the same
 //! restJson1 deserialize → handle → serialize path a client drives, and the templates are
 //! created through `CreateReplicationConfigurationTemplate`. The store is reached directly
-//! only to seed a precondition no sequence of calls can reach (another account's template)
-//! and to check that a removal left no record behind, the way the other mgn suites do.
+//! only to seed a precondition no sequence of calls can reach (another account's template,
+//! or a second template of the caller's own account, which the service's per-account quota
+//! admits only one of) and to check that a removal left no record behind, the way the other
+//! mgn suites do.
 //!
 //! The harness (`Mgn`, `error_code`, the region and account constants) is the one
 //! `application_lifecycle.rs` defines.
@@ -268,8 +270,28 @@ async fn a_delete_removes_the_named_template_and_concludes_with_no_content() {
         mgn.initialize().await;
         let template_id = create(&mgn, case, &request).await;
         // A second template of the same account, so the removal is shown to take only the
-        // record it named.
-        let survivor = create(&mgn, case, &minimal_request("subnet-ffffffffffffffff")).await;
+        // record it named. The service admits one template per account, so no sequence of
+        // calls of this account can create it: it is seeded, the way another account's
+        // template is below.
+        let survivor = "rct-fffffffffffffffff".to_string();
+        {
+            let store = mgn.store();
+            let mut guard = store.lock();
+            let stored = guard.insert_replication_configuration_template(
+                ReplicationConfigurationTemplate {
+                    replication_configuration_template_id: survivor.clone(),
+                    arn: format!(
+                        "arn:aws:mgn:{REGION}:{EMULATOR_ACCOUNT}:replication-configuration-template/{survivor}"
+                    ),
+                    account_id: EMULATOR_ACCOUNT.to_string(),
+                    ..ReplicationConfigurationTemplate::default()
+                },
+            );
+            assert!(
+                stored,
+                "case {case:?}: seeding the account's second template must store it"
+            );
+        }
 
         // The delete itself: the modelled 204, with no entity at all.
         let (status, _, raw) = mgn

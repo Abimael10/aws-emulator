@@ -11,6 +11,19 @@
 
 use super::*;
 
+/// The most replication configuration templates ONE ACCOUNT holds at a time: the
+/// service admits a single replication settings template per account, so a create in an
+/// account that already holds one meets the quota.
+///
+/// Unlike [`REPLICATION_CONFIGURATION_TEMPLATE_QUOTA`] below this is the service's own
+/// quota, so it is the bound a caller observes: `CreateReplicationConfigurationTemplate`
+/// checks
+/// [`ComAmazonawsMgnApplicationmigrationserviceState::replication_configuration_template_account_quota_reached`]
+/// and refuses past it with [`replication_configuration_template_quota_exceeded`].
+/// Removing a template frees the account's one place again, since the bound is a count
+/// of what the account holds rather than of what it ever created.
+pub const REPLICATION_CONFIGURATION_TEMPLATES_PER_ACCOUNT: usize = 1;
+
 /// The most replication configuration templates this store holds at a time, over every
 /// account.
 ///
@@ -18,9 +31,10 @@ use super::*;
 /// quota: the same reasoning as [`APPLICATION_QUOTA`]. Whatever stores a template goes
 /// through
 /// [`ComAmazonawsMgnApplicationmigrationserviceState::insert_replication_configuration_template`],
-/// which refuses past the bound rather than growing the heap without end. One bound on
-/// the whole store bounds every account's count with it, so there is no second,
-/// per-account comparison that could never be the one to refuse.
+/// which refuses past the bound rather than growing the heap without end. It is a
+/// backstop BEHIND the per-account quota above, which is what a caller of this service
+/// meets: with one template admitted per account, reaching this bound takes as many
+/// accounts as the bound itself.
 pub const REPLICATION_CONFIGURATION_TEMPLATE_QUOTA: usize = 1_000;
 
 /// The `replicationConfigurationTemplateID` prefix the model's `^rct-[0-9a-zA-Z]{17}$`
@@ -141,13 +155,27 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
         }
     }
 
+    /// Whether `account_id` already holds the
+    /// [`REPLICATION_CONFIGURATION_TEMPLATES_PER_ACCOUNT`] templates the service admits
+    /// it.
+    ///
+    /// Counted from the records the account holds, so a removal frees its place again,
+    /// and read ahead of minting an id so a refused create mints nothing. Another
+    /// account's templates are not counted: the quota is the account's own.
+    pub fn replication_configuration_template_account_quota_reached(
+        &self,
+        account_id: &str,
+    ) -> bool {
+        self.replication_configuration_templates_of(account_id).len()
+            >= REPLICATION_CONFIGURATION_TEMPLATES_PER_ACCOUNT
+    }
+
     /// Whether the template store is full: it already holds
     /// [`REPLICATION_CONFIGURATION_TEMPLATE_QUOTA`] templates, over every account.
     ///
-    /// The one bound the insert below enforces, read ahead of minting an id so a write
-    /// refuses before it mints anything. One bound on the whole store bounds every
-    /// account's count with it, as the quota's own doc records, so there is no second,
-    /// per-account comparison here that could never be the one to refuse.
+    /// The bound the insert below enforces, read ahead of minting an id so a write
+    /// refuses before it mints anything. The emulator's own heap backstop, behind the
+    /// per-account quota a caller meets first.
     pub fn replication_configuration_template_store_is_full(&self) -> bool {
         self.replication_configuration_templates.len() >= REPLICATION_CONFIGURATION_TEMPLATE_QUOTA
     }
@@ -252,15 +280,40 @@ const REPLICATION_CONFIGURATION_TEMPLATE_RESOURCE_TYPE: &str = "ReplicationConfi
 /// ID"), and that is the spelling the not-found message carries.
 const REPLICATION_CONFIGURATION_TEMPLATE_RESOURCE_NAME: &str = "Replication Configuration Template";
 
-/// The modelled refusal when the emulator's own
-/// [`REPLICATION_CONFIGURATION_TEMPLATE_QUOTA`] is reached:
-/// `CreateReplicationConfigurationTemplate` models no `ServiceQuotaExceededException`,
-/// so the request is refused with the one client error it does model for a request it
-/// cannot serve.
-pub fn replication_configuration_template_quota_exceeded(account_id: &str) -> ValidationException {
+/// The refusal for an account that already holds the
+/// [`REPLICATION_CONFIGURATION_TEMPLATES_PER_ACCOUNT`] templates the service admits it.
+///
+/// The whole sentence is fixed text for this error class — it interpolates no id, no
+/// account and no limit — and the shape is the service's
+/// `ServiceQuotaExceededException` (HTTP 402), which
+/// `CreateReplicationConfigurationTemplate` carries through its `extra_errors` widening
+/// since its own error list does not name it.
+pub fn replication_configuration_template_quota_exceeded() -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: Some(REPLICATION_CONFIGURATION_TEMPLATE_QUOTA_MESSAGE.to_string()),
+        code: None,
+        resource_id: None,
+        resource_type: Some(REPLICATION_CONFIGURATION_TEMPLATE_RESOURCE_TYPE.to_string()),
+        service_code: Some(ARN_NAMESPACE.to_string()),
+        quota_code: None,
+        quota_value: i32::try_from(REPLICATION_CONFIGURATION_TEMPLATES_PER_ACCOUNT).ok(),
+    }
+}
+
+/// How the service words the per-account template quota: fixed text, carrying nothing
+/// from the request or the store.
+pub const REPLICATION_CONFIGURATION_TEMPLATE_QUOTA_MESSAGE: &str =
+    "Max Replication Configuration Templates per Account exceeded";
+
+/// The refusal for the emulator's own [`REPLICATION_CONFIGURATION_TEMPLATE_QUOTA`] heap
+/// backstop, behind the per-account quota above: the store holds as many templates as it
+/// keeps, over every account, so a further one cannot be stored. The one client error
+/// `CreateReplicationConfigurationTemplate` models for a request it cannot serve words
+/// it, naming the emulator's bound rather than any service quota.
+pub fn replication_configuration_template_store_full(account_id: &str) -> ValidationException {
     ValidationException {
         message: Some(format!(
-            "Account {account_id} already holds the maximum of \
+            "Account {account_id} cannot be served: the emulator holds the maximum of \
              {REPLICATION_CONFIGURATION_TEMPLATE_QUOTA} replication configuration templates."
         )),
         code: None,
