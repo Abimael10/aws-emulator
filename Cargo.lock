@@ -16101,6 +16101,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-cloudformation",
  "aws-sdk-cloudfront",
  "aws-sdk-dynamodbstreams",
  "aws-sdk-ec2",

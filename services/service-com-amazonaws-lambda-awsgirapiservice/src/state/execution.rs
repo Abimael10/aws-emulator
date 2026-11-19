@@ -162,6 +162,11 @@ mod aws_sts;
 /// calls.
 mod aws_rds;
 
+/// The AWS CLOUDFORMATION half of it, for the same reason: that service's model declares
+/// `awsQuery` too, and it is what a handler reads the stack it was deployed by — its template,
+/// its resources, its outputs and its events — and drives a stack of its own through.
+mod aws_cloudformation;
+
 /// What every half of that seam bound by an AWS SDK CLIENT shares: how a call's input document
 /// is read, what the answer carried, and how a refusal is handed back.
 mod sdk_call;

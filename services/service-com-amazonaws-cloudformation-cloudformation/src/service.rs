@@ -69,9 +69,14 @@
 //! is recorded in the account's event history where CloudTrail's `LookupEvents` reports it,
 //! through one code path for every operation rather than a recording written into each
 //! handler.
+//!
+//! IAM's own decision hangs off the same operation wrapper, in FRONT of every handler: a
+//! caller whose identity-based policies do not allow the action its request asks for is
+//! refused before anything is read or written ([`identity_authorization`]).
 
 pub mod custom_resource_plane;
 pub mod double_members;
+pub mod identity_authorization;
 pub mod list_element_refusals;
 pub mod management_events;
 pub mod query_error_envelope;

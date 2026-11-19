@@ -149,6 +149,19 @@ fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dy
     svc.definition().routing_table().get(key)
 }
 
+/// The NAME of that operation — the routing key this service's protocol resolves, which for
+/// its awsQuery API is the `Action` the request names and so the operation's own shape name.
+///
+/// Read as an owned value so no borrow of the service's definition (which is not `Sync`) is
+/// held across an await.
+fn operation_named(svc: &dyn Service, req: &RtRequest) -> Option<String> {
+    svc.definition()
+        .protocol()
+        .routing_key(req)
+        .ok()
+        .map(str::to_string)
+}
+
 /// Serves a modelled operation through the framework exactly as the routing table would,
 /// then adds the envelope's `<RequestId>` to the response.
 ///
@@ -202,6 +215,33 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for RequestIdEnvelopeOperation<
             }
             match modeled_operation(svc, req) {
                 Some(op) => {
+                    // IAM's decision, taken before anything of the request is read or
+                    // written: a caller whose policies do not allow the action this request
+                    // asks for, on the resource it names, is told it is not authorized and
+                    // the answer says nothing about what the account holds
+                    // ([`crate::service::identity_authorization`]). WHICH action that is, is
+                    // the operation the request named — the routing key this service's
+                    // protocol resolves, which is that operation's own name — so the
+                    // decision is taken here, where the request is already matched.
+                    let refused = operation_named(svc, req).and_then(|operation| {
+                        crate::service::identity_authorization::denial(
+                            &*self.engine,
+                            ctx,
+                            req,
+                            &operation,
+                        )
+                    });
+                    if let Some(message) = refused {
+                        // The definition is read, used and dropped inside this one
+                        // statement: `&dyn ErasedServiceDefinition` is not `Sync`, so
+                        // holding it across an await would make this future non-`Send`.
+                        return with_request_id(
+                            crate::service::identity_authorization::refusal_response(
+                                svc.definition().protocol(),
+                                &message,
+                            ),
+                        );
+                    }
                     // A resource-signal wait whose `Timeout` has run out failed its stack's
                     // operation at the instant it expired, and that failure owes a ROLLBACK
                     // whose deletes reach the services that own the stack's resources —

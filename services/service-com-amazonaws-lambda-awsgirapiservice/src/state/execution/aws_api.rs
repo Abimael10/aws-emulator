@@ -186,6 +186,11 @@ pub enum Protocol {
     /// export and its role associations through, built by the client this crate holds for it
     /// ([`super::aws_rds`]).
     RdsQuery,
+    /// AWS CloudFormation's `awsQuery`: the same binding, for the service a handler reads the
+    /// STACK it was deployed by through — its template, its resources, its outputs and its
+    /// events — and drives a stack of its own through, built by the client this crate holds for
+    /// it ([`super::aws_cloudformation`]).
+    CloudFormationQuery,
 }
 
 impl Api {
@@ -205,7 +210,8 @@ impl Api {
             | Protocol::CloudFrontRest
             | Protocol::SnsQuery
             | Protocol::StsQuery
-            | Protocol::RdsQuery => "application/json".to_string(),
+            | Protocol::RdsQuery
+            | Protocol::CloudFormationQuery => "application/json".to_string(),
         }
     }
 }
@@ -656,7 +662,31 @@ pub const APIS: &[Api] = &[
         // reported ([`super::aws_rds`]); none of them carries bytes.
         answer_model: None,
     },
-    // `services/service-com-amazonaws-rdsdata-rdsdataservice/smithy-model/
+    // `services/service-com-amazonaws-cloudformation-cloudformation/smithy-model/
+    // com-amazonaws-cloudformation-cloudformation.json`: awsQuery, sigv4Name `cloudformation`,
+    // endpointPrefix `cloudformation`, sdkId `CloudFormation`. Its operations carry their input
+    // as the parameters of a form-encoded `Action` and answer an XML document rather than a
+    // JSON one, so the request is built by [`super::aws_cloudformation`].
+    //
+    // THE STACK A FUNCTION WAS DEPLOYED BY is what a handler declared in a template reads: the
+    // template it came from (`GetTemplate`), the resources the stack deployed and the physical
+    // ids they were given (`ListStackResources`, `DescribeStackResources`), and the stack's own
+    // status, parameters and outputs (`DescribeStacks`) — the way a function finds the queue,
+    // table or api its own stack created without being told its name. DRIVING a stack —
+    // creating, updating or deleting one, and signalling a resource that waits on work the
+    // handler did — is the other shape, and the one a deployment handler or a custom resource's
+    // provider takes. A handler that cannot reach this service can do neither.
+    Api {
+        sdk_token: "cloudformation",
+        signing_name: "cloudformation",
+        endpoint_prefix: "cloudformation",
+        model: Some(CLOUDFORMATION_MODEL),
+        protocol: Protocol::CloudFormationQuery,
+        // The answer of such a call is read by that client out of the XML the service sent,
+        // and the document this seam hands the guest is built from the output members it
+        // reported ([`super::aws_cloudformation`]); none of them carries bytes.
+        answer_model: None,
+    },
     // com-amazonaws-rdsdata-rdsdataservice.json`: restJson1, sigv4Name `rds-data`,
     // endpointPrefix `rds-data`, sdkId `RDS Data`. Its requests are bound per operation out
     // of that same model ([`RDS_DATA`]).
@@ -1311,6 +1341,10 @@ pub(super) const S3VECTORS_MODEL: &str = include_str!(
 pub(super) const TRANSFER_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-transfer-transferservice/smithy-model/\
      com-amazonaws-transfer-transferservice.json"
+);
+pub(super) const CLOUDFORMATION_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-cloudformation-cloudformation/smithy-model/\
+     com-amazonaws-cloudformation-cloudformation.json"
 );
 pub(super) const SCHEDULER_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-scheduler-awschronosservice/smithy-model/\
@@ -2177,6 +2211,16 @@ impl AwsAccess {
                 )
                 .await
             }
+            Protocol::CloudFormationQuery => {
+                super::aws_cloudformation::call(
+                    &self.callback,
+                    self.identity.as_ref(),
+                    region,
+                    operation,
+                    body,
+                )
+                .await
+            }
         }
     }
 
@@ -2468,7 +2512,8 @@ async fn sent(
         | Protocol::CloudFrontRest
         | Protocol::SnsQuery
         | Protocol::StsQuery
-        | Protocol::RdsQuery => {
+        | Protocol::RdsQuery
+        | Protocol::CloudFormationQuery => {
             return Err(Sent::NotMade(format!(
                 "{} binds its requests with its own protocol rather than with a JSON one",
                 api.sdk_token
@@ -2866,6 +2911,14 @@ mod tests {
                 super::Protocol::RdsQuery => assert_eq!(
                     api.signing_name, "rds",
                     "case {:?}: expected Amazon RDS's own signing name on its protocol entry",
+                    api.sdk_token
+                ),
+                // AWS CloudFormation's `awsQuery`, the same way, in
+                // `super::super::aws_cloudformation`.
+                super::Protocol::CloudFormationQuery => assert_eq!(
+                    api.signing_name, "cloudformation",
+                    "case {:?}: expected AWS CloudFormation's own signing name on its protocol \
+                     entry",
                     api.sdk_token
                 ),
             }
