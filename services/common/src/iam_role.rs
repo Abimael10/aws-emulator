@@ -537,18 +537,66 @@ pub async fn role_withholds_action_through(
     action: &str,
     resource: &str,
 ) -> bool {
-    if role_name(role_arn).is_none() {
-        return false;
-    }
+    role_action_decision_through(callback, region, role_arn, action, resource, &[])
+        .await
+        .is_some_and(|decision| decision != crate::iam_authorization::Decision::Allowed)
+}
+
+/// What IAM ANSWERS the permissions in force on the role `role_arn` names say about `action`
+/// on `resource`, in the condition context `context` states — `None` when nothing was
+/// learned.
+///
+/// The three-valued form of [`role_withholds_action_through`], which both of the readings
+/// around it are this answer narrowed to the decision they act on: a caller that has to tell
+/// an `Allow` and an explicit `Deny` apart from a policy set that says NOTHING about the
+/// request asks here. That is what a service combining a role's permissions with the
+/// permissions a RESOURCE's own policy states needs, since within one account an allow from
+/// either side grants and a deny from either refuses
+/// ([`crate::iam_authorization::is_allowed`]).
+///
+/// It is also the only form that carries the request's own CONDITION CONTEXT: an identity
+/// statement that grants the action only `when` a key holds a value — the canned ACL an
+/// object is written with, the account a service acts for — is decided against the values the
+/// call would really carry, so such a grant is read as the grant it is rather than as a
+/// clause nothing satisfies.
+///
+/// `None` — nothing learned — for a value that names no role of this account, an answer this
+/// emulator could not read, and any failure of the hop at all, including an emulator with no
+/// IAM mounted, exactly as [`role_withholds_action`] reads those. The hop is the SAME one:
+/// the simulation of a principal's policies over the in-process callback
+/// ([`crate::iam_client`]), so there is still one route to what IAM answers about a role's
+/// permissions.
+pub async fn role_action_decision_through(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    role_arn: &str,
+    action: &str,
+    resource: &str,
+    context: &[(String, String)],
+) -> Option<crate::iam_authorization::Decision> {
+    role_name(role_arn)?;
+    // "A list of context keys and corresponding values for the simulation to use": one entry
+    // per key the request carries a value for, which is how the simulated call's condition
+    // context is stated.
+    let entries: Vec<::aws_sdk_iam::types::ContextEntry> = context
+        .iter()
+        .map(|(key, value)| {
+            ::aws_sdk_iam::types::ContextEntry::builder()
+                .context_key_name(key)
+                .context_key_values(value)
+                .build()
+        })
+        .collect();
     let answer = crate::iam_client::iam_client_through(callback, region)
         .simulate_principal_policy()
         .policy_source_arn(role_arn)
         .action_names(action)
         .resource_arns(resource)
+        .set_context_entries((!entries.is_empty()).then_some(entries))
         .send()
         .await;
     let Ok(answer) = answer else {
-        return false;
+        return None;
     };
     // One result per action asked about, each carrying the decision over the resources asked
     // about; the pair here is one action and one resource, so the FIRST result is the answer,
@@ -557,11 +605,16 @@ pub async fn role_withholds_action_through(
         .evaluation_results()
         .first()
         .map(::aws_sdk_iam::types::EvaluationResult::eval_decision)
-        .is_some_and(|decision| {
-            !matches!(
-                decision,
-                ::aws_sdk_iam::types::PolicyEvaluationDecisionType::Allowed
-            )
+        .map(|decision| match decision {
+            ::aws_sdk_iam::types::PolicyEvaluationDecisionType::Allowed => {
+                crate::iam_authorization::Decision::Allowed
+            }
+            ::aws_sdk_iam::types::PolicyEvaluationDecisionType::ExplicitDeny => {
+                crate::iam_authorization::Decision::Denied
+            }
+            // The implicit deny, and any decision this emulator does not know, are a policy
+            // set that states nothing about the request.
+            _ => crate::iam_authorization::Decision::NotStated,
         })
 }
 
@@ -608,32 +661,8 @@ pub async fn role_denies_action_through(
     action: &str,
     resource: &str,
 ) -> bool {
-    if role_name(role_arn).is_none() {
-        return false;
-    }
-    let answer = crate::iam_client::iam_client_through(callback, region)
-        .simulate_principal_policy()
-        .policy_source_arn(role_arn)
-        .action_names(action)
-        .resource_arns(resource)
-        .send()
-        .await;
-    let Ok(answer) = answer else {
-        return false;
-    };
-    // One result per action asked about, each carrying the decision over the resources asked
-    // about; the pair here is one action and one resource, so the FIRST result is the answer,
-    // and an answer that reports no result at all is one nothing can be read from.
-    answer
-        .evaluation_results()
-        .first()
-        .map(::aws_sdk_iam::types::EvaluationResult::eval_decision)
-        .is_some_and(|decision| {
-            matches!(
-                decision,
-                ::aws_sdk_iam::types::PolicyEvaluationDecisionType::ExplicitDeny
-            )
-        })
+    role_action_decision_through(callback, region, role_arn, action, resource, &[]).await
+        == Some(crate::iam_authorization::Decision::Denied)
 }
 
 /// Whether IAM ANSWERED that the role `role_arn` names carries identity-based policies AT ALL

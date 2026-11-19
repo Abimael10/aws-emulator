@@ -18,13 +18,25 @@
 //! which mounts Config alone, still puts delivery channels whose recorder role no IAM
 //! record backs.
 //!
-//! The rows differ along what the rule generalises over: what the role's trust document
+//! The second rule under test: **Config makes those S3 calls UNDER that role, so each of
+//! them has TWO sources of permission — the policy in force on the bucket and the
+//! identity-based policies in force on the role — weighed within one account the way IAM
+//! weighs them: an explicit deny from either refuses, an allow from EITHER grants, and only a
+//! call neither of them allows is refused. So a same-account delivery bucket carrying NO
+//! bucket policy is taken when the recorder's role states the grants, the channel is refused
+//! when no source states them, and the same permission decides the write a performed delivery
+//! makes, read at the moment of that write.**
+//!
+//! The rows differ along what the rules generalise over: what the role's trust document
 //! says (which principal, which action, which effect, how many statements, whether it is
 //! readable as a policy at all, whether the role carries one), whether this account holds
-//! the role, whose account the ARN names, the path IAM holds the role under, and the
-//! channel and bucket names the refusal has to quote back.
+//! the role, whose account the ARN names, the path IAM holds the role under, the channel and
+//! bucket names the refusal has to quote back, and — for the second rule — which source
+//! states a grant, which of the two calls it covers, and which resource and condition it
+//! carries.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_configservice_starlingdoveservice::EmulatedService;
@@ -125,8 +137,9 @@ impl Emulator {
         parsed
     }
 
-    /// Create `bucket` through S3's own API, carrying no policy at all.
-    async fn create_bucket(&self, bucket: &str) {
+    /// An S3 client over the in-process callback, the way Config's own reads of the delivery
+    /// bucket are made.
+    fn s3(&self) -> aws_sdk_s3::Client {
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new(REGION.to_string()))
@@ -142,11 +155,96 @@ impl Emulator {
             )
             .build();
         aws_sdk_s3::Client::from_conf(config)
+    }
+
+    /// An IAM client over the same callback, so a role the rows provision is provisioned
+    /// through IAM's OWN API — `CreateRole`, `PutRolePolicy`, `AttachRolePolicy` — the way a
+    /// client sets a configuration recorder's role up.
+    fn iam(&self) -> aws_sdk_iam::Client {
+        service_common::iam_client::iam_client_through(&self.callback, REGION)
+    }
+
+    /// Create `bucket` through S3's own API, carrying no policy at all.
+    async fn create_bucket(&self, bucket: &str) {
+        self.s3()
             .create_bucket()
             .bucket(bucket)
             .send()
             .await
             .unwrap_or_else(|error| panic!("creating {bucket} must succeed, got {error:?}"));
+    }
+
+    /// Put `document` as `bucket`'s own policy.
+    async fn put_bucket_policy(&self, bucket: &str, document: String) {
+        self.s3()
+            .put_bucket_policy()
+            .bucket(bucket)
+            .policy(document)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("writing {bucket}'s policy must succeed, got {error:?}")
+            });
+    }
+
+    /// Every key `bucket` holds.
+    async fn keys(&self, bucket: &str) -> Vec<String> {
+        let listed = self
+            .s3()
+            .list_objects_v2()
+            .bucket(bucket)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("listing {bucket} must succeed, got {error:?}"));
+        listed
+            .contents()
+            .iter()
+            .filter_map(|object| object.key().map(str::to_string))
+            .collect()
+    }
+
+    /// Create `role_name` through IAM's own API, trusting the Config service principal the
+    /// way a configuration recorder's role has to, and answer the ARN IAM minted for it.
+    async fn create_config_role(&self, role_name: &str) -> String {
+        self.iam()
+            .create_role()
+            .role_name(role_name)
+            .assume_role_policy_document(config_trust())
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("creating {role_name} must succeed, got {error:?}"))
+            .role
+            .expect("CreateRole answers the role")
+            .arn
+    }
+
+    /// Embed `document` in `role_name` as the inline role policy `INLINE_POLICY_NAME`: a
+    /// second call under the same name REPLACES it, which is how a row takes a grant away
+    /// again.
+    async fn put_role_policy(&self, role_name: &str, document: String) {
+        self.iam()
+            .put_role_policy()
+            .role_name(role_name)
+            .policy_name(INLINE_POLICY_NAME)
+            .policy_document(document)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("embedding a policy in {role_name} must succeed, got {error:?}")
+            });
+    }
+
+    /// Attach the managed policy `policy_arn` to `role_name`.
+    async fn attach_role_policy(&self, role_name: &str, policy_arn: &str) {
+        self.iam()
+            .attach_role_policy()
+            .role_name(role_name)
+            .policy_arn(policy_arn)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("attaching {policy_arn} to {role_name} must succeed, got {error:?}")
+            });
     }
 
     /// Seed `role_name` into the shared engine's IAM store under `path`, carrying `trust`
@@ -567,5 +665,556 @@ async fn the_recorders_role_is_judged_before_the_buckets_policy() {
              {status} with {body}"
         );
         assert_no_such_channel(&emulator, case, &channel).await;
+    }
+}
+
+/// The name the rows below embed their inline role policy under. One name, so a row that
+/// embeds a second document REPLACES the first.
+const INLINE_POLICY_NAME: &str = "config-delivery";
+
+/// The managed policy AWS publishes for a configuration recorder's role, which a client
+/// ATTACHES instead of writing the bucket-level grants itself. Among its grants is
+/// `s3:GetBucketAcl`, so a role carrying it alone is permitted the ACL read and not the
+/// object write.
+const CONFIG_ROLE_MANAGED_POLICY: &str = "arn:aws:iam::aws:policy/service-role/AWS_ConfigRole";
+
+/// The canned ACL Config writes a delivered object with, which the delivery grant AWS
+/// documents conditions on (`s3:x-amz-acl`).
+const DELIVERY_OBJECT_ACL: &str = "bucket-owner-full-control";
+
+/// The account every row's bucket and role belong to.
+fn account() -> String {
+    engine::emulator_account_id().to_string()
+}
+
+/// The ARN of `bucket`, which a statement's `Resource` names.
+fn bucket_arn(bucket: &str) -> String {
+    format!("arn:aws:s3:::{bucket}")
+}
+
+/// The delivery path Config writes this account's objects under, behind `prefix` where a
+/// channel configures one: `[<prefix>/]AWSLogs/<account-id>`, the root the writability check
+/// Config makes before it takes a channel sits below (AWS Config Developer Guide,
+/// *Permissions for the Amazon S3 bucket*).
+fn delivery_path(prefix: Option<&str>) -> String {
+    let root = format!("AWSLogs/{}", account());
+    match prefix {
+        Some(prefix) => format!("{prefix}/{root}"),
+        None => root,
+    }
+}
+
+/// One `Allow` statement of an IDENTITY policy: `actions` on `resources`, carrying
+/// `condition` where the row states one. Such a statement names no principal — the role the
+/// policy is in force on IS the principal.
+fn identity_allow(actions: &[&str], resources: &[String], condition: Option<Value>) -> Value {
+    let mut statement = json!({
+        "Effect": "Allow",
+        "Action": actions,
+        "Resource": resources,
+    });
+    if let Some(condition) = condition {
+        statement["Condition"] = condition;
+    }
+    statement
+}
+
+/// A policy document carrying `statements`.
+fn document(statements: Vec<Value>) -> String {
+    json!({ "Version": "2012-10-17", "Statement": statements }).to_string()
+}
+
+/// The condition the documented delivery grant carries: the object is written with the canned
+/// ACL `acl`.
+fn acl_condition(acl: &str) -> Value {
+    json!({ "StringLike": { "s3:x-amz-acl": acl } })
+}
+
+/// The grant of the ACL read on the bucket itself, which Config makes before it will take a
+/// channel.
+fn acl_read(bucket: &str) -> Value {
+    identity_allow(&["s3:GetBucketAcl"], &[bucket_arn(bucket)], None)
+}
+
+/// The grant of the object write on `objects`, conditioned on the canned ACL `acl`.
+fn object_write(objects: String, acl: Option<&str>) -> Value {
+    identity_allow(
+        &["s3:PutObject", "s3:PutObjectAcl"],
+        std::slice::from_ref(&objects),
+        acl.map(acl_condition),
+    )
+}
+
+/// The inline role policy AWS's own Config setup embeds in the recorder's role: the ACL read
+/// on the bucket, and the object write on this account's delivery path under the channel's
+/// prefix, conditioned on the canned ACL Config writes with.
+fn documented_role_policy(bucket: &str, prefix: Option<&str>) -> String {
+    document(vec![
+        acl_read(bucket),
+        object_write(
+            format!("{}/{}/*", bucket_arn(bucket), delivery_path(prefix)),
+            Some(DELIVERY_OBJECT_ACL),
+        ),
+    ])
+}
+
+/// The same, with the write grant left out.
+fn acl_read_only(bucket: &str, _prefix: Option<&str>) -> String {
+    document(vec![acl_read(bucket)])
+}
+
+/// The same, with the ACL read left out.
+fn object_write_only(bucket: &str, prefix: Option<&str>) -> String {
+    document(vec![object_write(
+        format!("{}/{}/*", bucket_arn(bucket), delivery_path(prefix)),
+        Some(DELIVERY_OBJECT_ACL),
+    )])
+}
+
+/// Both grants, the write conditioned on ANOTHER canned ACL than the one Config writes with.
+fn write_under_another_acl(bucket: &str, prefix: Option<&str>) -> String {
+    document(vec![
+        acl_read(bucket),
+        object_write(
+            format!("{}/{}/*", bucket_arn(bucket), delivery_path(prefix)),
+            Some("public-read"),
+        ),
+    ])
+}
+
+/// Both grants, the write scoped to ANOTHER account's delivery path.
+fn write_for_another_account(bucket: &str, _prefix: Option<&str>) -> String {
+    document(vec![
+        acl_read(bucket),
+        object_write(
+            format!("{}/AWSLogs/999999999999/*", bucket_arn(bucket)),
+            Some(DELIVERY_OBJECT_ACL),
+        ),
+    ])
+}
+
+/// Both grants, the write scoped to this account's UNPREFIXED delivery path — which a channel
+/// delivering under a prefix does not write to.
+fn write_without_a_prefix(bucket: &str, _prefix: Option<&str>) -> String {
+    document(vec![
+        acl_read(bucket),
+        object_write(
+            format!("{}/{}/*", bucket_arn(bucket), delivery_path(None)),
+            Some(DELIVERY_OBJECT_ACL),
+        ),
+    ])
+}
+
+/// Both grants, the write covering every object of the bucket and conditioned on nothing.
+fn write_every_object(bucket: &str, _prefix: Option<&str>) -> String {
+    document(vec![
+        acl_read(bucket),
+        object_write(format!("{}/*", bucket_arn(bucket)), None),
+    ])
+}
+
+/// The bucket policy AWS documents for a delivery channel, as a client writes it on the
+/// bucket ITSELF: each statement an `Allow` for the Config service principal, which is what a
+/// resource-based grant names.
+fn documented_bucket_policy(bucket: &str) -> String {
+    let arn = bucket_arn(bucket);
+    let statements = [
+        ("s3:GetBucketAcl", arn.clone()),
+        ("s3:ListBucket", arn.clone()),
+        ("s3:PutObject", format!("{arn}/*")),
+    ]
+    .into_iter()
+    .map(|(action, resource)| {
+        json!({
+            "Effect": "Allow",
+            "Principal": { "Service": CONFIG_PRINCIPAL },
+            "Action": action,
+            "Resource": resource,
+        })
+    })
+    .collect();
+    document(statements)
+}
+
+/// A bucket policy that DENIES Config the ACL read outright.
+fn bucket_policy_denying_the_acl_read(bucket: &str) -> String {
+    document(vec![json!({
+        "Effect": "Deny",
+        "Principal": { "Service": CONFIG_PRINCIPAL },
+        "Action": "s3:GetBucketAcl",
+        "Resource": bucket_arn(bucket),
+    })])
+}
+
+/// Which S3 call a refusal names, and the `unable to …` clause it carries for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Denied {
+    /// The ACL read Config makes on the bucket.
+    BucketAcl,
+    /// The write of the object Config puts in the bucket to check it can deliver there.
+    ObjectWrite,
+}
+
+impl Denied {
+    /// The sentence the refusal carries, which names the bucket and this call — the object
+    /// write naming the key prefix the channel asked for with it.
+    fn message(self, bucket: &str, prefix: Option<&str>) -> String {
+        let clause = match self {
+            Self::BucketAcl => "get s3 bucket acl".to_string(),
+            Self::ObjectWrite => format!(
+                "write to bucket, provided s3 key prefix is '{}'",
+                prefix.unwrap_or("null")
+            ),
+        };
+        format!("Insufficient delivery policy to s3 bucket: {bucket}, unable to {clause}.")
+    }
+}
+
+/// One row: what each source of the permission states, and what the rule says of the put.
+struct SourceRow {
+    case: &'static str,
+    /// The inline policy embedded in the recorder's role, built from the row's bucket and the
+    /// prefix its channel configures; `None` for a role carrying none.
+    inline: Option<RolePolicy>,
+    /// Whether the row attaches the managed policy AWS publishes for the role.
+    managed: bool,
+    /// The policy in force on the delivery bucket, built from the row's bucket; `None` for a
+    /// bucket carrying none.
+    bucket_policy: Option<fn(&str) -> String>,
+    /// The `s3KeyPrefix` the channel configures.
+    prefix: Option<&'static str>,
+    /// The call the refusal has to name, or `None` for a put the rule says must be admitted.
+    denied: Option<Denied>,
+}
+
+/// The `PutDeliveryChannel` body for `channel` delivering into `bucket` under `prefix`.
+fn prefixed_channel_request(channel: &str, bucket: &str, prefix: Option<&str>) -> Value {
+    let mut body = channel_request(channel, bucket);
+    if let Some(prefix) = prefix {
+        body["DeliveryChannel"]["s3KeyPrefix"] = json!(prefix);
+    }
+    body
+}
+
+/// The S3 calls a delivery channel needs are authorized against the TWO sources of that
+/// permission together — the bucket's own policy and the identity-based policies in force on
+/// the configuration recorder's role — so a same-account bucket carrying NO policy is taken
+/// when the role states the grants, and a call no source allows, or one a source denies, is
+/// refused and named.
+///
+/// The rows differ along which source states the grant (the role's inline policy, the managed
+/// policy attached to it, the bucket's own policy, none of them, two at once), which of the
+/// two calls it covers, which resource and condition the grant carries, and whether the
+/// channel delivers under a key prefix.
+#[tokio::test]
+async fn a_delivery_either_source_permits_is_taken() {
+    let rows: Vec<SourceRow> = vec![
+        SourceRow {
+            case: "the role's own policy grants both calls, the bucket carrying no policy",
+            inline: Some(documented_role_policy),
+            managed: false,
+            bucket_policy: None,
+            prefix: None,
+            denied: None,
+        },
+        SourceRow {
+            case: "the same, with the managed policy AWS publishes attached as well",
+            inline: Some(documented_role_policy),
+            managed: true,
+            bucket_policy: None,
+            prefix: None,
+            denied: None,
+        },
+        SourceRow {
+            case: "the attached managed policy alone, which grants the ACL read only",
+            inline: None,
+            managed: true,
+            bucket_policy: None,
+            prefix: None,
+            denied: Some(Denied::ObjectWrite),
+        },
+        SourceRow {
+            case: "a role granting the ACL read alone",
+            inline: Some(acl_read_only),
+            managed: false,
+            bucket_policy: None,
+            prefix: None,
+            denied: Some(Denied::ObjectWrite),
+        },
+        SourceRow {
+            case: "a role granting the object write alone",
+            inline: Some(object_write_only),
+            managed: false,
+            bucket_policy: None,
+            prefix: None,
+            denied: Some(Denied::BucketAcl),
+        },
+        SourceRow {
+            case: "neither source states anything",
+            inline: None,
+            managed: false,
+            bucket_policy: None,
+            prefix: None,
+            denied: Some(Denied::BucketAcl),
+        },
+        SourceRow {
+            case: "the role's write grant conditioned on another canned ACL",
+            inline: Some(write_under_another_acl),
+            managed: false,
+            bucket_policy: None,
+            prefix: None,
+            denied: Some(Denied::ObjectWrite),
+        },
+        SourceRow {
+            case: "the role's write grant scoped to another account's delivery path",
+            inline: Some(write_for_another_account),
+            managed: false,
+            bucket_policy: None,
+            prefix: None,
+            denied: Some(Denied::ObjectWrite),
+        },
+        SourceRow {
+            case: "the role's write grant covering every object of the bucket",
+            inline: Some(write_every_object),
+            managed: false,
+            bucket_policy: None,
+            prefix: None,
+            denied: None,
+        },
+        SourceRow {
+            case: "the bucket's own policy grants both calls, the role stating nothing",
+            inline: None,
+            managed: false,
+            bucket_policy: Some(documented_bucket_policy),
+            prefix: None,
+            denied: None,
+        },
+        SourceRow {
+            case: "the bucket's policy denies the ACL read the role grants",
+            inline: Some(documented_role_policy),
+            managed: false,
+            bucket_policy: Some(bucket_policy_denying_the_acl_read),
+            prefix: None,
+            denied: Some(Denied::BucketAcl),
+        },
+        SourceRow {
+            case: "a channel under a key prefix, the role's grant covering that prefix",
+            inline: Some(documented_role_policy),
+            managed: false,
+            bucket_policy: None,
+            prefix: Some("audit"),
+            denied: None,
+        },
+        SourceRow {
+            case: "the same channel, the role's grant covering the unprefixed path alone",
+            inline: Some(write_without_a_prefix),
+            managed: false,
+            bucket_policy: None,
+            prefix: Some("audit"),
+            denied: Some(Denied::ObjectWrite),
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        // Each row stands its own emulator up and names its own bucket, role and channel, so
+        // the refusal's variable parts are the ones THAT row sent.
+        let emulator = Emulator::with_s3();
+        let bucket = format!("source-bucket-{index}");
+        let role_name = format!("source-role-{index}");
+        let channel = format!("source-channel-{index}");
+        emulator.create_bucket(&bucket).await;
+        if let Some(document) = row.bucket_policy {
+            emulator.put_bucket_policy(&bucket, document(&bucket)).await;
+        }
+        let role = emulator.create_config_role(&role_name).await;
+        if let Some(inline) = row.inline {
+            emulator
+                .put_role_policy(&role_name, inline(&bucket, row.prefix))
+                .await;
+        }
+        if row.managed {
+            emulator
+                .attach_role_policy(&role_name, CONFIG_ROLE_MANAGED_POLICY)
+                .await;
+        }
+        with_recorder(&emulator, &role).await;
+
+        let case = row.case;
+        let (status, body) = emulator
+            .call(
+                "PutDeliveryChannel",
+                &prefixed_channel_request(&channel, &bucket, row.prefix),
+            )
+            .await;
+        let Some(denied) = row.denied else {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the put to be admitted, got {status} with {body}"
+            );
+            // Round trip: the channel the permission admitted is readable, naming the bucket
+            // and the prefix it was put with.
+            let read = emulator
+                .ok(
+                    "DescribeDeliveryChannels",
+                    &json!({ "DeliveryChannelNames": [&channel] }),
+                )
+                .await;
+            let held = &read["DeliveryChannels"][0];
+            assert_eq!(
+                (held["s3BucketName"].as_str(), held["s3KeyPrefix"].as_str()),
+                (Some(bucket.as_str()), row.prefix),
+                "case {case:?}: expected the held channel to carry the bucket and prefix it \
+                 was put with, got {read}"
+            );
+            continue;
+        };
+        let expected = denied.message(&bucket, row.prefix);
+        assert_eq!(
+            (status, error_code(&body), error_message(&body)),
+            (400, INSUFFICIENT_POLICY.to_string(), expected.clone()),
+            "case {case:?}: expected HTTP 400 {INSUFFICIENT_POLICY} and {expected:?}, got \
+             {status} with {body}"
+        );
+        assert_no_such_channel(&emulator, case, &channel).await;
+    }
+}
+
+/// How long a poll waits for the delivery the clock owes, which falls due a fraction of a
+/// second after the call that scheduled it: many passes' worth of slack, not a span the
+/// behaviour depends on.
+const DELIVERY_BUDGET: Duration = Duration::from_secs(15);
+
+/// How long a poll waits between two reads.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The `lastStatus` a delivery that wrote its object reports, and the one a delivery that did
+/// not: the members of `com.amazonaws.configservice#DeliveryStatus`, upper-cased.
+const SUCCESS: &str = "SUCCESS";
+/// See [`SUCCESS`].
+const FAILURE: &str = "FAILURE";
+
+/// How a row builds the policy document a role carries, from the row's bucket and the prefix
+/// its channel configures.
+type RolePolicy = fn(&str, Option<&str>) -> String;
+
+/// The same permission decides the write a PERFORMED delivery makes, read at the moment of
+/// the write: a snapshot delivery whose role still states the grant writes its object into a
+/// bucket carrying no policy at all, and one whose grant was taken away after the channel was
+/// taken writes nothing and is reported as the failed delivery it is.
+///
+/// The rows differ along whether the role's write grant is still in force when the delivery
+/// runs, which is what the rule turns on.
+#[tokio::test]
+async fn a_performed_delivery_is_judged_by_the_permission_in_force_at_the_write() {
+    // (case, the policy left in force on the role when the delivery runs, whether written)
+    let rows: [(&str, RolePolicy, bool); 2] = [
+        (
+            "the role still grants the write",
+            documented_role_policy,
+            true,
+        ),
+        (
+            "the role's write grant taken away after the channel was taken",
+            acl_read_only,
+            false,
+        ),
+    ];
+
+    for (index, (case, left_in_force, written)) in rows.iter().enumerate() {
+        let emulator = Emulator::with_s3();
+        let bucket = format!("performed-bucket-{index}");
+        let role_name = format!("performed-role-{index}");
+        let channel = format!("performed-channel-{index}");
+        emulator.create_bucket(&bucket).await;
+        let role = emulator.create_config_role(&role_name).await;
+        // The channel is taken under the full grant — the row then replaces the role's inline
+        // policy with the document IT leaves in force, so what differs at the write is the
+        // permission and not the channel.
+        emulator
+            .put_role_policy(&role_name, documented_role_policy(&bucket, None))
+            .await;
+        with_recorder(&emulator, &role).await;
+        emulator
+            .ok("PutDeliveryChannel", &channel_request(&channel, &bucket))
+            .await;
+        emulator
+            .ok(
+                "StartConfigurationRecorder",
+                &json!({ "ConfigurationRecorderName": "the-recorder" }),
+            )
+            .await;
+        emulator
+            .put_role_policy(&role_name, left_in_force(&bucket, None))
+            .await;
+
+        let scheduled = emulator
+            .ok(
+                "DeliverConfigSnapshot",
+                &json!({ "deliveryChannelName": &channel }),
+            )
+            .await;
+        assert!(
+            scheduled["configSnapshotId"].is_string(),
+            "case {case:?}: expected a scheduled snapshot id, got {scheduled}"
+        );
+
+        // Wait for the delivery to reach a terminal status rather than for any span of time.
+        let deadline = Instant::now() + DELIVERY_BUDGET;
+        let info = loop {
+            let reported = emulator
+                .ok(
+                    "DescribeDeliveryChannelStatus",
+                    &json!({ "DeliveryChannelNames": [&channel] }),
+                )
+                .await;
+            let info = reported["DeliveryChannelsStatus"][0]["configSnapshotDeliveryInfo"].clone();
+            if info["lastStatus"].is_string() {
+                break info;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: expected the delivery to settle, got {info}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        };
+
+        let keys = emulator.keys(&bucket).await;
+        if *written {
+            assert_eq!(
+                info["lastStatus"],
+                json!(SUCCESS),
+                "case {case:?}: expected the delivery to succeed, got {info}"
+            );
+            assert_eq!(
+                keys.len(),
+                1,
+                "case {case:?}: expected one delivered object, got {keys:?}"
+            );
+            assert!(
+                keys[0].starts_with(&format!("{}/Config/", delivery_path(None))),
+                "case {case:?}: expected the object under this account's delivery path, got \
+                 {keys:?}"
+            );
+            continue;
+        }
+        let expected = Denied::ObjectWrite.message(&bucket, None);
+        assert_eq!(
+            (
+                info["lastStatus"].as_str(),
+                info["lastErrorCode"].as_str(),
+                info["lastErrorMessage"].as_str(),
+            ),
+            (
+                Some(FAILURE),
+                Some(INSUFFICIENT_POLICY),
+                Some(expected.as_str()),
+            ),
+            "case {case:?}: expected the delivery reported as failed with {expected:?}, got \
+             {info}"
+        );
+        assert!(
+            keys.is_empty(),
+            "case {case:?}: expected no delivered object, got {keys:?}"
+        );
     }
 }

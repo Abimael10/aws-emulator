@@ -13,11 +13,12 @@
 //! through the object itself. The write is made the way every other cross-service call
 //! of this crate is made, over the in-process callback
 //! ([`smithy_server_runtime::OperationContext::callback`]), so this crate names no other
-//! service crate; and it is made as CONFIG, so the bucket's own policy has to allow the
-//! Config service principal the write at the moment it happens
-//! ([`super::delivered_object_authorization`]). A bucket whose policy withholds that write,
-//! or which refuses it when it is made, earns the channel a `FAILURE` status carrying the
-//! code and the message of the refusal, and no object.
+//! service crate; and it is made under the configuration recorder's own role as the Config
+//! service principal, so the write has to be permitted at the moment it happens — by the
+//! bucket's own policy or by that role's permissions
+//! ([`super::delivered_object_authorization`]). A delivery no source of that permission
+//! allows, or one the bucket refuses when it is made, earns the channel a `FAILURE` status
+//! carrying the code and the message of the refusal, and no object.
 
 use std::io::Write;
 use std::time::SystemTime;
@@ -282,13 +283,16 @@ pub async fn run_due_snapshot_delivery<Eng: Send + Sync + 'static>(
                     // The resource of Config's the delivery is made for, which a bucket
                     // policy that conditions its grant on it is judged against.
                     store.customer_managed_recorder_arn(),
+                    // The role the write is made UNDER, whose own permissions are the other
+                    // source of the grant that write needs.
+                    store.customer_managed_recorder_role_arn(),
                     store.snapshot_configuration_items(region),
                 )
             })
     };
     // A channel naming no bucket has nowhere to deliver to, so the delivery did not
     // happen — which is reported as the failure it is, never left in flight for ever.
-    let Some((bucket, prefix, source_arn, items)) = target else {
+    let Some((bucket, prefix, source_arn, role_arn, items)) = target else {
         state.lock().record_snapshot_delivery_outcome(
             channel,
             snapshot_id,
@@ -308,20 +312,27 @@ pub async fn run_due_snapshot_delivery<Eng: Send + Sync + 'static>(
         snapshot_id,
     );
 
-    // Config writes a delivered object as its OWN service principal, so the write happens
-    // only while the policy in force on the bucket at this moment allows that principal the
-    // `s3:PutObject` on the key the object goes to. A policy that withholds it — one taken
-    // away after the channel was established as much as one that never granted it — leaves
-    // no object in the bucket, and the delivery is reported as the failure it then is, which
-    // is the only place that outcome is raised at all.
-    if let DeliveryAuthorization::Denied(denied) =
-        delivered_object_authorization(callback, region, &bucket, &key, source_arn.as_deref())
-            .await
+    // Config writes a delivered object under the configuration recorder's own role, so the
+    // write happens only while the permission for the `s3:PutObject` on the key the object
+    // goes to is in force at this moment — from the policy on the bucket, or from that
+    // role's own policies. A grant withheld — one taken away after the channel was
+    // established as much as one that never existed — leaves no object in the bucket, and
+    // the delivery is reported as the failure it then is, which is the only place that
+    // outcome is raised at all.
+    if let DeliveryAuthorization::Denied(denied) = delivered_object_authorization(
+        callback,
+        region,
+        &bucket,
+        &key,
+        source_arn.as_deref(),
+        role_arn.as_deref(),
+    )
+    .await
     {
         ::tracing::warn!(
             %bucket,
             %key,
-            "the bucket's policy does not allow Config to deliver a configuration snapshot"
+            "Config is not allowed to deliver a configuration snapshot into the bucket"
         );
         state.lock().record_snapshot_delivery_outcome(
             channel,
