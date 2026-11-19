@@ -41,6 +41,13 @@ const PRIVY_MEMBER: &str = "stripePrivyConfiguration";
 const SOURCE_MANAGED: &str = "MANAGED";
 const SOURCE_EXTERNAL: &str = "EXTERNAL";
 
+/// A Coinbase CDP `apiKeySecret` in the key format that vendor issues one in: the
+/// base64 of an Ed25519 private key (here the 32-byte seed). The service refuses a
+/// `MANAGED` value that is not such a key, so every row that hands one over sends one of
+/// these rather than an arbitrary string.
+const CDP_API_KEY_SECRET: &str = "YWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjZGU=";
+const CDP_API_KEY_SECRET_SECOND: &str = "YWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjZGY=";
+
 /// This service and Secrets Manager over one shared engine.
 struct Emulator {
     router: MultiServiceRouter,
@@ -267,7 +274,7 @@ fn rows() -> Vec<Row> {
                     external: false,
                     source_sent: false,
                     reference_by_arn: false,
-                    value: "YXBpLWtleS1zZWNyZXQ=",
+                    value: CDP_API_KEY_SECRET,
                     json_key: "",
                 },
                 Slot {
@@ -665,7 +672,7 @@ async fn a_name_already_held_is_refused_and_changes_nothing() {
         .create(&json!({
             "name": "held-name",
             "credentialProviderVendor": VENDOR_COINBASE_CDP,
-            "providerConfigurationInput": coinbase_managed("Zmlyc3Qtc2VjcmV0", "Zmlyc3Qtd2FsbGV0"),
+            "providerConfigurationInput": coinbase_managed(CDP_API_KEY_SECRET, "Zmlyc3Qtd2FsbGV0"),
         }))
         .await;
     assert_eq!(
@@ -678,7 +685,7 @@ async fn a_name_already_held_is_refused_and_changes_nothing() {
         (
             "the same vendor and a different configuration",
             json!(VENDOR_COINBASE_CDP),
-            coinbase_managed("c2Vjb25kLXNlY3JldA==", "c2Vjb25kLXdhbGxldA=="),
+            coinbase_managed(CDP_API_KEY_SECRET_SECOND, "c2Vjb25kLXdhbGxldA=="),
         ),
         (
             "another vendor entirely",
@@ -704,8 +711,13 @@ async fn a_name_already_held_is_refused_and_changes_nothing() {
             .await;
         assert_eq!(
             (status, error_code(&answer).as_str()),
-            (409, "ConflictException"),
-            "case {case:?}: expected HTTP 409 ConflictException, got {status} ({answer})"
+            (400, "ValidationException"),
+            "case {case:?}: expected HTTP 400 ValidationException, got {status} ({answer})"
+        );
+        assert_eq!(
+            answer["message"],
+            json!("Credential provider with name: held-name already exists"),
+            "case {case:?}: the refusal names the name the request carried, got {answer}"
         );
 
         let (status, fetched) = emulator.get("held-name").await;
@@ -753,7 +765,7 @@ async fn a_configuration_the_vendor_or_the_secret_source_refuses_is_a_validation
             "the Coinbase CDP configuration under the Stripe Privy vendor",
             "mismatch-privy",
             VENDOR_STRIPE_PRIVY,
-            coinbase_managed("c2VjcmV0", "d2FsbGV0"),
+            coinbase_managed(CDP_API_KEY_SECRET, "d2FsbGV0"),
             "providerConfigurationInput",
         ),
         (
@@ -776,7 +788,7 @@ async fn a_configuration_the_vendor_or_the_secret_source_refuses_is_a_validation
             json!({
                 "coinbaseCdpConfiguration": {
                     "apiKeyId": "api-key",
-                    "apiKeySecret": "c2VjcmV0",
+                    "apiKeySecret": CDP_API_KEY_SECRET,
                     "walletSecretSource": SOURCE_EXTERNAL,
                 }
             }),
@@ -817,7 +829,7 @@ async fn a_configuration_the_vendor_or_the_secret_source_refuses_is_a_validation
             json!({
                 "coinbaseCdpConfiguration": {
                     "apiKeyId": "api-key",
-                    "apiKeySecret": "c2VjcmV0",
+                    "apiKeySecret": CDP_API_KEY_SECRET,
                     "walletSecretSource": SOURCE_MANAGED,
                 }
             }),
@@ -844,7 +856,7 @@ async fn a_configuration_the_vendor_or_the_secret_source_refuses_is_a_validation
             json!({
                 "coinbaseCdpConfiguration": {
                     "apiKeyId": "api-key",
-                    "apiKeySecret": "c2VjcmV0",
+                    "apiKeySecret": CDP_API_KEY_SECRET,
                     "walletSecretSource": SOURCE_EXTERNAL,
                     "walletSecretConfig": {
                         "secretId": "arn:aws:s3:::000000000000-wallets",
@@ -876,7 +888,7 @@ async fn a_configuration_the_vendor_or_the_secret_source_refuses_is_a_validation
             json!({
                 "coinbaseCdpConfiguration": {
                     "apiKeyId": "api-key",
-                    "apiKeySecret": "c2VjcmV0",
+                    "apiKeySecret": CDP_API_KEY_SECRET,
                     "walletSecretSource": SOURCE_EXTERNAL,
                     "walletSecretConfig": {
                         "secretId": format!(
@@ -956,7 +968,7 @@ async fn a_name_naming_no_provider_is_refused() {
         .create(&json!({
             "name": "the-one-provider",
             "credentialProviderVendor": VENDOR_COINBASE_CDP,
-            "providerConfigurationInput": coinbase_managed("c2VjcmV0", "d2FsbGV0"),
+            "providerConfigurationInput": coinbase_managed(CDP_API_KEY_SECRET, "d2FsbGV0"),
         }))
         .await;
     assert_eq!(

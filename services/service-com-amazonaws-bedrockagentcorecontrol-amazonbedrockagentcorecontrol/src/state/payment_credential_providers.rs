@@ -34,6 +34,16 @@
 //! So no ARN here is composed from a request: a provider reports the ARN its
 //! secret's owner answered with, and `PaymentProviderConfigurationOutput` is
 //! "no raw secrets, only ARNs".
+//!
+//! ## The key format a vendor fixes
+//!
+//! A secret the service is to MANAGE arrives in the request, so this module is
+//! also where a value that cannot BE that vendor's credential is refused: the
+//! Coinbase CDP API key secret is a base64-encoded Ed25519 private key
+//! ([`SecretKeyFormat`]), and a create carrying something else is refused rather
+//! than stored as a credential no connector could authenticate with. Only the
+//! secrets whose kind the vendor states carry such a format; the rest are opaque
+//! to this service, bounded by their own `@pattern` and `@length` alone.
 
 use std::collections::HashMap;
 
@@ -48,10 +58,6 @@ use crate::ops::types::{
     PaymentProviderConfigurationOutput, ResourceNotFoundException, Secret, SecretReference,
     StripePrivyConfigurationOutput, ValidationException,
 };
-
-/// The resource noun [`resource_not_found`] names for a payment credential
-/// provider.
-pub const RESOURCE_PAYMENT_CREDENTIAL_PROVIDER: &str = "payment credential provider";
 
 /// How this service words a payment credential provider no name of this account
 /// resolves to: the resource's own modelled name, then that it is not there.
@@ -225,6 +231,102 @@ struct SecretMembers {
     config: &'static str,
 }
 
+/// The byte lengths an Ed25519 private key is carried in: the 32-byte seed the
+/// key pair is derived from, and the 64-byte form that carries the seed followed
+/// by its public key, which is how a vendor hands one over.
+const ED25519_PRIVATE_KEY_LENGTHS: [usize; 2] = [32, 64];
+
+/// The key format a vendor fixes for one of its secrets, beyond the characters
+/// the member's own `@pattern` admits.
+///
+/// A vendor's credential is a KEY of a stated kind, not an opaque token: a
+/// request carrying something else cannot authenticate, so the create refuses it
+/// instead of storing a provider whose secret is unusable. Only the secrets
+/// whose kind the vendor fixes carry one of these.
+#[derive(Debug, Clone, Copy)]
+enum SecretKeyFormat {
+    /// An Ed25519 private key, base64-encoded: the form the Coinbase Developer
+    /// Platform API key secret is issued in.
+    Base64Ed25519PrivateKey,
+}
+
+impl SecretKeyFormat {
+    /// The format as a refusal of a value names it.
+    fn expectation(self) -> &'static str {
+        match self {
+            Self::Base64Ed25519PrivateKey => "base64-encoded Ed25519 private key",
+        }
+    }
+
+    /// Whether `value` is a key in this format.
+    fn admits(self, value: &str) -> bool {
+        match self {
+            Self::Base64Ed25519PrivateKey => decoded_base64(value)
+                .is_some_and(|key| ED25519_PRIVATE_KEY_LENGTHS.contains(&key.len())),
+        }
+    }
+}
+
+/// The bytes a base64 value carries, or `None` when it is not base64 at all.
+///
+/// The secret members admit both base64 alphabets and whitespace (`smithy_query
+/// shape=CoinbaseCdpConfigurationInput`: `^[a-zA-Z0-9+/=\-_\s]*$`), so one key
+/// reaches here spelled standard or URL-safe, padded or not, possibly wrapped
+/// across lines. Whitespace is dropped and the decoding itself is the `base64`
+/// crate's, so no base64 is decoded by hand here.
+fn decoded_base64(value: &str) -> Option<Vec<u8>> {
+    use ::base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    use ::base64::Engine as _;
+
+    let compact: String = value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    STANDARD
+        .decode(&compact)
+        .or_else(|_| STANDARD_NO_PAD.decode(&compact))
+        .or_else(|_| URL_SAFE.decode(&compact))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(&compact))
+        .ok()
+}
+
+/// Why a payment vendor configuration the request carried cannot be served.
+///
+/// Two refusals of one operation, each in the shape the plane that reports it
+/// uses: a MEMBER rule of this control plane, reported in the modelled shape
+/// with the `reason` and the `fieldList` that name the member; and a vendor KEY
+/// FORMAT, which the identity plane reports with its sentence alone — so that
+/// one is carried as the sentence and answered through
+/// [`crate::scaffolded::Scaffolded::validation`], the modelled shape's
+/// `@required` `reason` being a member the identity plane does not report.
+#[derive(Debug)]
+pub enum PaymentConfigurationRefusal {
+    /// A member of the request the configuration rules refuse.
+    Member(ValidationException),
+    /// A secret whose value is not a key in the format its vendor issues.
+    SecretFormat(String),
+}
+
+impl From<ValidationException> for PaymentConfigurationRefusal {
+    fn from(refusal: ValidationException) -> Self {
+        Self::Member(refusal)
+    }
+}
+
+/// The refusal of a secret value that is not a key in the format its vendor
+/// issues: the member the request carried it in, and the format expected of it
+/// ("Invalid <member> format: Expected <format>").
+///
+/// The sentence around the two is fixed; the member is the one whose value was
+/// refused, so every secret a vendor fixes the format of is refused in the one
+/// sentence. The value itself is never echoed — it is a credential.
+fn invalid_secret_format(member: &str, format: SecretKeyFormat) -> PaymentConfigurationRefusal {
+    PaymentConfigurationRefusal::SecretFormat(format!(
+        "Invalid {member} format: Expected {}",
+        format.expectation()
+    ))
+}
+
 /// What a request asks the vault to do about ONE secret of a vendor
 /// configuration, once the rules on its members are satisfied.
 #[derive(Debug, Clone)]
@@ -246,8 +348,7 @@ pub struct RequestedPaymentSecret {
 }
 
 impl RequestedPaymentSecret {
-    /// What the request asks for one secret, or the modelled validation failure
-    /// its members are refused for.
+    /// What the request asks for one secret, or the refusal its members earn.
     ///
     /// A secret the CALLER manages needs the reference that names it: its
     /// `*Config` is "required when `*Source` is set to `EXTERNAL`"
@@ -259,14 +360,20 @@ impl RequestedPaymentSecret {
     /// SERVICE manages is the place the value is stored, so the request must
     /// carry that value — the value members have a modelled default of `""`, so
     /// a request that leaves one out is indistinguishable from one that sends it
-    /// empty, and either way there is nothing to store.
+    /// empty, and either way there is nothing to store — and, where the vendor
+    /// fixes what kind of key that secret is (`format`), the value has to BE
+    /// such a key: a provider whose stored credential cannot authenticate is
+    /// refused at the create rather than created and found unusable later. A
+    /// secret the caller manages is not checked that way: its value is in their
+    /// own secret, not in this request.
     fn from_members(
         members: SecretMembers,
         region: &str,
         value: Option<&String>,
         source: Option<&String>,
         config: Option<&SecretReference>,
-    ) -> Result<Self, ValidationException> {
+        format: Option<SecretKeyFormat>,
+    ) -> Result<Self, PaymentConfigurationRefusal> {
         let source = effective_secret_source(source.map(String::as_str), config.is_some());
         if source == SECRET_SOURCE_EXTERNAL {
             let reference = config.ok_or_else(|| {
@@ -304,7 +411,13 @@ impl RequestedPaymentSecret {
                     "must be provided when {} is {SECRET_SOURCE_MANAGED}",
                     members.source
                 ),
-            ));
+            )
+            .into());
+        }
+        if let Some(format) = format {
+            if !format.admits(value) {
+                return Err(invalid_secret_format(members.value, format));
+            }
         }
         Ok(Self {
             members,
@@ -473,13 +586,13 @@ pub enum RequestedPaymentProviderConfiguration {
 }
 
 impl RequestedPaymentProviderConfiguration {
-    /// What the configuration a request carried asks for, or the modelled
-    /// validation failure it is refused for.
+    /// What the configuration a request carried asks for, or the refusal it
+    /// earns.
     pub fn from_input(
         vendor: &str,
         region: &str,
         requested: &PaymentProviderConfigurationInput,
-    ) -> Result<Self, ValidationException> {
+    ) -> Result<Self, PaymentConfigurationRefusal> {
         let required_member = if vendor == PAYMENT_VENDOR_COINBASE_CDP {
             COINBASE_CDP_CONFIGURATION_MEMBER
         } else {
@@ -488,7 +601,7 @@ impl RequestedPaymentProviderConfiguration {
         match requested {
             PaymentProviderConfigurationInput::coinbaseCdpConfiguration(configuration) => {
                 if required_member != COINBASE_CDP_CONFIGURATION_MEMBER {
-                    return Err(vendor_configuration_mismatch(vendor, required_member));
+                    return Err(vendor_configuration_mismatch(vendor, required_member).into());
                 }
                 Ok(Self::CoinbaseCdp {
                     api_key_id: configuration.api_key_id.clone(),
@@ -498,6 +611,10 @@ impl RequestedPaymentProviderConfiguration {
                         configuration.api_key_secret.as_ref(),
                         configuration.api_key_secret_source.as_ref(),
                         configuration.api_key_secret_config.as_ref(),
+                        // "The API key secret provided by Coinbase Developer
+                        // Platform" is an Ed25519 private key the connector
+                        // signs CDP requests with, handed over base64-encoded.
+                        Some(SecretKeyFormat::Base64Ed25519PrivateKey),
                     )?,
                     wallet_secret: RequestedPaymentSecret::from_members(
                         WALLET_SECRET_MEMBERS,
@@ -505,12 +622,16 @@ impl RequestedPaymentProviderConfiguration {
                         configuration.wallet_secret.as_ref(),
                         configuration.wallet_secret_source.as_ref(),
                         configuration.wallet_secret_config.as_ref(),
+                        // The vendor states no key kind for the wallet secret,
+                        // so nothing but the member's own pattern constrains
+                        // it.
+                        None,
                     )?,
                 })
             }
             PaymentProviderConfigurationInput::stripePrivyConfiguration(configuration) => {
                 if required_member != STRIPE_PRIVY_CONFIGURATION_MEMBER {
-                    return Err(vendor_configuration_mismatch(vendor, required_member));
+                    return Err(vendor_configuration_mismatch(vendor, required_member).into());
                 }
                 Ok(Self::StripePrivy {
                     app_id: configuration.app_id.clone(),
@@ -521,6 +642,10 @@ impl RequestedPaymentProviderConfiguration {
                         configuration.app_secret.as_ref(),
                         configuration.app_secret_source.as_ref(),
                         configuration.app_secret_config.as_ref(),
+                        // The vendor states no key kind for either Privy
+                        // secret, so nothing but each member's own pattern
+                        // constrains it.
+                        None,
                     )?,
                     authorization_private_key: RequestedPaymentSecret::from_members(
                         AUTHORIZATION_PRIVATE_KEY_MEMBERS,
@@ -528,6 +653,7 @@ impl RequestedPaymentProviderConfiguration {
                         configuration.authorization_private_key.as_ref(),
                         configuration.authorization_private_key_source.as_ref(),
                         configuration.authorization_private_key_config.as_ref(),
+                        None,
                     )?,
                 })
             }

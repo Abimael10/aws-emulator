@@ -193,23 +193,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialises it rather than reporting a policy that no longer exists.
         store.expire_deleted_policy_engines_and_policies(now);
 
-        // The engine is resolved first and reported missing in its own sentence:
-        // a policy is addressed only through the engine that evaluates it, so an
-        // engine this account does not hold is a different refusal from a policy
-        // the engine does not hold.
-        let engine = store
+        // A policy is addressed by its OWN id; the engine id in the path only
+        // routes the lookup to the engine that evaluates it. So an id no policy
+        // of this account carries is the modelled 404 for the POLICY, named by
+        // the `policyId` the request asked for — including when the path's
+        // engine id names no engine either, where reporting the engine instead
+        // would point the caller at the wrong resource.
+        let record = store
             .policy_engines
             .get(&input.policy_engine_id)
+            .and_then(|engine| engine.policies.get(&input.policy_id))
             .ok_or_else(|| {
-                GetPolicyErrorModeled::ResourceNotFoundException(
-                    crate::state::policy_engine_not_found(&input.policy_engine_id),
-                )
+                GetPolicyErrorModeled::ResourceNotFoundException(crate::state::policy_not_found(
+                    &input.policy_id,
+                ))
             })?;
-        let record = engine.policies.get(&input.policy_id).ok_or_else(|| {
-            GetPolicyErrorModeled::ResourceNotFoundException(crate::state::policy_not_found(
-                &input.policy_id,
-            ))
-        })?;
 
         Ok(record.get_output(now))
     }

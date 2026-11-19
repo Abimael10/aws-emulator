@@ -126,6 +126,11 @@ impl Plane {
     }
 }
 
+/// A Coinbase CDP `apiKeySecret` in the key format that vendor issues one in: the base64
+/// of an Ed25519 private key (here the 32-byte seed), which the payment plane's create
+/// requires of a secret it is to manage.
+const CDP_API_KEY_SECRET: &str = "YWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjZGU=";
+
 /// ONE secret a row's provider carries.
 #[derive(Debug, Clone)]
 struct SecretSlot {
@@ -481,7 +486,7 @@ fn rows() -> Vec<Row> {
                 SecretSlot {
                     member: "apiKeySecret",
                     value_member: "apiKeySecret",
-                    value: "YXBpLWtleS1zZWNyZXQ=",
+                    value: CDP_API_KEY_SECRET,
                     json_key: None,
                     source_sent: false,
                 },

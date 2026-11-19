@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             let store = state.lock();
             if store.oauth2_credential_providers.contains_key(&input.name) {
-                return Err(name_taken(&input.name).into());
+                return Err(name_taken(&input.name));
             }
             if store.oauth2_credential_providers.len()
                 >= crate::state::MAX_OAUTH2_CREDENTIAL_PROVIDERS
@@ -268,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // replacing it. That is what makes the name unique under concurrent
         // creates.
         if store.oauth2_credential_providers.contains_key(&record.name) {
-            return Err(name_taken(&record.name).into());
+            return Err(name_taken(&record.name));
         }
         let output = record.create_output();
         store
@@ -280,14 +280,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The refusal of a create whose `name` this account already holds a provider
-/// under: a provider is addressed by name, so a repeated name is a conflict
-/// rather than a second provider later reads could not tell apart.
-fn name_taken(name: &str) -> CreateOauth2CredentialProviderErrorModeled {
-    CreateOauth2CredentialProviderErrorModeled::ConflictException(ConflictException {
-        message: Some(format!(
-            "an OAuth2 credential provider named {name} already exists in this account"
-        )),
-    })
+/// under: a provider is addressed by name, so a repeated name is refused rather
+/// than stored as a second provider later reads could not tell apart. Worded by
+/// the one helper every credential-provider create of the token vault shares,
+/// and answered as the identity plane answers it: HTTP 400
+/// `ValidationException` carrying that sentence alone.
+fn name_taken(name: &str) -> CreateOauth2CredentialProviderError {
+    crate::scaffolded::Scaffolded::validation(crate::state::credential_provider_name_taken(name))
 }
 
 /// How a create answers when the secret the provider's client secret lives in

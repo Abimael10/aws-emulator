@@ -202,7 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let gateway_id = gateway.gateway_id.clone();
         // An update reconfigures a STORED rate limit, it does not mint one, so an
         // id no limit of this gateway holds is the modelled 404 for the rate limit
-        // rather than for the gateway, which was found. Cloned out from under the
+        // rather than for the gateway, which was found — named by the id the path
+        // carried, in the one sentence every operation that resolves a limit
+        // reports a missing one with. Cloned out from under the
         // read borrow: the write below needs the store mutably, and the record the
         // update replaces is what dates and scopes the new one.
         let replaced = gateway
@@ -210,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.rate_limit_id)
             .ok_or_else(|| {
                 UpdateGatewayRateLimitErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_RATE_LIMIT),
+                    crate::state::gateway_rate_limit_not_found(&input.rate_limit_id),
                 )
             })?
             .clone();

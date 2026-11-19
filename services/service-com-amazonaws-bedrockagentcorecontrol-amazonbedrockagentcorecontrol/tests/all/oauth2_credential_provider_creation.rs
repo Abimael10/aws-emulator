@@ -10,7 +10,7 @@
 //! UPDATING | UPDATE_FAILED | READY | DELETING | DELETE_FAILED`; nothing is left for the
 //! clock to owe a provider whose secret the create already resolved) — and the name
 //! IDENTIFIES it, so the provider reads back under that name and a later create under a
-//! name the account already holds is refused `409 ConflictException`, leaving the held
+//! name the account already holds is refused `400 ValidationException`, leaving the held
 //! provider exactly as it was.
 //!
 //! The rows span what the rule generalises over: the `CredentialProviderName` grammar
@@ -442,8 +442,8 @@ async fn a_create_mints_a_provider_under_its_name_and_the_read_reports_it() {
     );
 }
 
-/// A create whose `name` the account already holds is refused `409 ConflictException`, and
-/// the held provider is left exactly as the first create minted it.
+/// A create whose `name` the account already holds is refused `400 ValidationException`,
+/// and the held provider is left exactly as the first create minted it.
 ///
 /// The rows differ along how the second request differs from the first — the identical
 /// request, another client of the same vendor, another vendor with the member that vendor
@@ -522,14 +522,12 @@ async fn a_create_under_a_held_name_is_refused_and_leaves_the_held_provider_unto
         let (status, refused) = emulator.create(region, &request).await;
         assert_eq!(
             (status, error_code(&refused).as_str()),
-            (409, "ConflictException"),
-            "case {case:?}: expected HTTP 409 ConflictException, got {status} ({refused})"
+            (400, "ValidationException"),
+            "case {case:?}: expected HTTP 400 ValidationException, got {status} ({refused})"
         );
-        assert!(
-            refused["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains(held),
+        assert_eq!(
+            refused["message"],
+            json!(format!("Credential provider with name: {held} already exists")),
             "case {case:?}: the refusal does not name the provider the account holds, got \
              {refused}"
         );

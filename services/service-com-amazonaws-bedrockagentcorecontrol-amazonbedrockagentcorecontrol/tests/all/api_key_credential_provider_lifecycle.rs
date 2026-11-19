@@ -610,7 +610,7 @@ async fn a_created_provider_reads_back_with_its_secret() {
 }
 
 /// The name is the identifier, so a second create under a name this account
-/// already holds is a conflict: the first provider — and its one secret — stand.
+/// already holds is refused: the first provider — and its one secret — stand.
 #[tokio::test]
 async fn a_repeated_name_is_refused_and_changes_nothing() {
     let case = "a name already held by a provider";
@@ -637,9 +637,15 @@ async fn a_repeated_name_is_refused_and_changes_nothing() {
         .await;
     assert_eq!(
         (again.status, again.error_code()),
-        (409, "ConflictException".to_string()),
-        "case {case:?}: a repeated provider name is a conflict, got {} and body {}",
+        (400, "ValidationException".to_string()),
+        "case {case:?}: a repeated provider name is refused on the request, got {} and body {}",
         again.status,
+        again.body
+    );
+    assert_eq!(
+        again.body["message"],
+        json!(format!("Credential provider with name: {name} already exists")),
+        "case {case:?}: the refusal names the name the request carried, got body {}",
         again.body
     );
 
@@ -675,8 +681,9 @@ async fn a_read_of_an_unknown_name_is_not_found() {
             )
             .await;
         assert!(
-            created.status == 201 || created.status == 409,
-            "case {case:?}: the stored provider must be there, got {} and body {}",
+            created.status == 201 || created.status == 400,
+            "case {case:?}: the stored provider must be there \
+             (created, or already held from the previous case), got {} and body {}",
             created.status,
             created.body
         );

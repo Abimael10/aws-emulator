@@ -101,6 +101,28 @@ pub fn api_key_credential_provider_not_found_on_update() -> ResourceNotFoundExce
     }
 }
 
+/// The sentence a credential-provider create is refused with when the `name` it
+/// carries is one this account already holds a provider under ("Credential
+/// provider with name: <name> already exists").
+///
+/// A `CredentialProviderName` "must be unique within your account"
+/// (`smithy_query doc shape=CreateApiKeyCredentialProvider member=name`), and
+/// the token vault reports a repeated one as a failure of the REQUEST — the 400
+/// `ValidationException` — rather than as a conflict with the stored provider:
+/// nothing about the held provider changes, the caller's input is what cannot be
+/// served. The refusal carries this sentence and nothing besides, which is why
+/// the handlers answer it through [`crate::scaffolded::Scaffolded::validation`]
+/// rather than through the modelled shape, whose `@required` `reason` would add
+/// a member the identity plane does not report.
+///
+/// The text around the name is fixed; the name is the one the request carried.
+/// Shared by every credential-provider create of the vault — the API key, the
+/// OAuth2 and the payment plane all address a provider by that one name — so one
+/// taken name cannot be refused in three different sentences.
+pub fn credential_provider_name_taken(name: &str) -> String {
+    format!("Credential provider with name: {name} already exists")
+}
+
 /// `SecretSourceType` values. The enum's full value list is `MANAGED | EXTERNAL`
 /// (`smithy_query shape=SecretSourceType`).
 pub const SECRET_SOURCE_MANAGED: &str = "MANAGED";

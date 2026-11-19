@@ -125,6 +125,12 @@ fn not_found_message(resource: &str) -> String {
     )
 }
 
+/// The sentence a missing RATE LIMIT is refused in: a limit is addressed by an id of its
+/// gateway, so the refusal names that id.
+fn rate_limit_not_found_message(rate_limit_id: &str) -> String {
+    format!("Rate limit not found: {rate_limit_id}")
+}
+
 async fn create_rate_limit(router: &MultiServiceRouter, gateway: &str, body: &Value) -> Answer {
     send(
         router,
@@ -693,7 +699,7 @@ async fn an_unknown_gateway_or_rate_limit_is_refused() {
             (
                 404,
                 "ResourceNotFoundException".to_string(),
-                not_found_message("rate limit")
+                rate_limit_not_found_message(unknown_limit)
             ),
             "case {unknown_limit:?}: expected HTTP 404 naming the rate limit, got {} ({})",
             refused.status,

@@ -14,7 +14,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     BatchPutLimitEntry, CreateGatewayRateLimitOutput, GatewayRateLimitDetail,
-    GetGatewayRateLimitOutput, LimitEntry, UpdateGatewayRateLimitOutput, ValidationException,
+    GetGatewayRateLimitOutput, LimitEntry, ResourceNotFoundException, UpdateGatewayRateLimitOutput,
+    ValidationException,
 };
 
 use super::{field_validation_failed, gateway_status_conflict, timestamp, GatewayRecord};
@@ -36,9 +37,23 @@ pub const GATEWAY_RATE_LIMIT_STATUS_ACTIVE: &str = "ACTIVE";
 /// would wait out.
 pub const GATEWAY_RATE_LIMIT_SETTLE_DELAY: Duration = super::GATEWAY_SETTLE_DELAY;
 
-/// The resource noun [`super::resource_not_found`] names for one rate limit of a
-/// gateway.
-pub const RESOURCE_GATEWAY_RATE_LIMIT: &str = "rate limit";
+/// The modelled not-found error for a rate limit no id of a gateway resolves to:
+/// the resource, then the id the request's path carried ("Rate limit not found:
+/// <rateLimitId>").
+///
+/// A rate limit is addressed by an id OF its gateway
+/// (`/gateways/{gatewayIdentifier}/rate-limits/{rateLimitId}`), and that id is
+/// the one thing that tells a missing limit from a missing gateway, so the
+/// refusal names it rather than taking the gateway plane's identifier-free
+/// sentence ([`super::resource_not_found`]). The text around the id is fixed.
+///
+/// Shared by every operation that resolves one, so a read and a write cannot
+/// report the same missing limit in two sentences.
+pub fn gateway_rate_limit_not_found(rate_limit_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Rate limit not found: {rate_limit_id}")),
+    }
+}
 
 /// How many rate limits one gateway will hold.
 ///

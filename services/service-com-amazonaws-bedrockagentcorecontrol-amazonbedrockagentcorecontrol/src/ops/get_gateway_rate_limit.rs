@@ -181,10 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         // A rate limit is addressed through its gateway, so an id no limit of
         // THIS gateway holds is the modelled 404 for the rate limit rather than
-        // for the gateway, which was found.
+        // for the gateway, which was found — named by the id the path carried.
         let record = gateway.rate_limits.get(&input.rate_limit_id).ok_or_else(|| {
             GetGatewayRateLimitErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_RATE_LIMIT),
+                crate::state::gateway_rate_limit_not_found(&input.rate_limit_id),
             )
         })?;
 

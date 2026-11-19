@@ -156,6 +156,13 @@ fn engine_not_found_message(policy_engine_id: &str) -> String {
     format!("Policy engine with ID {policy_engine_id} not found")
 }
 
+/// The sentence a policy READ is refused with when no policy of this account carries the
+/// id the path named: a policy is addressed by its own id, so the refusal names that id —
+/// the engine id alongside it only routes the lookup.
+fn policy_not_found_message(policy_id: &str) -> String {
+    format!("Policy with ID {policy_id} not found")
+}
+
 /// One row of the create table.
 struct Row {
     case: &'static str,
@@ -289,9 +296,9 @@ async fn a_create_against_an_unknown_policy_engine_is_refused() {
         let read = get_policy(&router, policy_engine_id, "AnyPolicy-0123456789").await;
         assert_eq!(
             (read.status, text(&read.body, "message")),
-            (404, engine_not_found_message(policy_engine_id)),
-            "case {policy_engine_id:?}: a policy read through the absent engine is refused in \
-             the same words, got {} ({})",
+            (404, policy_not_found_message("AnyPolicy-0123456789")),
+            "case {policy_engine_id:?}: a policy read through the absent engine is refused as \
+             the missing policy it asked for, got {} ({})",
             read.status,
             read.body
         );
@@ -510,7 +517,7 @@ async fn a_policy_is_addressed_through_its_own_engine() {
     );
     assert_eq!(
         text(&through_other.body, "message"),
-        format!("Policy with ID {policy_id} not found"),
+        policy_not_found_message(&policy_id),
         "the refusal names the policy the path carried, got {}",
         text(&through_other.body, "message")
     );
@@ -544,7 +551,7 @@ async fn a_policy_is_addressed_through_its_own_engine() {
         (
             404,
             "ResourceNotFoundException".to_string(),
-            "Policy with ID NoSuchPolicy-0123456789 not found".to_string()
+            policy_not_found_message("NoSuchPolicy-0123456789")
         ),
         "an id no policy of the engine carries is the modelled 404, got {} ({})",
         missing.status,

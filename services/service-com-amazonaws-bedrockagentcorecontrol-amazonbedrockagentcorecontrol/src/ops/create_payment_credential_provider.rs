@@ -152,15 +152,9 @@ fn refusal_for_store(
     name: &str,
 ) -> Option<CreatePaymentCredentialProviderError> {
     if store.payment_credential_providers.contains_key(name) {
-        return Some(
-            CreatePaymentCredentialProviderErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "a {} named {name} already exists",
-                    crate::state::RESOURCE_PAYMENT_CREDENTIAL_PROVIDER
-                )),
-            })
-            .into(),
-        );
+        return Some(crate::scaffolded::Scaffolded::validation(
+            crate::state::credential_provider_name_taken(name),
+        ));
     }
     if store.payment_credential_providers.len() >= crate::state::MAX_PAYMENT_CREDENTIAL_PROVIDERS {
         return Some(
@@ -177,6 +171,24 @@ fn refusal_for_store(
         );
     }
     None
+}
+
+/// How a create answers a vendor configuration it cannot serve: a member rule of
+/// this control plane is the modelled `ValidationException`, with the `reason`
+/// and the `fieldList` that name the member; a secret that is not a key in the
+/// format its vendor issues is the identity plane's own refusal, which carries
+/// its sentence and nothing besides. Both are the modelled 400.
+fn configuration_refused(
+    refusal: crate::state::PaymentConfigurationRefusal,
+) -> CreatePaymentCredentialProviderError {
+    match refusal {
+        crate::state::PaymentConfigurationRefusal::Member(modelled) => {
+            CreatePaymentCredentialProviderErrorModeled::ValidationException(modelled).into()
+        }
+        crate::state::PaymentConfigurationRefusal::SecretFormat(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
+    }
 }
 
 /// How a create answers when the secrets the provider authenticates with could
@@ -278,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &input.provider_configuration_input,
         )
-        .map_err(CreatePaymentCredentialProviderErrorModeled::ValidationException)?;
+        .map_err(configuration_refused)?;
 
         // The name is the "unique name for the payment credential provider" and
         // the only identifier any operation of the family carries, so a second

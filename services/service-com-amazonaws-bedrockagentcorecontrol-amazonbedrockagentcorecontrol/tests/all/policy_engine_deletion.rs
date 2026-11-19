@@ -197,6 +197,12 @@ fn engine_not_found_message(policy_engine_id: &str) -> String {
     format!("Policy engine with ID {policy_engine_id} not found")
 }
 
+/// The sentence a policy READ is refused with when no policy of this account carries the
+/// id the path named: a policy is addressed by its own id, so the refusal names that id.
+fn policy_not_found_message(policy_id: &str) -> String {
+    format!("Policy with ID {policy_id} not found")
+}
+
 /// The sentence this service refuses a delete of an engine that still holds policies with:
 /// what the engine still contains, counted off the service's state.
 fn engine_has_policies_message(policies: usize) -> String {
@@ -658,8 +664,9 @@ async fn an_engine_that_still_holds_a_policy_is_refused_and_keeps_its_policy() {
     let policy_gone = get_policy(&router, &policy_engine_id, &policy_id).await;
     assert_eq!(
         (policy_gone.status, text(&policy_gone.body, "message")),
-        (404, engine_not_found_message(&policy_engine_id)),
-        "a policy of a retired engine resolves nothing, got {} ({})",
+        (404, policy_not_found_message(&policy_id)),
+        "a policy of a retired engine resolves nothing, and the read names the policy it \
+         asked for, got {} ({})",
         policy_gone.status,
         policy_gone.body
     );
