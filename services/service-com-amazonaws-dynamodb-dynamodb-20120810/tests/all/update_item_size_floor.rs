@@ -1,27 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The item-size ceiling an UPDATE is held to, which is FLOOR-BOUND on the item's key.
+//! The item-size ceiling an UPDATE is held to, which is FLAT over the bytes the item stores:
+//! no part of the item — its key portion least of all — is charged at a floor of its own.
 //!
 //! The rule under test: a change is refused when the item it would leave behind crosses the
-//! documented 400 KB item ceiling, and the item is charged with its KEY portion — the key
-//! attributes' names and values together — counted at no less than a 22-byte floor. So a
-//! table keyed by a value SHORTER than that floor tops out BELOW the flat ceiling, by exactly
-//! the bytes its key is short of the floor, while a table whose key already reaches the floor
-//! tops out at the ceiling itself. A refused change leaves the stored item where it was, and
+//! documented 400 KB item ceiling, and what is charged against that ceiling is the bytes the
+//! item stores — its attribute names and values, the key attributes among them — with nothing
+//! added for the shape of the item. So the largest change an item accepts is the ceiling less
+//! what the rest of the item already holds, the item it leaves tops out AT the ceiling
+//! whatever it is keyed by, and one byte more is refused: the boundary moves with the key's
+//! own bytes and with nothing else. A refused change leaves the stored item where it was, and
 //! the refusal states the sentence the update path words that quota with.
 //!
 //! The rows span what the rule generalises over: key portions of four different sizes (a
-//! one-byte name with a one-byte value, a longer short key, a key exactly at the floor and one
-//! past it) plus a composite-key table whose two key attributes reach the floor together —
-//! each crossed with every surface that applies a stated change to a stored item (`UpdateItem`,
-//! `TransactWriteItems`' `Update`, and a PartiQL `UPDATE` through `ExecuteStatement`,
-//! `BatchExecuteStatement` and `ExecuteTransaction`), at its own computed boundary and one byte
-//! past it.
+//! one-byte name with a one-byte value, a longer short key, a longer one still and a long
+//! name beside a long value) plus a composite-key table whose two key attributes are charged
+//! together — each crossed with every surface that applies a stated change to a stored item
+//! (`UpdateItem`, `TransactWriteItems`' `Update`, and a PartiQL `UPDATE` through
+//! `ExecuteStatement`, `BatchExecuteStatement` and `ExecuteTransaction`), at its own computed
+//! boundary and one byte past it.
 //!
 //! Source of the ceiling: "Service, Account, and Table Quotas" in the Amazon DynamoDB
-//! Developer Guide ("The maximum item size in DynamoDB is 400 KB"). The floor is recorded
-//! behavior, stated once by the service (`state::MIN_ITEM_KEY_CHARGE`) and restated here
-//! because the boundary IS the requirement.
+//! Developer Guide ("The maximum item size in DynamoDB is 400 KB"); the service states it
+//! once (`state::update_size_exceeded`) for every update surface.
 
 use serde_json::{json, Value};
 
@@ -30,12 +31,6 @@ use crate::table_items::create_active_table;
 
 /// The documented item ceiling, 400 KB.
 const MAX_ITEM_BYTES: usize = 400 * 1024;
-
-/// The least the key portion of an item is charged on the update path.
-///
-/// Source: the service's own constant (`state::MIN_ITEM_KEY_CHARGE`), spelled out here
-/// because the boundary it moves is what this suite pins.
-const MIN_KEY_CHARGE: usize = 22;
 
 /// AWS's fixed sentence for a change that would grow the stored item past the ceiling.
 const UPDATE_TOO_BIG: &str = "Item size to update has exceeded the maximum allowed size";
@@ -188,44 +183,44 @@ impl Shape {
     }
 }
 
-/// Four key portions below, at and above the floor, plus a composite key whose two attributes
-/// reach it together.
+/// Four key portions of different sizes below, plus a composite key charged across its two
+/// attributes.
 const SHAPES: &[Shape] = &[
     Shape {
         case: "a one-byte key name and a one-byte key value",
-        table: "FloorBoundTiny",
+        table: "FlatCeilingTiny",
         partition: "k",
         sort: None,
         partition_value: "1",
         sort_value: None,
     },
     Shape {
-        case: "a key portion of eight bytes, still short of the floor",
-        table: "FloorBoundShort",
+        case: "a key portion of eight bytes",
+        table: "FlatCeilingShort",
         partition: "pk",
         sort: None,
         partition_value: "123456",
         sort_value: None,
     },
     Shape {
-        case: "a key portion exactly at the floor",
-        table: "FloorBoundExact",
+        case: "a key portion of twenty-one bytes",
+        table: "FlatCeilingMedium",
         partition: "pk",
         sort: None,
         partition_value: "1234567890123456789",
         sort_value: None,
     },
     Shape {
-        case: "a key portion past the floor",
-        table: "FloorBoundLong",
+        case: "a long key name beside a long key value",
+        table: "FlatCeilingLong",
         partition: "partitionkeyname",
         sort: None,
         partition_value: "0123456789012345",
         sort_value: None,
     },
     Shape {
-        case: "a composite key reaching the floor between its two attributes",
-        table: "FloorBoundComposite",
+        case: "a composite key charged across its two attributes",
+        table: "FlatCeilingComposite",
         partition: "pk",
         sort: Some("sk"),
         partition_value: "abcd",
@@ -233,12 +228,12 @@ const SHAPES: &[Shape] = &[
     },
 ];
 
-/// RULE: on every update surface, the largest change an item accepts is the ceiling less its
-/// key portion charged at the floor — that change is applied whole, the TOTAL it leaves is the
-/// ceiling less the bytes the key is short of the floor, and one byte more is refused with the
+/// RULE: on every update surface, the largest change an item accepts is the ceiling less what
+/// the rest of the item holds — that change is applied whole, the TOTAL it leaves is the
+/// ceiling itself whatever the item is keyed by, and one byte more is refused with the
 /// update-path sentence while the stored item keeps its value.
 #[tokio::test]
-async fn an_update_tops_out_at_the_ceiling_less_the_floor_bound_key() {
+async fn an_update_tops_out_at_the_flat_item_ceiling() {
     let router = emulator();
 
     for shape in SHAPES {
@@ -258,7 +253,7 @@ async fn an_update_tops_out_at_the_ceiling_less_the_floor_bound_key() {
             // The key portion of THIS item: the surface's suffix makes its value one byte
             // longer than the shape's own.
             let key_bytes = shape.key_bytes() + surface.suffix().len();
-            let largest = MAX_ITEM_BYTES - key_bytes.max(MIN_KEY_CHARGE) - WRITTEN.len();
+            let largest = MAX_ITEM_BYTES - key_bytes - WRITTEN.len();
             let case = format!("{} on {}", surface.operation(), shape.case);
 
             // At the boundary the change is applied...
@@ -275,15 +270,13 @@ async fn an_update_tops_out_at_the_ceiling_less_the_floor_bound_key() {
                 Some(largest),
                 "case {case:?}: expected the whole operand to be stored, got {stored:?} byte(s)"
             );
-            // ...and the TOTAL the item then holds is the ceiling less the bytes its key is
-            // short of the floor, which is what the floor being charged on the KEY means.
+            // ...and the TOTAL the item then holds is the ceiling itself, which is what a
+            // FLAT quota over the stored bytes means.
             let total = key_bytes + WRITTEN.len() + largest;
             assert_eq!(
-                total,
-                MAX_ITEM_BYTES - MIN_KEY_CHARGE.saturating_sub(key_bytes),
-                "case {case:?}: expected the stored item to top out {} byte(s) below the \
-                 ceiling over its {key_bytes}-byte key, got {total}",
-                MIN_KEY_CHARGE.saturating_sub(key_bytes)
+                total, MAX_ITEM_BYTES,
+                "case {case:?}: expected the stored item to top out at the ceiling over its \
+                 {key_bytes}-byte key, got {total}"
             );
 
             // One byte past it the change is refused, with the item left as it was.

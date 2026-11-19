@@ -577,12 +577,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // item plus the frame each clause of the request costs
         // ([`crate::state::ParsedUpdate::request_shape_charge`]), so the largest operand
         // one write may carry moves with the clauses stated beside it. The item itself is
-        // charged with its KEY portion held at the floor an update charges one at
-        // ([`crate::state::charged_update_size`]), so a table keyed by a short value tops
-        // out below the flat quota rather than at it.
-        let size = crate::state::charged_update_size(&item, &partition_key, sort_key.as_deref())
-            + update.request_shape_charge();
-        if size > crate::state::MAX_ITEM_SIZE_BYTES {
+        // charged the bytes it stores against the flat quota
+        // ([`crate::state::update_size_exceeded`]), so the boundary is the same whatever
+        // the item is keyed by.
+        if crate::state::update_size_exceeded(&item, update.request_shape_charge()) {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
             ));

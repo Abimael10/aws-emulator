@@ -584,9 +584,10 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
                 } else {
                     format!("because no identity-based policy allows the {LIST_ACTION} action")
                 };
-                let first = assert_access_denied_message(
+                let message = element(&body, "Message");
+                assert_access_denied_message(
                     case_name,
-                    &element(&body, "Message"),
+                    &message,
                     &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
                     LIST_ACTION,
                     &provider_collection(),
@@ -599,9 +600,8 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
 
                 // A refusal is not a one-shot: the same call is refused the same way
                 // again, and still reports nothing. Every part of the message is a fact of
-                // the request and of the documents in force — the authorization id a
-                // withheld call is pointed at under is a function of the request too — so
-                // the second denial reads identically.
+                // the request and of the documents in force, so the second denial reads
+                // identically.
                 let (again_status, again) =
                     call_signed_by(&router, Some(&access_key_id), "ListOpenIDConnectProviders", &[])
                         .await;
@@ -610,16 +610,17 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
                     "case {case_name:?}: the second call must be refused too, got \
                      {again_status}: {again}"
                 );
-                let second = assert_access_denied_message(
+                let second = element(&again, "Message");
+                assert_access_denied_message(
                     case_name,
-                    &element(&again, "Message"),
+                    &second,
                     &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
                     LIST_ACTION,
                     &provider_collection(),
                     &reason,
                 );
                 assert_eq!(
-                    second, first,
+                    second, message,
                     "case {case_name:?}: the same refused call must be worded alike every \
                      time, got {again}"
                 );

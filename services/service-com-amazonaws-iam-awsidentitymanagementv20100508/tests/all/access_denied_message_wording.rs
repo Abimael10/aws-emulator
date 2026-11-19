@@ -5,15 +5,12 @@
 //! The rule under test: the message names what the decision was made about — `User: ` +
 //! the ARN of the principal that signed the request + ` is not authorized to perform: ` +
 //! the IAM action the call was decided on + ` on resource: ` + the resource it was decided
-//! against + ` ` + why the decision went that way — and then GOES ON to point at the
-//! authorization details of that decision: the console page, at IAM's own endpoint Region
-//! whichever Region the caller addressed, and the authorization id of the refused request,
-//! named in both of the pointer's slots. EVERY refusal this service answers from the
-//! authorization gate carries that pointer: nothing selects it away — not which action was
-//! asked for, not the Region the request addressed, not which documents the caller held,
-//! not the resource form, not whether the call reads or writes, not how often it is made,
-//! and not WHY the decision went the way it did, since an evaluation ran in every one of
-//! those cases and so has details to point at in every one of them.
+//! against + ` ` + why the decision went that way — and ENDS there. That sentence is the
+//! WHOLE message of every refusal this service answers from the authorization gate:
+//! nothing is appended to it — not by which action was asked for, not by the Region the
+//! request addressed, not by which documents the caller held, not by the resource form,
+//! not by whether the call reads or writes, not by how often it is made, and not by WHY
+//! the decision went the way it did.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
 //! operation is refused, whether the resource is an ARN, a path-scoped collection, the
@@ -36,8 +33,8 @@ use crate::identity_policy_enforcement::{principal, statement};
 use crate::permissions_boundary_ceiling::statements;
 use crate::role_lifecycle::borrowed;
 use crate::user_lifecycle::{
-    account_id, assert_access_denied_message, authorization_details_id, call, call_signed_by,
-    call_signed_in_region, element, error_code, router, router_with_engine,
+    account_id, assert_access_denied_message, call, call_signed_by, call_signed_in_region, element,
+    error_code, router, router_with_engine,
 };
 
 /// The reason clause for a call no statement in force allows — the implicit deny.
@@ -560,17 +557,13 @@ async fn managed_policy(router: &MultiServiceRouter) -> String {
 }
 
 /// RULE: a refusal's message names the principal, the action and the resource the decision
-/// was made on, closed by why it went that way, and then by the pointer at that request's
-/// authorization details — whichever action was asked for and whichever way the decision
-/// went.
+/// was made on, closed by why it went that way and by nothing else — whichever action was
+/// asked for and whichever way the decision went.
 #[tokio::test]
-async fn a_refusal_names_the_decision_and_points_at_its_authorization_details() {
+async fn a_refusal_names_the_decision_and_ends_at_the_reason() {
     let router = router();
     target_user(&router).await;
     let policy_arn = managed_policy(&router).await;
-    // The id each row's refusal pointed at, so no two rows are pointed at under one id:
-    // the pointer names THAT request's evaluation, and these rows are different requests.
-    let mut pointed_at: Vec<(&str, String)> = Vec::new();
 
     for (row, case) in cases(&policy_arn).into_iter().enumerate() {
         let user_name = format!("denied{row}");
@@ -594,8 +587,7 @@ async fn a_refusal_names_the_decision_and_points_at_its_authorization_details() 
         );
 
         let message = element(&body, "Message");
-        // The sentence the decision is named in, and the pointer at the authorization
-        // details of that decision.
+        // The sentence the decision is named in, which is the whole message.
         assert_access_denied_message(
             case.case,
             &message,
@@ -604,39 +596,12 @@ async fn a_refusal_names_the_decision_and_points_at_its_authorization_details() 
             &case.named_as,
             &case.reason,
         );
-        let sentence = format!(
-            "User: arn:aws:iam::{}:user/{user_name} is not authorized to perform: {} on \
-             resource: {} {}",
-            account_id(),
-            case.iam_action,
-            case.named_as,
-            case.reason,
-        );
-        let clause = message
-            .strip_prefix(&sentence)
-            .expect("the sentence the shared assertion just matched");
-        let id = authorization_details_id(clause).unwrap_or_else(|| {
-            panic!(
-                "case {:?}: expected the refusal to point at the authorization details of \
-                 the request, got {clause:?} after the reason",
-                case.case
-            )
-        });
-        if let Some((earlier, _)) = pointed_at.iter().find(|(_, seen)| seen == id) {
-            panic!(
-                "case {:?}: expected its own authorization id, got {id:?} — the one case \
-                 {earlier:?} was pointed at under",
-                case.case
-            );
-        }
-        pointed_at.push((case.case, id.to_string()));
     }
 }
 
 /// RULE: every part of the message is a fact of the request and of the documents in
 /// force, so repeating the same refused call — and making it in another Region — answers
-/// the identical message: the sentence naming the decision, closed by the pointer at that
-/// request's own authorization details.
+/// the identical message: the sentence naming the decision and nothing besides.
 #[tokio::test]
 async fn the_same_refused_call_is_worded_identically_every_time() {
     let router = router();
@@ -678,9 +643,8 @@ async fn the_same_refused_call_is_worded_identically_every_time() {
         }
     }
 
-    // Every one of the three: the sentence is the same every time, and what follows it is
-    // the pointer at the authorization details of THAT refusal, whose id names the one
-    // request — so the id is the same across the attempts and across the Regions too.
+    // Every one of the three: the sentence is the whole message, the same one every time
+    // and in every Region.
     for (action, iam_action, named_as, messages) in [
         (
             "ListUsers",
@@ -706,40 +670,26 @@ async fn the_same_refused_call_is_worded_identically_every_time() {
              {named_as} {}",
             no_allow(iam_action),
         );
-        let mut ids: Vec<String> = Vec::new();
         for (attempt, message) in messages.iter().enumerate() {
-            let clause = message.strip_prefix(&sentence).unwrap_or_else(|| {
-                panic!(
-                    "case {action} attempt {attempt}: expected every refusal of the same \
-                     call to open {sentence:?}, got {message:?}"
-                )
-            });
-            let pointed_at = authorization_details_id(clause).unwrap_or_else(|| {
-                panic!(
-                    "case {action} attempt {attempt}: expected the refusal to point at the \
-                     authorization details of the request, got {clause:?} after the reason"
-                )
-            });
-            ids.push(pointed_at.to_string());
+            assert_eq!(
+                message, &sentence,
+                "case {action} attempt {attempt}: expected every refusal of the same call \
+                 to be worded {sentence:?}, got {message:?}"
+            );
         }
-        assert!(
-            ids.windows(2).all(|pair| pair[0] == pair[1]),
-            "case {action}: expected one authorization id for the same refused call, got \
-             {ids:?}"
-        );
     }
 }
 
-/// RULE: the page the pointer names is IAM's own, at its one endpoint Region, whichever
-/// Region the refused call addressed — IAM is a global service, so there is one place its
-/// authorization details are read from.
+/// RULE: the message is the sentence naming the decision whichever Region the refused call
+/// addressed — IAM is a global service, so nothing of the Region the caller reached it
+/// through reaches the refusal.
 #[tokio::test]
-async fn the_pointer_names_one_page_whichever_region_the_call_addressed() {
+async fn the_message_is_the_same_sentence_whichever_region_the_call_addressed() {
     let router = router();
     target_user(&router).await;
     let user_name = "elsewhere";
     // A grant for another action: a document is in force, so the refusal of this call is
-    // a withholding and carries the pointer.
+    // a withholding.
     let access_key_id = principal(
         &router,
         "a withheld call from several Regions",
@@ -771,13 +721,9 @@ async fn the_pointer_names_one_page_whichever_region_the_call_addressed() {
             no_allow("iam:GetUser"),
             account = account_id(),
         );
-        let clause = message.strip_prefix(&sentence).unwrap_or_else(|| {
-            panic!("case {region:?}: expected the refusal sentence, got {message:?}")
-        });
-        assert!(
-            authorization_details_id(clause).is_some(),
-            "case {region:?}: expected the pointer at IAM's one authorization-details page, \
-             got {clause:?}"
+        assert_eq!(
+            message, sentence,
+            "case {region:?}: expected the refusal sentence {sentence:?}, got {message:?}"
         );
     }
 }
@@ -802,11 +748,10 @@ fn names_resource(action: &str, user_name: &str) -> String {
 
 /// RULE: a refusal reached because the only statement for the action is conditioned on an
 /// instant the call is not yet past is the same WITHHOLDING as one reached with no
-/// document at all — so it is worded as every other refusal is, the sentence closed by the
-/// pointer at the request's authorization details — while the sibling action the same
-/// document already grants is served.
+/// document at all — so it is worded as every other refusal is — while the sibling action
+/// the same document already grants is served.
 #[tokio::test]
-async fn a_grant_not_yet_in_effect_is_withheld_and_points_at_its_details() {
+async fn a_grant_not_yet_in_effect_is_withheld_and_worded_like_every_other() {
     let router = router();
 
     // (case, the action granted from a past instant and therefore served, the action
@@ -875,18 +820,13 @@ async fn a_grant_not_yet_in_effect_is_withheld_and_points_at_its_details() {
 
         let iam_action = format!("iam:{not_yet}");
         let message = element(&body, "Message");
-        let pointed_at = assert_access_denied_message(
+        assert_access_denied_message(
             case,
             &message,
             &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
             &iam_action,
             &names_resource(not_yet, &user_name),
             &no_allow(&iam_action),
-        );
-        assert!(
-            !pointed_at.is_empty(),
-            "case {case:?}: expected the refusal of {not_yet} to point at the authorization \
-             details of the request, got {message:?}"
         );
     }
 }
@@ -1185,16 +1125,12 @@ async fn session_scoped_caller(
 
 /// RULE: a refusal of a call signed with a credential a mint SCOPED is worded exactly as
 /// every other refusal this gate answers — the principal that signed it (the session, not
-/// the role it is of), the action, the resource the decision was made on, the clause naming
-/// the document that withheld or denied the call, and then the pointer at the authorization
-/// details of that request, naming one id in both of its slots — whichever of the documents
-/// in force decided it and whichever form the session policy took.
+/// the role it is of), the action, the resource the decision was made on and the clause
+/// naming the document that withheld or denied the call, and nothing after it — whichever
+/// of the documents in force decided it and whichever form the session policy took.
 #[tokio::test]
-async fn a_session_scoped_refusal_is_worded_and_pointed_at_like_every_other() {
+async fn a_session_scoped_refusal_is_worded_like_every_other() {
     let (router, engine) = router_with_engine();
-    // The id each refused row was pointed at, so no two rows share one: the pointer names
-    // THAT request's evaluation, and these rows are different requests.
-    let mut pointed_at: Vec<(&str, String)> = Vec::new();
 
     for (row, scoping) in scopings().into_iter().enumerate() {
         let role_name = format!("scoped{row}");
@@ -1235,8 +1171,8 @@ async fn a_session_scoped_refusal_is_worded_and_pointed_at_like_every_other() {
         );
 
         let message = element(&body, "Message");
-        // The sentence the decision is named in, and the id of the pointer that closes it.
-        let id = assert_access_denied_message(
+        // The sentence the decision is named in, which is the whole message.
+        assert_access_denied_message(
             scoping.case,
             &message,
             &session_arn,
@@ -1244,21 +1180,12 @@ async fn a_session_scoped_refusal_is_worded_and_pointed_at_like_every_other() {
             &session_named_as(scoping.action, &role_name),
             &withheld.reason(scoping.iam_action),
         );
-        if let Some((earlier, _)) = pointed_at.iter().find(|(_, seen)| seen == &id) {
-            panic!(
-                "case {:?}: expected its own authorization id, got {id:?} — the one case \
-                 {earlier:?} was pointed at under",
-                scoping.case
-            );
-        }
-        pointed_at.push((scoping.case, id));
     }
 }
 
-/// RULE: the page a session-scoped refusal points at is IAM's own, at its one endpoint
-/// Region whichever Region the refused call addressed, and every part of the message is a
-/// fact of the request and of the documents in force — so the same refused call, repeated
-/// and made from elsewhere, answers the identical message.
+/// RULE: every part of a session-scoped refusal is a fact of the request and of the
+/// documents in force — so the same refused call, repeated and made from elsewhere,
+/// answers the identical message.
 #[tokio::test]
 async fn a_session_scoped_refusal_is_worded_identically_from_every_region() {
     let (router, engine) = router_with_engine();
@@ -1294,18 +1221,13 @@ async fn a_session_scoped_refusal_is_worded_identically_from_every_region() {
             "case {region:?}: expected the withheld call to be refused, got {status}: {body}"
         );
         let message = element(&body, "Message");
-        let pointed_at = assert_access_denied_message(
+        assert_access_denied_message(
             region,
             &message,
             &session_arn,
             "iam:ListRoleTags",
             &format!("role {role_name}"),
             &Withheld::NoSessionAllow.reason("iam:ListRoleTags"),
-        );
-        assert!(
-            !pointed_at.is_empty(),
-            "case {region:?}: expected the refusal to name an authorization id, got \
-             {message:?}"
         );
         answered.push(message);
     }

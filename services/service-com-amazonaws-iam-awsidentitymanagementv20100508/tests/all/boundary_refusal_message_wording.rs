@@ -3,16 +3,15 @@
 //! The WORDING of the `AccessDenied` message IAM answers a refused call with when a
 //! permissions boundary is part of the decision, end to end over the awsQuery wire.
 //!
-//! RULE: a refusal's message continues with the pointer at the request's authorization
-//! details in every case: not only for some actions, not only where a particular document
-//! refused it, not only where the refusal withheld a grant rather than being explained by
-//! an explicit `Deny`, and whatever is attached to the caller — attaching a permissions
-//! boundary, attaching one that admits the very action, attaching one that admits
-//! everything, and attaching one that is silent on the action all leave the refusal where
-//! the decision puts it. The reason clause still names the document that withheld or
-//! denied the call (the identity-based policies where nothing granted it, the boundary
-//! where they did and the ceiling capped it), since that is a different fact about the same
-//! decision.
+//! RULE: a refusal's message ends at the clause saying why the decision went that way in
+//! every case: not only for some actions, not only where a particular document refused it,
+//! not only where the refusal withheld a grant rather than being explained by an explicit
+//! `Deny`, and whatever is attached to the caller — attaching a permissions boundary,
+//! attaching one that admits the very action, attaching one that admits everything, and
+//! attaching one that is silent on the action all leave the refusal where the decision
+//! puts it. The reason clause names the document that withheld or denied the call (the
+//! identity-based policies where nothing granted it, the boundary where they did and the
+//! ceiling capped it), since that is a different fact about the same decision.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
 //! operation is refused, whether a boundary is attached at all, what that boundary admits
@@ -253,8 +252,8 @@ async fn target_user(router: &MultiServiceRouter) {
     );
 }
 
-/// Assert that `body` is the refusal `refusal` of `iam_action` on `named_as`, and that it
-/// carries the pointer at the authorization details of that decision.
+/// Assert that `body` is the refusal `refusal` of `iam_action` on `named_as`, worded as
+/// the gate words every refusal and ending at the clause that says why.
 fn assert_refusal(
     case: &str,
     body: &str,
@@ -270,8 +269,8 @@ fn assert_refusal(
         error_code(body)
     );
     let message = element(body, "Message");
-    // The sentence the decision is named in, and the id of the pointer that follows it.
-    let pointed_at = assert_access_denied_message(
+    // The sentence the decision is named in, which is the whole message.
+    assert_access_denied_message(
         case,
         &message,
         caller,
@@ -279,18 +278,12 @@ fn assert_refusal(
         &subject.named_as,
         &refusal.reason(subject.iam_action, boundary),
     );
-    assert!(
-        !pointed_at.is_empty(),
-        "case {case:?}: expected the refusal of {} to carry the pointer at the request's \
-         authorization details, got {message:?}",
-        subject.iam_action
-    );
 }
 
-/// RULE: a refusal carries the authorization-details pointer whichever document withheld
-/// or denied the call, and whatever ceiling is attached to the caller.
+/// RULE: a refusal is worded the same way whichever document withheld or denied the call,
+/// and whatever ceiling is attached to the caller.
 #[tokio::test]
-async fn a_boundary_does_not_move_whether_a_refusal_is_pointed_at() {
+async fn a_boundary_does_not_move_how_a_refusal_is_worded() {
     let router = router();
     target_user(&router).await;
 
@@ -431,10 +424,10 @@ impl Move {
 }
 
 /// RULE: the ceiling in force is read at the instant of the call, so attaching, replacing
-/// and removing it moves WHICH document the reason clause names — and never whether the
-/// message points at the request's authorization details, which every refusal does.
+/// and removing it moves WHICH document the reason clause names — and never the shape of
+/// the message, which ends at that clause in every case.
 #[tokio::test]
-async fn moving_the_ceiling_leaves_every_refusal_pointed_at() {
+async fn moving_the_ceiling_leaves_every_refusal_worded_alike() {
     let router = router();
     target_user(&router).await;
     let user_name = "recapped";

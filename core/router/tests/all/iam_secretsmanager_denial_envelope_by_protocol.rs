@@ -61,11 +61,6 @@ const AMBIENT_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 /// The name of the one inline policy a row puts in force on its user.
 const POLICY_NAME: &str = "in-force";
 
-/// The signing name of the identity service, whose refusals go on to point at the
-/// authorization details of the decision — a page and an API of that service alone, so a
-/// refusal served by any OTHER service carries no such continuation.
-const IDENTITY_SERVICE: &str = "iam";
-
 /// Which wire protocol a call is addressed over, and therefore which envelope its refusal
 /// travels in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -386,33 +381,19 @@ fn error_message(wire: Wire, body: &str) -> String {
     }
 }
 
-/// The sentence a decision is worded in, with the identity service's authorization-details
-/// pointer taken off where the refusal carries one.
+/// The sentence a decision is worded in: the whole message, whichever service answered it.
 ///
-/// The pointer names that service's own console page and its own API, so it closes the
-/// refusals IAM serves and none of the secret store's. Where it is there, the clause is
-/// read by the suite that owns that reader
-/// (`iam_authorization_details_pointer.rs`), which asserts it well-formed — the page, and
-/// ONE authorization id in both of its slots — rather than pinning the id, which is a fact
-/// of the request this run made.
+/// A refusal ends at the clause saying why the decision went that way — nothing of where
+/// the decision could be read or under which handle follows it — which is the rule
+/// `iam_authorization_details_pointer.rs` is the table for; this suite is about the
+/// ENVELOPE each protocol carries that sentence in, so it only reads it back.
 fn sentence_of(case: &str, call: &Call, message: &str) -> String {
-    use crate::iam_authorization_details_pointer as pointer;
-
-    if !message.contains(pointer::POINTER_HEAD) {
-        assert_ne!(
-            call.signing_name, IDENTITY_SERVICE,
-            "case {case:?}: expected the identity service's refusal to point at the \
-             authorization details of the decision, got {message:?}"
-        );
-        return message.to_string();
-    }
-    assert_eq!(
-        call.signing_name, IDENTITY_SERVICE,
-        "case {case:?}: expected no authorization-details pointer from a service that does \
-         not serve them, got {message:?}"
+    assert!(
+        !message.contains(". Go to "),
+        "case {case:?}: expected the refusal of {} to end at the reason, got {message:?}",
+        call.iam_action
     );
-    pointer::pointed_at(case, message);
-    pointer::sentence_of(case, message)
+    message.to_string()
 }
 
 /// Create the user a row is about, put its document in force, mint its long-term key, and
@@ -501,8 +482,7 @@ async fn an_authorization_refusals_envelope_follows_the_protocol_not_the_princip
                 .insert((status, code));
 
             // What the refusal CARRIES is about the principal and the action, closed by which
-            // of IAM's rules refused the call — and then, where the serving service is the
-            // identity service itself, by the pointer at that decision's details.
+            // of IAM's rules refused the call — and ending there.
             let message = error_message(call.wire, &body);
             let sentence = sentence_of(&case, call, &message);
             let opening = format!(
@@ -542,8 +522,7 @@ async fn an_authorization_refusals_envelope_follows_the_protocol_not_the_princip
 /// RULE, read as the relationship the two protocols stand in: for ONE principal and ONE
 /// decision, the two services answer the SAME sentence in DIFFERENT envelopes — the status
 /// and the code are the protocol's, while the principal, the action's own name and the reason
-/// are the decision's, and only the service that serves the authorization details of a
-/// decision goes on to point at them.
+/// are the decision's.
 #[tokio::test]
 async fn one_principals_two_refusals_differ_only_in_their_envelope() {
     let router = build_router();

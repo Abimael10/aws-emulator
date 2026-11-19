@@ -11,11 +11,9 @@
 //! deny). A refused call is answered HTTP 403 with the error code `AccessDenied`
 //! ([`crate::scaffolded::Scaffolded::access_denied`]) and a message built from the three
 //! things the decision was made about — the principal, the action and the resource —
-//! closed by why the decision went that way and then by the pointer at the authorization
-//! details of that decision: where they are read and under which authorization id
-//! ([`not_authorized`]). That pointer closes EVERY refusal this gate answers, whichever
-//! action was asked for and whichever document decided it — an evaluation ran in every
-//! case, so there are details of it to point at in every case.
+//! closed by why the decision went that way ([`not_authorized`]) and by nothing else: the
+//! sentence ENDS at that clause, whichever action was asked for and whichever document
+//! decided it.
 //!
 //! The five pieces, each held in exactly one place:
 //!
@@ -753,109 +751,28 @@ fn authorize_request(
             || capped == Decision::Denied,
         "the policies in force on the caller do not permit this call"
     );
-    // AWS's refusal does not end at the reason: it goes on to point at the authorization
-    // details of the evaluation that decided the call — the page they are read on and the
-    // authorization id of THIS request — so the decision can be traced after the fact.
-    // That continuation is a fact about the REFUSAL and not about what was asked: the
-    // evaluation it names ran whatever the action, whoever the caller, whichever document
-    // decided and whichever Region the request addressed, so every refusal this gate
-    // answers carries it.
-    Err(not_authorized(
-        &principal,
-        action,
-        named_as,
-        &reason,
-        &authorization_id(ctx, &principal, action, resource),
-    ))
-}
-
-/// Where the authorization details of ONE refused request are read: the console page for
-/// an authorization id.
-///
-/// The host and the Region parameter are IAM's own endpoint Region whichever Region the
-/// caller addressed, because IAM is a global service: there is one place its authorization
-/// details are served from, so a refusal answered to a caller elsewhere still points
-/// there.
-///
-/// LIMITATION, stated so the pointer is not mistaken for more than it is: this gate names
-/// the id of the refusal it is answering, and nothing here records the evaluation behind
-/// it, so a reader that follows the id into the authorization-details reader is told the
-/// details are not available. Recording them is the work of the operation that serves
-/// them, not of the refusal that names one.
-const AUTHORIZATION_DETAILS_PAGE: &str =
-    "https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/";
-
-/// The authorization id of THIS request: the handle its refusal points at.
-///
-/// Derived from what the request itself carries — the instant it was signed, the digest of
-/// its content, and what the decision was made about — rather than drawn at random, so two
-/// refusals over different content, at different instants or about different subjects are
-/// pointed at under different ids, and nothing has to be remembered for an id to stay the
-/// id of that refusal. It is a FUNCTION of those facts and nothing else: two refusals that
-/// agree on every one of them — the same caller refused the same call on the same content
-/// within the same second — are pointed at under one id, which is the determinism the
-/// wording this gate answers with is asserted on. The credential and signature a request is
-/// signed with are deliberately NOT part of it: the id travels back to the caller, so
-/// nothing derived from signing material goes into it.
-///
-/// Rendered by the tree's ONE derivation of an id from a seed
-/// ([`::service_common::caller_principal::aws_unique_id`]), in the lower case an
-/// authorization id is spelled in; it carries no type prefix, because an authorization id
-/// names a request rather than an entity.
-fn authorization_id(
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
-    principal: &str,
-    action: &str,
-    resource: &str,
-) -> String {
-    /// The header fields that say WHEN a request was signed and WHAT it carried, neither
-    /// of which is credential material.
-    const REQUEST_HEADERS: &[&str] = &["x-amz-date", "x-amz-content-sha256"];
-    /// The separator between the seed's parts, so two different splittings of the same
-    /// text cannot seed the same id.
-    const SEPARATOR: char = '\n';
-
-    let headers = &ctx.parts().headers;
-    let mut seed = String::new();
-    for header in REQUEST_HEADERS {
-        if let Some(value) = headers.get(*header).and_then(|value| value.to_str().ok()) {
-            seed.push_str(value);
-        }
-        seed.push(SEPARATOR);
-    }
-    for part in [principal, action, resource] {
-        seed.push_str(part);
-        seed.push(SEPARATOR);
-    }
-    ::service_common::caller_principal::aws_unique_id("", &seed).to_lowercase()
+    // AWS's refusal ends at the reason: nothing of the request beyond the three things the
+    // decision was made about, and nothing of the evaluation behind it, is reported back.
+    Err(not_authorized(&principal, action, named_as, &reason))
 }
 
 /// The `AccessDenied` text AWS words a call it will not perform for its caller with:
 /// what the refusal is about — the principal that signed the request, the action it
-/// asked for and the resource it asked for it on — closed by `reason`, which says why,
-/// and then by the pointer at the authorization details of that decision: the page they
-/// are read on and `authorization_id`, the handle of THIS request, which the pointer
-/// names in both of its slots because one refusal has one id.
+/// asked for and the resource it asked for it on — closed by `reason`, which says why.
+/// The sentence ENDS there: nothing of the evaluation that decided the call, and nothing
+/// else about the request, follows it.
 ///
 /// ONE wording for the code, so a refusal an operation reaches for a reason of its own
 /// is worded exactly as the policy decision above is, differing only in that reason.
 /// Every part of it is a fact of the request and of the account's state, so the same
 /// refused call is worded the same on every run and in every Region.
 /// [`not_authorized_without_reason`] is the OTHER wording this service answers: the one
-/// for a refusal no evaluation of the policies in force explains, which therefore has
-/// neither a reason to state nor details to point at.
-pub fn not_authorized(
-    principal: &str,
-    action: &str,
-    named_as: &str,
-    reason: &str,
-    authorization_id: &str,
-) -> AccessDenied {
+/// for a refusal no evaluation of the policies in force explains, which therefore has no
+/// reason to state.
+pub fn not_authorized(principal: &str, action: &str, named_as: &str, reason: &str) -> AccessDenied {
     AccessDenied::new(format!(
         "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
-         {reason}. Go to {AUTHORIZATION_DETAILS_PAGE}{authorization_id} for complete \
-         details, or call the GetRequestAuthorizationDetails API with the following \
-         authorization id: {authorization_id}"
+         {reason}"
     ))
 }
 

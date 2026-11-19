@@ -491,14 +491,13 @@ impl Estate {
     }
 }
 
-/// The reason clause of `message`: what follows the sentence's head, with the pointer at
-/// the request's authorization details taken off.
+/// The reason clause of `message`: what follows the sentence's head, which is where the
+/// message ends.
 ///
 /// The head is asserted here, so a row that diverges on the principal, the action or the
-/// resource says so rather than reporting a mangled clause; the continuation is read by the
-/// suite that owns that reader (`iam_authorization_details_pointer.rs`), which asserts its
-/// fixed text and that one id is named in both of its slots — the id itself is a fact of the
-/// request this run made, so no row pins its value.
+/// resource says so rather than reporting a mangled clause; that the message ends at the
+/// clause is the rule the suite owning that reader pins
+/// (`iam_authorization_details_pointer.rs`).
 fn reason_of(
     case: &str,
     message: &str,
@@ -506,13 +505,9 @@ fn reason_of(
     iam_action: &str,
     named_as: &str,
 ) -> String {
-    use crate::iam_authorization_details_pointer as pointer;
-
     let head =
         format!("User: {principal} is not authorized to perform: {iam_action} on resource: {named_as} ");
-    pointer::pointed_at(case, message);
-    let sentence = pointer::sentence_of(case, message);
-    sentence
+    message
         .strip_prefix(&head)
         .unwrap_or_else(|| {
             panic!("case {case:?}: expected the refusal to open {head:?}, got {message:?}")

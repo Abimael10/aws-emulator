@@ -26,9 +26,8 @@
 //! association's `policy` where it carries one ("the permissions for the Pod Identity
 //! association", `PodIdentityAssociation$policy`). A call those documents allow is served;
 //! one nothing in force allows is refused HTTP 403 `AccessDenied` with IAM's sentence,
-//! naming the SESSION as the principal, closed by the clause every authorization refusal of
-//! the identity service carries — the pointer at that request's authorization details, whose
-//! reader is `iam_authorization_details_pointer.rs` beside this file.
+//! naming the SESSION as the principal and ending at the clause saying why the decision
+//! went that way, whose reader is `iam_authorization_details_pointer.rs` beside this file.
 //!
 //! Four services on one engine make the pair of rules: EKS publishes the address and serves
 //! the Kubernetes API behind it, EKS Auth exchanges the pod's token, STS records the session
@@ -615,13 +614,11 @@ fn a_pod_identity_credential_from_the_published_endpoint_carries_the_roles_permi
                             "case {case:?}: expected the error code AccessDenied, got {}",
                             listed.text
                         );
-                        // Every authorization refusal of the identity service closes with a
-                        // pointer at THAT request's own authorization details, whose id is
-                        // per-run, so the SENTENCE this row set up is what is pinned and the
-                        // continuation is read by the suite that owns that clause
-                        // (`iam_authorization_details_pointer.rs`), which holds it to its
-                        // fixed text and to naming ONE id in both of its slots.
-                        crate::iam_authorization_details_pointer::assert_points_at_details(
+                        // An authorization refusal of the identity service IS the sentence
+                        // naming the decision and ends at the clause saying why, which the
+                        // suite that owns that reader pins
+                        // (`iam_authorization_details_pointer.rs`).
+                        crate::iam_authorization_details_pointer::assert_refusal_sentence(
                             case,
                             &element(&listed.text, "Message"),
                             &refusal(&session_arn, &reason),

@@ -803,12 +803,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                             .map_err(lift)?;
                     }
                     crate::state::canonicalize_item(&mut item).map_err(lift)?;
-                    if crate::state::charged_update_size(
-                        &item,
-                        &partition_key,
-                        sort_key.as_deref(),
-                    ) > crate::state::MAX_ITEM_SIZE_BYTES
-                    {
+                    if crate::state::update_size_exceeded(&item, 0) {
                         return Err(crate::scaffolded::Scaffolded::validation(
                             crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
                         ));

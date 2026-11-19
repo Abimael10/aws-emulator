@@ -314,9 +314,9 @@ async fn an_assumed_role_session_is_decided_against_the_roles_policies() {
                     "case {case:?}: expected AccessDenied, got {code:?}: {body}"
                 );
                 let message = message_of(&body);
-                // The sentence this row set up, closed by the pointer every refusal of the
-                // gate carries (`iam_authorization_details_pointer.rs` owns that reader).
-                crate::iam_authorization_details_pointer::assert_points_at_details(
+                // The sentence this row set up, which is the whole refusal
+                // (`iam_authorization_details_pointer.rs` owns that reader).
+                crate::iam_authorization_details_pointer::assert_refusal_sentence(
                     &case,
                     &message,
                     &not_authorized(
@@ -380,7 +380,7 @@ async fn a_session_of_a_role_with_no_policy_is_refused() {
             listing.action
         );
         let message = message_of(&body);
-        crate::iam_authorization_details_pointer::assert_points_at_details(
+        crate::iam_authorization_details_pointer::assert_refusal_sentence(
             listing.action,
             &message,
             &not_authorized(

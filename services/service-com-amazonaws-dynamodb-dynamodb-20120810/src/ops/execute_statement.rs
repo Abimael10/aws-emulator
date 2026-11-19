@@ -864,9 +864,9 @@ fn update_item(
             .map_err(lift)?;
     }
     crate::state::canonicalize_item(&mut item).map_err(lift)?;
-    if crate::state::charged_update_size(&item, &partition_key, sort_key.as_deref())
-        > crate::state::MAX_ITEM_SIZE_BYTES
-    {
+    // A statement states its change without an expression, so nothing is charged on top of
+    // the item it leaves ([`crate::state::update_size_exceeded`]).
+    if crate::state::update_size_exceeded(&item, 0) {
         return Err(crate::scaffolded::Scaffolded::validation(
             crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
         ));
