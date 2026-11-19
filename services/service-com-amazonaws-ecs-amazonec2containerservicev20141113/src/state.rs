@@ -4144,6 +4144,16 @@ pub struct TaskRecord {
     /// Amazon ECS stops the task with at the instant it would otherwise have started
     /// ([`TaskRecord::fail_launch`]), and `None` for a task nothing is known to block.
     pub launch_failure: Option<String>,
+    /// The name of the container [`Self::launch_failure`] belongs to, when the step that
+    /// decided it decided it about ONE container — the image fetch, which fails on the first
+    /// image a registry would not serve ([`ImagePullVerdict::failed_image`]). That container
+    /// reports the failure as its own `Container$reason` when the stop falls due
+    /// ([`TaskRecord::fail_launch`]).
+    ///
+    /// `None` for a task nothing blocks, and for one blocked by something no single container
+    /// owns: a role the launch may not assume, or a resource the agent retrieves for the task
+    /// as a whole.
+    pub launch_failure_container: Option<String>,
     /// Whether the roles THIS launch resolved have been put to the account's IAM records
     /// already ([`evaluate_launch_role_assumptions`]) — `false` for a task that has only
     /// just been placed, whoever placed it.

@@ -1285,6 +1285,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             volume_configurations: Vec::new(),
             awsvpc_configuration: None,
             launch_failure: None,
+            launch_failure_container: None,
             launch_roles_assumed: false,
             // Nothing has retrieved the values this launch's containers take yet: that
             // happens once its roles are assumed and its images are fetched

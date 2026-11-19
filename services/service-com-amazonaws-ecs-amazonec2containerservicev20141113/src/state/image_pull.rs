@@ -276,9 +276,12 @@ pub fn evaluate_image_pulls<Eng: Send + Sync + 'static>(engine: &Eng) {
     let now = SystemTime::now();
     for (launch, verdict) in launches.iter().zip(failures.iter_mut()) {
         if verdict.failure.is_none() {
-            let (failure, digests) = fetch_launch_images(engine, launch, now);
-            verdict.failure = failure;
-            verdict.image_digests = digests;
+            let fetched = fetch_launch_images(engine, launch, now);
+            if let Some((image, reason)) = fetched.refused {
+                verdict.failed_image = Some(image);
+                verdict.failure = Some(reason);
+            }
+            verdict.image_digests = fetched.digests;
         }
     }
     // The SECRETS the agent fetches for the task's containers, in the same step and as the
@@ -314,6 +317,11 @@ pub struct ImagePullVerdict {
     /// The `stoppedReason` of the stop a task whose containers could not be fetched earns,
     /// and `None` when nothing was decided against the fetch.
     pub failure: Option<String>,
+    /// The image reference whose fetch is what failed, when the failure is ONE image's: the
+    /// container that runs that image is the container the failure is reported on
+    /// ([`TaskRecord::launch_failure_container`]). `None` for a verdict that failed on
+    /// something other than an image, and for one that failed on nothing.
+    pub failed_image: Option<String>,
     /// `(image reference, manifest digest)` for each of the task's images a registry this
     /// emulator holds served: `Container$imageDigest` is "The container image manifest
     /// digest", and the registry that served the pull is what states it.
@@ -321,19 +329,25 @@ pub struct ImagePullVerdict {
 }
 
 impl ImagePullVerdict {
-    /// The verdict of `launch` with `failure` recorded and no image fetched yet.
-    fn of(launch: &TaskLaunch, failure: Option<String>) -> Self {
+    /// The verdict of `launch` with `failure` — the image whose fetch failed and the reason
+    /// it did — recorded, and no image fetched yet.
+    fn of(launch: &TaskLaunch, failure: Option<(String, String)>) -> Self {
+        let (failed_image, failure) = match failure {
+            Some((image, reason)) => (Some(image), Some(reason)),
+            None => (None, None),
+        };
         Self {
             task_arn: launch.task_arn.clone(),
             failure,
+            failed_image,
             image_digests: Vec::new(),
         }
     }
 }
 
 /// Fetch each image of `launch` from the registry its reference names, and answer what that
-/// took: why the FIRST image a registry this emulator holds would not serve could not be
-/// fetched, and the manifest digest of each image that was served.
+/// took: the FIRST image a registry this emulator holds would not serve with why it could
+/// not be fetched, and the manifest digest of each image that was served.
 ///
 /// Two registries are this emulator's to answer for, and an image reference names one of
 /// them by its host (the module docs stand this on what each registry documents):
@@ -357,7 +371,7 @@ fn fetch_launch_images<Eng: Send + Sync + 'static>(
     engine: &Eng,
     launch: &TaskLaunch,
     now: SystemTime,
-) -> (Option<String>, Vec<(String, String)>) {
+) -> LaunchFetch {
     let mut digests: Vec<(String, String)> = Vec::new();
     for image in &launch.images {
         match fetch_image(engine, launch, image, now) {
@@ -369,10 +383,27 @@ fn fetch_launch_images<Eng: Send + Sync + 'static>(
             }
             // The first image that cannot be fetched is what stops the task: its containers
             // are not started, so the images after it are not fetched either.
-            ImageFetch::Refused(reason) => return (Some(reason), digests),
+            ImageFetch::Refused(reason) => {
+                return LaunchFetch {
+                    refused: Some((image.clone(), reason)),
+                    digests,
+                }
+            }
         }
     }
-    (None, digests)
+    LaunchFetch {
+        refused: None,
+        digests,
+    }
+}
+
+/// What the fetch of a whole launch's images answered ([`fetch_launch_images`]).
+struct LaunchFetch {
+    /// `(image reference, reason)` of the FIRST image a registry this emulator holds would
+    /// not serve, and `None` where nothing was decided against the fetch.
+    refused: Option<(String, String)>,
+    /// `(image reference, manifest digest)` for each image such a registry served.
+    digests: Vec<(String, String)>,
 }
 
 /// What the fetch of ONE image reference answered.
@@ -487,10 +518,13 @@ fn reference_into_this_registry<'image>(
     ))
 }
 
-/// Why the containers of `launch` cannot be launched where the task is placed — the
-/// `stoppedReason` of the first image no path reaches — or `None` when every image can be
-/// fetched, or when this emulator holds no network facts about the placement at all.
-fn unfetchable_image(store: &ComAmazonawsEc2Amazonec2State, launch: &TaskLaunch) -> Option<String> {
+/// Why the containers of `launch` cannot be launched where the task is placed — the first
+/// image no path reaches and the `stoppedReason` that earns — or `None` when every image can
+/// be fetched, or when this emulator holds no network facts about the placement at all.
+fn unfetchable_image(
+    store: &ComAmazonawsEc2Amazonec2State,
+    launch: &TaskLaunch,
+) -> Option<(String, String)> {
     // The subnet the task's elastic network interface was given, which is the one the
     // launch named first
     // ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::mint_task_attachments`]).
@@ -500,7 +534,7 @@ fn unfetchable_image(store: &ComAmazonawsEc2Amazonec2State, launch: &TaskLaunch)
         subnet_reaches_internet(store, subnet_id, &vpc_id, launch.assign_public_ip.as_deref());
     launch.images.iter().find_map(|image| {
         let reachable = internet || endpoints_reach_registry(store, &vpc_id, image);
-        (!reachable).then(|| cannot_pull_container_message(image))
+        (!reachable).then(|| (image.clone(), cannot_pull_container_message(image)))
     })
 }
 
@@ -811,6 +845,17 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }
                 if task.launch_failure.is_none() && task.is_pending() {
                     task.launch_failure = verdict.failure.clone();
+                    // A fetch that failed failed for ONE image, and the container that runs
+                    // that image is the one Amazon ECS could not create: it is the container
+                    // the failure is reported on when the stop falls due
+                    // ([`TaskRecord::launch_failure_container`]).
+                    task.launch_failure_container =
+                        verdict.failed_image.as_deref().and_then(|image| {
+                            task.containers
+                                .iter()
+                                .find(|container| container.image.as_deref() == Some(image))
+                                .and_then(|container| container.name.clone())
+                        });
                 }
             }
         }
@@ -851,6 +896,15 @@ impl TaskRecord {
     /// is what a `ListTasks` narrowed to stopped tasks reports it under — and `STOPPED`
     /// itself falls due one [`TRANSITION_SPAN`] later, the same two-step stop every other
     /// stop of a task is recorded as.
+    ///
+    /// The failure is reported on the CONTAINER it belongs to as well, where the step that
+    /// decided it named one ([`TaskRecord::launch_failure_container`]): `Container$reason` is
+    /// "a short (1024 max characters) human-readable string to provide additional details
+    /// about a running or stopped container", and the additional detail about a container
+    /// Amazon ECS could not create is what kept it from being created. A report the AGENT has
+    /// made about that container (`SubmitContainerStateChange$reason`) is left as the agent
+    /// gave it, and a failure no one container owns — a resource the agent retrieves for the
+    /// task as a whole, or a role the launch may not assume — is reported on the task alone.
     pub fn fail_launch(&mut self, reason: &str, at: SystemTime) {
         self.desired_status = STATUS_STOPPED.to_string();
         self.stopped_reason = Some(reason.to_string());
@@ -859,6 +913,17 @@ impl TaskRecord {
         self.pending_due_at = None;
         self.running_due_at = None;
         self.stopped_due_at = Some(at + TRANSITION_SPAN);
+        if let Some(name) = self.launch_failure_container.clone() {
+            for container in self
+                .containers
+                .iter_mut()
+                .filter(|container| container.name.as_deref() == Some(name.as_str()))
+            {
+                if container.reason.is_none() {
+                    container.reason = Some(reason.to_string());
+                }
+            }
+        }
         self.version += 1;
     }
 }

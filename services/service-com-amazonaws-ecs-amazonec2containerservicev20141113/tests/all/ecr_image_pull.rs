@@ -21,7 +21,14 @@
 //! * a task that DID pull records the instants the fetch took (`Task$pullStartedAt` and
 //!   `pullStoppedAt`) and runs, and a task placed on its own then reaches the terminal
 //!   `STOPPED` status with the stop code for an essential container that exited — while a
-//!   task a service's scheduler placed is kept running by that scheduler.
+//!   task a service's scheduler placed is kept running by that scheduler;
+//! * that same stop is what a SERVICE's scheduler produces for a reference the registry
+//!   resolves to nothing, and it is reachable the way a caller diagnosing the service finds
+//!   it: listed by `ListTasks` under the stopped desired status and then described, with the
+//!   failure reported both as the task's `stoppedReason` and as the `Container$reason` ("a
+//!   short (1024 max characters) human-readable string to provide additional details about a
+//!   running or stopped container") of the container whose image it was — while the
+//!   service's `Service$runningCount` stays `0`.
 //!
 //! The rows differ along what the rule generalises over: whether the registry holds the
 //! image, whether a cache rule covers the repository, which half of the pull the role is
@@ -35,7 +42,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    ecr, emulator_with_ecr_and_iam, iam, ok, register_instance, string, ACCOUNT, SIGNED_REGION,
+    awsvpc_network_configuration, count, ecr, emulator_with_ecr_and_iam, iam, list, ok,
+    register_instance, string, ACCOUNT, AWSVPC_START, SIGNED_REGION,
 };
 use crate::task_lifecycle::container;
 
@@ -69,8 +77,22 @@ const POLL_BUDGET: Duration =
         )
         .saturating_add(Duration::from_secs(4));
 
+/// How long a poll of a SERVICE's task keeps trying: the whole start of an `awsvpc` task
+/// ([`AWSVPC_START`], which covers the interface steps Amazon ECS takes and the start owed
+/// after them) plus the further spans a failed launch takes — the fetch is decided where the
+/// start would have been, and `STOPPED` falls due one span after that — with margin for a
+/// loaded test machine. Built by `Duration` arithmetic, so no figure here is a cast.
+const SERVICE_POLL_BUDGET: Duration = AWSVPC_START.saturating_add(
+    service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::TRANSITION_SPAN
+        .saturating_mul(4)
+        .saturating_add(Duration::from_secs(4)),
+);
+
 /// `Task$lastStatus` of a task that has stopped.
 const STOPPED: &str = "STOPPED";
+
+/// `Task$lastStatus` of a task that is running.
+const RUNNING: &str = "RUNNING";
 
 /// `Task$stopCode` of a task Amazon ECS could not launch the containers of
 /// (`smithy_query(query="shape",shape="TaskStopCode")`).
@@ -711,4 +733,378 @@ async fn a_service_keeps_a_running_task_past_the_span_a_standalone_task_ends_in(
         task["stopCode"].is_null(),
         "case {case:?}: expected no stopCode on a running task, got {task}"
     );
+}
+
+/// The repository the service rows below pull from, which holds ONE tagged image.
+const HELD_REPOSITORY: &str = "serviceapp";
+
+/// The tag that repository's one image carries.
+const HELD_TAG: &str = "1";
+
+/// A repository that is created and then left EMPTY — nothing is ever pushed to it, which is
+/// the state a repository is in between its create and its first push.
+const EMPTY_REPOSITORY: &str = "servicestaging";
+
+/// A repository name the registry is never asked to create.
+const ABSENT_REPOSITORY: &str = "nosuchrepository";
+
+/// A manifest digest no image of this registry was stored under: a well-formed `sha256`
+/// digest, so what the registry answers about the reference is that it resolves to nothing
+/// rather than that it cannot be read at all.
+const UNHELD_DIGEST: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Create `name` in this account's registry through Amazon ECR's own API, and answer the
+/// `Repository$repositoryUri` that registry published for it — "The URI for the repository.
+/// You can use this URI for container image push and pull operations", which is the value a
+/// client composes the image reference in its container definition from.
+async fn repository(router: &MultiServiceRouter, name: &str, case: &str) -> String {
+    let created = ecr(
+        router,
+        "CreateRepository",
+        json!({ "repositoryName": name }),
+        case,
+    )
+    .await;
+    string(&created["repository"], "repositoryUri", case)
+}
+
+/// Push one tagged image into the repository `name`, through Amazon ECR's own API.
+async fn push(router: &MultiServiceRouter, name: &str, tag: &str, case: &str) {
+    ecr(
+        router,
+        "PutImage",
+        json!({
+            "repositoryName": name,
+            "imageManifest": MANIFEST,
+            "imageTag": tag,
+        }),
+        case,
+    )
+    .await;
+}
+
+/// One row of the service table: a service whose revision runs `containers`, and the
+/// container its launch must fail at — `None` for a row whose every image the registry
+/// serves.
+struct ServiceRow {
+    case: &'static str,
+    /// The service's name, which is also its revision's family and the `serviceName` the row
+    /// is listed and described by.
+    name: &'static str,
+    /// `(container name, image reference)` per container of the revision, in the order the
+    /// revision declares them.
+    containers: Vec<(&'static str, String)>,
+    /// The name of the container whose image cannot be fetched, and `None` for a row that
+    /// runs.
+    fails_at: Option<&'static str>,
+}
+
+impl ServiceRow {
+    /// The image reference the container `name` of this row runs.
+    fn image_of(&self, name: &str) -> String {
+        self.containers
+            .iter()
+            .find(|(container, _)| *container == name)
+            .map(|(_, image)| image.clone())
+            .unwrap_or_else(|| {
+                panic!("case {:?}: the row declares the container {name:?}", self.case)
+            })
+    }
+}
+
+/// Register the `awsvpc`, Fargate-compatible revision of `row` as `execution_role` and
+/// create the service whose scheduler places it, with one task desired.
+///
+/// The revision names an execution role because the Fargate launch type requires one of a
+/// revision whose containers run Amazon ECR images (`RegisterTaskDefinition` refuses one
+/// without), and because the pull is made AS that role.
+async fn create_service(router: &MultiServiceRouter, row: &ServiceRow, execution_role: &str) {
+    let definitions: Vec<Value> = row
+        .containers
+        .iter()
+        .map(|(name, image)| container(name, image))
+        .collect();
+    ok(
+        router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": row.name,
+            "networkMode": "awsvpc",
+            "cpu": "256",
+            "memory": "512",
+            "requiresCompatibilities": ["FARGATE"],
+            "executionRoleArn": execution_role,
+            "containerDefinitions": definitions,
+        }),
+        row.case,
+    )
+    .await;
+    ok(
+        router,
+        "CreateService",
+        json!({
+            "cluster": CLUSTER,
+            "serviceName": row.name,
+            "taskDefinition": row.name,
+            "desiredCount": 1,
+            "launchType": "FARGATE",
+            "networkConfiguration": awsvpc_network_configuration(),
+        }),
+        row.case,
+    )
+    .await;
+}
+
+/// The tasks of `row`'s service that `ListTasks` reports in `desired_status` (every desired
+/// status when `None`), read back through `DescribeTasks` — the stored records, not the
+/// answer of the call that placed them.
+async fn service_tasks(
+    router: &MultiServiceRouter,
+    row: &ServiceRow,
+    desired_status: Option<&str>,
+) -> Vec<Value> {
+    let mut request = json!({ "cluster": CLUSTER, "serviceName": row.name });
+    if let Some(status) = desired_status {
+        request["desiredStatus"] = json!(status);
+    }
+    let listed = ok(router, "ListTasks", request, row.case).await;
+    let arns = list(&listed, "taskArns", row.case);
+    if arns.is_empty() {
+        return Vec::new();
+    }
+    let described = ok(
+        router,
+        "DescribeTasks",
+        json!({ "cluster": CLUSTER, "tasks": arns }),
+        row.case,
+    )
+    .await;
+    list(&described, "tasks", row.case)
+}
+
+/// The `runningCount` `DescribeServices` reports for `row`'s service.
+async fn running_count(router: &MultiServiceRouter, row: &ServiceRow) -> i64 {
+    let described = ok(
+        router,
+        "DescribeServices",
+        json!({ "cluster": CLUSTER, "services": [row.name] }),
+        row.case,
+    )
+    .await;
+    let service = list(&described, "services", row.case)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {:?}: expected the service back, got {described}",
+                row.case
+            )
+        });
+    count(&service, "runningCount", row.case)
+}
+
+/// The container `name` of `task`.
+fn container_of(task: &Value, name: &str, case: &str) -> Value {
+    list(task, "containers", case)
+        .into_iter()
+        .find(|container| container["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("case {case:?}: expected the container {name:?} on {task}"))
+}
+
+/// Assert everything the stop a failed fetch earns carries, on the task `task` of `row`.
+fn assert_failed_fetch(row: &ServiceRow, task: &Value, failing: &str) {
+    let case = row.case;
+    let image = row.image_of(failing);
+    let reason = string(task, "stoppedReason", case);
+    for expected in [CANNOT_PULL, image.as_str()] {
+        assert!(
+            reason.contains(expected),
+            "case {case:?}: expected the stoppedReason to carry {expected:?}, got {reason:?}"
+        );
+    }
+    assert!(
+        task["startedAt"].is_null(),
+        "case {case:?}: expected no startedAt on a task that never ran, got {task}"
+    );
+    // The failure belongs to the container whose image it was, and to that container alone.
+    for (name, _) in &row.containers {
+        let container = container_of(task, name, case);
+        let carried = container["reason"].as_str();
+        if *name == failing {
+            let carried = carried.unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected the failed fetch on the container {name:?}, got \
+                     {container}"
+                )
+            });
+            for expected in [CANNOT_PULL, image.as_str()] {
+                assert!(
+                    carried.contains(expected),
+                    "case {case:?}: expected the reason of {name:?} to carry {expected:?}, got \
+                     {carried:?}"
+                );
+            }
+        } else {
+            assert_eq!(
+                carried, None,
+                "case {case:?}: expected no reason on the container {name:?}, whose image was \
+                 fetched, got {container}"
+            );
+        }
+        assert_eq!(
+            container["lastStatus"].as_str(),
+            Some(STOPPED),
+            "case {case:?}: expected the container {name:?} of a stopped task to be stopped, \
+             got {container}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_service_whose_image_the_registry_resolves_to_nothing_stops_a_task_that_says_so() {
+    let router = emulator_with_ecr_and_iam();
+    cluster(&router).await;
+
+    // The registry's own records, written through Amazon ECR's API: one repository holding
+    // one tagged image, and one created and left empty.
+    let case = "the registry's records";
+    let held = repository(&router, HELD_REPOSITORY, case).await;
+    push(&router, HELD_REPOSITORY, HELD_TAG, case).await;
+    let empty = repository(&router, EMPTY_REPOSITORY, case).await;
+    // The repository nothing creates is named in the SAME registry the two above are in, so
+    // the rows differ in what that registry holds rather than in which registry they address.
+    let absent = held.replace(HELD_REPOSITORY, ABSENT_REPOSITORY);
+    // The task execution role every row pulls as, granted both calls a pull makes, so what
+    // the rows differ in is what the registry RESOLVES rather than what it authorizes.
+    let execution_role = role(
+        &router,
+        "servicepull",
+        Some(&grant(&["ecr:GetAuthorizationToken", "ecr:BatchGetImage"])),
+    )
+    .await;
+
+    let one = |case: &'static str, name: &'static str, image: String, fails: bool| ServiceRow {
+        case,
+        name,
+        containers: vec![("app", image)],
+        fails_at: fails.then_some("app"),
+    };
+    let rows = vec![
+        one(
+            "a tag the repository never held",
+            "missingtagservice",
+            format!("{held}:does-not-exist"),
+            true,
+        ),
+        one(
+            "a repository created and left empty",
+            "emptyrepservice",
+            format!("{empty}:{HELD_TAG}"),
+            true,
+        ),
+        one(
+            "a repository this registry does not hold",
+            "absentrepservice",
+            format!("{absent}:{HELD_TAG}"),
+            true,
+        ),
+        one(
+            "a digest the repository cannot resolve",
+            "missingdigestservice",
+            format!("{held}@{UNHELD_DIGEST}"),
+            true,
+        ),
+        ServiceRow {
+            case: "a second container whose image the registry holds nothing for",
+            name: "sidecarmissingservice",
+            containers: vec![
+                ("app", format!("{held}:{HELD_TAG}")),
+                ("sidecar", format!("{held}:2")),
+            ],
+            fails_at: Some("sidecar"),
+        },
+        one(
+            "the tag the repository holds",
+            "heldtagservice",
+            format!("{held}:{HELD_TAG}"),
+            false,
+        ),
+    ];
+
+    // Every service is created first and polled afterwards: each converges on its own clock,
+    // so the whole table costs one run rather than one per row.
+    for row in &rows {
+        create_service(&router, row, &execution_role).await;
+    }
+
+    for row in &rows {
+        let case = row.case;
+        let deadline = Instant::now() + SERVICE_POLL_BUDGET;
+        loop {
+            let settled = match row.fails_at {
+                Some(failing) => {
+                    // The task is reached exactly as a caller diagnosing the service reaches
+                    // it: listed under the stopped desired status, then described.
+                    let failed = service_tasks(&router, row, Some(STOPPED))
+                        .await
+                        .into_iter()
+                        .find(|task| {
+                            task["lastStatus"].as_str() == Some(STOPPED)
+                                && task["stopCode"].as_str() == Some(TASK_FAILED_TO_START)
+                        });
+                    match failed {
+                        Some(task) => {
+                            assert_failed_fetch(row, &task, failing);
+                            // A service whose scheduler cannot launch a task runs none.
+                            let running = running_count(&router, row).await;
+                            assert_eq!(
+                                running, 0,
+                                "case {case:?}: expected the service to run no task, got \
+                                 runningCount {running}"
+                            );
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                None => {
+                    // The row the registry serves: its task runs, and nothing of it is ever
+                    // stopped for a fetch that failed.
+                    let running = service_tasks(&router, row, None)
+                        .await
+                        .into_iter()
+                        .any(|task| task["lastStatus"].as_str() == Some(RUNNING));
+                    if running {
+                        let reported = running_count(&router, row).await;
+                        assert_eq!(
+                            reported, 1,
+                            "case {case:?}: expected the service to run its one task, got \
+                             runningCount {reported}"
+                        );
+                        let stopped = service_tasks(&router, row, Some(STOPPED)).await;
+                        assert!(
+                            !stopped.iter().any(|task| {
+                                task["stopCode"].as_str() == Some(TASK_FAILED_TO_START)
+                            }),
+                            "case {case:?}: expected no failed launch for an image the registry \
+                             serves, got {stopped:?}"
+                        );
+                    }
+                    running
+                }
+            };
+            if settled {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: expected the service's task to settle on what the registry \
+                 answered about its image, got the tasks {:?} with runningCount {}",
+                service_tasks(&router, row, None).await,
+                running_count(&router, row).await
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
 }
