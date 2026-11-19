@@ -13,7 +13,11 @@
 //!    spelling of a name (escaped or literal, upper or lower case, with or
 //!    without the trailing dot) names the SAME record set. The table rows differ
 //!    along the octet that needs escaping, the case of the letters, the number of
-//!    labels and whether the caller already sent the escaped spelling.
+//!    labels and whether the caller already sent the escaped spelling. The name
+//!    an alias ROUTES TO is another resource's own domain name rather than a name
+//!    this service spells, so it is reported as submitted — fully qualified and
+//!    lower-cased, never re-spelled — while still being IDENTIFIED by the name it
+//!    spells.
 //! 2. A record set is identified by the TRIPLE (name, type, set identifier), and
 //!    a refusal naming a record set names all three parts it has.
 //!    One name and type are served EITHER by a single simple record set OR by a
@@ -388,12 +392,21 @@ async fn two_spellings_of_one_name_are_one_record_set() {
 // 2. Identity is the triple (name, type, set identifier)
 // ---------------------------------------------------------------------------
 
+/// The hosted zone the alias rows below route INTO: a load balancer's own
+/// canonical hosted zone, whose id a caller reads off the resource
+/// (`DescribeLoadBalancers`' `CanonicalHostedZoneId`, per
+/// `smithy_query(query="doc",shape="AliasTarget",member="HostedZoneId")`) rather
+/// than being fixed by the service that owns it. No domain is fixed with such an
+/// id, so these rows are about how a target is SPELLED and nothing else. Named
+/// once, in the suite that pins where an alias target may lie.
+use crate::record_set_validation::RESOURCE_ZONE as TARGET_ZONE;
+
 /// A `<Change>` element for an ALIAS record set, which routes to another DNS
 /// name instead of carrying record data (so no TTL and no `ResourceRecords`).
 fn alias_change(action: &str, name: &str, target: &str) -> String {
     format!(
         "<Change><Action>{action}</Action><ResourceRecordSet><Name>{}</Name><Type>A</Type>\
-         <AliasTarget><HostedZoneId>Z2FDTNDATAQYW2</HostedZoneId><DNSName>{}</DNSName>\
+         <AliasTarget><HostedZoneId>{TARGET_ZONE}</HostedZoneId><DNSName>{}</DNSName>\
          <EvaluateTargetHealth>false</EvaluateTargetHealth></AliasTarget>\
          </ResourceRecordSet></Change>",
         escape_xml(name),
@@ -401,40 +414,90 @@ fn alias_change(action: &str, name: &str, target: &str) -> String {
     )
 }
 
-#[tokio::test]
-async fn an_alias_targets_dns_name_is_stored_in_canonical_form() {
-    // The canonical form is a rule about DNS NAMES, not about one member: the
-    // name an alias routes to is held in it too, so it comes back canonical and
-    // a DELETE naming the target in any other spelling still matches the stored
-    // record set. The rows differ along the spelling axis the rule generalises
-    // over: letter case and a missing trailing dot, an already canonical name,
-    // and a target carrying an octet outside the literal set.
-    let router = router();
-    let zone_id = create_zone_ok(&router, ZONE, "ref-alias-canonical").await;
+/// One spelling of an alias target, the value the service must report it as, and
+/// a spelling a DELETE may restate it with.
+struct AliasTargetCase {
+    /// The case this row is named by in every assertion below.
+    label: &'static str,
+    /// The `AliasTarget.DNSName` the change batch is written with.
+    submitted: &'static str,
+    /// The value a listing must report for it.
+    reported: &'static str,
+    /// A spelling of the SAME name a DELETE restates the record set with — the
+    /// reported one, or another spelling of it.
+    restated: &'static str,
+}
 
-    for (index, (label, submitted, canonical)) in [
-        (
-            "mixed case with no trailing dot",
-            "My-LB-123456.us-east-1.ELB.amazonaws.com",
-            "my-lb-123456.us-east-1.elb.amazonaws.com.",
-        ),
-        (
-            "already canonical",
-            "d111111abcdef8.cloudfront.net.",
-            "d111111abcdef8.cloudfront.net.",
-        ),
-        (
-            "an octet outside the literal set",
-            "*.example.net",
-            "\\052.example.net.",
-        ),
+#[tokio::test]
+async fn an_alias_targets_dns_name_is_reported_as_it_was_submitted() {
+    // The name an alias ROUTES TO is another resource's own domain name — "the
+    // domain name that CloudFront assigned when you created your distribution",
+    // "the DNS name that is associated with the load balancer" (see
+    // `smithy_query(query="doc",shape="AliasTarget",member="DNSName")`) — so it
+    // is reported as it was submitted, folded to lower case and terminated by
+    // the root dot ("The trailing dot is optional; Amazon Route 53 assumes that
+    // the domain name is fully qualified"), and NOT re-spelled in the
+    // presentation format the record set's own `Name` is reported in. That is
+    // what lets a caller compare the target it reads back with the name the
+    // owning service handed it. Identity is unchanged: a DELETE restating the
+    // same name in any other spelling still names the stored record set.
+    //
+    // The rows differ along what the rule generalises over: letter case, a
+    // missing trailing dot, an already qualified name, an octet outside the
+    // literal set, an authority carrying a port (the form a data plane this
+    // emulator serves publishes), an IPv6 authority in brackets, and a label
+    // carrying an underscore.
+    let router = router();
+    let zone_id = create_zone_ok(&router, ZONE, "ref-alias-reported").await;
+
+    for (index, case) in [
+        AliasTargetCase {
+            label: "mixed case with no trailing dot",
+            submitted: "My-LB-123456.us-east-1.ELB.amazonaws.com",
+            reported: "my-lb-123456.us-east-1.elb.amazonaws.com.",
+            restated: "MY-LB-123456.US-EAST-1.elb.amazonaws.com.",
+        },
+        AliasTargetCase {
+            label: "already fully qualified and lower case",
+            submitted: "d111111abcdef8.cloudfront.net.",
+            reported: "d111111abcdef8.cloudfront.net.",
+            restated: "d111111abcdef8.cloudfront.net.",
+        },
+        AliasTargetCase {
+            // An octet outside the literal set is NOT escaped here, and the
+            // escaped spelling of it still names the same name.
+            label: "an octet outside the literal set",
+            submitted: "*.example.net",
+            reported: "*.example.net.",
+            restated: "\\052.example.net.",
+        },
+        AliasTargetCase {
+            label: "an authority carrying a port",
+            submitted: "127.0.0.1:34865",
+            reported: "127.0.0.1:34865.",
+            restated: "127.0.0.1\\07234865.",
+        },
+        AliasTargetCase {
+            label: "an IPv6 authority in brackets, upper case",
+            submitted: "[2001:DB8::A]:9443",
+            reported: "[2001:db8::a]:9443.",
+            restated: "[2001:db8::a]:9443.",
+        },
+        AliasTargetCase {
+            label: "a label carrying an underscore",
+            submitted: "_endpoint.Example.COM",
+            reported: "_endpoint.example.com.",
+            restated: "_endpoint.example.com.",
+        },
     ]
     .into_iter()
     .enumerate()
     {
+        let label = case.label;
         let name = format!("alias{index}.example.com");
         let stored_name = format!("alias{index}.example.com.");
-        let created = submit(&router, &zone_id, &alias_change("CREATE", &name, submitted)).await;
+        let created =
+            submit(&router, &zone_id, &alias_change("CREATE", &name, case.submitted)).await;
         assert_eq!(
             created.status, 200,
             "case {label}: expected 200, got {} with body {}",
@@ -444,19 +507,21 @@ async fn an_alias_targets_dns_name_is_stored_in_canonical_form() {
         let listed = list(&router, &zone_id).await;
         let targets = listed.all("AliasTarget/DNSName");
         assert!(
-            targets.contains(&canonical),
-            "case {label}: expected the alias target {canonical:?} in the listing, got {targets:?}"
+            targets.contains(&case.reported),
+            "case {label}: expected the alias target {:?} in the listing, got {targets:?}",
+            case.reported
         );
 
         // "To delete a resource record set, you must specify all the same values
-        // that you specified when you created it" — and the canonical form is
-        // what makes the OTHER spelling those same values.
-        let deleted = submit(&router, &zone_id, &alias_change("DELETE", &name, canonical)).await;
+        // that you specified when you created it" — and a name's identity is
+        // what makes another spelling of the target those same values.
+        let deleted =
+            submit(&router, &zone_id, &alias_change("DELETE", &name, case.restated)).await;
         assert_eq!(
             deleted.status, 200,
-            "case {label}: a DELETE naming the canonical target must be accepted, got {} with \
+            "case {label}: a DELETE restating the target as {:?} must be accepted, got {} with \
              body {}",
-            deleted.status, deleted.body
+            case.restated, deleted.status, deleted.body
         );
         assert_eq!(
             count_named(&router, &zone_id, &stored_name).await,

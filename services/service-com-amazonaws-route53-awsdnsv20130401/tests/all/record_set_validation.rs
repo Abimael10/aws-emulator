@@ -24,6 +24,10 @@
 //! 5. A latency record set routes by an Amazon EC2 Region, so it needs both the
 //!    identifier that tells it from its siblings and a `Region` that names a
 //!    region: two requirements refused by two different stages.
+//! 6. An alias routes to the resource its target names, so the target has to lie
+//!    within the hosted zone it names — checkable for the target zones whose id
+//!    the owning service fixes, and refused (`InvalidChangeBatch`) when it does
+//!    not.
 //!
 //! Every test drives the service through the real router, using the SAME
 //! harness `hosted_zone_records` uses, so what is asserted is the HTTP/restXml
@@ -1084,4 +1088,189 @@ async fn a_latency_record_set_is_refused_in_two_stages() {
         "case a region beside a shape fault: expected InvalidInput, got {}",
         mixed.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// 6. An alias target lies within the hosted zone it names
+// ---------------------------------------------------------------------------
+
+/// The hosted zone id AWS fixes for a Global Accelerator accelerator, from the
+/// same documentation `CLOUDFRONT_ZONE` is read off ("Global Accelerator
+/// accelerator: Specify `Z2BJ6XQ5FK7U4H`"). Exercised here because the rule is
+/// about every target zone whose domain is fixed with its id, not about one of
+/// them.
+const GLOBAL_ACCELERATOR_ZONE: &str = "Z2BJ6XQ5FK7U4H";
+
+/// A target zone whose id a caller reads off the RESOURCE instead — a load
+/// balancer's `CanonicalHostedZoneId`, per the same documentation — so no domain
+/// is fixed with it and a target naming it is not checked against one.
+///
+/// `pub(crate)` so a sibling suite writing an alias that is about something OTHER
+/// than where its target lies names the same zone rather than a second copy of it.
+pub(crate) const RESOURCE_ZONE: &str = "Z35SXDOTRQ7X7K";
+
+/// One alias target and the zone it names, with what the service must do with
+/// it.
+struct AliasZoneCase {
+    label: &'static str,
+    /// The `AliasTarget.HostedZoneId` the change names.
+    zone: &'static str,
+    /// The `AliasTarget.DNSName` the change names.
+    target: &'static str,
+    /// That target as the service reports it: lower-cased and fully qualified.
+    reported: &'static str,
+    /// Whether the batch must be refused.
+    refused: bool,
+}
+
+#[tokio::test]
+async fn an_alias_target_must_lie_within_the_hosted_zone_it_names() {
+    // The rule: an alias routes to the resource its target names, and the target
+    // names it by the hosted zone it lives in plus its name INSIDE that zone, so
+    // a change writing an alias whose target lies outside the zone it names is
+    // refused `InvalidChangeBatch`. The zones this is decidable for are the ones
+    // whose id the owning service FIXES — CloudFront's and Global Accelerator's,
+    // the two `AliasTarget$HostedZoneId` states by id — because the domain their
+    // names lie in is fixed with the id; a zone id read off a resource fixes no
+    // domain, so a target naming one is accepted whatever it is.
+    //
+    // The rows span what the rule generalises over: the two fixed zones, a
+    // target inside the zone and one outside it, the case and trailing dot it is
+    // written in, a name whose last labels only LOOK like the zone's, a name that
+    // merely ends with the zone's text inside a longer label, each fixed zone
+    // against the OTHER one's domain, a target that names the address an endpoint
+    // of this emulator is published at, and a zone id no domain is fixed with.
+    let router = router();
+    let zone_id = create_zone_ok(&router, ZONE, "alias-target-zone").await;
+
+    let rows: &[AliasZoneCase] = &[
+        AliasZoneCase {
+            label: "a distribution's own domain",
+            zone: CLOUDFRONT_ZONE,
+            target: "d111111abcdef8.cloudfront.net",
+            reported: "d111111abcdef8.cloudfront.net.",
+            refused: false,
+        },
+        AliasZoneCase {
+            label: "the same domain in mixed case, already qualified",
+            zone: CLOUDFRONT_ZONE,
+            target: "D111111ABCDEF8.CloudFront.NET.",
+            reported: "d111111abcdef8.cloudfront.net.",
+            refused: false,
+        },
+        AliasZoneCase {
+            label: "a name in the caller's own domain",
+            zone: CLOUDFRONT_ZONE,
+            target: "cdn.example.net",
+            reported: "cdn.example.net.",
+            refused: true,
+        },
+        AliasZoneCase {
+            label: "a name whose last labels only look like the zone's",
+            zone: CLOUDFRONT_ZONE,
+            target: "notcloudfront.net",
+            reported: "notcloudfront.net.",
+            refused: true,
+        },
+        AliasZoneCase {
+            label: "a name that carries the zone's text in a longer suffix",
+            zone: CLOUDFRONT_ZONE,
+            target: "d111111abcdef8.cloudfront.net.example.com",
+            reported: "d111111abcdef8.cloudfront.net.example.com.",
+            refused: true,
+        },
+        AliasZoneCase {
+            label: "an accelerator's own DNS name",
+            zone: GLOBAL_ACCELERATOR_ZONE,
+            target: "a1234567890abcdef.awsglobalaccelerator.com",
+            reported: "a1234567890abcdef.awsglobalaccelerator.com.",
+            refused: false,
+        },
+        AliasZoneCase {
+            label: "the other fixed zone's domain under the accelerator zone",
+            zone: GLOBAL_ACCELERATOR_ZONE,
+            target: "d111111abcdef8.cloudfront.net",
+            reported: "d111111abcdef8.cloudfront.net.",
+            refused: true,
+        },
+        AliasZoneCase {
+            label: "the accelerator domain under the CloudFront zone",
+            zone: CLOUDFRONT_ZONE,
+            target: "a1234567890abcdef.awsglobalaccelerator.com",
+            reported: "a1234567890abcdef.awsglobalaccelerator.com.",
+            refused: true,
+        },
+        AliasZoneCase {
+            // An endpoint this emulator serves is published as the address a
+            // client dials rather than as a name in the owning service's zone,
+            // so a target that names one names an endpoint of that zone.
+            label: "the address an endpoint of this emulator is published at",
+            zone: CLOUDFRONT_ZONE,
+            target: "127.0.0.1:34865",
+            reported: "127.0.0.1:34865.",
+            refused: false,
+        },
+        AliasZoneCase {
+            label: "a zone id read off the resource, with a load balancer's name",
+            zone: RESOURCE_ZONE,
+            target: "my-lb-123456.us-east-1.elb.amazonaws.com",
+            reported: "my-lb-123456.us-east-1.elb.amazonaws.com.",
+            refused: false,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let record = Rrset::new(&format!("alias{index}.{ZONE}"), "A").alias(row.zone, row.target);
+        let reply = submit_one(&router, &zone_id, "CREATE", &record).await;
+        if row.refused {
+            assert_refused(
+                &router,
+                &zone_id,
+                row.label,
+                &reply,
+                "InvalidChangeBatch",
+                &format!(
+                    "[Tried to create an alias that targets {}, type A in zone {}, but the \
+                     alias target name does not lie within the target zone]",
+                    row.reported, row.zone
+                ),
+                &record.canonical(),
+            )
+            .await;
+            continue;
+        }
+        assert_eq!(
+            reply.status, 200,
+            "case {:?}: expected the alias to be accepted, got {} with body {}",
+            row.label, reply.status, reply.body
+        );
+        let listed = list(&router, &zone_id).await;
+        let targets = listed.all("AliasTarget/DNSName");
+        assert!(
+            targets.contains(&row.reported),
+            "case {:?}: expected the alias target {:?} in the listing, got {targets:?}",
+            row.label,
+            row.reported
+        );
+    }
+
+    // The rule is about what a change WRITES, not about the action it writes
+    // with: an UPSERT carrying an out-of-zone target is refused exactly as the
+    // CREATE above is.
+    let upserted = Rrset::new(&format!("upsert.{ZONE}"), "A")
+        .alias(CLOUDFRONT_ZONE, "cdn.example.net");
+    let reply = submit_one(&router, &zone_id, "UPSERT", &upserted).await;
+    assert_refused(
+        &router,
+        &zone_id,
+        "an UPSERT with an out-of-zone target",
+        &reply,
+        "InvalidChangeBatch",
+        &format!(
+            "[Tried to create an alias that targets cdn.example.net., type A in zone \
+             {CLOUDFRONT_ZONE}, but the alias target name does not lie within the target zone]"
+        ),
+        &upserted.canonical(),
+    )
+    .await;
 }

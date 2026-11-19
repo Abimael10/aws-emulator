@@ -200,11 +200,12 @@ async fn an_alias_to_an_address_is_answered_with_that_address() {
 
     // The answer is composed from the record set, which the query leaves exactly
     // as it was created: the alias target a listing reports still carries the
-    // authority — port included — that the publishing service handed the caller.
+    // authority — port included — that the publishing service handed the caller,
+    // character for character.
     let listed = list(&router, &zone_id).await;
     let targets = listed.all("AliasTarget/DNSName");
     assert!(
-        targets.contains(&"127.0.0.1\\07234567."),
+        targets.contains(&"127.0.0.1:34567."),
         "expected the stored alias target to keep the published authority, got {targets:?}"
     );
 }

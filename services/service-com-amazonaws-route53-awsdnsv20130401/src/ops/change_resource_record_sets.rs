@@ -107,11 +107,11 @@
 use super::types::*;
 
 use crate::state::{
-    canonical_dns_name, dns_name_fault, dns_name_fault_clause, dns_sort_key, name_is_in_zone,
-    name_not_permitted_in_zone_message, no_such_health_check, no_such_hosted_zone,
-    normalize_zone_id, record_set_already_exists_message, record_set_label,
-    zone_record_set_limit_message, DnsNameKey, RecordKey, MAX_CHANGES_PER_BATCH,
-    MAX_RECORD_SETS_PER_ZONE, MAX_REPORTED_CHANGE_PROBLEMS,
+    alias_target_zone_problem, canonical_dns_name, dns_name_fault, dns_name_fault_clause,
+    dns_sort_key, name_is_in_zone, name_not_permitted_in_zone_message, no_such_health_check,
+    no_such_hosted_zone, normalize_zone_id, record_set_already_exists_message, record_set_label,
+    reported_target_dns_name, zone_record_set_limit_message, DnsNameKey, RecordKey,
+    MAX_CHANGES_PER_BATCH, MAX_RECORD_SETS_PER_ZONE, MAX_REPORTED_CHANGE_PROBLEMS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -595,8 +595,12 @@ fn delete_names_stored(stored: &ResourceRecordSet, named: &ResourceRecordSet) ->
         (None, None) => true,
         (Some(named), Some(stored)) => {
             named.hosted_zone_id == stored.hosted_zone_id
-                // A DNS name is case-insensitive, so an alias target's is too.
-                && named.dns_name.eq_ignore_ascii_case(&stored.dns_name)
+                // The target is compared by the NAME it spells, not by the
+                // characters it is written with: a DNS name is case-insensitive,
+                // and the escaped and the literal spelling of an octet are one
+                // name — which is what `canonical_dns_name` resolves every
+                // spelling onto.
+                && canonical_dns_name(&named.dns_name) == canonical_dns_name(&stored.dns_name)
                 && named.evaluate_target_health == stored.evaluate_target_health
         }
         _ => false,
@@ -784,17 +788,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for change in &input.change_batch.changes {
             let mut record = change.resource_record_set.clone();
             // A record set is stored, keyed and reported under the ONE canonical
-            // form of its name, whatever spelling the change was written with;
-            // the same holds for the DNS name an alias routes to.
+            // form of its name, whatever spelling the change was written with.
             record.name = canonical_dns_name(&record.name);
+            // The name an alias ROUTES TO is another resource's own domain name,
+            // which this service reports as it was submitted — fully qualified
+            // and folded to lower case, not re-spelled in the presentation
+            // format the record set's own name is reported in.
             if let Some(alias) = record.alias_target.as_mut() {
-                alias.dns_name = canonical_dns_name(&alias.dns_name);
+                alias.dns_name = reported_target_dns_name(&alias.dns_name);
             }
             let action = change.action.as_str();
             let key = RecordKey::of_record(&record);
 
             if !name_is_in_zone(&record.name, &zone_name) {
                 problems.push(name_not_permitted_in_zone_message(&record.name, &zone_name));
+                continue;
+            }
+
+            // WHERE AN ALIAS ROUTES TO: the target names a resource by the
+            // hosted zone it lives in and its name inside that zone, so a change
+            // that WRITES an alias whose target lies outside the zone it names
+            // writes an alias that routes nowhere. A `DELETE` restates the
+            // values of a record set that already exists in order to remove it,
+            // so it names no new target to check.
+            let written_alias = record
+                .alias_target
+                .as_ref()
+                .filter(|_| action != CHANGE_ACTION_DELETE);
+            if let Some(problem) = written_alias.and_then(|alias| {
+                alias_target_zone_problem(&alias.dns_name, &record.r#type, &alias.hosted_zone_id)
+            }) {
+                problems.push(problem);
                 continue;
             }
 
