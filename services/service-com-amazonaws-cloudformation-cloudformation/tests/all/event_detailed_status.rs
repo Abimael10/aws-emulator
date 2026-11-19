@@ -24,6 +24,11 @@
 //! `unsupported_resource_properties.rs` (the property validation) and
 //! `stack_name_conflict_validation.rs` (the existence check); what this one adds is which
 //! events do NOT carry it.
+//!
+//! The templates and the collision below are this target's ONE fixture set for "a create each
+//! stage of a stack operation can fail", shared with `stack_level_create_failure_event.rs`
+//! (which pins how many of the stack's own failure events exist and where they stand), so the
+//! two suites cannot drift apart about what the same stage and the same collision are.
 
 use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
@@ -38,7 +43,7 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{resource_status
 /// pre-deployment validation failed, from the model's `DetailedStatus` enum
 /// (`smithy_query(query="shape", shape="DetailedStatus")`, whose values are
 /// `[CONFIGURATION_COMPLETE, VALIDATION_FAILED]`).
-const VALIDATION_FAILED: &str = "VALIDATION_FAILED";
+pub(crate) const VALIDATION_FAILED: &str = "VALIDATION_FAILED";
 
 /// The two `EventType` values the rows below read a detailed status off, from the model's
 /// `EventType` enum: the stack's own status change, and the result of a pre-deployment
@@ -48,17 +53,17 @@ const VALIDATION_ERROR: &str = "VALIDATION_ERROR";
 
 /// The log-group name the collision rows are about: held by CloudWatch Logs itself before the
 /// create, so it is a name held OUTSIDE CloudFormation.
-const HELD_GROUP: &str = "/detailed-status/held";
+pub(crate) const HELD_GROUP: &str = "/detailed-status/held";
 
 /// A declaration carrying a member its type's schema states no property for, which is what the
 /// property validation fails an operation on.
-const UNSUPPORTED_PROPERTY_TEMPLATE: &str = r#"{"Resources":{"Param":{
+pub(crate) const UNSUPPORTED_PROPERTY_TEMPLATE: &str = r#"{"Resources":{"Param":{
     "Type":"AWS::SSM::Parameter","Properties":{"Name":"detailed-status-parameter",
     "Type":"String","Value":"x","ThisPropertyDoesNotExist":"x"}}}}"#;
 
 /// A declaration of a log group at a name something else already holds, which is what the
 /// existence check fails an operation on.
-fn colliding_group_template() -> String {
+pub(crate) fn colliding_group_template() -> String {
     json!({
         "Resources": {
             "Group": {
@@ -73,19 +78,19 @@ fn colliding_group_template() -> String {
 /// A FIFO topic whose name does not carry the suffix Amazon SNS requires: the declaration
 /// reaches the owning service, which refuses it — a failure no validation of
 /// CloudFormation's own reached.
-const REFUSED_TOPIC_TEMPLATE: &str = r#"{"Resources":{"Notifications":{
+pub(crate) const REFUSED_TOPIC_TEMPLATE: &str = r#"{"Resources":{"Notifications":{
     "Type":"AWS::SNS::Topic","Properties":{"TopicName":"detailed-status-fifo",
     "FifoTopic":true}}}}"#;
 
 /// A template whose declared transform cannot be applied to it: the document the stack would
 /// have deployed could not be produced, so the stack's own failure event carries that
 /// diagnostic — which is CloudFormation's, not a validation's verdict.
-const UNPROCESSABLE_TEMPLATE: &str = r#"{"Transform":"AWS::LanguageExtensions",
+pub(crate) const UNPROCESSABLE_TEMPLATE: &str = r#"{"Transform":"AWS::LanguageExtensions",
     "Mappings":{"Fn::ForEach::Envs":["E",["a"],{"M${E}":{"k":{"v":"x"}}}]},
     "Resources":{"Topic":{"Type":"AWS::SNS::Topic"}}}"#;
 
 /// A template that deploys: the control row, whose events report no detailed status either.
-const DEPLOYABLE_TEMPLATE: &str = r#"{"Resources":{"Topic":{"Type":"AWS::SNS::Topic",
+pub(crate) const DEPLOYABLE_TEMPLATE: &str = r#"{"Resources":{"Topic":{"Type":"AWS::SNS::Topic",
     "Properties":{"TopicName":"detailed-status-control"}}}}"#;
 
 /// One row: what the create submits, and which of its recorded events must carry a detailed
@@ -223,6 +228,21 @@ fn rows() -> Vec<Row> {
     ]
 }
 
+/// Give CloudWatch Logs [`HELD_GROUP`], so the name the colliding declaration above states is
+/// already taken OUTSIDE CloudFormation before the operation runs.
+pub(crate) async fn hold_the_held_group(router: &MultiServiceRouter, case: &str) {
+    let (code, body) = logs(
+        router,
+        "CreateLogGroup",
+        &json!({"logGroupName": HELD_GROUP}),
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: the setup CreateLogGroup must answer 200, got {code} {body}"
+    );
+}
+
 /// The `(LogicalResourceId, ResourceStatus)` of every event `DescribeStackEvents` reports a
 /// non-empty `DetailedStatus` on, with the value it reports — sorted, since what the rule is
 /// about is WHICH events carry one and not the order the log is paged in.
@@ -328,16 +348,7 @@ async fn only_a_validation_failure_carries_a_detailed_status() {
         let router = router();
 
         if row.holds_the_group {
-            let (code, body) = logs(
-                &router,
-                "CreateLogGroup",
-                &json!({"logGroupName": HELD_GROUP}),
-            )
-            .await;
-            assert_eq!(
-                code, 200,
-                "case {case:?}: the setup CreateLogGroup must answer 200, got {code} {body}"
-            );
+            hold_the_held_group(&router, case).await;
         }
 
         let extra: Vec<(String, String)> = row

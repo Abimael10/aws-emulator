@@ -932,6 +932,51 @@ pub async fn stack_event_reasons(
     xml_texts(&events, "ResourceStatusReason")
 }
 
+/// One recorded event of a stack ITSELF, as the three members its own transitions report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackOwnEvent {
+    pub resource_status: String,
+    pub detailed_status: String,
+    pub reason: String,
+}
+
+/// The events whose `LogicalResourceId` is the stack itself, OLDEST FIRST — the order the
+/// stack moved through them, which `DescribeStackEvents` reports reversed ("Returns all stack
+/// related events for a specified stack in reverse chronological order").
+///
+/// The ONE reader of a stack's own transitions for the suites that assert the SEQUENCE they
+/// were recorded in, so none of them re-spells the "filter to the stack's own logical id, then
+/// un-reverse" scan. The whole stream is read in one page and the absence of a `NextToken` is
+/// asserted, so a caller counting those events counts every one the stack recorded and not the
+/// head of a longer log.
+pub async fn stack_own_events(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+) -> Vec<StackOwnEvent> {
+    let (code, body) = call(router, "DescribeStackEvents", &[member("StackName", stack)]).await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: DescribeStackEvents({stack}) must answer 200, got {code} {body}"
+    );
+    assert_eq!(
+        xml_text(&body, "NextToken"),
+        None,
+        "case {case:?}: expected the whole event stream in one page, got {body}"
+    );
+    let mut oldest_first: Vec<StackOwnEvent> = xml_blocks(&body, "member")
+        .iter()
+        .filter(|event| xml_text(event, "LogicalResourceId").as_deref() == Some(stack))
+        .map(|event| StackOwnEvent {
+            resource_status: xml_text(event, "ResourceStatus").unwrap_or_default(),
+            detailed_status: xml_text(event, "DetailedStatus").unwrap_or_default(),
+            reason: xml_text(event, "ResourceStatusReason").unwrap_or_default(),
+        })
+        .collect();
+    oldest_first.reverse();
+    oldest_first
+}
+
 /// `GetTemplate` at one stage, or at the service's default when `stage` is `None`.
 pub async fn get_template(
     router: &MultiServiceRouter,

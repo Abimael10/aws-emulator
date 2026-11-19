@@ -2,15 +2,21 @@
 
 //! WHICH events report a failed stack operation, end to end over the awsQuery wire.
 //!
-//! RULE under test: **a stack-level event reports a failed status only where the stack RESTS
-//! in it.** A create or update CloudFormation rolls back never rests in `CREATE_FAILED` /
-//! `UPDATE_FAILED` — it goes from the operation's own `*_IN_PROGRESS` straight into
-//! `ROLLBACK_IN_PROGRESS` / `UPDATE_ROLLBACK_IN_PROGRESS`, whose event carries the failure
-//! and, for a rolled-back create, the clause saying the rollback was asked for — so the only
-//! `*_FAILED` event such an operation leaves is the one of the RESOURCE that failed. A caller
-//! that asked for the failed state to be kept (`OnFailure=DO_NOTHING`, `DisableRollback`)
-//! gets a stack that does rest in the failed status, and then the stack's own event reports
-//! it too.
+//! RULE under test: **a stack-level event reports a failed status an OWNING SERVICE's refusal
+//! reached only where the stack RESTS in that status.** A create or update CloudFormation
+//! rolls back never rests in `CREATE_FAILED` / `UPDATE_FAILED` — it goes from the operation's
+//! own `*_IN_PROGRESS` straight into `ROLLBACK_IN_PROGRESS` /
+//! `UPDATE_ROLLBACK_IN_PROGRESS`, whose event carries the failure and, for a rolled-back
+//! create, the clause saying the rollback was asked for — so the only `*_FAILED` event such an
+//! operation leaves is the one of the RESOURCE that failed. A caller that asked for the failed
+//! state to be kept (`OnFailure=DO_NOTHING`, `DisableRollback`) gets a stack that does rest in
+//! the failed status, and then the stack's own event reports it too.
+//!
+//! Every row here fails at an owning service, which is what the rule above is about: a failure
+//! CloudFormation's own PRE-DEPLOYMENT VALIDATION reached has no resource event that could
+//! carry it, so the stack's own failure event reports it even where the rollback begins at the
+//! same instant — `stack_level_create_failure_event.rs` is the suite that pins that half, and
+//! which of the two a given failure is.
 //!
 //! Why it matters: deployment tooling reads the event stream to find WHAT failed — the
 //! `*_FAILED` events, whose `LogicalResourceId` and `ResourceType` name the resources to fix.
