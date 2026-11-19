@@ -4102,6 +4102,32 @@ pub const KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE: &str =
     "An argument is invalid: to create a key group, you must specify at least one public \
      key for the key group";
 
+/// The modelled `InvalidArgument` (HTTP 400) for a key group configuration whose `Items`
+/// name a public key this account holds none of.
+///
+/// `KeyGroupConfig$Items` is "a list of the identifiers of the public keys in the key group",
+/// and a key group is what makes those keys the signers a cache behaviour trusts — so an
+/// entry resolving to nothing names no signer at all, and CloudFront treats such a
+/// configuration as unusable rather than storing a reference to a key that is not there. The
+/// sentence states the CONDITION — the configuration names a public key that does not exist
+/// — so nothing from the request or from the store belongs in it, as
+/// [`KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE`] carries nothing for the other rule about the
+/// same member.
+pub fn absent_public_key_in_key_group() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(ABSENT_PUBLIC_KEY_IN_KEY_GROUP_MESSAGE.to_string()),
+    }
+}
+
+/// The message a key group write naming an absent public key is refused with, as CloudFront
+/// sends it on the wire — observed in a recorded CloudFront response to this refusal, which
+/// is the source this wording comes from: the service names the resource "CloudFront public
+/// key" and words the condition "does not exist", as [`NO_SUCH_PUBLIC_KEY_MESSAGE`] does for
+/// a read of the key itself, and says where the unresolvable reference was found. Fixed text
+/// throughout: it carries no identifier.
+pub const ABSENT_PUBLIC_KEY_IN_KEY_GROUP_MESSAGE: &str =
+    "The specified CloudFront public key does not exist in key group.";
+
 /// The modelled `InvalidArgument` (HTTP 400) for a `ListKeyGroups` `Marker` that is no
 /// resume point this service handed out.
 ///

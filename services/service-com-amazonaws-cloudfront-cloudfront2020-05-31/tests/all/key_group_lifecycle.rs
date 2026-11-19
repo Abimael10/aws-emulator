@@ -26,8 +26,8 @@
 //!   the signatures" — read from that key group's stored record.
 //!
 //! The table rows differ along everything these rules generalise over: how many public key
-//! ids a group names (one up to the published quota), whether those ids are ones
-//! `CreatePublicKey` minted or opaque strings a client submitted, whether a comment is
+//! ids a group names (one up to the published quota), which of the account's keys those ids
+//! are and in which order the configuration lists them, whether a comment is
 //! carried at all and whether it is empty, plain ASCII, XML metacharacters or exactly the
 //! published 128-character bound.
 //!
@@ -192,10 +192,10 @@ pub(crate) async fn mint_public_keys(
 ///
 /// The rows span what the rules generalise over: the number of public key ids a group
 /// names — one, two, and exactly the published quota
-/// ([`MAX_PUBLIC_KEYS_IN_KEY_GROUP`], the bound itself being admissible) — whether those
-/// ids were minted by `CreatePublicKey` or are opaque strings a client submitted, and the
-/// comment forms (absent, empty, plain ASCII, XML metacharacters, and the published
-/// 128-character bound).
+/// ([`MAX_PUBLIC_KEYS_IN_KEY_GROUP`], the bound itself being admissible) — WHICH of the
+/// account's keys a group names and in which order (a group names any keys the account
+/// holds, in the order the configuration lists them), and the comment forms (absent, empty,
+/// plain ASCII, XML metacharacters, and the published 128-character bound).
 pub(crate) async fn table(router: &MultiServiceRouter) -> Vec<Group> {
     let minted = mint_public_keys(router, "key-group-table", MAX_PUBLIC_KEYS_IN_KEY_GROUP).await;
     let comments: [Option<String>; 5] = [
@@ -212,13 +212,10 @@ pub(crate) async fn table(router: &MultiServiceRouter) -> Vec<Group> {
         minted[..2].to_vec(),
         // The published quota on one group's key list, which is admissible.
         minted.clone(),
-        // A client may submit any identifier; the group stores the list as submitted.
-        vec!["K1OPAQUEIDAAAA".to_string()],
-        vec![
-            "K1OPAQUEIDAAAA".to_string(),
-            "K2OPAQUEIDBBBB".to_string(),
-            "K3OPAQUEIDCCCC".to_string(),
-        ],
+        // A group names any of the account's keys, not only the ones created first.
+        minted[MAX_PUBLIC_KEYS_IN_KEY_GROUP - 1..].to_vec(),
+        // The list is stored in the order submitted, so one row submits it reversed.
+        minted.iter().rev().take(3).cloned().collect(),
     ];
 
     item_sets
@@ -652,15 +649,15 @@ async fn a_create_past_the_account_bound_is_refused() {
 
     // The bound is an ENTRY COUNT, so what matters is the create that fills it and the ones
     // past it; the rows filling it still vary the configuration's forms, so the count is
-    // what refuses them rather than anything about one group.
+    // what refuses them rather than anything about one group. Every group names keys the
+    // account really holds, which is what every stored key group names.
+    let keys = mint_public_keys(&router, "key-group-bound", MAX_PUBLIC_KEYS_IN_KEY_GROUP).await;
     let mut filled: Vec<(String, Group)> = Vec::new();
     for index in 0..MAX_KEY_GROUPS {
         let row = Group {
             case: format!("group {index} of the bound"),
             name: format!("key-group-bound-{index}"),
-            items: (0..=(index % MAX_PUBLIC_KEYS_IN_KEY_GROUP))
-                .map(|key| format!("K{index}BOUND{key}AAAAA"))
-                .collect(),
+            items: keys[..=(index % MAX_PUBLIC_KEYS_IN_KEY_GROUP)].to_vec(),
             comment: match index % 3 {
                 0 => None,
                 1 => Some(String::new()),
@@ -681,16 +678,13 @@ async fn a_create_past_the_account_bound_is_refused() {
         Group {
             case: "one group past the bound".to_string(),
             name: "key-group-past-the-bound".to_string(),
-            items: vec!["K1PASTIDAAAAAA".to_string()],
+            items: keys[..1].to_vec(),
             comment: None,
         },
         Group {
             case: "another group past the bound".to_string(),
             name: "key-group-past-the-bound-again".to_string(),
-            items: vec![
-                "K2PASTIDAAAAAA".to_string(),
-                "K3PASTIDBBBBBB".to_string(),
-            ],
+            items: keys[..2].to_vec(),
             comment: Some("past the bound".to_string()),
         },
     ];

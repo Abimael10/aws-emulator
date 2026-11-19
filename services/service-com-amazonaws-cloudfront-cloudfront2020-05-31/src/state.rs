@@ -4323,3 +4323,11 @@ pub use path_identifiers::*;
 /// `pub use` keeps every name reachable as `crate::state::<name>`.
 mod anycast_entitlement;
 pub use anycast_entitlement::*;
+
+/// The judgement a submitted key group CONFIGURATION is admitted by: the rules about a
+/// `KeyGroupConfig` itself, made ONCE for both the call that creates a key group and the call
+/// that replaces one's configuration. A SUBMODULE for the same reason [`functions`] is one;
+/// `pub use` keeps every name reachable as `crate::state::<name>`.
+mod key_group_config;
+pub use key_group_config::*;
+

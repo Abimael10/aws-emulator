@@ -23,12 +23,15 @@
 //!   ([`crate::state::PRECONDITION_FAILED_FOR_THIS_OPERATION_MESSAGE`]) — so an update only
 //!   lands on the configuration its caller actually read
 //!   ([`crate::state::check_if_match`]);
-//! * a configuration that names no public key at all, or whose `Comment` is past the
-//!   documented 128 characters — `InvalidArgument` (HTTP 400), the SAME checks the create
-//!   path applies, because each states a rule about the CONFIGURATION rather than about the
-//!   call that submits it, so an update cannot store one a create would have refused;
+//! * a configuration that names no public key at all, whose `Comment` is past the
+//!   documented 128 characters, or that names a public key this account holds none of —
+//!   `InvalidArgument` (HTTP 400), the SAME judgement the create path makes
+//!   ([`crate::state::key_group_config_refusal`]), because each rule is about the
+//!   CONFIGURATION rather than about the call that submits it, so an update cannot store one
+//!   a create would have refused — a group that lists a key that is not there admits no
+//!   signature at all;
 //! * a configuration naming more public keys than the published quota on one group's key
-//!   list — `TooManyPublicKeysInKeyGroup` (HTTP 400);
+//!   list — `TooManyPublicKeysInKeyGroup` (HTTP 400), from that same judgement;
 //! * a `Name` ANOTHER key group already holds — `KeyGroupConfig$Name` is "a name to identify
 //!   the key group", so renaming a group onto a name that is taken is
 //!   `KeyGroupAlreadyExists` (HTTP 409); the name this group already holds is its own, so an
@@ -229,34 +232,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "You must specify at least one public key for the key group" is a rule about the
-        // configuration, so it holds on every payload that states one: an update cannot
-        // leave a stored group naming no key, and the group keeps the keys it held.
-        if config.items.is_empty() {
-            return Err(UpdateKeyGroupErrorModeled::InvalidArgument(
-                crate::state::key_group_without_a_public_key(),
-            )
-            .into());
-        }
-
-        // "A comment to describe the key group. The comment cannot be longer than 128
-        // characters." The documented bound holds on every payload that states a
-        // configuration, so an update cannot store one the create would have refused.
-        let comment_length = config.comment.as_deref().unwrap_or_default().chars().count();
-        if comment_length > crate::state::MAX_KEY_GROUP_COMMENT {
-            return Err(UpdateKeyGroupErrorModeled::InvalidArgument(
-                crate::state::comment_too_long(comment_length),
-            )
-            .into());
-        }
-
-        // The published quota on ONE group's key list: the list is stored whole and every
-        // read of the group reports it, so a configuration past the bound is refused with
-        // the error the operation models for it rather than stored cut short.
-        if config.items.len() > crate::state::MAX_PUBLIC_KEYS_IN_KEY_GROUP {
-            return Err(UpdateKeyGroupErrorModeled::TooManyPublicKeysInKeyGroup(
-                crate::state::too_many_public_keys_in_key_group(),
-            )
+        // Every rule about the CONFIGURATION itself holds on every payload that states one,
+        // so this update is judged by the one the create path makes
+        // ([`crate::state::key_group_config_refusal`]): it names at least one public key, its
+        // comment is within the documented bound, it names no more keys than the published
+        // quota, and every id it names resolves to a public key this account holds. Refused
+        // before anything is written, so the group keeps the configuration, the keys and the
+        // version token it held.
+        if let Some(refusal) = crate::state::key_group_config_refusal(&store, &config) {
+            return Err(match refusal {
+                crate::state::KeyGroupConfigRefusal::InvalidArgument(error) => {
+                    UpdateKeyGroupErrorModeled::InvalidArgument(error)
+                }
+                crate::state::KeyGroupConfigRefusal::TooManyPublicKeysInKeyGroup(error) => {
+                    UpdateKeyGroupErrorModeled::TooManyPublicKeysInKeyGroup(error)
+                }
+            }
             .into());
         }
 

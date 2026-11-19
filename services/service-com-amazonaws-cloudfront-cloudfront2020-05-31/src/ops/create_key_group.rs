@@ -11,6 +11,12 @@
 //! URLs and signed cookies" — and the only path by which a key group enters this service's
 //! store.
 //!
+//! The configuration itself is judged by the rules both key group writes make
+//! ([`crate::state::key_group_config_refusal`]) — it names at least one public key, its
+//! comment is within the documented bound, it names no more keys than the published quota,
+//! and every id it names resolves to a public key this account holds — each checked BEFORE
+//! the id and the version token are minted, so a refused create stores nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -167,36 +173,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // model gives it no status, so one this service accepts is usable at once.
         store.settle(now);
 
-        // "To create a key group, you must specify at least one public key for the key
-        // group." The model's list carries no length constraint, so a configuration that
-        // names none is refused here — with the refusal this operation models for an
-        // unusable argument — BEFORE anything is minted.
-        if config.items.is_empty() {
-            return Err(CreateKeyGroupErrorModeled::InvalidArgument(
-                crate::state::key_group_without_a_public_key(),
-            )
-            .into());
-        }
-
-        // "A comment to describe the key group. The comment cannot be longer than 128
-        // characters." The member carries no `@length` in the model, so the documented
-        // bound is refused here, in the same words every other configuration of this
-        // service refuses an over-long comment with.
-        let comment_length = config.comment.as_deref().unwrap_or_default().chars().count();
-        if comment_length > crate::state::MAX_KEY_GROUP_COMMENT {
-            return Err(CreateKeyGroupErrorModeled::InvalidArgument(
-                crate::state::comment_too_long(comment_length),
-            )
-            .into());
-        }
-
-        // The published quota on ONE group's key list: the list is stored whole and every
-        // read of the group reports it, so a configuration past the bound is refused with
-        // the error the operation models for it rather than stored cut short.
-        if config.items.len() > crate::state::MAX_PUBLIC_KEYS_IN_KEY_GROUP {
-            return Err(CreateKeyGroupErrorModeled::TooManyPublicKeysInKeyGroup(
-                crate::state::too_many_public_keys_in_key_group(),
-            )
+        // Every rule about the CONFIGURATION itself, made in the one judgement the update
+        // path makes too ([`crate::state::key_group_config_refusal`]): a configuration naming
+        // no public key at all, one whose `Comment` is past the documented 128 characters, one
+        // naming more public keys than the published quota on one group's list, and one naming
+        // a public key this account holds none of — a key group is what makes the keys it
+        // lists the signers a behaviour trusting it accepts, so an entry that resolves to
+        // nothing names no signer and the group is not stored holding it. Refused BEFORE
+        // anything is minted, so a refused create stores nothing.
+        if let Some(refusal) = crate::state::key_group_config_refusal(&store, &config) {
+            return Err(match refusal {
+                crate::state::KeyGroupConfigRefusal::InvalidArgument(error) => {
+                    CreateKeyGroupErrorModeled::InvalidArgument(error)
+                }
+                crate::state::KeyGroupConfigRefusal::TooManyPublicKeysInKeyGroup(error) => {
+                    CreateKeyGroupErrorModeled::TooManyPublicKeysInKeyGroup(error)
+                }
+            }
             .into());
         }
 
