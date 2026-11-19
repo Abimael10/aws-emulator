@@ -32,9 +32,11 @@
 //!
 //! The rows differ along what the rule generalises over: whether the registry holds the
 //! image, whether a cache rule covers the repository, which half of the pull the role is
-//! granted, which document grants it, and whether the reference names this registry at
-//! all. Nothing here reaches into either state struct: every value asserted is read back
-//! through `DescribeTasks` and Amazon ECR's `DescribeImages`.
+//! granted, which document grants it, whether the reference names this registry at all,
+//! and — for a service's deployment — the FORM the reference that resolves to nothing
+//! takes. Nothing here reaches into either state struct: every value asserted is read back
+//! through `DescribeTasks`, `ListTasks`, `DescribeServices` and Amazon ECR's
+//! `DescribeImages`.
 
 use std::time::{Duration, Instant};
 
@@ -995,6 +997,17 @@ async fn a_service_whose_image_the_registry_resolves_to_nothing_stops_a_task_tha
             "a tag the repository never held",
             "missingtagservice",
             format!("{held}:does-not-exist"),
+            true,
+        ),
+        // A reference that names no tag at all asks for the registry's default tag, which
+        // nothing was pushed under either: what decides the launch is what the reference
+        // RESOLVES to, not how much of the pull form the caller wrote
+        // (`<account>.dkr.ecr.<region>.<suffix>/<repository>[:<tag>|@<digest>]`, the pull
+        // reference form of the Amazon ECR User Guide).
+        one(
+            "no tag at all, so the default tag, which the repository never held",
+            "defaulttagservice",
+            held.clone(),
             true,
         ),
         one(
