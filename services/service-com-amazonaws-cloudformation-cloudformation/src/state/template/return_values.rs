@@ -685,6 +685,19 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // function version" embeds and which every call on the version takes as its
         // qualifier.
         || resource_type == LAMBDA_VERSION
+        // An AWS Step Functions state machine VERSION is the same case:
+        // `PublishStateMachineVersion` takes no identifier for the version — the declaration
+        // states the machine it is published from — and answers the ARN that service minted,
+        // which carries the version number it allocated. An ALIAS of one is too: its ARN is
+        // built on the state machine the versions it routes to belong to, which the
+        // declaration names only through those versions, and
+        // `CreateStateMachineAlias` is what answers it. Each ARN is what that type's `Ref`
+        // returns and what every Step Functions call on the resource takes
+        // ([`crate::state::provisioning::step_functions_versions_and_aliases`]).
+        || resource_type
+            == crate::state::provisioning::step_functions_versions_and_aliases::STEP_FUNCTIONS_STATE_MACHINE_VERSION
+        || resource_type
+            == crate::state::provisioning::step_functions_versions_and_aliases::STEP_FUNCTIONS_STATE_MACHINE_ALIAS
         || resource_type == KMS_KEY
         || resource_type == AOSS_COLLECTION
         // An OpenSearch Serverless managed interface ENDPOINT is the same case:

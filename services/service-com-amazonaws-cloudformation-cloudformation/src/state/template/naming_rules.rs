@@ -158,6 +158,16 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         STEP_FUNCTIONS_STATE_MACHINE | STEP_FUNCTIONS_ACTIVITY => {
             rules(80, Characters::AsGenerated)
         }
+        // The same service's `CreateStateMachineAlias.name`: `CharacterRestrictedName`,
+        // `@length(min: 1, max: 80)` with the pattern
+        // `^(?=.*[a-zA-Z_\-\.])[a-zA-Z0-9_\-\.]+$` (that same model) — a generated name is
+        // already inside that character set, since letters, digits and the hyphen are all
+        // admitted, so the bound is what one may break. An alias's generated name is the name
+        // the create is made under, the identity in force being the ARN that service answers
+        // ([`crate::state::provisioning::step_functions_versions_and_aliases`]).
+        crate::state::provisioning::step_functions_versions_and_aliases::STEP_FUNCTIONS_STATE_MACHINE_ALIAS => {
+            rules(80, Characters::AsGenerated)
+        }
         // AppConfig `CreateApplication.Name`, `CreateEnvironment.Name` and
         // `CreateDeploymentStrategy.Name`: each `Name`, `@length(min: 1, max: 64)`
         // (AppConfig's own Smithy model), which a generated name is already inside

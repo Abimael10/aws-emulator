@@ -49,6 +49,17 @@ pub fn replacement_deletes_first(resource_type: &str) -> bool {
 pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
     match resource_type {
         IAM_ACCESS_KEY => &["Serial", "UserName"],
+        // A published state machine VERSION keeps everything it was published with: it is the
+        // snapshot `PublishStateMachineVersion` took of the machine, and Step Functions
+        // publishes no call that edits one — so a declaration restating any property asks for a
+        // DIFFERENT version, which CloudFormation replaces by publishing one
+        // ([`crate::state::provisioning::step_functions_versions_and_aliases`]). (An ALIAS
+        // needs no entry: its description and its routing configuration are
+        // `UpdateStateMachineAlias`' own members, so a change to either reaches the alias in
+        // place, and its NAME is in this position through [`name_is_create_only`].)
+        crate::state::provisioning::step_functions_versions_and_aliases::STEP_FUNCTIONS_STATE_MACHINE_VERSION => {
+            &["Description", "StateMachineArn", "StateMachineRevisionId"]
+        }
         // An Amazon Athena SAVED QUERY keeps everything it was saved with: `CreateNamedQuery`
         // takes the database, the SQL and the workgroup, and the one call that changes a query
         // afterwards (`UpdateNamedQuery`) takes the query's id with a new name, description and

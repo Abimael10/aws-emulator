@@ -159,6 +159,12 @@ impl Owner {
             Self::StepFunctionsStateMachine => {
                 step_functions_state_machine::create(ctx, region, resource, propagated).await
             }
+            // Neither a published version nor an alias takes tags: Step Functions' tagging
+            // calls address a state machine or an activity, so there is no call that could
+            // carry a tag to one.
+            Self::StepFunctionsVersionOrAlias(kind) => {
+                step_functions_versions_and_aliases::create(ctx, region, kind, resource).await
+            }
             Self::ApiGatewayRestApi(kind) => {
                 apigateway_rest_api::create(ctx, region, kind, resource, propagated).await
             }
@@ -339,6 +345,11 @@ impl Owner {
                 Ok(secretsmanager_resource_policy::readiness())
             }
             Self::StepFunctionsStateMachine => Ok(step_functions_state_machine::readiness()),
+            // A published version and an alias each exist from the moment their own create
+            // answers ([`step_functions_versions_and_aliases::ready`]).
+            Self::StepFunctionsVersionOrAlias(_) => {
+                Ok(step_functions_versions_and_aliases::ready())
+            }
             // Each of these resources EXISTS from the moment its create answers: API Gateway
             // reports no state an api, a resource, a method, a deployment or a stage is still
             // coming up in — a stage serves the deployment it points at as soon as the create
@@ -532,6 +543,9 @@ impl Owner {
             // own create answered, so there is nothing left to read once it is up.
             Self::SecretsManagerResourcePolicy => Ok(BTreeMap::new()),
             Self::SecretsManagerSecret | Self::StepFunctionsStateMachine => Ok(BTreeMap::new()),
+            // A version's and an alias's `Arn` are the ones their own creates answered with, so
+            // there is nothing left to read once either resource is up.
+            Self::StepFunctionsVersionOrAlias(_) => Ok(BTreeMap::new()),
             // An api's id and its root resource, and the id of a resource or a deployment, are
             // the ones their own creates answered with, so there is nothing left to read once
             // the resource is up.
@@ -663,6 +677,11 @@ impl Owner {
             }
             Self::StepFunctionsStateMachine => {
                 step_functions_state_machine::removal(ctx, region, physical_resource_id).await
+            }
+            // `DeleteStateMachineVersion` and `DeleteStateMachineAlias` each take the resource
+            // away as they answer, so there is nothing to wait for.
+            Self::StepFunctionsVersionOrAlias(_) => {
+                Ok(step_functions_versions_and_aliases::removal())
             }
             // Every API Gateway delete here takes the resource away as it answers: that
             // service reports no state a deleted api, resource, method, deployment, stage or
@@ -856,6 +875,14 @@ impl Owner {
                 step_functions_state_machine::update(ctx, region, resource, declared, propagated)
                     .await
             }
+            // An alias is re-pointed in place by `UpdateStateMachineAlias`; a published
+            // VERSION is the snapshot its publish took, so a changed declaration of one is
+            // deployed as a new version rather than applied
+            // ([`step_functions_versions_and_aliases::update`]).
+            Self::StepFunctionsVersionOrAlias(kind) => {
+                step_functions_versions_and_aliases::update(ctx, region, kind, resource, declared)
+                    .await
+            }
             // A CHANGED declaration of the api, of a resource of it, of a method, of a
             // deployment or of a stage is applied through the PATCH call API Gateway publishes
             // for that record, which is how that service changes one; a change no pointer of
@@ -1014,6 +1041,9 @@ impl Owner {
             // A resource policy is not taggable either, so nothing is asked about its tags.
             Self::SecretsManagerResourcePolicy => Ok(()),
             Self::SecretsManagerSecret | Self::StepFunctionsStateMachine => Ok(()),
+            // Neither a published version nor an alias is taggable at all, so nothing is asked
+            // about their tags.
+            Self::StepFunctionsVersionOrAlias(_) => Ok(()),
             // Nor are the tags of an api or a stage that already exists ([`Provisioner::retag`]'s
             // own default), so nothing is asked about those either.
             Self::ApiGatewayRestApi(_) => Ok(()),
@@ -1175,6 +1205,12 @@ impl Owner {
             // no snapshot invented for it.
             Self::StepFunctionsStateMachine => {
                 step_functions_state_machine::delete(ctx, region, resource).await
+            }
+            // Step Functions takes no snapshot of a version or an alias on the way out either:
+            // there is no such call, so a `Snapshot` deletion policy on one of these types
+            // deletes the resource with no snapshot invented for it.
+            Self::StepFunctionsVersionOrAlias(kind) => {
+                step_functions_versions_and_aliases::delete(ctx, region, kind, resource).await
             }
             // API Gateway takes no snapshot of an api, a resource, a method, a deployment or a
             // stage on the way out: there is no such call, so a `Snapshot` deletion policy on
@@ -1352,6 +1388,20 @@ impl Owner {
                 )
                 .await?
             }
+            Self::StepFunctionsVersionOrAlias(kind) => match kind {
+                // A published version is the snapshot its publish took, and Step Functions
+                // publishes no call that edits one, so nothing of it can have drifted from its
+                // declaration.
+                step_functions_versions_and_aliases::Kind::Version => {
+                    return Ok(ActualConfiguration::Unchecked)
+                }
+                step_functions_versions_and_aliases::Kind::Alias => {
+                    step_functions_versions_and_aliases::alias_configuration(
+                        ctx, region, resource,
+                    )
+                    .await?
+                }
+            },
             Self::ApiGatewayRestApi(kind) => {
                 apigateway_rest_api::actual_configuration(ctx, region, kind, resource).await?
             }
@@ -1462,7 +1512,8 @@ impl Owner {
             Self::SecretsManagerRotationSchedule
             | Self::SecretsManagerResourcePolicy
             | Self::SecretsManagerSecret
-            | Self::StepFunctionsStateMachine => message.to_string(),
+            | Self::StepFunctionsStateMachine
+            | Self::StepFunctionsVersionOrAlias(_) => message.to_string(),
             // Amazon API Gateway's does the same.
             Self::ApiGatewayRestApi(_) => message.to_string(),
             // Application Auto Scaling's does the same.

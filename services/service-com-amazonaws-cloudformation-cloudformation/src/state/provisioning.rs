@@ -326,6 +326,13 @@ mod secretsmanager_rotation_schedule;
 /// Manager itself ([`secretsmanager_secret`]).
 mod secretsmanager_secret;
 mod step_functions_state_machine;
+/// The two `AWS::StepFunctions::*` types a stack declares beside a state machine — the
+/// VERSION it publishes of one and the ALIAS that routes traffic to versions: created in AWS
+/// Step Functions itself ([`step_functions_versions_and_aliases`]). Visible to the rest of
+/// this service's state because the types' own NAMES live here, beside the arms that
+/// provision them (the naming rules fit the alias's generated name to that service's bound,
+/// and the return-value rules name the two whose identity their create answers).
+pub(in crate::state) mod step_functions_versions_and_aliases;
 
 /// Custom resources: the provider a template names in a resource's `ServiceToken`, the
 /// request CloudFormation sends it on every stack operation touching the resource, and the
@@ -1197,6 +1204,11 @@ pub(super) enum Owner {
     /// `AWS::StepFunctions::StateMachine`, whose arms are
     /// [`step_functions_state_machine`]'s.
     StepFunctionsStateMachine,
+    /// One of the two Step Functions types [`step_functions_versions_and_aliases`] creates
+    /// beside a state machine: the published VERSION of one, and the ALIAS that routes traffic
+    /// to versions. Which of them it is travels with the owner, as it does for the types
+    /// above.
+    StepFunctionsVersionOrAlias(step_functions_versions_and_aliases::Kind),
     /// One of the `AWS::ApiGateway::*` types of that service's REST control plane, which
     /// [`apigateway_rest_api`] creates in Amazon API Gateway: the api, a resource of it, a
     /// method on that resource, a deployment of them, the stage that serves it, and the four
@@ -1322,6 +1334,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if resource_type == step_functions_state_machine::STEP_FUNCTIONS_STATE_MACHINE {
         return Some(Owner::StepFunctionsStateMachine);
+    }
+    if let Some(kind) = step_functions_versions_and_aliases::kind_of(resource_type) {
+        return Some(Owner::StepFunctionsVersionOrAlias(kind));
     }
     if let Some(kind) = apigateway_rest_api::kind_of(resource_type) {
         return Some(Owner::ApiGatewayRestApi(kind));

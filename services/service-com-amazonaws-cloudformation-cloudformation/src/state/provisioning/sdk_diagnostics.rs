@@ -221,6 +221,23 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
         "ServiceDiscovery",
         SdkDiagnostic::Attempts,
     ),
+    // AWS Step Functions' SDK names it `Sfn` — that model's own `sdkId` (`SFN`,
+    // `smithy_query(query="service_info")` on that service's model) written as its SDK client
+    // is, which is NOT the signing name the request was signed with (`states`) nor the service
+    // shape's own name. The shape is the ATTEMPT-counting one, as the recorded
+    // `ResourceStatusReason` of an `AWS::StepFunctions::StateMachine` whose declared Amazon
+    // States Language definition that service refuses carries it (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, checks
+    // `cloudformation__stepfunctions.deploy-cdk-choice-default-unknown-state-rejected` and
+    // `cloudformation__stepfunctions.deploy-pass-state-with-next-and-end-together-rejected-\
+    // at-stack-create`, whose reasons read `Resource handler returned message: "<the service's
+    // sentence> (Service: Sfn, Status Code: 400, Request ID: …) (SDK Attempt Count: …)"
+    // (RequestToken: …, HandlerErrorCode: InvalidRequest)`), which is the shape that service's
+    // refusals carry wherever they are relayed. The three resource types this emulator
+    // provisions over this signing name are all that service's
+    // ([`provisioning::step_functions_state_machine`] and
+    // [`provisioning::step_functions_versions_and_aliases`]).
+    ("states", "Sfn", SdkDiagnostic::Attempts),
     // AWS X-Ray's SDK names it by that model's own `sdkId` (`XRay`,
     // `smithy_query(query="service_info")` on that service's model), which is also the
     // `cloudFormationName` the type names of its resources carry. The shape is the bare
