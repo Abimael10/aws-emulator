@@ -17,7 +17,10 @@
 //!   instance's address — cannot be registered in one;
 //! * "If the task definition that your service task specifies uses the `bridge` or `host`
 //!   network mode, you must specify a `containerName` and `containerPort` combination from
-//!   the task definition";
+//!   the task definition", and `ServiceRegistry$port` — "The port value used if your
+//!   service discovery service specified an SRV record. This field might be used if both
+//!   the `awsvpc` network mode and SRV records are used" — is the member such an entry may
+//!   NOT carry, so one that carries it is refused naming `port` itself;
 //! * "If the task definition ... uses the `awsvpc` network mode and a type SRV DNS record is
 //!   used, you must specify either a `containerName` and `containerPort` combination or a
 //!   `port` value. However, you can't specify both" — an `SRV` record publishes exactly one
@@ -114,6 +117,16 @@ fn host_network_pair_message(registry_arn: &str) -> String {
         "When specifying 'host' or 'bridge' for networkMode, values for 'containerName' and \
          'containerPort' must be specified from the task definition. Registry: \
          {registry_arn}"
+    )
+}
+
+/// The refusal an entry that carries a `port` earns against a revision on the host's or the
+/// bridge's network, where the port a task is reached at comes from the container pair.
+fn host_network_port_message(registry_arn: &str) -> String {
+    format!(
+        "When specifying 'host' or 'bridge' for networkMode, you can\u{2019}t specify a \
+         value for 'port'. Instead, specify values for 'containerName' and 'containerPort' \
+         from the task definition.  Registry: {registry_arn}"
     )
 }
 
@@ -395,7 +408,7 @@ async fn a_service_registry_is_held_to_its_record_type_and_the_revisions_network
             case: "an SRV registry against a bridge revision naming only a port",
             network_mode: "bridge",
             registry: json!({ "registryArn": srv, "port": REGISTRY_PORT }),
-            refused_with: Some(host_network_pair_message(srv)),
+            refused_with: Some(host_network_port_message(srv)),
         },
         // The containerName is resolved against the revision whatever the record type.
         Row {
@@ -1043,4 +1056,279 @@ async fn a_refused_registry_leaves_no_service_and_no_cloud_map_instance() {
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// The service each `UpdateService` row below changes, and the one whose task sets the
+/// `CreateTaskSet` rows attach to.
+const PORT_RULE_SERVICE: &str = "portregsvc";
+const PORT_RULE_TASK_SET_SERVICE: &str = "portsetsvc";
+
+#[tokio::test]
+async fn a_host_or_bridge_registry_is_refused_for_the_port_member_it_may_not_carry() {
+    let fixture = Fixture::build().await;
+    let router = &fixture.router;
+    let (srv, http) = (fixture.srv.as_str(), fixture.http.as_str());
+
+    // The entry the rule ADMITS on those modes, which the update rows start from.
+    let pair = json!({
+        "registryArn": srv,
+        "containerName": CONTAINER,
+        "containerPort": CONTAINER_PORT,
+    });
+
+    // The rows span the class along the members the entry carries (`port` alone, `port`
+    // beside the complete pair, `port` beside each half of it, no port at all), the
+    // revision's network mode (`bridge`, `host`, and `awsvpc` where `port` is the member
+    // the model names) and the registry's record type (`SRV`, and a registry that publishes
+    // no DNS record at all).
+    let rows = vec![
+        Row {
+            case: "a bridge revision whose SRV registry names only a port",
+            network_mode: "bridge",
+            registry: json!({ "registryArn": srv, "port": REGISTRY_PORT }),
+            refused_with: Some(host_network_port_message(srv)),
+        },
+        Row {
+            case: "a host revision whose SRV registry names only a port",
+            network_mode: "host",
+            registry: json!({ "registryArn": srv, "port": REGISTRY_PORT }),
+            refused_with: Some(host_network_port_message(srv)),
+        },
+        Row {
+            case: "a bridge revision whose SRV registry names a port beside the pair",
+            network_mode: "bridge",
+            registry: json!({
+                "registryArn": srv,
+                "containerName": CONTAINER,
+                "containerPort": CONTAINER_PORT,
+                "port": REGISTRY_PORT,
+            }),
+            refused_with: Some(host_network_port_message(srv)),
+        },
+        Row {
+            case: "a host revision whose SRV registry names a port beside a containerName",
+            network_mode: "host",
+            registry: json!({
+                "registryArn": srv,
+                "containerName": CONTAINER,
+                "port": REGISTRY_PORT,
+            }),
+            refused_with: Some(host_network_port_message(srv)),
+        },
+        Row {
+            case: "a bridge revision whose SRV registry names a port beside a containerPort",
+            network_mode: "bridge",
+            registry: json!({
+                "registryArn": srv,
+                "containerPort": CONTAINER_PORT,
+                "port": REGISTRY_PORT,
+            }),
+            refused_with: Some(host_network_port_message(srv)),
+        },
+        Row {
+            case: "a host revision whose record-less registry names a port",
+            network_mode: "host",
+            registry: json!({ "registryArn": http, "port": REGISTRY_PORT }),
+            refused_with: Some(host_network_port_message(http)),
+        },
+        // With NO port, the same entry is held to the pair it has to carry instead — a
+        // different sentence, naming the members to add rather than the one to drop.
+        Row {
+            case: "a bridge revision whose SRV registry names neither a port nor a pair",
+            network_mode: "bridge",
+            registry: json!({ "registryArn": srv }),
+            refused_with: Some(host_network_pair_message(srv)),
+        },
+        Row {
+            case: "a host revision whose SRV registry names a containerPort alone",
+            network_mode: "host",
+            registry: json!({ "registryArn": srv, "containerPort": CONTAINER_PORT }),
+            refused_with: Some(host_network_pair_message(srv)),
+        },
+        // ... and the complete pair is answered on both modes.
+        Row {
+            case: "a bridge revision whose SRV registry names the complete pair",
+            network_mode: "bridge",
+            registry: pair.clone(),
+            refused_with: None,
+        },
+        Row {
+            case: "a host revision whose SRV registry names the complete pair",
+            network_mode: "host",
+            registry: pair.clone(),
+            refused_with: None,
+        },
+        // The member is legal in the mode the model names it for: an awsvpc revision
+        // registered in an SRV record is reached at the port the entry carries.
+        Row {
+            case: "an awsvpc revision whose SRV registry names only a port",
+            network_mode: "awsvpc",
+            registry: json!({ "registryArn": srv, "port": REGISTRY_PORT }),
+            refused_with: None,
+        },
+    ];
+
+    let mut accepted = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let name = format!("portsvc{index}");
+        let request = create_request(row, &name);
+        match row.refused_with.as_deref() {
+            Some(expected) => {
+                let (code, message) = refusal(router, "CreateService", request, case).await;
+                assert_eq!(
+                    (code.as_str(), message.as_str()),
+                    (INVALID_PARAMETER, expected),
+                    "case {case:?}: expected the create to be refused with \
+                     {INVALID_PARAMETER} {expected:?}, got ({code:?}, {message:?})"
+                );
+            }
+            None => {
+                let body = ok(router, "CreateService", request, case).await;
+                let stored = &body["service"]["serviceRegistries"];
+                assert_eq!(
+                    stored,
+                    &json!([row.registry.clone()]),
+                    "case {case:?}: expected the create to store the registry it was \
+                     given, got {stored}"
+                );
+                accepted.push(name);
+            }
+        }
+    }
+
+    // A refused create stored nothing: the cluster holds exactly the accepted rows.
+    let listed = ok(router, "ListServices", json!({ "cluster": CLUSTER }), "listing").await;
+    let mut listed_names: Vec<String> = list(&listed, "serviceArns", "listing")
+        .into_iter()
+        .map(|arn| {
+            arn.as_str()
+                .unwrap_or_else(|| panic!("expected a service ARN, got {arn}"))
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    listed_names.sort();
+    accepted.sort();
+    assert_eq!(
+        listed_names, accepted,
+        "a refused create stores nothing: expected the cluster to hold {accepted:?}, got \
+         {listed_names:?}"
+    );
+
+    // The same rule holds for every other operation that attaches a registry, read off the
+    // SAME revision: a bridge service the update changes, and a task set attached to an
+    // externally deployed service.
+    ok(
+        router,
+        "CreateService",
+        json!({
+            "cluster": CLUSTER,
+            "serviceName": PORT_RULE_SERVICE,
+            "taskDefinition": "registryrules-bridge",
+            "desiredCount": 1,
+            "launchType": "EC2",
+            "serviceRegistries": [pair.clone()],
+        }),
+        "setup",
+    )
+    .await;
+    ok(
+        router,
+        "CreateService",
+        json!({
+            "cluster": CLUSTER,
+            "serviceName": PORT_RULE_TASK_SET_SERVICE,
+            "deploymentController": { "type": "EXTERNAL" },
+            "desiredCount": 1,
+        }),
+        "setup",
+    )
+    .await;
+
+    let attached: Vec<(&str, Value, Option<String>)> = vec![
+        (
+            "a port alone",
+            json!({ "registryArn": srv, "port": REGISTRY_PORT }),
+            Some(host_network_port_message(srv)),
+        ),
+        (
+            "a port beside the pair",
+            json!({
+                "registryArn": srv,
+                "containerName": CONTAINER,
+                "containerPort": CONTAINER_PORT,
+                "port": REGISTRY_PORT,
+            }),
+            Some(host_network_port_message(srv)),
+        ),
+        ("the complete pair", pair.clone(), None),
+    ];
+
+    for (index, (form, registry, refused_with)) in attached.iter().enumerate() {
+        let requests: [(&str, Value); 2] = [
+            (
+                "UpdateService",
+                json!({
+                    "cluster": CLUSTER,
+                    "service": PORT_RULE_SERVICE,
+                    "serviceRegistries": [registry.clone()],
+                }),
+            ),
+            (
+                "CreateTaskSet",
+                json!({
+                    "cluster": CLUSTER,
+                    "service": PORT_RULE_TASK_SET_SERVICE,
+                    "taskDefinition": "registryrules-bridge",
+                    "externalId": format!("portset{index}"),
+                    "launchType": "EC2",
+                    "serviceRegistries": [registry.clone()],
+                }),
+            ),
+        ];
+        for (operation, request) in requests {
+            let case = format!("{form} on {operation}");
+            match refused_with.as_deref() {
+                Some(expected) => {
+                    let (code, message) = refusal(router, operation, request, &case).await;
+                    assert_eq!(
+                        (code.as_str(), message.as_str()),
+                        (INVALID_PARAMETER, expected),
+                        "case {case:?}: expected {INVALID_PARAMETER} {expected:?}, got \
+                         ({code:?}, {message:?})"
+                    );
+                }
+                None => {
+                    let (status, body) = answered(router, operation, request).await;
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?}: the entry the rule admits is answered, got {status} \
+                         with {body}"
+                    );
+                }
+            }
+        }
+    }
+
+    // The refused attachments changed nothing: the service still carries the pair it was
+    // created with, read back through the describe.
+    let described = ok(
+        router,
+        "DescribeServices",
+        json!({ "cluster": CLUSTER, "services": [PORT_RULE_SERVICE] }),
+        "readback",
+    )
+    .await;
+    let services = list(&described, "services", "readback");
+    let found = services
+        .first()
+        .unwrap_or_else(|| panic!("readback: expected the service to be described"));
+    assert_eq!(
+        &found["serviceRegistries"],
+        &json!([pair]),
+        "a refused attachment must change nothing, got {found}"
+    );
 }

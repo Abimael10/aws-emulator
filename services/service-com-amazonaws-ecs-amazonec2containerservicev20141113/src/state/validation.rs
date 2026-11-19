@@ -161,7 +161,11 @@ pub fn service_registry_refusal(
 /// * "If the task definition that your service task specifies uses the `bridge` or `host`
 ///   network mode, you must specify a `containerName` and `containerPort` combination from
 ///   the task definition": such a task is reached at the port the container was published
-///   on, so an entry naming neither has nothing to register.
+///   on, so an entry naming neither has nothing to register. `ServiceRegistry$port` is for
+///   the other mode — "The port value used if your service discovery service specified an
+///   SRV record. This field might be used if both the `awsvpc` network mode and SRV records
+///   are used" — so an entry that carries one against such a revision is refused NAMING
+///   that member, before the pair it has to carry instead is looked for.
 /// * "If the task definition ... uses the `awsvpc` network mode and a type SRV DNS record is
 ///   used, you must specify either a `containerName` and `containerPort` combination or a
 ///   `port` value. However, you can't specify both": an `SRV` record publishes exactly ONE
@@ -217,6 +221,14 @@ pub fn service_registry_binding_violation(
                      '{NETWORK_MODE_HOST}' or '{NETWORK_MODE_BRIDGE}' for networkMode. Change \
                      to '{DNS_RECORD_TYPE_SRV}' record, which is the supported DNS record \
                      type. Registry: {registry_arn}"
+                ));
+            }
+            if registry.port.is_some() {
+                return Some(format!(
+                    "When specifying '{NETWORK_MODE_HOST}' or '{NETWORK_MODE_BRIDGE}' for \
+                     networkMode, you can\u{2019}t specify a value for 'port'. Instead, \
+                     specify values for 'containerName' and 'containerPort' from the task \
+                     definition.  Registry: {registry_arn}"
                 ));
             }
             if registry.container_name.is_none() || registry.container_port.is_none() {
