@@ -28,6 +28,12 @@
 //! at a time. An app block a builder still holds is in use, which is what `DeleteAppBlock`
 //! refuses on.
 //!
+//! A builder's own instance state lives here too, with the transition the clock owes it:
+//! `StartAppBlockBuilder` moves the stored record to `STARTING` and records the instant
+//! from which `RUNNING` is due ([`PendingState`]), and
+//! `DescribeAppBlockBuilders` materialises what is already due before it reports
+//! ([`ComAmazonawsAppstreamPhotonadminproxyserviceState::settle_app_block_builder_states`]).
+//!
 //! Usage reporting lives here too: it is ONE account-and-Region-wide setting, so
 //! `CreateUsageReportSubscription` writes the single [`UsageReportSubscriptionRecord`]
 //! this struct holds and `DescribeUsageReportSubscriptions` renders that same record
@@ -53,7 +59,7 @@
 //!
 //! A fleet's streaming state lives here too, with the transition the clock owes it:
 //! `StartFleet` moves the stored record to `STARTING` and records the instant from which
-//! `RUNNING` is due ([`PendingFleetState`]), `DescribeFleets` materialises what is already
+//! `RUNNING` is due ([`PendingState`]), `DescribeFleets` materialises what is already
 //! due before it reports ([`ComAmazonawsAppstreamPhotonadminproxyserviceState::settle_fleet_states`]),
 //! and `CreateStreamingURL` reads that same state as the gate on issuing a URL.
 //!
@@ -180,10 +186,32 @@ pub const FLEET_START_SPAN: ::std::time::Duration = ::std::time::Duration::from_
 ///
 /// A builder is created stopped: `StartAppBlockBuilder`'s doc states that "an app block
 /// builder can only be started when it's associated with an app block", and a create
-/// associates none — so nothing the clock owes can start it, and `STOPPED` is a terminal
-/// status here. The value is `AppBlockBuilderState`'s
+/// associates none — so this is where a created builder stays until a caller associates an
+/// app block and starts it. The value is `AppBlockBuilderState`'s
 /// (`APP_BLOCK_BUILDER_STATE_VALUES` in `ops/types/shared_types.rs`).
 pub const APP_BLOCK_BUILDER_STATE_CREATED: &str = "STOPPED";
+
+/// The `AppBlockBuilderState` a builder carries while the instance
+/// `StartAppBlockBuilder` asked for is coming up, one of `APP_BLOCK_BUILDER_STATE_VALUES`.
+/// It is not terminal: the clock owes the builder [`APP_BLOCK_BUILDER_STATE_RUNNING`] once
+/// [`APP_BLOCK_BUILDER_START_SPAN`] has passed.
+pub const APP_BLOCK_BUILDER_STATE_STARTING: &str = "STARTING";
+
+/// The `AppBlockBuilderState` of a builder whose instance is up, which is the state a
+/// started builder settles in — "starting an app block builder starts a new instance", so
+/// the builder is running once that instance is.
+pub const APP_BLOCK_BUILDER_STATE_RUNNING: &str = "RUNNING";
+
+/// How long a builder stays [`APP_BLOCK_BUILDER_STATE_STARTING`] before the clock owes it
+/// [`APP_BLOCK_BUILDER_STATE_RUNNING`].
+///
+/// AWS takes minutes to bring the builder's instance up; the span here is the emulator's
+/// own, chosen so that a caller acting straight after `StartAppBlockBuilder` still observes
+/// the transient state, without any caller having to wait minutes. Nothing sleeps for it:
+/// the due instant is stored on the builder and the transition is applied the next time the
+/// builder is read.
+pub const APP_BLOCK_BUILDER_START_SPAN: ::std::time::Duration =
+    ::std::time::Duration::from_secs(3);
 
 /// How many records one `DescribeStacks`/`DescribeFleets` page carries.
 ///
@@ -483,6 +511,20 @@ pub fn fleet_not_running_message(fleet_name: &str) -> String {
     format!(
         "The fleet {fleet_name} is not running. The stack must have a running fleet \
          to get a streaming URL"
+    )
+}
+
+/// The sentence a start of an app block builder that is associated with no app block is
+/// refused with.
+///
+/// `StartAppBlockBuilder`'s own documentation states the rule: "An app block builder can
+/// only be started when it's associated with an app block." The sentence states the
+/// builder's condition and that rule; its only variable part is the builder name the
+/// request asked for.
+pub fn app_block_builder_not_associated_message(name: &str) -> String {
+    format!(
+        "The app block builder {name} is not associated with an app block. An app block \
+         builder can only be started when it's associated with an app block"
     )
 }
 
@@ -867,7 +909,7 @@ pub struct FleetRecord {
     /// The state the clock owes this fleet, and the instant from which it is owed: what
     /// `StartFleet` records so that a fleet reports `STARTING` until its instances are
     /// up and `RUNNING` afterwards, without anything sleeping for the span.
-    pub pending_state: Option<PendingFleetState>,
+    pub pending_state: Option<PendingState>,
     pub desired_instances: i32,
     pub desired_user_sessions: Option<i32>,
     pub running: i32,
@@ -895,10 +937,13 @@ pub struct FleetRecord {
     pub tags: BTreeMap<String, String>,
 }
 
-/// A fleet-state transition the clock owes: the state the fleet moves to, and the instant
-/// at which it is due.
+/// A resource-state transition the clock owes: the state the resource moves to, and the
+/// instant at which it is due. Held by every record whose state a start or a stop moves on
+/// the clock — a fleet's ([`FleetRecord::pending_state`]) and an app block builder's
+/// ([`AppBlockBuilderRecord::pending_state`]) — so one rule decides when such a transition
+/// is owed.
 #[derive(Debug, Clone, Copy)]
-pub struct PendingFleetState {
+pub struct PendingState {
     pub state: &'static str,
     pub due_at: ::std::time::Instant,
 }
@@ -993,6 +1038,10 @@ pub struct AppBlockBuilderRecord {
     /// One of `APP_BLOCK_BUILDER_STATE_VALUES`; [`APP_BLOCK_BUILDER_STATE_CREATED`] for a
     /// freshly created builder.
     pub state: String,
+    /// The state the clock owes this builder, and the instant from which it is owed: what
+    /// `StartAppBlockBuilder` records so that a builder reports `STARTING` until its
+    /// instance is up and `RUNNING` afterwards, without anything sleeping for the span.
+    pub pending_state: Option<PendingState>,
     pub created_time: ::aws_smithy_types::DateTime,
     /// The errors that stopped the builder reaching its state; empty while none has
     /// occurred.
@@ -1005,6 +1054,27 @@ pub struct AppBlockBuilderRecord {
 }
 
 impl AppBlockBuilderRecord {
+    /// Apply the transition the clock owes this builder, if `now` is past its due instant.
+    ///
+    /// This materialises a change the CLOCK already made due — the builder would have
+    /// reached the state at that instant even if nobody had called — so a read may apply
+    /// it. Nothing else about the builder changes, and once applied there is nothing owed.
+    pub fn settle_state(&mut self, now: ::std::time::Instant) {
+        let Some(pending) = self.pending_state else {
+            return;
+        };
+        if now < pending.due_at {
+            return;
+        }
+        self.state = pending.state.to_string();
+        self.pending_state = None;
+    }
+
+    /// Whether this builder's instance is up, which is the state a start settles it in.
+    pub fn is_running(&self) -> bool {
+        self.state == APP_BLOCK_BUILDER_STATE_RUNNING
+    }
+
     /// Render the stored record as the modelled `AppBlockBuilder` every reader returns.
     pub fn to_app_block_builder(&self) -> AppBlockBuilder {
         AppBlockBuilder {
@@ -2062,6 +2132,18 @@ impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
         let now = ::std::time::Instant::now();
         for fleet in self.fleets.values_mut() {
             fleet.settle_state(now);
+        }
+    }
+
+    /// Apply every app-block-builder transition the clock has already made due.
+    ///
+    /// The same rule as [`Self::settle_fleet_states`], for the resource whose instance a
+    /// `StartAppBlockBuilder` brings up: the builder reaches `RUNNING` at an instant that
+    /// call fixed, so the transition is owed whether or not anybody calls again.
+    pub fn settle_app_block_builder_states(&mut self) {
+        let now = ::std::time::Instant::now();
+        for builder in self.app_block_builders.values_mut() {
+            builder.settle_state(now);
         }
     }
 

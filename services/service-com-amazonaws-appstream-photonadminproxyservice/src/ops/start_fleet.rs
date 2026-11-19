@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             fleet.state = crate::state::FLEET_STATE_STARTING.to_string();
             // The instances come up on the clock: the instant they are due is stored and
             // nothing waits for it here.
-            fleet.pending_state = Some(crate::state::PendingFleetState {
+            fleet.pending_state = Some(crate::state::PendingState {
                 state: crate::state::FLEET_STATE_RUNNING,
                 due_at: ::std::time::Instant::now() + crate::state::FLEET_START_SPAN,
             });

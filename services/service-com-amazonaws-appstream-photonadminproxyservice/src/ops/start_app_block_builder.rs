@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartAppBlockBuilder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartAppBlockBuilder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartAppBlockBuilder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the named app block builder's stored state to `STARTING` and records
+//! the instant from which the clock owes it `RUNNING`, so a caller reading straight after
+//! the call still sees the transient state and one reading later sees a running builder.
+//! The started builder is reported back from the stored record. A builder that is
+//! associated with no app block cannot be started and answers
+//! `OperationNotPermittedException` (HTTP 400); a name this account holds no builder under
+//! answers `ResourceNotFoundException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +152,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartAppBlockBuilder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartAppBlockBuilderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartAppBlockBuilder"))
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("StartAppBlockBuilder")
+        })?;
+        let mut state = state.lock();
+        // Whatever an earlier start already owes is due on the clock, not on this call.
+        state.settle_app_block_builder_states();
+
+        // The association gate reads the edges the store holds right now, so it is a live
+        // check: `DisassociateAppBlockBuilderAppBlock` closes the gate again, and
+        // associating an app block opens it.
+        let has_app_block = state.app_block_of_builder(&input.name).is_some();
+
+        let Some(builder) = state.app_block_builders.get_mut(&input.name) else {
+            return Err(StartAppBlockBuilderErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::APP_BLOCK_BUILDER_KIND,
+                        &input.name,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "An app block builder can only be started when it's associated with an app
+        // block": a builder with an empty app block slot has nothing to package, so the
+        // start is refused and nothing is written — the builder keeps the state it had.
+        if !has_app_block {
+            return Err(
+                StartAppBlockBuilderErrorModeled::OperationNotPermittedException(
+                    OperationNotPermittedException {
+                        message: Some(crate::state::app_block_builder_not_associated_message(
+                            &input.name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A builder that is already running, or already on its way there, is in the state
+        // this call asks for: starting it again asks for nothing new, so nothing is
+        // changed and no second span is started.
+        if !builder.is_running() && builder.pending_state.is_none() {
+            builder.state = crate::state::APP_BLOCK_BUILDER_STATE_STARTING.to_string();
+            // "Starting an app block builder starts a new instance", and that instance
+            // comes up on the clock: the instant it is due is stored and nothing waits for
+            // it here.
+            builder.pending_state = Some(crate::state::PendingState {
+                state: crate::state::APP_BLOCK_BUILDER_STATE_RUNNING,
+                due_at: ::std::time::Instant::now() + crate::state::APP_BLOCK_BUILDER_START_SPAN,
+            });
+        }
+
+        // The result renders the stored record, so what this answers is what a later
+        // `DescribeAppBlockBuilders` reports.
+        Ok(StartAppBlockBuilderOutput {
+            app_block_builder: Some(builder.to_app_block_builder()),
+        })
     }
 }

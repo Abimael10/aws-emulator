@@ -263,6 +263,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // no app block, so this is where a created builder stays until a caller
             // associates an app block and starts it.
             state: crate::state::APP_BLOCK_BUILDER_STATE_CREATED.to_string(),
+            // Nothing has started the builder, so the clock owes it no transition.
+            pending_state: None,
             created_time: crate::state::now(),
             // A freshly created builder carries no errors, and has changed state for no
             // reason yet.

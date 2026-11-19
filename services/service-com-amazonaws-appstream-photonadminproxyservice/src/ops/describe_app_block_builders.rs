@@ -155,9 +155,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::not_implemented("DescribeAppBlockBuilders")
         })?;
-        // A read: the guard is only ever read through, so a Describe can never change
-        // what a later caller sees.
-        let state = state.lock();
+        // A read of the builders' own state: the guard is written through ONLY to
+        // materialise the state transitions the clock has already made due (a builder a
+        // `StartAppBlockBuilder` asked for is running once its span has passed, whether or
+        // not anybody called), so what this reports is the state every later caller sees
+        // too.
+        let mut state = state.lock();
+        state.settle_app_block_builder_states();
 
         let selected: ::std::collections::BTreeSet<String> = match &input.names {
             Some(names) => {
