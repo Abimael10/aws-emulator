@@ -20,7 +20,9 @@
 //! ## The entry set of a superseded version
 //!
 //! "Adding or removing entries in a prefix list creates a new version of the prefix list"
-//! (`ModifyManagedPrefixList`), and "the version of the prefix list for which to return the
+//! (`ModifyManagedPrefixList`), and so does restoring an earlier version's entries
+//! ("restores the entries from a previous version of a managed prefix list to a NEW version of
+//! the prefix list", `RestoreManagedPrefixListVersion`) — and "the version of the prefix list for which to return the
 //! entries" (`GetManagedPrefixListEntriesRequest$TargetVersion`) is a version a caller may
 //! still ask about once a later one has replaced it — so the entry set a revision REPLACES is
 //! kept here, under the version it was the entry set of, rather than dropped. The CURRENT
@@ -72,9 +74,10 @@ use crate::state::{
 /// that REVISES a prefix list — `Prefix List <id> not found.`
 ///
 /// `ModifyManagedPrefixList`'s own sentence, which is why it lives in that operation's
-/// module: EC2 does not word this code one way everywhere, and the operations that resolve a
-/// list TO REPORT ON OR REMOVE IT answer [`crate::state::prefix_list_does_not_exist`]'s `The
-/// prefix list (<id>) does not exist.` instead. The operations that merely REFERENCE a list
+/// module: EC2 does not word this code one way everywhere, and the other operations that
+/// resolve ONE managed prefix list — to report on it, to remove it, or to restore an earlier
+/// version of its entries — answer [`crate::state::prefix_list_does_not_exist`]'s `The prefix
+/// list (<id>) does not exist.` instead. The operations that merely REFERENCE a list
 /// from another resource's request and have no recorded sentence of their own (`CreateRoute`,
 /// `CreateIpamPrefixListResolverTarget`) answer this one too. The id is the one the request
 /// named and nothing else is in the text.
@@ -96,18 +99,30 @@ pub const PREFIX_LIST_STATE_MODIFY_IN_PROGRESS: &str = "modify-in-progress";
 /// after the call that started it, whether or not anybody calls again.
 pub const PREFIX_LIST_STATE_MODIFY_COMPLETE: &str = "modify-complete";
 
-/// The states a prefix list of this emulator may be MODIFIED or DELETED in: the settled
-/// states, the ones no clock-owed move is still due from.
+/// The state a prefix list is in while the revision a `RestoreManagedPrefixListVersion`
+/// started is still owed, from the same modelled catalog: restoring an earlier version's
+/// entries is a revision of the entry set like any other, so it is answered in a non-terminal
+/// state and settles one [`crate::state::TRANSITION_DELAY`] later.
+pub const PREFIX_LIST_STATE_RESTORE_IN_PROGRESS: &str = "restore-in-progress";
+
+/// The state that restore reaches, from that same catalog: the clock owes a
+/// [`PREFIX_LIST_STATE_RESTORE_IN_PROGRESS`] list this one one
+/// [`crate::state::TRANSITION_DELAY`] after the call that started it, whether or not anybody
+/// calls again.
+pub const PREFIX_LIST_STATE_RESTORE_COMPLETE: &str = "restore-complete";
+
+/// The states a prefix list of this emulator may be MODIFIED, RESTORED or DELETED in: the
+/// settled states, the ones no clock-owed move is still due from.
 ///
 /// A list whose creation or whose last revision is still in progress is not one a further
 /// revision has a defined entry set to start from, so it is refused with the state it is in
-/// rather than revised. The catalog holds the two settled states this emulator can leave a
-/// list in — the one `CreateManagedPrefixList` settles into and the one a revision settles
-/// into; the `restore-*` states of the modelled catalog land with
-/// `RestoreManagedPrefixListVersion`, which is still a scaffold stub.
-pub const PREFIX_LIST_STATES_ADMITTING_A_REVISION: [&str; 2] = [
+/// rather than revised. The catalog holds the settled states this emulator can leave a list
+/// in — the one `CreateManagedPrefixList` settles into, the one a revision of the entry set
+/// settles into, and the one a restore of an earlier version settles into.
+pub const PREFIX_LIST_STATES_ADMITTING_A_REVISION: [&str; 3] = [
     PREFIX_LIST_STATE_CREATE_COMPLETE,
     PREFIX_LIST_STATE_MODIFY_COMPLETE,
+    PREFIX_LIST_STATE_RESTORE_COMPLETE,
 ];
 
 /// One CIDR block a request named for a prefix list of address family `family`, in the

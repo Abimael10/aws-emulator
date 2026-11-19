@@ -114,9 +114,9 @@ pub fn invalid_prefix_list_id_not_found<E>(prefix_list_id: &str) -> Scaffolded<E
 /// id in parentheses, with the terminating full stop.
 ///
 /// The ONE place that sentence lives, for every operation recorded answering it: the delete
-/// of a list, the read of its entries, the describe that reports it, and the transit gateway
-/// reference that points at it. The id is the one the REQUEST named and nothing else is in
-/// the text.
+/// of a list, the read of its entries, the describe that reports it, the restore of an earlier
+/// version of its entries, and the transit gateway reference that points at it. The id is the
+/// one the REQUEST named and nothing else is in the text.
 ///
 /// EC2 does NOT word this code one way everywhere, so an operation recorded answering another
 /// sentence keeps it rather than being moved here:

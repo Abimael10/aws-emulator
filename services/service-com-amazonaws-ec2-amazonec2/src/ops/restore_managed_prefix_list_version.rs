@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreManagedPrefixListVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreManagedPrefixListVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreManagedPrefixListVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves ONE managed prefix list of the account in [`crate::state`] to a NEW version whose
+//! entry set is the one an EARLIER version of that list had: "restores the entries from a
+//! previous version of a managed prefix list to a new version of the prefix list". The entry
+//! set the restore replaces is itself kept under the version that had it
+//! ([`crate::ops::modify_managed_prefix_list::managed_prefix_list_entries`]), the same store
+//! a `ModifyManagedPrefixList` revision retains its superseded entry set in and the same one
+//! the version to restore is read out of, so a restore can itself be restored. The list is
+//! answered in the non-terminal `restore-in-progress` state the model publishes, and the
+//! clock — not a later call — owes it `restore-complete` one [`crate::state::TRANSITION_DELAY`]
+//! later.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +137,238 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreManagedPrefixListVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreManagedPrefixListVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreManagedPrefixListVersion"))
+        use crate::ops::modify_managed_prefix_list::managed_prefix_list_entries::{
+            PREFIX_LIST_STATE_RESTORE_COMPLETE, PREFIX_LIST_STATE_RESTORE_IN_PROGRESS,
+            PREFIX_LIST_STATES_ADMITTING_A_REVISION, require_prefix_list_versions,
+        };
+        use crate::state;
+
+        // The request's own FORM first, before anything is resolved: "not a prefix list id at
+        // all" is a fact about the request, while "no such prefix list" is a fact about what
+        // the caller can see — the order every resource of this crate asks the two questions
+        // in (`crate::state::require_well_formed_id`).
+        state::require_well_formed_id(
+            state::PREFIX_LIST_ID_PREFIX,
+            &input.prefix_list_id,
+            state::INVALID_PREFIX_LIST_ID_MALFORMED,
+        )?;
+
+        // EC2 is a regional service reached through a regional endpoint: the Region the caller
+        // signed for is the Region whose PUBLISHED prefix lists it can see beside its own, and
+        // one of those is a list this operation cannot revise.
+        let region = state::request_region(ctx.parts());
+
+        // "The version to restore" (`$PreviousVersion`), read out of the ONE store the entry
+        // set of a superseded version is kept in, and the version store's record ceiling —
+        // both asked BEFORE the main store is taken, so the two locks are never held at once.
+        // Nothing is refused on either answer yet: whether this caller may be told anything at
+        // all about a version of this list turns on the list itself, which only the main store
+        // can resolve.
+        let (restored, has_capacity) = {
+            let versions = require_prefix_list_versions(&*self.engine)?;
+            let versions = versions.lock();
+            (
+                versions
+                    .entries_of(&input.prefix_list_id, input.previous_version)
+                    .cloned(),
+                versions.has_capacity(),
+            )
+        };
+
+        // The whole restore — what it is refused for, and the write itself — happens under ONE
+        // hold of the main store, so what the request was validated against is what it writes.
+        // The entry set it supersedes comes back out to be kept, after the lock has been let
+        // go of.
+        let (superseded, prefix_list) = {
+            let state_handle = state::require_service_state(&*self.engine)?;
+            let mut store = state_handle.lock();
+            // The clock-owed move a stored list may already be due: a list an earlier call
+            // answered `create-in-progress`, `modify-in-progress` or `restore-in-progress` is
+            // settled once its due instant has passed, whether or not anybody called — so
+            // applying it here is what keeps this restore from being refused for a state the
+            // list has already left.
+            store.materialize_due_transitions();
+
+            let record = match store.managed_prefix_lists.get(&input.prefix_list_id) {
+                Some(record) => record,
+                None => {
+                    // A list the REGION publishes for one of its services is visible to this
+                    // caller but is not the account's to revise: "the ID of the owner of the
+                    // prefix list" (`ManagedPrefixList$OwnerId`) is Amazon Web Services
+                    // itself, nothing revises one, and so such a list has no earlier version
+                    // to restore. That is a refusal about the resource rather than about the
+                    // id, so it is the crate's one wording of `UnsupportedOperation` for a
+                    // published list rather than the not-found an unresolvable id earns.
+                    if state::region_publishes_prefix_list(&region, &input.prefix_list_id) {
+                        return Err(state::published_prefix_list_unsupported(
+                            &input.prefix_list_id,
+                            "restored",
+                        ));
+                    }
+                    // This operation RESOLVES one managed prefix list the caller names, the
+                    // way the describe, the read of its entries and the delete do, so it
+                    // answers the sentence EC2 words that code with for those — the crate's
+                    // one wording of it — and not the one `ModifyManagedPrefixList` answers.
+                    return Err(state::prefix_list_does_not_exist(&input.prefix_list_id));
+                }
+            };
+
+            // A list whose creation or whose last revision is still owed to the clock has no
+            // settled entry set for this one to supersede, so it is refused with the state it
+            // is in — EC2's `IncorrectState`, worded the way every refusal of this crate that
+            // turns solely on a resource's state is.
+            let current_state = record.view.state.clone().unwrap_or_default();
+            if !PREFIX_LIST_STATES_ADMITTING_A_REVISION.contains(&current_state.as_str()) {
+                return Err(state::incorrect_state_of(
+                    "Prefix list",
+                    &input.prefix_list_id,
+                    &current_state,
+                ));
+            }
+
+            // "The current version number for the prefix list" (`$CurrentVersion`), which this
+            // operation's model makes REQUIRED: the caller names the version it last read, so a
+            // restore is applied to that version and to nothing later. EC2's model declares no
+            // error for this operation, so the code is this service's choice: the version is
+            // part of the list's state, and `IncorrectState` is what EC2 answers when the
+            // resource a request names is not in the state it needs — the same code
+            // `ModifyManagedPrefixList` answers for the same mismatch.
+            let current_version = record
+                .view
+                .version
+                .unwrap_or(state::FIRST_PREFIX_LIST_VERSION);
+            if input.current_version != current_version {
+                return Err(state::incorrect_state(format!(
+                    "The prefix list '{prefix_list_id}' is at version {current_version}, \
+                     not the version {named} the request names",
+                    prefix_list_id = input.prefix_list_id,
+                    named = input.current_version,
+                )));
+            }
+
+            // "When a prefix list becomes IPAM managed, its CIDRs are automatically
+            // synchronized based on the IPAM prefix list resolver's CIDR selection rules, and
+            // direct CIDR modifications are restricted"
+            // (`ManagedPrefixList$IpamPrefixListResolverTargetId`): the resolver owns the
+            // entry set of such a list, so a request that would write it back to an earlier
+            // one is refused for the same reason a direct revision of it is.
+            if let Some(target_id) = record.view.ipam_prefix_list_resolver_target_id.as_deref() {
+                return Err(state::unsupported_operation(format!(
+                    "The prefix list '{prefix_list_id}' is managed by IPAM prefix list \
+                     resolver target '{target_id}', so its entries cannot be modified \
+                     directly",
+                    prefix_list_id = input.prefix_list_id,
+                )));
+            }
+
+            // "The version to restore" (`$PreviousVersion`) is a version the list has LEFT:
+            // the version it stands at is the one it would be restored to, which is no change
+            // at all, and a version it has never had has no entry set to restore from. Either
+            // is refused rather than answered with an entry set the caller did not ask for.
+            if input.previous_version == current_version {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value '{previous}' for previousVersion. The prefix list \
+                     '{prefix_list_id}' already stands at version {previous}",
+                    previous = input.previous_version,
+                    prefix_list_id = input.prefix_list_id,
+                )));
+            }
+            let restored = restored.ok_or_else(|| {
+                state::invalid_parameter_value(format!(
+                    "Invalid value '{previous}' for previousVersion. The prefix list \
+                     '{prefix_list_id}' has no version {previous}",
+                    previous = input.previous_version,
+                    prefix_list_id = input.prefix_list_id,
+                ))
+            })?;
+
+            // "The maximum number of entries for the prefix list" is the most the list may
+            // hold, so an earlier version carrying more entries than the list's maximum now
+            // admits is not restored — the same ceiling, and the same sentence, a direct
+            // revision of the entry set is held to.
+            let max_entries = record.view.max_entries.unwrap_or_default();
+            if restored.len() > usize::try_from(max_entries).unwrap_or(usize::MAX) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The prefix list '{prefix_list_id}' would carry {count} entries, which is \
+                     more than its maximum of {max_entries} entries",
+                    prefix_list_id = input.prefix_list_id,
+                    count = restored.len(),
+                )));
+            }
+
+            // Nothing reclaims a superseded version, and a caller may restore one as often as
+            // it likes, so the store that keeps them has a ceiling like every other store of
+            // this crate and a restore past it is refused with the quota code.
+            if !has_capacity {
+                return Err(state::prefix_list_limit_exceeded(format!(
+                    "This emulator holds {max} superseded prefix list versions, which is as \
+                     many as it stores",
+                    max = state::MAX_STORED_RECORDS_PER_STORE,
+                )));
+            }
+
+            // What this restore would retain, counted by the ONE definition of a prefix list's
+            // charge: the entry set it writes onto the record. The entry set it SUPERSEDES
+            // stays charged, because the version store keeps it, so nothing is given back.
+            let charge = state::managed_prefix_list_payload_bytes("", &restored, &[], None);
+            if store.would_exceed_stored_bytes_after_refund(charge, 0) {
+                return Err(state::prefix_list_limit_exceeded(format!(
+                    "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                     data, so it cannot store {charge} more",
+                    held = store.stored_bytes(),
+                    max = state::MAX_STORED_BYTES,
+                )));
+            }
+
+            // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+            // the flag asks whether the request WOULD have worked, so one that would have been
+            // refused is refused with that reason instead, and one that would have succeeded
+            // leaves the store untouched. "If you have the required permissions, the error
+            // response is DryRunOperation" (`$DryRun`), and every caller of this emulator
+            // holds them.
+            if input.dry_run == Some(true) {
+                return Err(state::dry_run_operation());
+            }
+
+            store.add_stored_bytes(charge);
+            let record = store
+                .managed_prefix_lists
+                .get_mut(&input.prefix_list_id)
+                .ok_or_else(|| {
+                    state::internal_error(format!(
+                        "the prefix list '{prefix_list_id}' this request resolved could not be \
+                         written",
+                        prefix_list_id = input.prefix_list_id,
+                    ))
+                })?;
+            // "Restores the entries from a previous version of a managed prefix list to a NEW
+            // version of the prefix list": the restored entry set belongs to the next version,
+            // and the one it replaced belongs to the version it was the entry set of, which
+            // comes back out of here to be kept.
+            let previous = ::std::mem::replace(&mut record.entries, restored);
+            record.view.version = Some(current_version.saturating_add(1));
+            // The restore is answered in the transient state the model publishes for it, and
+            // the clock — not a later call — owes the list the settled one, so a caller reading
+            // straight after this call still sees `restore-in-progress`.
+            record.view.state = Some(PREFIX_LIST_STATE_RESTORE_IN_PROGRESS.to_string());
+            record.pending = Some(state::ManagedPrefixListTransition::starting_now(
+                state::ManagedPrefixListMove::Settled(PREFIX_LIST_STATE_RESTORE_COMPLETE),
+            ));
+            ((current_version, previous), record.view.clone())
+        };
+
+        // The entry set the restore replaced, kept under the version that had it — so
+        // `GetManagedPrefixListEntries` can still be asked for that version and answer ITS
+        // entries, and so a restore can itself be restored. Written after the main store's
+        // lock has been let go of: the two stores are never held at once.
+        let (version, entries) = superseded;
+        let versions = require_prefix_list_versions(&*self.engine)?;
+        versions
+            .lock()
+            .record(&input.prefix_list_id, version, entries);
+
+        Ok(RestoreManagedPrefixListVersionOutput {
+            prefix_list: Some(prefix_list),
+        })
     }
 }
