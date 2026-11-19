@@ -16,13 +16,21 @@
 //! `GetRecords`) serves for the same position, because one rule decides where a reader of a
 //! shard starts and what one read of it delivers.
 //!
+//! A subscription holds its shard only while its event stream is LIVE: once that stream has
+//! ended, the consumer's renewal of it — `SubscribeToShard` again for the same `ConsumerARN`
+//! and `ShardId`, from the `ContinuationSequenceNumber` the last event reported — is served
+//! from the position it names, and only a subscription that is still being read is refused as
+//! a contended one.
+//!
 //! The recorded flows this was derived from subscribe with a `ConsumerARN` naming a stream
-//! that does not exist, and with one naming a consumer that was never registered; both are
-//! rows of the tables below. The other rows differ along what the rule generalises over: which
-//! of the five `ShardIteratorType` positions the request names and which member supplies it,
-//! how many records the position admits, which resource of the subscription is missing, which
-//! member of the starting position its own type does not admit, whether the shard is open or
-//! closed by a reshard, and whether the consumer already holds a subscription to the shard.
+//! that does not exist, with one naming a consumer that was never registered, and with the
+//! checkpoint-and-resubscribe loop a consumer reads a shard on with; all are rows of the
+//! tables below. The other rows differ along what the rule generalises over: which of the five
+//! `ShardIteratorType` positions the request names and which member supplies it, how many
+//! records the position admits, which resource of the subscription is missing, which member of
+//! the starting position its own type does not admit, whether the shard is open or closed by a
+//! reshard, how many times the renewal loop has gone round, and which consumer and shard it
+//! renews.
 //!
 //! Every case drives the real awsJson1_1 request path (`POST /` with `X-Amz-Target:
 //! Kinesis_20131202.<Operation>` through `MultiServiceRouter::dispatch`), so the statuses,
@@ -32,8 +40,10 @@ use aws_smithy_eventstream::frame::read_message_from;
 use aws_smithy_types::event_stream::HeaderValue;
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    dry_run_succeeded_message, CONSUMER_ACTIVE,
+    dry_run_succeeded_message, ConsumerRecord, CONSUMER_ACTIVE, SUBSCRIPTION_TAKEOVER_WINDOW,
 };
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
 
 use crate::stream_tags::{
     error_code, error_message, poll_until, poll_until_active, stream_arn, Emulator, REGION,
@@ -340,8 +350,8 @@ async fn a_subscription_delivers_the_records_the_position_it_names_admits() {
     ];
 
     for (index, (case, position, expected, continuation)) in rows.into_iter().enumerate() {
-        // One consumer per row: a consumer that already holds a subscription to the shard is
-        // refused a second one, which the table below is about.
+        // One consumer per row, so each row's subscription is the first one of its own
+        // consumer and nothing an earlier row read can carry into it.
         let consumer_arn =
             active_consumer(&emulator, case, stream, &format!("positions-{index}")).await;
         let event = subscribed_event(
@@ -476,93 +486,249 @@ async fn a_subscription_naming_a_resource_that_is_not_there_is_refused() {
     }
 }
 
-/// A consumer that already holds a subscription to a shard is refused a second one, while the
-/// same consumer on another shard and another consumer on the same shard are both served.
-#[tokio::test]
-async fn a_second_subscription_of_one_consumer_to_one_shard_is_refused() {
-    let emulator = Emulator::new();
-    let stream = "efo-exclusive";
-    active_stream(&emulator, "setup", stream, 2).await;
-    let second_shard = "shardId-000000000001";
-    let holder = active_consumer(&emulator, "setup", stream, "holder").await;
-    let other = active_consumer(&emulator, "setup", stream, "other-holder").await;
-    let position = json!({ "Type": "TRIM_HORIZON" });
-
-    let subscribe = |consumer: String, shard: &'static str| {
-        json!({
-            "ConsumerARN": consumer,
-            "ShardId": shard,
-            "StartingPosition": position.clone(),
+/// The `ContinuationSequenceNumber` one event reported: the checkpoint "to use as
+/// SequenceNumber in the next call to SubscribeToShard"
+/// (`SubscribeToShardEvent$ContinuationSequenceNumber`).
+fn checkpoint_of(case: &str, event: &Value) -> String {
+    event["ContinuationSequenceNumber"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case {case}: an event reports a ContinuationSequenceNumber, got {event}")
         })
-    };
+        .to_string()
+}
 
-    subscribed_event(
+/// How a renewal of a finished subscription spells the position it reads on from: every form
+/// the documented checkpoint-and-resubscribe loop can name (source: `StartingPosition$Type`,
+/// `smithy_query(query="shape",shape="ShardIteratorType")`).
+#[derive(Debug)]
+enum Renewal {
+    /// The checkpoint the previous event reported, read on from exclusively: "Use this as
+    /// SequenceNumber in the next call to SubscribeToShard, with StartingPosition set to
+    /// AT_SEQUENCE_NUMBER or AFTER_SEQUENCE_NUMBER."
+    AfterTheCheckpoint,
+    /// The same checkpoint read on from inclusively, the other form that sentence names.
+    AtTheCheckpoint,
+    /// The newest record of the shard, named by its own sequence number.
+    AtTheNewestRecord,
+    /// The oldest record the shard still retains.
+    TheHorizon,
+    /// Just after the newest record the shard holds.
+    TheTip,
+}
+
+/// A subscription whose event stream has ENDED holds its shard no longer, so the renewal the
+/// service documents — "you need to call SubscribeToShard again to renew the subscription if
+/// you want to continue to receive records", from the checkpoint the last event reported — is
+/// SERVED, whichever form the renewal names its position in and however many times the loop
+/// has gone round.
+#[tokio::test]
+async fn a_renewal_of_a_finished_subscription_is_served_from_its_checkpoint() {
+    let emulator = Emulator::new();
+    let stream = "efo-renewal";
+    active_stream(&emulator, "setup", stream, 1).await;
+    let consumer_arn = active_consumer(&emulator, "setup", stream, "renewing").await;
+
+    // The first leg of the loop: one record on the shard, read from the horizon.
+    let mut written = vec!["record-1".to_string()];
+    put(&emulator, "setup", stream, &written[0]).await;
+    let case = "the first subscription";
+    let event = subscribed_event(
         &emulator,
-        "the first subscription",
-        &subscribe(holder.clone(), FIRST_SHARD),
+        case,
+        &json!({
+            "ConsumerARN": consumer_arn,
+            "ShardId": FIRST_SHARD,
+            "StartingPosition": { "Type": "TRIM_HORIZON" },
+        }),
     )
     .await;
-
-    let (code, message) = refusal(
-        &emulator,
-        "the same consumer and shard again",
-        "SubscribeToShard",
-        &subscribe(holder.clone(), FIRST_SHARD),
-    )
-    .await;
+    let served = delivered(case, &event);
     assert_eq!(
-        code, "ResourceInUseException",
-        "case the same consumer and shard again: expected ResourceInUseException, got {code} \
-         with {message:?}"
+        served,
+        written,
+        "case {case:?}: expected the first subscription to deliver {written:?}, got {served:?}"
     );
-    assert!(
-        message.contains(&holder) && message.contains(FIRST_SHARD),
-        "case the same consumer and shard again: expected the refusal to name the consumer \
-         and the shard it already holds, got {message:?}"
-    );
+    let mut checkpoint = checkpoint_of(case, &event);
 
-    // The subscription is held per consumer AND per shard, so neither of these is the one
-    // that is already held.
-    for (case, body) in [
-        (
-            "the same consumer on another shard",
-            subscribe(holder, second_shard),
-        ),
-        (
-            "another consumer on the same shard",
-            subscribe(other, FIRST_SHARD),
-        ),
-    ] {
-        subscribed_event(&emulator, case, &body).await;
+    // Every round writes one more record and then RENEWS the subscription of the same
+    // consumer to the same shard, immediately after the previous one's stream ended: the
+    // rows differ along the form the renewal names its position in, and the loop itself is
+    // the count — the fifth renewal is as acceptable as the first.
+    let rows = [
+        ("the renewal after the checkpoint", Renewal::AfterTheCheckpoint),
+        ("a renewal at the checkpoint", Renewal::AtTheCheckpoint),
+        ("a renewal at the newest record", Renewal::AtTheNewestRecord),
+        ("a renewal from the horizon", Renewal::TheHorizon),
+        ("a renewal at the tip", Renewal::TheTip),
+    ];
+    for (case, renewal) in rows {
+        let payload = format!("record-{}", written.len() + 1);
+        let newest = put(&emulator, case, stream, &payload).await;
+        // What that form names, and the records of this shard it admits: the one record
+        // written since the checkpoint, the newest record, everything retained, or nothing.
+        let (position, expected) = match renewal {
+            Renewal::AfterTheCheckpoint => (
+                json!({ "Type": "AFTER_SEQUENCE_NUMBER", "SequenceNumber": checkpoint }),
+                vec![payload.clone()],
+            ),
+            Renewal::AtTheCheckpoint => (
+                json!({ "Type": "AT_SEQUENCE_NUMBER", "SequenceNumber": checkpoint }),
+                vec![written[written.len() - 1].clone(), payload.clone()],
+            ),
+            Renewal::AtTheNewestRecord => (
+                json!({ "Type": "AT_SEQUENCE_NUMBER", "SequenceNumber": newest }),
+                vec![payload.clone()],
+            ),
+            Renewal::TheHorizon => (
+                json!({ "Type": "TRIM_HORIZON" }),
+                written
+                    .iter()
+                    .cloned()
+                    .chain([payload.clone()])
+                    .collect::<Vec<String>>(),
+            ),
+            Renewal::TheTip => (json!({ "Type": "LATEST" }), Vec::new()),
+        };
+        written.push(payload);
+
+        let event = subscribed_event(
+            &emulator,
+            case,
+            &json!({
+                "ConsumerARN": consumer_arn,
+                "ShardId": FIRST_SHARD,
+                "StartingPosition": position,
+            }),
+        )
+        .await;
+        let served = delivered(case, &event);
+        assert_eq!(
+            served, expected,
+            "case {case:?}: expected the renewal from {renewal:?} to deliver {expected:?}, \
+             got {served:?}"
+        );
+        checkpoint = checkpoint_of(case, &event);
     }
 }
 
-/// Once the window a subscription holds its shard for has passed, "the second call takes over
-/// the subscription": the same consumer and shard are served again.
+/// A finished subscription releases exactly the shard it held, for exactly the consumer that
+/// held it: every combination of consumer and shard runs its own renewal loop.
 #[tokio::test]
-async fn a_subscription_is_taken_over_once_the_window_has_passed() {
+async fn a_renewal_is_served_for_every_consumer_and_shard() {
     let emulator = Emulator::new();
-    let stream = "efo-takeover";
-    active_stream(&emulator, "setup", stream, 1).await;
-    let consumer_arn = active_consumer(&emulator, "setup", stream, "taking-over").await;
-    let body = json!({
-        "ConsumerARN": consumer_arn,
-        "ShardId": FIRST_SHARD,
-        "StartingPosition": { "Type": "TRIM_HORIZON" },
-    });
+    let stream = "efo-renewal-pairs";
+    active_stream(&emulator, "setup", stream, 2).await;
+    let second_shard = "shardId-000000000001";
+    let first_consumer = active_consumer(&emulator, "setup", stream, "renewing-one").await;
+    let second_consumer = active_consumer(&emulator, "setup", stream, "renewing-two").await;
 
-    subscribed_event(&emulator, "the first subscription", &body).await;
-    // The CONDITION the service reaches on its own clock — never a duration this case
-    // measures: it looks again until the shard is served to this consumer once more.
-    poll_until(
-        "a taken-over subscription",
-        "the same consumer and shard are served again",
-        || async {
-            let (status, _, _) = emulator.call_raw("SubscribeToShard", &body).await;
-            status == 200
-        },
-    )
-    .await;
+    // (case, the consumer subscribing, the shard it reads) — the two shards of the stream
+    // crossed with the two consumers registered with it.
+    let rows = [
+        (
+            "the first consumer on the first shard",
+            &first_consumer,
+            FIRST_SHARD,
+        ),
+        (
+            "the first consumer on the second shard",
+            &first_consumer,
+            second_shard,
+        ),
+        (
+            "the second consumer on the first shard",
+            &second_consumer,
+            FIRST_SHARD,
+        ),
+        (
+            "the second consumer on the second shard",
+            &second_consumer,
+            second_shard,
+        ),
+    ];
+    for (case, consumer_arn, shard_id) in rows {
+        let body = json!({
+            "ConsumerARN": consumer_arn,
+            "ShardId": shard_id,
+            "StartingPosition": { "Type": "TRIM_HORIZON" },
+        });
+        // Twice in a row, with nothing between them but the end of the first stream: both
+        // the subscription and its renewal are served.
+        for round in ["the subscription", "the renewal"] {
+            let event = subscribed_event(&emulator, &format!("{case}, {round}"), &body).await;
+            let served = delivered(case, &event);
+            assert!(
+                served.is_empty(),
+                "case {case:?}: no record was written to this shard, so {round} delivers \
+                 none, got {served:?}"
+            );
+        }
+    }
+}
+
+/// What a second subscription is judged against is a subscription that is still LIVE: the
+/// marker one writes stands while its event stream goes on, is gone the moment that stream
+/// ends, names only the shard it was established for, and is bounded by the window the
+/// service documents even where nothing released it.
+#[test]
+fn a_subscription_holds_its_shard_only_while_its_stream_is_live() {
+    let established = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let mut consumer = ConsumerRecord::registered_at(
+        &stream_arn(REGION, "efo-held"),
+        "holding",
+        established,
+        HashMap::new(),
+    );
+
+    // (case, when the next call arrives, whether the subscription established above still
+    // holds the shard then) — each bound of the documented window and one past it.
+    let rows = [
+        ("the same instant", established, true),
+        (
+            "a moment into the stream",
+            established + Duration::from_millis(1),
+            true,
+        ),
+        (
+            "just inside the window",
+            established + SUBSCRIPTION_TAKEOVER_WINDOW - Duration::from_millis(1),
+            true,
+        ),
+        (
+            "at the window",
+            established + SUBSCRIPTION_TAKEOVER_WINDOW,
+            false,
+        ),
+        (
+            "well past the window",
+            established + SUBSCRIPTION_TAKEOVER_WINDOW + Duration::from_secs(600),
+            false,
+        ),
+    ];
+    for (case, now, held) in rows {
+        consumer.subscribed_at(FIRST_SHARD, established);
+        let holds = consumer.holds_subscription(FIRST_SHARD, now);
+        assert_eq!(
+            holds, held,
+            "case {case:?}: expected the shard to be held {held}, got {holds}"
+        );
+        let other = consumer.holds_subscription(ABSENT_SHARD, now);
+        assert!(
+            !other,
+            "case {case:?}: a subscription holds the one shard it named, got {other} for \
+             another shard"
+        );
+        // The stream ends — the client closed it, or the service tore it down — so the shard
+        // is free at that same instant, which is what makes the renewal servable.
+        consumer.subscription_ended(FIRST_SHARD);
+        let after_the_stream = consumer.holds_subscription(FIRST_SHARD, now);
+        assert!(
+            !after_the_stream,
+            "case {case:?}: a subscription whose stream has ended holds nothing, got \
+             {after_the_stream}"
+        );
+    }
 }
 
 /// A dry run is refused with the error the model declares for it and establishes nothing: the

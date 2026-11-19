@@ -186,13 +186,16 @@ pub const CONSUMER_ACTIVE: &str = "ACTIVE";
 /// never slept on.
 pub const CONSUMER_ACTIVATION_DELAY: Duration = ACTIVATION_DELAY;
 
-/// How long one consumer's subscription to one shard holds that shard: "If you call
-/// SubscribeToShard again with the same ConsumerARN and ShardId within 5 seconds of a
-/// successful call, you'll get a ResourceInUseException. If you call SubscribeToShard 5
-/// seconds or more after a successful call, the second call takes over the subscription and
-/// the previous connection expires or fails with a ResourceInUseException"
-/// (`SubscribeToShard`) — an AWS-documented duration, counted from the instant the stored
-/// subscription was established ([`ConsumerRecord::holds_subscription`]).
+/// How long at most one consumer's subscription to one shard goes on holding that shard
+/// while its event stream has not ended: "If you call SubscribeToShard again with the same
+/// ConsumerARN and ShardId within 5 seconds of a successful call, you'll get a
+/// ResourceInUseException. If you call SubscribeToShard 5 seconds or more after a successful
+/// call, the second call takes over the subscription and the previous connection expires or
+/// fails with a ResourceInUseException" (`SubscribeToShard`) — an AWS-documented duration,
+/// counted from the instant the stored subscription was established
+/// ([`ConsumerRecord::holds_subscription`]), and a CEILING on a marker whose stream ended
+/// without releasing it rather than a quiet period after a subscription that is over
+/// ([`ConsumerRecord::subscription_ended`]).
 pub const SUBSCRIPTION_TAKEOVER_WINDOW: Duration = Duration::from_secs(5);
 
 /// The most consumers one stream carries: "With On-demand Standard and Provisioned
@@ -932,11 +935,12 @@ pub struct ConsumerRecord {
     /// "attached to the specified data stream or consumer" (`GetResourcePolicy`), so the
     /// consumer it governs is where it is stored, and it is gone when the consumer is.
     pub policy: Option<String>,
-    /// When a `SubscribeToShard` last established a subscription of this consumer to a
-    /// shard, keyed by that shard's id — the instant a later subscription to the same shard
-    /// is judged against ([`SUBSCRIPTION_TAKEOVER_WINDOW`]). An entry the window has rolled
-    /// past is dropped as the next one is recorded ([`Self::subscribed_at`]), so what the
-    /// record holds is bounded by the shards being subscribed to right now.
+    /// The subscriptions of this consumer whose event stream is STILL LIVE, keyed by the
+    /// shard each one holds and carrying the instant it was established — what a later
+    /// subscription to the same shard is judged against. An entry is written as a
+    /// subscription is established ([`Self::subscribed_at`]) and dropped as its event stream
+    /// ends ([`Self::subscription_ended`]), so a consumer whose last subscription is over
+    /// holds no shard here and the shards this map names are the ones being read right now.
     pub subscriptions: HashMap<String, SystemTime>,
 }
 
@@ -966,12 +970,14 @@ impl ConsumerRecord {
         }
     }
 
-    /// Whether this consumer still holds a subscription to `shard_id` at `now`, so a second
-    /// one is refused rather than taking it over: "If you call SubscribeToShard again with
-    /// the same ConsumerARN and ShardId within 5 seconds of a successful call, you'll get a
-    /// ResourceInUseException. If you call SubscribeToShard 5 seconds or more after a
-    /// successful call, the second call takes over the subscription"
-    /// (`SubscribeToShard`). Decided from the stored instant, so two reads at the same
+    /// Whether a subscription of this consumer to `shard_id` is still LIVE at `now`, so a
+    /// second one is refused rather than taking it over: "If you call SubscribeToShard again
+    /// with the same ConsumerARN and ShardId within 5 seconds of a successful call, you'll
+    /// get a ResourceInUseException. If you call SubscribeToShard 5 seconds or more after a
+    /// successful call, the second call takes over the subscription" (`SubscribeToShard`).
+    /// Only a subscription that has not ended is recorded at all, and the window above
+    /// bounds even that one, so a renewal of a subscription whose event stream is over
+    /// contends with nothing. Decided from the stored instant, so two reads at the same
     /// instant agree.
     pub fn holds_subscription(&self, shard_id: &str, now: SystemTime) -> bool {
         self.subscriptions.get(shard_id).is_some_and(|established| {
@@ -982,16 +988,27 @@ impl ConsumerRecord {
         })
     }
 
-    /// Record that a subscription of this consumer to `shard_id` was established at `at`,
-    /// which is what the window above is then counted from. The entries the window has
-    /// rolled past are dropped with it, so the record holds at most the subscriptions that
-    /// are live.
+    /// Record that a subscription of this consumer to `shard_id` was established at `at` and
+    /// is now live, which is what the window above is then counted from. The entries the
+    /// window has rolled past are dropped with it, so the record holds at most the
+    /// subscriptions that are live.
     pub fn subscribed_at(&mut self, shard_id: &str, at: SystemTime) {
         self.subscriptions.retain(|_, established| {
             !at.duration_since(*established)
                 .is_ok_and(|since| since >= SUBSCRIPTION_TAKEOVER_WINDOW)
         });
         self.subscriptions.insert(shard_id.to_string(), at);
+    }
+
+    /// Release the shard a subscription of this consumer to `shard_id` held: its event
+    /// stream has ENDED, so the subscription is no longer one a later call contends with.
+    /// "Your consumer starts receiving events of type SubscribeToShardEvent over the HTTP/2
+    /// connection for up to 5 minutes, after which time you need to call SubscribeToShard
+    /// again to renew the subscription if you want to continue to receive records"
+    /// (`SubscribeToShard`) — that renewal is what this makes possible, because a stream
+    /// that is over holds nothing.
+    pub fn subscription_ended(&mut self, shard_id: &str) {
+        self.subscriptions.remove(shard_id);
     }
 
     /// The consumer's status at `now`: `CREATING` until the transition its registration

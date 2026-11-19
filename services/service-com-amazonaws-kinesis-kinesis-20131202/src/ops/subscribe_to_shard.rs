@@ -38,12 +38,24 @@
 //! `ChildShards` is carried only "at the end of the current shard", which is a shard a
 //! reshard closed and whose retained records the subscription has delivered.
 //!
-//! A successful subscription is RECORDED on the consumer it was established for
-//! ([`crate::state::ConsumerRecord::subscribed_at`]), because the next one is judged against
-//! it: "If you call SubscribeToShard again with the same ConsumerARN and ShardId within 5
-//! seconds of a successful call, you'll get a ResourceInUseException. If you call
-//! SubscribeToShard 5 seconds or more after a successful call, the second call takes over
-//! the subscription."
+//! ## What one subscription holds, and for how long
+//!
+//! A subscription is RECORDED on the consumer it was established for while its event stream
+//! is LIVE ([`crate::state::ConsumerRecord::subscribed_at`]), because a subscription being
+//! contended is what the next call is judged against: "If you call SubscribeToShard again
+//! with the same ConsumerARN and ShardId within 5 seconds of a successful call, you'll get a
+//! ResourceInUseException. If you call SubscribeToShard 5 seconds or more after a successful
+//! call, the second call takes over the subscription."
+//!
+//! That record is RELEASED the moment the event stream ends
+//! ([`crate::state::ConsumerRecord::subscription_ended`]), which for the one response this
+//! emulator serves a subscription as is the instant its frames are complete. A consumer
+//! whose stream is over holds no shard, so the renewal the service documents — "your
+//! consumer starts receiving events of type SubscribeToShardEvent over the HTTP/2 connection
+//! for up to 5 minutes, after which time you need to call SubscribeToShard again to renew
+//! the subscription if you want to continue to receive records", from the
+//! `ContinuationSequenceNumber` the last event reported — is SERVED rather than refused, and
+//! the refusal is left to say what it is for: a subscription that is still being read.
 //!
 //! ## Input
 //!
@@ -77,7 +89,7 @@
 //!   shard of it.
 //! * `ResourceInUseException` (HTTP 400) — the stream is not `ACTIVE`, the consumer is not
 //!   `ACTIVE` yet ("a consumer can't read data while in the CREATING or DELETING states"), or
-//!   this consumer already holds a subscription to this shard.
+//!   a subscription of this consumer to this shard is still being served.
 //! * `InvalidArgumentException` (HTTP 400) — the `StartingPosition` members name no position
 //!   in the shard.
 //! * `DryRunOperationException` (HTTP 400) — "The request was rejected because the DryRun
@@ -265,7 +277,10 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
         }
 
         // "If you call SubscribeToShard again with the same ConsumerARN and ShardId within 5
-        // seconds of a successful call, you'll get a ResourceInUseException."
+        // seconds of a successful call, you'll get a ResourceInUseException": what is
+        // refused is a subscription being CONTENDED, so only a stream that has not ended yet
+        // is recorded here at all — a consumer renewing from its checkpoint after its stream
+        // is over contends with nothing and is served.
         if consumer.holds_subscription(&input.shard_id, now) {
             return Err(in_use(crate::state::consumer_already_subscribed_message(
                 &input.consumer_arn,
@@ -386,9 +401,9 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             measured.record_for_the_call(&series, call_series, value, now);
         }
 
-        // The subscription is established, so it is recorded on the consumer it was
-        // established for: that is what the next call to the same consumer and shard is
-        // judged against.
+        // The subscription is established and is now being served, so it is recorded on the
+        // consumer it was established for: that is what another call to the same consumer
+        // and shard, while this one is still live, is judged against.
         if let Some(consumer) = store
             .streams
             .get_mut(&stream_key)
@@ -398,6 +413,42 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
         }
 
         Ok((event, measured))
+    }
+
+    /// Release the shard the subscription this request established was holding: its event
+    /// stream has ENDED.
+    ///
+    /// The subscription this emulator serves is ONE response, so its stream ends when the
+    /// frames of that response are complete, which is where this is called from. From then
+    /// on the consumer holds nothing, and the renewal the service documents — call
+    /// `SubscribeToShard` again from the `ContinuationSequenceNumber` the last event
+    /// reported — is served rather than refused as a contended subscription.
+    ///
+    /// Releasing a subscription nothing holds is nothing to do, which is why a consumer,
+    /// stream or shard that has gone away in the meantime is simply not found here.
+    fn release(
+        store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
+        region: &str,
+        now: std::time::SystemTime,
+        input: &SubscribeToShardInput,
+    ) {
+        let stream_key = {
+            let Some(stream) = store.stream_by_arn(
+                now,
+                region,
+                crate::state::stream_arn_of_consumer(&input.consumer_arn),
+            ) else {
+                return;
+            };
+            crate::state::RegionalName::new(&stream.region, &stream.name)
+        };
+        if let Some(consumer) = store
+            .streams
+            .get_mut(&stream_key)
+            .and_then(|stream| stream.consumer_by_arn_mut(&input.consumer_arn))
+        {
+            consumer.subscription_ended(&input.shard_id);
+        }
     }
 
     /// Read the request into the modelled input shape and check it against the model.
@@ -553,7 +604,7 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
         // The body opens with the frame a client reads the OUTPUT shape out of, before any
         // event of the subscription: `SubscribeToShardOutput`'s only member is the stream
         // itself, so that frame carries no member.
-        match frame_empty_initial_response(protocol).and_then(|mut frames| {
+        let framed = frame_empty_initial_response(protocol).and_then(|mut frames| {
             frames.extend(frame_event(
                 protocol,
                 SUBSCRIBE_TO_SHARD_EVENT,
@@ -562,7 +613,17 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
                 &SubscribeToShardEvent::SCHEMA,
             )?);
             Ok(frames)
-        }) {
+        });
+
+        // The event stream is complete, so the subscription it carried is OVER and the shard
+        // it held is released: the next call of this consumer to this shard is the renewal
+        // the service documents, not a second reader contending with this one.
+        {
+            let mut store = state.lock();
+            Self::release(&mut store, region, now, input);
+        }
+
+        match framed {
             Ok(frames) => event_stream_only_response(frames),
             Err(error) => error_response(
                 protocol,
