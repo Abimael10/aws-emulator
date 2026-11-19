@@ -70,6 +70,18 @@ const MAPPING_DYNAMIC: &str = "dynamic";
 /// The `dynamic` value that refuses a document carrying an unmapped field.
 const DYNAMIC_STRICT: &str = "strict";
 
+/// The mapping member that decides whether a value is CLEANED UP to fit the field's mapped
+/// type: "Coercion attempts to clean up dirty values to fit the data type of a field" —
+/// strings are coerced to numbers, and floating points are truncated for integer values
+/// (the `coerce` mapping parameter). It accepts `true` (the default) and `false`, and a
+/// field that declares `false` takes only a value already of its own type.
+const MAPPING_COERCE: &str = "coerce";
+
+/// The settings section an index-wide default for a mapping parameter stands in: an index
+/// setting is named `index.<setting>` and this one is `index.mapping.coerce`, so `mapping`
+/// is the section inside the index's settings it is read from.
+const MAPPING_SETTINGS_SECTION: &str = "mapping";
+
 /// The mappings member nesting the field mappings themselves.
 ///
 /// The sibling vocabulary this module reads — the schema's `mappings` section
@@ -671,6 +683,9 @@ fn accepted_by_mappings(
     let Some(mappings) = mappings else {
         return Ok(());
     };
+    // What a field that states no `coerce` of its own gets, read once per document: the
+    // index's own setting for it.
+    let index_coerces = index_coerces(schema);
     let mut pending = vec![(String::new(), mappings, document)];
     while let Some((path, mappings, value)) = pending.pop() {
         let Document::Object(mappings) = mappings else {
@@ -722,8 +737,11 @@ fn accepted_by_mappings(
                 // field: a field holding further fields is mapped as an object.
                 _ => members.get(MAPPING_PROPERTIES).map(|_| TYPE_OBJECT),
             };
+            // Whether this field cleans a value up to fit its type, which is what decides
+            // a numeric field's reading of a string and of a fraction.
+            let coerces = coerces(members, index_coerces);
             if let Some(mapped_type) = mapped_type {
-                if !parses_as(mapped_type, field) {
+                if !parses_as(mapped_type, field, coerces) {
                     return Err(WriteRefusal::Rejected {
                         error_type: MAPPER_PARSING_EXCEPTION,
                         message: format!(
@@ -749,6 +767,47 @@ fn accepted_by_mappings(
 /// no type of its own.
 const TYPE_OBJECT: &str = "object";
 
+/// Whether a field whose mapping carries `members` cleans a value up to fit its mapped
+/// type — what its `coerce` member ([`MAPPING_COERCE`]) says, and `default` where the
+/// mapping names none.
+///
+/// A mapping parameter is written as a JSON boolean, and the engine reads the strings
+/// spelling one beside it, so `"false"` turns coercion off the same way `false` does.
+fn coerces(
+    members: &::std::collections::HashMap<String, ::aws_smithy_types::Document>,
+    default: bool,
+) -> bool {
+    use ::aws_smithy_types::Document;
+
+    match members.get(MAPPING_COERCE) {
+        Some(Document::Bool(coerce)) => *coerce,
+        Some(Document::String(coerce)) => coerce != "false",
+        _ => default,
+    }
+}
+
+/// What a field of the index `schema` describes that states no `coerce` of its own gets:
+/// the index's own setting for the parameter, which "can be set on the index level to
+/// disable coercion globally across all mapping types" (`index.mapping.coerce`), and `true`
+/// where the index states none, since that is the parameter's default.
+///
+/// The settings are read through the one reader of an index's settings
+/// ([`super::index_settings`]), so the setting is found whichever spelling and form it was
+/// written in.
+fn index_coerces(schema: &::aws_smithy_types::Document) -> bool {
+    use ::serde_json::Value;
+
+    let stated = super::index_settings(schema)
+        .get(MAPPING_SETTINGS_SECTION)
+        .and_then(|section| section.get(MAPPING_COERCE))
+        .cloned();
+    match stated {
+        Some(Value::Bool(coerce)) => coerce,
+        Some(Value::String(coerce)) => coerce != "false",
+        _ => true,
+    }
+}
+
 /// Whether a value of a field mapped with `mapped_type` can be parsed from `value`.
 ///
 /// The catalog is the engine's own documented FIELD TYPES (OpenSearch "Supported field
@@ -756,8 +815,9 @@ const TYPE_OBJECT: &str = "object";
 ///
 /// * a string field (`text`, `keyword`, …) takes any scalar, since a number or a boolean
 ///   is converted to its string form, and no object;
-/// * a numeric field takes a number, and a string a number can be read from — numeric
-///   fields coerce by default ("coerce: try to convert strings to numbers");
+/// * a numeric field takes a number, and — while it coerces — a string a number can be
+///   read from, numeric fields coercing by default ("coerce: try to convert strings to
+///   numbers");
 /// * a boolean field takes `true`/`false` and the strings spelling them, and no number;
 /// * a date field takes a value of the format set its mapping declares — the engine's own
 ///   default pair where it declares none ([`super::date_values::DEFAULT_FORMATS`]), so an
@@ -770,7 +830,13 @@ const TYPE_OBJECT: &str = "object";
 /// `null` is taken by every type: a null field is simply not indexed. An ARRAY is taken
 /// where each of its elements is, because "there is no dedicated array type: any field can
 /// contain zero or more values of the same type".
-fn parses_as(mapped_type: &str, value: &::serde_json::Value) -> bool {
+///
+/// `coerces` is what the field's `coerce` parameter says ([`coerces`], defaulted by the
+/// index's own setting for it): the cleaning up a numeric field does by default — reading a
+/// number out of a string, and truncating a fraction for a field whose type holds whole
+/// numbers — is what a field the parameter is off for does NOT do, so such a field takes
+/// only a value already of its type.
+fn parses_as(mapped_type: &str, value: &::serde_json::Value, coerces: bool) -> bool {
     use ::serde_json::Value;
 
     match value {
@@ -778,7 +844,7 @@ fn parses_as(mapped_type: &str, value: &::serde_json::Value) -> bool {
         Value::Array(elements) => {
             return elements
                 .iter()
-                .all(|element| parses_as(mapped_type, element))
+                .all(|element| parses_as(mapped_type, element, coerces))
         }
         _ => {}
     }
@@ -786,10 +852,17 @@ fn parses_as(mapped_type: &str, value: &::serde_json::Value) -> bool {
         "text" | "keyword" | "match_only_text" | "wildcard" | "constant_keyword" | "search_as_you_type" => {
             !value.is_object()
         }
-        "long" | "integer" | "short" | "byte" | "double" | "float" | "half_float"
-        | "scaled_float" | "unsigned_long" => match value {
+        // A whole-number type: a fraction is truncated into it only while it coerces.
+        "long" | "integer" | "short" | "byte" | "unsigned_long" => match value {
+            Value::Number(number) => {
+                coerces || number.as_f64().is_none_or(|number| number.fract() == 0.0)
+            }
+            Value::String(text) => coerces && text.trim().parse::<f64>().is_ok(),
+            _ => false,
+        },
+        "double" | "float" | "half_float" | "scaled_float" => match value {
             Value::Number(_) => true,
-            Value::String(text) => text.trim().parse::<f64>().is_ok(),
+            Value::String(text) => coerces && text.trim().parse::<f64>().is_ok(),
             _ => false,
         },
         "boolean" => match value {
@@ -982,6 +1055,195 @@ mod tests {
                     "case {mapped_type:?} with {label}: expected it to be taken, got {answer:?}"
                 );
             }
+        }
+    }
+
+    /// RULE: a numeric field CLEANS a value up to fit its type while it coerces — a number
+    /// read out of a string, a fraction truncated into a whole-number type — and a field
+    /// declaring `coerce: false` takes only a value already of its own type.
+    ///
+    /// The rows span what the rule generalises over: the numeric families (whole-number
+    /// and floating-point), the forms a value arrives in (a number, a fraction, a numeric
+    /// string, a string holding no number, an array, a null), and both settings of the
+    /// parameter, including the spelling that writes it as a string.
+    #[test]
+    fn coerce_decides_what_a_numeric_field_takes() {
+        // (the case, the field mapping, the value, whether the field takes it)
+        let rows: &[(&str, &str, ::serde_json::Value, bool)] = &[
+            (
+                "a numeric string for a non-coercing integer",
+                r#"{"type":"integer","coerce":false}"#,
+                ::serde_json::json!("12"),
+                false,
+            ),
+            (
+                "a number for a non-coercing integer",
+                r#"{"type":"integer","coerce":false}"#,
+                ::serde_json::json!(12),
+                true,
+            ),
+            (
+                "a fraction for a non-coercing integer",
+                r#"{"type":"integer","coerce":false}"#,
+                ::serde_json::json!(12.5),
+                false,
+            ),
+            (
+                "a whole number written with a fraction part, for a non-coercing integer",
+                r#"{"type":"integer","coerce":false}"#,
+                ::serde_json::json!(12.0),
+                true,
+            ),
+            (
+                "a numeric string for an integer that coerces by default",
+                r#"{"type":"integer"}"#,
+                ::serde_json::json!("12"),
+                true,
+            ),
+            (
+                "a fraction for an integer that coerces by default",
+                r#"{"type":"integer"}"#,
+                ::serde_json::json!(12.5),
+                true,
+            ),
+            (
+                "a numeric string for an integer that coerces explicitly",
+                r#"{"type":"integer","coerce":true}"#,
+                ::serde_json::json!("12"),
+                true,
+            ),
+            (
+                "a numeric string for a non-coercing long",
+                r#"{"type":"long","coerce":false}"#,
+                ::serde_json::json!("7"),
+                false,
+            ),
+            (
+                "a fraction for a non-coercing double",
+                r#"{"type":"double","coerce":false}"#,
+                ::serde_json::json!(1.5),
+                true,
+            ),
+            (
+                "a numeric string for a non-coercing double",
+                r#"{"type":"double","coerce":false}"#,
+                ::serde_json::json!("1.5"),
+                false,
+            ),
+            (
+                "the parameter written as a string",
+                r#"{"type":"integer","coerce":"false"}"#,
+                ::serde_json::json!("12"),
+                false,
+            ),
+            (
+                "a string holding no number, where the field coerces",
+                r#"{"type":"integer"}"#,
+                ::serde_json::json!("many"),
+                false,
+            ),
+            (
+                "no value at all, where the field does not coerce",
+                r#"{"type":"integer","coerce":false}"#,
+                ::serde_json::json!(null),
+                true,
+            ),
+            (
+                "an array of numbers, where the field does not coerce",
+                r#"{"type":"integer","coerce":false}"#,
+                ::serde_json::json!([1, 2]),
+                true,
+            ),
+            (
+                "an array holding a numeric string, where the field does not coerce",
+                r#"{"type":"integer","coerce":false}"#,
+                ::serde_json::json!([1, "2"]),
+                false,
+            ),
+        ];
+        for (case, mapping, value, taken) in rows {
+            let mappings = schema(&format!(
+                r#"{{"mappings":{{"properties":{{"qty":{mapping}}}}}}}"#
+            ));
+            let answer =
+                accepted_by_mappings(&mappings, &::serde_json::json!({ "qty": value }), "doc-1");
+            assert_eq!(
+                answer.is_ok(),
+                *taken,
+                "case {case:?}: expected {value} to be {}, got {answer:?}",
+                if *taken { "taken" } else { "refused" }
+            );
+            if !*taken {
+                assert!(
+                    matches!(
+                        &answer,
+                        Err(WriteRefusal::Rejected { error_type, message })
+                            if *error_type == MAPPER_PARSING_EXCEPTION
+                                && message.contains("[qty]")
+                    ),
+                    "case {case:?}: expected the parse refusal to name the field, got {answer:?}"
+                );
+            }
+        }
+    }
+
+    /// RULE: a field that states no `coerce` of its own takes the INDEX's setting for the
+    /// parameter, and its own member wins over that setting where it carries one.
+    ///
+    /// The rows span the spellings an index setting is written in (flattened, under the
+    /// `index` section), both settings, and a field overriding the index's own.
+    #[test]
+    fn an_index_setting_is_the_default_for_a_field_that_states_no_coerce() {
+        // (the case, the index's settings section, the field's mapping, the value, taken)
+        let rows: &[(&str, &str, &str, ::serde_json::Value, bool)] = &[
+            (
+                "the index turns coercion off, flattened",
+                r#"{"index.mapping.coerce":false}"#,
+                r#"{"type":"integer"}"#,
+                ::serde_json::json!("12"),
+                false,
+            ),
+            (
+                "the index turns coercion off, under its own section",
+                r#"{"index":{"mapping":{"coerce":false}}}"#,
+                r#"{"type":"integer"}"#,
+                ::serde_json::json!("12"),
+                false,
+            ),
+            (
+                "the index leaves coercion on",
+                r#"{"index.mapping.coerce":true}"#,
+                r#"{"type":"integer"}"#,
+                ::serde_json::json!("12"),
+                true,
+            ),
+            (
+                "the field coerces where the index does not",
+                r#"{"index.mapping.coerce":false}"#,
+                r#"{"type":"integer","coerce":true}"#,
+                ::serde_json::json!("12"),
+                true,
+            ),
+            (
+                "the field does not coerce where the index does",
+                r#"{"index.mapping.coerce":true}"#,
+                r#"{"type":"integer","coerce":false}"#,
+                ::serde_json::json!("12"),
+                false,
+            ),
+        ];
+        for (case, settings, mapping, value, taken) in rows {
+            let mappings = schema(&format!(
+                r#"{{"settings":{settings},"mappings":{{"properties":{{"qty":{mapping}}}}}}}"#
+            ));
+            let answer =
+                accepted_by_mappings(&mappings, &::serde_json::json!({ "qty": value }), "doc-1");
+            assert_eq!(
+                answer.is_ok(),
+                *taken,
+                "case {case:?}: expected {value} to be {}, got {answer:?}",
+                if *taken { "taken" } else { "refused" }
+            );
         }
     }
 
