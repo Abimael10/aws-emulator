@@ -1393,11 +1393,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     stack.client_request_token.clone(),
                 );
             }
-            // What a failed pre-deployment validation refuses the deployment with. A failed
-            // PROPERTY validation refuses it with the summary over its errors, each error's
-            // own detail being on the validation result recorded above; the existence check,
-            // whose verdict is one sentence about one identifier, refuses it with that
-            // sentence.
+            // What a failed pre-deployment validation refuses the deployment with: the
+            // summary over the stage's errors, whichever stage failed, each error's own
+            // detail being on the validation result recorded above
+            // ([`crate::state::early_validation::validation_failure_summary`]).
             let failed_validation = property_failure
                 .as_ref()
                 .map(|failure| {
@@ -1406,8 +1405,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 })
                 .or_else(|| {
-                    name_conflict.as_ref().map(|conflicting| {
-                        crate::state::early_validation::name_conflict_failure(conflicting).reason
+                    name_conflict.as_ref().map(|_| {
+                        // ONE error: the existence check refuses the deployment on the first
+                        // addition whose identifier the owning service already holds.
+                        crate::state::early_validation::validation_failure_summary(1)
                     })
                 });
             // ...and whether that stage is what refused THIS deployment, known here rather

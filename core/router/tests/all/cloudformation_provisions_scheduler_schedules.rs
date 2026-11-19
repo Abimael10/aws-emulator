@@ -29,7 +29,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -54,6 +54,38 @@ const ACCOUNT_ID: &str = "000000000000";
 /// The group a schedule that names none lands in (`GetSchedule$GroupName`: "if you omit
 /// this, the default schedule group is used"), which AWS creates with the account.
 const DEFAULT_GROUP: &str = "default";
+
+/// What a stack reports when CloudFormation refuses a deployment at one of its pre-deployment
+/// validations: the count of errors that stage found and where their detail is read. Source:
+/// `state::early_validation::validation_failure_summary`.
+const VALIDATION_SUMMARY: &str = "Validation failed with 1 error(s). Call DescribeEvents to \
+                                  retrieve the full list of issues with resource and property \
+                                  details, resolve each error, then retry the operation.";
+
+/// How long a wait for a stack's own terminal status may take before the case fails rather
+/// than hangs, and how often it looks again. Generous: what a case asserts is the CONDITION (a
+/// settled stack), never the time it took, so a loaded host cannot decide one.
+const TERMINAL_DEADLINE: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The stack's `StackStatus` once it is out of its `_IN_PROGRESS` statuses, with the whole
+/// `DescribeStacks` answer it was read from.
+///
+/// Waits for the CONDITION, looking again every [`POLL_INTERVAL`] until it holds or
+/// [`TERMINAL_DEADLINE`] passes, and answers the last status it read either way — so a stack
+/// that never settles fails on the status the case asserts rather than on a measured span.
+async fn settled_stack(router: &MultiServiceRouter, region: &str, stack: &str) -> (String, String) {
+    let deadline = Instant::now() + TERMINAL_DEADLINE;
+    loop {
+        let (_, described) =
+            cloudformation(router, region, "DescribeStacks", &[("StackName", stack)]).await;
+        let status = opt_element(&described, "StackStatus").unwrap_or_default();
+        if !status.ends_with("_IN_PROGRESS") || Instant::now() >= deadline {
+            return (status, described);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
 
 /// `2030-01-01T00:00:00Z` and `2031-01-01T00:00:00Z` as the seconds since the epoch the
 /// `restJson1` wire carries a timestamp member as — the two instants the dated row
@@ -877,21 +909,28 @@ async fn a_declaration_the_owning_service_refuses_fails_the_stack() {
             "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body \
              {answered}"
         );
-        tokio::time::sleep(PAST_STACK_SPAN).await;
-
-        let (_, described) =
-            cloudformation(&router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
+        let (settled, described) = settled_stack(&router, region, stack_name).await;
         assert_eq!(
-            opt_element(&described, "StackStatus").as_deref(),
-            Some("ROLLBACK_COMPLETE"),
+            settled, "ROLLBACK_COMPLETE",
             "case {case:?}: expected the failed create to be rolled back rather than report \
              a resource nothing created, got {described}"
         );
         let reason = opt_element(&described, "StackStatusReason").unwrap_or_default();
-        assert!(
-            reason.contains(failing),
-            "case {case:?}: expected the failure to name {failing:?}, got {reason:?}"
-        );
+        if group == DEFAULT_GROUP {
+            // The group that name belongs to is one the account already has, so CloudFormation
+            // refused the deployment at its pre-deployment validation: the stack carries the
+            // summary over that stage's errors, and which resource collided with what is the
+            // detail on the validation result `DescribeEvents` reports.
+            assert_eq!(
+                reason, VALIDATION_SUMMARY,
+                "case {case:?}: expected the pre-deployment validation summary, got {reason:?}"
+            );
+        } else {
+            assert!(
+                reason.contains(failing),
+                "case {case:?}: expected the failure to name {failing:?}, got {reason:?}"
+            );
+        }
 
         // Nothing was put in the group the declaration pointed at.
         let (status, listed) = scheduler(

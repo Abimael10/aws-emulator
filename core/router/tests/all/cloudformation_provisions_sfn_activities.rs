@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -39,8 +39,21 @@ use super::query_wire::{elements, form_encode, opt_element};
 /// due, so the stack reports the template it deployed.
 const PAST_STACK_SPAN: Duration = Duration::from_millis(900);
 
+/// How long a wait for a stack's own terminal status may take before the case fails rather
+/// than hangs, and how often it looks again. Generous: what a case asserts is the CONDITION (a
+/// settled stack), never the time it took, so a loaded host cannot decide one.
+const TERMINAL_DEADLINE: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT: &str = "000000000000";
+
+/// What a stack reports when CloudFormation refuses a deployment at one of its pre-deployment
+/// validations: the count of errors that stage found and where their detail is read. Source:
+/// `state::early_validation::validation_failure_summary`.
+const VALIDATION_SUMMARY: &str = "Validation failed with 1 error(s). Call DescribeEvents to \
+                                  retrieve the full list of issues with resource and property \
+                                  details, resolve each error, then retry the operation.";
 
 /// A KMS key ARN of the form Step Functions' `kmsKeyId` documents ("an alias, alias ARN,
 /// key ID, or key ARN"), for the customer-managed row.
@@ -125,6 +138,25 @@ async fn sfn(
     let status = response.status().as_u16();
     let payload: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
     (status, payload)
+}
+
+/// The stack's `StackStatus` once it is out of its `_IN_PROGRESS` statuses, with the whole
+/// `DescribeStacks` answer it was read from.
+///
+/// Waits for the CONDITION, looking again every [`POLL_INTERVAL`] until it holds or
+/// [`TERMINAL_DEADLINE`] passes, and answers the last status it read either way — so a stack
+/// that never settles fails on the status the case asserts rather than on a measured span.
+async fn settled_stack(router: &MultiServiceRouter, region: &str, stack: &str) -> (String, String) {
+    let deadline = Instant::now() + TERMINAL_DEADLINE;
+    loop {
+        let (_, described) =
+            cloudformation(router, region, "DescribeStacks", &[("StackName", stack)]).await;
+        let status = opt_element(&described, "StackStatus").unwrap_or_default();
+        if !status.ends_with("_IN_PROGRESS") || Instant::now() >= deadline {
+            return (status, described);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// A `DescribeStacks` answer's `Outputs`, as the key/value map a client reads it as. Each
@@ -512,14 +544,14 @@ async fn a_stack_provisions_the_step_functions_activity_its_template_declares() 
     }
 }
 
-/// A stack whose template declares an activity Step Functions REFUSES does not report a
-/// resource nothing created: the stack fails, with the refusal the owning service gave, and
-/// the activity a client already had is untouched.
+/// A stack whose template declares an activity that is ALREADY there does not report a
+/// resource nothing created: the stack fails before anything is provisioned — CloudFormation's
+/// own pre-deployment validation establishes that the name is held — and the activity a client
+/// already had is untouched.
 ///
-/// The refusal here is Step Functions' own `ActivityAlreadyExists`, reached by pointing a
-/// template at a name a client already created with DIFFERENT encryption settings — the one
-/// difference that create's idempotency does not absorb ("EncryptionConfiguration may not be
-/// updated").
+/// The name is one a client created with DIFFERENT encryption settings, the one difference
+/// Step Functions' own create idempotency does not absorb ("EncryptionConfiguration may not be
+/// updated"), so the deployment could not have been carried out either way.
 #[tokio::test]
 async fn an_activity_the_owning_service_refuses_fails_the_stack() {
     let router = build_router();
@@ -566,19 +598,19 @@ async fn an_activity_the_owning_service_refuses_fails_the_stack() {
         status, 200,
         "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_STACK_SPAN).await;
-
-    let (_, described) =
-        cloudformation(&router, region, "DescribeStacks", &[("StackName", "activity-clash")]).await;
+    let (settled, described) = settled_stack(&router, region, "activity-clash").await;
     assert_eq!(
-        opt_element(&described, "StackStatus").as_deref(),
-        Some("ROLLBACK_COMPLETE"),
+        settled, "ROLLBACK_COMPLETE",
         "case {case:?}: expected the failed create to be rolled back, got {described}"
     );
     let reason = opt_element(&described, "StackStatusReason").unwrap_or_default();
-    assert!(
-        reason.contains("Activity"),
-        "case {case:?}: expected the failure to name the resource, got {reason:?}"
+    // The name was taken before anything was provisioned, so CloudFormation refused the
+    // deployment at its pre-deployment validation: the stack carries the summary over that
+    // stage's errors, and which resource collided with what is the detail on the validation
+    // result `DescribeEvents` reports.
+    assert_eq!(
+        reason, VALIDATION_SUMMARY,
+        "case {case:?}: expected the pre-deployment validation summary, got {reason:?}"
     );
 
     // The activity the client created is still exactly as it was.

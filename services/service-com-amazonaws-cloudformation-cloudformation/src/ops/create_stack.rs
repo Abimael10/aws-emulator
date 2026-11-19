@@ -901,12 +901,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .next()
         };
-        // What a failed pre-deployment validation refuses the deployment with. A failed
-        // PROPERTY validation refuses it with the summary over its errors — each error's own
-        // detail is on the validation result the stack recorded for it, which is what
-        // `DescribeEvents` reports ([`crate::state::property_validation`]) — while the
-        // existence check, whose verdict is one sentence about one identifier, refuses it with
-        // that sentence.
+        // What a failed pre-deployment validation refuses the deployment with: the summary
+        // over the stage's errors, whichever stage failed. Each error's own detail is on the
+        // validation result the stack recorded for it, which is what `DescribeEvents` reports
+        // ([`crate::state::early_validation::validation_failure_summary`]) — so the stack
+        // reports that CloudFormation refused the deployment and where to read why, rather
+        // than one stage's wording of one failure.
         let failed_validation = property_failure
             .as_ref()
             .map(|failure| {
@@ -915,11 +915,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })
             .or_else(|| {
-                name_conflict
-                    .as_ref()
-                    .map(|conflicting| {
-                        crate::state::early_validation::name_conflict_failure(conflicting).reason
-                    })
+                name_conflict.as_ref().map(|_| {
+                    // ONE error: the existence check refuses the deployment on the first
+                    // addition whose identifier the owning service already holds.
+                    crate::state::early_validation::validation_failure_summary(1)
+                })
             });
         // ...and whether that stage is what refused THIS deployment, known here rather than
         // re-derived from the reason text below: a refusal reached before it stands instead.

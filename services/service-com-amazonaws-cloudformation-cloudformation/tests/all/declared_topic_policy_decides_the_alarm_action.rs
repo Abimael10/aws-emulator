@@ -98,7 +98,15 @@ const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// One Amazon SQS call through the same router, signed for `sqs` the way a client's SDK signs
 /// it: the status and the parsed answer document.
-async fn sqs(router: &MultiServiceRouter, operation: &str, request: &Value) -> (u16, Value) {
+///
+/// `pub(crate)` because it is the ONE Amazon SQS caller of this target: a suite that reads a
+/// queue back calls this rather than spelling that service's awsJson1_0 wire again
+/// (`resource_schema_validation.rs` reads the queues its templates declare through it).
+pub(crate) async fn sqs(
+    router: &MultiServiceRouter,
+    operation: &str,
+    request: &Value,
+) -> (u16, Value) {
     let http_request = http::Request::builder()
         .method("POST")
         .uri(format!("https://sqs.{REGION}.amazonaws.com/"))

@@ -31,7 +31,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -46,6 +46,38 @@ const PAST_STACK_SPAN: Duration = Duration::from_millis(900);
 
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT: &str = "000000000000";
+
+/// What a stack reports when CloudFormation refuses a deployment at one of its pre-deployment
+/// validations: the count of errors that stage found and where their detail is read. Source:
+/// `state::early_validation::validation_failure_summary`.
+const VALIDATION_SUMMARY: &str = "Validation failed with 1 error(s). Call DescribeEvents to \
+                                  retrieve the full list of issues with resource and property \
+                                  details, resolve each error, then retry the operation.";
+
+/// How long a wait for a stack's own terminal status may take before the case fails rather
+/// than hangs, and how often it looks again. Generous: what a case asserts is the CONDITION (a
+/// settled stack), never the time it took, so a loaded host cannot decide one.
+const TERMINAL_DEADLINE: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The stack's `StackStatus` once it is out of its `_IN_PROGRESS` statuses, with the whole
+/// `DescribeStacks` answer it was read from.
+///
+/// Waits for the CONDITION, looking again every [`POLL_INTERVAL`] until it holds or
+/// [`TERMINAL_DEADLINE`] passes, and answers the last status it read either way — so a stack
+/// that never settles fails on the status the case asserts rather than on a measured span.
+async fn settled_stack(router: &MultiServiceRouter, region: &str, stack: &str) -> (String, String) {
+    let deadline = Instant::now() + TERMINAL_DEADLINE;
+    loop {
+        let (_, described) =
+            cloudformation(router, region, "DescribeStacks", &[("StackName", stack)]).await;
+        let status = opt_element(&described, "StackStatus").unwrap_or_default();
+        if !status.ends_with("_IN_PROGRESS") || Instant::now() >= deadline {
+            return (status, described);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
 
 /// The longest repository name CodeCommit accepts (`RepositoryName`, `@length(min: 1,
 /// max: 100)` in that service's own model), which a GENERATED name is held to.
@@ -616,10 +648,12 @@ async fn a_stack_provisions_the_codecommit_repository_its_template_declares() {
 }
 
 /// A declaration CodeCommit REFUSES does not report a resource nothing created: the stack
-/// fails with that service's own refusal, and nothing half-created is left behind.
+/// fails with that service's own refusal, and nothing half-created is left behind. A name that
+/// is ALREADY held is refused one stage earlier, by CloudFormation's own pre-deployment
+/// validation, which the stack reports with that stage's summary ([`VALIDATION_SUMMARY`]).
 ///
 /// The rows differ along WHAT is refused and by WHICH of the two calls the type's arm
-/// makes: a repository name a client already holds (refused by the create), a trigger whose
+/// makes: a repository name a client already holds (refused before the create), a trigger whose
 /// destination is not an ARN and one whose destination is in another Region (both refused by
 /// the trigger write, after the repository was created — so each also checks that the
 /// repository that write was for is gone again), and a property this emulator maps onto no
@@ -705,20 +739,27 @@ async fn a_repository_the_owning_service_refuses_fails_the_stack() {
             status, 200,
             "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
         );
-        tokio::time::sleep(PAST_STACK_SPAN).await;
-
-        let (_, described) =
-            cloudformation(&router, region, "DescribeStacks", &[("StackName", &stack_name)]).await;
+        let (settled, described) = settled_stack(&router, region, &stack_name).await;
         assert_eq!(
-            opt_element(&described, "StackStatus").as_deref(),
-            Some("ROLLBACK_COMPLETE"),
+            settled, "ROLLBACK_COMPLETE",
             "case {case:?}: expected the failed create to be rolled back, got {described}"
         );
         let reason = opt_element(&described, "StackStatusReason").unwrap_or_default();
-        assert!(
-            reason.contains("Repo"),
-            "case {case:?}: expected the failure to name the resource, got {reason:?}"
-        );
+        if repository == "already-there" {
+            // The name was taken before anything was provisioned, so CloudFormation refused the
+            // deployment at its pre-deployment validation: the stack carries the summary over
+            // that stage's errors, and which resource collided with what is the detail on the
+            // validation result `DescribeEvents` reports.
+            assert_eq!(
+                reason, VALIDATION_SUMMARY,
+                "case {case:?}: expected the pre-deployment validation summary, got {reason:?}"
+            );
+        } else {
+            assert!(
+                reason.contains("Repo"),
+                "case {case:?}: expected the failure to name the resource, got {reason:?}"
+            );
+        }
 
         let (status, read) = codecommit(
             &router,

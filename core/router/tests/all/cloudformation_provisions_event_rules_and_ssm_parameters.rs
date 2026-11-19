@@ -42,6 +42,13 @@ const PAST_STACK_SPAN: Duration = Duration::from_millis(900);
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT_ID: &str = "000000000000";
 
+/// What a stack reports when CloudFormation refuses a deployment at one of its pre-deployment
+/// validations: the count of errors that stage found and where their detail is read. Source:
+/// `state::early_validation::validation_failure_summary`.
+const VALIDATION_SUMMARY: &str = "Validation failed with 1 error(s). Call DescribeEvents to \
+                                  retrieve the full list of issues with resource and property \
+                                  details, resolve each error, then retry the operation.";
+
 /// How long a wait for a stack's own clock-owed transition may take before the test fails
 /// rather than hangs: far above the span itself, so a loaded host cannot decide the outcome.
 const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
@@ -853,9 +860,9 @@ async fn a_stack_provisions_the_event_rules_and_parameters_its_template_declares
     }
 }
 
-/// A resource an owning service — or, for an UPSERT create, the probe that stands in for
-/// its refusal — will not create is not reported as created: a second stack declaring a
-/// name the owning service already holds fails, naming the resource, and what the first
+/// A resource whose name is ALREADY held is not reported as created: a second stack declaring
+/// a name the owning service already holds fails before anything is provisioned, with the
+/// summary CloudFormation reports for a failed pre-deployment validation, and what the first
 /// stack created is untouched.
 #[tokio::test]
 async fn a_resource_whose_name_is_already_held_fails_the_stack() {
@@ -886,24 +893,21 @@ async fn a_resource_whose_name_is_already_held_fails_the_stack() {
     })
     .to_string();
 
-    // (the case, the two stack names, the template both deploy, the logical id the failure
-    // must name)
-    let cases: [(&str, [&str; 2], &str, &str); 2] = [
+    // (the case, the two stack names, the template both deploy)
+    let cases: [(&str, [&str; 2], &str); 2] = [
         (
             "two stacks declaring one parameter name",
             ["parameter-first", "parameter-second"],
             &template,
-            "Param",
         ),
         (
             "two stacks declaring one rule name",
             ["rule-first", "rule-second"],
             &rule_template,
-            "Rule",
         ),
     ];
 
-    for (case, stack_names, body, logical_id) in cases {
+    for (case, stack_names, body) in cases {
         for stack_name in stack_names {
             let (status, answered) = cloudformation(
                 &router,
@@ -918,31 +922,29 @@ async fn a_resource_whose_name_is_already_held_fails_the_stack() {
                  {status} with body {answered}"
             );
         }
-        tokio::time::sleep(PAST_STACK_SPAN).await;
-
-        let (_, first) =
-            cloudformation(&router, region, "DescribeStacks", &[("StackName", stack_names[0])])
-                .await;
+        let settled_first = settled_stack_status(&router, region, case, stack_names[0]).await;
         assert_eq!(
-            opt_element(&first, "StackStatus").as_deref(),
-            Some("CREATE_COMPLETE"),
-            "case {case:?}: expected the first stack to complete, got {first}"
+            settled_first, "CREATE_COMPLETE",
+            "case {case:?}: expected the first stack to complete, got {settled_first:?}"
         );
 
+        let settled_second = settled_stack_status(&router, region, case, stack_names[1]).await;
+        assert_eq!(
+            settled_second, "ROLLBACK_COMPLETE",
+            "case {case:?}: expected the second stack's failed create to be rolled back \
+             rather than report a resource nothing created, got {settled_second:?}"
+        );
         let (_, second) =
             cloudformation(&router, region, "DescribeStacks", &[("StackName", stack_names[1])])
                 .await;
-        assert_eq!(
-            opt_element(&second, "StackStatus").as_deref(),
-            Some("ROLLBACK_COMPLETE"),
-            "case {case:?}: expected the second stack's failed create to be rolled back \
-             rather than report a resource nothing created, got {second}"
-        );
         let reason = opt_element(&second, "StackStatusReason").unwrap_or_default();
-        assert!(
-            reason.contains(logical_id),
-            "case {case:?}: expected the failure to name the resource that failed, got \
-             {reason:?}"
+        // The name was already held when the second create was weighed, so CloudFormation
+        // refused that deployment at its pre-deployment validation: the stack carries the
+        // summary over that stage's errors, and which resource collided with what is the detail
+        // on the validation result `DescribeEvents` reports.
+        assert_eq!(
+            reason, VALIDATION_SUMMARY,
+            "case {case:?}: expected the pre-deployment validation summary, got {reason:?}"
         );
     }
 

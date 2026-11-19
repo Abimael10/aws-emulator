@@ -162,6 +162,30 @@ pub fn failed_reason(validations: &[&str]) -> String {
     )
 }
 
+/// How a stack operation reports, ON THE STACK, that its resources did not pass a
+/// PRE-DEPLOYMENT VALIDATION: how many errors the stage found, and that the detail of each one
+/// is on the operation's own events.
+///
+/// ONE sentence for every stage that runs before anything is provisioned — the existence check
+/// this module performs and the property validation beside it
+/// ([`super::property_validation::validation_failure_summary`] is that stage's own reading of
+/// it) — because what the stack has to report is that CLOUDFORMATION refused the operation at
+/// that stage and where to read why: each failure's own diagnosis is the validation result
+/// recorded for the resource it failed on ([`super::StoredValidationFailure`]), which
+/// `DescribeEvents` reports. Folding one of those diagnoses into the stack's reason instead
+/// would make the one field a client reads off the stack depend on which stage failed and on
+/// how that stage words a single failure.
+///
+/// The one variable part is the count of errors, which is how many failures the stage reported
+/// for the operation.
+pub fn validation_failure_summary(errors: usize) -> String {
+    format!(
+        "Validation failed with {errors} error(s). Call DescribeEvents to retrieve the full \
+         list of issues with resource and property details, resolve each error, then retry \
+         the operation."
+    )
+}
+
 /// One resource whose physical name the template SPELLS: the resource the existence check is
 /// about, with the identifier its owning service would know it by.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -57,6 +57,13 @@ const POLLS: usize = 400;
 const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 const ROLLBACK_COMPLETE: &str = "ROLLBACK_COMPLETE";
 
+/// What a stack reports when CloudFormation refuses a deployment at one of its pre-deployment
+/// validations: the count of errors that stage found and where their detail is read. Source:
+/// `state::early_validation::validation_failure_summary`.
+const VALIDATION_SUMMARY: &str = "Validation failed with 1 error(s). Call DescribeEvents to \
+                                  retrieve the full list of issues with resource and property \
+                                  details, resolve each error, then retry the operation.";
+
 /// The `StreamStatus` a stream serves reads and writes in.
 const ACTIVE: &str = "ACTIVE";
 
@@ -652,11 +659,13 @@ async fn a_stack_provisions_the_kinesis_stream_its_template_declares() {
 
 /// A declaration Amazon Kinesis Data Streams REFUSES does not report a resource nothing
 /// created: the stack fails with that service's own refusal, and nothing half-created is left
-/// behind.
+/// behind. A name that is ALREADY held is refused one stage earlier, by CloudFormation's own
+/// pre-deployment validation, which the stack reports with that stage's summary
+/// ([`VALIDATION_SUMMARY`]).
 ///
 /// The rows differ along WHAT is refused and by WHICH of the calls the type's arm makes: a
-/// stream name a client already holds (refused by the create), a capacity mode whose shard
-/// count the service manages itself (refused by the create too), a retention window past the
+/// stream name a client already holds (refused before the create), a capacity mode whose shard
+/// count the service manages itself (refused by the create), a retention window past the
 /// published ceiling and one SHORTER than the default — the two directions the second call
 /// carries a declared window in, both refused after the stream was created, so each also
 /// checks the stream that call was for is gone again — a property this emulator maps onto no
@@ -748,10 +757,21 @@ async fn a_stream_the_owning_service_refuses_fails_the_stack() {
             "case {case:?}: expected the failed create to be rolled back, got {described}"
         );
         let reason = opt_element(&described, "StackStatusReason").unwrap_or_default();
-        assert!(
-            reason.contains("Stream"),
-            "case {case:?}: expected the failure to name the resource, got {reason:?}"
-        );
+        if stream == "already-there" {
+            // The name was taken before anything was provisioned, so CloudFormation refused the
+            // deployment at its pre-deployment validation: the stack carries the summary over
+            // that stage's errors, and which resource collided with what is the detail on the
+            // validation result `DescribeEvents` reports.
+            assert_eq!(
+                reason, VALIDATION_SUMMARY,
+                "case {case:?}: expected the pre-deployment validation summary, got {reason:?}"
+            );
+        } else {
+            assert!(
+                reason.contains("Stream"),
+                "case {case:?}: expected the failure to name the resource, got {reason:?}"
+            );
+        }
 
         if stream == "already-there" {
             // The stream the CLIENT created is still exactly as it was: the stack's failure

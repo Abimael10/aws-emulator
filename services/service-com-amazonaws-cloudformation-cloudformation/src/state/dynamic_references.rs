@@ -72,6 +72,17 @@ use super::provisioning::call_secretsmanager;
 /// The delimiters of a dynamic reference: `{{resolve:<store>:<reference key>}}`.
 const OPEN: &str = "{{resolve:";
 
+/// Whether `text` carries a dynamic reference that has NOT been resolved yet — the opener
+/// [`OPEN`] standing anywhere in it, which is what makes the text a reference rather than the
+/// value it stands for.
+///
+/// Read by the stages that judge a declaration BEFORE a deployment resolves its references
+/// ([`super::property_validation`]): such a text is not the value the owning service will be
+/// given, so nothing about that value can be decided from it.
+pub fn carries_a_reference(text: &str) -> bool {
+    text.contains(OPEN)
+}
+
 /// See [`OPEN`].
 const CLOSE: &str = "}}";
 

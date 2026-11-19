@@ -8,13 +8,14 @@
 //! type ALREADY holds — and that no live stack of the account and Region manages — fails at
 //! that stage: nothing is asked of any owning service, no resource of the stack reports an
 //! event of its own, the resource that was already there is untouched, and the stack's own
-//! failure event carries `DetailedStatus` `VALIDATION_FAILED` with CloudFormation's sentence
-//! for the collision, whose fixed text is `Resource of type '…' with identifier '…' already
-//! exists.` The detail is the validation result `DescribeEvents` reports: one
+//! failure event carries `DetailedStatus` `VALIDATION_FAILED` with the summary every
+//! pre-deployment validation reports on the stack — the count of errors and the pointer at
+//! `DescribeEvents`. The detail is the validation result `DescribeEvents` reports: one
 //! `VALIDATION_ERROR` event naming `NAME_CONFLICT_VALIDATION`, `FAILED`, handled by failing,
-//! at the element of the template that declared the resource. `DisableValidation` turns the
-//! stage off, and the same declaration then reaches the owning service, whose own refusal is
-//! what that resource's event reports.
+//! at the element of the template that declared the resource, reading CloudFormation's
+//! sentence for the collision, whose fixed text is `Resource of type '…' with identifier '…'
+//! already exists.` `DisableValidation` turns the stage off, and the same declaration then
+//! reaches the owning service, whose own refusal is what that resource's event reports.
 //!
 //! The rows differ along what the rule generalises over: WHICH resource type the colliding
 //! declaration is of (four owning services), the FORM of the identifier the collision is
@@ -60,6 +61,17 @@ const VALIDATION_FAILED: &str = "VALIDATION_FAILED";
 /// that identifier. Source: `state::early_validation::already_exists`.
 fn already_exists(resource_type: &str, identifier: &str) -> String {
     format!("Resource of type '{resource_type}' with identifier '{identifier}' already exists.")
+}
+
+/// What a stack reports for a failure of ANY of CloudFormation's pre-deployment validations:
+/// the count of errors the stage found and where their detail is read. Source:
+/// `state::early_validation::validation_failure_summary`.
+fn summary(errors: usize) -> String {
+    format!(
+        "Validation failed with {errors} error(s). Call DescribeEvents to retrieve the full \
+         list of issues with resource and property details, resolve each error, then retry \
+         the operation."
+    )
 }
 
 /// Who already holds the name a row's template declares.
@@ -361,6 +373,9 @@ async fn a_name_the_owning_service_holds_fails_the_create_before_provisioning() 
 
         let collides = !matches!(row.holder, Holder::Nobody);
         let reason = already_exists(row.resource_type, &row.identifier);
+        // ...and what the STACK reports for it: the summary over the stage's one error, which
+        // is what points a client at the detail above.
+        let reported = summary(1);
 
         let (status_code, described) = describe_stack(&router, row.stack).await;
         assert_eq!(
@@ -381,9 +396,9 @@ async fn a_name_the_owning_service_holds_fails_the_create_before_provisioning() 
         if collides {
             let settled_reason = xml_text(&described, "StackStatusReason").unwrap_or_default();
             assert_eq!(
-                settled_reason, reason,
-                "case {case:?}: expected the stack to report the collision {reason:?}, got \
-                 {settled_reason:?}"
+                settled_reason, reported,
+                "case {case:?}: expected the stack to report the validation summary \
+                 {reported:?}, got {settled_reason:?}"
             );
         }
 
@@ -409,8 +424,8 @@ async fn a_name_the_owning_service_holds_fails_the_create_before_provisioning() 
                  {detailed_status:?} in {events:?}"
             );
             assert_eq!(
-                event_reason, &reason,
-                "case {case:?}: expected the failure event to carry {reason:?}, got \
+                event_reason, &reported,
+                "case {case:?}: expected the failure event to carry {reported:?}, got \
                  {event_reason:?}"
             );
         }
@@ -650,6 +665,7 @@ async fn an_update_is_held_to_the_same_check_and_its_own_resources_are_no_collis
     settle_the_store(&router, &engine).await;
 
     let reason = already_exists("AWS::Logs::LogGroup", held);
+    let reported = summary(1);
     let events = stack_events(&router, case, "conflict-update").await;
     let failed: Vec<&(String, String, String, String)> = events
         .iter()
@@ -664,9 +680,9 @@ async fn an_update_is_held_to_the_same_check_and_its_own_resources_are_no_collis
     );
     assert_eq!(
         (failed[0].2.as_str(), failed[0].3.as_str()),
-        (VALIDATION_FAILED, reason.as_str()),
+        (VALIDATION_FAILED, reported.as_str()),
         "case {case:?}: expected the failure event to report {VALIDATION_FAILED} and \
-         {reason:?}, got {failed:?}"
+         {reported:?}, got {failed:?}"
     );
     // Nothing was asked of CloudWatch Logs: the resource the update would have added reports
     // no event of its own, and the group that was already there is untouched.

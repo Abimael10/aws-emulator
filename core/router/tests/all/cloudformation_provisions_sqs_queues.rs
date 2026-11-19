@@ -380,24 +380,21 @@ const UPDATE_ROWS: &[UpdateRow] = &[
         expected_tags: &[],
     },
     UpdateRow {
-        case: "several attributes at once, one of them a policy written as an object",
+        case: "several attributes at once, one of them a document written as an object",
         stack_name: "update-several-stack",
         declared_name: Some("update-several-queue"),
         created: r#"{"QueueName":"update-several-queue","VisibilityTimeout":30,
              "MessageRetentionPeriod":600,
-             "Policy":{"Version":"2012-10-17","Statement":[]}}"#,
+             "RedriveAllowPolicy":{"redrivePermission":"allowAll"}}"#,
         updated: r#"{"QueueName":"update-several-queue","VisibilityTimeout":43200,
              "MessageRetentionPeriod":1209600,
-             "Policy":{"Version":"2012-10-17","Statement":[{"Effect":"Allow"}]}}"#,
+             "RedriveAllowPolicy":{"redrivePermission":"denyAll"}}"#,
         expected_attributes: &[
             ("VisibilityTimeout", "43200"),
             ("MessageRetentionPeriod", "1209600"),
             // The object the update declared, as the compact JSON string the attribute is
             // documented to carry, with its members in the order the template wrote them.
-            (
-                "Policy",
-                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow"}]}"#,
-            ),
+            ("RedriveAllowPolicy", r#"{"redrivePermission":"denyAll"}"#),
         ],
         expected_tags: &[],
     },

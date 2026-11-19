@@ -51,6 +51,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT: &str = "000000000000";
 
+/// What a stack reports when CloudFormation refuses a deployment at one of its pre-deployment
+/// validations: the count of errors that stage found and where their detail is read. Source:
+/// `state::early_validation::validation_failure_summary`.
+const VALIDATION_SUMMARY: &str = "Validation failed with 1 error(s). Call DescribeEvents to \
+                                  retrieve the full list of issues with resource and property \
+                                  details, resolve each error, then retry the operation.";
+
 /// The stack-level tag every row's `CreateStack` states, which CloudFormation propagates to
 /// the resources the stack creates.
 const STACK_TAG_KEY: &str = "Stack";
@@ -606,12 +613,13 @@ async fn a_stack_provisions_the_xray_group_its_template_declares() {
     }
 }
 
-/// A stack whose template declares a group X-Ray REFUSES does not report a resource nothing
-/// created: the stack fails with that service's own refusal, and the group a client already
+/// A stack whose template declares a group that is ALREADY there does not report a resource
+/// nothing created: the stack fails before anything is provisioned — CloudFormation's own
+/// pre-deployment validation establishes that the name is held — and the group a client already
 /// had is untouched.
 ///
-/// The refusal here is X-Ray's own: a group name the account already holds, which
-/// `CreateGroup` rejects rather than redefining.
+/// The name is one the account already holds, which `CreateGroup` would reject rather than
+/// redefining, so the deployment could not have been carried out either way.
 #[tokio::test]
 async fn an_xray_group_the_owning_service_refuses_fails_the_stack() {
     let router = build_router();
@@ -668,9 +676,13 @@ async fn an_xray_group_the_owning_service_refuses_fails_the_stack() {
         "case {case:?}: expected the failed create to be rolled back, got {described}"
     );
     let reason = opt_element(&described, "StackStatusReason").unwrap_or_default();
-    assert!(
-        reason.contains("Group"),
-        "case {case:?}: expected the failure to name the resource, got {reason:?}"
+    // The name was taken before anything was provisioned, so CloudFormation refused the
+    // deployment at its pre-deployment validation: the stack carries the summary over that
+    // stage's errors, and which resource collided with what is the detail on the validation
+    // result `DescribeEvents` reports.
+    assert_eq!(
+        reason, VALIDATION_SUMMARY,
+        "case {case:?}: expected the pre-deployment validation summary, got {reason:?}"
     );
 
     // The group the client created is still exactly as it was.

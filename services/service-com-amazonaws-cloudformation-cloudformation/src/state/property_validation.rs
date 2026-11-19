@@ -34,6 +34,11 @@
 //!   emulator holds in full ([`declared_properties`]), which is the
 //!   `Unsupported property [<member>]` the stage reports
 //!   ([`declared_properties::unsupported_property_reason`]);
+//! * a property whose contract states the TYPE of its value, carrying a scalar that spells no
+//!   value of that type, over the rows this emulator holds
+//!   ([`typed_properties::TYPED_PROPERTIES`]), which is the
+//!   `Property validation failure: [Value of property {/<member>} does not match type
+//!   {<type>}]` the stage reports ([`typed_properties::type_failure_reason`]);
 //! * a property whose contract publishes the values it admits, carrying a value that is not
 //!   one of them, over the rows this emulator holds ([`CONSTRAINED_PROPERTIES`]);
 //! * a property whose contract publishes the PATTERN its values match, carrying a value
@@ -43,9 +48,10 @@
 //!   ([`patterned_properties::pattern_failure_reason`]).
 //!
 //! A resource is judged in that order, because a property that is not there has no value to
-//! hold to a set and a member the type does not have has no set to hold one to, and the
-//! resources in the order the deployment would have created them — so the failure reported is
-//! the one the operation would have run into first.
+//! hold to a set, a member the type does not have has no set to hold one to and a value of the
+//! wrong type is no value of a set or a spelling whatever it reads like, and the resources in
+//! the order the deployment would have created them — so the failure reported is the one the
+//! operation would have run into first.
 //!
 //! What the STACK reports for a failure of this stage is not one of those reasons but the
 //! summary over them ([`validation_failure_summary`]): the count of errors, and that the
@@ -105,6 +111,10 @@ pub mod declared_properties;
 /// Which SPELLINGS a property admits, which is the other question its schema makes decidable
 /// about a value.
 pub mod patterned_properties;
+
+/// Which TYPE a property's value has to have, which is the first question its schema makes
+/// decidable about that value.
+pub mod typed_properties;
 
 /// One property whose admitted values its type's contract publishes.
 #[derive(Debug, Clone, Copy)]
@@ -407,14 +417,16 @@ const PROPERTIES_SECTION: &str = "Properties";
 /// every property the type REQUIRES (a property that is not there has no value to hold to a
 /// set), then that every member it does carry is one the type HAS
 /// ([`declared_properties`]), then the `oneOf` over those members, and last each value
-/// against what its property states about a value — the set it publishes, and then the
-/// pattern it admits ([`patterned_properties`]), since a value outside a published set is
-/// not one of its values whatever it is spelled like.
+/// against what its property states about a value — the TYPE it states
+/// ([`typed_properties`]), then the set it publishes, and then the pattern it admits
+/// ([`patterned_properties`]), since a value of another type is no value of a published set
+/// and a value outside such a set is not one of its values whatever it is spelled like.
 pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
     declared.iter().find_map(|resource| {
         missing_required_property(resource)
             .or_else(|| declared_properties::undeclared_property(resource))
             .or_else(|| matched_several_subschemas(resource))
+            .or_else(|| typed_properties::value_of_another_type(resource))
             .or_else(|| inadmissible_value(resource))
             .or_else(|| patterned_properties::value_outside_its_pattern(resource))
     })
@@ -433,13 +445,12 @@ pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
 /// The one variable part is the count, which is how many failures this stage reported for the
 /// operation — the length of `failures`, since [`failure`] reports the FIRST declaration the
 /// stage refuses and the operation is then refused on it.
+///
+/// The sentence itself is the one EVERY pre-deployment validation stage reports on the stack
+/// ([`super::early_validation::validation_failure_summary`]), so this stage and the existence
+/// check beside it cannot word the same refusal differently.
 pub fn validation_failure_summary(failures: &[PropertyFailure]) -> String {
-    let errors = failures.len();
-    format!(
-        "Validation failed with {errors} error(s). Call DescribeEvents to retrieve the full \
-         list of issues with resource and property details, resolve each error, then retry \
-         the operation."
-    )
+    super::early_validation::validation_failure_summary(failures.len())
 }
 
 /// `Some(failure)` for a resource carrying MORE THAN ONE of a group of properties its type's

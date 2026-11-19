@@ -75,6 +75,37 @@ pub const DECLARED_PROPERTIES: &[DeclaredProperties] = &[
             "TopicArn",
         ],
     },
+    // `AWS::SQS::Queue`: the queue's `QueueName`, every one of its own ATTRIBUTES the owning
+    // API publishes as settable — named identically on both sides
+    // (`::service_com_amazonaws_sqs_amazonsqs::state::SETTABLE_ATTRIBUTES`) — LESS the
+    // queue's `Policy`, for which this type's schema states no property at all (a queue's
+    // access policy is carried by resource types of its own, `AWS::SQS::QueuePolicy` and
+    // `AWS::SQS::QueueInlinePolicy`), plus the `Tags` the type publishes as a list and the
+    // two the schema marks READ-ONLY (`Arn`, `QueueUrl`) — the values Amazon SQS computes for
+    // the queue, which a declaration may carry and a deployment ignores.
+    DeclaredProperties {
+        resource_type: "AWS::SQS::Queue",
+        declared: &[
+            "Arn",
+            "ContentBasedDeduplication",
+            "DeduplicationScope",
+            "DelaySeconds",
+            "FifoQueue",
+            "FifoThroughputLimit",
+            "KmsDataKeyReusePeriodSeconds",
+            "KmsMasterKeyId",
+            "MaximumMessageSize",
+            "MessageRetentionPeriod",
+            "QueueName",
+            "QueueUrl",
+            "ReceiveMessageWaitTimeSeconds",
+            "RedriveAllowPolicy",
+            "RedrivePolicy",
+            "SqsManagedSseEnabled",
+            "Tags",
+            "VisibilityTimeout",
+        ],
+    },
     // The three resources that ARE one resource policy, each stating the document and the
     // resources it is installed on, and nothing else.
     DeclaredProperties {
@@ -263,6 +294,31 @@ mod tests {
                 "AWS::Logs::LogStream",
                 json!({"LogGroupName": "g", "RetentionInDays": 7}),
                 Some("RetentionInDays"),
+            ),
+            (
+                "a queue carrying the access policy its own schema states no property for",
+                "AWS::SQS::Queue",
+                json!({"QueueName": "q", "VisibilityTimeout": 30,
+                       "Policy": {"Version": "2012-10-17"}}),
+                Some("Policy"),
+            ),
+            (
+                "a queue carrying only members its schema states, the read-only ones among \
+                 them",
+                "AWS::SQS::Queue",
+                json!({"QueueName": "q.fifo", "FifoQueue": true,
+                       "ContentBasedDeduplication": true, "DeduplicationScope": "queue",
+                       "FifoThroughputLimit": "perQueue", "DelaySeconds": 0,
+                       "KmsDataKeyReusePeriodSeconds": 300, "KmsMasterKeyId": "alias/aws/sqs",
+                       "MaximumMessageSize": 262144, "MessageRetentionPeriod": 345600,
+                       "ReceiveMessageWaitTimeSeconds": 0,
+                       "RedriveAllowPolicy": {"redrivePermission": "allowAll"},
+                       "RedrivePolicy": {"maxReceiveCount": 3},
+                       "SqsManagedSseEnabled": true, "VisibilityTimeout": 30,
+                       "Tags": [{"Key": "team", "Value": "ops"}],
+                       "Arn": "arn:aws:sqs:us-east-1:000000000000:q.fifo",
+                       "QueueUrl": "https://example.invalid/q.fifo"}),
+                None,
             ),
             (
                 "a wait condition handle, which has no property at all",

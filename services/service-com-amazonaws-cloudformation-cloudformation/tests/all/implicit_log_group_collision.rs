@@ -10,11 +10,12 @@
 //! fails the check is refused before anything is provisioned — so no resource of the template
 //! exists afterwards and the resource that was already there is unchanged. The failure is
 //! reported as the validation it is: the stack settles `ROLLBACK_COMPLETE`, its ONE stack-level
-//! `CREATE_FAILED` event carries `DetailedStatus` `VALIDATION_FAILED` with CloudFormation's
-//! sentence for the collision (fixed text `Resource of type '…' with identifier '…' already
-//! exists.`), and `DescribeEvents` carries one `VALIDATION_ERROR` result naming
+//! `CREATE_FAILED` event carries `DetailedStatus` `VALIDATION_FAILED` with the summary every
+//! pre-deployment validation reports on the stack (the count of errors and the pointer at
+//! `DescribeEvents`), and `DescribeEvents` carries one `VALIDATION_ERROR` result naming
 //! `NAME_CONFLICT_VALIDATION`, `FAILED`, at the element of the template the resource was
-//! declared at.
+//! declared at, reading CloudFormation's sentence for the collision (fixed text `Resource of
+//! type '…' with identifier '…' already exists.`).
 //!
 //! The rows differ along what the rule generalises over: WHO holds the name — the log group a
 //! function's first invocation opened for itself, left behind when the stack that declared the
@@ -98,6 +99,17 @@ const REPORTED_MEMBERS: [&str; 3] = ["arn", "creationTime", "retentionInDays"];
 /// identifier. Source: `state::early_validation::already_exists`.
 fn already_exists(resource_type: &str, identifier: &str) -> String {
     format!("Resource of type '{resource_type}' with identifier '{identifier}' already exists.")
+}
+
+/// What a stack reports for a failure of ANY of CloudFormation's pre-deployment validations:
+/// the count of errors the stage found and where their detail is read. Source:
+/// `state::early_validation::validation_failure_summary`.
+fn summary(errors: usize) -> String {
+    format!(
+        "Validation failed with {errors} error(s). Call DescribeEvents to retrieve the full \
+         list of issues with resource and property details, resolve each error, then retry \
+         the operation."
+    )
 }
 
 /// How the group whose name the colliding template declares came to exist.
@@ -630,6 +642,8 @@ async fn a_log_group_name_already_taken_outside_cloudformation_refuses_the_whole
         );
 
         let reason = already_exists(LOG_GROUP_TYPE, &group);
+        // ...and what the STACK reports for it: the summary over the stage's one error.
+        let reported = summary(1);
         let events = stack_events(&router, case, &stack).await;
 
         if !collides {
@@ -673,9 +687,9 @@ async fn a_log_group_name_already_taken_outside_cloudformation_refuses_the_whole
         let (_, _, detailed_status, event_reason) = failed[0];
         assert_eq!(
             (detailed_status.as_str(), event_reason.as_str()),
-            (DETAILED_STATUS_VALIDATION_FAILED, reason.as_str()),
+            (DETAILED_STATUS_VALIDATION_FAILED, reported.as_str()),
             "case {case:?}: expected the failure event to report \
-             {DETAILED_STATUS_VALIDATION_FAILED} and {reason:?}, got {detailed_status:?} and \
+             {DETAILED_STATUS_VALIDATION_FAILED} and {reported:?}, got {detailed_status:?} and \
              {event_reason:?}"
         );
 
