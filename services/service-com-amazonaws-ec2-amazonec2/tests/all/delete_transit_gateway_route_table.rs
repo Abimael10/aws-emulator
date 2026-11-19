@@ -584,7 +584,7 @@ async fn a_delete_that_is_not_admissible_is_refused_and_removes_nothing() {
         "a table an attachment is still associated with".to_string(),
         table_param(&associated_table),
         400,
-        ec2::state::DEPENDENCY_VIOLATION,
+        ec2::state::INCORRECT_STATE,
     ));
     cases.push((
         "a dry run of a delete that would have succeeded".to_string(),

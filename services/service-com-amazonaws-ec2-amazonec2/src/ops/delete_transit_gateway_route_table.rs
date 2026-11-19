@@ -7,7 +7,9 @@
 //! state its own state catalog names.
 //!
 //! A table one of its transit gateway's default roles names, and one an attachment is still
-//! associated with, are refused instead.
+//! associated with, are refused instead — both with `IncorrectState` (HTTP 400), the code
+//! EC2 refuses a delete the resource's own state forbids with, and the table is left as it
+//! was.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -189,19 +191,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If there are any route tables associated with the transit gateway route table, you
         // must first run DisassociateRouteTable before you can delete the transit gateway
-        // route table": an association is a dependency the CALLER clears, so a table that
-        // still holds one is refused with EC2's own code for a delete the resource's
-        // dependencies forbid, and nothing is removed.
-        let associated: Vec<String> = store
+        // route table": an association is a part of the table the CALLER takes away first, so
+        // a table that still holds one cannot be deleted and nothing is removed. EC2 refuses
+        // it for the STATE those associations leave the table in — `IncorrectState`, the code
+        // a client reads as "clear what holds it and ask again", which is the same answer
+        // `DeleteTransitGateway` gives a gateway whose attachments are still there
+        // (`crate::ops::delete_transit_gateway`) — and the sentence names the table THE
+        // REQUEST NAMED and no dependent id: which attachment holds it is not part of the
+        // sentence AWS builds for this class.
+        if store
             .transit_gateway_route_table_associations(route_table_id)
-            .map(|association| association.transit_gateway_attachment_id.clone())
-            .collect();
-        if !associated.is_empty() {
-            return Err(state::dependency_violation(format!(
-                "The transit gateway route table '{route_table_id}' is associated with the \
-                 transit gateway attachments {holders}, which must be disassociated from it \
-                 before it can be deleted",
-                holders = associated.join(", "),
+            .next()
+            .is_some()
+        {
+            return Err(state::incorrect_state(format!(
+                "{route_table_id} has associated attachments"
             )));
         }
 

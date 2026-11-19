@@ -2296,6 +2296,16 @@ pub const TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATING: &str = "associating";
 /// An association in force: that enum's `associated` member.
 pub const TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
 
+/// An association being taken down: that same enum's `disassociating` member, the TRANSIENT
+/// state a disassociation puts an association into while the clock still owes it the move to
+/// [`TRANSIT_GATEWAY_ASSOCIATION_STATE_DISASSOCIATED`].
+pub const TRANSIT_GATEWAY_ASSOCIATION_STATE_DISASSOCIATING: &str = "disassociating";
+
+/// An association that has been taken down: that same enum's `disassociated` member, the
+/// TERMINAL state of a disassociation — reaching it is what takes the record out of the
+/// store, so nothing reports an association the account no longer holds.
+pub const TRANSIT_GATEWAY_ASSOCIATION_STATE_DISASSOCIATED: &str = "disassociated";
+
 /// A policy table in service: the `TransitGatewayPolicyTableState` enum's `available`
 /// member (that enum being `pending`, `available`, `deleting`, `deleted`).
 pub const TRANSIT_GATEWAY_POLICY_TABLE_STATE_AVAILABLE: &str = "available";

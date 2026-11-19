@@ -1591,15 +1591,31 @@ impl ComAmazonawsEc2Amazonec2State {
         // One attachment's association with a ROUTE table, which
         // `AssociateTransitGatewayRouteTable` leaves in the transient `associating` state
         // with `associated` owed: the same contract as the policy table associations above.
-        for association in self.transit_gateway_associations.values_mut() {
+        // The other direction ends the record rather than moving it: an association
+        // `DisassociateTransitGatewayRouteTable` left `disassociating` has REACHED
+        // `disassociated` once that move falls due, and a disassociated association is one
+        // the account no longer holds — so the record goes, giving its bytes back, whether or
+        // not anybody calls again. That is what frees its attachment to be associated again
+        // and its route table to be deleted.
+        let mut taken_down: Vec<(String, String)> = Vec::new();
+        for (key, association) in &mut self.transit_gateway_associations {
             if let Some(state) = association
                 .pending
                 .as_ref()
                 .and_then(|pending| pending.due_by(now))
                 .map(str::to_string)
             {
+                if state == TRANSIT_GATEWAY_ASSOCIATION_STATE_DISASSOCIATED {
+                    taken_down.push(key.clone());
+                    continue;
+                }
                 association.state = state;
                 association.pending = None;
+            }
+        }
+        for key in taken_down {
+            if self.transit_gateway_associations.remove(&key).is_some() {
+                self.release_stored_bytes(STORED_RECORD_OVERHEAD_BYTES);
             }
         }
         // A metering policy `CreateTransitGatewayMeteringPolicy` left `pending`: it reaches

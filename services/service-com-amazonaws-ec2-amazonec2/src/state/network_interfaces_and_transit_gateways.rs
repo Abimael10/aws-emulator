@@ -2626,3 +2626,80 @@ pub fn associate_transit_gateway_route_table<E>(
     );
     Ok(view)
 }
+
+/// Take the association of the transit gateway attachment `transit_gateway_attachment_id`
+/// with the transit gateway route table `transit_gateway_route_table_id` down, and answer the
+/// association as it now stands.
+///
+/// The rule `DisassociateTransitGatewayRouteTable` follows — "disassociates a resource
+/// attachment from a transit gateway route table" — in [`crate::state`] beside the associating
+/// writer, so the reports of what each wrote cannot disagree:
+///
+/// * the route table must be one the account holds, and then the attachment must be
+///   ([`invalid_transit_gateway_route_table_id_not_found`],
+///   [`invalid_transit_gateway_attachment_id_not_found`]) — the same two resources
+///   [`associate_transit_gateway_route_table`] resolves, in the order the operation's members
+///   name them;
+/// * a pair the account holds no association for is refused for the STATE it is in rather
+///   than written: `IncorrectState` is the code this resource family answers a request its
+///   current state does not admit ([`incorrect_state`], the code a route table its
+///   associations still hold refuses a delete with), and nothing is written, so a caller that
+///   disassociates twice can tell the disassociation it performed from one it did not;
+/// * the disassociation puts the association into the TRANSIENT
+///   [`TRANSIT_GATEWAY_ASSOCIATION_STATE_DISASSOCIATING`] state with the clock owing it
+///   [`TRANSIT_GATEWAY_ASSOCIATION_STATE_DISASSOCIATED`] — the span is never zero, so a caller
+///   acting straight after this call still sees the association being taken down, and the
+///   route table it holds still refuses its delete — and reaching that terminal state is what
+///   REMOVES the record
+///   ([`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]), so the attachment holds
+///   no route table from then on and nothing reports an association the account no longer has.
+///
+/// A record already being taken down is answered AS IT STANDS, with nothing written and its
+/// own deadline untouched: a repeat of a call whose work is already owed to the clock must not
+/// put the terminal state further away than the first call left it.
+pub fn disassociate_transit_gateway_route_table<E>(
+    store: &mut ComAmazonawsEc2Amazonec2State,
+    transit_gateway_route_table_id: &str,
+    transit_gateway_attachment_id: &str,
+) -> Result<TransitGatewayAssociation, Scaffolded<E>> {
+    // The clock first: an association whose move has fallen due is in the state it was owed —
+    // and one the clock has finished taking down is not in the store at all — so what this
+    // call is asked against is the state the store is ACTUALLY in.
+    store.materialize_due_transitions();
+
+    if !store
+        .transit_gateway_route_tables
+        .contains_key(transit_gateway_route_table_id)
+    {
+        return Err(invalid_transit_gateway_route_table_id_not_found(
+            transit_gateway_route_table_id,
+        ));
+    }
+    if !store
+        .transit_gateway_attachments
+        .contains_key(transit_gateway_attachment_id)
+    {
+        return Err(invalid_transit_gateway_attachment_id_not_found(
+            transit_gateway_attachment_id,
+        ));
+    }
+
+    let key = (
+        transit_gateway_route_table_id.to_string(),
+        transit_gateway_attachment_id.to_string(),
+    );
+    let Some(record) = store.transit_gateway_associations.get_mut(&key) else {
+        return Err(incorrect_state(format!(
+            "{transit_gateway_attachment_id} is not associated with \
+             {transit_gateway_route_table_id}"
+        )));
+    };
+    if record.state == TRANSIT_GATEWAY_ASSOCIATION_STATE_DISASSOCIATING {
+        return Ok(record.view());
+    }
+    record.state = TRANSIT_GATEWAY_ASSOCIATION_STATE_DISASSOCIATING.to_string();
+    record.pending = Some(PendingStateMove::starting_now(
+        TRANSIT_GATEWAY_ASSOCIATION_STATE_DISASSOCIATED,
+    ));
+    Ok(record.view())
+}

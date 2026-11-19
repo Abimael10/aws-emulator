@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateTransitGatewayRouteTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateTransitGatewayRouteTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes the association of the attachment the request names with the transit
+//! gateway route table it names DOWN, and answers that association in the transient
+//! `disassociating` state with the clock owing it `disassociated` — reaching which is what
+//! takes the record out of the store, so the attachment then holds no route table and the
+//! table can be deleted. `AssociateTransitGatewayRouteTable` is the writer this undoes and
+//! `GetTransitGatewayRouteTableAssociations` reads the very record this call moves.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateTransitGatewayRouteTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A route table or an attachment this account does not hold, and a pair the account holds no
+//! association for, are refused instead, and nothing is written.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +138,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateTransitGatewayRouteTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateTransitGatewayRouteTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateTransitGatewayRouteTable"))
+        // `ctx` carries request metadata only; this operation reads none of it — both
+        // resources are named by id, and an id identifies at most one resource in this store.
+        // The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // The request's own form first, in the order the operation's members name the two
+        // resources: an id that is not an id of its kind at all is refused as malformed, so
+        // "not an id of this kind" never reads as "no such resource" and is never answered by
+        // the DryRun arm below either — the order `AssociateTransitGatewayRouteTable` takes,
+        // this call's own writer.
+        state::require_well_formed_transit_gateway_route_table_id(
+            &input.transit_gateway_route_table_id,
+        )?;
+        state::require_well_formed_transit_gateway_attachment_id(
+            &input.transit_gateway_attachment_id,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`DisassociateTransitGatewayRouteTableRequest$DryRun`): the flag asks about
+        // PERMISSION, not about the named resources, so it is answered before anything is
+        // resolved and every caller of this emulator is permitted — as the associating call
+        // answers it.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "Disassociates a resource attachment from a transit gateway route table" — the whole
+        // rule, including which refusal each unresolvable resource and a pair that holds no
+        // association get, lives in `crate::state` beside the writer this undoes.
+        let association = state::disassociate_transit_gateway_route_table(
+            &mut store,
+            &input.transit_gateway_route_table_id,
+            &input.transit_gateway_attachment_id,
+        )?;
+
+        Ok(DisassociateTransitGatewayRouteTableOutput {
+            association: Some(association),
+        })
     }
 }
