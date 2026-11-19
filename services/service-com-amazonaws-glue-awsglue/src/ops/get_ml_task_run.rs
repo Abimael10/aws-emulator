@@ -206,6 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 EntityNotFoundException {
                     message: Some(crate::state::messages::ml_task_run_not_found(
                         &input.task_run_id,
+                        &input.transform_id,
                     )),
                     from_federation_source: None,
                 },

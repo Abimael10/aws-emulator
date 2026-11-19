@@ -218,6 +218,12 @@ pub struct DataQualityResultEntry {
     pub started_on: SystemTime,
     /// `CompletedOn`: when that run completed, which is when this result was produced.
     pub completed_on: SystemTime,
+    /// `ProfileId`: the data quality profile measured alongside this result
+    /// ([`DataQualityProfileEntry`]) — the measurements the run that produced it took of the
+    /// dataset. It is the SAME profile for every result of one run, because one run reads the
+    /// rows once; `None` only on a result of a run the store settled before this emulator
+    /// recorded profiles at all.
+    pub profile_id: Option<String>,
     /// What each rule of the ruleset answered.
     pub rules: Vec<EvaluatedDataQualityRule>,
 }
@@ -239,6 +245,10 @@ impl DataQualityResultEntry {
             data_source,
             started_on,
             completed_on,
+            // The profile is recorded once for the whole run, by the walk that settles it
+            // ([`ComAmazonawsGlueAwsglueState::settle_due_data_quality_ruleset_evaluation_runs`]),
+            // so it is written onto the result there rather than minted per ruleset here.
+            profile_id: None,
             rules: evaluated.rules.clone(),
         }
     }

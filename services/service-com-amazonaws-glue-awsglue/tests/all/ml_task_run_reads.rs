@@ -371,9 +371,14 @@ async fn a_task_run_the_addressed_transform_does_not_hold_is_refused() {
             "case {case:?}: expected EntityNotFoundException, got {}",
             error_code(&body)
         );
+        // The run miss names the whole of a run's address: the requested run, the account
+        // whose namespace was searched and the transform it was addressed under.
         assert_eq!(
             error_message(&body),
-            format!("Cannot find MLTaskRun in account {ACCOUNT_ID} with handle {task_run_id}"),
+            format!(
+                "No ML Task Run found for {task_run_id}: in account {ACCOUNT_ID} for transform \
+                 {transform_id}"
+            ),
             "case {case:?}: expected the refusal to name the requested run, got {body}"
         );
     }

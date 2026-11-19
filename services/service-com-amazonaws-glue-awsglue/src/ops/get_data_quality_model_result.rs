@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataQualityModelResult
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataQualityModelResult`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataQualityModelResult::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Retrieve a statistic's predictions for a given Profile ID": what the anomaly-detection
+//! model trained over ONE statistic's datapoints says — the value it predicts and the bounds
+//! a datapoint outside which is an anomaly — for every datapoint of that statistic this
+//! account holds.
+//!
+//! The model is computed from the datapoints that are stored
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::data_quality_model_result`]), over the
+//! profiles a client has not annotated out of the training set, so what this read reports
+//! moves with the profiles that were recorded and with the annotations written for them. An
+//! address that resolves to no trained model — a `ProfileId` no run minted, a `StatisticId`
+//! the profile holds no datapoint of, a training still under way — is the miss the model
+//! reads share.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +153,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataQualityModelResult` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDataQualityModelResultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataQualityModelResult"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(
+                GetDataQualityModelResultErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue data quality store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // A `ProfileId` outside the grammar the service mints one with names no profile that
+        // could ever exist, so it is a malformed request rather than a miss — the same
+        // reading the status read above takes of that member.
+        if !crate::state::is_data_quality_profile_id(&input.profile_id) {
+            return Err(
+                GetDataQualityModelResultErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::messages::invalid_data_quality_profile_id()),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+        // Reporting only: the datapoints are read and the model is computed from them, so
+        // nothing is written and what a later caller sees is unchanged by this read.
+        let store = state.lock();
+        // Both ids are `@required` with `length 1..255`. The profile is resolved first, then
+        // the datapoint it holds for the statistic, then whether the training over that
+        // statistic's history has produced a model yet: each of the three is an address that
+        // resolves to no model result, which is ONE miss to the caller.
+        let missing = || {
+            GetDataQualityModelResultError::from(
+                GetDataQualityModelResultErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(
+                            crate::state::messages::DATA_QUALITY_MODEL_RESULT_NOT_FOUND
+                                .to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                ),
+            )
+        };
+        let profile = store
+            .data_quality_profile(&input.profile_id)
+            .ok_or_else(missing)?;
+        if profile.statistic(&input.statistic_id).is_none() {
+            return Err(missing());
+        }
+        let training = profile.model_training(now);
+        if !training.produced_a_model() {
+            return Err(missing());
+        }
+        // The model is the STATISTIC's: it is trained over that statistic's whole history
+        // across the profiles this account holds, so the predictions are keyed on the
+        // statistic alone and the `ProfileId` is the address that has to hold a datapoint of
+        // it — which is what the two refusals above decide. Deliberate, not an oversight: a
+        // model trained per profile would have exactly one datapoint to learn from, and
+        // `PutDataQualityProfileAnnotation` annotates a profile precisely to change what the
+        // model of every statistic it holds is trained on.
+        let model = store.data_quality_model_result(&input.statistic_id);
+        if model.is_empty() {
+            // Every profile holding a datapoint of this statistic is annotated OUT of the
+            // training set, so the model was trained on nothing and predicts nothing.
+            return Err(missing());
+        }
+
+        Ok(GetDataQualityModelResultOutput {
+            // "The timestamp when the data quality model training completed", which is the
+            // training this read reported a model for.
+            completed_on: training.completed_on.map(crate::state::to_date_time),
+            model: Some(
+                model
+                    .into_iter()
+                    .map(|prediction| StatisticModelResult {
+                        lower_bound: Some(prediction.lower_bound),
+                        upper_bound: Some(prediction.upper_bound),
+                        predicted_value: Some(prediction.predicted_value),
+                        actual_value: Some(prediction.actual_value),
+                        date: Some(crate::state::to_date_time(prediction.date)),
+                        inclusion_annotation: prediction.inclusion_annotation,
+                    })
+                    .collect(),
+            ),
+        })
     }
 }

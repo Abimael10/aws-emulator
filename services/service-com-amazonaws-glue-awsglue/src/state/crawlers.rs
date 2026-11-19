@@ -256,6 +256,28 @@ impl CrawlerEntry {
         self.last_updated = now;
     }
 
+    /// Whether this crawler has a cron expression to run at all, which is what a schedule
+    /// write put on it ([`Self::apply_schedule`]). A crawler carrying none has no schedule
+    /// to start, resume or report.
+    pub fn has_schedule(&self) -> bool {
+        self.schedule_expression.is_some()
+    }
+
+    /// Put this crawler's suspended schedule back in force: the schedule state becomes
+    /// [`SCHEDULE_STATE_SCHEDULED`], which is all `StartCrawlerSchedule` decides — it
+    /// "changes the schedule state of the specified crawler to `SCHEDULED`, unless the
+    /// crawler is already running or the schedule state is already `SCHEDULED`".
+    ///
+    /// The cron expression is the one already on the crawler: this call carries none, so what
+    /// it resumes is the schedule a write stated. Nothing else moves, for the reason
+    /// [`Self::suspend_schedule`] gives for the opposite write: the crawler's run `State` is
+    /// not this call's to change and `Version` counts the crawler's DEFINITION, which this
+    /// call writes no member of, while `LastUpdated` moves because the record did change.
+    pub fn resume_schedule(&mut self, now: SystemTime) {
+        self.schedule_state = SCHEDULE_STATE_SCHEDULED.to_string();
+        self.last_updated = now;
+    }
+
     /// Whether a crawl of this crawler is IN PROGRESS, i.e. its run state is not the one
     /// modelled `CrawlerState` with no run in it ([`CRAWLER_STATE_READY`]): of the other
     /// two, [`CRAWLER_STATE_RUNNING`] is a crawl under way and [`CRAWLER_STATE_STOPPING`]

@@ -335,6 +335,49 @@ impl CatalogDefinition {
             CATALOG_TYPE_NATIVE
         }
     }
+
+    /// Whether this catalog's databases live in a source OUTSIDE the Glue Data Catalog,
+    /// i.e. its definition names a `FederatedCatalog`.
+    ///
+    /// Narrower than [`Self::catalog_type`] on purpose: a catalog that names a
+    /// `TargetRedshiftCatalog` holds RESOURCE LINKS to another catalog's databases — its own
+    /// definition is still this Data Catalog's record — while a federated catalog's
+    /// definition is the federation's, which is what the write of a catalog's properties is
+    /// refused against ([`messages::FEDERATED_CATALOG_NOT_UPDATABLE`]).
+    pub fn is_federated(&self) -> bool {
+        self.federated_catalog.is_some()
+    }
+
+    /// Apply an `UpdateCatalog` request's `CatalogInput` to this stored catalog, as served
+    /// at `now`.
+    ///
+    /// `CatalogInput` is "a `CatalogInput` object specifying the new properties of an
+    /// existing catalog" (`UpdateCatalogRequest$CatalogInput`) — the WHOLE client-settable
+    /// definition, the same shape the create submitted — so the update STATES the definition
+    /// rather than merging into it: every member it carries is written and every member it
+    /// omits is cleared, which is the one way a caller takes a description or a property map
+    /// off a catalog. A connection update reads its own whole-definition input the same way
+    /// ([`ConnectionEntry::apply_input`]).
+    ///
+    /// The members no `CatalogInput` carries are not this request's to change: the catalog's
+    /// `Name` and `CatalogId` address it, `CreateTime` is the instant of the create and never
+    /// moves, and the create's tags are written through the tagging operations.
+    /// `UpdateTime` becomes `now`, since it is "the time at which the catalog was last
+    /// updated" (`Catalog$UpdateTime`).
+    pub fn apply_input(&mut self, input: &CatalogInput, now: SystemTime) {
+        self.description = input.description.clone();
+        self.parameters = input.parameters.clone();
+        self.federated_catalog = input.federated_catalog.clone();
+        self.target_redshift_catalog = input.target_redshift_catalog.clone();
+        self.catalog_properties = input.catalog_properties.clone();
+        self.create_table_default_permissions = input.create_table_default_permissions.clone();
+        self.create_database_default_permissions =
+            input.create_database_default_permissions.clone();
+        self.allow_full_table_external_data_access = input
+            .allow_full_table_external_data_access
+            .clone();
+        self.update_time = now;
+    }
 }
 
 /// The Lake Formation default-permission grants a READ reports, from what is stored.

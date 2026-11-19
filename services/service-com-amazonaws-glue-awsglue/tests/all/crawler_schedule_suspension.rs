@@ -386,13 +386,12 @@ struct NotRunningCase {
     served_suspends: usize,
 }
 
-/// A crawler with no schedule running has no scheduler to stop, so the call is the
+/// A crawler that has NO schedule at all has no scheduler to stop, so the call is the
 /// modelled not-running refusal and the crawler is left exactly as it was.
 ///
-/// The rows span the ways a schedule can fail to be running: a crawler created without
-/// one, a crawler whose schedule a write took off, and a crawler whose schedule this very
-/// operation already suspended — once, and then repeatedly, because a suspend is not a
-/// call that can be made twice.
+/// The rows span the ways a crawler comes to carry no cron expression: created without one,
+/// and left without one by a schedule write. A crawler whose schedule is merely SUSPENDED is
+/// served instead ([`a_repeated_suspend_of_a_scheduled_crawler_is_served`]).
 #[tokio::test]
 async fn a_suspend_of_a_schedule_that_is_not_running_is_the_modelled_refusal() {
     let router = emulator();
@@ -411,16 +410,10 @@ async fn a_suspend_of_a_schedule_that_is_not_running_is_the_modelled_refusal() {
             served_suspends: 0,
         },
         NotRunningCase {
-            case: "already suspended once",
-            created_with: Some("cron(0 * * * ? *)"),
-            restated: None,
-            served_suspends: 1,
-        },
-        NotRunningCase {
-            case: "suspended, rescheduled and suspended again",
-            created_with: Some("cron(0 * * * ? *)"),
-            restated: Some(Some("cron(30 2 ? * MON-FRI *)")),
-            served_suspends: 1,
+            case: "a schedule write stated none on a crawler that had none",
+            created_with: None,
+            restated: Some(None),
+            served_suspends: 0,
         },
     ];
 
@@ -481,6 +474,64 @@ async fn a_suspend_of_a_schedule_that_is_not_running_is_the_modelled_refusal() {
                  expected {before}, got {after}"
             );
         }
+    }
+}
+
+/// A crawler whose cron expression is still on it but whose schedule is already suspended is
+/// SERVED: the state the call writes is the state it is in, so the write is idempotent and
+/// the crawler stays suspended.
+///
+/// The rows differ along how the schedule got onto the crawler and how many suspends precede
+/// the one under test.
+#[tokio::test]
+async fn a_repeated_suspend_of_a_scheduled_crawler_is_served() {
+    let router = emulator();
+
+    for (index, (case, scheduled_by, served_suspends)) in [
+        ("scheduled at create, suspended once", ScheduledBy::Create, 1usize),
+        (
+            "scheduled by a schedule write, suspended once",
+            ScheduledBy::ScheduleWrite,
+            1,
+        ),
+        ("suspended three times already", ScheduledBy::Create, 3),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("suspend-again-{index}");
+        scheduled_crawler(&router, &name, "cron(15 12 * * ? *)", scheduled_by).await;
+        for _ in 0..served_suspends {
+            ok(
+                &router,
+                "StopCrawlerSchedule",
+                &json!({ "CrawlerName": &name }),
+            )
+            .await;
+        }
+
+        let answer = ok(
+            &router,
+            "StopCrawlerSchedule",
+            &json!({ "CrawlerName": &name }),
+        )
+        .await;
+        assert_eq!(
+            answer,
+            json!({}),
+            "case {case}: expected the empty answer, got {answer}"
+        );
+        let after = get_crawler(&router, &name).await;
+        assert_eq!(
+            after.pointer("/Schedule/State").and_then(Value::as_str),
+            Some(SCHEDULE_STATE_NOT_SCHEDULED),
+            "case {case}: the crawler stays suspended, got {after}"
+        );
+        assert_eq!(
+            after.pointer("/Schedule/ScheduleExpression").and_then(Value::as_str),
+            Some("cron(15 12 * * ? *)"),
+            "case {case}: the cron expression stays on the crawler, got {after}"
+        );
     }
 }
 

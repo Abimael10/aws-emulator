@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TestConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TestConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TestConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Tests a connection to a service to validate the service credentials that you provide.
+//! You can either provide an existing connection name or a TestConnectionInput for testing a
+//! non-existing connection input. Providing both at the same time will cause an error."
+//!
+//! So the call first resolves WHICH definition is under test — the inline one, or the stored
+//! one the name addresses — and then reads that definition by the two rules this surface
+//! holds (`crate::state::connection_tests`): only a UNIFIED connection can be tested at
+//! all, and an inline configuration has to carry the credentials its `AuthenticationType`
+//! needs. The two refusals are deliberately different classes, so a caller can tell a
+//! restriction on the kind of connection from a field it left out.
+//!
+//! Past both, the test is an attempt to reach the data source the definition points at. That
+//! source is outside this emulator, which opens no connection to anything outside itself —
+//! the same reason a stored connection carries no validation status
+//! ([`crate::state::ConnectionEntry::from_input`]) — so the attempt reaches nothing and the
+//! call reports that rather than a success nothing verified.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -94,7 +104,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `TestConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#TestConnection")]
+// The operation's MODELED errors, plus the one shape widened in through `extra_errors`:
+// `ValidationException`, which this SERVICE models (`UpdateIntegrationResourceProperty`
+// lists it) and this operation's own `errors` list omits, while RECORDED behaviour is that
+// the restriction on which connections can be tested is answered with exactly that class.
+// Widening it in is what lets the refusal carry the service's own shape — and so the
+// envelope every other Glue failure is rendered in — rather than a synthetic one.
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#TestConnection",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum TestConnectionErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -106,6 +125,7 @@ pub enum TestConnectionErrorModeled {
     InvalidInputException(InvalidInputException),
     OperationTimeoutException(OperationTimeoutException),
     ResourceNumberLimitExceededException(ResourceNumberLimitExceededException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -159,18 +179,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TestConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TestConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TestConnection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(TestConnectionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // Which definition is under test is decided on the request alone. "Providing both at
+        // the same time will cause an error", and a request providing NEITHER names no
+        // connection to test at all, so both are refused before any state is read.
+        let connection_type = match (
+            input.connection_name.as_deref(),
+            input.test_connection_input.as_ref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(TestConnectionErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::TEST_CONNECTION_STATES_TWO_CONNECTIONS
+                                .to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
+            (None, None) => {
+                return Err(TestConnectionErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::TEST_CONNECTION_NAMES_NO_CONNECTION
+                                .to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
+            // The inline definition: its `ConnectionType` and `ConnectionProperties` are
+            // `@required`, so what is left to read is the authentication configuration.
+            (None, Some(inline)) => {
+                // The restriction on the KIND is answered first: a connection the operation
+                // does not support is refused whatever its configuration carries.
+                if !crate::state::is_unified_connection_type(&inline.connection_type) {
+                    return Err(TestConnectionErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::messages::TEST_CONNECTION_UNIFIED_ONLY.to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                if let Some(missing) = inline
+                    .authentication_configuration
+                    .as_ref()
+                    .and_then(crate::state::missing_authentication_member)
+                {
+                    // The member path and the type that requires it both come from the
+                    // request; the type is there because the reading above found a member
+                    // missing for it.
+                    let authentication_type = inline
+                        .authentication_configuration
+                        .as_ref()
+                        .and_then(|configuration| configuration.authentication_type.clone())
+                        .unwrap_or_default();
+                    return Err(TestConnectionErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                crate::state::messages::authentication_member_required_for_type(
+                                    missing,
+                                    &authentication_type,
+                                ),
+                            ),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                }
+                inline.connection_type.clone()
+            }
+            // The stored definition the name addresses: "if only name is provided, the
+            // operation will get the connection and use that for testing", so the connection
+            // is resolved out of the catalog the request named exactly as a read of it
+            // resolves one, and a name that catalog holds nothing under is that read's miss.
+            (Some(name), None) => {
+                let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+                let catalog_refusal = crate::state::catalog_refusal(
+                    &state.lock(),
+                    &catalog_id,
+                    &crate::state::request_region(ctx.parts()),
+                    Self::NAME,
+                );
+                match catalog_refusal {
+                    None => {}
+                    Some(crate::state::CatalogRefusal::NotFound(message)) => {
+                        return Err(TestConnectionErrorModeled::EntityNotFoundException(
+                            EntityNotFoundException {
+                                message: Some(message),
+                                from_federation_source: None,
+                            },
+                        )
+                        .into())
+                    }
+                    Some(crate::state::CatalogRefusal::NotAuthorized(message)) => {
+                        return Err(TestConnectionErrorModeled::AccessDeniedException(
+                            AccessDeniedException {
+                                message: Some(message),
+                            },
+                        )
+                        .into())
+                    }
+                }
+                // Reporting only: the stored definition is read and nothing is written, so
+                // what a later caller sees is unchanged by this test.
+                let store = state.lock();
+                let Some(entry) = store.connection(&catalog_id, name) else {
+                    return Err(TestConnectionErrorModeled::EntityNotFoundException(
+                        EntityNotFoundException {
+                            message: Some(crate::state::messages::connection_not_found(
+                                name,
+                                &catalog_id,
+                            )),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                };
+                let connection_type = entry
+                    .definition
+                    .connection_type
+                    .clone()
+                    .unwrap_or_default();
+                // The same restriction on the kind, read off the stored definition: the rule
+                // is the connection's, not the request form's. The credentials of a stored
+                // connection are NOT re-read here — the record keeps none of them
+                // (`ConnectionEntry::from_input`), and the field-level reading above is of
+                // the configuration a REQUEST carries.
+                if !crate::state::is_unified_connection_type(&connection_type) {
+                    return Err(TestConnectionErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::messages::TEST_CONNECTION_UNIFIED_ONLY.to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                connection_type
+            }
+        };
+
+        // The definition is one this operation supports and carries what it needs, so what is
+        // left is the connection itself. It would be made to a data source outside this
+        // emulator, which reaches none, so the attempt is reported as the failure it is.
+        ::tracing::info!(
+            operation = "TestConnection",
+            connection_type = %connection_type,
+            "a Glue connection test reached no data source"
+        );
+        Err(TestConnectionErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(
+                    crate::state::messages::connection_test_did_not_reach_the_source(
+                        &connection_type,
+                    ),
+                ),
+                from_federation_source: None,
+            },
+        )
+        .into())
     }
 }

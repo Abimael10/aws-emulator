@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDataQualityProfileAnnotation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDataQualityProfileAnnotation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDataQualityProfileAnnotation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Annotate all datapoints for a Profile": the write that decides whether the measurements
+//! ONE data quality profile holds are part of what an anomaly-detection model is trained on.
+//!
+//! The annotation is stored on the profile the `ProfileId` addresses
+//! ([`crate::state::DataQualityProfileEntry::inclusion_annotation`]), so the next read of a
+//! model over any statistic that profile holds a datapoint of answers with the training set
+//! this write left — which is what makes the annotation observable. A `ProfileId` no
+//! statistics run of this account minted names no profile to annotate.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +140,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDataQualityProfileAnnotation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDataQualityProfileAnnotationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDataQualityProfileAnnotation"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(
+                PutDataQualityProfileAnnotationErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue data quality store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // A `ProfileId` outside the grammar the service mints one with names no profile that
+        // could ever exist, so it is a malformed request rather than a miss — the same
+        // reading the two model reads take of that member.
+        if !crate::state::is_data_quality_profile_id(&input.profile_id) {
+            return Err(
+                PutDataQualityProfileAnnotationErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::messages::invalid_data_quality_profile_id()),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+        // Both members are `@required` and `InclusionAnnotation` is an enum the request layer
+        // validates, so reaching here the only question is whether any run of this account
+        // minted the profile. The write names the profile it could not resolve.
+        let Some(profile) = store.data_quality_profile_mut(&input.profile_id) else {
+            return Err(
+                PutDataQualityProfileAnnotationErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::data_quality_profile_not_found(
+                            &input.profile_id,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Annotate ALL datapoints for a Profile": the annotation is the profile's, so it is
+        // stored once and applies to every datapoint it holds.
+        profile.inclusion_annotation = Some(input.inclusion_annotation.clone());
+        ::tracing::info!(
+            operation = "PutDataQualityProfileAnnotation",
+            profile = %input.profile_id,
+            annotation = %input.inclusion_annotation,
+            "annotated the datapoints of a Glue data quality profile"
+        );
+
+        Ok(PutDataQualityProfileAnnotationOutput {})
     }
 }

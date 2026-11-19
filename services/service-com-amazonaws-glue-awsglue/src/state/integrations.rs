@@ -144,6 +144,23 @@ impl IntegrationResourcePropertyEntry {
     pub fn arn(&self, region: &str) -> String {
         integration_resource_property_arn(region, &self.property_id)
     }
+
+    /// Apply an `UpdateIntegrationResourceProperty` to this record: each side the request
+    /// states replaces the stored one, and a side it does not state is left as stored.
+    ///
+    /// The same reading as a repeated create ([`Self::apply_create`]), for the same reason:
+    /// the two sides of an integration are written by separate calls, so a write that states
+    /// one says nothing about the other and must not erase it. The id is not touched — the
+    /// record is the same resource's — and the request carries no tags, so the ones stored
+    /// stay where they are.
+    pub fn apply_update(&mut self, input: &UpdateIntegrationResourcePropertyInput) {
+        if input.source_processing_properties.is_some() {
+            self.source_processing_properties = input.source_processing_properties.clone();
+        }
+        if input.target_processing_properties.is_some() {
+            self.target_processing_properties = input.target_processing_properties.clone();
+        }
+    }
 }
 
 /// The ARN resource-type segment of a Data Catalog table, whose resource portion carries

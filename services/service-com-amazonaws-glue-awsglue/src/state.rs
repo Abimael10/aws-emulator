@@ -267,6 +267,7 @@ mod column_statistics;
 mod column_statistics_source;
 mod column_statistics_values;
 mod conditional_triggers;
+mod connection_tests;
 mod crawl;
 mod crawl_authorization;
 mod crawl_history;
@@ -276,6 +277,7 @@ mod crawler_roles_and_connections;
 mod crawlers;
 mod data_assets;
 mod data_catalog_export;
+mod data_quality_profiles;
 mod data_quality_results;
 mod data_quality_rules;
 mod dynamodb_crawl_source;
@@ -310,6 +312,7 @@ pub use column_statistics::*;
 pub use column_statistics_source::*;
 pub use column_statistics_values::*;
 pub use conditional_triggers::*;
+pub use connection_tests::*;
 pub use crawl::*;
 pub use crawl_authorization::*;
 pub use crawl_history::*;
@@ -319,6 +322,7 @@ pub use crawler_roles_and_connections::*;
 pub use crawlers::*;
 pub use data_assets::*;
 pub use data_catalog_export::*;
+pub use data_quality_profiles::*;
 pub use data_quality_results::*;
 pub use data_quality_rules::*;
 pub use dynamodb_crawl_source::*;
@@ -353,6 +357,7 @@ use self::catalog_encryption::ObjectEncryption;
 
 use crate::ops::types::{
     Action, AssetFormEntry, AssetFormRecord, AssetTypeFormReference, CatalogImportStatus,
+    AuthenticationConfigurationInput,
     CatalogInput,
     CatalogProperties,
     CatalogPropertiesOutput,
@@ -417,6 +422,7 @@ use crate::ops::types::{
     TriggerUpdate,
     UpdateClassifierInput, UpdateColumnStatisticsTaskSettingsInput, UpdateCrawlerInput,
     UpdateDataQualityRulesetInput, UpdateGlossaryInput,
+    UpdateIntegrationResourcePropertyInput,
     UpdateMLTransformInput,
     UpdateWorkflowInput,
     UsageProfileDefinition,
@@ -1244,6 +1250,23 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// out of are recorded ON the result ([`DataQualityResultEntry`]). Kept in the order the
     /// runs produced them and bounded by [`MAX_DATA_QUALITY_RESULTS`].
     pub data_quality_results: Vec<DataQualityResultEntry>,
+    /// Every data quality PROFILE this emulator holds, oldest first.
+    ///
+    /// A profile lives beside the results, for the reason a result lives beside the runs:
+    /// `GetDataQualityModel` and `PutDataQualityProfileAnnotation` address one by `ProfileId`
+    /// alone, so the namespace is per account and the run and the dataset a profile's
+    /// measurements came from are recorded ON the profile ([`DataQualityProfileEntry`]). Kept
+    /// in the order the runs recorded them — which is the order a statistic's datapoints form
+    /// its history in — and bounded by [`MAX_DATA_QUALITY_PROFILES`].
+    pub data_quality_profiles: Vec<DataQualityProfileEntry>,
+    /// The `StatisticId` of every (dataset, measurement) pair a run of this account has
+    /// measured, keyed by that pair ([`ComAmazonawsGlueAwsglueState::data_quality_statistic_id`]).
+    ///
+    /// Beside the profiles rather than on one of them, because a statistic OUTLIVES the
+    /// profile holding one of its datapoints: what the anomaly-detection surface is about is
+    /// one statistic's history across runs, so the id has to be the same the next time the
+    /// same thing is measured.
+    pub data_quality_statistic_ids: HashMap<String, String>,
     /// Every data quality ruleset this emulator holds, keyed by its name, in name order.
     ///
     /// Per account and beside the catalog tree, like crawlers and custom entity types:
@@ -1694,6 +1717,11 @@ impl ComAmazonawsGlueAwsglueState {
     /// applied afterwards: one walk reads the catalog, the next writes the runs. A run that
     /// finished its evaluation publishes the results it produced
     /// ([`DataQualityResultEntry`]), which is what `GetDataQualityResult` reads back.
+    ///
+    /// It publishes a PROFILE with them ([`DataQualityProfileEntry`]) wherever its evaluation
+    /// measured anything about the dataset: those measurements are the profile's datapoints,
+    /// the results it produced name the profile they were measured alongside, and the model
+    /// over the datapoints starts training from the instant the run finished.
     pub fn settle_due_data_quality_ruleset_evaluation_runs(&mut self, now: SystemTime) {
         let misses: Vec<(usize, Option<String>)> = self
             .data_quality_ruleset_evaluation_runs
@@ -1704,9 +1732,35 @@ impl ComAmazonawsGlueAwsglueState {
             .collect();
         let mut produced: Vec<DataQualityResultEntry> = Vec::new();
         for (index, miss) in misses {
-            if let Some(run) = self.data_quality_ruleset_evaluation_runs.get_mut(index) {
-                produced.extend(run.settle(miss));
+            let Some(run) = self.data_quality_ruleset_evaluation_runs.get_mut(index) else {
+                continue;
+            };
+            let mut settled = run.settle(miss);
+            // A run that produced no result EVALUATED nothing — its data source was gone, or
+            // its own evaluation failed — so it measured nothing to profile either.
+            if settled.is_empty() {
+                continue;
             }
+            // The run's own address and what its evaluation measured, read off the record
+            // before the store is borrowed again to mint the statistic ids.
+            let run_id = run.id.clone();
+            let table = run.primary_table.clone();
+            let measured: Vec<(String, f64)> = settled
+                .iter()
+                .flat_map(|result| result.rules.iter())
+                .flat_map(|rule| rule.metrics.iter().cloned())
+                .collect();
+            let completed_on = settled
+                .first()
+                .map_or(now, |result| result.completed_on);
+            let profile = self.profile_of_settled_run(&run_id, table, &measured, completed_on);
+            // Each result of this run names the profile measured alongside it, which is how
+            // a client that reads a result reaches the datapoints it was produced with.
+            for result in &mut settled {
+                result.profile_id = Some(profile.id.clone());
+            }
+            self.record_data_quality_profile(profile);
+            produced.extend(settled);
         }
         self.record_data_quality_results(produced);
     }
@@ -1957,6 +2011,22 @@ impl ComAmazonawsGlueAwsglueState {
                 &fold_name(&reference.name),
             ))
             .and_then(|catalog| catalog.definition.as_ref())
+    }
+
+    /// The same record, for the one operation that WRITES a stored catalog's definition
+    /// (`UpdateCatalog`): resolved exactly as [`Self::catalog_definition`] resolves it, so a
+    /// write reaches the catalog a read of the same id reports and no other, and a `None`
+    /// here is the same miss a read answers.
+    pub fn catalog_definition_mut(
+        &mut self,
+        reference: &CatalogReference,
+    ) -> Option<&mut CatalogDefinition> {
+        self.catalogs
+            .get_mut(&child_catalog_id(
+                &reference.account_id,
+                &fold_name(&reference.name),
+            ))
+            .and_then(|catalog| catalog.definition.as_mut())
     }
 
     /// The catalog RESOURCES this store holds inside the Data Catalog of `account_id`, each

@@ -91,6 +91,21 @@ pub fn resource_property_target(
     })
 }
 
+/// The Glue resource whose processing properties an UPDATE writes, or the sentence its
+/// refusal carries.
+///
+/// The same member and the same two legs as the create reads above, read in ONE step:
+/// RECORDED behaviour of this call is that every value it cannot interpret as one of them —
+/// another service's ARN, a Glue ARN of a resource type this API does not accept, a value
+/// that is no ARN at all — earns the operation's modelled `ValidationException` carrying
+/// this service's general reading of that member ([`invalid_resource_arn`]), the sentence the
+/// delete and the three integration table property calls word it with. The create words it
+/// as the TARGET it is stating instead, which is why the two are separate functions over one
+/// resolution.
+pub fn updated_resource_property_target(resource_arn: &str) -> Result<TaggedResource, String> {
+    integration_resource_reference(resource_arn).map_err(|_| invalid_resource_arn(resource_arn))
+}
+
 /// Whether `resource_arn` is an ARN of one of Glue's OWN resources, which is the whole of
 /// what a read or a delete of an integration resource property needs of that member.
 ///

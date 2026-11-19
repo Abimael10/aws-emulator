@@ -13,12 +13,15 @@
 //! still there for a resume to put back in force. The crawler's `Version` counts its
 //! DEFINITION, which this call writes no member of, so only `LastUpdated` moves.
 //!
-//! A name no crawler in this account has is this operation's `EntityNotFoundException`,
-//! and a crawler with no schedule RUNNING — one already suspended, or one that carries no
-//! cron expression at all — is its `SchedulerNotRunningException`: there is no scheduler
-//! to stop. `SchedulerTransitioningException` reports a schedule caught mid-transition,
-//! which this store never holds one in: the documented behaviour is that the call SETS the
-//! state, so it is in effect the moment the call returns.
+//! A name no crawler in this account has is this operation's `EntityNotFoundException`, and
+//! a crawler that carries NO cron expression at all is its `SchedulerNotRunningException`:
+//! there is no scheduler for it to stop, and this operation's model declares no
+//! no-schedule error of its own. A crawler whose schedule is merely SUSPENDED is served —
+//! the state the call writes is the state it is in — so suspending twice answers twice,
+//! exactly as putting a schedule back in force twice does
+//! ([`crate::ops::start_crawler_schedule`]). `SchedulerTransitioningException` reports a
+//! schedule caught mid-transition, which this store never holds one in: the documented
+//! behaviour is that the call SETS the state, so it is in effect the moment the call returns.
 //!
 //! ## Shape of an operation
 //!
@@ -177,10 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Only a schedule that is RUNNING can be stopped: a crawler whose schedule is
-        // already suspended, and one that carries no cron expression to run at all, has
-        // no scheduler for this call to set to NOT_SCHEDULED.
-        if !entry.schedule_is_running() {
+        // Only a crawler that HAS a cron expression has a scheduler at all: one carrying
+        // none has nothing for this call to set to NOT_SCHEDULED. A crawler whose schedule is
+        // merely suspended is served — the state this call writes is the state it is in — so
+        // the write is idempotent, exactly as the resume of a schedule already in force is.
+        if !entry.has_schedule() {
             return Err(StopCrawlerScheduleErrorModeled::SchedulerNotRunningException(
                 SchedulerNotRunningException {
                     message: Some(crate::state::messages::scheduler_not_running(

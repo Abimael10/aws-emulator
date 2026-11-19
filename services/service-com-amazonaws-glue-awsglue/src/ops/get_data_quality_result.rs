@@ -256,14 +256,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             completed_on: Some(crate::state::to_date_time(result.completed_on)),
             rule_results: Some(result.to_rule_results()),
             score: Some(result.score()),
-            // The members a result of a JOB or of an anomaly-detection profile carries are
-            // not this result's: it came out of a ruleset evaluation run, which names no job,
-            // no job run, no evaluation context and no profile — and this evaluation computes
-            // no analyzer, observation or aggregated metric, so it reports none.
+            // The members a result of a JOB carries are not this result's: it came out of a
+            // ruleset evaluation run, which names no job, no job run and no evaluation
+            // context. The PROFILE is the one the run measured alongside this result, where
+            // its evaluation measured anything at all; this evaluation computes no analyzer,
+            // observation or aggregated metric, so it reports none.
             job_name: None,
             job_run_id: None,
             evaluation_context: None,
-            profile_id: None,
+            profile_id: result.profile_id.clone(),
             analyzer_results: None,
             observations: None,
             aggregated_metrics: None,

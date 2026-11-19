@@ -30,14 +30,27 @@ pub fn crawler_already_started(name: &str) -> String {
     format!("Crawler with name {name} has already started")
 }
 
-/// A request to suspend the schedule of a crawler that has no schedule running —
-/// one whose schedule is already suspended, or that carries no cron expression at
-/// all. NOT recorded: what is pinned is the behaviour — 400 with the operation's
-/// modelled `SchedulerNotRunningException` — and, like the crawler-running refusal
-/// above, a sentence carrying only the requested `CrawlerName`.
+/// A request to suspend the schedule of a crawler that has NO schedule at all — one
+/// carrying no cron expression to run ([`super::CrawlerEntry::has_schedule`]) — so there
+/// is no scheduler for the call to stop. A crawler whose schedule is merely suspended is
+/// SERVED, because the state that call writes is the state it is in.
+///
+/// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+/// `SchedulerNotRunningException`, the only class it declares for a crawler with no
+/// schedule — and, like the crawler-running refusal above, a sentence carrying only the
+/// requested `CrawlerName`.
 pub fn scheduler_not_running(name: &str) -> String {
     format!("Scheduler for crawler with name {name} is not running")
 }
+
+/// A request to put the schedule of a crawler that carries NO cron expression back in
+/// force ([`super::CrawlerEntry::has_schedule`]): there is no schedule to start.
+///
+/// RECORDED constant, and the whole message: the service states that no schedule was found
+/// and echoes back neither the crawler the request addressed nor the state its schedule
+/// would have been in — unlike the not-running refusal above, whose sentence names the
+/// crawler. The refusal is the operation's modelled `NoScheduleException`.
+pub const NO_SCHEDULE_FOUND: &str = "No schedule found.";
 
 /// A write whose `Schedule` is not the `cron(..)` expression the service
 /// documents ([`super::is_cron_expression`]). NOT recorded: what is pinned is the
@@ -981,6 +994,30 @@ pub const CATALOG_NOT_FOUND: &str = "Catalog not found.";
 pub const ROOT_CATALOG_NOT_DELETABLE: &str =
     "Only lowercase letters, numbers, underscores and hyphens are allowed for catalog name";
 
+/// An `UpdateCatalog` whose `CatalogId` addresses a catalog whose databases live in a
+/// source OUTSIDE the Glue Data Catalog — one stored with a `FederatedCatalog`
+/// ([`super::CatalogDefinition::is_federated`]).
+///
+/// Such a catalog's definition is the federation's, not this catalog's own: the Data
+/// Catalog holds the pointer at the source and the source holds everything under it, so
+/// there is nothing here for a `CatalogInput` to write.
+///
+/// RECORDED constant, and the whole message: the service states that the write is not
+/// allowed on a federated catalog — in the service's own spelling of that kind of catalog —
+/// and interpolates neither the catalog the request addressed nor its source. The refusal is
+/// the operation's modelled `InvalidInputException`.
+pub const FEDERATED_CATALOG_NOT_UPDATABLE: &str = "Update on FederateCatalog is not allowed.";
+
+/// An `UpdateCatalog` whose `CatalogId` addresses the account's own Data Catalog, which
+/// holds the catalogs a create registers and is not one of them — so no `CatalogInput`
+/// describes it.
+///
+/// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+/// `InvalidInputException` — and the wording is the one the delete of that same catalog
+/// answers ([`ROOT_CATALOG_NOT_DELETABLE`]), because both refuse the same catalog for the
+/// same reason: the id addresses no catalog a write of this surface describes.
+pub const ROOT_CATALOG_NOT_UPDATABLE: &str = ROOT_CATALOG_NOT_DELETABLE;
+
 /// `CreateCatalog` for a `CatalogInput` that names no source outside the Glue Data
 /// Catalog. Recorded constant: the whole sentence is fixed text, naming neither the
 /// catalog the request asked for nor any member of its input.
@@ -1063,6 +1100,77 @@ pub const CONNECTION_NOT_FOUND_FOR_DELETE: &str = "Connection not found";
 /// states the resource kind and withholds the name the create asked for, as the
 /// recorded `CreateDatabase` duplicate does for its own resource.
 pub const CONNECTION_ALREADY_EXISTS: &str = "Connection already exists.";
+
+/// `TestConnection` of a connection whose `ConnectionType` is one of the LEGACY kinds
+/// ([`super::LEGACY_CONNECTION_TYPES`]) rather than a unified connection's.
+///
+/// RECORDED constant, and the whole message: the service states which connections the
+/// operation supports and names neither the type it was handed nor the connection the
+/// request addressed, so one wording answers every kind outside the unified surface. No
+/// trailing period, as recorded, and the refusal is a 400 `ValidationException` — a class
+/// this operation's own `errors` list omits and the SERVICE models, so the handler widens
+/// that shape in rather than inventing one.
+pub const TEST_CONNECTION_UNIFIED_ONLY: &str =
+    "TestConnection is only supported for the Unified Connections";
+
+/// `TestConnection` whose inline `TestConnectionInput` states an `AuthenticationType`
+/// without the member its credentials live in
+/// ([`super::missing_authentication_member`]).
+///
+/// RECORDED template: the sentence is wrapped in the brackets this service states a list of
+/// field-level validation failures in, and its two variable parts come from the request —
+/// the member path, as AWS spells it from the `AuthenticationConfiguration` member down, and
+/// the `AuthenticationType` that requires it. The refusal is the operation's modelled
+/// `InvalidInputException`, a DIFFERENT class from the type-level refusal above, which is
+/// what lets a caller tell a restriction on the kind of connection from a missing field.
+pub fn authentication_member_required_for_type(
+    member_path: &str,
+    authentication_type: &str,
+) -> String {
+    format!(
+        "[AuthenticationConfiguration.{member_path} is required for {authentication_type} \
+         AuthenticationType.]"
+    )
+}
+
+/// `TestConnection` that names neither the connection to test nor an inline definition to
+/// test: both members are optional on their own, so a request carrying neither asks for no
+/// connection at all.
+///
+/// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+/// `InvalidInputException` — and the sentence follows the one this service states the same
+/// either-or requirement with one surface over
+/// ([`INTEGRATION_PROCESSING_PROPERTIES_REQUIRED`]), naming the two members in prose.
+pub const TEST_CONNECTION_NAMES_NO_CONNECTION: &str =
+    "Either ConnectionName or TestConnectionInput must be provided in the request.";
+
+/// `TestConnection` that names a stored connection AND carries an inline definition: two
+/// connections, where the call tests one. Stated by the model: "you can either provide an
+/// existing connection name or a TestConnectionInput for testing a non-existing connection
+/// input. Providing both at the same time will cause an error" (`TestConnection`).
+///
+/// NOT recorded: what is pinned is the behaviour the documentation states — 400 with the
+/// operation's modelled `InvalidInputException` — in a sentence naming the two members,
+/// beside the either-or above.
+pub const TEST_CONNECTION_STATES_TWO_CONNECTIONS: &str =
+    "ConnectionName and TestConnectionInput cannot both be provided in the same request.";
+
+/// `TestConnection` for a connection definition this service accepted and then could not
+/// connect through.
+///
+/// A unified connection names a data source OUTSIDE this emulator — a SaaS tenant, an
+/// authorization server, a database host — and this emulator opens no connection to anything
+/// outside itself, which is also why a stored connection carries no validation status at all
+/// (`ConnectionEntry::from_input`). So the test reaches no data source, and what it reports
+/// is that failure rather than a success nothing verified.
+///
+/// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+/// `InvalidInputException` — and the sentence names the one thing the attempt was decided
+/// by, the kind of data source the connection points at, taken from the definition under
+/// test.
+pub fn connection_test_did_not_reach_the_source(connection_type: &str) -> String {
+    format!("Unable to connect to the {connection_type} data source.")
+}
 
 /// `GetTable` for an address it cannot resolve — a table the database does not hold, or
 /// a `DatabaseName` the catalog holds no database under. Recorded constant: this read
@@ -1547,6 +1655,25 @@ pub fn invalid_data_quality_run_id() -> String {
     )
 }
 
+/// A `ProfileId` that is no data quality profile id at all — one outside the grammar the
+/// service mints a profile id with ([`super::is_data_quality_profile_id`]) — on any of the
+/// three operations of the profile surface.
+///
+/// A value outside that grammar names no profile that could ever exist, so it is a malformed
+/// request rather than a miss: RECORDED behaviour is the operations' modelled
+/// `InvalidInputException`, where a well-formed id nothing minted is the
+/// `EntityNotFoundException` above. RECORDED template: two fixed sentences, the second
+/// quoting the one prefix the store MINTS a profile id with
+/// ([`crate::state::DATA_QUALITY_PROFILE_ID_PREFIX`]) rather than a second spelling of it, so
+/// the stated grammar and the minted one cannot disagree. It echoes nothing of the request,
+/// so one wording answers every value outside the grammar.
+pub fn invalid_data_quality_profile_id() -> String {
+    format!(
+        "Invalid profileId format. Valid identifiers begin with {}",
+        crate::state::DATA_QUALITY_PROFILE_ID_PREFIX
+    )
+}
+
 /// A machine learning transform lookup (`GetMLTransform`, `UpdateMLTransform`,
 /// `DeleteMLTransform`, or a walk over one transform's task runs) for a `TransformId` no
 /// transform in this account has.
@@ -1565,20 +1692,33 @@ pub fn ml_transform_not_found(transform_id: &str) -> String {
 }
 
 /// A machine learning task run lookup (`GetMLTaskRun`) for a `TaskRunId` the addressed
-/// transform holds no run under.
+/// transform holds no run under, and the `CancelMLTaskRun` that addresses one the same way.
 ///
-/// NOT recorded: the sentence follows the template this same machine learning surface
-/// words its recorded parent miss in ([`ml_transform_not_found`]) — the account whose
-/// namespace the lookup was served in and the id the request itself sent — because the
-/// run and its transform are missed by the same surface, so one miss cannot be worded
-/// one way for the parent and another for the child. The `TaskRunId` is the half of a
-/// run's address the transform could not resolve, so it is what the sentence names.
-pub fn ml_task_run_not_found(task_run_id: &str) -> String {
+/// RECORDED template: the fixed text is `No ML Task Run found for `, `: in account ` and
+/// ` for transform ` — the colon stands directly after the task run id — and the variable
+/// parts are the `TaskRunId` the request sent, the account whose namespace was searched and
+/// the `TransformId` the run was addressed under. A DIFFERENT sentence from the parent
+/// transform's miss ([`ml_transform_not_found`]), which names only the transform, because
+/// this one is about the run and names the whole of a run's address.
+pub fn ml_task_run_not_found(task_run_id: &str, transform_id: &str) -> String {
     format!(
-        "Cannot find MLTaskRun in account {} with handle {task_run_id}",
+        "No ML Task Run found for {task_run_id}: in account {} for transform {transform_id}",
         ::engine::emulator_account_id()
     )
 }
+
+/// `CancelMLTaskRun` against a task run whose task the service is no longer working
+/// through ([`super::MlTaskRunEntry::is_cancellable`]): a run that has already stopped,
+/// finished or been terminated, and one already stopping, has no task left for a cancel
+/// to stop.
+///
+/// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+/// `InvalidInputException` — and the wording follows the one this service already states
+/// the same rule in for a run of a JOB ([`JOB_RUN_CANNOT_BE_STOPPED`]), one resource kind
+/// over, which states neither the status the run stands in nor the ids the request
+/// addressed it by.
+pub const ML_TASK_RUN_CANNOT_BE_CANCELLED: &str =
+    "Task run cannot be cancelled in current state.";
 
 /// `CreateMLTransform` for a `Name` this account already holds a transform under.
 ///
@@ -1628,6 +1768,43 @@ pub fn data_quality_ruleset_evaluation_run_not_found(run_id: &str) -> String {
 pub fn data_quality_result_not_found(result_id: &str) -> String {
     data_quality_not_found(DATA_QUALITY_RESULT, result_id)
 }
+
+/// The two reads of the anomaly-detection model (`GetDataQualityModel`,
+/// `GetDataQualityModelResult`) for an address they can resolve no model result at: a
+/// `ProfileId` no statistics run of this account minted, a `StatisticId` the addressed
+/// profile holds no datapoint of, and — for the read of the result itself — a model whose
+/// training has produced nothing yet.
+///
+/// RECORDED constant, and the whole message: the model reads state that the result was not
+/// found and echo back neither the profile nor the statistic the request addressed, so one
+/// wording answers every address that resolves to no model result. The refusal is the
+/// operations' modelled `EntityNotFoundException`.
+pub const DATA_QUALITY_MODEL_RESULT_NOT_FOUND: &str = "Unable to find Model Result";
+
+/// `PutDataQualityProfileAnnotation` for a `ProfileId` no statistics run of this account
+/// minted.
+///
+/// RECORDED template: unlike the model reads above, the annotation write NAMES the profile it
+/// could not resolve — the account whose namespace holds no such profile and the `ProfileId`
+/// the request itself sent, which is the shape this service words a missing machine learning
+/// run in too ([`ml_task_run_not_found`]) — and the refusal is the operation's modelled
+/// `EntityNotFoundException`.
+pub fn data_quality_profile_not_found(profile_id: &str) -> String {
+    format!(
+        "Cannot find Data Profile in account {} with id {profile_id}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// `GetDataQualityModelResponse$FailureReason` of a training that produced no model because
+/// the profile it was asked for holds no datapoint at all.
+///
+/// NOT recorded: a model is trained over a statistic's datapoints, so a profile carrying none
+/// leaves a training that produced nothing rather than one still running or one that
+/// succeeded. Whole fixed text, and inside the member's `length 1..255`: the profile it is
+/// about is the one the request addressed.
+pub const DATA_QUALITY_MODEL_HAS_NO_STATISTICS: &str =
+    "The profile holds no statistics to train a model on.";
 
 /// A data quality run start whose `DataSource` carries neither kind of Glue table. NOT
 /// recorded: what is pinned is the behaviour — 400 with the operation's modelled

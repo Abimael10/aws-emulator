@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataQualityModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataQualityModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataQualityModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Retrieve the training status of the model along with more information (CompletedOn,
+//! StartedOn, FailureReason)."
+//!
+//! The model is the anomaly-detection model trained over the datapoints of ONE data quality
+//! profile — the measurements a finished ruleset evaluation run took of its dataset
+//! ([`crate::state::DataQualityProfileEntry`]) — so the read resolves the profile the
+//! `ProfileId` addresses, narrows it to one statistic where the request names one, and
+//! reports the training the clock has reached. A `ProfileId` no run minted, and a
+//! `StatisticId` the profile holds no datapoint of, resolve to no model result at all.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +155,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataQualityModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDataQualityModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataQualityModel"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(GetDataQualityModelErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue data quality store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // A `ProfileId` outside the grammar the service mints one with names no profile that
+        // could ever exist, so it is a malformed request rather than a miss — decided before
+        // anything is looked up, as the data quality run surface decides its own id.
+        if !crate::state::is_data_quality_profile_id(&input.profile_id) {
+            return Err(GetDataQualityModelErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::invalid_data_quality_profile_id()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        // Reporting only: the profile is read and the training status is DERIVED from the
+        // instant the clock had already made it due, so nothing is written and what a later
+        // caller sees is unchanged by this read.
+        let store = state.lock();
+        // `ProfileId` is `@required` with `length 1..255`, so reaching here the only question
+        // is whether any run of this account minted it.
+        let Some(profile) = store.data_quality_profile(&input.profile_id) else {
+            return Err(GetDataQualityModelErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(
+                        crate::state::messages::DATA_QUALITY_MODEL_RESULT_NOT_FOUND.to_string(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // `StatisticId` is optional: a request that names one asks for the model of THAT
+        // statistic, so a statistic this profile holds no datapoint of addresses no model.
+        if let Some(statistic_id) = input.statistic_id.as_deref() {
+            if profile.statistic(statistic_id).is_none() {
+                return Err(GetDataQualityModelErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(
+                            crate::state::messages::DATA_QUALITY_MODEL_RESULT_NOT_FOUND
+                                .to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        let training = profile.model_training(now);
+        Ok(GetDataQualityModelOutput {
+            status: Some(training.status.to_string()),
+            started_on: Some(crate::state::to_date_time(training.started_on)),
+            completed_on: training.completed_on.map(crate::state::to_date_time),
+            failure_reason: training.failure_reason.map(str::to_string),
+        })
     }
 }

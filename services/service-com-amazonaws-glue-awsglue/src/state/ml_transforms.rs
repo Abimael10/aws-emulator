@@ -485,6 +485,13 @@ impl MlTransformEntry {
         self.task_runs.iter().find(|run| run.id == run_id)
     }
 
+    /// The same run, for the one operation that WRITES to it ([`MlTaskRunEntry::cancel`]):
+    /// addressed exactly as [`Self::task_run`] addresses it, so a cancel reaches the run a
+    /// read of the same pair reports and no other.
+    pub fn task_run_mut(&mut self, run_id: &str) -> Option<&mut MlTaskRunEntry> {
+        self.task_runs.iter_mut().find(|run| run.id == run_id)
+    }
+
     /// Every task run of this transform `filter` admits, in the order `sort` names, each
     /// paired with its ordering key — which is what the listing's continuation token
     /// carries ([`MlTaskRunEntry::ordering_key`]).
@@ -603,6 +610,23 @@ pub const ML_TASK_RUN_STATUS_STARTING: &str = "STARTING";
 /// and enters `TIMEOUT` status" (`CreateMLTransform$Timeout`) — the end of a run that spent
 /// the resource budget its transform allows without finishing its task.
 pub const ML_TASK_RUN_STATUS_TIMEOUT: &str = "TIMEOUT";
+
+/// See [`ML_TASK_RUN_STATUS_STARTING`]: of the modelled enum, the status of a run whose task
+/// the service is carrying out — the one a run moves on to from `STARTING` while its task is
+/// still under way.
+pub const ML_TASK_RUN_STATUS_RUNNING: &str = "RUNNING";
+
+/// See [`ML_TASK_RUN_STATUS_STARTING`]: of the modelled enum, the status a CANCEL puts a run
+/// in — the task has been asked to stop and has not stopped yet, which is why it is a status
+/// of its own beside [`ML_TASK_RUN_STATUS_STOPPED`]. Not terminal: the clock owes the run its
+/// way to stopped ([`MlTaskRunEntry::cancel`]).
+pub const ML_TASK_RUN_STATUS_STOPPING: &str = "STOPPING";
+
+/// See [`ML_TASK_RUN_STATUS_STOPPING`]: the terminal status of a run that was cancelled and
+/// has stopped. A run that reaches it ran out of nothing and failed on nothing, so it carries
+/// no error string — unlike the run its budget terminated
+/// ([`ML_TASK_RUN_TIMED_OUT_MESSAGE`]).
+pub const ML_TASK_RUN_STATUS_STOPPED: &str = "STOPPED";
 
 /// How long a task run stays in the status the call that started it put it in before the
 /// clock owes it the next one.
@@ -795,10 +819,47 @@ impl MlTaskRunEntry {
             return;
         }
         self.settles_at = None;
-        self.status = ML_TASK_RUN_STATUS_TIMEOUT.to_string();
-        self.error_string = Some(ML_TASK_RUN_TIMED_OUT_MESSAGE.to_string());
+        // A run that was CANCELLED is owed the end its cancel asked for, not the end its
+        // budget running out would have put it in: it stops, and it failed on nothing, so it
+        // carries no error string.
+        if self.status == ML_TASK_RUN_STATUS_STOPPING {
+            self.status = ML_TASK_RUN_STATUS_STOPPED.to_string();
+        } else {
+            self.status = ML_TASK_RUN_STATUS_TIMEOUT.to_string();
+            self.error_string = Some(ML_TASK_RUN_TIMED_OUT_MESSAGE.to_string());
+        }
         self.completed_on = Some(due);
         self.last_modified_on = due;
+    }
+
+    /// Whether this run is one a cancel can still stop: a run whose task the service is
+    /// working through, i.e. one of the modelled `TaskStatusType` values a run stands in
+    /// before it has finished ([`ML_TASK_RUN_STATUS_STARTING`] and
+    /// [`ML_TASK_RUN_STATUS_RUNNING`]).
+    ///
+    /// A run that has FINISHED — stopped, succeeded, failed or been terminated by its budget
+    /// — has no task left to stop, and neither has one already stopping, so a cancel of any
+    /// of them changes nothing and is refused rather than reported as a cancel that happened.
+    pub fn is_cancellable(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            ML_TASK_RUN_STATUS_STARTING | ML_TASK_RUN_STATUS_RUNNING
+        )
+    }
+
+    /// Ask this run to stop, as served at `now`: the run leaves the status it was in for
+    /// [`ML_TASK_RUN_STATUS_STOPPING`], and the clock owes it its way to
+    /// [`ML_TASK_RUN_STATUS_STOPPED`] [`ML_TASK_RUN_SETTLES_AFTER`] later
+    /// ([`Self::settle_if_due`] is what materialises that) — so a caller that reads the run
+    /// straight after the cancel still observes it stopping, which is the status the cancel
+    /// itself reports.
+    ///
+    /// The due instant REPLACES whatever the run was previously owed: the task is being torn
+    /// down from now, so its own budget no longer decides when it ends.
+    pub fn cancel(&mut self, now: SystemTime) {
+        self.status = ML_TASK_RUN_STATUS_STOPPING.to_string();
+        self.settles_at = Some(now.checked_add(ML_TASK_RUN_SETTLES_AFTER).unwrap_or(now));
+        self.last_modified_on = now;
     }
 
     /// `TaskRun$ExecutionTime`: "The amount of time (in seconds) that the task run

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelMLTaskRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelMLTaskRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelMLTaskRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops ONE task run of ONE machine learning transform: "you can cancel a machine learning
+//! task run at any time by calling CancelMLTaskRun with a task run's parent transform's
+//! TransformID and the task run's TaskRunId". A run is addressed by that pair, so the lookup
+//! resolves the transform first and then the run among the runs started OF it — the same two
+//! steps, and the same two misses, as the read of one run (`GetMLTaskRun`).
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +154,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelMLTaskRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelMLTaskRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelMLTaskRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(CancelMLTaskRunErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue machine learning transform store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // `TransformId` and `TaskRunId` are both `@required` with `length 1..255`, so an
+        // absent or over-long one is refused at the boundary: reaching here, the only
+        // question is which half of the run's address this account can resolve. A run is
+        // held ON its transform, so a `TransformId` this account holds no transform under
+        // addresses no run at all.
+        let Some(transform) = store.ml_transforms.get_mut(&input.transform_id) else {
+            return Err(CancelMLTaskRunErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::ml_transform_not_found(
+                        &input.transform_id,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // The status the clock had already made due is materialised BEFORE the cancel is
+        // decided, so a run whose task the clock has already finished is refused as finished
+        // rather than cancelled on the strength of a status it had already left. It was owed
+        // at that instant whether or not anybody called.
+        transform.settle_due_task_runs(now);
+
+        let Some(run) = transform.task_run_mut(&input.task_run_id) else {
+            return Err(CancelMLTaskRunErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::ml_task_run_not_found(
+                        &input.task_run_id,
+                        &input.transform_id,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // A run with no task left to stop is refused rather than reported as cancelled: the
+        // call would change nothing, and the status it answered would say the run stopped
+        // when it had already ended some other way.
+        if !run.is_cancellable() {
+            return Err(CancelMLTaskRunErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        crate::state::messages::ML_TASK_RUN_CANNOT_BE_CANCELLED.to_string(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        run.cancel(now);
+        let status = run.status.clone();
+        ::tracing::info!(
+            operation = "CancelMLTaskRun",
+            transform = %input.transform_id,
+            run = %input.task_run_id,
+            status = %status,
+            "cancelled a Glue machine learning task run"
+        );
+
+        // Every member comes from the run that is now stored, so what the cancel reports is
+        // what a read of that run reports until the clock moves it on.
+        Ok(CancelMLTaskRunOutput {
+            transform_id: Some(input.transform_id),
+            task_run_id: Some(input.task_run_id),
+            status: Some(status),
+        })
     }
 }

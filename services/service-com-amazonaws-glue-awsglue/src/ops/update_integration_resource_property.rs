@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIntegrationResourceProperty
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIntegrationResourceProperty`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIntegrationResourceProperty::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the processing properties of ONE resource of an integration: "this API can be used
+//! for updating the ResourceProperty of the Glue connection (for the source) or Glue database
+//! ARN (for the target)". One record per resource, keyed by the ARN the request names, which
+//! is the record `GetIntegrationResourceProperty` reads back — so a write for a resource that
+//! carries no record yet is that record's first write and not a miss.
+//!
+//! The two rules of this family order the call ([`crate::service::integration_properties`]):
+//! the sides stated are judged on the request BODY alone, before `ResourceArn` is read at
+//! all, and the ARN is then read as one of the integration's two legs — a value that names
+//! neither is this operation's modelled `ValidationException`, and a leg this account does
+//! not hold is its `EntityNotFoundException`.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +166,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIntegrationResourceProperty` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIntegrationResourcePropertyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIntegrationResourceProperty"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(
+                UpdateIntegrationResourcePropertyErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "the Glue integration resource property store is unavailable".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // What this call writes is a side of the integration: the source's processing
+        // properties or the target's, never both — the two sides belong to two different
+        // resources and are written by two calls, so a request stating BOTH addresses two
+        // resources at once and no `ResourceArn` can be the resource of both. Decided on the
+        // request alone, as the create decides it, before anything it addresses is resolved.
+        if input.source_processing_properties.is_some()
+            && input.target_processing_properties.is_some()
+        {
+            return Err(
+                UpdateIntegrationResourcePropertyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::service::integration_properties::PROCESSING_PROPERTIES_SIDES_EXCLUSIVE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The model marks each side optional on its own, so a request that states NEITHER is
+        // refused here as the service's own requirement — it asks for no property to be
+        // written at all. Decided on the request alone, like the rule above, so nothing is
+        // persisted for it and a later read of that resource still reports what it did.
+        if input.source_processing_properties.is_none()
+            && input.target_processing_properties.is_none()
+        {
+            return Err(
+                UpdateIntegrationResourcePropertyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::messages::INTEGRATION_PROCESSING_PROPERTIES_REQUIRED
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The connection ARN of the source, or the database ARN of the target": a value that
+        // names neither names no resource whose properties this call could write.
+        let resource = match crate::service::integration_properties::updated_resource_property_target(
+            &input.resource_arn,
+        ) {
+            Ok(resource) => resource,
+            Err(message) => {
+                return Err(
+                    UpdateIntegrationResourcePropertyErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        let mut store = state.lock();
+        // The properties are the named resource's own, so that resource has to exist: an ARN
+        // of a connection or a database this endpoint does not hold — including one of
+        // another account or another Region — names nothing here. Worded as the create words
+        // it, because both writes of one record resolve the same resource.
+        if store.resource_tags(&resource).is_none() {
+            return Err(
+                UpdateIntegrationResourcePropertyErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::tagged_resource_not_found_message(
+                            &resource,
+                            &input.resource_arn,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // One record per resource: this write is that record's next one where the resource
+        // already has it, and its first where it does not — "these properties can include the
+        // role to access the connection or database", which a resource either carries or does
+        // not, so there is no second record for a write to make. The record is keyed by the
+        // `ResourceArn` as SENT, which is the key the create stores one under and the key the
+        // read and the delete address one by, so all four calls reach one record.
+        let stored_already = store
+            .integration_resource_properties
+            .contains_key(&input.resource_arn);
+        if !stored_already && !store.can_store_integration_resource_property() {
+            // The store is resident memory and this write is reachable by any caller, so the
+            // number of records one process will hold is bounded, exactly as the create
+            // bounds it. The refusal is the closest client error this operation models.
+            return Err(
+                UpdateIntegrationResourcePropertyErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} integration resource \
+                             properties",
+                            crate::state::MAX_INTEGRATION_RESOURCE_PROPERTIES
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record's own ARN names the resource it describes, under this record type's ARN
+        // segment, exactly as the create derives it — so a record written by either call is
+        // addressed by the same `ResourcePropertyArn`.
+        let property_id = format!("{}/{}", resource.kind.arn_segment(), resource.name);
+        let stored = store
+            .integration_resource_properties
+            .entry(input.resource_arn.clone())
+            .or_insert_with(|| crate::state::IntegrationResourcePropertyEntry {
+                resource_arn: input.resource_arn.clone(),
+                property_id,
+                source_processing_properties: input.source_processing_properties.clone(),
+                target_processing_properties: input.target_processing_properties.clone(),
+                tags: Vec::new(),
+            });
+        if stored_already {
+            stored.apply_update(&input);
+        }
+
+        ::tracing::info!(
+            operation = "UpdateIntegrationResourceProperty",
+            resource = %stored.resource_arn,
+            stored_already,
+            "wrote the processing properties of a Glue integration resource"
+        );
+
+        // Every member comes from the record that is now stored, so what this write reports
+        // is what a later read of that record reports.
+        Ok(UpdateIntegrationResourcePropertyOutput {
+            resource_arn: Some(stored.resource_arn.clone()),
+            resource_property_arn: Some(stored.arn(&region)),
+            source_processing_properties: stored.source_processing_properties.clone(),
+            target_processing_properties: stored.target_processing_properties.clone(),
+        })
     }
 }
