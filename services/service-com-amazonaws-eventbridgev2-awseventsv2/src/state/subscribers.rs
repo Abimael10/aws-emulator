@@ -22,7 +22,7 @@ use super::{base36, spread, ComAmazonawsEventbridgev2Awseventsv2State, StoredEve
 use crate::ops::types::{
     BatchConfiguration, Filter, FilterConfiguration, InvokeConfiguration, LogConfiguration,
     OnFailureConfiguration, PointInTimeConfiguration, ResourceNotFoundException, RetryPolicy,
-    Transformer,
+    Transformer, UniversalTargetParameters,
 };
 
 /// The resource-type segment of a `SubscriberArn`, from the modelled pattern
@@ -65,6 +65,21 @@ pub const STARTING_POSITION_LATEST: &str = "LATEST";
 /// bus's retained log the subscriber's `PointInTimeConfiguration` names, so the
 /// subscriber is owed the backlog from that point on.
 pub const STARTING_POSITION_POINT_IN_TIME: &str = "POINT_IN_TIME";
+
+/// `ResumePosition::LAST_PROCESSED` — "Continue delivery from where it stopped
+/// (last persisted progress)", so an unpause from this position leaves the
+/// subscriber's own position on its bus's log alone and the backlog it accrued
+/// while stopped is still owed to it. It is the position an unpause naming none
+/// takes ("Defaults to LAST_PROCESSED when omitted"). An entry of
+/// [`crate::ops::types::RESUME_POSITION_VALUES`].
+pub const RESUME_POSITION_LAST_PROCESSED: &str = "LAST_PROCESSED";
+
+/// `ResumePosition::LATEST` — "Skip the backlog accrued while stopped; deliver
+/// only new events (resume at the tip)", so an unpause from this position moves
+/// the subscriber's position to the END of its bus's log and nothing published
+/// while it was stopped is delivered. An entry of
+/// [`crate::ops::types::RESUME_POSITION_VALUES`].
+pub const RESUME_POSITION_LATEST: &str = "LATEST";
 
 /// `PointType::HORIZON` — the point is the horizon of the bus's retained log:
 /// the oldest event the bus still holds. An entry of
@@ -766,6 +781,44 @@ pub fn filter_configuration_fault(configuration: &FilterConfiguration) -> Option
     })
 }
 
+/// Whether `configuration` is the EMPTY shape, which an update carries to CLEAR
+/// the filter a subscriber holds.
+///
+/// `FilterConfiguration` separates the two: "On UpdateSubscriber, an empty
+/// `FilterConfiguration:{}` clears the existing filter. Any non-empty shape
+/// (including `{Language:X}` without Filters) must contain a valid Filters list".
+/// So emptiness is a property of the SHAPE — no member of it carried at all —
+/// rather than of the filters alone, and a configuration naming only a language
+/// is non-empty and held to [`filter_configuration_fault`].
+pub fn filter_configuration_clears(configuration: &FilterConfiguration) -> bool {
+    configuration.language.is_none() && configuration.filters.is_none()
+}
+
+/// Why a subscriber cannot carry both this target configuration and this
+/// transformer, or `None` when it can.
+///
+/// `Transformer` states the rule: it is "Not applicable to universal (aws-sdk)
+/// targets, whose input transformation is UniversalTargetParameters.Input; a
+/// Transformer on such a target is rejected". A universal target is the one
+/// whose `UniversalTargetParameters` the subscriber's `InvokeConfiguration`
+/// carries, so the two members are what the check reads.
+///
+/// The `Some` is the whole `Message` of the refusal, which is why it names the
+/// members the request got wrong.
+pub fn transformer_fault(
+    universal_target_parameters: Option<&UniversalTargetParameters>,
+    transformer: Option<&Transformer>,
+) -> Option<String> {
+    let (Some(_), Some(_)) = (universal_target_parameters, transformer) else {
+        return None;
+    };
+    Some(
+        "Transformer: a universal target takes its input transformation from \
+         UniversalTargetParameters.Input and accepts no Transformer"
+            .to_string(),
+    )
+}
+
 /// What this subscriber's target is handed for `event`, or `None` when the
 /// subscriber's `Transformer` names a transformation this slice does not perform
 /// — in which case nothing is delivered rather than a document the transformer
@@ -859,6 +912,40 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
             subscriber.region == region
                 && subscriber.client_token.as_deref() == Some(client_token)
         })
+    }
+
+    /// Place the subscriber `arn` at the position an UNPAUSE resumes delivery
+    /// from, as `ResumePosition` names it.
+    ///
+    /// `ResumePosition` is "honored only on an UpdateSubscriber call that
+    /// transitions State from STOPPED to RUNNING (unpause)", so this is called
+    /// only for that transition. `LAST_PROCESSED` — the default — "continue[s]
+    /// delivery from where it stopped", which is the position the subscriber
+    /// already holds, so nothing moves; `LATEST` "skip[s] the backlog accrued
+    /// while stopped" by moving the position to the END of the bus's log, so the
+    /// events published while the subscriber was stopped are never owed to it.
+    ///
+    /// A value `ResumePosition` does not declare is refused at the boundary
+    /// before any handler runs, so it cannot reach here; one that does is
+    /// nonetheless treated as the default rather than as a jump nobody asked
+    /// for.
+    pub fn resume_subscriber(&mut self, arn: &str, resume_position: Option<&str>) {
+        if resume_position != Some(RESUME_POSITION_LATEST) {
+            return;
+        }
+        let Some(subscriber) = self.subscribers.get(arn) else {
+            return;
+        };
+        let Some(tip) = self
+            .event_buses
+            .get(&subscriber.event_bus_arn)
+            .map(|bus| bus.next_sequence_number)
+        else {
+            return;
+        };
+        if let Some(subscriber) = self.subscribers.get_mut(arn) {
+            subscriber.next_sequence_number = tip;
+        }
     }
 
     /// Take what the subscriber `arn` is owed right now, advancing its position
@@ -966,12 +1053,13 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
 mod tests {
     use super::{
         FILTER_SCOPE_DATA, FILTER_SCOPE_METADATA, FILTER_SCOPE_SYSTEM_METADATA,
-        ORDERING_TYPE_UNORDERED, STARTING_POSITION_LATEST, SUBSCRIBER_STATE_RUNNING,
-        SUBSCRIBER_STATE_STOPPED, TRANSFORMER_TYPE_RAW, TRANSFORMER_TYPE_WITH_METADATA,
+        ORDERING_TYPE_UNORDERED, RESUME_POSITION_LAST_PROCESSED, RESUME_POSITION_LATEST,
+        STARTING_POSITION_LATEST, SUBSCRIBER_STATE_RUNNING, SUBSCRIBER_STATE_STOPPED,
+        TRANSFORMER_TYPE_RAW, TRANSFORMER_TYPE_WITH_METADATA,
     };
     use crate::ops::types::{
-        FILTER_SCOPE_VALUES, ORDERING_TYPE_VALUES, STARTING_POSITION_VALUES,
-        SUBSCRIBER_STATE_VALUES, TRANSFORMER_TYPE_VALUES,
+        FILTER_SCOPE_VALUES, ORDERING_TYPE_VALUES, RESUME_POSITION_VALUES,
+        STARTING_POSITION_VALUES, SUBSCRIBER_STATE_VALUES, TRANSFORMER_TYPE_VALUES,
     };
 
     /// Every value this slice puts on the wire, or keys a decision on, is a
@@ -999,6 +1087,16 @@ mod tests {
                 "StartingPosition::LATEST",
                 STARTING_POSITION_LATEST,
                 STARTING_POSITION_VALUES,
+            ),
+            (
+                "ResumePosition::LAST_PROCESSED",
+                RESUME_POSITION_LAST_PROCESSED,
+                RESUME_POSITION_VALUES,
+            ),
+            (
+                "ResumePosition::LATEST",
+                RESUME_POSITION_LATEST,
+                RESUME_POSITION_VALUES,
             ),
             ("FilterScope::DATA", FILTER_SCOPE_DATA, FILTER_SCOPE_VALUES),
             (

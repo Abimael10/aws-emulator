@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSubscriber
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSubscriber`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSubscriber::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: applies the members an update carries to a stored subscriber and
+//! leaves the ones it omits unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -134,10 +127,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `UpdateSubscriberError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#UpdateSubscriber")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#UpdateSubscriber",
+    extra_errors = ["InternalException", "InvalidInputException"]
+)]
 #[derive(Debug)]
 pub enum UpdateSubscriberErrorModeled {
     ConcurrentModificationException(ConcurrentModificationException),
+    InternalException(InternalException),
+    InvalidInputException(InvalidInputException),
     InvalidStateException(InvalidStateException),
     LimitExceededException(LimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -194,18 +192,283 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSubscriber` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSubscriberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSubscriber"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateSubscriberErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the event bus store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // The store's lock is taken for the change alone and released with this
+        // statement, because the deliveries an unpause makes due are calls into
+        // other services of this same emulator, which reach those services' own
+        // stores.
+        let applied = apply(&mut store.lock(), &input, now)?;
+
+        // What an unpaused subscriber is owed: a subscriber resuming from where
+        // it stopped still holds the backlog that accrued while it was not
+        // delivering, and it is due as soon as it is RUNNING again. An unpause
+        // that resumed at the tip, and an update that is no unpause, make
+        // nothing due and deliver nothing here.
+        crate::state::subscriber_delivery::deliver_due(ctx.callback(), &applied.due).await;
+
+        Ok(applied.response)
+    }
+}
+
+/// The whole `Message` of the refusal every mutating operation on a withdrawn
+/// subscriber answers with.
+///
+/// `DescribeSubscriberResponse$Revoked` states the rule: "Revocation is
+/// terminal: it never returns to false. Mutating operations on a revoked
+/// subscriber fail with InvalidStateException, except DeleteSubscriber". The
+/// sentence names nothing of the request, so it is fixed text.
+pub const REVOKED_SUBSCRIBER_MESSAGE: &str = "Subscriber is revoked and cannot be updated";
+
+/// What one update leaves behind: the response it answers, and the deliveries it
+/// made due.
+struct Applied {
+    response: UpdateSubscriberOutput,
+    due: Vec<crate::state::DueDelivery>,
+}
+
+/// Apply this update to the subscriber it addresses, and report what it made due.
+///
+/// SYNCHRONOUS, and handed the store rather than the engine, because it runs
+/// under the store's lock from end to end: resolving the subscriber, refusing a
+/// change it cannot take, writing the members the request carries and taking what
+/// the change owes are one atomic step, so no two updates can interleave on one
+/// subscriber. The deliveries it makes due are made by the caller, with the lock
+/// released.
+fn apply(
+    state: &mut crate::state::ComAmazonawsEventbridgev2Awseventsv2State,
+    input: &UpdateSubscriberInput,
+    now: ::std::time::SystemTime,
+) -> Result<Applied, UpdateSubscriberError> {
+    state.settle_lifecycles(now);
+
+    let Some(subscriber) = state.subscriber(&input.subscriber_arn) else {
+        return Err(UpdateSubscriberErrorModeled::ResourceNotFoundException(
+            crate::state::subscriber_not_found(&input.subscriber_arn),
+        )
+        .into());
+    };
+
+    // "Mutating operations on a revoked subscriber fail with
+    // InvalidStateException": a subscriber the bus owner has withdrawn takes no
+    // further change, whatever the request carries.
+    if subscriber.revoked {
+        return Err(UpdateSubscriberErrorModeled::InvalidStateException(
+            InvalidStateException {
+                message: Some(REVOKED_SUBSCRIBER_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    }
+
+    // The run state this request asks for, and `None` when it asks for no
+    // change: "Fields omitted from the request are left unchanged", so an
+    // omitted `State` is NOT the default a create takes.
+    let requested_state = match input.state.as_deref() {
+        None => None,
+        Some(value) => match crate::state::SubscriberRunState::from_wire(Some(value)) {
+            Some(state) => Some(state),
+            None => {
+                return Err(UpdateSubscriberErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "State: {value} is not a SubscriberState this service declares"
+                        )),
+                    },
+                )
+                .into())
+            }
+        },
+    };
+
+    // A filter configuration that is not the empty shape is held to the same
+    // contract a create's is — "Any non-empty shape (including `{Language:X}`
+    // without Filters) must contain a valid Filters list — same contract as
+    // CreateSubscriber" — because a configuration naming no filters, or a text
+    // that is not a pattern of the one language this service evaluates, would
+    // select nothing for the rest of the subscriber's life.
+    let clears_filters = input
+        .filter_configuration
+        .as_ref()
+        .is_some_and(crate::state::filter_configuration_clears);
+    if !clears_filters {
+        if let Some(reason) = input
+            .filter_configuration
+            .as_ref()
+            .and_then(crate::state::filter_configuration_fault)
+        {
+            return Err(UpdateSubscriberErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+    }
+
+    // A `Transformer` and a universal target are mutually exclusive, read
+    // against the target configuration this update LEAVES the subscriber with:
+    // either member may be the one the request changes.
+    let universal_target = match input.invoke_configuration.as_ref() {
+        Some(requested) => requested.universal_target_parameters.clone(),
+        None => subscriber
+            .invoke_configuration
+            .universal_target_parameters
+            .clone(),
+    };
+    let transformer = match input.transformer.as_ref() {
+        Some(requested) => Some(requested.clone()),
+        None => subscriber.transformer.clone(),
+    };
+    if let Some(reason) =
+        crate::state::transformer_fault(universal_target.as_ref(), transformer.as_ref())
+    {
+        return Err(UpdateSubscriberErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(reason),
+            },
+        )
+        .into());
+    }
+
+    // `ResumePosition` is "honored only on an UpdateSubscriber call that
+    // transitions State from STOPPED to RUNNING (unpause)", so whether this call
+    // IS that transition is decided from the subscriber as it stands, before
+    // anything is written.
+    let unpausing = subscriber.state == crate::state::SubscriberRunState::Stopped
+        && requested_state == Some(crate::state::SubscriberRunState::Running);
+
+    // Everything above is decided from the subscriber as it stands, so the
+    // refusals are settled before the mutable borrow and there is exactly one
+    // not-found path.
+    let subscriber = state
+        .subscribers
+        .get_mut(&input.subscriber_arn)
+        .expect("the subscriber resolved above is in the store");
+
+    // "Fields omitted from the request are left unchanged": each member the
+    // request carries is written, and a member it omits is not touched. A member
+    // that IS carried replaces the stored value wholesale rather than being
+    // merged into it.
+    let mut modified = false;
+    if let Some(description) = input.description.clone() {
+        subscriber.description = Some(description);
+        modified = true;
+    }
+    if let Some(requested) = input.invoke_configuration.as_ref() {
+        // `UpdateInvokeConfiguration` carries no `TargetArn`: what a subscriber
+        // invokes is fixed at creation and only HOW it invokes it is update-able,
+        // so the stored target survives the change.
+        subscriber.invoke_configuration =
+            invoked(subscriber.invoke_configuration.target_arn.clone(), requested);
+        modified = true;
+    }
+    if let Some(configuration) = input.filter_configuration.clone() {
+        // "An empty `FilterConfiguration:{}` clears the existing filter": a
+        // subscriber holding no filter is delivered every event of its bus, which
+        // is what a create naming no filter configuration would have left it.
+        subscriber.filter_configuration = (!clears_filters).then_some(configuration);
+        modified = true;
+    }
+    if let Some(batch_configuration) = input.batch_configuration.clone() {
+        subscriber.batch_configuration = Some(batch_configuration);
+        modified = true;
+    }
+    if let Some(transformer) = input.transformer.clone() {
+        subscriber.transformer = Some(transformer);
+        modified = true;
+    }
+    if let Some(retry_policy) = input.retry_policy.clone() {
+        subscriber.retry_policy = Some(retry_policy);
+        modified = true;
+    }
+    if let Some(on_failure_configuration) = input.on_failure_configuration.clone() {
+        subscriber.on_failure_configuration = Some(on_failure_configuration);
+        modified = true;
+    }
+    if let Some(log_configuration) = input.log_configuration.clone() {
+        subscriber.log_configuration = Some(log_configuration);
+        modified = true;
+    }
+    if let Some(requested) = requested_state {
+        modified |= requested != subscriber.state;
+        subscriber.state = requested;
+    }
+    // `LastModifiedTime` reports a modification of the resource, so it moves for
+    // an update that carries something to apply and stands still for one that
+    // carries nothing at all.
+    if modified {
+        subscriber.last_modified_time = now;
+    }
+
+    let due = if unpausing {
+        // The unpaused subscriber is placed where `ResumePosition` says delivery
+        // resumes from, and then handed what that position owes it — under this
+        // same lock, so one event is owed to it once however many calls follow.
+        state.resume_subscriber(&input.subscriber_arn, input.resume_position.as_deref());
+        state
+            .take_due_delivery(&input.subscriber_arn)
+            .into_iter()
+            .filter(|due| !due.events.is_empty())
+            .collect()
+    } else {
+        // Nothing else makes a delivery due: a subscriber that stays STOPPED
+        // keeps its backlog, and one that was already RUNNING was handed each
+        // event as its bus accepted it.
+        Vec::new()
+    };
+
+    let stored = state
+        .subscriber(&input.subscriber_arn)
+        .expect("the subscriber updated above is in the store");
+    Ok(Applied {
+        response: updated_response(stored),
+        due,
+    })
+}
+
+/// The target configuration a subscriber invoking `target_arn` holds after an
+/// update carried `requested`.
+///
+/// `UpdateInvokeConfiguration` is `InvokeConfiguration` without its `TargetArn`,
+/// so every other member comes from the request and the target comes from the
+/// subscriber: a member the request left out of the configuration it carried is
+/// cleared, because the configuration replaces the stored one rather than being
+/// merged into it.
+fn invoked(target_arn: String, requested: &UpdateInvokeConfiguration) -> InvokeConfiguration {
+    InvokeConfiguration {
+        target_arn,
+        role_arn: requested.role_arn.clone(),
+        lambda_parameters: requested.lambda_parameters.clone(),
+        sqs_parameters: requested.sqs_parameters.clone(),
+        sns_parameters: requested.sns_parameters.clone(),
+        kinesis_parameters: requested.kinesis_parameters.clone(),
+        step_functions_parameters: requested.step_functions_parameters.clone(),
+        http_parameters: requested.http_parameters.clone(),
+        universal_target_parameters: requested.universal_target_parameters.clone(),
+        event_bus_v2_parameters: requested.event_bus_v2_parameters.clone(),
+    }
+}
+
+/// Project a stored subscriber into `UpdateSubscriberResponse`. Every member is
+/// read back out of the store — the subscriber as it stands after the change.
+fn updated_response(subscriber: &crate::state::Subscriber) -> UpdateSubscriberOutput {
+    UpdateSubscriberOutput {
+        subscriber_arn: Some(subscriber.arn.clone()),
+        name: Some(subscriber.name.clone()),
+        event_bus_arn: Some(subscriber.event_bus_arn.clone()),
+        r#type: Some(subscriber.ordering_type.clone()),
+        starting_position: Some(subscriber.starting_position.clone()),
+        point_in_time_configuration: subscriber.point_in_time_configuration.clone(),
+        state: Some(subscriber.state.wire_value().to_string()),
+        last_modified_time: Some(crate::state::to_date_time(subscriber.last_modified_time)),
     }
 }

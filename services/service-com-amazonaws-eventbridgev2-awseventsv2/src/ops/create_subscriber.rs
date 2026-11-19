@@ -315,6 +315,23 @@ fn create(
         .into());
     }
 
+    // A `Transformer` and a universal target are mutually exclusive: the one
+    // rule both the create and the update of a subscriber are held to.
+    if let Some(reason) = crate::state::transformer_fault(
+        input
+            .invoke_configuration
+            .universal_target_parameters
+            .as_ref(),
+        input.transformer.as_ref(),
+    ) {
+        return Err(CreateSubscriberErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(reason),
+            },
+        )
+        .into());
+    }
+
     // A retry carrying the same ClientToken replays the subscriber that
     // token minted — identical parameters only; different ones are the
     // mismatch the model names. The token is read off the stored subscriber, so
