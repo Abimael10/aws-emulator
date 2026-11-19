@@ -72,6 +72,10 @@ pub mod guardrail_registry;
 /// reports.
 pub mod guardrail_evaluation;
 
+/// What a guardrail's topic policy places text on one of its denied topics BY: the
+/// vocabulary each topic's own configuration is.
+pub mod guardrail_topics;
+
 /// The generation stage every inference surface answers from: the assistant text
 /// a turn serves, which says plainly that no language model ran.
 pub mod generation;

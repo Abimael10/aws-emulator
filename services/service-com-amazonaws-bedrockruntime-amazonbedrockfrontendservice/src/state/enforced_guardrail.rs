@@ -591,10 +591,10 @@ pub fn guard_converse_turn<Eng: Send + Sync + 'static>(
     };
     let texts = guarded_texts(&enforced, system, messages);
     if let Some(messaging) = enforced.input_intervention(&texts) {
-        return turn.intervened(messaging);
+        return turn.intervened(messaging, true);
     }
     if let Some(messaging) = enforced.output_intervention(&turn.text) {
-        return turn.intervened(messaging);
+        return turn.intervened(messaging, false);
     }
     turn
 }
@@ -674,16 +674,33 @@ impl ConverseTurn {
     ///
     /// A blocked turn requests no tool, reaches no generation cap and halts on
     /// no stop sequence: nothing was generated for the request at all.
+    ///
+    /// `input` says which SIDE blocked it, and the turn's token accounting follows
+    /// that: `usage` reports what the model was invoked FOR, so a turn blocked on
+    /// the INPUT side — refused before the generation stage, answering with the
+    /// operator's configured messaging rather than with anything a model produced
+    /// — reports no tokens at all, while one blocked on the output side keeps the
+    /// input it was generated for and is charged for the messaging it answers
+    /// with instead.
     #[must_use]
-    pub fn intervened(self, messaging: &str) -> Self {
+    pub fn intervened(self, messaging: &str, input: bool) -> Self {
+        let (input_tokens, output_tokens, cache) = match input {
+            true => (0, 0, None),
+            false => (
+                self.input_tokens,
+                count_text_tokens(messaging),
+                self.cache.clone(),
+            ),
+        };
         Self {
             text: messaging.to_string(),
             tool_use: None,
-            output_tokens: count_text_tokens(messaging),
+            input_tokens,
+            output_tokens,
+            cache,
             truncated: false,
             halted_at_stop_sequence: false,
             guardrail_intervened: true,
-            ..self
         }
     }
 }

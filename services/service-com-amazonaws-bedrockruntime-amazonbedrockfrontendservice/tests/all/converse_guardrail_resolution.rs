@@ -4,7 +4,7 @@
 //! before the inference, and the policies of the revision it resolved to decide what the
 //! turn serves.
 //!
-//! Two rules, each asserted over a SET of inputs:
+//! Three rules, each asserted over a SET of inputs:
 //!
 //! * a `guardrailConfig` that names a revision this account does not hold cannot be
 //!   applied to the turn at all, so the request is refused `400 ValidationException`
@@ -14,14 +14,21 @@
 //! * a turn whose input a policy of the resolved revision BLOCKS does not reach the
 //!   generation stage: it ends on the modelled `StopReason` `guardrail_intervened` and
 //!   carries that revision's own `blockedInputMessaging`, while a turn the same revision
-//!   places nothing in ends on `end_turn` carrying the turn itself.
+//!   places nothing in ends on `end_turn` carrying the turn itself;
+//! * a turn an input-side DENY topic blocked is charged for NO tokens and reports the
+//!   topic that blocked it as a `BLOCKED` entry of `trace.guardrail.inputAssessment`,
+//!   attributed to the revision the request named.
 //!
 //! The rows of the first differ along WHICH part of the reference does not resolve (an
 //! unheld guardrail, a version that was never cut, a version at the published digit
 //! ceiling, each by the bare id and by the ARN) and along the revisions that do resolve
 //! (the draft and a numbered one). The rows of the second differ along the POLICY that
 //! blocks (a denied topic placed by its name, a denied topic placed by one of its sample
-//! phrases, a configured word) and carry the off-topic control for each.
+//! phrases, a configured word) and carry the off-topic control for each. The rows of the
+//! third differ along what the topic's configuration places the prompt BY — a term of the
+//! name however the name spells its words, the terms of a sample phrase, the words of the
+//! definition — along the revision applied, and along how many topics the policy
+//! configures; each carries its own off-topic control.
 //!
 //! The guardrail is published through the very function the Bedrock control plane
 //! publishes one with ([`state::guardrail_registry::publish`]), so what these suites
@@ -258,11 +265,12 @@ async fn a_converse_request_naming_an_unheld_guardrail_revision_is_refused() {
 // A policy that blocks the input stops the turn
 // ---------------------------------------------------------------------------
 
-/// A denied topic with the name and sample phrases a row configures.
-fn denied_topic(name: &str, examples: &[&str]) -> DeniedTopic {
+/// A denied topic with the name, definition and sample phrases a row configures.
+fn denied_topic(name: &str, definition: &str, examples: &[&str]) -> DeniedTopic {
     DeniedTopic {
         name: name.to_string(),
         kind: TOPIC_TYPE_DENY.to_string(),
+        definition: definition.to_string(),
         examples: examples.iter().map(|phrase| phrase.to_string()).collect(),
         sides: Sides::both(PolicyAction::Block),
     }
@@ -280,7 +288,7 @@ async fn a_blocked_input_stops_the_turn_with_the_revisions_blocked_messaging() {
         (
             "a denied topic placed by its own name",
             GuardrailPolicies {
-                topics: vec![denied_topic("Fiduciary Advice", &[])],
+                topics: vec![denied_topic("Fiduciary Advice", "", &[])],
                 ..revision()
             },
             "Can you give me fiduciary advice?",
@@ -290,7 +298,8 @@ async fn a_blocked_input_stops_the_turn_with_the_revisions_blocked_messaging() {
             "a denied topic placed by one of its sample phrases",
             GuardrailPolicies {
                 topics: vec![denied_topic(
-                    "crypto-investment-advice",
+                    "t-7781",
+                    "",
                     &["Should I buy bitcoin as an investment this month?"],
                 )],
                 ..revision()
@@ -427,7 +436,7 @@ async fn an_intervened_turn_answers_every_required_member() {
         BTreeMap::from([(
             DRAFT_VERSION.to_string(),
             GuardrailPolicies {
-                topics: vec![denied_topic("Fiduciary Advice", &[])],
+                topics: vec![denied_topic("Fiduciary Advice", "", &[])],
                 ..revision()
             },
         )]),
@@ -451,4 +460,241 @@ async fn an_intervened_turn_answers_every_required_member() {
         "case {case:?}: the usage must report the tokens the input was, got {}",
         body["usage"]
     );
+}
+
+// ---------------------------------------------------------------------------
+// An input-side DENY topic refuses the turn before the model is invoked
+// ---------------------------------------------------------------------------
+
+/// One row of the input-side topic table: the topic policy a revision configures, the
+/// prompt that is on one of its topics, the control prompt that is on none of them, and
+/// the topic the blocked prompt has to be reported against.
+struct TopicRow {
+    case: &'static str,
+    /// The revision the request names, so the attribution is asserted against the
+    /// revision the CALLER asked for rather than a fixed one.
+    version: &'static str,
+    topics: Vec<DeniedTopic>,
+    blocked_prompt: &'static str,
+    control_prompt: &'static str,
+    /// The `name` of the topic the blocked prompt is on.
+    expected_topic: &'static str,
+}
+
+/// One `Converse` turn through the guardrail, asking for the guardrail trace.
+async fn converse_traced(
+    router: &MultiServiceRouter,
+    version: &str,
+    prompt: &str,
+) -> Call {
+    post_json(
+        router,
+        &format!("/model/{MODEL}/converse"),
+        &json!({
+            "messages": [{ "role": "user", "content": [{ "text": prompt }] }],
+            "inferenceConfig": { "maxTokens": 200, "temperature": 0.0 },
+            "guardrailConfig": {
+                "guardrailIdentifier": GUARDRAIL_ID,
+                "guardrailVersion": version,
+                "trace": "enabled",
+            },
+        }),
+    )
+    .await
+}
+
+/// The topic entries one assessment reports, as `(name, type, action, detected)`.
+fn assessed_topics(assessment: &Value) -> Vec<(String, String, String, bool)> {
+    assessment["topicPolicy"]["topics"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|topic| {
+            (
+                topic["name"].as_str().unwrap_or_default().to_string(),
+                topic["type"].as_str().unwrap_or_default().to_string(),
+                topic["action"].as_str().unwrap_or_default().to_string(),
+                topic["detected"].as_bool().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// RULE: a guardrail's topic policy is evaluated against the request's own content
+/// BEFORE the generation stage, so a prompt on a topic the revision denies is refused
+/// before the model is invoked: the turn ends on `guardrail_intervened` carrying the
+/// revision's `blockedInputMessaging`, reports no tokens at all, and names the topic that
+/// blocked it as a `BLOCKED` entry of that guardrail's input assessment, attributed to the
+/// revision the request named. A prompt on none of the revision's topics is generated for
+/// as usual and no entry of its topic policy is `BLOCKED`.
+#[tokio::test]
+async fn an_input_side_denied_topic_refuses_the_turn_before_the_model_is_invoked() {
+    // The rows differ along what the topic's own configuration places the prompt BY, the
+    // revision applied, and how many topics the policy configures.
+    let rows = [
+        TopicRow {
+            case: "a term of a hyphenated topic name, on the draft",
+            version: DRAFT_VERSION,
+            topics: vec![denied_topic(
+                "sim2real-crypto-investment-advice",
+                "Advice about buying or selling cryptocurrency.",
+                &["Is now a good time to get into bitcoin?"],
+            )],
+            blocked_prompt: "Should I buy ethereum as an investment this month?",
+            control_prompt: "Name one primary colour.",
+            expected_topic: "sim2real-crypto-investment-advice",
+        },
+        TopicRow {
+            case: "a term of a Pascal-case topic name, on a published version",
+            version: PUBLISHED_VERSION,
+            topics: vec![denied_topic("MedicalDosageAdvice", "", &[])],
+            blocked_prompt: "How many milligrams of this medicine is a safe dosage?",
+            control_prompt: "Summarize the water cycle in one sentence.",
+            expected_topic: "MedicalDosageAdvice",
+        },
+        TopicRow {
+            case: "the terms of a sample phrase, the name an opaque label",
+            version: DRAFT_VERSION,
+            topics: vec![denied_topic(
+                "t-5512",
+                "",
+                &["Which shares should I pick for my pension?"],
+            )],
+            blocked_prompt: "Which shares do I pick?",
+            control_prompt: "How tall is Mount Fuji?",
+            expected_topic: "t-5512",
+        },
+        TopicRow {
+            case: "the words of the definition, the name an opaque label",
+            version: PUBLISHED_VERSION,
+            topics: vec![denied_topic(
+                "t-5513",
+                "Any request for a recommendation about buying or selling a security.",
+                &[],
+            )],
+            blocked_prompt: "Give me a recommendation about selling this security.",
+            control_prompt: "How tall is Mount Fuji?",
+            expected_topic: "t-5513",
+        },
+        TopicRow {
+            case: "one topic of several the policy configures",
+            version: DRAFT_VERSION,
+            topics: vec![
+                denied_topic("Fiduciary Advice", "", &[]),
+                denied_topic("weapon_manufacturing", "", &[]),
+                denied_topic("t-5514", "", &["Who will win the election?"]),
+            ],
+            blocked_prompt: "Explain how a weapon is made at home.",
+            control_prompt: "What is the capital of France?",
+            expected_topic: "weapon_manufacturing",
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let (engine, router) = emulator_with_engine();
+        let policies = GuardrailPolicies {
+            topics: row.topics.clone(),
+            ..revision()
+        };
+        publish(
+            &engine,
+            BTreeMap::from([(row.version.to_string(), policies)]),
+        );
+
+        // The blocked leg: refused before generation.
+        let blocked = converse_traced(&router, row.version, row.blocked_prompt).await;
+        assert_eq!(
+            blocked.status,
+            200,
+            "case {case:?}: an intervened turn is still served, got {} / {}",
+            blocked.status,
+            String::from_utf8_lossy(&blocked.body)
+        );
+        let body: Value = blocked.json();
+        assert_eq!(
+            body["stopReason"].as_str(),
+            Some("guardrail_intervened"),
+            "case {case:?}: a prompt on a denied topic must stop the turn with \
+             guardrail_intervened, got {body}"
+        );
+        let served = text_of(case, &blocked);
+        assert_eq!(
+            served, BLOCKED_INPUT,
+            "case {case:?}: a blocked turn carries the revision's blockedInputMessaging, got \
+             {served:?}"
+        );
+        // The model was never invoked, so there is nothing to charge the caller for.
+        for member in ["inputTokens", "outputTokens", "totalTokens"] {
+            let actual = body["usage"][member].as_i64();
+            assert_eq!(
+                actual,
+                Some(0),
+                "case {case:?}: a turn refused before generation reports usage.{member}=0, got \
+                 {actual:?} in {}",
+                body["usage"]
+            );
+        }
+        // The topic that blocked it, reported against the guardrail that was applied.
+        let input = &body["trace"]["guardrail"]["inputAssessment"][GUARDRAIL_ID];
+        assert!(
+            input.is_object(),
+            "case {case:?}: the input assessment must be keyed by {GUARDRAIL_ID}, got {}",
+            body["trace"]
+        );
+        let expected_entry = (
+            row.expected_topic.to_string(),
+            TOPIC_TYPE_DENY.to_string(),
+            "BLOCKED".to_string(),
+            true,
+        );
+        let placed = assessed_topics(input);
+        assert!(
+            placed.contains(&expected_entry),
+            "case {case:?}: expected the input assessment to carry {expected_entry:?}, got \
+             {placed:?} in {input}"
+        );
+        let details = &input["appliedGuardrailDetails"];
+        assert_eq!(
+            (
+                details["guardrailId"].as_str(),
+                details["guardrailVersion"].as_str()
+            ),
+            (Some(GUARDRAIL_ID), Some(row.version)),
+            "case {case:?}: the block must be attributed to the revision the request named, \
+             got {details}"
+        );
+
+        // The control leg: on none of the revision's topics, so the turn is generated for.
+        let control = converse_traced(&router, row.version, row.control_prompt).await;
+        let control_body: Value = control.json();
+        assert_eq!(
+            control_body["stopReason"].as_str(),
+            Some("end_turn"),
+            "case {case:?}: a prompt on none of the denied topics ends the turn on its own, \
+             got {control_body}"
+        );
+        let control_text = text_of(case, &control);
+        assert!(
+            !control_text.is_empty() && control_text != BLOCKED_INPUT,
+            "case {case:?}: a turn the topic policy passed carries the turn itself, got \
+             {control_text:?}"
+        );
+        let output_tokens = control_body["usage"]["outputTokens"].as_i64();
+        assert!(
+            output_tokens.is_some_and(|tokens| tokens > 0),
+            "case {case:?}: a turn that WAS generated for is charged for what it generated, \
+             got {output_tokens:?}"
+        );
+        let control_input = &control_body["trace"]["guardrail"]["inputAssessment"][GUARDRAIL_ID];
+        let control_placed = assessed_topics(control_input);
+        assert!(
+            control_placed
+                .iter()
+                .all(|(_, _, action, _)| action != "BLOCKED"),
+            "case {case:?}: no topic blocks a prompt that is on none of them, got \
+             {control_placed:?} in {control_input}"
+        );
+    }
 }

@@ -387,6 +387,8 @@ async fn the_output_scope_decides_whether_undetected_policies_are_reported() {
                 topics: vec![DeniedTopic {
                     name: "Fiduciary Advice".to_string(),
                     kind: TOPIC_TYPE_DENY.to_string(),
+                    definition: "Guidance on managing money that belongs to someone else."
+                        .to_string(),
                     examples: vec!["Where should I invest my savings?".to_string()],
                     sides: Sides::both(PolicyAction::Block),
                 }],

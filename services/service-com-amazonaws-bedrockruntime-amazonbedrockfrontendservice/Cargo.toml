@@ -91,6 +91,13 @@ regex = "1.12"
 # prompt is counted at the granularity a model's own tokenizer counts it at instead of
 # by a character heuristic.
 tiktoken-rs = "0.12"
+# The two readings a guardrail's topic policy places text with (`state::guardrail_topics`):
+# the published English function-word list, so the words that carry no subject of their own
+# are discounted from a published list rather than from one written out here, and the
+# Snowball English stemmer, so a topic configured in one inflection of a term is placed in
+# text spelling that term in another.
+stop-words = "0.8"
+rust-stemmers = "1.2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

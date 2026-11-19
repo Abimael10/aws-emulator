@@ -82,6 +82,7 @@ fn applied_policies(revision: &GuardrailRevision) -> runtime_registry::Guardrail
                     .r#type
                     .clone()
                     .unwrap_or_else(|| runtime_registry::TOPIC_TYPE_DENY.to_string()),
+                definition: topic.definition.clone(),
                 examples: topic.examples.clone().unwrap_or_default(),
                 sides: Sides::new(
                     topic.input_action.as_deref(),

@@ -213,15 +213,17 @@ impl Sides {
 
 /// One topic a guardrail's topic policy denies.
 ///
-/// The DEFINITION a topic carries is natural language for a model to read, and no
-/// model runs in this emulator, so what is published is the topic's NAME and the
-/// sample phrases it was configured with — the two parts of a topic a recognizer can
-/// place text against (see [`super::guardrail_evaluation`]).
+/// All three parts of the topic's configuration are published, because all three are
+/// written about the one subject and all three are what a topic is placed by: no model
+/// runs in this emulator, so they are read as the VOCABULARY of that subject rather
+/// than as language to interpret (see [`super::guardrail_topics`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeniedTopic {
     pub name: String,
     /// `GuardrailTopic$type` — `DENY` for every topic a guardrail configures.
     pub kind: String,
+    /// `GuardrailTopicConfig$definition` — what the topic was described as.
+    pub definition: String,
     /// `GuardrailTopicConfig$examples` — the sample phrases of the topic.
     pub examples: Vec<String>,
     pub sides: Sides,

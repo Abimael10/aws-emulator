@@ -25,9 +25,10 @@
 //!   emulator serves Comprehend's PII family from, so the two services cannot
 //!   disagree about what a value is, and places its regular expressions with the
 //!   same linear-time engine;
-//! * the TOPIC policy places text against each denied topic's NAME and the sample
-//!   phrases it was configured with. A topic's DEFINITION is natural language for a
-//!   model to read and no model runs here, so it is not what a topic is placed by;
+//! * the TOPIC policy places text against the VOCABULARY each denied topic's own
+//!   configuration is — its name, its definition and the sample phrases it was
+//!   configured with, read as the terms they are made of rather than as language to
+//!   interpret, no model running here ([`super::guardrail_topics`]);
 //! * the CONTEXTUAL GROUNDING policy SCORES the guarded content against the grounding
 //!   source and the query the request carried ([`grounding_score`],
 //!   [`relevance_score`]).
@@ -55,6 +56,7 @@ use super::guardrail_registry::{
     self, DeniedTopic, GuardrailPolicies, PolicyAction, ResolvedGuardrail, ASSESSED_NONE,
     GROUNDING_FILTER_GROUNDING, GROUNDING_FILTER_RELEVANCE, MANAGED_WORDS_PROFANITY,
 };
+use super::guardrail_topics;
 use super::ConverseTurn;
 use crate::ops::types::{
     AppliedGuardrailDetails, ContentBlock, GuardrailAssessment, GuardrailContentBlock,
@@ -116,16 +118,6 @@ pub const GUARDRAIL_OWNERSHIP_SELF: &str = "SELF";
 /// that action; a call the guardrail only masked, or only placed detections in,
 /// blocked nothing and carries no reason at all.
 pub const ACTION_REASON_BLOCKED: &str = "Guardrail blocked.";
-
-/// How far an evaluation reads one of a topic's sample phrases in the text before the
-/// text is on that topic.
-///
-/// A sample phrase is a FORM of the topic rather than a string to find: a request
-/// phrases the same thing in its own words, so a phrase is read where the text
-/// carries this proportion of the words that phrase is made of. It is a proportion
-/// rather than an exact match so a rephrasing is still placed, and high enough that a
-/// phrase sharing only its ordinary words with the text is not.
-pub const TOPIC_PHRASE_COVERAGE: f64 = 0.8;
 
 /// The most entries of one policy an evaluation reports.
 ///
@@ -492,11 +484,10 @@ impl Finding for TopicFinding {
 
 /// Each denied topic evaluated on this side, with whether the text is on it.
 ///
-/// The text is read ONCE for the whole policy rather than once per topic: every
-/// topic NAME goes into the one word matcher both guardrail paths scan with
-/// ([`matched_words`]), and the words each piece carries are collected once and then
-/// compared with each topic's sample phrases. So the work is linear in the submitted
-/// text plus the configured topics, never their product.
+/// The text is read ONCE for the whole policy rather than once per topic
+/// ([`super::guardrail_topics::submitted_terms`]), and each topic's own vocabulary
+/// once: so the work is linear in the submitted text plus the configured topics, never
+/// their product.
 fn topic_findings(
     policies: &GuardrailPolicies,
     texts: &[String],
@@ -510,30 +501,13 @@ fn topic_findings(
     if evaluated.is_empty() {
         return Vec::new();
     }
-    let names: Vec<&str> = evaluated
-        .iter()
-        .map(|(topic, _)| topic.name.trim())
-        .filter(|name| !name.is_empty())
-        .collect();
-    // A topic's name is matched as a phrase of its own, so at most one placement per
-    // configured name is what there is to find.
-    let named: BTreeSet<String> = matched_words(&names, texts, names.len().max(1))
-        .into_iter()
-        .map(|matched| matched.to_lowercase())
-        .collect();
-    let carried: Vec<BTreeSet<String>> = texts.iter().map(|text| words(text)).collect();
+    let carried = guardrail_topics::submitted_terms(texts);
     evaluated
         .into_iter()
         .map(|(topic, action)| TopicFinding {
             name: topic.name.clone(),
             kind: topic.kind.clone(),
-            detected: named.contains(&topic.name.trim().to_lowercase())
-                || topic.examples.iter().any(|example| {
-                    let phrase = words(example);
-                    carried
-                        .iter()
-                        .any(|words| coverage(&phrase, words) >= TOPIC_PHRASE_COVERAGE)
-                }),
+            detected: guardrail_topics::on_topic(topic, &carried),
             action,
         })
         .collect()
@@ -1375,6 +1349,10 @@ pub fn converse_guardrail<Eng: Send + Sync + 'static>(
 /// ends on the guardrail's stop reason. A policy that MASKS rather than blocks leaves
 /// the turn, with the values it matched masked in the text it serves.
 ///
+/// The input side is evaluated FIRST and short-circuits the rest: a request the
+/// guardrail refuses is one the model is never invoked for, so the turn it answers is
+/// charged for no tokens and the trace reports the input assessment alone.
+///
 /// The trace comes back only where the request asked for one, and is reported under
 /// the guardrail's own id — the key a Converse trace carries its assessments under.
 ///
@@ -1404,6 +1382,26 @@ pub fn guard_turn(
         true,
         full_scope,
     );
+    // The INPUT side is evaluated BEFORE the turn is answered from the generation
+    // stage, so a request the guardrail refuses never reaches the model: the turn
+    // carries the revision's blocked input messaging, is charged for no tokens, and
+    // the trace reports the input assessment alone — nothing was generated, so there
+    // is no answer to assess and no assessed output to report.
+    if on_input.blocked {
+        let trace = traced.then(|| GuardrailTraceAssessment {
+            model_output: None,
+            input_assessment: Some(::std::collections::HashMap::from([(
+                applied.id.clone(),
+                on_input.assessment.clone(),
+            )])),
+            output_assessments: None,
+            action_reason: on_input.action_reason.clone(),
+        });
+        return (
+            turn.intervened(policies.blocked_messaging(true), true),
+            trace,
+        );
+    }
     // The OUTPUT side guards the text the turn serves, and it is that text a
     // contextual grounding filter scores: the answer against the source the request
     // carried, and against the question it asked.
@@ -1431,17 +1429,14 @@ pub fn guard_turn(
             applied.id.clone(),
             vec![on_output.assessment.clone()],
         )])),
-        action_reason: on_input
-            .action_reason
-            .clone()
-            .or_else(|| on_output.action_reason.clone()),
+        action_reason: on_output.action_reason.clone(),
     });
 
-    if on_input.blocked {
-        return (turn.intervened(policies.blocked_messaging(true)), trace);
-    }
     if on_output.blocked {
-        return (turn.intervened(policies.blocked_messaging(false)), trace);
+        return (
+            turn.intervened(policies.blocked_messaging(false), false),
+            trace,
+        );
     }
     // A policy that masks rather than blocks leaves the turn served, with the values
     // it matched masked in the text it carries.
@@ -1611,14 +1606,15 @@ mod tests {
         }
     }
 
-    /// RULE: a denied topic is placed by its own name, as a phrase, or by the sample
-    /// phrases it was configured with — and a longer word that merely contains the
-    /// name is not it.
+    /// RULE: a denied topic is placed by the vocabulary its own configuration is — a
+    /// term of its name, or the terms of a sample phrase — and a longer word that
+    /// merely contains one of those terms is not it.
     #[test]
     fn a_denied_topic_is_placed_by_its_name_or_its_examples() {
         let topic = DeniedTopic {
             name: "Fiduciary Advice".to_string(),
             kind: TOPIC_TYPE_DENY.to_string(),
+            definition: "Guidance on managing money that belongs to someone else.".to_string(),
             examples: vec!["Where should I invest my retirement savings?".to_string()],
             sides: Sides::both(PolicyAction::Block),
         };
