@@ -4,7 +4,8 @@
 //!
 //! Reports the prompt a `PromptIdentifier` names from [`crate::state`]: every member
 //! comes from the stored record, so a prompt `CreatePrompt` minted is read back as it
-//! was stored.
+//! was stored, and a numbered version is read back off the snapshot
+//! `CreatePromptVersion` cut rather than off the draft it was cut from.
 //!
 //! ## Shape of an operation
 //!
@@ -217,25 +218,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Which version is being read: `promptVersion`, which is documented "Omit this
         // field to return information about the working draft of the prompt", else the
-        // version the identifier itself qualified, else the working draft. A version the
-        // prompt does not hold — every numbered version until something cuts one from
-        // the draft — names no resource.
+        // version the identifier itself qualified, else the working draft. A numbered
+        // version is reported from the snapshot `CreatePromptVersion` cut, so a change to
+        // the draft never moves it; a version the prompt holds no cut under names no
+        // resource.
         let requested_version = input
             .prompt_version
             .as_deref()
             .or(selection.version)
             .unwrap_or(crate::state::DRAFT_VERSION);
-        if requested_version != record.version {
+        let with_variants =
+            crate::state::included_data_carries_variants(input.included_data.as_deref());
+        if requested_version == record.version {
+            return Ok(record.to_get_output(with_variants));
+        }
+        let Some(version) = state.prompt_version_of(selection.prompt_id, requested_version) else {
             return Err(GetPromptErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::prompt_version_not_found_message(Self::NAME)),
                 },
             )
             .into());
-        }
+        };
 
-        Ok(record.to_get_output(crate::state::included_data_carries_variants(
-            input.included_data.as_deref(),
-        )))
+        Ok(version.to_get_output(with_variants))
     }
 }

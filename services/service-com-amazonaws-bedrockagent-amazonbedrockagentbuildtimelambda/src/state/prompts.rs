@@ -18,7 +18,9 @@
 
 use super::*;
 
-use crate::ops::types::{CreatePromptOutput, GetPromptOutput, PromptVariant};
+use crate::ops::types::{
+    CreatePromptOutput, CreatePromptVersionOutput, GetPromptOutput, PromptVariant,
+};
 
 /// The most prompts this store holds; past it `CreatePrompt` answers the modelled
 /// `ServiceQuotaExceededException` instead of growing.
@@ -52,6 +54,10 @@ pub struct PromptRecord {
     pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
+    /// The highest number any version cut from this prompt has ever carried: a
+    /// high-water mark, so the next cut takes the next number even if the version that
+    /// held the last one has since been deleted. Zero until something cuts one.
+    pub versions_cut: u32,
 }
 
 impl PromptRecord {
@@ -88,6 +94,135 @@ impl PromptRecord {
             updated_at: to_date_time(self.updated_at),
         }
     }
+}
+
+/// The most numbered versions this store holds for one prompt; past it
+/// `CreatePromptVersion` answers the modelled `ServiceQuotaExceededException` instead of
+/// growing.
+///
+/// Amazon Bedrock publishes an adjustable quota on versions per prompt, and this emulator
+/// models neither Service Quotas nor an account's adjustments — so this is the emulator's
+/// OWN bound on the store, set far above any workflow an emulator serves, and it is what
+/// stops one prompt's version state growing without end.
+pub const PROMPT_VERSION_QUOTA: usize = 1_000;
+
+/// One stored numbered version of a prompt: the single source of truth for every
+/// operation that reports a version cut from the prompt's working draft.
+///
+/// A numbered version is a STATIC SNAPSHOT of that draft at the instant
+/// `CreatePromptVersion` cut it (the operation is documented "Creates a static snapshot
+/// of your prompt that can be deployed to production"), so the members that make up the
+/// snapshot are stored here rather than read back off the prompt: a later change to the
+/// draft moves the draft alone.
+///
+/// The version number is held as the integer it counts rather than as the wire string, so
+/// one prompt's versions order by the sequence they were cut in
+/// (`CreatePromptVersion$version` is documented "Versions are numbered incrementally,
+/// starting from 1") instead of lexically, which would put `10` before `9`. The modelled
+/// `Version` token is that integer rendered.
+#[derive(Debug, Clone)]
+pub struct PromptVersionRecord {
+    /// The prompt this version was cut from.
+    pub prompt_id: String,
+    /// The ARN of this VERSION, as the modelled `PromptArn` spells a qualified one
+    /// (`…:prompt/<promptId>:<version>`).
+    pub arn: String,
+    pub version: u32,
+    /// The name the prompt carried when this version was cut.
+    pub name: String,
+    /// The description of the version: the one the request gave, or the prompt's own when
+    /// it gave none.
+    pub description: Option<String>,
+    pub customer_encryption_key_arn: Option<String>,
+    pub default_variant: Option<String>,
+    /// The variants the prompt carried when this version was cut, exactly as the draft
+    /// held them.
+    pub variants: Option<Vec<PromptVariant>>,
+    /// The tags the cut attached to this version. A version is addressed by its own
+    /// qualified ARN, so its tags are its own and not the draft's.
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl PromptVersionRecord {
+    /// A version cut from `prompt` as version `version` at `now`: the snapshot
+    /// `CreatePromptVersion` stores.
+    ///
+    /// `description` is the request's, which the operation documents as "A description for
+    /// the version of the prompt"; a request that gives none leaves the version carrying
+    /// the prompt's own description, as the rest of the snapshot does.
+    ///
+    /// A version is a new, immutable resource minted by this call, so both of its
+    /// timestamps are the instant it was cut: `createdAt` is when this version came into
+    /// being, and nothing can update it afterwards.
+    pub fn snapshot_of(
+        prompt: &PromptRecord,
+        version: u32,
+        description: Option<String>,
+        tags: HashMap<String, String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            prompt_id: prompt.prompt_id.clone(),
+            arn: prompt_version_arn(&prompt.arn, version),
+            version,
+            name: prompt.name.clone(),
+            description: description.or_else(|| prompt.description.clone()),
+            customer_encryption_key_arn: prompt.customer_encryption_key_arn.clone(),
+            default_variant: prompt.default_variant.clone(),
+            variants: prompt.variants.clone(),
+            tags,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// This record as the `CreatePromptVersion` response: every member comes from the
+    /// snapshot just stored, never from the request being served.
+    pub fn to_create_output(&self) -> CreatePromptVersionOutput {
+        CreatePromptVersionOutput {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            customer_encryption_key_arn: self.customer_encryption_key_arn.clone(),
+            default_variant: self.default_variant.clone(),
+            variants: self.variants.clone(),
+            id: self.prompt_id.clone(),
+            arn: self.arn.clone(),
+            version: self.version.to_string(),
+            created_at: to_date_time(self.created_at),
+            updated_at: to_date_time(self.updated_at),
+        }
+    }
+
+    /// This record as the `GetPrompt` response for the version it is: the snapshot the
+    /// version was cut as, reported from the store rather than read back off the prompt,
+    /// so a later change to the draft never moves what a numbered version reports.
+    ///
+    /// `with_variants` is false for a metadata-only read, which drops the variants and
+    /// nothing else.
+    pub fn to_get_output(&self, with_variants: bool) -> GetPromptOutput {
+        GetPromptOutput {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            customer_encryption_key_arn: self.customer_encryption_key_arn.clone(),
+            default_variant: self.default_variant.clone(),
+            variants: with_variants.then(|| self.variants.clone()).flatten(),
+            id: self.prompt_id.clone(),
+            arn: self.arn.clone(),
+            version: self.version.to_string(),
+            created_at: to_date_time(self.created_at),
+            updated_at: to_date_time(self.updated_at),
+        }
+    }
+}
+
+/// The ARN of one numbered version of the prompt `prompt_arn` names: the prompt's own ARN
+/// qualified with the version, which is the form the modelled `PromptArn` admits past the
+/// prompt id (`…:prompt/<promptId>(?::[0-9]{1,5})?`) and the one a
+/// `PromptIdentifier` carrying a version is written in.
+pub fn prompt_version_arn(prompt_arn: &str, version: u32) -> String {
+    format!("{prompt_arn}:{version}")
 }
 
 /// The resource-type field a prompt's ARN carries, as the modelled `PromptArn` spells
@@ -248,5 +383,37 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             }
         }
         None
+    }
+
+    /// The numbered version the modelled `Version` token `prompt_version` names on this
+    /// prompt, or `None` when the prompt holds no version cut under that number.
+    ///
+    /// A numbered version is identified by the pair, so one prompt never reports another
+    /// prompt's version.
+    pub fn prompt_version_of(
+        &self,
+        prompt_id: &str,
+        prompt_version: &str,
+    ) -> Option<&PromptVersionRecord> {
+        let version = numerical_version(prompt_version)?;
+        self.prompt_versions.get(&(prompt_id.to_string(), version))
+    }
+
+    /// The numbered versions this prompt has been cut into.
+    pub fn prompt_version_count(&self, prompt_id: &str) -> usize {
+        self.prompt_versions
+            .values()
+            .filter(|record| record.prompt_id == prompt_id)
+            .count()
+    }
+
+    /// The number `CreatePromptVersion` cuts this prompt's next version as: one past the
+    /// highest number the prompt has ever reached ([`PromptRecord::versions_cut`]), so a
+    /// number a deleted version held is never handed out again, and versions are numbered
+    /// incrementally from 1.
+    pub fn next_prompt_version(&self, prompt_id: &str) -> u32 {
+        self.prompts
+            .get(prompt_id)
+            .map_or(1, |prompt| prompt.versions_cut.saturating_add(1))
     }
 }

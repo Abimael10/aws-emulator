@@ -140,7 +140,11 @@
 //! record -> wire projections ([`PromptRecord::to_create_output`] /
 //! [`PromptRecord::to_get_output`]) and the one resolution of a
 //! `PromptIdentifier`. A prompt's working draft IS the stored record, the way a
-//! flow's DRAFT version is the stored flow.
+//! flow's DRAFT version is the stored flow; the static snapshots
+//! `CreatePromptVersion` cuts from that draft are held beside it in the
+//! [`prompt_versions`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::prompt_versions)
+//! map, keyed by the prompt and the version number, so a change to the draft
+//! never moves what a numbered version reports.
 //!
 //! Whether a NEW agent may be minted at all is the one thing about the agent
 //! surface that is not a property of a record in the
@@ -2923,6 +2927,17 @@ pub struct ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// `clientToken` -> `promptId`, so a retried `CreatePrompt` carrying the same
     /// `@idempotencyToken` returns the prompt it already created.
     pub prompt_client_tokens: HashMap<String, String>,
+    /// Every numbered prompt version that exists, keyed by the `promptId` it was cut
+    /// from and its version number. The pair is the version's identity, so one prompt
+    /// never reports another prompt's versions. The prompt's DRAFT version is NOT here:
+    /// it is the prompt record itself.
+    pub prompt_versions: HashMap<(String, u32), PromptVersionRecord>,
+    /// `(promptId, clientToken)` -> the version number that request cut, so a retried
+    /// `CreatePromptVersion` carrying the same `@idempotencyToken` reports the version it
+    /// already cut rather than cutting a second one. The key carries the prompt the
+    /// replay is read at, so one token reused for another prompt cannot displace the
+    /// version it already names.
+    pub prompt_version_client_tokens: HashMap<(String, String), u32>,
     /// Feeds id minting; never returned to a caller.
     id_sequence: u64,
 }

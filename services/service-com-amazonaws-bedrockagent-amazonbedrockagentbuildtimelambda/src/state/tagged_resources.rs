@@ -41,8 +41,9 @@ pub enum TaggableResource {
     /// `flow/<flowId>/alias/<flowAliasId>` — an alias belongs to its flow, which is how
     /// the modelled `FlowAliasArn` spells it.
     FlowAlias(String, String),
-    /// `prompt/<promptId>`, with the version the identifier may carry after a `:`.
-    Prompt(String),
+    /// `prompt/<promptId>`, with the numbered version the ARN may qualify it with after
+    /// a `:`; `None` names the prompt itself, whose working draft the record holds.
+    Prompt(String, Option<u32>),
     /// `retrieval-instruction/<retrievalInstructionId>`.
     RetrievalInstruction(String),
 }
@@ -97,14 +98,15 @@ pub fn taggable_resource(arn: &str) -> Option<TaggableResource> {
         (FLOW_TYPE, [flow_id, FLOW_ALIAS_SEGMENT, alias_id]) => {
             TaggableResource::FlowAlias((*flow_id).to_string(), (*alias_id).to_string())
         }
-        // A prompt ARN may carry the version after its id (`prompt/<id>:<version>`), and
-        // the prompt the tags belong to is the one that id names.
-        (PROMPT_TYPE, [prompt_id]) => TaggableResource::Prompt(
-            prompt_id
-                .split_once(':')
-                .map_or(*prompt_id, |(id, _version)| id)
-                .to_string(),
-        ),
+        // A prompt ARN may carry the version after its id (`prompt/<id>:<version>`),
+        // which addresses the numbered version rather than the prompt's working draft:
+        // a version is a resource of its own, with its own tags.
+        (PROMPT_TYPE, [prompt_id]) => match prompt_id.split_once(':') {
+            None => TaggableResource::Prompt((*prompt_id).to_string(), None),
+            Some((prompt_id, version)) => {
+                TaggableResource::Prompt(prompt_id.to_string(), Some(numerical_version(version)?))
+            }
+        },
         (RETRIEVAL_INSTRUCTION_TYPE, [instruction_id]) => {
             TaggableResource::RetrievalInstruction((*instruction_id).to_string())
         }
@@ -126,7 +128,8 @@ impl TaggableResource {
             Self::KnowledgeBase(_) => "KnowledgeBase",
             Self::Flow(_) => "Flow",
             Self::FlowAlias(_, _) => "FlowAlias",
-            Self::Prompt(_) => "Prompt",
+            Self::Prompt(_, None) => "Prompt",
+            Self::Prompt(_, Some(_)) => "PromptVersion",
             Self::RetrievalInstruction(_) => "RetrievalInstruction",
         }
     }
@@ -138,7 +141,7 @@ impl TaggableResource {
             Self::Agent(id)
             | Self::KnowledgeBase(id)
             | Self::Flow(id)
-            | Self::Prompt(id)
+            | Self::Prompt(id, _)
             | Self::RetrievalInstruction(id) => vec![id.as_str()],
             Self::AgentAlias(first, second) | Self::FlowAlias(first, second) => {
                 vec![first.as_str(), second.as_str()]
@@ -202,9 +205,13 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
                 .get(knowledge_base_id)
                 .map(|record| &record.tags),
             TaggableResource::Flow(flow_id) => self.flows.get(flow_id).map(|record| &record.tags),
-            TaggableResource::Prompt(prompt_id) => {
+            TaggableResource::Prompt(prompt_id, None) => {
                 self.prompts.get(prompt_id).map(|record| &record.tags)
             }
+            TaggableResource::Prompt(prompt_id, Some(version)) => self
+                .prompt_versions
+                .get(&(prompt_id.clone(), *version))
+                .map(|record| &record.tags),
             TaggableResource::FlowAlias(flow_id, alias_id) => self
                 .flow_aliases
                 .get(&(flow_id.clone(), alias_id.clone()))
@@ -234,9 +241,13 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             TaggableResource::Flow(flow_id) => {
                 self.flows.get_mut(flow_id).map(|record| &mut record.tags)
             }
-            TaggableResource::Prompt(prompt_id) => self
+            TaggableResource::Prompt(prompt_id, None) => self
                 .prompts
                 .get_mut(prompt_id)
+                .map(|record| &mut record.tags),
+            TaggableResource::Prompt(prompt_id, Some(version)) => self
+                .prompt_versions
+                .get_mut(&(prompt_id.clone(), *version))
                 .map(|record| &mut record.tags),
             TaggableResource::FlowAlias(flow_id, alias_id) => self
                 .flow_aliases

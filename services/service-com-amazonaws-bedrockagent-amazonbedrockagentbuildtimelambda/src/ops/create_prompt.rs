@@ -272,6 +272,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default(),
             created_at: now,
             updated_at: now,
+            // Nothing has been cut from this draft yet, so the first version
+            // `CreatePromptVersion` cuts from it is numbered 1.
+            versions_cut: 0,
         };
 
         let output = record.to_create_output();

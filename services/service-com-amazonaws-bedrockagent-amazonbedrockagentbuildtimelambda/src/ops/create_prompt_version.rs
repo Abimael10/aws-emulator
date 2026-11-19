@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePromptVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePromptVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePromptVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cuts a static snapshot of a prompt's working draft and STORES it in
+//! [`crate::state`]: the response is projected from the stored snapshot, so a following
+//! `GetPrompt` at that version reports the same values however the draft moves on.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +181,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePromptVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePromptVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePromptVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The modelled `PromptIdentifier` admits a prompt ARN — optionally qualified with
+        // a version — or a bare prompt id, and nothing else. The boundary validator lets
+        // other values through, because the pattern's top-level alternation leaves its
+        // first branch anchored only at the start, so an identifier of neither form is
+        // refused here as the bad request it is rather than reported as a missing prompt.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePromptVersion"))
+        // A version a qualified identifier carries selects nothing here: a version is a
+        // snapshot of the prompt's WORKING DRAFT, so a cut is always taken from the draft
+        // of the prompt the identifier names.
+        let Some(selection) = crate::state::prompt_from_identifier(&input.prompt_identifier)
+        else {
+            return Err(CreatePromptVersionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::prompt_identifier_pattern_message(
+                        &input.prompt_identifier,
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        };
+        let prompt_id = selection.prompt_id.to_string();
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        // `clientToken` is an @idempotencyToken: a repeat of the same request reports the
+        // version it already cut rather than cutting a second one.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| {
+                state
+                    .prompt_version_client_tokens
+                    .get(&(prompt_id.clone(), token.to_string()))
+                    .copied()
+            })
+            .and_then(|version| state.prompt_versions.get(&(prompt_id.clone(), version)))
+        {
+            return Ok(existing.to_create_output());
+        }
+
+        // The version number is this prompt's next, and the quota is this prompt's: both
+        // are read before the snapshot so the refusals below name the prompt the request
+        // addressed.
+        let version = state.next_prompt_version(&prompt_id);
+        let version_count = state.prompt_version_count(&prompt_id);
+
+        let Some(prompt) = state.prompts.get(&prompt_id) else {
+            return Err(CreatePromptVersionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::prompt_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        };
+
+        // Two bounds stop one prompt's version state growing without end, and
+        // `ServiceQuotaExceededException` is the modelled refusal for either: the store's
+        // own bound on the versions one prompt holds, and the model's — a version past the
+        // widest the modelled `Version` token carries could not be reported on the wire at
+        // all. Each names the bound it hit. Both are checked AFTER the idempotency replay
+        // above, so a retry of an accepted cut is still served.
+        let exceeded = if version_count >= crate::state::PROMPT_VERSION_QUOTA {
+            Some(format!(
+                "this prompt already holds the maximum of {} versions",
+                crate::state::PROMPT_VERSION_QUOTA
+            ))
+        } else if version > crate::state::MAX_NUMERICAL_VERSION {
+            Some(format!(
+                "this prompt has already been cut at version {}, the highest a prompt \
+                 version can be numbered",
+                crate::state::MAX_NUMERICAL_VERSION
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = exceeded {
+            return Err(
+                CreatePromptVersionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A version is a STATIC SNAPSHOT of the draft it is cut from, taken now: the name,
+        // description, encryption key, default variant and variants the prompt holds at
+        // this instant, under the next version number. A later change to the draft moves
+        // the draft alone. The tags are the request's: the version is addressed by its own
+        // qualified ARN, so the tags it carries are its own.
+        let record = crate::state::PromptVersionRecord::snapshot_of(
+            prompt,
+            version,
+            input.description,
+            input.tags.unwrap_or_default(),
+            now,
+        );
+        let output = record.to_create_output();
+        if let Some(token) = input.client_token {
+            state
+                .prompt_version_client_tokens
+                .insert((prompt_id.clone(), token), version);
+        }
+        state
+            .prompt_versions
+            .insert((prompt_id.clone(), version), record);
+        // The prompt has now been cut at this version, and numbering never goes back: the
+        // next cut takes the next number even if this version is deleted.
+        if let Some(prompt) = state.prompts.get_mut(&prompt_id) {
+            prompt.versions_cut = version;
+        }
+
+        Ok(output)
     }
 }
