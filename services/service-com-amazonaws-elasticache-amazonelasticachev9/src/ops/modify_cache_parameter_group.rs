@@ -229,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let held = group.parameter_values.clone();
         // A family's own default group is the service's, not the customer's: its
         // values ARE the engine defaults, so no parameter of it may be set.
-        if name.starts_with(crate::state::DEFAULT_PARAMETER_GROUP_PREFIX) {
+        if group.is_service_provided() {
             return Err(invalid_parameter_value(
                 crate::state::DEFAULT_PARAMETER_GROUP_IMMUTABLE.to_string(),
             ));

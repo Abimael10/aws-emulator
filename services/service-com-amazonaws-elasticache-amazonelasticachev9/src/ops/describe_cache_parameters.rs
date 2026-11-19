@@ -282,8 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // applied to the source the GROUP reports it under rather than to the
         // catalog row — in both lists.
         let selected = |parameter: &crate::state::ParameterRecord| {
-            let set_value = group.set_value(&parameter.name);
-            source_filter.is_none_or(|source| source == parameter.source_in_group(set_value))
+            source_filter.is_none_or(|source| source == parameter.source_in_group(group))
         };
         let page_node_type_specific: Vec<CacheNodeTypeSpecificParameter> = parameters
             .values()
@@ -308,7 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 marker = Some(crate::state::encode_marker(&marker_key(&group.name, key)));
                 break;
             }
-            page_plain.push(parameter.to_modeled_in_group(group.set_value(&parameter.name)));
+            page_plain.push(parameter.to_modeled_in_group(group));
         }
 
         Ok(DescribeCacheParametersOutput {

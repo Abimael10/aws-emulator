@@ -262,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // back to one. Only a name the identifier rule above admits reaches
         // here, so this is the refusal of a legal identifier that falls in the
         // reserved namespace.
-        if name.starts_with(crate::state::DEFAULT_PARAMETER_GROUP_PREFIX) {
+        if group.is_service_provided() {
             return Err(invalid_parameter_value(
                 crate::state::DEFAULT_PARAMETER_GROUP_IMMUTABLE.to_string(),
             ));

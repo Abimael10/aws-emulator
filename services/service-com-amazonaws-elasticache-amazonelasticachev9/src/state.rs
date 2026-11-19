@@ -1177,6 +1177,19 @@ impl CacheParameterGroupRecord {
         self.parameter_values.get(name).map(String::as_str)
     }
 
+    /// True when this group is one the SERVICE provides rather than one a
+    /// customer created: a family's default group, whose name carries the
+    /// reserved [`DEFAULT_PARAMETER_GROUP_PREFIX`].
+    ///
+    /// Such a group is the service's own ("Cannot modify a default parameter
+    /// group"), so nothing on it can be a customer's: it is what every
+    /// operation that writes a parameter value refuses, and what decides the
+    /// `Parameter$Source` a value it holds is reported under
+    /// ([`ParameterRecord::source_in_group`]).
+    pub fn is_service_provided(&self) -> bool {
+        self.name.starts_with(DEFAULT_PARAMETER_GROUP_PREFIX)
+    }
+
     /// True when this group turns cluster mode ON: the value it holds for
     /// [`CLUSTER_ENABLED_PARAMETER`] is [`CLUSTER_ENABLED_ON`].
     ///

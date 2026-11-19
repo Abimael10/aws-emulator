@@ -347,9 +347,10 @@ async fn every_cluster_capable_family_publishes_its_cluster_mode_on_default_grou
 
         // The one value the two groups differ by, read back through the
         // parameter reader: cluster mode is ON in the cluster-mode-on group and
-        // OFF in the plain default. The parameter is one the engine fixes, so
-        // either way it is reported as the SERVICE's value rather than a
-        // customer's.
+        // OFF in the plain default. Either way the value is one the SERVICE put
+        // on a group it provides, so it is reported as the service's rather than
+        // a customer's — while the catalog row stays what it publishes for every
+        // group, a parameter a customer may set on a group of their own.
         for (group, expected) in [
             (&cluster_on, state::CLUSTER_ENABLED_ON),
             (&plain, "no"),
@@ -366,13 +367,13 @@ async fn every_cluster_capable_family_publishes_its_cluster_mode_on_default_grou
             assert_eq!(
                 parameter.field("Source"),
                 Some(state::PARAMETER_SOURCE_SYSTEM),
-                "case {case}: a parameter the engine fixes is the service's value, got {:?}",
+                "case {case}: a value on a group the service provides is the service's, got {:?}",
                 parameter.field("Source")
             );
             assert_eq!(
                 parameter.field("IsModifiable"),
-                Some("false"),
-                "case {case}: cluster mode is not a parameter a customer may set, got {:?}",
+                Some("true"),
+                "case {case}: the published catalog marks cluster mode modifiable, got {:?}",
                 parameter.field("IsModifiable")
             );
         }

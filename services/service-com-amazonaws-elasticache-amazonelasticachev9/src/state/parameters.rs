@@ -460,7 +460,11 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         "Whether cluster mode is enabled for the cluster.",
         "string",
         "yes,no",
-        false,
+        // The published table marks the cluster-mode flag modifiable, applied
+        // at the next reboot: a customer turns cluster mode on by setting it on
+        // a group of their own, which is how a group that runs cluster mode
+        // comes to exist beside the service's own cluster-mode-on default.
+        true,
         "3.2.4",
         CHANGE_TYPE_REQUIRES_REBOOT,
         false,
@@ -1345,29 +1349,31 @@ impl ParameterRecord {
     }
 
     /// The `Parameter$Source` a group reporting this parameter answers under:
-    /// the customer's when the group holds a value for it, the service's
-    /// otherwise; see [`CacheParameterGroupRecord::parameter_values`].
+    /// the customer's when the group holds a value the customer set, the
+    /// service's otherwise; see [`CacheParameterGroupRecord::parameter_values`].
     ///
-    /// A parameter a customer cannot set is never the customer's, whatever value
-    /// the group holds for it: a parameter whose value is per cache node type
-    /// takes the node's own capacity, and one the engine fixes
-    /// (`IsModifiable: false`) can only carry a value the SERVICE put there —
-    /// the cluster-mode flag of a cluster-mode-on default group, say.
-    pub fn source_in_group(&self, set_value: Option<&str>) -> &'static str {
-        if set_value.is_some() && !self.is_node_type_specific() && self.is_modifiable {
+    /// A value a group holds is the CUSTOMER's exactly when a customer could
+    /// have put it there. Every group the SERVICE provides is immutable
+    /// (`ModifyCacheParameterGroup` and `ResetCacheParameterGroup` refuse one),
+    /// so the values such a group differs from its family's engine defaults by
+    /// — the cluster-mode flag of a cluster-mode-on default group, say — are the
+    /// service's own, whatever the catalog says about modifying that parameter
+    /// on a group of one's own.
+    pub fn source_in_group(&self, group: &CacheParameterGroupRecord) -> &'static str {
+        if group.set_value(&self.name).is_some() && !group.is_service_provided() {
             PARAMETER_SOURCE_USER
         } else {
             PARAMETER_SOURCE_SYSTEM
         }
     }
 
-    /// This record as the modelled `Parameter` of a group that holds
-    /// `set_value` for it: the value the group was given, reported as the
-    /// customer's, or the engine's own default reported as the service's.
-    pub fn to_modeled_in_group(&self, set_value: Option<&str>) -> Parameter {
+    /// This record as the modelled `Parameter` of `group`: the value the group
+    /// was given, reported under the source [`Self::source_in_group`] gives it,
+    /// or the engine's own default while the group holds none.
+    pub fn to_modeled_in_group(&self, group: &CacheParameterGroupRecord) -> Parameter {
         let mut parameter = self.to_modeled();
-        parameter.source = Some(self.source_in_group(set_value).to_string());
-        if let Some(value) = set_value {
+        parameter.source = Some(self.source_in_group(group).to_string());
+        if let Some(value) = group.set_value(&self.name) {
             parameter.parameter_value = Some(value.to_string());
         }
         parameter
