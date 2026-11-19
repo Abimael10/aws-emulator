@@ -23,7 +23,9 @@
 //! The rows span what the rule generalises over rather than one recorded request: the
 //! FORM the unresolvable identifier takes (a key ARN, a bare key id, a multi-Region
 //! key id, an alias, a value that is no key identifier at all), the member the value
-//! travels in, the KIND of key failure, and the OPERATION that names the key
+//! travels in, whether the call carries a value at all — the key a request names is
+//! resolved for its own sake, not only to seal something — the key the secret is
+//! already on, the KIND of key failure, and the OPERATION that names the key
 //! (`CreateSecret`, `UpdateSecret`).
 //!
 //! KMS is mounted beside Secrets Manager on ONE engine, so every key below is a real
@@ -503,5 +505,186 @@ async fn an_update_naming_a_key_that_resolves_to_nothing_is_an_invalid_parameter
             "case {case:?}: a refused update left the secret on the key it refused, got \
              {described}"
         );
+    }
+}
+
+/// The key a request NAMES is resolved for its own sake, so a call that carries no
+/// value — and therefore seals nothing — is refused for an identifier that names no
+/// key just the same.
+#[tokio::test]
+async fn a_create_that_stores_no_value_still_resolves_the_key_it_names() {
+    for (index, key) in unresolvable_keys().iter().enumerate() {
+        let emulator = Emulator::new();
+        let case = format!("a valueless CreateSecret naming {}", key.case);
+        let name = format!("valueless-unresolvable-{index}");
+
+        let (code, message) = emulator
+            .sm_err(
+                "CreateSecret",
+                &json!({"Name": &name, "KmsKeyId": &key.identifier}),
+                &case,
+            )
+            .await;
+        assert_eq!(
+            code, "InvalidParameterException",
+            "case {case:?}: expected InvalidParameterException, got {code} with {message:?}"
+        );
+        assert_relays_kms(
+            &message,
+            INVALID_KEY_SENTENCE,
+            KEY_NOT_FOUND_CODE,
+            &key.kms_phrase,
+            &case,
+        );
+        assert_no_secret(&emulator, &name, &case).await;
+
+        // The refusal is about the identifier and nothing else: the same valueless
+        // create under a key that EXISTS is stored, on that key and with no version.
+        let prepared_case = format!("{case}, once a key exists");
+        let (key_arn, _) = emulator.create_key(&prepared_case).await;
+        emulator
+            .sm_ok(
+                "CreateSecret",
+                &json!({"Name": &name, "KmsKeyId": &key_arn}),
+                &prepared_case,
+            )
+            .await;
+        let described = emulator
+            .sm_ok("DescribeSecret", &json!({"SecretId": &name}), &prepared_case)
+            .await;
+        assert_eq!(
+            described["KmsKeyId"].as_str(),
+            Some(key_arn.as_str()),
+            "case {prepared_case:?}: expected the secret on the key it named, got {described}"
+        );
+        assert_eq!(
+            version_count(&emulator, &name, &prepared_case).await,
+            0,
+            "case {prepared_case:?}: a create carrying no value stored a version"
+        );
+    }
+}
+
+/// The mirror for `UpdateSecret`: an update that stores no value still points the
+/// secret at the key it names, so that key is resolved before anything changes — and
+/// a refused one leaves the secret on the key it was already on, whichever key that
+/// was, while an update naming no key at all is unaffected.
+#[tokio::test]
+async fn an_update_that_stores_no_value_still_resolves_the_key_it_names() {
+    let stored = ValueCase::string("the stored value", "v1");
+    // The two kinds of key a secret can already be on: the Amazon Web Services managed
+    // key, which a create names by leaving `KmsKeyId` out, and a customer managed key.
+    for (held_case, on_customer_key) in [
+        ("a secret on the service-managed key", false),
+        ("a secret on a customer managed key", true),
+    ] {
+        for (index, key) in unresolvable_keys().iter().enumerate() {
+            let emulator = Emulator::new();
+            let case = format!("{held_case}, a valueless UpdateSecret naming {}", key.case);
+            let name = format!("valueless-update-unresolvable-{index}");
+            let held_key = if on_customer_key {
+                let (key_arn, _) = emulator.create_key(&case).await;
+                Some(key_arn)
+            } else {
+                None
+            };
+            emulator
+                .sm_ok(
+                    "CreateSecret",
+                    &create_body(&name, held_key.as_deref(), &stored),
+                    &case,
+                )
+                .await;
+            let before = version_count(&emulator, &name, &case).await;
+
+            let (code, message) = emulator
+                .sm_err(
+                    "UpdateSecret",
+                    &json!({"SecretId": &name, "KmsKeyId": &key.identifier}),
+                    &case,
+                )
+                .await;
+            assert_eq!(
+                code, "InvalidParameterException",
+                "case {case:?}: expected InvalidParameterException, got {code} with {message:?}"
+            );
+            assert_relays_kms(
+                &message,
+                INVALID_KEY_SENTENCE,
+                KEY_NOT_FOUND_CODE,
+                &key.kms_phrase,
+                &case,
+            );
+
+            // Nothing about the secret moved: the key it was on, its versions and its
+            // value are what they were.
+            let described = emulator
+                .sm_ok("DescribeSecret", &json!({"SecretId": &name}), &case)
+                .await;
+            assert_eq!(
+                described["KmsKeyId"].as_str(),
+                held_key.as_deref(),
+                "case {case:?}: expected the secret still on the key it was created \
+                 under, got {described}"
+            );
+            assert_eq!(
+                version_count(&emulator, &name, &case).await,
+                before,
+                "case {case:?}: a refused update changed the secret's versions"
+            );
+            let read = emulator
+                .sm_ok("GetSecretValue", &json!({"SecretId": &name}), &case)
+                .await;
+            stored.assert_round_trip(&read, &case);
+
+            // An update that names no key is not about a key at all, so it is served.
+            let metadata_case = format!("{case}, then a metadata-only update");
+            emulator
+                .sm_ok(
+                    "UpdateSecret",
+                    &json!({"SecretId": &name, "Description": "still updatable"}),
+                    &metadata_case,
+                )
+                .await;
+            let described = emulator
+                .sm_ok("DescribeSecret", &json!({"SecretId": &name}), &metadata_case)
+                .await;
+            assert_eq!(
+                described["Description"].as_str(),
+                Some("still updatable"),
+                "case {metadata_case:?}: expected the metadata update to be applied, got \
+                 {described}"
+            );
+            assert_eq!(
+                described["KmsKeyId"].as_str(),
+                held_key.as_deref(),
+                "case {metadata_case:?}: an update naming no key moved the secret's key, got \
+                 {described}"
+            );
+
+            // And the same valueless update onto a key that EXISTS is applied.
+            let prepared_case = format!("{case}, then a key that exists");
+            let (key_arn, _) = emulator.create_key(&prepared_case).await;
+            emulator
+                .sm_ok(
+                    "UpdateSecret",
+                    &json!({"SecretId": &name, "KmsKeyId": &key_arn}),
+                    &prepared_case,
+                )
+                .await;
+            let described = emulator
+                .sm_ok("DescribeSecret", &json!({"SecretId": &name}), &prepared_case)
+                .await;
+            assert_eq!(
+                described["KmsKeyId"].as_str(),
+                Some(key_arn.as_str()),
+                "case {prepared_case:?}: expected the secret on the key the update named, got \
+                 {described}"
+            );
+            let read = emulator
+                .sm_ok("GetSecretValue", &json!({"SecretId": &name}), &prepared_case)
+                .await;
+            stored.assert_round_trip(&read, &prepared_case);
+        }
     }
 }

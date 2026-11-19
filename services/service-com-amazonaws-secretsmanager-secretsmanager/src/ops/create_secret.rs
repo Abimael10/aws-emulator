@@ -527,6 +527,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "The ARN, key ID, or alias of the KMS key that Secrets Manager uses to
+        // encrypt the secret value in the secret." (`CreateSecretRequest$KmsKeyId`,
+        // this service's Smithy model.) The key the secret is to be created under is
+        // resolved through KMS before the secret is stored, for its own sake rather
+        // than only to encrypt something right now: an identifier naming no key names
+        // nothing this service could ever encrypt a version of this secret under, so
+        // the create is refused for the value it carried and no secret is stored —
+        // including for a create that stores no initial value and so seals nothing.
+        if let Some(refusal) = crate::state::envelope::unresolvable_key_refusal(
+            ctx,
+            &region,
+            input.kms_key_id.as_deref(),
+        )
+        .await
+        {
+            return Err(encryption_failure(refusal));
+        }
+
         // The initial value is stored under the key this secret names, so storing
         // it means encrypting it under that key: a key that cannot seal it refuses
         // this create, under the class the kind of key failure calls for (see

@@ -348,6 +348,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (target, staged)
         };
 
+        // "The ARN, key ID, or alias of the KMS key that Secrets Manager uses to
+        // encrypt new secret versions as well as any existing versions with the
+        // staging labels AWSCURRENT, AWSPENDING, or AWSPREVIOUS."
+        // (`UpdateSecretRequest$KmsKeyId`, this service's Smithy model.) The key this
+        // call would point the secret at is resolved through KMS before anything about
+        // the secret changes, for its own sake rather than only to encrypt something
+        // right now: an identifier naming no key names nothing this service could ever
+        // encrypt a version of this secret under, so the update is refused for the
+        // value it carried and the secret keeps the key it was on — including for an
+        // update that stores no value, and for one whose existing versions a key change
+        // would leave where they are.
+        if let Some(refusal) = crate::state::envelope::unresolvable_key_refusal(
+            ctx,
+            &region,
+            input.kms_key_id.as_deref(),
+        )
+        .await
+        {
+            return Err(encryption_failure(refusal));
+        }
+
         // The new value is stored under that key, so storing it means encrypting it
         // under that key: a key that cannot seal it refuses this update, under the
         // class the kind of key failure calls for (see `encryption_failure`), and

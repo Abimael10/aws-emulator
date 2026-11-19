@@ -410,24 +410,17 @@ pub const STAGE_LIMIT_MESSAGE: &str =
     "You exceeded the maximum number of staging labels allowed on a secret.";
 
 /// The `ResourceNotFoundException` message for a `VersionId` the named secret
-/// holds no version under, for an operation that moves a staging label onto that
-/// version rather than reading a value.
+/// holds no version under.
 ///
-/// The secret itself was found, so the missing thing is the version the request
-/// named — and the caller cannot tell which of the ids it sent was wrong unless
-/// the message names it.
-pub fn version_not_found_message(version_id: &str) -> String {
-    format!("Secrets Manager can't find the specified secret version: {version_id}")
-}
-
-/// The `ResourceNotFoundException` message for a READ of a secret value that
-/// resolves the value by `VersionId` and finds no such version.
-///
-/// A read of a secret value reports the VALUE it could not find, naming the
-/// request member it resolved by and that member's value — the same sentence
-/// shape as the staging-label form below, whose fixed text differs only in the
-/// member it names ([`stage_not_found_message`]). The only variable part is the
-/// `VersionId` echoed from the request.
+/// A version of a secret IS a secret value, so a `VersionId` the secret holds none
+/// under is reported as the value that identifier names being absent, naming the
+/// request member it was resolved by and that member's value — one sentence for
+/// every operation that resolves a `VersionId` against a secret it found, whether it
+/// reads that value or moves a staging label onto it, so the two never diverge. It
+/// has the same shape as the staging-label form below, whose fixed text differs only
+/// in the member it names ([`stage_not_found_message`]). The only variable part is
+/// the `VersionId` echoed from the request, which is what tells a caller which of
+/// the ids it sent was wrong.
 pub fn value_version_not_found_message(version_id: &str) -> String {
     format!("Secrets Manager can't find the specified secret value for VersionId: {version_id}")
 }

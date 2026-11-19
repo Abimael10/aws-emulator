@@ -668,6 +668,43 @@ pub async fn key_refusal(
     region: &str,
     kms_key_id: Option<&str>,
 ) -> Option<String> {
+    described_refusal(ctx, region, kms_key_id)
+        .await
+        .map(|refusal| refusal.encryption_failure_message())
+}
+
+/// KMS's refusal of the identifier a request CARRIED, for the one kind of key failure
+/// that is a fault of that identifier rather than of a key: it resolves to no key at
+/// the endpoint it was asked of ([`RefusalKind::NoSuchKey`]). `None` for every other
+/// answer, including a key that exists and would refuse a cryptographic use of itself,
+/// which is a judgement of that key and is met where the value is sealed.
+///
+/// An operation whose request NAMES a key resolves it this way before it applies it, so
+/// a `KmsKeyId` naming nothing is refused whether or not the call also stores a value —
+/// the key a secret is pointed at is resolved for its own sake, not only when something
+/// has to be encrypted under it right now.
+pub async fn unresolvable_key_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kms_key_id: Option<&str>,
+) -> Option<KmsRefusal> {
+    described_refusal(ctx, region, kms_key_id)
+        .await
+        .filter(|refusal| refusal.kind() == RefusalKind::NoSuchKey)
+}
+
+/// What KMS answers when asked about the key `kms_key_id` names (`kms:DescribeKey`), as
+/// the refusal it stated; `None` when the key can be described, when there is no
+/// customer managed key to ask about, and when no KMS answered.
+///
+/// A fault KMS stated nothing about says nothing about the key, so there is nothing to
+/// report: the modelled sentence for the failure class stands for a refused write, not
+/// for a judgement of the key.
+async fn described_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kms_key_id: Option<&str>,
+) -> Option<KmsRefusal> {
     let key_id = customer_managed_key(kms_key_id)?;
     match kms_client(ctx, region, None)
         .describe_key()
@@ -678,12 +715,7 @@ pub async fn key_refusal(
         Ok(_) => None,
         Err(error) => match call_failure(&error) {
             CallFailure::NoKms => None,
-            // A fault KMS stated nothing about says nothing about the key, so
-            // there is nothing to report: the modelled sentence for the failure
-            // class stands for a refused write, not for a judgement of the key.
-            CallFailure::Failed(refusal) => refusal
-                .stated_by_kms()
-                .then(|| refusal.encryption_failure_message()),
+            CallFailure::Failed(refusal) => refusal.stated_by_kms().then_some(refusal),
         },
     }
 }

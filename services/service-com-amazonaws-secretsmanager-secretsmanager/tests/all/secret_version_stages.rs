@@ -34,7 +34,7 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_secretsmanager_secretsmanager::state::{
-    FORCE_DELETE_PURGE_DELAY, STAGES_PER_VERSION,
+    value_version_not_found_message, FORCE_DELETE_PURGE_DELAY, STAGES_PER_VERSION,
 };
 use service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -796,32 +796,66 @@ async fn a_stage_change_names_a_version_to_move_or_remove() {
     }
 
     // A `MoveToVersionId` the secret holds no version under is not found, and the
-    // message names the version asked for.
-    for absent in [version_id("absent"), version_id("another-absent")] {
-        let case = format!("MoveToVersionId {absent}");
+    // message names the version asked for. The rows run over the absent id, the label
+    // being moved (a caller's own, and each reserved one the service moves itself) and
+    // whether the call also names the version to take that label off — so the refusal
+    // is the missing VALUE the id names in every shape the call can take.
+    for (absent, label, names_holder) in [
+        (version_id("absent"), "blue", false),
+        (version_id("another-absent"), "AWSCURRENT", true),
+        (version_id("third-absent"), "AWSPENDING", false),
+    ] {
+        let case = format!("MoveToVersionId {absent} for label {label:?}");
         let router = emulator();
         let name = "stage-absent-version";
-        create(&router, name, &case).await;
-        let (code, message) = err(
-            &router,
-            "UpdateSecretVersionStage",
-            json!({
-                "SecretId": name,
-                "VersionStage": "blue",
-                "MoveToVersionId": absent.clone(),
-            }),
-            &case,
-        )
-        .await;
+        let (_, v0) = create(&router, name, &case).await;
+        let before = stages(&router, name, &case).await;
+        let mut body = json!({
+            "SecretId": name,
+            "VersionStage": label,
+            "MoveToVersionId": absent.clone(),
+        });
+        if names_holder {
+            body["RemoveFromVersionId"] = json!(v0.clone());
+        }
+        let (code, message) = err(&router, "UpdateSecretVersionStage", body, &case).await;
         assert_eq!(
             code, "ResourceNotFoundException",
             "case {case:?}: expected ResourceNotFoundException, got {code:?} with message \
              {message:?}"
         );
-        let expected = format!("Secrets Manager can't find the specified secret version: {absent}");
+        // A version of a secret is a secret value, so an id the secret holds no
+        // version under is reported as that value being absent — the same sentence a
+        // READ by `VersionId` answers with (`value_version_not_found_message`).
+        let expected = value_version_not_found_message(&absent);
         assert_eq!(
             message, expected,
             "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+        let (read_code, read_message) = err(
+            &router,
+            "GetSecretValue",
+            json!({"SecretId": name, "VersionId": absent.clone()}),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            (read_code.as_str(), read_message.as_str()),
+            ("ResourceNotFoundException", expected.as_str()),
+            "case {case:?}: expected a read of the same absent id to answer the same way, got \
+             {read_code:?} with {read_message:?}"
+        );
+        // The refused move left every label where it was: `AWSCURRENT` is still on
+        // the version the create staked it on.
+        assert_eq!(
+            stages(&router, name, &case).await,
+            before,
+            "case {case:?}: the refused move changed the staging labels"
+        );
+        assert_eq!(
+            holder_of(&before, "AWSCURRENT").as_deref(),
+            Some(v0.as_str()),
+            "case {case:?}: expected AWSCURRENT on version {v0}, got {before:?}"
         );
     }
 }

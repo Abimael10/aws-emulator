@@ -280,7 +280,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     UpdateSecretVersionStageErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(crate::state::version_not_found_message(&move_to)),
+                            message: Some(crate::state::value_version_not_found_message(
+                                &move_to,
+                            )),
                         },
                     )
                     .into(),
