@@ -59,6 +59,12 @@
 //! plan's mutation publishes. What only this suite reaches is the whole path: an event on
 //! the bus, a state machine started for it with the document the target rendered, and a real
 //! AWS Backup job at the far end.
+//!
+//! Every row here runs under a role that MAY start the backup, so what this suite holds fixed
+//! is the chain itself. What the policies in force on that role decide about the task's call
+//! is the question of `crate::backup_event_rule_target_permission_decides_its_backup_task`,
+//! which borrows the harness below rather than restating the wiring — which is why the
+//! harness is `pub(crate)`.
 
 use std::time::{Duration, Instant};
 
@@ -72,51 +78,51 @@ use crate::query_wire::element;
 use crate::sns_lambda_subscription_permission_boundary::iam;
 
 /// The Region every request below is signed for — the one the shared IAM caller signs for.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The `source` a client's own events below carry, and the `source` AWS Backup publishes
 /// under with the `detail-type` of a stored plan's mutation — spelled out here rather than
 /// imported from the service crate, so a wrong constant in the implementation cannot make
 /// this suite pass.
-const TEST_SOURCE: &str = "sim2real.backup.automation";
+pub(crate) const TEST_SOURCE: &str = "sim2real.backup.automation";
 const BACKUP_SOURCE: &str = "aws.backup";
 const BACKUP_PLAN_STATE_CHANGE: &str = "Backup Plan State Change";
 
 /// The service principals this chain acts as, and the two calls the roles grant: EventBridge
 /// starts the execution, and the execution's task starts the backup job.
-const EVENTS_PRINCIPAL: &str = "events.amazonaws.com";
-const STATES_PRINCIPAL: &str = "states.amazonaws.com";
-const BACKUP_PRINCIPAL: &str = "backup.amazonaws.com";
-const START_EXECUTION_ACTION: &str = "states:StartExecution";
-const START_BACKUP_JOB_ACTION: &str = "backup:StartBackupJob";
+pub(crate) const EVENTS_PRINCIPAL: &str = "events.amazonaws.com";
+pub(crate) const STATES_PRINCIPAL: &str = "states.amazonaws.com";
+pub(crate) const BACKUP_PRINCIPAL: &str = "backup.amazonaws.com";
+pub(crate) const START_EXECUTION_ACTION: &str = "states:StartExecution";
+pub(crate) const START_BACKUP_JOB_ACTION: &str = "backup:StartBackupJob";
 
 /// The `Task` `Resource` under test: the AWS SDK integration family's name for AWS Backup's
 /// `StartBackupJob`.
-const START_BACKUP_JOB_TASK: &str = "arn:aws:states:::aws-sdk:backup:startBackupJob";
+pub(crate) const START_BACKUP_JOB_TASK: &str = "arn:aws:states:::aws-sdk:backup:startBackupJob";
 
 /// The state a backup job of this emulator is stored in before the clock moves it, and the
 /// terminal state a job performed under a permitted role reaches, as the model's
 /// `BackupJobState` spells them
 /// (`smithy_query(query="shape", shape="com.amazonaws.backup#BackupJobState")`).
 const CREATED: &str = "CREATED";
-const COMPLETED: &str = "COMPLETED";
+pub(crate) const COMPLETED: &str = "COMPLETED";
 
 /// The Backup resource type of the table every row protects, as the Backup API's own
 /// `ByResourceType` catalog spells it (`ListBackupJobs`).
-const DYNAMODB_TYPE: &str = "DynamoDB";
+pub(crate) const DYNAMODB_TYPE: &str = "DynamoDB";
 
 /// How long a row waits for the handover and the run it must see, how long the row that must
 /// see NOTHING keeps looking for one, and how often either looks. Each is generous: nothing
 /// here is a measurement of how fast the host runs.
-const RUN_BUDGET: Duration = Duration::from_secs(60);
-const QUIET_WINDOW: Duration = Duration::from_secs(3);
-const LOOK_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const RUN_BUDGET: Duration = Duration::from_secs(60);
+pub(crate) const QUIET_WINDOW: Duration = Duration::from_secs(3);
+pub(crate) const LOOK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The whole emulator over one engine, exactly as `core/router/src/lib.rs` assembles it for
 /// the binary: the `StartExecution` EventBridge makes and the `StartBackupJob` the task makes
 /// are dispatched back into this same router, so the job this suite reads is the job that run
 /// created.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let mut router = aws_emulator_router::build_router(aws_emulator_router::new_engine());
     router.set_request_authentication(false);
     router
@@ -168,7 +174,12 @@ async fn rpc(
 }
 
 /// One EventBridge call (`awsJson1_1`, `AWSEvents.<Operation>`), which must answer 200.
-async fn events(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn events(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let (status, parsed) = rpc(
         router,
         "events",
@@ -187,7 +198,12 @@ async fn events(router: &MultiServiceRouter, case: &str, operation: &str, body: 
 
 /// One Step Functions call (`awsJson1_0`, `AWSStepFunctions.<Operation>`), which must answer
 /// 200.
-async fn sfn(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn sfn(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let (status, parsed) = rpc(
         router,
         "states",
@@ -223,7 +239,7 @@ async fn dynamodb(router: &MultiServiceRouter, case: &str, operation: &str, body
 }
 
 /// One AWS Backup call (`restJson1`), which must answer 200.
-async fn backup(
+pub(crate) async fn backup(
     router: &MultiServiceRouter,
     case: &str,
     method: &str,
@@ -251,20 +267,22 @@ async fn backup(
 }
 
 /// A string member of a response, or a panic naming the case and what came back.
-fn member(case: &str, body: &Value, pointer: &str) -> String {
+pub(crate) fn member(case: &str, body: &Value, pointer: &str) -> String {
     body.pointer(pointer)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: expected {pointer} in {body}"))
         .to_string()
 }
 
-/// The trust document of a role a service may act as.
-fn trusting(service: &str) -> String {
+/// The trust document of a role the services `services` may act as — a list, because one
+/// role is handed to more than one service wherever the same role both takes the handover
+/// and runs the work it starts.
+fn trusting(services: &[&str]) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
             "Effect": "Allow",
-            "Principal": { "Service": service },
+            "Principal": { "Service": services },
             "Action": "sts:AssumeRole",
         }],
     })
@@ -287,13 +305,36 @@ fn allowing(actions: &[&str]) -> String {
 /// Create the role `name` where IAM holds it — trusted by `service`, granting `actions` — and
 /// answer the ARN IAM ITSELF reports for it, so a value this suite hands another service is
 /// the owning service's own answer rather than an ARN format written out here.
-async fn role(router: &MultiServiceRouter, name: &str, service: &str, actions: &[&str]) -> String {
+pub(crate) async fn role(
+    router: &MultiServiceRouter,
+    name: &str,
+    service: &str,
+    actions: &[&str],
+) -> String {
+    role_trusted_by(router, name, &[service], &allowing(actions)).await
+}
+
+/// The same, for a role whose identity-based policy is the WHOLE document `policy` and which
+/// the services `services` may act as: what a role may do is the dimension a suite about
+/// authorization varies, so the document is handed in rather than built from a list of
+/// actions.
+///
+/// `pub(crate)` — like the rest of this harness — because
+/// [`crate::backup_event_rule_target_permission_decides_its_backup_task`] asks what the
+/// policies in force on that role decide about the same chain, and `tests/all/main.rs` is one
+/// crate root: one wiring, reached from both.
+pub(crate) async fn role_trusted_by(
+    router: &MultiServiceRouter,
+    name: &str,
+    services: &[&str],
+    policy: &str,
+) -> String {
     let created = iam(
         router,
         "CreateRole",
         &[
             ("RoleName", name),
-            ("AssumeRolePolicyDocument", &trusting(service)),
+            ("AssumeRolePolicyDocument", &trusting(services)),
         ],
     )
     .await;
@@ -303,7 +344,7 @@ async fn role(router: &MultiServiceRouter, name: &str, service: &str, actions: &
         &[
             ("RoleName", name),
             ("PolicyName", "granted"),
-            ("PolicyDocument", &allowing(actions)),
+            ("PolicyDocument", policy),
         ],
     )
     .await;
@@ -313,7 +354,7 @@ async fn role(router: &MultiServiceRouter, name: &str, service: &str, actions: &
 /// A state machine whose single `Task` state performs `StartBackupJob` with the three members
 /// read out of the document the execution was started with, at `vault_path`, `resource_path`
 /// and `role_path`; answers its ARN.
-async fn backup_state_machine(
+pub(crate) async fn backup_state_machine(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -352,7 +393,7 @@ async fn backup_state_machine(
 }
 
 /// The executions the state machine at `arn` holds right now.
-async fn executions(router: &MultiServiceRouter, case: &str, arn: &str) -> Vec<Value> {
+pub(crate) async fn executions(router: &MultiServiceRouter, case: &str, arn: &str) -> Vec<Value> {
     let listed = sfn(
         router,
         case,
@@ -365,7 +406,7 @@ async fn executions(router: &MultiServiceRouter, case: &str, arn: &str) -> Vec<V
 
 /// The executions of the machine at `arn` once it holds at least one, looking again until it
 /// does or [`RUN_BUDGET`] has passed with it not doing so.
-async fn executions_once_started(
+pub(crate) async fn executions_once_started(
     router: &MultiServiceRouter,
     case: &str,
     arn: &str,
@@ -386,7 +427,11 @@ async fn executions_once_started(
 }
 
 /// The execution at `execution_arn` once it has left `RUNNING`.
-async fn once_terminal(router: &MultiServiceRouter, case: &str, execution_arn: &str) -> Value {
+pub(crate) async fn once_terminal(
+    router: &MultiServiceRouter,
+    case: &str,
+    execution_arn: &str,
+) -> Value {
     let deadline = Instant::now() + RUN_BUDGET;
     loop {
         let described = sfn(
@@ -409,7 +454,11 @@ async fn once_terminal(router: &MultiServiceRouter, case: &str, execution_arn: &
 
 /// The backup job `job_id` as AWS Backup reports it once the clock has moved it out of
 /// [`CREATED`], looking again until it has or [`RUN_BUDGET`] has passed.
-async fn job_once_settled(router: &MultiServiceRouter, case: &str, job_id: &str) -> Value {
+pub(crate) async fn job_once_settled(
+    router: &MultiServiceRouter,
+    case: &str,
+    job_id: &str,
+) -> Value {
     let deadline = Instant::now() + RUN_BUDGET;
     loop {
         let read = backup(router, case, "GET", &format!("/backup-jobs/{job_id}"), None).await;
@@ -426,7 +475,11 @@ async fn job_once_settled(router: &MultiServiceRouter, case: &str, job_id: &str)
 
 /// A protected resource an owning service really holds: a DynamoDB table, answered as the ARN
 /// DynamoDB itself reports for it.
-async fn protected_table(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+pub(crate) async fn protected_table(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> String {
     let created = dynamodb(
         router,
         case,
