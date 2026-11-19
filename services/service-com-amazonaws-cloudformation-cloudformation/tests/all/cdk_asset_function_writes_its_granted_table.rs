@@ -539,7 +539,16 @@ async fn deploy(router: &MultiServiceRouter, row: &Row) -> (String, String) {
 /// Wait until AWS Lambda first reports `name` `Active`, and answer the state it reported then:
 /// a created function is `Pending` until that service's own activation span falls due, and
 /// "you cannot invoke … while the function is in the Pending state".
-async fn wait_until_active(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+///
+/// `pub(crate)` because more than one suite of this target invokes a function a stack deployed
+/// and so has to wait for that span first: `sam_layer_version_serves_its_function.rs` waits for
+/// the function its declared layer serves through this one spelling of the wait rather than a
+/// copy of it.
+pub(crate) async fn wait_until_active(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> String {
     let mut last = String::new();
     for _ in 0..LOOKS {
         let answered = lambda(

@@ -316,7 +316,12 @@ async fn lambda(
 }
 
 /// `GetLayerVersion` for one version of one layer.
-async fn get_layer_version(
+///
+/// `pub(crate)` with [`layer_version_arn`]: the sibling suite that drives a declared layer all
+/// the way into a RUN of the function it serves
+/// (`sam_layer_version_serves_its_function.rs`) reads the published version back through this
+/// one spelling of the call rather than a copy of it.
+pub(crate) async fn get_layer_version(
     router: &MultiServiceRouter,
     layer: &str,
     version: u32,
@@ -332,7 +337,9 @@ async fn get_layer_version(
 
 /// The ARN a layer version carries: the total function of the Region, the account, the layer
 /// name and the version number both services compute it from.
-fn layer_version_arn(layer: &str, version: u32) -> String {
+///
+/// `pub(crate)` for the reason [`get_layer_version`] is.
+pub(crate) fn layer_version_arn(layer: &str, version: u32) -> String {
     format!("arn:aws:lambda:{REGION}:{ACCOUNT_ID}:layer:{layer}:{version}")
 }
 
