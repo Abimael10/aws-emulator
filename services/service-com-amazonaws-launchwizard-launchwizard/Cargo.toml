@@ -27,12 +27,10 @@ hex = { workspace = true }
 # The digest `state::fresh_uuid_v4` lays out as a deployment id, so minting one
 # pulls in no crate this workspace does not already build.
 sha2 = { workspace = true }
-# Writes the PNG a workload catalogue entry's icon is served as
-# (`state::workload_icons`), so the image is a real PNG rather than hand-rolled bytes.
-png = "0.18"
 # `service-common` carries the workspace's ONE authenticator over a value a store hands out
 # and takes back (`page_tokens::PageTokenKey`), which the address of a catalogue entry's icon
-# carries so only an address this store minted resolves.
+# carries so only an address this store minted resolves — and `record_identicon`, the one
+# renderer of the image a service serves for a record it holds no uploaded bytes for.
 service-common = { path = "../common" }
 
 [build-dependencies]
@@ -42,6 +40,11 @@ emulator-core-build-support = { workspace = true }
 # Tests forge a pagination token with the same encoding `state::encode_token` issues
 # one with, rather than hand-rolling hex beside it.
 hex = { workspace = true }
+# DEV-ONLY: reads back the PNG a workload catalogue entry's icon is served as, so the suite
+# that follows an `iconUrl` decodes a real image rather than checking its first bytes. The
+# image itself is WRITTEN by the one renderer every such service shares
+# (`service_common::record_identicon`), so the library build links no codec of its own.
+png = "0.18"
 
 [lints]
 workspace = true

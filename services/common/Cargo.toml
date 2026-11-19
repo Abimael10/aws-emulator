@@ -270,6 +270,11 @@ cron = "0.15"
 # patterns with (its linear-time matcher, so a pattern a caller wrote cannot cost the host
 # more than the input it is run over) rather than a matcher written here.
 regex = "1.13"
+# `record_identicon`: the PNG encoder the image a service serves for a record whose own image
+# bytes it does not hold is written with — the maintained codec this workspace already encodes
+# PNGs with, so the one renderer every such service shares writes a real image rather than
+# hand-assembled bytes.
+png = "0.18"
 
 [dev-dependencies]
 # `acm_certificate_termination`'s own cases load REAL certificate material, minted by the

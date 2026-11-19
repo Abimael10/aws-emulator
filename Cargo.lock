@@ -22047,6 +22047,7 @@ dependencies = [
  "percent-encoding",
  "pkcs1",
  "pkcs8 0.10.2",
+ "png 0.18.1",
  "rand 0.9.5",
  "rcgen",
  "regex",

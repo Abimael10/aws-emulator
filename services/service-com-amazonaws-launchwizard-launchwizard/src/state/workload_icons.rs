@@ -27,7 +27,6 @@
 
 use std::time::Duration;
 
-use ::sha2::{Digest, Sha256};
 use ::smithy_server_runtime::{http, SignedUrlRequest, UrlSigner};
 
 /// The signing name this service's requests are signed under, which an address on this
@@ -35,9 +34,10 @@ use ::smithy_server_runtime::{http, SignedUrlRequest, UrlSigner};
 /// (the model's `sigv4Name`/`endpointPrefix`, `smithy_query(query="service_info")`).
 pub const SIGNING_NAME: &str = "launchwizard";
 
-/// The media type the icon is served as, and the format [`render_icon`] writes: a PNG,
-/// which is what the `.png` address names.
-pub const ICON_MEDIA_TYPE: &str = "image/png";
+/// The media type the icon is served as, and the format the shared renderer writes: a PNG,
+/// which is what the `.png` address names
+/// (`service_common::record_identicon::IDENTICON_MEDIA_TYPE`).
+pub const ICON_MEDIA_TYPE: &str = ::service_common::record_identicon::IDENTICON_MEDIA_TYPE;
 
 /// The first path segment of every icon address: the catalogue collection the entry whose
 /// icon it is belongs to.
@@ -157,6 +157,11 @@ impl super::ComAmazonawsLaunchwizardLaunchwizardState {
 /// Read through the catalogue the reporting operations read, so an address is served an
 /// image exactly while `GetWorkload` reports the entry it belongs to, and the image is
 /// rendered from the STORED entry's name rather than from the requested text.
+///
+/// The image itself is the one every service that publishes a picture of a record it holds no
+/// uploaded bytes for serves (`service_common::record_identicon`), derived from the entry's
+/// own name: the catalogue needs no image file beside it, two entries cannot share an icon,
+/// and nothing about the image depends on the request or the clock.
 pub fn workload_icon<Eng: Send + Sync + 'static>(
     engine: &Eng,
     workload_name: &str,
@@ -171,72 +176,5 @@ pub fn workload_icon<Eng: Send + Sync + 'static>(
         return None;
     }
     let workload = store.resolve_workload(workload_name).ok()?;
-    render_icon(&workload.workload_name)
-}
-
-/// How many blocks a side of the icon is divided into.
-const ICON_GRID_BLOCKS: usize = 8;
-
-/// How many pixels a side of one block is, which makes the icon
-/// `ICON_GRID_BLOCKS * ICON_BLOCK_PIXELS` pixels square.
-const ICON_BLOCK_PIXELS: usize = 8;
-
-/// How many samples one pixel carries: 8-bit RGB.
-const ICON_SAMPLES_PER_PIXEL: usize = 3;
-
-/// The background every icon is drawn on: a light neutral, so the figure drawn over it
-/// stands out whatever colour the entry's own is.
-const ICON_BACKGROUND: [u8; ICON_SAMPLES_PER_PIXEL] = [0xF2, 0xF2, 0xF2];
-
-/// The darkest and the lightest a figure sample may be, so the figure is neither
-/// invisible against [`ICON_BACKGROUND`] nor a flat black whatever the digest says.
-const ICON_FIGURE_FLOOR: u8 = 0x20;
-/// See [`ICON_FIGURE_FLOOR`].
-const ICON_FIGURE_CEILING: u8 = 0xC0;
-
-/// The icon of the catalogue entry `workload_name` as PNG bytes, or `None` when the image
-/// cannot be encoded.
-///
-/// DERIVED from the entry's name, so the catalogue needs no image file beside it and two
-/// entries cannot share an icon: a SHA-256 digest of the name picks the figure's colour
-/// and the blocks it fills on a `ICON_GRID_BLOCKS` square grid, mirrored across the
-/// vertical axis the way a generated avatar is. Nothing about it depends on the request or
-/// the clock, so the address of an entry's icon always serves the same image.
-fn render_icon(workload_name: &str) -> Option<Vec<u8>> {
-    let digest = Sha256::digest(workload_name.as_bytes());
-    let figure: Vec<u8> = digest
-        .iter()
-        .take(ICON_SAMPLES_PER_PIXEL)
-        .map(|sample| {
-            let span = u16::from(ICON_FIGURE_CEILING - ICON_FIGURE_FLOOR) + 1;
-            let offset = u16::from(*sample) % span;
-            ICON_FIGURE_FLOOR + u8::try_from(offset).unwrap_or(0)
-        })
-        .collect();
-    let side_pixels = ICON_GRID_BLOCKS * ICON_BLOCK_PIXELS;
-    let mut samples = Vec::with_capacity(side_pixels * side_pixels * ICON_SAMPLES_PER_PIXEL);
-    for y in 0..side_pixels {
-        for x in 0..side_pixels {
-            let row = y / ICON_BLOCK_PIXELS;
-            // Mirrored across the vertical axis: a column in the right half takes the
-            // block of the column facing it in the left half.
-            let column = (x / ICON_BLOCK_PIXELS).min(ICON_GRID_BLOCKS - 1 - x / ICON_BLOCK_PIXELS);
-            let bit = digest
-                .get(ICON_SAMPLES_PER_PIXEL + row)
-                .map_or(0, |byte| (byte >> column) & 1);
-            let pixel = if bit == 1 { &figure } else { &ICON_BACKGROUND[..] };
-            samples.extend_from_slice(pixel);
-        }
-    }
-    let mut rendered = Vec::new();
-    {
-        let side = u32::try_from(side_pixels).ok()?;
-        let mut encoder = ::png::Encoder::new(&mut rendered, side, side);
-        encoder.set_color(::png::ColorType::Rgb);
-        encoder.set_depth(::png::BitDepth::Eight);
-        let mut writer = encoder.write_header().ok()?;
-        writer.write_image_data(&samples).ok()?;
-        writer.finish().ok()?;
-    }
-    Some(rendered)
+    ::service_common::record_identicon::identicon_png(&workload.workload_name)
 }

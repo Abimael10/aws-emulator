@@ -215,6 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = store.lock();
 
+        // Where the addresses this response announces — the listing's logo thumbnail and the
+        // reviews page of each review source that keeps one — are served: the endpoint THIS
+        // request reached the emulator at, because this emulator serves those pages itself.
+        let announced = crate::state::announced_page_base(ctx);
+
         let preferred = crate::state::resolve_requested_locale(input.locale.as_deref())
             .map_err(GetListingError::validation)?;
 
@@ -286,14 +291,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             integration_guide: listing.integration_guide.clone(),
             listing_id: listing.listing_id.clone(),
             listing_name: text.name.clone(),
-            logo_thumbnail_url: listing.logo_thumbnail_url.clone(),
+            logo_thumbnail_url: listing.logo.announced(&announced),
             long_description: text.long_description.clone(),
             pricing_models: listing.pricing_models.clone(),
             pricing_units: listing.pricing_units.clone(),
             promotional_media: listing.promotional_media.clone(),
             publisher: listing.publisher.clone(),
             resources: listing.resources.clone(),
-            review_summary: listing.review_summary.clone(),
+            review_summary: listing
+                .reviews
+                .as_ref()
+                .map(|reviews| reviews.announced(&announced)),
             seller_engagements: listing.seller_engagements.clone(),
             short_description: text.short_description.clone(),
             use_cases: listing.use_cases.clone(),

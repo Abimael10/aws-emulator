@@ -690,6 +690,10 @@ pub mod quoted_refusals;
 /// An `@httpQuery`-bound timestamp read in every form the wire names an instant in, which
 /// the generated schema narrows to one and the framework therefore refuses.
 pub mod query_timestamps;
+/// The IMAGE a service serves at an address it published for a record whose own image bytes
+/// it does not hold, derived from that record's identifier — one renderer for every service
+/// that publishes such an address.
+pub mod record_identicon;
 /// The ONE rendering of the envelope a service states around a refusal ANOTHER service
 /// answered it with: the called service, the status it answered, that call's request id and
 /// how many attempts it took.

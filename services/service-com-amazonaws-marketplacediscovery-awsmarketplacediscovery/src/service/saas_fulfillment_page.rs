@@ -50,21 +50,11 @@ pub fn answer<Eng: Send + Sync + 'static>(
     // option the catalog does not hold, or one whose record names no such page.
     let status = if document.is_some() { 200_u16 } else { 404 };
     let document = document.unwrap_or_else(crate::state::saas_page_not_found_page);
-    let body = if body_wanted {
-        document.clone().into_bytes()
-    } else {
-        Vec::new()
-    };
-    let mut response = aws_smithy_runtime_api::http::Response::new(
-        aws_smithy_runtime_api::http::StatusCode::try_from(status).ok()?,
-        ::aws_smithy_types::body::SdkBody::from(body),
-    );
-    let headers = response.headers_mut();
-    headers.insert("content-type", crate::state::SAAS_PAGE_MEDIA_TYPE);
-    // The size of the page itself, which is what a `HEAD` of it reports with no body.
-    headers.insert("content-length", document.len().to_string());
-    // The page is served from this emulator's own origin, so the type it announces is the
-    // only type it may be treated as.
-    headers.insert("x-content-type-options", "nosniff");
-    Some(response)
+    // Answered the one way this service answers a fetch of an address it published.
+    super::served_document::served_document(
+        status,
+        crate::state::SAAS_PAGE_MEDIA_TYPE,
+        document.into_bytes(),
+        body_wanted,
+    )
 }

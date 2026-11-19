@@ -160,7 +160,11 @@ pub fn saas_page_route(uri: &str) -> Option<(&str, SaasPage)> {
 /// The PATH of a request target, whether it arrived in origin form (`/a/b?q`) or in absolute
 /// form (`https://host/a/b?q`), which is how a request that carries its endpoint in the URI
 /// spells the same address.
-fn request_target_path(uri: &str) -> &str {
+///
+/// Shared with the catalog's other served planes ([`super::listing_logo`],
+/// [`super::listing_reviews`]), so every address this service publishes is read back out of a
+/// request the same way.
+pub(super) fn request_target_path(uri: &str) -> &str {
     let path = uri.split(['?', '#']).next().unwrap_or(uri);
     match path.split_once("://") {
         Some((_scheme, authority_and_path)) => authority_and_path
@@ -243,6 +247,9 @@ pub fn saas_page_not_found_page() -> String {
 }
 
 /// `value` as text inside an HTML element, through the `html-escape` crate's own escaping.
-fn escaped(value: &str) -> String {
+///
+/// Shared with the catalog's other served pages ([`super::listing_reviews`]), so every
+/// document this service writes escapes its stored values the same way.
+pub(super) fn escaped(value: &str) -> String {
     ::html_escape::encode_safe(value).into_owned()
 }

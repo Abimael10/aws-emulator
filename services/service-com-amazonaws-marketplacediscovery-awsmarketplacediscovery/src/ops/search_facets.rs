@@ -454,7 +454,7 @@ fn listing_facet_values(
             vec![(products.to_string(), display_name)]
         }
         "AVERAGE_CUSTOMER_RATING" => {
-            let rating = crate::state::average_customer_rating(listing.review_summary.as_ref());
+            let rating = listing.average_customer_rating();
             RATING_FACET_BUCKETS
                 .iter()
                 .filter(|(minimum, _, _)| rating >= *minimum)

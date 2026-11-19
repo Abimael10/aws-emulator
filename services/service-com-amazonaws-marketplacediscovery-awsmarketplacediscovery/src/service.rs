@@ -68,13 +68,22 @@
 //!   `fulfillmentUrl` / `launchUrl`, claimed in `can_handle` and answered from
 //!   `override_routing_error`, because such an address is opened by a browser rather than
 //!   called by an SDK.
+//! * [`catalog_media`] — the same for the media a CATALOG RECORD publishes: the logo
+//!   thumbnail image a listing or product announces in `logoThumbnailUrl`, and the reviews
+//!   page a review source keeps for a listing (`ReviewSourceSummary$sourceUrl`).
 
 /// The per-request IAM decision every operation of this service takes before it reads any
 /// catalog record: `AccessDeniedException` is a service-common error of this model.
 pub mod authorization;
+/// The routes that answer at the addresses a catalog record publishes its media at: a
+/// listing's or product's logo thumbnail image, and the reviews page of a review source.
+pub mod catalog_media;
 /// The route that answers at the buyer-facing addresses a SaaS fulfillment option
 /// publishes, which no modelled operation describes.
 pub mod saas_fulfillment_page;
+/// The one way this service answers a fetch of an address it published itself, shared by
+/// every plane that publishes one.
+mod served_document;
 /// How a request the framework's walk refused is WORDED.
 pub(crate) mod validation;
 
@@ -94,9 +103,9 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The shared engine, for the one address this service serves that no modelled
-    /// operation describes ([`saas_fulfillment_page`]): that answer is taken outside the
-    /// operation walk, so it reaches the store itself.
+    /// The shared engine, for the addresses this service serves that no modelled
+    /// operation describes ([`saas_fulfillment_page`], [`catalog_media`]): those answers are
+    /// taken outside the operation walk, so they reach the store themselves.
     engine: Arc<Eng>,
     /// The same modelled operations the generated table holds, each wrapped in
     /// [`StatedPerOperation`] so a refused request is worded the way this service words it.
@@ -274,7 +283,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service itself minted under the plane segment that is this service's alone. See
         // [`saas_fulfillment_page`]: without this the router answers `404 UnknownService`
         // for an address this service published.
-        saas_fulfillment_page::claimed(parts)
+        if saas_fulfillment_page::claimed(parts) {
+            return true;
+        }
+        // And a fetch of the media a catalog record publishes: the logo thumbnail image a
+        // listing or product announces, and the reviews page a review source keeps for a
+        // listing. Both are addresses this service minted under a plane segment of its own
+        // and both are opened anonymously, exactly as the pages above are.
+        catalog_media::claimed(parts)
     }
 
     fn override_operation(
@@ -322,13 +338,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
         //
-        // The ONE address this service serves that no modelled operation describes: a
+        // The addresses this service serves that no modelled operation describes: a
         // buyer-facing page of a stored SaaS fulfillment option, which `fulfillmentUrl` and
-        // `launchUrl` publish for a buyer to follow. It is answered here because the router
-        // consults this seam before it authenticates anything, which is how AWS serves the
-        // seller's own host — unauthenticated, and as a web page rather than a modelled API
-        // call.
+        // `launchUrl` publish for a buyer to follow, and the media a catalog record publishes
+        // — its logo thumbnail image and the reviews page of a review source. They are
+        // answered here because the router consults this seam before it authenticates
+        // anything, which is how AWS serves them: unauthenticated, and as an image or a web
+        // page rather than a modelled API call.
         saas_fulfillment_page::answer(&*self.engine, req)
+            .or_else(|| catalog_media::answer(&*self.engine, req))
     }
 
     fn override_framework_error(

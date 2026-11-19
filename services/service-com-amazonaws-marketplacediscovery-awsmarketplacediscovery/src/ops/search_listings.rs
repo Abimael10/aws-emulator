@@ -188,6 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = store.lock();
 
+        // Where the addresses this response announces — each summary's logo thumbnail and the
+        // reviews page of each review source that keeps one — are served: the endpoint THIS
+        // request reached the emulator at, because this emulator serves those pages itself.
+        let announced = crate::state::announced_page_base(ctx);
+
         let locale = crate::state::resolve_requested_locale(input.locale.as_deref())
             .map_err(SearchListingsError::validation)?;
 
@@ -206,9 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .map(|listing| {
                 let score = match input.sort_by.as_str() {
-                    "AVERAGE_CUSTOMER_RATING" => {
-                        crate::state::average_customer_rating(listing.review_summary.as_ref())
-                    }
+                    "AVERAGE_CUSTOMER_RATING" => listing.average_customer_rating(),
                     // RELEVANCE, the model's default.
                     _ => relevance(
                         listing,
@@ -255,7 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             total_results,
             listing_summaries: page
                 .iter()
-                .map(|(_, listing)| state.listing_summary(listing, locale))
+                .map(|(_, listing)| state.listing_summary(listing, locale, &announced))
                 .collect(),
             next_token,
         })

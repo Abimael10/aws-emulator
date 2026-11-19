@@ -17,6 +17,11 @@
 //! * the projections from stored records onto wire shapes
 //!   ([`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::listing_summary`],
 //!   [`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::purchase_options`]);
+//! * the addresses a record publishes for a client to FETCH — its logo thumbnail image
+//!   ([`listing_logo`]) and the reviews page of a review source ([`listing_reviews`]), beside
+//!   the buyer-facing pages of a SaaS fulfillment option ([`saas_fulfillment`]) — each
+//!   announced on the endpoint the request reached this emulator at and served by
+//!   `crate::service`;
 //! * the listing match set `SearchListings` pages over and `SearchFacets` counts facets
 //!   from ([`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::search_matches`],
 //!   [`matches_every_search_filter`]);
@@ -33,6 +38,14 @@ mod taxonomy_rows;
 /// names, and the addresses it announces them at.
 mod saas_fulfillment;
 
+/// The media record a catalog record's logo thumbnail is held as, the address this emulator
+/// announces it at, and the image it serves there.
+mod listing_logo;
+
+/// What a listing's review sources hold for it, and where this emulator serves the reviews
+/// page a source keeps for one listing.
+mod listing_reviews;
+
 /// The sealed continuation token every `@paginated` read of this service hands out, and
 /// the key this store seals one under.
 mod page_cursor;
@@ -42,6 +55,16 @@ pub use page_cursor::{decode_page_token, encode_page_token, page, PageCursorKey}
 pub use saas_fulfillment::{
     announced_page_base, saas_page_not_found_page, saas_page_path, saas_page_route, saas_page_url,
     SaasPage, SaasServedPages, SAAS_FULFILLMENT_PLANE_SEGMENT, SAAS_PAGE_MEDIA_TYPE,
+};
+
+pub use listing_logo::{
+    logo_path, logo_route, logo_url, LogoMedia, LISTING_MEDIA_PLANE_SEGMENT, LOGO_MEDIA_TYPE,
+};
+
+pub use listing_reviews::{
+    reviews_list_id, reviews_page_not_found_page, reviews_page_path, reviews_page_route,
+    reviews_page_url, ReviewRecord, LISTING_REVIEWS_PLANE_SEGMENT, REVIEWS_PAGE_MEDIA_TYPE,
+    REVIEW_SOURCE,
 };
 
 use crate::ops::types::{
@@ -454,7 +477,10 @@ impl Localized {
 pub struct Listing {
     pub listing_id: String,
     pub text: Localized,
-    pub logo_thumbnail_url: String,
+    /// The media record the catalog holds for this listing's logo thumbnail. The ADDRESS it
+    /// is announced at is composed per read, from the endpoint the request reached this
+    /// emulator at ([`LogoMedia::announced`]), because that is where the image is served.
+    pub logo: LogoMedia,
     pub integration_guide: Option<String>,
     pub categories: Vec<Category>,
     pub highlights: Vec<String>,
@@ -472,7 +498,20 @@ pub struct Listing {
     pub resources: Vec<Resource>,
     pub seller_engagements: Vec<SellerEngagement>,
     pub use_cases: Vec<UseCaseEntry>,
-    pub review_summary: Option<ReviewSummary>,
+    /// What this listing's review sources hold for it, and `None` for a listing no source
+    /// holds reviews of. The reviews page a source keeps for it — the `sourceUrl` a client
+    /// turns into a "read the reviews" link — is part of this record
+    /// ([`ReviewRecord::announced`]).
+    pub reviews: Option<ReviewRecord>,
+}
+
+impl Listing {
+    /// The rating a client sorts and filters this listing by, read off the reviews its
+    /// sources hold for it ([`average_customer_rating`]). A listing no source holds reviews
+    /// of rates 0.
+    pub fn average_customer_rating(&self) -> f64 {
+        average_customer_rating(self.reviews.as_ref().map(ReviewRecord::stored))
+    }
 }
 
 /// A product in the seeded catalog.
@@ -483,7 +522,9 @@ pub struct Product {
     pub listing_id: String,
     pub text: Localized,
     pub manufacturer: SellerInformation,
-    pub logo_thumbnail_url: String,
+    /// The media record the catalog holds for this product's logo thumbnail: its listing's
+    /// own, because the logo of a listing's product is that listing's logo.
+    pub logo: LogoMedia,
     pub categories: Vec<Category>,
     pub highlights: Vec<String>,
     pub promotional_media: Vec<PromotionalMedia>,
@@ -701,12 +742,14 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
     /// classified under, the fulfillment options, pricing models and pricing units it is sold
     /// through, and the products it associates with their manufacturers — lowercased.
     ///
-    /// It is read off the listing's own [`Self::listing_summary`], so the text a keyword can
+    /// It is read off the listing's own summary projection ([`Self::listing_content`], which
+    /// [`Self::listing_summary`] restates the same text from), so the text a keyword can
     /// match is exactly the text the client is shown for that listing and the two cannot
     /// drift. IDENTIFIERS are deliberately not part of it: an id is what `filters` select a
-    /// listing by, while `searchText` is the keyword query over its content.
+    /// listing by, while `searchText` is the keyword query over its content — and neither is
+    /// any ADDRESS the summary announces, which is why the haystack needs no endpoint.
     pub fn search_haystack(&self, listing: &Listing, preferred: &'static str) -> String {
-        let summary = self.listing_summary(listing, preferred);
+        let summary = self.listing_content(listing, preferred);
         let mut parts: Vec<String> = vec![
             summary.listing_name,
             summary.short_description,
@@ -745,8 +788,41 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
         parts.join(" ").to_lowercase()
     }
 
-    /// The listing summary `SearchListings` returns for `listing`, in `preferred` locale.
-    pub fn listing_summary(&self, listing: &Listing, preferred: &'static str) -> ListingSummary {
+    /// The listing summary `SearchListings` returns for `listing`, in `preferred` locale, as
+    /// it is ANNOUNCED to a caller that reached this emulator at `endpoint_base`.
+    ///
+    /// `logoThumbnailUrl` and the `sourceUrl` of each review source are the two members a
+    /// client FETCHES rather than displays, so they have to lead back to this emulator: each
+    /// is composed here from the record's own stored media ([`LogoMedia::announced`]) and
+    /// reviews ([`ReviewRecord::announced`]) at the endpoint this request arrived on, and
+    /// `sourceUrl` is absent for a source the record keeps no reviews page for. Every other
+    /// member is the stored record's, unchanged ([`Self::listing_content`]).
+    pub fn listing_summary(
+        &self,
+        listing: &Listing,
+        preferred: &'static str,
+        endpoint_base: &str,
+    ) -> ListingSummary {
+        ListingSummary {
+            logo_thumbnail_url: listing.logo.announced(endpoint_base),
+            review_summary: listing
+                .reviews
+                .as_ref()
+                .map(|reviews| reviews.announced(endpoint_base))
+                .unwrap_or_default(),
+            ..self.listing_content(listing, preferred)
+        }
+    }
+
+    /// The CONTENT of a listing's summary: every member that is the stored record's, in
+    /// `preferred` locale.
+    ///
+    /// The two members that are ADDRESSES this emulator serves are left at their default
+    /// here, because what they are depends on the endpoint the request being answered reached
+    /// this emulator at, which only [`Self::listing_summary`] is handed — so this projection
+    /// is never served to a client on its own. It exists because the keyword haystack
+    /// ([`Self::search_haystack`]) reads the summary's TEXT and no address.
+    fn listing_content(&self, listing: &Listing, preferred: &'static str) -> ListingSummary {
         let locale = listing.text.content_locale(preferred);
         let text = listing.text.text(locale);
         ListingSummary {
@@ -756,10 +832,10 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
             fulfillment_option_summaries: self.listing_fulfillment_option_summaries(listing),
             catalog: self.catalog.clone(),
             short_description: text.short_description.clone(),
-            logo_thumbnail_url: listing.logo_thumbnail_url.clone(),
+            logo_thumbnail_url: String::new(),
             categories: listing.categories.clone(),
             badges: self.listing_badges(listing),
-            review_summary: listing.review_summary.clone().unwrap_or_default(),
+            review_summary: ReviewSummary::default(),
             pricing_models: listing.pricing_models.clone(),
             pricing_units: listing.pricing_units.clone(),
             associated_entities: listing
@@ -1544,11 +1620,11 @@ pub fn matches_every_search_filter(
             // (SearchFilter$filterValues documentation).
             "MIN_AVERAGE_CUSTOMER_RATING" => {
                 let bound = rating_bound(&filter.filter_type, values)?;
-                average_customer_rating(listing.review_summary.as_ref()) >= bound
+                listing.average_customer_rating() >= bound
             }
             "MAX_AVERAGE_CUSTOMER_RATING" => {
                 let bound = rating_bound(&filter.filter_type, values)?;
-                average_customer_rating(listing.review_summary.as_ref()) <= bound
+                listing.average_customer_rating() <= bound
             }
             other => {
                 return Err(format!("filters: '{other}' is not a supported filterType"));
@@ -2308,15 +2384,35 @@ fn purchase_option_badge(badge_type: &str, display_name: &str) -> PurchaseOption
     }
 }
 
-fn reviews(average_rating: &str, total_reviews: i64) -> Option<ReviewSummary> {
-    Some(ReviewSummary {
+/// What the catalog's review source holds for the listing `listing_id`: the ratings it
+/// reports, and — when `keeps_reviews_page` — the reviews list that source keeps for THIS
+/// listing, which is the page its `sourceUrl` announces.
+///
+/// `sourceUrl` is optional, so the record decides whether the listing has one at all: a
+/// source that keeps no reviews page for a listing is recorded with none, and the member is
+/// then absent rather than carrying a page shared with every other listing. The address
+/// itself is composed per read, because the page is served by this emulator
+/// ([`ReviewRecord::announced`]).
+fn reviews(
+    listing_id: &str,
+    average_rating: &str,
+    total_reviews: i64,
+    keeps_reviews_page: bool,
+) -> Option<ReviewRecord> {
+    let (source_id, source_name) = REVIEW_SOURCE;
+    let record = ReviewRecord::new(ReviewSummary {
         review_source_summaries: vec![ReviewSourceSummary {
-            source_name: "AWS Marketplace".to_string(),
-            source_id: "AWS_MARKETPLACE".to_string(),
-            source_url: Some("https://aws.amazon.com/marketplace/reviews".to_string()),
+            source_name: source_name.to_string(),
+            source_id: source_id.to_string(),
+            source_url: None,
             average_rating: average_rating.to_string(),
             total_reviews,
         }],
+    });
+    Some(if keeps_reviews_page {
+        record.keeping(source_id, reviews_list_id(listing_id, source_id))
+    } else {
+        record
     })
 }
 
@@ -2566,7 +2662,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
         Listing {
             listing_id: "l-0001-analytics".to_string(),
             text: analytics_text,
-            logo_thumbnail_url: "https://example.com/logos/acme-analytics.png".to_string(),
+            logo: LogoMedia::of_listing("l-0001-analytics"),
             integration_guide: Some("https://example.com/docs/acme-analytics/integrate".to_string()),
             categories: classified_under(&["business-applications", "data-products"]),
             highlights: vec![
@@ -2600,7 +2696,12 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 "Operational reporting",
                 "Publish scheduled operational reports to business teams.",
             )],
-            review_summary: reviews("4.6", 120),
+            // The source keeps a reviews page for this listing, so its summary carries the
+            // `sourceUrl` of that page. Which of the catalog's listings it keeps one for
+            // varies by record: the member is optional and its ABSENCE is what tells a
+            // client not to render a "read the reviews" link, so a catalog where every
+            // listing had one would never show that.
+            reviews: reviews("l-0001-analytics", "4.6", 120, true),
         },
     );
     let mut analytics_product_text = Localized {
@@ -2627,7 +2728,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             listing_id: "l-0001-analytics".to_string(),
             text: analytics_product_text,
             manufacturer: acme.clone(),
-            logo_thumbnail_url: "https://example.com/logos/acme-analytics.png".to_string(),
+            logo: LogoMedia::of_listing("l-0001-analytics"),
             categories: classified_under(&["business-applications"]),
             highlights: vec!["Hosted by the seller".to_string()],
             promotional_media: vec![promotional_image(
@@ -2785,7 +2886,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
         Listing {
             listing_id: "l-0002-firewall".to_string(),
             text: firewall_text,
-            logo_thumbnail_url: "https://example.com/logos/nimbus-firewall.png".to_string(),
+            logo: LogoMedia::of_listing("l-0002-firewall"),
             integration_guide: None,
             categories: classified_under(&["network-infrastructure"]),
             highlights: vec!["Deep packet inspection".to_string()],
@@ -2806,7 +2907,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 "Perimeter security",
                 "Filter inbound and outbound traffic at the VPC edge.",
             )],
-            review_summary: reviews("4.1", 58),
+            reviews: reviews("l-0002-firewall", "4.1", 58, false),
         },
     );
     state.products.insert(
@@ -2824,7 +2925,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 translations: BTreeMap::new(),
             },
             manufacturer: nimbus.clone(),
-            logo_thumbnail_url: "https://example.com/logos/nimbus-firewall.png".to_string(),
+            logo: LogoMedia::of_listing("l-0002-firewall"),
             categories: classified_under(&["network-infrastructure"]),
             highlights: vec!["Runs in your account".to_string()],
             promotional_media: Vec::new(),
@@ -2904,7 +3005,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 ),
                 translations: BTreeMap::new(),
             },
-            logo_thumbnail_url: "https://example.com/logos/orion-feed.png".to_string(),
+            logo: LogoMedia::of_listing("l-0003-datafeed"),
             integration_guide: None,
             categories: classified_under(&["data-products"]),
             highlights: vec!["Covers 40 exchanges".to_string()],
@@ -2925,7 +3026,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 "Portfolio valuation",
                 "Value portfolios against end-of-day reference prices.",
             )],
-            review_summary: reviews("3.8", 11),
+            reviews: reviews("l-0003-datafeed", "3.8", 11, false),
         },
     );
     state.products.insert(
@@ -2943,7 +3044,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 translations: BTreeMap::new(),
             },
             manufacturer: orion.clone(),
-            logo_thumbnail_url: "https://example.com/logos/orion-feed.png".to_string(),
+            logo: LogoMedia::of_listing("l-0003-datafeed"),
             categories: classified_under(&["data-products"]),
             highlights: vec!["Parquet and CSV".to_string()],
             promotional_media: Vec::new(),
@@ -3005,7 +3106,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 ),
                 translations: BTreeMap::new(),
             },
-            logo_thumbnail_url: "https://example.com/logos/zephyr-mlkit.png".to_string(),
+            logo: LogoMedia::of_listing("l-0004-mlkit"),
             integration_guide: Some("https://example.com/docs/zephyr/integrate".to_string()),
             categories: classified_under(&["machine-learning"]),
             highlights: vec![
@@ -3052,7 +3153,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                     "Spot defects on a production line from camera frames.",
                 ),
             ],
-            review_summary: reviews("4.9", 240),
+            reviews: reviews("l-0004-mlkit", "4.9", 240, true),
         },
     );
     state.products.insert(
@@ -3070,7 +3171,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 translations: BTreeMap::new(),
             },
             manufacturer: zephyr.clone(),
-            logo_thumbnail_url: "https://example.com/logos/zephyr-mlkit.png".to_string(),
+            logo: LogoMedia::of_listing("l-0004-mlkit"),
             categories: classified_under(&["machine-learning"]),
             highlights: vec!["GPU and CPU variants".to_string()],
             promotional_media: vec![promotional_video(
@@ -3114,7 +3215,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 translations: BTreeMap::new(),
             },
             manufacturer: zephyr.clone(),
-            logo_thumbnail_url: "https://example.com/logos/zephyr-mlkit.png".to_string(),
+            logo: LogoMedia::of_listing("l-0004-mlkit"),
             categories: classified_under(&["machine-learning"]),
             highlights: vec!["Runs on EKS or ECS".to_string()],
             promotional_media: Vec::new(),
@@ -3176,7 +3277,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 ),
                 translations: BTreeMap::new(),
             },
-            logo_thumbnail_url: "https://example.com/logos/helios-devops.png".to_string(),
+            logo: LogoMedia::of_listing("l-0005-devtools"),
             integration_guide: None,
             categories: classified_under(&["devops"]),
             highlights: vec!["Bring your own licence".to_string()],
@@ -3197,7 +3298,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 "Release automation",
                 "Promote builds between environments with policy gates.",
             )],
-            review_summary: reviews("4.3", 77),
+            reviews: reviews("l-0005-devtools", "4.3", 77, true),
         },
     );
     state.products.insert(
@@ -3215,7 +3316,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 translations: BTreeMap::new(),
             },
             manufacturer: helios.clone(),
-            logo_thumbnail_url: "https://example.com/logos/helios-devops.png".to_string(),
+            logo: LogoMedia::of_listing("l-0005-devtools"),
             categories: classified_under(&["devops"]),
             highlights: vec!["Self hosted".to_string()],
             promotional_media: Vec::new(),
@@ -3289,7 +3390,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 ),
                 translations: BTreeMap::new(),
             },
-            logo_thumbnail_url: "https://example.com/logos/vertex-backup.png".to_string(),
+            logo: LogoMedia::of_listing("l-0006-backup"),
             integration_guide: None,
             categories: classified_under(&["storage"]),
             highlights: vec!["Coverage reporting".to_string()],
@@ -3310,7 +3411,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 "Backup reporting",
                 "Report on backup coverage and restore readiness.",
             )],
-            review_summary: reviews("4.0", 33),
+            reviews: reviews("l-0006-backup", "4.0", 33, false),
         },
     );
     state.products.insert(
@@ -3328,7 +3429,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 translations: BTreeMap::new(),
             },
             manufacturer: vertex.clone(),
-            logo_thumbnail_url: "https://example.com/logos/vertex-backup.png".to_string(),
+            logo: LogoMedia::of_listing("l-0006-backup"),
             categories: classified_under(&["storage"]),
             highlights: vec!["Read-only access".to_string()],
             promotional_media: Vec::new(),
@@ -3649,18 +3750,66 @@ const PRICING_UNIT_DISPLAY_NAMES: &[(&str, &str)] = &[
     ("UNITS", "Units"),
 ];
 
-/// The review summaries the breadth rows carry, taken in turn: `(averageRating,
-/// totalReviews)`. They span the whole 0.0–5.0 rating range the
-/// `MIN`/`MAX_AVERAGE_CUSTOMER_RATING` filters bound, so a rating filter and the
-/// `AVERAGE_CUSTOMER_RATING` facet select some listings and not others.
-const BREADTH_REVIEWS: &[(&str, i64)] = &[
-    ("4.8", 310),
-    ("4.5", 164),
-    ("4.1", 88),
-    ("3.7", 42),
-    ("3.2", 19),
-    ("2.6", 11),
-    ("4.9", 7),
+/// One review record a seeded row carries: what the catalog's review source holds for its
+/// listing.
+///
+/// A row of a derived tier takes one of [`BREADTH_REVIEWS`] in turn, so this type is what a
+/// tier states about a row's reviews and [`seed_rows`] is the one place that turns it into a
+/// stored [`ReviewRecord`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReviewSeed {
+    /// `ReviewSourceSummary$averageRating`.
+    pub average_rating: &'static str,
+    /// `ReviewSourceSummary$totalReviews`.
+    pub total_reviews: i64,
+    /// Whether the source keeps a reviews page for the row's listing, which is what decides
+    /// whether its summary carries the optional `sourceUrl` at all.
+    pub keeps_reviews_page: bool,
+}
+
+/// The review summaries the derived rows carry, taken in turn. They span the whole 0.0–5.0
+/// rating range the `MIN`/`MAX_AVERAGE_CUSTOMER_RATING` filters bound, so a rating filter and
+/// the `AVERAGE_CUSTOMER_RATING` facet select some listings and not others.
+///
+/// Some of them have a reviews page at the source and some have none, because `sourceUrl` is
+/// optional and its ABSENCE is what tells a client not to render a "read the reviews" link:
+/// a catalog whose every listing had one would never exercise that.
+const BREADTH_REVIEWS: &[ReviewSeed] = &[
+    ReviewSeed {
+        average_rating: "4.8",
+        total_reviews: 310,
+        keeps_reviews_page: true,
+    },
+    ReviewSeed {
+        average_rating: "4.5",
+        total_reviews: 164,
+        keeps_reviews_page: false,
+    },
+    ReviewSeed {
+        average_rating: "4.1",
+        total_reviews: 88,
+        keeps_reviews_page: true,
+    },
+    ReviewSeed {
+        average_rating: "3.7",
+        total_reviews: 42,
+        keeps_reviews_page: false,
+    },
+    ReviewSeed {
+        average_rating: "3.2",
+        total_reviews: 19,
+        keeps_reviews_page: true,
+    },
+    ReviewSeed {
+        average_rating: "2.6",
+        total_reviews: 11,
+        keeps_reviews_page: false,
+    },
+    ReviewSeed {
+        average_rating: "4.9",
+        total_reviews: 7,
+        keeps_reviews_page: false,
+    },
 ];
 
 /// The part of a fulfillment option's id that names its TYPE: the type in lower case with
@@ -3839,8 +3988,8 @@ pub(crate) struct CatalogRow<'a> {
     pub pricing_model: (&'a str, &'a str),
     /// Its pricing unit, as `(PricingUnitType, displayName)`.
     pub pricing_unit: (&'a str, &'a str),
-    /// Its review summary, as `(averageRating, totalReviews)`.
-    pub reviews: (&'a str, i64),
+    /// What the catalog's review source holds for its listing.
+    pub reviews: ReviewSeed,
     /// Its fictional support telephone number.
     pub support_phone: &'a str,
     /// Whether its offer belongs to an offer set.
@@ -3878,7 +4027,6 @@ fn seed_rows(
         let publisher = seller(seller_profile_id, seller_name);
         let (model_type, model_name) = row.pricing_model;
         let (unit_type, unit_name) = row.pricing_unit;
-        let (rating, total_reviews) = row.reviews;
 
         let categories = classified_under(row.categories);
         // The row's own deepest category, which is the one its prose names: the expanded
@@ -3897,7 +4045,7 @@ fn seed_rows(
             default: text(row.name, row.short_description, &long_description),
             translations: BTreeMap::new(),
         };
-        let logo = format!("https://example.com/logos/{slug}.png");
+        let logo = LogoMedia::of_listing(&listing_id);
         let docs = format!("https://example.com/docs/{slug}");
         let support_email = format!("support@{slug}.example.com");
         // The row's own number in the `555-01xx` range reserved for fictional use, so the
@@ -3913,7 +4061,7 @@ fn seed_rows(
             Listing {
                 listing_id: listing_id.clone(),
                 text: listing_text.clone(),
-                logo_thumbnail_url: logo.clone(),
+                logo: logo.clone(),
                 integration_guide: None,
                 categories: categories.clone(),
                 highlights: vec![
@@ -3940,7 +4088,12 @@ fn seed_rows(
                         row.short_description
                     ),
                 )],
-                review_summary: reviews(rating, total_reviews),
+                reviews: reviews(
+                    &listing_id,
+                    row.reviews.average_rating,
+                    row.reviews.total_reviews,
+                    row.reviews.keeps_reviews_page,
+                ),
             },
         );
 
@@ -3951,7 +4104,7 @@ fn seed_rows(
                 listing_id: listing_id.clone(),
                 text: listing_text,
                 manufacturer: publisher.clone(),
-                logo_thumbnail_url: logo,
+                logo,
                 categories,
                 highlights: vec![format!("Fulfilled as {fulfillment_name}")],
                 promotional_media: Vec::new(),

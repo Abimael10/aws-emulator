@@ -199,6 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = store.lock();
 
+        // Where the logo thumbnail this response announces is served: the endpoint THIS
+        // request reached the emulator at, because this emulator serves that image itself.
+        let announced = crate::state::announced_page_base(ctx);
+
         let preferred = crate::state::resolve_requested_locale(input.locale.as_deref())
             .map_err(GetProductError::validation)?;
 
@@ -222,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deployed_on_aws: product.deployed_on_aws().to_string(),
             short_description: text.short_description.clone(),
             long_description: text.long_description.clone(),
-            logo_thumbnail_url: product.logo_thumbnail_url.clone(),
+            logo_thumbnail_url: product.logo.announced(&announced),
             // Derived from the product's fulfillment options, the single record of how
             // it is fulfilled, so this list and `ListFulfillmentOptions` cannot disagree.
             fulfillment_option_summaries: product.fulfillment_option_summaries(),
