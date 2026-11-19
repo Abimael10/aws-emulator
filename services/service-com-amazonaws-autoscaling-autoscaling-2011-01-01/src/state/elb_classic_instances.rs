@@ -281,6 +281,112 @@ pub fn attachment_states<Eng: Send + Sync + 'static>(
         .collect()
 }
 
+/// The instances of each group of `groups` whose Classic Load Balancer registration that
+/// service reports as having FAILED the load balancer's health check, keyed by the group's
+/// name.
+///
+/// "`ELB` - Use Elastic Load Balancing health checks" (`HealthCheckType`): a group configured
+/// that way takes the verdict of the load balancer checking its instances as the health of
+/// those instances, and a Classic Load Balancer the group is attached to checks them exactly
+/// as a target group does — so this is the Classic half of the verdict
+/// [`crate::state::elbv2_targets::elb_unhealthy_instances`] reads for a target group, in the
+/// same form, and the two are read together
+/// ([`AutoScalingState::reconcile_elb_instance_health`]).
+///
+/// The verdict itself is never computed here. It is read from the service that performs the
+/// checks ([`elb::LoadBalancer::instance_health`]), whose own thresholds decide it, and only a
+/// registration that failed them for the INSTANCE's own doing ([`elb::REASON_CODE_INSTANCE`])
+/// counts: a registration whose checks are still running is out of service for Elastic Load
+/// Balancing's own reason ([`elb::REASON_CODE_ELB`]), which is no failed check, exactly as a
+/// target group's `initial` is none.
+///
+/// A group that does NOT derive its instances' health from that service (its `HealthCheckType`
+/// names only `EC2`, or it is attached to no Classic Load Balancer) is absent from the answer
+/// rather than present with an empty set: there is no verdict of that service for its
+/// instances, so a caller has nothing to apply to them.
+///
+/// The checks the clock has already made due are run first, exactly as [`attachment_states`]
+/// and that service's own `DescribeInstanceHealth` run them: they were owed at `now` whether
+/// or not anybody called. What one of them observes is read from the account's own Amazon EC2
+/// store BEFORE the Elastic Load Balancing store is locked, and once for every group given, so
+/// the two stores are never held at once — the lock order this module's header states.
+pub fn elb_unhealthy_instances<'a, Eng: Send + Sync + 'static, I>(
+    engine: &Eng,
+    groups: I,
+    now: SystemTime,
+) -> BTreeMap<String, BTreeSet<String>>
+where
+    I: IntoIterator<Item = &'a StoredGroup>,
+{
+    // Only the groups that take their instances' health from that service, and only while
+    // they are attached to something that could report one: for every other group this reads
+    // nothing and locks nothing at all.
+    let deriving: Vec<&StoredGroup> = groups
+        .into_iter()
+        .filter(|group| elb_health_checks_enabled(group) && !attached_names(group).is_empty())
+        .collect();
+    if deriving.is_empty() {
+        return BTreeMap::new();
+    }
+    // The store those verdicts live in, resolved BEFORE anything is observed: with no such
+    // store there is no verdict to read for anybody, so the Amazon EC2 store is not locked for
+    // an answer nothing would be read out of. Resolving the handle takes no lock of either.
+    let Some(state) = elb::service_state(engine) else {
+        return BTreeMap::new();
+    };
+    // What one check of each of those groups' instances observes, read once for all of them —
+    // and before the Elastic Load Balancing store is locked, so the two stores are never held
+    // at once.
+    let instance_ids: BTreeSet<String> = deriving
+        .iter()
+        .flat_map(|group| group.active_instances())
+        .map(|instance| instance.instance_id.clone())
+        .collect();
+    let observed = elb::observe_instances(engine, &instance_ids);
+    let mut store = state.lock();
+    deriving
+        .into_iter()
+        .map(|group| {
+            // Which instance of THIS group each registration stands for, named by the
+            // workload the registration carries: a registration of another group, of another
+            // emulated service's scheduler or of a `RegisterInstancesWithLoadBalancer` caller
+            // stands for no instance of this group and is read for nobody.
+            let owed: BTreeSet<String> = group
+                .active_instances()
+                .map(|instance| workload(&group.arn, &instance.instance_id))
+                .collect();
+            let mut unhealthy: BTreeSet<String> = BTreeSet::new();
+            // A Region this store holds no load balancer of at all reports no failed check of
+            // anybody: the group is answered with the empty set — present, because it IS a
+            // group that derives its instances' health from that service — exactly as an
+            // attachment whose load balancer that service no longer holds reports none.
+            let Some(records) = store.load_balancers_in_mut(&group.region) else {
+                return (group.name.clone(), unhealthy);
+            };
+            for name in attached_names(group) {
+                let Some(record) = records.get_mut(name) else {
+                    continue;
+                };
+                // The checks this load balancer's registrations owed at `now`, run before
+                // their verdicts are read.
+                record.settle_instance_health(&observed, now);
+                for (instance_id, held_for) in record.instances.scheduler_registrations() {
+                    if !owed.contains(&held_for) {
+                        continue;
+                    }
+                    let reported = record.instance_health(&instance_id);
+                    if reported.state == elb::STATE_OUT_OF_SERVICE
+                        && reported.reason_code == elb::REASON_CODE_INSTANCE
+                    {
+                        unhealthy.insert(instance_id);
+                    }
+                }
+            }
+            (group.name.clone(), unhealthy)
+        })
+        .collect()
+}
+
 /// Bring the Classic Load Balancers in line with what the group `group_name` now holds: the
 /// ONE call a write that moved that group's instances or its attachments makes for it.
 ///

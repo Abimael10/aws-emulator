@@ -2053,12 +2053,19 @@ impl AutoScalingState {
     ///
     /// A group whose `HealthCheckType` names `ELB` checks its instances with "Elastic Load
     /// Balancing health checks", so the health of such an instance is DERIVED: it is
-    /// [`HEALTH_STATUS_UNHEALTHY`] exactly while the load balancer reports its target
-    /// unhealthy in a target group the group is attached to
-    /// ([`elbv2_targets::elb_unhealthy_instances`]) and [`HEALTH_STATUS_HEALTHY`] otherwise —
-    /// nothing is stored beside the instance to say so, and the value is recomputed from that
-    /// service's own verdict every time the clock is read. A group that checks its instances
-    /// any other way derives nothing here and is left exactly as it stands.
+    /// [`HEALTH_STATUS_UNHEALTHY`] exactly while a load balancer the group is attached to
+    /// reports that instance's registration as failing its health check, and
+    /// [`HEALTH_STATUS_HEALTHY`] otherwise — nothing is stored beside the instance to say so,
+    /// and the value is recomputed from that service's own verdict every time the clock is
+    /// read. A group that checks its instances any other way derives nothing here and is left
+    /// exactly as it stands.
+    ///
+    /// Whichever FAMILY of load balancer is checking them: the verdict of an Elastic Load
+    /// Balancing v2 target group the group is attached to
+    /// ([`elbv2_targets::elb_unhealthy_instances`]) and the verdict of a Classic Load Balancer
+    /// it is attached to ([`elb_classic_instances::elb_unhealthy_instances`]) are the same
+    /// `ELB` health check, so an instance either of them reports as failing is one this
+    /// group's own health check has found out of service.
     ///
     /// `HealthCheckGracePeriod` is "the amount of time, in seconds, that Amazon EC2 Auto
     /// Scaling waits before checking the health status of an EC2 instance that has come into
@@ -2077,9 +2084,18 @@ impl AutoScalingState {
         engine: &Eng,
         now: SystemTime,
     ) {
-        // Read once for every group, under the other store's lock alone and with no group of
-        // this store borrowed across the write below.
-        let verdicts = elbv2_targets::elb_unhealthy_instances(engine, self.groups.values(), now);
+        // Read once for every group, under the other stores' locks alone and with no group of
+        // this store borrowed across the write below. A group attached to both families
+        // carries the UNION of what the two report: an instance failing the checks of either
+        // load balancer is one the group's `ELB` health check has found out of service, while a
+        // group neither answer names is one no such load balancer checks and is left alone.
+        let mut verdicts =
+            elbv2_targets::elb_unhealthy_instances(engine, self.groups.values(), now);
+        for (group_name, unhealthy) in
+            elb_classic_instances::elb_unhealthy_instances(engine, self.groups.values(), now)
+        {
+            verdicts.entry(group_name).or_default().extend(unhealthy);
+        }
         for (group_name, unhealthy) in verdicts {
             let Some(group) = self.groups.get_mut(&group_name) else {
                 continue;

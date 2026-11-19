@@ -8,7 +8,10 @@
 //! Elastic Load Balancing health checks" the health of a member is the health the load
 //! balancer reports for the TARGET that member occupies, which is the derived value
 //! [`AutoScalingState::reconcile_elb_instance_health`] recomputes from that service's own
-//! verdict ([`super::elbv2_targets::elb_unhealthy_instances`]). What this module owns is the
+//! verdict — the one an Elastic Load Balancing v2 target group reports
+//! ([`super::elbv2_targets::elb_unhealthy_instances`]) and the one a Classic Load Balancer
+//! reports ([`super::elb_classic_instances::elb_unhealthy_instances`]), read together. What
+//! this module owns is the
 //! consequence: "Amazon EC2 Auto Scaling terminates and replaces the unhealthy instance"
 //! (`SetInstanceHealth$HealthStatus`), so a member that verdict leaves reported
 //! [`super::HEALTH_STATUS_UNHEALTHY`] owes the group's health check exactly what a member a
