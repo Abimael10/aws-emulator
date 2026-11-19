@@ -1363,12 +1363,15 @@ async fn a_page_size_outside_the_range_reports_the_bound_it_missed() {
 
 /// The member path a target-tracking policy's predefined metric type is carried at, as a
 /// client spells it in the request.
-const PREDEFINED_METRIC_TYPE_PARAMETER: &str =
+///
+/// THE ONE COPY for this crate's tests: `tests/all/published_enum_value_set_order.rs`
+/// drives the same member over the forms a value can miss its enumerated type in.
+pub(crate) const PREDEFINED_METRIC_TYPE_PARAMETER: &str =
     "TargetTrackingConfiguration.PredefinedMetricSpecification.PredefinedMetricType";
 
 /// The same member as a refusal names it: the path the validating walk reports, in the
 /// lowerCamel spelling every constraint clause of this protocol uses.
-const PREDEFINED_METRIC_TYPE_PATH: &str =
+pub(crate) const PREDEFINED_METRIC_TYPE_PATH: &str =
     "targetTrackingConfiguration.predefinedMetricSpecification.predefinedMetricType";
 
 /// The predefined metric types the SERVICE publishes for that member, in the order it
@@ -1378,7 +1381,11 @@ const PREDEFINED_METRIC_TYPE_PATH: &str =
 /// ships declares four of them (`smithy_query(query="shape",shape="MetricType")`); the
 /// service publishes five — the high-resolution CPU metric as well — and lists them in
 /// this order, which is neither the model's declaration order nor a sort of it.
-const PUBLISHED_METRIC_TYPES: &str = "ASGAverageCPUUtilization, ASGAverageNetworkOut, \
+///
+/// THE ONE COPY for this crate's tests: `tests/all/published_enum_value_set_order.rs`
+/// reads the values back out of this one statement of the set rather than writing them
+/// again.
+pub(crate) const PUBLISHED_METRIC_TYPES: &str = "ASGAverageCPUUtilization, ASGAverageNetworkOut, \
                                       ASGAverageNetworkIn, \
                                       ASGAverageCPUUtilizationHighResolution, \
                                       ALBRequestCountPerTarget";
