@@ -1116,7 +1116,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         var name = error.name === undefined || error.name === null ? 'Error' : String(error.name);
         var message = error.message === undefined || error.message === null
             ? ''
-            : decorated(String(error.message));
+            : decorated(String(error.message), error);
         if (name === '') {
             return message;
         }
@@ -1550,7 +1550,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         }
         var type = typeof error.name === 'string' && error.name !== '' ? error.name : 'Error';
         var message = error.message === undefined ? '' : String(error.message);
-        var trace = traceLines(type + ': ' + decorated(message));
+        var trace = traceLines(type + ': ' + decorated(message, error));
         var frames = tracedFrames(error);
         if (frames !== '') {
             var lines = frames.split('\n');
@@ -1563,7 +1563,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         return {
             outcome: 'raised',
             errorType: type,
-            errorMessage: decorated(message),
+            errorMessage: decorated(message, error),
             trace: trace
         };
     }
@@ -1584,7 +1584,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     }
 
     // The message the RUNTIME reports for an error class whose own wording it states rather
-    // than the engine's. Four of them:
+    // than the engine's. Five of them:
     //
     // * `require` is not a binding of ES module scope, and a module that reaches for it is
     //   told which of the two module systems it is in and what to use instead;
@@ -1597,7 +1597,9 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     //   client reads in the function's log and in the error document the invocation answers.
     //   The class, the property name and the value read are the engine's own; only the
     //   wording is the runtime's.
-    function decorated(message) {
+    // * a CALL of a value that is not callable names the EXPRESSION the call named in front
+    //   of the failure — "<expression> is not a function" ([`calledExpression`]).
+    function decorated(message, error) {
         if (message === 'require is not defined') {
             var told = 'require is not defined in ES module scope, you can use import instead';
             return state !== null && state.esModuleHint !== null && state.esModuleHint !== undefined
@@ -1615,6 +1617,10 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
                     + " (reading '" + access.property + "')"
                 : 'Cannot set properties of ' + access.value
                     + " (setting '" + access.property + "')";
+        }
+        if (message === NOT_A_FUNCTION) {
+            var called = calledExpression(error);
+            return called === null ? message : called + ' is not a function';
         }
         return message;
     }
@@ -1634,6 +1640,285 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             return null;
         }
         return { read: access[1] === 'read', property: access[2], value: access[3] };
+    }
+
+    // What the engine words a CALL of a value that is not callable as: the failure alone,
+    // naming nothing of the call it was made at.
+    var NOT_A_FUNCTION = 'not a function';
+
+    // The characters an identifier, a property name or a number is written with.
+    var WORD = /[A-Za-z0-9_$]/;
+
+    // The EXPRESSION a call that failed named, as the module's own source writes it — what a
+    // managed runtime reports in front of that failure, and `null` where this runtime cannot
+    // read it off the source.
+    //
+    // The engine states the failure alone, and its innermost frame names the position the
+    // call was made at: the property a MEMBER call names, and the start of the expression a
+    // call of any other form names. From that position the expression is read off the line
+    // the frame names — the chain the call is the end of, with any argument list INSIDE it
+    // elided, which is how a managed runtime renders one.
+    //
+    // Reading it is best-effort by nature: a frame of a module this function holds no source
+    // for (the runtime's own), and a position the line does not state a call at, are answered
+    // with nothing at all, so the engine's own wording stands rather than a guessed one.
+    function calledExpression(error) {
+        if (!(error instanceof TypeError)) {
+            return null;
+        }
+        try {
+            var frames = engineFrames(error);
+            var lines = typeof frames === 'string' ? frames.split('\n') : [];
+            var innermost = lines.length === 0 ? null : framePosition(lines[0]);
+            if (innermost === null || innermost.column < 1) {
+                return null;
+            }
+            var text = unitLine(innermost.unit, innermost.line);
+            return text === null ? null : calleeWritten(text, innermost.column - 1);
+        } catch (unreadable) {
+            // The wording of a failure is not itself a failure: an expression that cannot be
+            // read leaves the engine's own message as the one reported.
+            return null;
+        }
+    }
+
+    // The callee of the call written at `at` on `text`: from where the expression begins to
+    // the argument list the call hands it.
+    function calleeWritten(text, at) {
+        var before = lastWordlessBefore(text, at);
+        var connector = before < 0 ? '' : text.charAt(before);
+        var list = null;
+        if (connector === '.') {
+            // A member call: the position is the property, and the list follows it.
+            list = listAfter(text, wordEnd(text, at));
+        } else if (connector === '[') {
+            // A member call through a computed key: the list follows the key's brackets.
+            var closed = groupEnd(text, before);
+            list = closed < 0 ? null : listAfter(text, closed + 1);
+        } else {
+            // Any other call: the position is the start of the callee, whose own chain the
+            // list ends.
+            list = lastListOfChain(text, at);
+        }
+        if (list === null) {
+            return null;
+        }
+        var written = text.slice(calleeStart(text, at), list).trim();
+        return written === '' ? null : elidedLists(written);
+    }
+
+    // The index of the last character before `at` that is not a space, or `-1` for a position
+    // with nothing but spaces in front of it.
+    function lastWordlessBefore(text, at) {
+        var index = at;
+        while (index > 0 && /\s/.test(text.charAt(index - 1))) {
+            index -= 1;
+        }
+        return index - 1;
+    }
+
+    // The index just past the identifier, property name or number written at `from`.
+    function wordEnd(text, from) {
+        var index = from;
+        while (index < text.length && WORD.test(text.charAt(index))) {
+            index += 1;
+        }
+        return index;
+    }
+
+    // The index of the argument list opening at or after `from`, or `null` where what follows
+    // is not a call at all.
+    function listAfter(text, from) {
+        var index = from;
+        while (index < text.length && /\s/.test(text.charAt(index))) {
+            index += 1;
+        }
+        return text.charAt(index) === '(' ? index : null;
+    }
+
+    // The index of the bracket closing the group that opens at `open`, or `-1` for a group
+    // the line does not close. Nested groups and the text of a string literal are stepped
+    // over, so the bracket answered is the one that closes this group.
+    function groupEnd(text, open) {
+        var depth = 0;
+        var index = open;
+        while (index < text.length) {
+            var ch = text.charAt(index);
+            if (ch === "'" || ch === '"' || ch === '`') {
+                index = stringEnd(text, index);
+                continue;
+            }
+            if (ch === '(' || ch === '[' || ch === '{') {
+                depth += 1;
+            } else if (ch === ')' || ch === ']' || ch === '}') {
+                depth -= 1;
+                if (depth === 0) {
+                    return index;
+                }
+            }
+            index += 1;
+        }
+        return -1;
+    }
+
+    // The index just past the string literal that opens at `open`.
+    function stringEnd(text, open) {
+        var quote = text.charAt(open);
+        var index = open + 1;
+        while (index < text.length) {
+            var ch = text.charAt(index);
+            if (ch === '\\') {
+                index += 2;
+                continue;
+            }
+            index += 1;
+            if (ch === quote) {
+                return index;
+            }
+        }
+        return index;
+    }
+
+    // The LAST argument list of the member-and-call chain that starts at `at`: the list of
+    // the call the chain ends in, which is the call that was made of the expression in front
+    // of it. `null` for a chain holding no call at all.
+    function lastListOfChain(text, at) {
+        var index = at;
+        var list = null;
+        while (index < text.length) {
+            var ch = text.charAt(index);
+            if (WORD.test(ch) || ch === '.' || ch === '?') {
+                index += 1;
+                continue;
+            }
+            if (ch === '(' || ch === '[') {
+                var closed = groupEnd(text, index);
+                if (closed < 0) {
+                    return ch === '(' ? index : list;
+                }
+                if (ch === '(') {
+                    list = index;
+                }
+                index = closed + 1;
+                continue;
+            }
+            return list;
+        }
+        return list;
+    }
+
+    // Where the expression a call was made of BEGINS, walking back from the position `at` the
+    // frame names: over each member step and the operand it was taken on, so the whole chain
+    // in front of the call is named and nothing in front of the chain is.
+    function calleeStart(text, at) {
+        var start = at;
+        for (;;) {
+            var before = lastWordlessBefore(text, start);
+            if (before < 0) {
+                return start;
+            }
+            var step = before;
+            var ch = text.charAt(before);
+            if (ch === '.') {
+                // The same step, written as an optional chain.
+                var optional = lastWordlessBefore(text, before);
+                step = optional >= 0 && text.charAt(optional) === '?' ? optional : before;
+            } else if (ch !== '[') {
+                return start;
+            }
+            var operand = operandStart(text, step);
+            if (operand === null) {
+                return start;
+            }
+            start = operand;
+        }
+    }
+
+    // Where the operand that ends just before `before` begins — an identifier or number, a
+    // bracketed group, or a string literal — or `null` for anything else, which is not part of
+    // the chain the call was made on.
+    function operandStart(text, before) {
+        var end = lastWordlessBefore(text, before);
+        if (end < 0) {
+            return null;
+        }
+        var ch = text.charAt(end);
+        if (ch === ')' || ch === ']') {
+            var open = groupStart(text, end);
+            return open < 0 ? null : open;
+        }
+        if (ch === "'" || ch === '"' || ch === '`') {
+            var quoted = stringStart(text, end);
+            return quoted < 0 ? null : quoted;
+        }
+        if (WORD.test(ch)) {
+            var index = end;
+            while (index > 0 && WORD.test(text.charAt(index - 1))) {
+                index -= 1;
+            }
+            return index;
+        }
+        return null;
+    }
+
+    // The index of the bracket that opens the group closing at `close`, or `-1` for a group
+    // the line does not open.
+    function groupStart(text, close) {
+        var depth = 0;
+        var index = close;
+        while (index >= 0) {
+            var ch = text.charAt(index);
+            if (ch === ')' || ch === ']' || ch === '}') {
+                depth += 1;
+            } else if (ch === '(' || ch === '[' || ch === '{') {
+                depth -= 1;
+                if (depth === 0) {
+                    return index;
+                }
+            }
+            index -= 1;
+        }
+        return -1;
+    }
+
+    // The index of the quote that opens the string literal closing at `close`, or `-1` for a
+    // literal the line does not open.
+    function stringStart(text, close) {
+        var quote = text.charAt(close);
+        var index = close - 1;
+        while (index >= 0) {
+            if (text.charAt(index) === quote && text.charAt(index - 1) !== '\\') {
+                return index;
+            }
+            index -= 1;
+        }
+        return -1;
+    }
+
+    // The chain `written` with every argument list in it elided: a managed runtime names what
+    // was called rather than what each call inside it was handed, so a list is reported as the
+    // one it is and not as its arguments.
+    function elidedLists(written) {
+        var out = '';
+        var index = 0;
+        while (index < written.length) {
+            var ch = written.charAt(index);
+            // A `(` that opens a CALL's list follows the expression called; one that opens a
+            // grouped expression follows nothing, and is written as the source has it.
+            var after = index === 0 ? '' : written.charAt(lastWordlessBefore(written, index));
+            if (ch === '(' && (WORD.test(after) || after === ')' || after === ']')) {
+                var closed = groupEnd(written, index);
+                if (closed < 0) {
+                    return out + written.slice(index);
+                }
+                out = out + '(...)';
+                index = closed + 1;
+                continue;
+            }
+            out = out + ch;
+            index += 1;
+        }
+        return out;
     }
 
     // Why the module that is running is being treated as an ES module, when that is the
@@ -2135,7 +2420,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             if (error instanceof SyntaxError) {
                 return runtimeFailure(
                     'Runtime.UserCodeSyntaxError',
-                    'SyntaxError: ' + decorated(error.message)
+                    'SyntaxError: ' + decorated(error.message, error)
                 );
             }
             return raised(error);
