@@ -266,8 +266,9 @@ async fn a_budget_is_held_only_until_its_end_date_has_passed() {
 
 /// RULE: the budget's own resources go with it — the notifications, their subscribers and
 /// its tags are held inside the budget, so once its end date has passed every read and
-/// write of them answers `NotFoundException` too, while an otherwise identical budget
-/// whose end date is ahead keeps serving all of them.
+/// write that RESOLVES the budget answers `NotFoundException` too, while an otherwise
+/// identical budget whose end date is ahead keeps serving all of them. The one read whose
+/// subject is a subscriber SET, not the budget, answers the empty set instead.
 #[tokio::test]
 async fn an_expired_budget_takes_its_notifications_subscribers_and_tags_with_it() {
     let router = router();
@@ -309,17 +310,47 @@ async fn an_expired_budget_takes_its_notifications_subscribers_and_tags_with_it(
             "case {case}: expected CreateBudget to answer 200, got {status} {body}"
         );
 
+        // `DescribeSubscribersForNotification` is deliberately not one of the rows below:
+        // its subject is the subscriber set the request addresses, and an addressee nothing
+        // is stored for carries none, so the expired budget's notification reads as having
+        // no subscribers — HTTP 200 with the optional `Subscribers` member left out — while
+        // the live budget still reports the subscriber it was created with. Read before the
+        // writes below, which move that notification to another identity.
+        let (status, body) = call(
+            &router,
+            "DescribeSubscribersForNotification",
+            &json!({
+                "AccountId": &account_id,
+                "BudgetName": case,
+                "Notification": notification.clone()
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case} DescribeSubscribersForNotification: expected 200, got {status} {body}"
+        );
+        let addresses: Vec<&str> = body["Subscribers"]
+            .as_array()
+            .map(|held| {
+                held.iter()
+                    .filter_map(|entry| entry["Address"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let expected: Vec<&str> = if expired {
+            Vec::new()
+        } else {
+            vec!["ops@example.com"]
+        };
+        assert_eq!(
+            addresses, expected,
+            "case {case}: expected the subscribers {expected:?}, got {body}"
+        );
+
         let named = json!({"AccountId": &account_id, "BudgetName": case});
         let requests: Vec<(&str, Value)> = vec![
             ("DescribeNotificationsForBudget", named.clone()),
-            (
-                "DescribeSubscribersForNotification",
-                json!({
-                    "AccountId": &account_id,
-                    "BudgetName": case,
-                    "Notification": notification.clone()
-                }),
-            ),
             (
                 "ListTagsForResource",
                 json!({"ResourceARN": budget_arn(&account_id, case)}),

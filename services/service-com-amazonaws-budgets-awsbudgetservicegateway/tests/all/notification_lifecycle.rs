@@ -606,10 +606,11 @@ async fn what_a_notification_alerts_on_is_its_identity() {
 }
 
 /// RULE 3: a notification belongs to a budget — "you must create the budget before you
-/// create the associated notification" — so a call naming a budget the account does not
+/// create the associated notification" — so a WRITE naming a budget the account does not
 /// hold is refused with `NotFoundException` and stores nothing. Reading the subscribers of
-/// a notification THAT budget does not hold is not such a call: the notification holds no
-/// subscribers, which the read reports as the empty set.
+/// a notification is not such a call: the read reports the subscriber set the request
+/// addresses, and an addressee that is not stored — the notification, or the budget it
+/// would belong to — holds none, which the read reports as the empty set.
 ///
 /// The rows differ along WHAT is missing: the budget name, and the notification itself.
 #[tokio::test]
@@ -654,15 +655,6 @@ async fn a_notification_needs_the_budget_that_owns_it() {
                 "Subscribers": [email_subscriber(0)]
             }),
         ),
-        (
-            "read subscribers for a budget that does not exist",
-            "DescribeSubscribersForNotification",
-            json!({
-                "AccountId": &account_id,
-                "BudgetName": "no-such-budget",
-                "Notification": &present
-            }),
-        ),
     ] {
         let (status, body) = call(&router, operation, &request).await;
         assert_eq!(
@@ -675,30 +667,46 @@ async fn a_notification_needs_the_budget_that_owns_it() {
         );
     }
 
-    // The notification the budget does not hold is the OTHER half of the rule: the budget
-    // exists, so there is a subscriber set to report for the notification addressed, and
-    // that set is empty — `Subscribers` is `@length(min: 1)`, so the empty set is the
-    // member left out.
-    let (status, body) = call(
-        &router,
-        "DescribeSubscribersForNotification",
-        &json!({
-            "AccountId": &account_id,
-            "BudgetName": name,
-            "Notification": &absent
-        }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case \"read subscribers of a notification the budget does not hold\": expected 200, \
-         got {status} {body}"
-    );
-    assert!(
-        body.get("Subscribers").is_none_or(Value::is_null),
-        "case \"read subscribers of a notification the budget does not hold\": expected no \
-         Subscribers member, got {body}"
-    );
+    // The reads are the OTHER half of the rule: whatever the request addresses that is not
+    // stored — a notification this budget does not hold, or a budget name the account holds
+    // nothing under — has an empty subscriber set to report, and `Subscribers` is
+    // `@length(min: 1)`, so the empty set is the member left out.
+    for (case, budget_name, wanted) in [
+        (
+            "read subscribers of a notification the budget does not hold",
+            name,
+            &absent,
+        ),
+        (
+            "read subscribers for a budget that does not exist",
+            "no-such-budget",
+            &present,
+        ),
+        (
+            "read subscribers for a budget name whose case does not match the stored one",
+            "OWNED",
+            &present,
+        ),
+    ] {
+        let (status, body) = call(
+            &router,
+            "DescribeSubscribersForNotification",
+            &json!({
+                "AccountId": &account_id,
+                "BudgetName": budget_name,
+                "Notification": wanted
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} {body}"
+        );
+        assert!(
+            body.get("Subscribers").is_none_or(Value::is_null),
+            "case {case:?}: expected no Subscribers member, got {body}"
+        );
+    }
 
     // Nothing the refusals named was created: the budget still holds exactly the one
     // notification, and no budget was brought into being by a refused call.

@@ -4,11 +4,12 @@
 //!
 //! Reports the subscribers stored for ONE notification of a budget, a page at a time.
 //! The notification is addressed by what it alerts on
-//! ([`crate::state::same_notification`]), since it carries no id; a budget this account
-//! does not hold is `NotFoundException`, while a notification that budget does not hold
-//! holds no subscribers, which is the EMPTY set this read reports by leaving the
-//! optional `Subscribers` member out — the list is `@length(min: 1)`, so no empty list
-//! can be serialized for it. This is a pure read: nothing about the budget changes.
+//! ([`crate::state::same_notification`]), since it carries no id. Whatever the request
+//! addresses and the account does not hold — a notification the budget does not hold,
+//! or a budget name nothing is stored under — holds no subscribers, which is the EMPTY
+//! set this read reports by leaving the optional `Subscribers` member out: the list is
+//! `@length(min: 1)`, so no empty list can be serialized for it. This is a pure read:
+//! nothing about the budget changes.
 //!
 //! ## Shape of an operation
 //!
@@ -198,23 +199,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let store = crate::state::store_at(&state, now);
-        let stored = store
+        // This read answers with the subscriber set the request ADDRESSES, and an
+        // addressee the account does not hold carries no subscribers: a notification the
+        // budget does not hold (a notification exists only as the set of subscribers
+        // attached to it — `Subscribers` is `@length(min: 1)`, so deleting the last one
+        // takes the notification with it), and a budget name nothing is stored under
+        // (one deleted, one expired, one never created: the store tells them apart from
+        // each other no more than from a notification that is gone) both resolve to the
+        // EMPTY set, reported below. Nothing has to exist for "which subscribers does
+        // this notification have" to have an answer, so this read refuses no request for
+        // an absent resource — unlike the sibling read of a budget's notifications,
+        // whose subject IS the budget.
+        let subscribers = store
             .budgets
             .get(&(input.account_id.clone(), input.budget_name.clone()))
-            .ok_or_else(|| {
-                DescribeSubscribersForNotificationErrorModeled::NotFoundException(
-                    NotFoundException {
-                        message: Some(crate::state::budget_not_found(&input.budget_name)),
-                    },
-                )
-            })?;
-        // A notification carries no subscribers of its own once the budget no longer
-        // holds it — a notification exists only as the set of subscribers attached to it
-        // (`Subscribers` is `@length(min: 1)`, so deleting the last one takes the
-        // notification with it) — so this read reports the subscribers the addressed
-        // notification has, which for one the budget does not hold is NONE. The read
-        // itself succeeds: only the budget has to exist for there to be a set to report.
-        let subscribers = crate::state::find_notification(stored, &input.notification)
+            .and_then(|stored| crate::state::find_notification(stored, &input.notification))
             .map(|held| held.subscribers.clone())
             .unwrap_or_default();
 

@@ -2160,9 +2160,10 @@ fn budget_deletion_due(stored: &StoredBudget, now: SystemTime) -> bool {
 /// never comes back, so no later caller sees a budget this one did not.
 ///
 /// Every operation that reaches this store runs it first ([`store_at`]), so a budget past
-/// its end date is absent from every listing, resolves to the `NotFoundException` a budget
-/// that does not exist resolves to, and stops counting against the account's budget quota
-/// ([`budget_count_for_account`]).
+/// its end date is absent from every listing, is answered exactly as a budget that was
+/// never created is answered — the `NotFoundException` on each call that resolves the
+/// budget, the empty subscriber set on the read whose subject is a subscriber set — and
+/// stops counting against the account's budget quota ([`budget_count_for_account`]).
 fn expire_due_budgets(
     state: &mut ComAmazonawsBudgetsAwsbudgetservicegatewayState,
     now: SystemTime,

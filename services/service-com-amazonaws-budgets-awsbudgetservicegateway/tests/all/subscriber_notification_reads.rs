@@ -11,9 +11,10 @@
 //!
 //! 1. The subscribers reported are exactly the list stored for the notification of the
 //!    budget the request addresses — the account, the budget name and what the
-//!    notification alerts on together — in stored order; a notification that budget does
-//!    not hold holds no subscribers, which is the empty set the read reports by leaving
-//!    `Subscribers` out, and a budget the account does not hold is `NotFoundException`.
+//!    notification alerts on together — in stored order; an addressee the account does
+//!    not hold, be it a notification that budget does not hold or a budget name nothing
+//!    is stored under, holds no subscribers, which is the empty set the read reports by
+//!    leaving `Subscribers` out.
 //! 2. The page size and the continuation token are the modelled ones: a `MaxResults`
 //!    inside the published `@range` caps a page and the pages concatenate to the stored
 //!    list, one past either published bound is refused at request validation, a
@@ -150,9 +151,9 @@ struct Scope {
 }
 
 /// RULE 1: the subscribers reported are exactly those stored for the notification of the
-/// budget the request addresses, in stored order — a notification the budget does not hold
-/// reports no subscribers rather than another notification's, and a budget the account
-/// does not hold is `NotFoundException`.
+/// budget the request addresses, in stored order — an addressee the account does not hold,
+/// a notification the budget does not hold or a budget name nothing is stored under,
+/// reports no subscribers rather than another notification's.
 ///
 /// The rows span what the addressing generalises over: one account holding two budgets,
 /// each budget holding a different subset of the notification catalog, every cell with
@@ -240,7 +241,8 @@ async fn subscribers_are_reported_for_the_addressed_notification_only() {
         }
     }
 
-    // The budget itself has to be one this account holds.
+    // A budget name the account holds nothing under is addressed the same way: the set it
+    // would hold is empty, so the read answers 200 with `Subscribers` left out.
     for (case, budget_name) in [
         ("a budget name the account holds nothing under", "absent-name"),
         ("a stored name in another case", "FIRST-NAME"),
@@ -248,12 +250,12 @@ async fn subscribers_are_reported_for_the_addressed_notification_only() {
         let (status, body) =
             read_subscribers(&router, &only, budget_name, &catalog[0], None, None).await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: expected the refusal at 400, got {status} {body}"
+            status, 200,
+            "case {case:?}: expected 200, got {status} {body}"
         );
         assert!(
-            is_error(&body, "NotFoundException"),
-            "case {case:?}: expected NotFoundException, got {body}"
+            body.get("Subscribers").is_none_or(Value::is_null),
+            "case {case:?}: expected no Subscribers member, got {body}"
         );
     }
 }
