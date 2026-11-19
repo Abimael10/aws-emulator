@@ -1494,10 +1494,11 @@ impl ComAmazonawsEc2Amazonec2State {
         self.materialize_due_ipam_scope_deletions(now);
         // The resources whose own record carries the move the clock owes it
         // ([`PendingStateMove`]): a transit gateway attachment an acceptance or a rejection
-        // left transient, one subnet association of a multicast domain, a route table
-        // announcement a delete started on, and a BYOIP range whose advertisement was asked
-        // for. Each move was due at its instant whether or not anybody called, so applying
-        // it here changes nothing a later caller would not have seen anyway.
+        // left transient, a multicast domain a create left `pending` and one subnet
+        // association of such a domain, a route table announcement a delete started on, and a
+        // BYOIP range whose advertisement was asked for. Each move was due at its instant
+        // whether or not anybody called, so applying it here changes nothing a later caller
+        // would not have seen anyway.
         for record in self.transit_gateway_attachments.values_mut() {
             if let Some(state) = record
                 .pending
@@ -1510,6 +1511,17 @@ impl ComAmazonawsEc2Amazonec2State {
             }
         }
         for domain in self.transit_gateway_multicast_domains.values_mut() {
+            // The domain's OWN move first: one a create answered `pending` is `available`
+            // once its due instant has passed, whether or not anybody called.
+            if let Some(state) = domain
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            {
+                domain.state = state;
+                domain.pending = None;
+            }
             for association in &mut domain.associations {
                 if let Some(state) = association
                     .pending

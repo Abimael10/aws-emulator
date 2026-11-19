@@ -1447,19 +1447,108 @@ pub const MULTICAST_ASSOCIATION_STATE_ASSOCIATING: &str = "associating";
 pub const MULTICAST_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
 
 /// One transit gateway multicast domain and the resources associated with it.
+///
+/// Every member of the modelled `TransitGatewayMulticastDomain` is optional, and the facts a
+/// CREATE records for a domain — its ARN, the options it was created with, when it was
+/// created and the tags it carries — are held here exactly that way: a record a path wrote
+/// without one holds `None` for it and every reader reports it absent rather than inventing
+/// a value.
 #[derive(Debug, Clone)]
 pub struct TransitGatewayMulticastDomainRecord {
     /// The domain's own id, minted by the store.
     pub transit_gateway_multicast_domain_id: String,
     /// The transit gateway the domain belongs to.
     pub transit_gateway_id: String,
+    /// "The Amazon Resource Name (ARN) of the transit gateway multicast domain"
+    /// (`TransitGatewayMulticastDomain$TransitGatewayMulticastDomainArn`), derived by the
+    /// writer from the Region the create was signed for.
+    pub transit_gateway_multicast_domain_arn: Option<String>,
     /// The account that owns the domain.
     pub owner_id: String,
+    /// "The options for the transit gateway multicast domain"
+    /// (`TransitGatewayMulticastDomain$Options`), as the create resolved them.
+    pub options: Option<TransitGatewayMulticastDomainOptions>,
     /// The domain's state, a member of `TransitGatewayMulticastDomainState`.
     pub state: String,
+    /// "The time the transit gateway multicast domain was created"
+    /// (`TransitGatewayMulticastDomain$CreationTime`).
+    pub creation_time: Option<::aws_smithy_types::DateTime>,
+    /// "The tags for the transit gateway multicast domain"
+    /// (`TransitGatewayMulticastDomain$Tags`), as its create assigned them.
+    pub tags: Option<Vec<Tag>>,
     /// The subnet associations of the domain, one per (attachment, subnet).
     pub associations: Vec<MulticastDomainAssociationRecord>,
+    /// The move to [`TRANSIT_GATEWAY_MULTICAST_DOMAIN_STATE_AVAILABLE`] the clock owes a
+    /// domain a create answered in the transient
+    /// [`TRANSIT_GATEWAY_MULTICAST_DOMAIN_STATE_PENDING`] state.
+    pub pending: Option<PendingStateMove>,
 }
+
+/// A domain a create has started on: the `TransitGatewayMulticastDomainState` enum's
+/// `pending` member (`smithy_query(query="shape",shape="TransitGatewayMulticastDomainState")`,
+/// whose values are `pending | available | deleting | deleted`).
+pub const TRANSIT_GATEWAY_MULTICAST_DOMAIN_STATE_PENDING: &str = "pending";
+
+/// A domain in service: that enum's `available` member.
+pub const TRANSIT_GATEWAY_MULTICAST_DOMAIN_STATE_AVAILABLE: &str = "available";
+
+impl TransitGatewayMulticastDomainRecord {
+    /// The modelled `TransitGatewayMulticastDomain` a report of this record answers with.
+    ///
+    /// The ONE projection of a stored domain, on the contract of
+    /// [`MulticastDomainAssociationRecord::view`]: the create that mints a domain and every
+    /// later reader of it answer with this, so they cannot report one domain differently. A
+    /// member the record holds no fact for is reported ABSENT rather than invented.
+    pub fn view(&self) -> TransitGatewayMulticastDomain {
+        TransitGatewayMulticastDomain {
+            transit_gateway_multicast_domain_id: Some(
+                self.transit_gateway_multicast_domain_id.clone(),
+            ),
+            transit_gateway_id: Some(self.transit_gateway_id.clone()),
+            transit_gateway_multicast_domain_arn: self
+                .transit_gateway_multicast_domain_arn
+                .clone(),
+            owner_id: Some(self.owner_id.clone()),
+            options: self.options.clone(),
+            state: Some(self.state.clone()),
+            creation_time: self.creation_time,
+            tags: self.tags.clone(),
+        }
+    }
+}
+
+/// What `CreateTransitGatewayMulticastDomain` asks the store for: the facts the REQUEST
+/// carries about a new multicast domain, and nothing the service itself owns.
+///
+/// Everything else a stored domain holds — its id, its ARN, the owning account, the state it
+/// starts in and the move the clock owes it — is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_created_transit_gateway_multicast_domain`], so a
+/// caller cannot choose any of it.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayMulticastDomainSpec {
+    /// "The ID of the transit gateway"
+    /// (`CreateTransitGatewayMulticastDomainRequest$TransitGatewayId`) the domain is created
+    /// on, already resolved against the store by the handler.
+    pub transit_gateway_id: String,
+    /// The Region the request was signed for, which the domain's ARN names.
+    pub region: String,
+    /// When the domain was created, which it reports as its `CreationTime`.
+    pub created_at: SystemTime,
+    /// "The options for the transit gateway multicast domain"
+    /// (`CreateTransitGatewayMulticastDomainRequest$Options`), each member resolved to the
+    /// value the request asked for or to its default.
+    pub options: TransitGatewayMulticastDomainOptions,
+    /// "The tags for the transit gateway multicast domain"
+    /// (`CreateTransitGatewayMulticastDomainRequest$TagSpecifications`), read out of the
+    /// specifications by the one reader every create holds its tags to.
+    pub tags: Vec<Tag>,
+}
+
+/// The `ResourceType` a transit gateway multicast domain is named by, as the `ResourceType`
+/// enum spells it (`smithy_query(query="shape",shape="ResourceType")`): the type a
+/// `TagSpecification` of its create may name, and the resource part of its ARN.
+pub const RESOURCE_TYPE_TRANSIT_GATEWAY_MULTICAST_DOMAIN: &str =
+    "transit-gateway-multicast-domain";
 
 /// Refuse a request that named a transit gateway multicast domain id no domain of the
 /// account has: HTTP 400 [`INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_NOT_FOUND`].

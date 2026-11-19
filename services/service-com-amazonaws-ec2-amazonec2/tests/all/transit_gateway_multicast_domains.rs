@@ -18,10 +18,10 @@
 //! holds, which selector the request uses, how many ids it names, and how large a page it
 //! asks for (both published bounds of `TransitGatewayMaxResults` and one past each). The
 //! domains are seeded through the store's own writer
-//! (`insert_transit_gateway_multicast_domain`), because
-//! `CreateTransitGatewayMulticastDomain` is still a scaffold stub — which is also why a
-//! stored domain carries no ARN, options, creation time or tags for this describe to report:
-//! nothing has recorded them, and a describe reports what the store holds.
+//! (`insert_transit_gateway_multicast_domain`) so a row can put one in any state the catalog
+//! publishes — and seeded rather than created, so a stored domain here carries no ARN,
+//! options, creation time or tags for this describe to report: a describe reports what the
+//! store holds. What a CREATED domain reports is the create suite's own cover.
 
 use ec2::ops::types::TRANSIT_GATEWAY_MULTICAST_DOMAIN_STATE_VALUES;
 use ec2::state::{
@@ -108,9 +108,17 @@ fn seed(engine: &engine::InMemoryEngine) -> Vec<String> {
                 // The store mints the id; what a writer puts here is replaced by it.
                 transit_gateway_multicast_domain_id: String::new(),
                 transit_gateway_id: fixture.transit_gateway_id.to_string(),
+                // Seeded rather than created, so the facts a create records — the ARN, the
+                // options, the creation time and the tags — carry no value here, which is
+                // what the absence assertions below are written against.
+                transit_gateway_multicast_domain_arn: None,
                 owner_id: engine::emulator_account_id().to_string(),
+                options: None,
                 state: fixture.state.to_string(),
+                creation_time: None,
+                tags: None,
                 associations: Vec::new(),
+                pending: None,
             })
             .expect("the store holds the seeded multicast domain");
         ids.push(domain_id);
@@ -188,10 +196,10 @@ fn has_member(case: &str, body: &str, name: &str) -> bool {
 /// gateway it belongs to, the account that owns it and the state it is in. One row per seeded
 /// domain, so no single domain is the specification.
 ///
-/// The members a stored record holds no fact for — `transitGatewayMulticastDomainArn`,
-/// `options`, `creationTime` and `tagSet` — are asserted ABSENT: nothing in this emulator has
-/// recorded them (`CreateTransitGatewayMulticastDomain` is still a scaffold stub), and a
-/// describe must report what the store holds rather than invent a value for it.
+/// The members a stored domain holds no fact for — `transitGatewayMulticastDomainArn`,
+/// `options`, `creationTime` and `tagSet` — are asserted ABSENT: these domains were seeded
+/// rather than created, so nothing recorded those facts, and a describe must report what the
+/// store holds rather than invent a value for it.
 #[tokio::test]
 async fn every_fact_a_stored_domain_carries_reads_back() {
     let (router, _engine, ids) = seeded();

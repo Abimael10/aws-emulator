@@ -298,10 +298,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 continue;
             }
-            // The modelled shape this record is reported as, built from the facts the store
-            // holds about the domain and from nothing else: a member no stored record
-            // carries is reported absent rather than invented here.
-            let domain = domain_view(record);
+            // The modelled shape this record is reported as, through the ONE projection of a
+            // stored domain (`TransitGatewayMulticastDomainRecord::view`), so this describe
+            // and the create that minted the domain cannot report it differently: a member no
+            // stored record carries is reported absent rather than invented.
+            let domain = record.view();
             if state::matches_every_filter(&compiled, &mut budget, &|name| {
                 filter_values(&domain, name)
             }) {
@@ -368,29 +369,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             next_token,
         })
-    }
-}
-
-/// The modelled [`TransitGatewayMulticastDomain`] one stored record is reported as.
-///
-/// Every member comes from the record: the id the store minted, the transit gateway the
-/// domain belongs to, the account that owns it and the state it is in. The members the
-/// stored record carries no fact for — the domain's ARN, its options, its creation time and
-/// its tags — are left ABSENT rather than invented, because nothing in this emulator has
-/// recorded them: `CreateTransitGatewayMulticastDomain`, the operation that would, is still
-/// a scaffold stub (`src/ops/create_transit_gateway_multicast_domain.rs`), and a describe
-/// reports what the store holds.
-fn domain_view(
-    record: &crate::state::TransitGatewayMulticastDomainRecord,
-) -> TransitGatewayMulticastDomain {
-    TransitGatewayMulticastDomain {
-        transit_gateway_multicast_domain_id: Some(
-            record.transit_gateway_multicast_domain_id.clone(),
-        ),
-        transit_gateway_id: Some(record.transit_gateway_id.clone()),
-        owner_id: Some(record.owner_id.clone()),
-        state: Some(record.state.clone()),
-        ..Default::default()
     }
 }
 

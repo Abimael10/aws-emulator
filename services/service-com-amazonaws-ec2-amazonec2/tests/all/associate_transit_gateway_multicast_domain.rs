@@ -17,9 +17,8 @@
 //! request names, in which order, whether it repeats one, which of the three resources
 //! cannot be resolved, whether a named value is an id of its kind at all, which state the
 //! attachment is in, and whether the subnet is one the attachment can reach. The multicast
-//! domain and the attachment are seeded through the store's own writers, because
-//! `CreateTransitGatewayMulticastDomain` and `CreateTransitGatewayVpcAttachment` are still
-//! scaffold stubs with issues of their own; the VPCs and subnets are created over the wire.
+//! domain and the attachment are seeded through the store's own writers, so a row can put
+//! each in any state the catalog publishes; the VPCs and subnets are created over the wire.
 
 use std::time::Duration;
 
@@ -193,10 +192,16 @@ async fn fixture(router: &MultiServiceRouter, engine: &engine::InMemoryEngine) -
             // The store mints the id; what a writer puts here is replaced by it.
             transit_gateway_multicast_domain_id: String::new(),
             transit_gateway_id: "tgw-0123456789abcdef0".to_string(),
+            // Seeded rather than created, so the facts a create records carry no value here.
+            transit_gateway_multicast_domain_arn: None,
             owner_id: engine::emulator_account_id().to_string(),
+            options: None,
             // The `TransitGatewayMulticastDomainState` enum's `available` member.
             state: "available".to_string(),
+            creation_time: None,
+            tags: None,
             associations: Vec::new(),
+            pending: None,
         })
         .expect("the store holds the seeded multicast domain");
     drop(guard);

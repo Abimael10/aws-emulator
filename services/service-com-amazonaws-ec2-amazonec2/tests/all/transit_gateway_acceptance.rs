@@ -455,10 +455,16 @@ fn seed_multicast_domain(engine: &engine::InMemoryEngine) -> (String, Vec<String
         .insert_transit_gateway_multicast_domain(TransitGatewayMulticastDomainRecord {
             transit_gateway_multicast_domain_id: String::new(),
             transit_gateway_id: "tgw-0123456789abcdef0".to_string(),
+            // Seeded rather than created, so the facts a create records carry no value here.
+            transit_gateway_multicast_domain_arn: None,
             owner_id: engine::emulator_account_id().to_string(),
+            options: None,
             // The `TransitGatewayMulticastDomainState` enum's `available` member.
             state: "available".to_string(),
+            creation_time: None,
+            tags: None,
             associations,
+            pending: None,
         })
         .expect("the store holds the seeded multicast domain");
     (domain_id, attachments)

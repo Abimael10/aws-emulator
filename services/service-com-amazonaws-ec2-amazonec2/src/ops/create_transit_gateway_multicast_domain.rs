@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGatewayMulticastDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGatewayMulticastDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGatewayMulticastDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -140,10 +131,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; a multicast domain is a resource OF the
-        // gateway the request names, so nothing here is read off it. The store is reached
-        // through the engine held on `self`.
-        let _ = ctx;
+        // `ctx` carries request metadata only; the one thing read off it is the Region the
+        // request was signed for, which the domain's ARN names. The store is reached through
+        // the engine held on `self`.
+        use ::std::time::SystemTime;
+
         use crate::state;
 
         // "The ID of the transit gateway" (`TransitGatewayId`) is `@required` but modelled
@@ -159,11 +151,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The tags for the transit gateway multicast domain" (`TagSpecifications`) — "you
         // must specify the resource type to tag, otherwise the request will fail"
         // (`TagSpecification`), and the only type this action tags is the domain it creates.
-        let _tags: Vec<Tag> = state::tags_from_specifications(
+        let tags: Vec<Tag> = state::tags_from_specifications(
             input.tag_specifications.as_deref(),
-            RESOURCE_TYPE_TRANSIT_GATEWAY_MULTICAST_DOMAIN,
+            state::RESOURCE_TYPE_TRANSIT_GATEWAY_MULTICAST_DOMAIN,
             Self::NAME,
         )?;
+
+        // "The options for the transit gateway multicast domain" (`Options`): each member is
+        // a switch whose enum publishes exactly `enable` and `disable`
+        // (`smithy_query(query="shape",shape="Igmpv2SupportValue")` and the two beside it),
+        // read by the one reader this crate holds such an option to — so a spelling outside
+        // the enum is refused rather than stored and reported back as the domain's own
+        // setting, and a member the request leaves out is the option turned OFF rather than
+        // a value nothing asked for.
+        let requested = input.options.as_ref();
+        let options = TransitGatewayMulticastDomainOptions {
+            igmpv2_support: Some(domain_option(
+                requested.and_then(|options| options.igmpv2_support.as_deref()),
+                "igmpv2Support",
+            )?),
+            static_sources_support: Some(domain_option(
+                requested.and_then(|options| options.static_sources_support.as_deref()),
+                "staticSourcesSupport",
+            )?),
+            auto_accept_shared_associations: Some(domain_option(
+                requested.and_then(|options| options.auto_accept_shared_associations.as_deref()),
+                "autoAcceptSharedAssociations",
+            )?),
+        };
 
         // "Checks whether you have the required permissions for the action, WITHOUT
         // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
@@ -185,21 +200,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no gateway for has nothing to create a domain on. Resolved against the store
         // alone — the one refusal `DescribeTransitGateways` answers for a `TransitGatewayId`
         // it cannot resolve, so one resource family reads one way.
-        if !store.transit_gateways.contains_key(&input.transit_gateway_id) {
+        let Some(transit_gateway_state) = store
+            .transit_gateways
+            .get(&input.transit_gateway_id)
+            .map(|gateway| gateway.state.clone().unwrap_or_default())
+        else {
             return Err(state::invalid_transit_gateway_id_not_found(
                 &input.transit_gateway_id,
             ));
+        };
+
+        // "The transit gateway must be in the AVAILABLE state before you create a domain": a
+        // gateway still being created — or one the lifecycle has moved past service — carries
+        // no domain, which is a refusal for the STATE a resource is in and so EC2's
+        // `IncorrectState`. This is why the clock-owed `pending` -> `available` move was
+        // applied above: the answer is about the state the gateway is actually in.
+        if transit_gateway_state != state::TRANSIT_GATEWAY_STATE_AVAILABLE {
+            return Err(state::incorrect_state(format!(
+                "The transit gateway '{transit_gateway_id}' is in state \
+                 '{transit_gateway_state}'; a multicast domain can only be created on a \
+                 transit gateway in state '{available}'",
+                transit_gateway_id = input.transit_gateway_id,
+                available = state::TRANSIT_GATEWAY_STATE_AVAILABLE,
+            )));
         }
 
-        // Storing the domain itself is still unwritten, so the operation answers the
-        // scaffold's 501 rather than a success it cannot back with state. Every refusal the
-        // request earns is minted above, before this point, so a client learns that its
-        // input is wrong from the code the real service answers rather than from this.
-        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
+        // A count ceiling first, then the byte budget: a record count on its own admits tags
+        // of any length, and a byte budget on its own admits records without end. The writer
+        // asks the same count predicate and answers `None` for it, so this is the refusal the
+        // caller sees rather than a second rule.
+        if !store.has_transit_gateway_multicast_domain_capacity() {
+            return Err(store_is_full(store.transit_gateway_multicast_domains.len()));
+        }
+        // The bytes this domain would add to the store, charged against the crate's one byte
+        // budget BEFORE the write: the tags are a new domain's only caller-chosen bytes, on
+        // top of the fixed overhead every stored record costs, which is exactly what the
+        // writer charges — so the pre-check and the charge cannot drift apart.
+        let payload_bytes = state::STORED_RECORD_OVERHEAD_BYTES + state::tag_list_bytes(&tags);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {maximum} bytes of caller-supplied \
+                 data, so it cannot store another transit gateway multicast domain",
+                held = store.stored_bytes(),
+                maximum = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The record itself, built the one way this crate builds a multicast domain: the id,
+        // the ARN, the owning account, the `pending` state and the clock-owed `available`
+        // move all come from the store, never from the request.
+        let Some(domain) = store.insert_created_transit_gateway_multicast_domain(
+            state::TransitGatewayMulticastDomainSpec {
+                transit_gateway_id: input.transit_gateway_id.clone(),
+                region: state::request_region(ctx.parts()),
+                created_at: SystemTime::now(),
+                options,
+                tags,
+            },
+        ) else {
+            // Unreachable: the ceiling was asked above, and the store is locked throughout.
+            // Kept as the backstop that keeps a full store from reading as a 200, worded by
+            // the ONE definition of that refusal so the two cannot drift apart.
+            return Err(store_is_full(store.transit_gateway_multicast_domains.len()));
+        };
+
+        // "Information about the transit gateway multicast domain"
+        // (`TransitGatewayMulticastDomain`): the record as it was stored, through the one
+        // projection every reader of a domain answers with, so this create and
+        // `DescribeTransitGatewayMulticastDomains` cannot report it differently.
+        Ok(CreateTransitGatewayMulticastDomainOutput {
+            transit_gateway_multicast_domain: Some(domain.view()),
+        })
     }
 }
 
-/// The `ResourceType` a `TagSpecification` of this action may name: the multicast domain it
-/// creates, as the `ResourceType` enum spells it
-/// (`smithy_query(query="shape",shape="ResourceType")`).
-const RESOURCE_TYPE_TRANSIT_GATEWAY_MULTICAST_DOMAIN: &str = "transit-gateway-multicast-domain";
+/// One `enable`/`disable` member of `Options`: the value the request asked for, or `disable`
+/// for a member it left out.
+///
+/// The value itself is read by the one reader this crate holds an `enable`/`disable` transit
+/// gateway option to ([`crate::state::transit_gateway_option_value`]), so a value no enum
+/// publishes cannot reach the store whatever reaches this handler. An option nothing asked to
+/// turn on is OFF: each of these members switches a capability of the domain on, and a domain
+/// created without naming one does not carry it.
+fn domain_option(
+    requested: Option<&str>,
+    member: &str,
+) -> Result<String, CreateTransitGatewayMulticastDomainError> {
+    match requested {
+        None => Ok(crate::state::OPTION_DISABLE.to_string()),
+        Some(value) => crate::state::transit_gateway_option_value(value, member),
+    }
+}
+
+/// The refusal a store that holds as many multicast domains as it can answers: HTTP 400
+/// `ResourceLimitExceeded`, naming how many it holds.
+///
+/// The ONE definition of that wording, so the pre-check and the writer's backstop below it
+/// cannot drift apart.
+fn store_is_full(held: usize) -> CreateTransitGatewayMulticastDomainError {
+    crate::state::resource_limit_exceeded(format!(
+        "This emulator holds {held} transit gateway multicast domains, which is as many as \
+         it stores"
+    ))
+}

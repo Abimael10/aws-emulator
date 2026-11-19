@@ -120,10 +120,10 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         let domain_id = self.next_id(TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_PREFIX);
         record.transit_gateway_multicast_domain_id = domain_id.clone();
-        // The caller-chosen bytes a domain holds are the ids of the associations written
-        // with it, charged here like every other writer's — on top of the fixed overhead
-        // the record itself costs — so no path can store them uncharged and a domain with
-        // no association is not free against the byte budget either.
+        // The caller-chosen bytes a domain holds are its tags and the ids of the associations
+        // written with it, charged here like every other writer's — on top of the fixed
+        // overhead the record itself costs — so no path can store them uncharged and a domain
+        // with no tag and no association is not free against the byte budget either.
         let association_bytes: usize = record
             .associations
             .iter()
@@ -133,10 +133,73 @@ impl ComAmazonawsEc2Amazonec2State {
                     + association.subnet_id.len()
             })
             .sum();
-        self.add_stored_bytes(STORED_RECORD_OVERHEAD_BYTES + association_bytes);
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES
+                + tag_list_bytes(record.tags.as_deref().unwrap_or_default())
+                + association_bytes,
+        );
         self.transit_gateway_multicast_domains
             .insert(domain_id.clone(), record);
         Some(domain_id)
+    }
+
+    /// Store the multicast domain `CreateTransitGatewayMulticastDomain` asks for, in the
+    /// non-terminal state a create leaves it in, and answer it AS STORED — or `None` when the
+    /// store is at its ceiling and nothing was stored.
+    ///
+    /// Everything the SERVICE owns is derived here rather than taken from a caller — the id,
+    /// the ARN, the owning account, the state and the clock-owed `available` move — the way
+    /// [`Self::insert_transit_gateway`] derives a gateway's, so no two writers can report one
+    /// domain differently; `spec` carries only what the request said. The id and the byte
+    /// charge are the shared [`Self::insert_transit_gateway_multicast_domain`]'s, so a created
+    /// domain is stored and charged exactly like any other.
+    ///
+    /// A multicast domain carries traffic only once the transit gateway it belongs to does, so
+    /// the move it owes falls due one [`TRANSITION_DELAY`] after that gateway's own move to
+    /// `available` is due ([`Self::transit_gateway_available_at`]) — and one span after this
+    /// call for a gateway that is in service already. Nothing is slept for either way.
+    pub fn insert_created_transit_gateway_multicast_domain(
+        &mut self,
+        spec: TransitGatewayMulticastDomainSpec,
+    ) -> Option<TransitGatewayMulticastDomainRecord> {
+        let now = Instant::now();
+        let gateway_ready_at = self
+            .transit_gateway_available_at
+            .get(spec.transit_gateway_id.as_str())
+            .copied()
+            .unwrap_or(now);
+        let record = TransitGatewayMulticastDomainRecord {
+            // The store mints the id, and the ARN that carries it is derived below.
+            transit_gateway_multicast_domain_id: String::new(),
+            transit_gateway_id: spec.transit_gateway_id,
+            transit_gateway_multicast_domain_arn: None,
+            owner_id: ::engine::emulator_account_id().to_string(),
+            options: Some(spec.options),
+            // The TRANSIENT state of a create, with the clock owing it `available`: the span
+            // is never zero, so a caller acting straight after this call still sees the
+            // domain pending.
+            state: TRANSIT_GATEWAY_MULTICAST_DOMAIN_STATE_PENDING.to_string(),
+            creation_time: Some(system_time_to_date_time(spec.created_at)),
+            tags: Some(spec.tags),
+            associations: Vec::new(),
+            pending: Some(PendingStateMove {
+                to: TRANSIT_GATEWAY_MULTICAST_DOMAIN_STATE_AVAILABLE.to_string(),
+                due_at: now.max(gateway_ready_at) + TRANSITION_DELAY,
+            }),
+        };
+        let domain_id = self.insert_transit_gateway_multicast_domain(record)?;
+        // "The Amazon Resource Name (ARN) of the transit gateway multicast domain"
+        // (`TransitGatewayMulticastDomain$TransitGatewayMulticastDomainArn`): built from the
+        // id the store just minted and the Region the request was signed for, through the one
+        // ARN builder this emulator has.
+        let arn = ::engine::emulator_arn(
+            "ec2",
+            &spec.region,
+            &format!("{RESOURCE_TYPE_TRANSIT_GATEWAY_MULTICAST_DOMAIN}/{domain_id}"),
+        );
+        let stored = self.transit_gateway_multicast_domains.get_mut(&domain_id)?;
+        stored.transit_gateway_multicast_domain_arn = Some(arn);
+        Some(stored.clone())
     }
 
     /// Store a transit gateway route table announcement and answer the
