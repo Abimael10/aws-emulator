@@ -35,11 +35,15 @@
 //! while the rule could have cached it.
 //!
 //! What an import stores is the registry's own record of the cached image: a manifest this
-//! registry writes, describing one configuration blob it also stores, with the digest of
-//! each computed over the bytes held ([`content_digest`]). No upstream registry is
-//! contacted — this emulator makes no outbound connection — so no layer of the upstream
-//! image is claimed to be here: the imported manifest references the configuration blob
-//! alone, and the image's size is the size of what the repository really holds.
+//! registry writes, describing one configuration blob and ONE filesystem layer it also
+//! stores, with the digest and the size of each computed over the bytes held
+//! ([`content_digest`]). No upstream registry is contacted — this emulator makes no
+//! outbound connection — so the layer is not the upstream image's own bytes but a root
+//! filesystem this registry writes and keeps ([`cached_image_filesystem_layer`]). Every
+//! blob the cached manifest references is therefore really in the repository, which is what
+//! lets every read of a cached image report the content this registry has: its manifest, the
+//! availability and the download of its layers, its size, and the filesystem a basic scan
+//! of it reads.
 //!
 //! Nothing is withheld on evidence this emulator does not have. An engine carrying no IAM
 //! store, a role that store holds no record for, and a role carrying an attachment whose
@@ -92,12 +96,20 @@ pub const DEFAULT_IMAGE_TAG: &str = "latest";
 /// spelling that goes with [`OCI_IMAGE_MANIFEST_MEDIA_TYPE`].
 const OCI_IMAGE_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
 
+/// The media type of the gzip compressed filesystem layer an imported manifest declares, in
+/// the same OCI spelling as [`OCI_IMAGE_CONFIG_MEDIA_TYPE`].
+const OCI_IMAGE_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+
 /// How many blobs a repository may hold before an IMPORT adds none.
 ///
 /// See [`MAX_IMAGES_PER_REPOSITORY`]: the same reasoning for the blob map, which an import
-/// grows by one entry per cached image, and which no other cap bounds the entry COUNT of.
-/// It is set at the image cap because an import stores one configuration blob per image it
-/// caches, so a repository at this bound is one whose images are capped too. Without it a
+/// grows by one configuration blob per cached image — every cached image of a repository
+/// shares the one filesystem layer, which is content-addressed like any other blob — and
+/// which no other cap bounds the entry COUNT of. It is set at the image cap because a
+/// repository at this bound is one whose images are capped too. The bound is read BEFORE an
+/// import, which then adds the one configuration blob (and, for the first cached image of
+/// the repository, the shared filesystem layer), so a repository one entry below it ends at
+/// most one entry above it — the heap this bounds is the entries themselves. Without it a
 /// client pulling one tag after another under a cache rule would grow this process's heap
 /// without end.
 const MAX_IMPORTED_BLOBS_PER_REPOSITORY: usize = MAX_IMAGES_PER_REPOSITORY;
@@ -620,7 +632,7 @@ pub enum CacheImport {
 /// [`CacheImport::Unavailable`] for a rule the upstream cannot be reached THROUGH
 /// ([`pull_through_cache_upstream_failure`]), and [`CacheImport::AtCapacity`] for a registry
 /// at a bound a cached copy would push it past: an import stores a repository, an image, a
-/// tag and the one blob that image references, so it is held to the cap on each of them.
+/// tag and the blobs that image references, so it is held to the cap on each of them.
 /// EVERY bound is checked before ANYTHING is written, so a refused import leaves the store
 /// exactly as it found it — a client pulling tag after tag under a cache rule is bounded by
 /// those caps rather than growing this process without end.
@@ -671,9 +683,10 @@ pub fn import_covered_image(
         }
         _ => {}
     }
-    let (manifest, config) = imported_manifest(&upstream);
-    let digest = manifest_digest(&manifest);
-    let config_digest = content_digest(config.as_bytes());
+    let imported = imported_image(&upstream);
+    let digest = manifest_digest(&imported.manifest);
+    let config_digest = content_digest(imported.config.as_bytes());
+    let layer_digest = content_digest(&imported.layer);
     let repository = store
         .repositories
         .entry(repository_key(region, repository_name))
@@ -688,16 +701,31 @@ pub fn import_covered_image(
         config_digest.clone(),
         LayerBlob {
             digest: config_digest,
-            size: i64::try_from(config.len()).ok(),
+            size: i64::try_from(imported.config.len()).ok(),
             media_type: Some(OCI_IMAGE_CONFIG_MEDIA_TYPE.to_string()),
             filesystem: LayerFilesystem::default(),
-            content: config.into_bytes(),
+            content: imported.config.into_bytes(),
+        },
+    );
+    // The FILESYSTEM LAYER the imported manifest declares is held the same way, under the
+    // digest of its own bytes and with what READING those bytes identified — the record
+    // `CompleteLayerUpload` writes for a layer a client pushed ([`scan_layer_filesystem`]) —
+    // so a reader of the cached image, a basic scan included, sees the filesystem this
+    // repository really holds rather than a claim about one.
+    repository.layer_blobs.insert(
+        layer_digest.clone(),
+        LayerBlob {
+            digest: layer_digest,
+            size: i64::try_from(imported.layer.len()).ok(),
+            media_type: Some(OCI_IMAGE_LAYER_MEDIA_TYPE.to_string()),
+            filesystem: scan_layer_filesystem(&imported.layer),
+            content: imported.layer,
         },
     );
     repository.images.entry(digest.clone()).or_insert_with(|| {
         ImageRecord::pushed(
             digest.clone(),
-            manifest,
+            imported.manifest,
             Some(OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string()),
             now,
         )
@@ -756,20 +784,34 @@ fn upstream_reference(rule: &PullThroughCacheRule, repository_name: &str, tag: &
     format!("{host}/{upstream_prefix}{path}:{tag}")
 }
 
-/// The manifest an import stores for the cached image, with the configuration document it
-/// describes: `(manifest, configuration)`.
+/// What an import stores for the cached image: the manifest this registry writes for it and
+/// the bytes of each blob that manifest references.
+struct ImportedImage {
+    /// The image manifest, which the cached image is stored under the digest of.
+    manifest: String,
+    /// The configuration document the manifest's `config` descriptor addresses.
+    config: String,
+    /// The archive the manifest's one `layers` entry addresses.
+    layer: Vec<u8>,
+}
+
+/// The image an import stores for the upstream reference `upstream`.
 ///
-/// An OCI image manifest describing ONE configuration blob and no layer, because no layer
-/// of the upstream image is here: this emulator makes no outbound connection, so what the
-/// registry holds for a cached image is its own record of what was cached — the upstream
-/// reference it came from, in the configuration document's annotation — and every digest
-/// and size in the manifest is computed over the bytes beside it.
-fn imported_manifest(upstream: &str) -> (String, String) {
+/// An OCI image manifest over ONE configuration document and ONE filesystem layer, each
+/// descriptor's digest and size computed over the bytes beside it, so the cached image
+/// references nothing the repository does not hold. The upstream image's own bytes are not
+/// reachable from this process — this emulator makes no outbound connection — so what is
+/// cached is this registry's own copy: the layer is the root filesystem it writes for a
+/// cached image ([`cached_image_filesystem_layer`]), and the configuration document records
+/// WHICH upstream reference was cached, in the annotation an OCI image carries its reference
+/// name in.
+fn imported_image(upstream: &str) -> ImportedImage {
     let config = serde_json::json!({
         "mediaType": OCI_IMAGE_CONFIG_MEDIA_TYPE,
         "annotations": { "org.opencontainers.image.ref.name": upstream },
     })
     .to_string();
+    let layer = cached_image_filesystem_layer();
     let manifest = serde_json::json!({
         "schemaVersion": 2,
         "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
@@ -778,10 +820,18 @@ fn imported_manifest(upstream: &str) -> (String, String) {
             "digest": content_digest(config.as_bytes()),
             "size": config.len(),
         },
-        "layers": [],
+        "layers": [{
+            "mediaType": OCI_IMAGE_LAYER_MEDIA_TYPE,
+            "digest": content_digest(&layer),
+            "size": layer.len(),
+        }],
     })
     .to_string();
-    (manifest, config)
+    ImportedImage {
+        manifest,
+        config,
+        layer,
+    }
 }
 
 #[cfg(test)]
@@ -911,26 +961,60 @@ mod tests {
     }
 
     #[test]
-    fn an_imported_manifest_states_the_digest_and_size_of_the_blob_it_holds() {
-        let (manifest, config) = imported_manifest("registry-1.docker.io/library/busybox:latest");
+    fn an_imported_image_states_the_digest_and_size_of_every_blob_it_holds() {
+        let imported = imported_image("registry-1.docker.io/library/busybox:latest");
         let document: serde_json::Value =
-            serde_json::from_str(&manifest).expect("the imported manifest is JSON");
+            serde_json::from_str(&imported.manifest).expect("the imported manifest is JSON");
         assert_eq!(
             document["config"]["digest"].as_str(),
-            Some(content_digest(config.as_bytes()).as_str()),
+            Some(content_digest(imported.config.as_bytes()).as_str()),
             "case \"the configuration descriptor\": expected the digest of the stored bytes, \
-             got {manifest}"
+             got {}",
+            imported.manifest
         );
         assert_eq!(
             document["config"]["size"].as_u64(),
-            u64::try_from(config.len()).ok(),
+            u64::try_from(imported.config.len()).ok(),
             "case \"the configuration descriptor\": expected the length of the stored bytes, \
-             got {manifest}"
+             got {}",
+            imported.manifest
+        );
+        assert_eq!(
+            document["layers"][0]["digest"].as_str(),
+            Some(content_digest(&imported.layer).as_str()),
+            "case \"the layer descriptor\": expected the digest of the stored bytes, got {}",
+            imported.manifest
+        );
+        assert_eq!(
+            document["layers"][0]["size"].as_u64(),
+            u64::try_from(imported.layer.len()).ok(),
+            "case \"the layer descriptor\": expected the length of the stored bytes, got {}",
+            imported.manifest
         );
         assert!(
-            config.contains("registry-1.docker.io/library/busybox:latest"),
+            imported
+                .config
+                .contains("registry-1.docker.io/library/busybox:latest"),
             "case \"the configuration document\": expected it to name the upstream reference, \
-             got {config}"
+             got {}",
+            imported.config
+        );
+    }
+
+    #[test]
+    fn the_layer_an_import_stores_is_a_filesystem_a_basic_scan_reads() {
+        let imported = imported_image("public.ecr.aws/amazonlinux/amazonlinux:latest");
+        let case = "the cached image's layer";
+        assert!(
+            is_scannable_image_manifest(&imported.manifest),
+            "case {case:?}: expected the cached manifest to declare a filesystem layer, got {}",
+            imported.manifest
+        );
+        let identified = scan_layer_filesystem(&imported.layer);
+        assert!(
+            identified.operating_system.is_some() && identified.package_manager.is_some(),
+            "case {case:?}: expected the stored bytes to carry an operating-system release \
+             file and a package database, got {identified:?}"
         );
     }
 

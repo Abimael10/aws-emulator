@@ -477,6 +477,58 @@ pub(super) fn scanned_filesystem(
     identified
 }
 
+/// The root filesystem the layer of a CACHED image carries, as the `(path, content)`
+/// members of the archive that layer is: what a basic scan reads an image's filesystem
+/// for, and nothing besides.
+///
+/// The first member is the `os-release` file of the os-release specification, at the first
+/// of the paths [`OS_RELEASE_PATHS`] reads, naming `linux` — the `ID` that specification
+/// gives a Linux system whose distribution is not identified further, which is all a copy
+/// held without the upstream bytes states about it. The second is one of the
+/// installed-package databases [`PACKAGE_DATABASE_PATHS`] reads, and it lists no package:
+/// no package list was read into it, so a scan of this filesystem enumerates none and
+/// reports no finding — as every basic scan here does ([`basic_scan_findings`]).
+const CACHED_IMAGE_FILESYSTEM: [(&str, &str); 2] = [
+    ("etc/os-release", "NAME=\"Linux\"\nID=linux\n"),
+    ("var/lib/dpkg/status", ""),
+];
+
+/// The mode the members of [`CACHED_IMAGE_FILESYSTEM`] are archived with: a regular file
+/// readable by everyone, which is how an image's release file and package database sit in
+/// its filesystem.
+const CACHED_IMAGE_FILE_MODE: u32 = 0o644;
+
+/// The bytes of ONE filesystem layer carrying [`CACHED_IMAGE_FILESYSTEM`]: a gzip
+/// compressed tar, the form both image formats' `...tar+gzip` layer media types carry.
+///
+/// What a pull through cache import stores as the filesystem layer of the image it caches
+/// ([`registry_pull::import_covered_image`]). A layer IS its bytes, so a registry that
+/// declares one in a manifest holds the archive itself: a scan of a cached image reads its
+/// filesystem out of these bytes ([`scan_layer_filesystem`]) exactly as it does for a layer
+/// a client uploaded, and a download of that layer serves them.
+pub(super) fn cached_image_filesystem_layer() -> Vec<u8> {
+    use ::std::io::Write;
+
+    let mut archive = ::tar::Builder::new(Vec::new());
+    for (path, content) in CACHED_IMAGE_FILESYSTEM {
+        let mut header = ::tar::Header::new_gnu();
+        header.set_size(u64::try_from(content.len()).unwrap_or_default());
+        header.set_mode(CACHED_IMAGE_FILE_MODE);
+        // The archive is assembled in memory, so appending a member writes to a `Vec` and
+        // cannot fail; a member that somehow could not be appended is left out rather than
+        // ending this process, and what the archive does carry still reads as a filesystem.
+        let _ = archive.append_data(&mut header, path, content.as_bytes());
+    }
+    let uncompressed = archive.into_inner().unwrap_or_default();
+    let mut encoder =
+        ::flate2::write::GzEncoder::new(Vec::new(), ::flate2::Compression::default());
+    let _ = encoder.write_all(&uncompressed);
+    // For the same reason: the compressor writes into a `Vec`. The plain archive is what is
+    // left if it ever reported otherwise, and a layer's bytes are read compressed or plain
+    // ([`scan_layer_filesystem`]).
+    encoder.finish().unwrap_or(uncompressed)
+}
+
 /// Whether `manifest` describes something a basic scan can examine: a container image
 /// with at least one filesystem layer.
 ///

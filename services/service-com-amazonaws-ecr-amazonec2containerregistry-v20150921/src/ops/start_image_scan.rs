@@ -289,16 +289,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A basic scan reads the operating system packages in an image's filesystem, so
-        // a manifest that declares no layer is of a type that cannot be scanned.
+        // a manifest that declares no layer is of a type that cannot be scanned. The
+        // sentence ECR words that refusal with ends there: it names the identifier the
+        // request sent, the repository it named and the registry that holds it, and states
+        // nothing about WHY the image is of such a type.
         if !crate::state::is_scannable_image_manifest(&image.manifest) {
             return Err(StartImageScanErrorModeled::UnsupportedImageTypeException(
                 UnsupportedImageTypeException {
                     message: Some(format!(
                         "The image with '{}' in the repository with name \
                          '{repository_name}' in the registry with id '{registry_id}' is \
-                         of a type that cannot be scanned: a basic scan examines the \
-                         operating system packages in an image's filesystem layers, and \
-                         its manifest declares none",
+                         of a type that cannot be scanned",
                         crate::state::identifier_description(&input.image_id)
                     )),
                 },

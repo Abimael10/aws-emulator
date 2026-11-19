@@ -5,26 +5,37 @@
 //! Every case goes through the router, so it exercises routing, deserialization, the
 //! handler, the persisted state and serialization — the same path a client takes.
 //!
-//! The RULE asserted over the tables below: **a read of an image under a repository name a
-//! registered pull through cache rule's `ecrRepositoryPrefix` covers is served by CACHING
-//! the upstream image — creating the mirrored repository on that first read and reporting
-//! the image it stored — rather than refused as an absent repository; a read of a name no
-//! rule covers is still refused `RepositoryNotFoundException`, and one a rule covers but
-//! whose upstream cannot be reached through that rule is refused
+//! The FIRST rule asserted over the tables below: **a read of an image under a repository
+//! name a registered pull through cache rule's `ecrRepositoryPrefix` covers is served by
+//! CACHING the upstream image — creating the mirrored repository on that first read and
+//! reporting the image it stored — rather than refused as an absent repository; a read of a
+//! name no rule covers is still refused `RepositoryNotFoundException`, and one a rule covers
+//! but whose upstream cannot be reached through that rule is refused
 //! `UnableToGetUpstreamImageException`.** The mirrored repository exists from then on, so
 //! every later read of it — `BatchGetImage`, `DescribeImages`, `DescribeRepositories` — and
 //! a `docker pull` on the registry endpoint report the same cached image.
 //!
-//! The rows differ along what the rule generalises over: which upstream registry the rule
+//! The SECOND: **what the cached manifest references, this registry HOLDS — an image is
+//! cached with its filesystem layers, so a cached image is as complete as a pushed one: its
+//! layers are available and downloadable, and a basic scan of it is accepted and reads a
+//! filesystem, exactly as for an image a client pushed.** `UnsupportedImageTypeException` is
+//! reserved for a manifest a basic scan genuinely cannot examine (a manifest list, an index,
+//! anything that is not a container image), and its sentence is AWS's, which ends at "is of
+//! a type that cannot be scanned".
+//!
+//! The rows differ along what the rules generalise over: which upstream registry the rule
 //! caches from and whether it authenticates its callers, how the prefix is written (plain,
 //! with its assumed trailing slash, nested), how many namespace levels the cached path
-//! carries under it, which tag is asked for, which upstream prefix the rule prepends, and
-//! which plane the read arrives on.
+//! carries under it, which tag is asked for, which upstream prefix the rule prepends, which
+//! plane the read arrives on, which manifest form declares no filesystem layer, and how a
+//! scan's request addresses the image (by tag, by digest, by both).
 
 use serde_json::{json, Value};
 
 use crate::registry_v2_pull::{fetch, given_credential};
-use crate::wire::{at, call, emulator, ok, refused, REGION, REGISTRY_ID};
+use crate::wire::{
+    at, call, emulator, fetch_url, layer_digest, ok, ok_until, refused, REGION, REGISTRY_ID,
+};
 
 /// A Secrets Manager secret ARN in the namespace `CredentialArn`'s modelled pattern states
 /// (smithy_query operation=CreatePullThroughCacheRule, member credentialArn:
@@ -639,4 +650,322 @@ async fn a_docker_pull_of_a_covered_reference_caches_it_the_same_way() {
         json!(pulled.content_digest.clone()),
         "case {case:?}: expected the digest the registry endpoint stated, got {image:?}"
     );
+}
+
+/// The status a start ADMITS a basic scan in, and the one the clock carries it into before
+/// it ends, spelled out here rather than imported from the crate so a wrong spelling in the
+/// implementation fails this suite (smithy_query shape=ScanStatus).
+const SCAN_PENDING: &str = "PENDING";
+/// See [`SCAN_PENDING`].
+const SCAN_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`SCAN_PENDING`].
+const SCAN_COMPLETE: &str = "COMPLETE";
+
+/// The `description` a run that examined the image and finished reports beside
+/// [`SCAN_COMPLETE`], spelled out for the same reason as [`SCAN_PENDING`].
+const SCAN_COMPLETE_DESCRIPTION: &str = "The scan was completed successfully.";
+
+/// Whether a scan read has left the two states a run that has not ended reports.
+fn has_ended(answer: &Value) -> bool {
+    ![SCAN_PENDING, SCAN_IN_PROGRESS]
+        .iter()
+        .any(|status| at(answer, "/imageScanStatus/status") == json!(status))
+}
+
+/// A cached image is as complete as a pushed one: the registry holds the filesystem layers
+/// its manifest declares, so a basic scan of it is ACCEPTED and settles at `COMPLETE` with
+/// its findings block — the documented mirror-then-scan workflow.
+///
+/// Every row of [`rows`] is exercised, so the rule is asserted for each upstream registry,
+/// prefix spelling, path depth and tag the import table spans; the scan is started by the
+/// TAG that was mirrored, the way a client that pulled a tag through the cache scans it.
+#[tokio::test]
+async fn a_basic_scan_of_a_cached_image_is_accepted_and_completes() {
+    let router = emulator();
+    // Every row is cached and started before any is read, so the runs the clock owes
+    // proceed together rather than one row at a time.
+    let mut started: Vec<(&str, String, Value)> = Vec::new();
+    for row in rows() {
+        let case = row.case;
+        given_rule(&router, &row).await;
+        let repository = cached_repository(&row);
+
+        let answer = read_by_tag(&router, &repository, row.tag).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected the covered read to cache the image, got {} with {:?}",
+            answer.status, answer.body
+        );
+        let image = single_image(case, &answer.body);
+        let manifest = at(&image, "/imageManifest")
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let document: Value = serde_json::from_str(&manifest).unwrap_or_else(|error| {
+            panic!("case {case:?}: expected the cached manifest to be JSON ({error}): {manifest}")
+        });
+
+        // The cached image carries the filesystem layers of the image that was cached, and
+        // the repository holds every one of them: available for download under the digest
+        // and the size the manifest states, and served byte for byte.
+        let layers = document["layers"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !layers.is_empty(),
+            "case {case:?}: expected the cached manifest to declare the image's filesystem \
+             layers, got {manifest}"
+        );
+        for (index, descriptor) in layers.iter().enumerate() {
+            let digest = descriptor["digest"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let availability = ok(
+                &router,
+                case,
+                "BatchCheckLayerAvailability",
+                &json!({"repositoryName": repository, "layerDigests": [digest.clone()]}),
+            )
+            .await;
+            assert_eq!(
+                at(&availability, "/layers/0/layerAvailability"),
+                json!("AVAILABLE"),
+                "case {case:?}: expected the repository to hold layer {index} of the cached \
+                 image ({digest}), got {availability:?}"
+            );
+            assert_eq!(
+                at(&availability, "/layers/0/layerSize"),
+                descriptor["size"],
+                "case {case:?}: expected layer {index}'s stored size to be the one the \
+                 manifest states, got {availability:?}"
+            );
+            let handed_out = ok(
+                &router,
+                case,
+                "GetDownloadUrlForLayer",
+                &json!({"repositoryName": repository, "layerDigest": digest.clone()}),
+            )
+            .await;
+            let url = at(&handed_out, "/downloadUrl")
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let (status, bytes) = fetch_url(&router, case, &url).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected layer {index} of the cached image to be served, got \
+                 HTTP {status}"
+            );
+            assert_eq!(
+                layer_digest(&bytes),
+                digest,
+                "case {case:?}: expected the bytes served for layer {index} to be the content \
+                 its digest addresses, got {} bytes",
+                bytes.len()
+            );
+        }
+
+        let image_id = json!({"imageTag": row.tag});
+        let scan = ok(
+            &router,
+            case,
+            "StartImageScan",
+            &json!({"repositoryName": repository, "imageId": image_id}),
+        )
+        .await;
+        assert_eq!(
+            at(&scan, "/imageScanStatus/status"),
+            json!(SCAN_PENDING),
+            "case {case:?}: expected the cached image's scan to be admitted queued, got {scan:?}"
+        );
+        assert_eq!(
+            at(&scan, "/repositoryName"),
+            json!(repository.clone()),
+            "case {case:?}: expected the start to report the cache repository, got {scan:?}"
+        );
+        assert_eq!(
+            at(&scan, "/imageId/imageTag"),
+            json!(row.tag),
+            "case {case:?}: expected the start to report the tag it was asked for, got {scan:?}"
+        );
+        started.push((case, repository, image_id));
+    }
+
+    for (case, repository, image_id) in started {
+        // The terminal status is the clock's to owe, so this looks again until the run has
+        // ended rather than waiting out a span of wall clock.
+        let ended = ok_until(
+            &router,
+            case,
+            "DescribeImageScanFindings",
+            &json!({"repositoryName": repository, "imageId": image_id}),
+            has_ended,
+        )
+        .await;
+        assert_eq!(
+            at(&ended, "/imageScanStatus"),
+            json!({"status": SCAN_COMPLETE, "description": SCAN_COMPLETE_DESCRIPTION}),
+            "case {case:?}: expected a scan of the cached image to complete, got {:?}",
+            at(&ended, "/imageScanStatus")
+        );
+        assert!(
+            at(&ended, "/imageScanFindings/imageScanCompletedAt").is_number(),
+            "case {case:?}: expected a completed run to report when it completed, got {:?}",
+            at(&ended, "/imageScanFindings/imageScanCompletedAt")
+        );
+        let counts = at(&ended, "/imageScanFindings/findingSeverityCounts");
+        assert!(
+            counts
+                .as_object()
+                .is_some_and(|counts| counts.values().all(Value::is_i64)),
+            "case {case:?}: expected an integer-valued severity map over the run's findings, \
+             got {counts:?}"
+        );
+        // The counts are over the findings the run REPORTS, and a basic scan here consults
+        // no vulnerability source, so the map is present and counts nothing.
+        assert_eq!(
+            counts,
+            json!({}),
+            "case {case:?}: expected the counts to be over the findings reported, got \
+             {counts:?}"
+        );
+    }
+}
+
+/// One row of the unscannable-image table: a document that declares no filesystem layer,
+/// and how the scan request addresses the image it was pushed as.
+struct Unscannable<'a> {
+    case: &'a str,
+    repository: &'a str,
+    /// The document pushed, which declares no filesystem layer.
+    manifest: Value,
+    /// The tag it is pushed under.
+    tag: &'a str,
+    /// Whether the scan request carries the image's digest, and whether it carries the tag
+    /// — a member it leaves out is rendered `null` in the refusal.
+    by_digest: bool,
+    by_tag: bool,
+}
+
+/// An image a basic scan genuinely cannot examine is refused `UnsupportedImageTypeException`
+/// in AWS's own sentence, which names the identifier the request sent, the repository it
+/// named and the registry that holds it, and ENDS at "is of a type that cannot be scanned".
+///
+/// The rows differ along what declares no filesystem layer — a manifest list and an OCI
+/// image index (both reference other images), a manifest whose layer list is empty, and a
+/// document that is no image manifest at all — and along how the request addresses the
+/// image, since the identifier is echoed into the sentence.
+#[tokio::test]
+async fn an_image_no_basic_scan_can_examine_is_refused_in_the_documented_words() {
+    let child = format!("sha256:{}", "b".repeat(64));
+    let rows = vec![
+        Unscannable {
+            case: "a docker manifest list, addressed by its tag",
+            repository: "unscannable/manifest-list",
+            manifest: json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+                "manifests": [{
+                    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                    "size": 7,
+                    "digest": child,
+                    "platform": {"architecture": "amd64", "os": "linux"},
+                }],
+            }),
+            tag: "latest",
+            by_digest: false,
+            by_tag: true,
+        },
+        Unscannable {
+            case: "an OCI image index, addressed by its digest",
+            repository: "unscannable/oci-index",
+            manifest: json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [{
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "size": 11,
+                    "digest": child,
+                }],
+            }),
+            tag: "v2",
+            by_digest: true,
+            by_tag: false,
+        },
+        Unscannable {
+            case: "an image manifest whose layer list is empty, addressed by both",
+            repository: "unscannable/no-layers",
+            manifest: json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "layers": [],
+            }),
+            tag: "3.1",
+            by_digest: true,
+            by_tag: true,
+        },
+        Unscannable {
+            case: "a document that is no image manifest at all, addressed by its tag",
+            repository: "unscannable/not-a-manifest",
+            manifest: json!({"schemaVersion": 2, "image": "neither one thing nor the other"}),
+            tag: "latest",
+            by_digest: false,
+            by_tag: true,
+        },
+    ];
+
+    let router = emulator();
+    for row in &rows {
+        let case = row.case;
+        ok(
+            &router,
+            case,
+            "CreateRepository",
+            &json!({"repositoryName": row.repository}),
+        )
+        .await;
+        let manifest = serde_json::to_string(&row.manifest).expect("the test manifest serialises");
+        ok(
+            &router,
+            case,
+            "PutImage",
+            &json!({
+                "repositoryName": row.repository,
+                "imageManifest": manifest.clone(),
+                "imageTag": row.tag,
+            }),
+        )
+        .await;
+        let digest = layer_digest(manifest.as_bytes());
+
+        let mut image_id = json!({});
+        if row.by_digest {
+            image_id["imageDigest"] = json!(digest.clone());
+        }
+        if row.by_tag {
+            image_id["imageTag"] = json!(row.tag);
+        }
+        let body = refused(
+            &router,
+            case,
+            "StartImageScan",
+            &json!({"repositoryName": row.repository, "imageId": image_id}),
+            "UnsupportedImageTypeException",
+        )
+        .await;
+        // The identifier is rendered with BOTH its members, an absent one as `null`, as
+        // every refusal of this registry renders the one the request sent.
+        let expected = format!(
+            "The image with 'imageId {{imageDigest:'{}', imageTag:'{}'}}' in the repository \
+             with name '{}' in the registry with id '{REGISTRY_ID}' is of a type that cannot \
+             be scanned",
+            if row.by_digest { digest.as_str() } else { "null" },
+            if row.by_tag { row.tag } else { "null" },
+            row.repository,
+        );
+        assert_eq!(
+            body["message"].as_str().unwrap_or_default(),
+            expected,
+            "case {case:?}: expected the error class's own sentence, got {body:?}"
+        );
+    }
 }
