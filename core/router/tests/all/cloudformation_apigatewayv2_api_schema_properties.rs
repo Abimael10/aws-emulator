@@ -100,7 +100,12 @@ fn authorization(service: &str) -> String {
 }
 
 /// Call one CloudFormation operation over its awsQuery wire.
-async fn cloudformation(
+///
+/// `pub(crate)` for the same reason as [`build_router`]: a sibling suite that drives the
+/// services mounted here addresses CloudFormation's own API exactly this way, and one
+/// spelling of the wire keeps the two from drifting on the encoding of a member or on the
+/// Region the call is signed for — which is the Region the stack under test belongs to.
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     action: &str,
     members: &[(&str, &str)],
