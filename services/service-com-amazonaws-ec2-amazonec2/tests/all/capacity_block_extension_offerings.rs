@@ -604,6 +604,7 @@ fn seed_expired_block(engine: &engine::InMemoryEngine, region: &str) -> String {
                 interruption_info: None,
                 zero_size_preference: None,
                 pending: None,
+                capacity_reservation_fleet_id: None,
             },
         })
         .expect("the store has room for one seeded Capacity Block");

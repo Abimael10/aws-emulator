@@ -2600,4 +2600,9 @@ pub struct CapacityReservationSpec {
     /// The move the clock owes the reservation, or `None` for one that is already in a
     /// terminal state.
     pub pending: Option<CapacityReservationTransition>,
+    /// "The ID of the Capacity Reservation Fleet to which the Capacity Reservation belongs"
+    /// (`CapacityReservation$CapacityReservationFleetId`) — set for a reservation a Capacity
+    /// Reservation Fleet reserves its target capacity through, and `None` for a reservation
+    /// created on its own.
+    pub capacity_reservation_fleet_id: Option<String>,
 }

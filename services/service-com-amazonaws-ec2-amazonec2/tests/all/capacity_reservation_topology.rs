@@ -243,6 +243,7 @@ fn seed_expired(engine: &engine::InMemoryEngine, zone_name: &str) -> String {
             interruption_info: None,
             zero_size_preference: None,
             pending: None,
+            capacity_reservation_fleet_id: None,
         })
         .unwrap_or_else(|| panic!("the store must accept one seeded reservation"))
 }

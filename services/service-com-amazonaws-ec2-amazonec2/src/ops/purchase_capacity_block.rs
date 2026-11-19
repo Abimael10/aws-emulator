@@ -333,6 +333,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 pending: Some(state::CapacityReservationTransition::starting_now(
                     state::CapacityReservationMove::Scheduled,
                 )),
+                // The capacity of a Capacity Block that was bought, not capacity a Capacity
+                // Reservation Fleet reserved: the reservation belongs to no Fleet.
+                capacity_reservation_fleet_id: None,
             },
         });
         let Some((capacity_block_id, capacity_reservation_id)) = purchased else {

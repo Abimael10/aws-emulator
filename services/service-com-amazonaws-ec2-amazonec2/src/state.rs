@@ -2256,6 +2256,15 @@ pub use snapshot_create_volume_permissions::*;
 pub mod acm_certificates;
 pub use acm_certificates::*;
 
+/// The resource groups a Capacity Reservation has been added to, as
+/// `GetGroupsForCapacityReservation` reports them: a resource group is Resource Groups'
+/// resource and the membership is that service's to report, so this ASKS it over the
+/// emulator's in-process callback instead of keeping a second copy of the membership. In a
+/// module of its own, re-exported so a handler reaches it as `crate::state::<item>` like every
+/// other primitive here.
+pub mod capacity_reservation_resource_groups;
+pub use capacity_reservation_resource_groups::*;
+
 /// The fast snapshot restores the account holds — what one (snapshot, Availability Zone)
 /// pair is stored as, the lifecycle the clock owes it and the one reading of the request
 /// members an enable and a disable share — in a module of its own, re-exported so a handler

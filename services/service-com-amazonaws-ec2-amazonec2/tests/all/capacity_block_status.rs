@@ -439,6 +439,7 @@ fn seed(engine: &engine::InMemoryEngine) -> Seeded {
                     interruption_info: None,
                     zero_size_preference: None,
                     pending: None,
+                    capacity_reservation_fleet_id: None,
                 })
                 .expect("the store accepts a seeded Capacity Reservation");
             // Nothing in this emulator launches an instance INTO a reservation, so a row

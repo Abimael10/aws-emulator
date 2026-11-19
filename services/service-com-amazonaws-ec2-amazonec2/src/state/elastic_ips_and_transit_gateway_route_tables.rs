@@ -91,11 +91,14 @@ impl ComAmazonawsEc2Amazonec2State {
             instance_match_criteria: Some(spec.instance_match_criteria),
             create_date: Some(system_time_to_date_time(spec.created_at)),
             tags: Some(spec.tags),
-            // This emulator has no Outposts, no Capacity Reservation Fleets and no cluster
-            // placement groups to create a reservation in, so a reservation belongs to
-            // none of them.
+            // This emulator has no Outposts and no cluster placement groups to create a
+            // reservation in, so a reservation belongs to neither. A reservation a Capacity
+            // Reservation Fleet reserves its capacity through names that Fleet — "The ID of
+            // the Capacity Reservation Fleet to which the Capacity Reservation belongs"
+            // (`CapacityReservation$CapacityReservationFleetId`) — and one created on its own
+            // names none.
             outpost_arn: None,
-            capacity_reservation_fleet_id: None,
+            capacity_reservation_fleet_id: spec.capacity_reservation_fleet_id,
             placement_group_arn: None,
             // "Information about instance capacity usage": nothing has launched into a
             // reservation this call mints, so none of its capacity is allocated to a running
@@ -237,6 +240,38 @@ impl ComAmazonawsEc2Amazonec2State {
         } else {
             Vec::new()
         });
+    }
+
+    /// Reserve `instance_count` instances through the Capacity Reservation
+    /// `capacity_reservation_id` names: the capacity it reserves becomes that many instances,
+    /// and the capacity nothing has launched into follows it.
+    ///
+    /// "The total number of instances for which the Capacity Reservation reserves capacity"
+    /// (`CapacityReservation$TotalInstanceCount`) is what a writer that changes the reserved
+    /// capacity sets, and "The remaining capacity. Indicates the number of instances that can
+    /// be launched in the Capacity Reservation" (`$AvailableInstanceCount`) is what is left of
+    /// it once the instances already running in the reservation are counted — so resizing
+    /// never takes capacity away from an instance that is using it, and never hands out
+    /// capacity twice. The ONE writer of a resize, used where a Capacity Reservation Fleet
+    /// reserves a new target capacity through the reservations it holds.
+    ///
+    /// Silent for a reservation this store does not hold: the caller has already resolved the
+    /// reservation, and this records what it resolved.
+    pub fn resize_capacity_reservation(
+        &mut self,
+        capacity_reservation_id: &str,
+        instance_count: i32,
+    ) {
+        let Some(record) = self.capacity_reservations.get_mut(capacity_reservation_id) else {
+            return;
+        };
+        let used = record
+            .view
+            .total_instance_count
+            .unwrap_or_default()
+            .saturating_sub(record.available_instance_count());
+        record.view.total_instance_count = Some(instance_count);
+        record.view.available_instance_count = Some(instance_count.saturating_sub(used).max(0));
     }
 
     /// Cancel the Capacity Reservation `capacity_reservation_id` names, and answer whether

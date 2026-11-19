@@ -317,6 +317,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             interruption_info: None,
             zero_size_preference: None,
             pending: None,
+            // Capacity split out of a reservation the caller holds, which is a reservation of
+            // its own: it belongs to no Capacity Reservation Fleet.
+            capacity_reservation_fleet_id: None,
         };
         let Some(destination_id) = store.insert_capacity_reservation(destination_spec) else {
             return Err(state::resource_count_exceeded(

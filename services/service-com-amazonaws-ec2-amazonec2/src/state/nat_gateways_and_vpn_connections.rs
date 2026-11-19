@@ -1402,6 +1402,14 @@ pub struct CapacityReservationFleetRecord {
     /// The Fleet as the model shapes it, carrying the state reached so far and the Capacity
     /// Reservations it reserves its capacity through.
     pub view: CapacityReservationFleet,
+    /// The Region the Fleet was created in, which is the Region of every Capacity
+    /// Reservation it reserves capacity through.
+    ///
+    /// A fact of the Fleet the modelled [`CapacityReservationFleet`] shape carries no member
+    /// for — it is readable out of the Fleet's ARN, but an ARN is a thing to report rather
+    /// than a thing to parse — so a modification that has to reserve a further Capacity
+    /// Reservation reserves it in the Fleet's own Region.
+    pub region: String,
     /// The `CapacityReservationFleetState` the Fleet held BEFORE the one
     /// [`Self::view`] carries: the state word it last moved out of, which is what EC2
     /// reports as a Fleet's previous state. A Fleet that has not left the state it was
@@ -1534,7 +1542,16 @@ impl CapacityReservationFleetRecord {
                 .weight
                 .filter(|weight| *weight > 0.0)
                 .unwrap_or(DEFAULT_FLEET_INSTANCE_WEIGHT);
-            let reserved_here = chosen == Some(index);
+            // A Fleet reserves capacity THROUGH a Capacity Reservation, so a specification
+            // the strategy chose but that holds none — and that this call could not reserve
+            // one for, the Capacity Reservation store having refused it at one of its own
+            // ceilings — reserves nothing, exactly like one the strategy did not choose: it
+            // counts no instances and fulfils no capacity rather than reporting capacity no
+            // stored reservation backs.
+            let chosen_here = chosen == Some(index);
+            let backed = reservation.capacity_reservation_id.is_some()
+                || minted_reservation_id.is_some();
+            let reserved_here = chosen_here && backed;
             let instance_count = if reserved_here {
                 fleet_instance_count(total_target_capacity, weight)
             } else {
@@ -1703,6 +1720,46 @@ pub struct CapacityReservationFleetSpec {
     pub tags: Vec<Tag>,
 }
 
+/// What ONE Capacity Reservation of a Capacity Reservation Fleet is reserved with, for
+/// [`ComAmazonawsEc2Amazonec2State::reserve_fleet_capacity_reservation`].
+///
+/// Borrowed rather than owned, and gathered into one struct rather than passed as a dozen
+/// arguments, because both writers of a Fleet's reservations — the create, which reads a
+/// validated request, and a modification, which reads the Fleet as stored — already hold
+/// these facts and must reserve capacity on the same terms.
+#[derive(Debug, Clone)]
+pub(super) struct FleetCapacityReservationFacts {
+    /// The Fleet the reservation belongs to
+    /// (`CapacityReservation$CapacityReservationFleetId`).
+    pub fleet_id: String,
+    /// The Region the reservation's ARN names: the Fleet's own.
+    pub region: String,
+    /// The tenancy every Capacity Reservation of the Fleet inherits.
+    pub tenancy: String,
+    /// The instance matching criteria every Capacity Reservation of the Fleet inherits.
+    pub instance_match_criteria: String,
+    /// The Fleet's end date, which its Capacity Reservations expire on too, or `None` for a
+    /// Fleet with no end date.
+    pub end_date: Option<::aws_smithy_types::DateTime>,
+    /// The Fleet's tags, which "are automatically assigned to the Capacity Reservations in
+    /// the Fleet" (`CreateCapacityReservationFleetRequest$TagSpecifications`).
+    pub tags: Vec<Tag>,
+    /// The instance type this reservation reserves capacity for.
+    pub instance_type: String,
+    /// The operating system it reserves that capacity for.
+    pub instance_platform: String,
+    /// The Availability Zone the capacity is reserved in.
+    pub availability_zone: String,
+    /// The id of [`Self::availability_zone`].
+    pub availability_zone_id: String,
+    /// Whether the specification reserves capacity for EBS-optimized instances.
+    pub ebs_optimized: bool,
+    /// How many instances this reservation holds capacity for.
+    pub instance_count: i32,
+    /// When it was reserved.
+    pub created_at: SystemTime,
+}
+
 impl ComAmazonawsEc2Amazonec2State {
     /// Whether another Capacity Reservation Fleet fits inside the store's ceiling
     /// ([`MAX_CAPACITY_RESERVATION_FLEETS`]).
@@ -1729,8 +1786,14 @@ impl ComAmazonawsEc2Amazonec2State {
     /// least the target. A specification nothing was reserved on holds no Capacity
     /// Reservation, so it reports neither an id nor a create date: there is no reservation to
     /// name.
+    ///
+    /// Each Capacity Reservation the Fleet reserves through is WRITTEN to this account's
+    /// Capacity Reservation store ([`Self::reserve_fleet_capacity_reservation`]), so the id
+    /// the Fleet reports is an id every reader of a Capacity Reservation resolves rather than
+    /// a number nothing is stored under.
     pub(super) fn fleet_capacity_reservations(
         &mut self,
+        fleet_id: &str,
         spec: &CapacityReservationFleetSpec,
         created_at: SystemTime,
     ) -> Vec<FleetCapacityReservation> {
@@ -1747,15 +1810,47 @@ impl ComAmazonawsEc2Amazonec2State {
             } else {
                 DEFAULT_FLEET_INSTANCE_WEIGHT
             };
-            let reserved_here = chosen == Some(index);
-            let total_instance_count = if reserved_here {
+            let on_the_chosen_specification = chosen == Some(index);
+            let wanted_instance_count = if on_the_chosen_specification {
                 fleet_instance_count(spec.total_target_capacity, weight)
             } else {
                 0
             };
+            // The Capacity Reservation the Fleet reserves this specification's capacity
+            // through is a Capacity Reservation OF THE ACCOUNT: it is written to the one
+            // Capacity Reservation store, so every reader of one resolves it under the id
+            // the Fleet reports. A specification nothing is reserved on gets none.
+            let capacity_reservation_id = if wanted_instance_count > 0 {
+                self.reserve_fleet_capacity_reservation(FleetCapacityReservationFacts {
+                    fleet_id: fleet_id.to_string(),
+                    region: spec.region.clone(),
+                    tenancy: spec.tenancy.to_string(),
+                    instance_match_criteria: spec.instance_match_criteria.to_string(),
+                    end_date: spec.end_date,
+                    tags: spec.tags.clone(),
+                    instance_type: instance_spec.instance_type.to_string(),
+                    instance_platform: instance_spec.instance_platform.to_string(),
+                    availability_zone: instance_spec.availability_zone.clone(),
+                    availability_zone_id: instance_spec.availability_zone_id.clone(),
+                    ebs_optimized: instance_spec.ebs_optimized,
+                    instance_count: wanted_instance_count,
+                    created_at,
+                })
+            } else {
+                None
+            };
+            // A Fleet reserves the capacity its Capacity Reservations hold, so a
+            // specification whose reservation the Capacity Reservation store refused at one
+            // of its own ceilings has reserved nothing: it counts no instances and fulfils
+            // no capacity, exactly like one the strategy did not reserve on.
+            let reserved_here = capacity_reservation_id.is_some();
+            let total_instance_count = if reserved_here {
+                wanted_instance_count
+            } else {
+                0
+            };
             reservations.push(FleetCapacityReservation {
-                capacity_reservation_id: reserved_here
-                    .then(|| self.next_id(CAPACITY_RESERVATION_ID_PREFIX)),
+                capacity_reservation_id,
                 availability_zone: Some(instance_spec.availability_zone.clone()),
                 availability_zone_id: Some(instance_spec.availability_zone_id.clone()),
                 instance_type: Some(instance_spec.instance_type.to_string()),
@@ -1776,6 +1871,69 @@ impl ComAmazonawsEc2Amazonec2State {
             });
         }
         reservations
+    }
+
+    /// Reserve ONE Capacity Reservation of this account for a Capacity Reservation Fleet, and
+    /// answer the id it was stored under — or `None` when the Capacity Reservation store
+    /// refused it at one of its own ceilings.
+    ///
+    /// A Fleet reserves capacity THROUGH Capacity Reservations: "the Fleet automatically
+    /// creates … Capacity Reservations" (`ModifyCapacityReservationFleet`), and the ids it
+    /// reports are ids of this account's reservations, which
+    /// `DescribeCapacityReservations`, `GetCapacityReservationUsage` and
+    /// `GetGroupsForCapacityReservation` resolve like any other. So a Fleet's reservation is
+    /// written through the ONE writer of that store
+    /// ([`Self::insert_capacity_reservation`]) rather than being a number the Fleet alone
+    /// knows, and it carries what the Fleet reserves it with: the Fleet's tenancy and
+    /// matching criteria, which "All Capacity Reservations in the Fleet inherit"
+    /// (`CreateCapacityReservationFleetRequest$Tenancy` / `$InstanceMatchCriteria`); the
+    /// Fleet's end date, because "When the Capacity Reservation Fleet expires … all of the
+    /// Capacity Reservations in the Fleet expire" (`$EndDate`); the Fleet's tags, which "are
+    /// automatically assigned to the Capacity Reservations in the Fleet"
+    /// (`$TagSpecifications`); and the Fleet's own id, which is what
+    /// "The ID of the Capacity Reservation Fleet to which the Capacity Reservation belongs"
+    /// (`CapacityReservation$CapacityReservationFleetId`) names.
+    ///
+    /// The reservation is stored in the non-terminal `pending`, with `active` owed to the
+    /// clock one [`TRANSITION_DELAY`] later: the Fleet is still "preparing to create the
+    /// Capacity Reservations" when it is submitted
+    /// ([`CAPACITY_RESERVATION_FLEET_STATE_SUBMITTED`]), and the Fleet reaches `active` only
+    /// after the reservations it waits on are themselves ready — one span later than they are
+    /// ([`CAPACITY_RESERVATION_FLEET_ACTIVATION_DELAY`]).
+    pub(super) fn reserve_fleet_capacity_reservation(
+        &mut self,
+        facts: FleetCapacityReservationFacts,
+    ) -> Option<String> {
+        self.insert_capacity_reservation(CapacityReservationSpec {
+            instance_type: facts.instance_type,
+            instance_platform: facts.instance_platform,
+            availability_zone: facts.availability_zone,
+            availability_zone_id: facts.availability_zone_id,
+            region: facts.region,
+            tenancy: facts.tenancy,
+            instance_count: facts.instance_count,
+            ebs_optimized: facts.ebs_optimized,
+            // "Deprecated" (`CapacityReservation$EphemeralStorage`), and nothing a Fleet's
+            // instance type specification asks for, so a Fleet's reservation claims none.
+            ephemeral_storage: false,
+            end_date: facts.end_date.map(date_time_to_system_time),
+            instance_match_criteria: facts.instance_match_criteria,
+            created_at: facts.created_at,
+            // Capacity a Fleet reserves for use now: it is not a future-dated request, so it
+            // has no requested delivery date, nothing it committed to and no delivery method.
+            start_date: None,
+            commitment: None,
+            delivery_preference: None,
+            state: CAPACITY_RESERVATION_STATE_PENDING,
+            tags: facts.tags,
+            // Reserved by the Fleet, not carved out of another reservation of the account.
+            interruption_info: None,
+            zero_size_preference: None,
+            pending: Some(CapacityReservationTransition::starting_now(
+                CapacityReservationMove::Active,
+            )),
+            capacity_reservation_fleet_id: Some(facts.fleet_id),
+        })
     }
 
     /// Store a Capacity Reservation Fleet and answer it as it was stored.
@@ -1801,7 +1959,7 @@ impl ComAmazonawsEc2Amazonec2State {
     ) -> CapacityReservationFleet {
         let fleet_id = self.next_id(CAPACITY_RESERVATION_FLEET_ID_PREFIX);
         let created_at = SystemTime::now();
-        let reservations = self.fleet_capacity_reservations(&spec, created_at);
+        let reservations = self.fleet_capacity_reservations(&fleet_id, &spec, created_at);
         let view = CapacityReservationFleet {
             capacity_reservation_fleet_id: Some(fleet_id.clone()),
             // "The ARN of the Capacity Reservation Fleet"
@@ -1832,6 +1990,7 @@ impl ComAmazonawsEc2Amazonec2State {
             fleet_id,
             CapacityReservationFleetRecord {
                 view,
+                region: spec.region,
                 previous_state: CAPACITY_RESERVATION_FLEET_STATE_SUBMITTED.to_string(),
                 pending: Some(CapacityReservationFleetTransition::due_in(
                     CAPACITY_RESERVATION_FLEET_STATE_ACTIVE,
@@ -1872,9 +2031,9 @@ impl ComAmazonawsEc2Amazonec2State {
         if !record.is_modifiable() {
             return false;
         }
-        // Which specification the Fleet reserves on, and the id for a Capacity Reservation
-        // this call has to CREATE there — minted before the record is borrowed mutably,
-        // because only the store mints ids.
+        // Which specification the Fleet reserves on, and the Capacity Reservation this call
+        // has to RESERVE there when that specification holds none — written before the record
+        // is borrowed mutably, because only the store writes a Capacity Reservation.
         let reservations = record
             .view
             .instance_type_specifications
@@ -1882,16 +2041,57 @@ impl ComAmazonawsEc2Amazonec2State {
             .unwrap_or_default();
         let chosen =
             prioritized_fleet_specification(reservations, |reservation| reservation.priority);
-        let needs_reservation_id = chosen.is_some_and(|index| {
-            reservations
-                .get(index)
-                .is_some_and(|reservation| reservation.capacity_reservation_id.is_none())
-        });
-        let minted_reservation_id = (change.total_target_capacity.is_some()
-            && needs_reservation_id)
-            .then(|| self.next_id(CAPACITY_RESERVATION_ID_PREFIX));
-
         let now = SystemTime::now();
+        // The end date the Fleet comes out of this call with, which is also the date its
+        // Capacity Reservations expire on.
+        let end_date = match change.end_date {
+            CapacityReservationFleetEndDate::AsStored => record.view.end_date,
+            CapacityReservationFleetEndDate::MovedTo(end_date) => Some(end_date),
+            CapacityReservationFleetEndDate::Removed => None,
+        };
+        // The Capacity Reservations the Fleet held BEFORE this call, so the ones it no longer
+        // reserves through can be cancelled below rather than left active under an id the
+        // Fleet has stopped reporting.
+        let reserved_before: Vec<String> = reservations
+            .iter()
+            .filter_map(|reservation| reservation.capacity_reservation_id.clone())
+            .collect();
+        let to_reserve = change.total_target_capacity.and_then(|target| {
+            let reservation = reservations.get(chosen?)?;
+            if reservation.capacity_reservation_id.is_some() {
+                return None;
+            }
+            let weight = reservation
+                .weight
+                .filter(|weight| *weight > 0.0)
+                .unwrap_or(DEFAULT_FLEET_INSTANCE_WEIGHT);
+            let instance_count = fleet_instance_count(target, weight);
+            (instance_count > 0).then(|| FleetCapacityReservationFacts {
+                fleet_id: fleet_id.to_string(),
+                region: record.region.clone(),
+                tenancy: record.view.tenancy.clone().unwrap_or_default(),
+                instance_match_criteria: record
+                    .view
+                    .instance_match_criteria
+                    .clone()
+                    .unwrap_or_default(),
+                end_date,
+                tags: record.view.tags.clone().unwrap_or_default(),
+                instance_type: reservation.instance_type.clone().unwrap_or_default(),
+                instance_platform: reservation.instance_platform.clone().unwrap_or_default(),
+                availability_zone: reservation.availability_zone.clone().unwrap_or_default(),
+                availability_zone_id: reservation
+                    .availability_zone_id
+                    .clone()
+                    .unwrap_or_default(),
+                ebs_optimized: reservation.ebs_optimized.unwrap_or(false),
+                instance_count,
+                created_at: now,
+            })
+        });
+        let minted_reservation_id =
+            to_reserve.and_then(|facts| self.reserve_fleet_capacity_reservation(facts));
+
         let Some(record) = self.capacity_reservation_fleets.get_mut(fleet_id) else {
             return false;
         };
@@ -1917,7 +2117,82 @@ impl ComAmazonawsEc2Amazonec2State {
             CapacityReservationFleetEndDate::Removed => record.view.end_date = None,
         }
         record.begin_modification();
+
+        // What the Fleet now reserves, read back off the record it just wrote, so the
+        // Capacity Reservations of the account are brought into line with the Fleet rather
+        // than with what this call meant to write.
+        let reserved_now: Vec<(String, i32)> = record
+            .view
+            .instance_type_specifications
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|reservation| {
+                Some((
+                    reservation.capacity_reservation_id.clone()?,
+                    reservation.total_instance_count.unwrap_or_default(),
+                ))
+            })
+            .collect();
+        // "the Fleet automatically creates new Capacity Reservations, or MODIFIES or CANCELS
+        // existing Capacity Reservations in the Fleet to meet the new total target capacity"
+        // (`ModifyCapacityReservationFleet`): a reservation the Fleet still reserves through
+        // holds the instances the Fleet now counts on it, and one it no longer reserves
+        // through is cancelled. Both are facts of this call, so a reader of either resource
+        // sees the same capacity.
+        for (capacity_reservation_id, instance_count) in &reserved_now {
+            self.resize_capacity_reservation(capacity_reservation_id, *instance_count);
+            if let Some(reservation) = self.capacity_reservations.get_mut(capacity_reservation_id)
+            {
+                reservation.view.end_date = end_date;
+                reservation.view.end_date_type = Some(
+                    if end_date.is_some() {
+                        END_DATE_TYPE_LIMITED
+                    } else {
+                        END_DATE_TYPE_UNLIMITED
+                    }
+                    .to_string(),
+                );
+            }
+        }
+        for capacity_reservation_id in reserved_before {
+            if !reserved_now
+                .iter()
+                .any(|(reserved, _)| *reserved == capacity_reservation_id)
+            {
+                self.cancel_capacity_reservation(&capacity_reservation_id);
+            }
+        }
         true
+    }
+
+    /// Cancel the Capacity Reservation Fleet `fleet_id` names, and the Capacity Reservations
+    /// it reserves its capacity through, answering the Fleet's PREVIOUS state as
+    /// [`CapacityReservationFleetRecord::begin_cancellation`] does — or `None` when the id
+    /// names no Fleet of the account, or one in a state a cancellation does not run from.
+    ///
+    /// "When you cancel a Capacity Reservation Fleet … all of the individual Capacity
+    /// Reservations in the Fleet are cancelled" (`CancelCapacityReservationFleets`): the
+    /// Fleet's own state word and the state of the reservations it holds are one outcome, so
+    /// they are written together rather than by two callers — a cancelled Fleet cannot be
+    /// left reporting Capacity Reservations the Capacity Reservation store still answers as
+    /// usable. The Fleet keeps REPORTING the composition it reserved, which is what EC2
+    /// reports for a cancelled Fleet; it is the reservations themselves that are cancelled.
+    pub fn cancel_capacity_reservation_fleet(&mut self, fleet_id: &str) -> Option<String> {
+        let record = self.capacity_reservation_fleets.get_mut(fleet_id)?;
+        let previous_fleet_state = record.begin_cancellation()?;
+        let cancelled: Vec<String> = record
+            .view
+            .instance_type_specifications
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|reservation| reservation.capacity_reservation_id.clone())
+            .collect();
+        for capacity_reservation_id in cancelled {
+            self.cancel_capacity_reservation(&capacity_reservation_id);
+        }
+        Some(previous_fleet_state)
     }
 
     /// Apply every Capacity Reservation Fleet move the clock owes, as of `now`.

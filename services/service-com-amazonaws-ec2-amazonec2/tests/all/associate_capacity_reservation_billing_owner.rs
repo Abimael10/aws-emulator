@@ -229,6 +229,7 @@ fn seed_reservation(engine: &engine::InMemoryEngine, state: &'static str) -> Str
             interruption_info: None,
             zero_size_preference: None,
             pending: None,
+            capacity_reservation_fleet_id: None,
         })
         .expect("the store accepts a seeded Capacity Reservation")
 }

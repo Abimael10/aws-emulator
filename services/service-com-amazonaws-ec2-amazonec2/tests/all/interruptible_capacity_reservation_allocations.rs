@@ -211,6 +211,7 @@ fn source_spec(
         interruption_info: None,
         zero_size_preference: None,
         pending: None,
+        capacity_reservation_fleet_id: None,
     }
 }
 

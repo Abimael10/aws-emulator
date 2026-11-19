@@ -219,7 +219,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for fleet_id in fleet_ids {
             // Resolved a moment ago, with the store locked throughout, so this cannot be a
             // Fleet the account does not hold.
-            let Some(record) = store.capacity_reservation_fleets.get_mut(&fleet_id) else {
+            let Some(current_state) = store
+                .capacity_reservation_fleets
+                .get(&fleet_id)
+                .map(|record| record.state().to_string())
+            else {
                 failed.push(cancellation_failure(
                     &fleet_id,
                     INVALID_CAPACITY_RESERVATION_FLEET_ID_NOT_FOUND,
@@ -229,12 +233,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             // "The Capacity Reservation Fleet's status changes to `cancelled`" by way of
             // `cancelling`, from a state the Fleet has not already left
-            // (`CAPACITY_RESERVATION_FLEET_CANCELLABLE_STATES`). A Fleet that is already
-            // being cancelled, is cancelled, has expired or has failed has nothing left to
-            // cancel, so it is reported as a Fleet that could not be cancelled rather than
-            // moved again.
-            let current_state = record.state().to_string();
-            let Some(previous_fleet_state) = record.begin_cancellation() else {
+            // (`CAPACITY_RESERVATION_FLEET_CANCELLABLE_STATES`), and "all of the individual
+            // Capacity Reservations in the Fleet are cancelled" with it — one outcome, so the
+            // store writes both. A Fleet that is already being cancelled, is cancelled, has
+            // expired or has failed has nothing left to cancel, so it is reported as a Fleet
+            // that could not be cancelled rather than moved again.
+            let Some(previous_fleet_state) = store.cancel_capacity_reservation_fleet(&fleet_id)
+            else {
                 failed.push(cancellation_failure(
                     &fleet_id,
                     INCORRECT_STATE,
@@ -254,17 +259,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Fleet" (`$CurrentFleetState`) is read back OUT of the stored record, so the
             // caller is told the state a later describe will report rather than the word this
             // handler meant to write.
-            successful.push(CapacityReservationFleetCancellationState {
-                capacity_reservation_fleet_id: Some(fleet_id.clone()),
-                previous_fleet_state: Some(previous_fleet_state),
-                current_fleet_state: Some(record.state().to_string()),
-            });
+            let cancelling_state = store
+                .capacity_reservation_fleets
+                .get(&fleet_id)
+                .map(|record| record.state().to_string());
             debug_assert_eq!(
-                record.state(),
-                CAPACITY_RESERVATION_FLEET_STATE_CANCELLING,
+                cancelling_state.as_deref(),
+                Some(CAPACITY_RESERVATION_FLEET_STATE_CANCELLING),
                 "a cancellation leaves the Fleet in the transient state the clock owes \
                  `cancelled`"
             );
+            successful.push(CapacityReservationFleetCancellationState {
+                capacity_reservation_fleet_id: Some(fleet_id.clone()),
+                previous_fleet_state: Some(previous_fleet_state),
+                current_fleet_state: cancelling_state,
+            });
         }
 
         // Both sets are reported even when empty: EC2's ec2Query XML carries the set element

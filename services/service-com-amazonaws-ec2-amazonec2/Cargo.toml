@@ -118,6 +118,12 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # `GetMetricStatistics` and alarm evaluation read — so both append their datapoints through that
 # service's own state accessor rather than keeping a second copy of the series beside it.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# `state::capacity_reservation_resource_groups`: the Resource Groups client the groups a Capacity
+# Reservation has been added to are read from, over the in-process callback into this same
+# emulator — a resource group and the membership in it are that service's resources, so
+# `GetGroupsForCapacityReservation` asks it rather than keeping a second copy. No network client
+# feature is enabled: the transport is the emulator's own.
+aws-sdk-resourcegroups = { version = "1", default-features = false }
 # `state::flow_log_s3_delivery`: the Amazon S3 client a flow log's destination bucket policy is
 # amended through, over the in-process callback into this same emulator — the permissions the log
 # delivery service needs to write a flow log's records are Amazon S3's own resource. No network
@@ -171,6 +177,11 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # TEST-ONLY — `src/` publishes over the in-process callback instead.
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# The Resource Groups service, so the Capacity Reservation group suite can create a group and add
+# a reservation to it through the service that OWNS groups and memberships, and watch what
+# `GetGroupsForCapacityReservation` reports off it.
+# TEST-ONLY — `src/` reaches that service over the in-process callback instead.
+service-com-amazonaws-resourcegroups-ardi = { workspace = true }
 
 [lints]
 workspace = true

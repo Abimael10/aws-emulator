@@ -809,6 +809,7 @@ fn seed(engine: &engine::InMemoryEngine, seeded: &Seeded) -> String {
             interruption_info: None,
             zero_size_preference: None,
             pending: None,
+            capacity_reservation_fleet_id: None,
         })
         .expect("the store accepts a seeded Capacity Reservation");
     if let Some(record) = store.capacity_reservations.get_mut(&id) {

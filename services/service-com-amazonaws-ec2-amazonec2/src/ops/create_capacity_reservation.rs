@@ -731,6 +731,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         interruption_info: None,
                         zero_size_preference: None,
                         pending: initial_pending,
+                        // Capacity reserved by this call on its own, not through a Capacity
+                        // Reservation Fleet: the reservation belongs to no Fleet.
+                        capacity_reservation_fleet_id: None,
                     })
                 else {
                     // The store refused the write at one of its own ceilings: a quota, not

@@ -419,6 +419,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 pending: Some(state::CapacityReservationTransition::starting_now(
                     state::CapacityReservationMove::Active,
                 )),
+                // Capacity allocated out of a source reservation the caller holds, not
+                // capacity a Capacity Reservation Fleet reserved: it belongs to no Fleet.
+                capacity_reservation_fleet_id: None,
             })
         else {
             // The store refused the write at one of its own ceilings: a quota, not

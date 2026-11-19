@@ -4,12 +4,12 @@
 //! IMPLEMENTED: reports the resource groups the stored Capacity Reservation the request names
 //! has been added to. This is the ONLY file to touch for this operation.
 //!
-//! No reservation this store holds is in a group — a reservation joins one through the
-//! Resource Groups API, which this emulator does not serve, and no EC2 operation adds one — so
-//! what this operation reports is the EMPTY list, with no page after it. The `NextToken` a
-//! request may carry is still read, because a value this service never issued names no
-//! position in any list and is refused for that; `MaxResults` bounds a page of a list with
-//! nothing in it.
+//! A resource group is NOT this service's resource: a Capacity Reservation joins one through
+//! the Resource Groups API (`GroupResources` on an `AWS::EC2::CapacityReservationPool` group)
+//! and leaves it through `UngroupResources`, so what this operation reports is the membership
+//! THAT service holds for the reservation's ARN, read over the emulator's in-process callback
+//! ([`crate::state::groups_holding`]) rather than out of a copy kept here. The `MaxResults`
+//! and `NextToken` a request may carry page that report, in group-ARN order.
 //!
 //! ## Shape of an operation
 //!
@@ -146,19 +146,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state;
 
-        // `ctx` carries request metadata only; this operation reads none of it — the store
-        // holds Capacity Reservations per account, so the Region a request was signed for
-        // does not narrow them.
-        let _ = ctx;
+        // The Region of the request's SigV4 credential scope: the store holds Capacity
+        // Reservations per account, so the Region does not narrow them — but a resource group
+        // lives in the Region whose endpoint created it, so it is the Region the membership
+        // below is read in.
+        let region = state::request_region(ctx.parts());
 
         // "The token to use to retrieve the next page of results" (`$NextToken`) — anything
         // else is refused rather than read as a group ARN, and it is refused before the store
         // is looked at, so whether a bogus token is caught never depends on what is stored.
+        // The token is SCOPED to the reservation it was issued for: this report is the groups
+        // of ONE Capacity Reservation, so a position inside another reservation's report names
+        // no position in this one.
         let start_at = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                state::decode_page_token(token)
-                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+                state::decode_scoped_page_token(token, &input.capacity_reservation_id)
+                    .ok_or_else(state::invalid_pagination_token)?,
             ),
         };
 
@@ -172,34 +176,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(Scaffolded::dry_run_operation());
         }
 
-        let service_state = state::require_service_state(&*self.engine)?;
-        let mut store = service_state.lock();
-        // A move the clock already owed is materialised before the reservation is read, so
-        // this report sees the state a caller would have been shown anyway — and nothing else
-        // is written: listing a reservation's groups is a READ.
-        store.materialize_due_transitions();
+        // The reservation's own ARN, which is what a grouping names it by: read under the
+        // store lock and carried out of it, because the membership is read from ANOTHER
+        // service and no lock of this one is held across that read.
+        let capacity_reservation_arn = {
+            let service_state = state::require_service_state(&*self.engine)?;
+            let mut store = service_state.lock();
+            // A move the clock already owed is materialised before the reservation is read, so
+            // this report sees the state a caller would have been shown anyway — and nothing
+            // else is written: listing a reservation's groups is a READ.
+            store.materialize_due_transitions();
 
-        // "The ID of the Capacity Reservation" (`$CapacityReservationId`): an id the account
-        // holds no reservation for is an error, not an empty list — and this operation's
-        // validator answers the MALFORMED half for every id it cannot resolve
-        // ([`crate::state::require_resolvable_capacity_reservation`]).
-        state::require_resolvable_capacity_reservation(&store, &input.capacity_reservation_id)?;
+            // "The ID of the Capacity Reservation" (`$CapacityReservationId`): an id the
+            // account holds no reservation for is an error, not an empty list — and this
+            // operation's validator answers the MALFORMED half for every id it cannot resolve
+            // ([`crate::state::require_resolvable_capacity_reservation`]).
+            let record = state::require_resolvable_capacity_reservation(
+                &store,
+                &input.capacity_reservation_id,
+            )?;
+            record.view.capacity_reservation_arn.clone()
+        };
 
         // "Lists the resource groups to which a Capacity Reservation has been ADDED": a
-        // reservation joins a resource group through the Resource Groups API
-        // (`GroupResourcesRequest`), which this emulator does not serve, and no EC2 operation
-        // adds one to a group — so no reservation this store holds is in a group and the list
-        // is empty rather than invented. The `MaxResults` the request may carry bounds a page
-        // of that list and the `NextToken` above names a position in it; with nothing to page
-        // over, there is no page after this one, which is what the absent token says ("this
-        // value is null when there are no more results to return", `$NextToken`). The paging
-        // itself belongs to the day a membership can exist, so it is not written here against
-        // a list that is statically empty.
-        let _ = (&start_at, input.max_results);
+        // reservation is added to a resource group through the Resource Groups API, which owns
+        // both the group and the membership — so the groups it belongs to are ASKED FOR there,
+        // by the reservation's ARN, rather than invented or kept in a second copy here. A
+        // reservation whose ARN names nothing to ask about is in no group.
+        //
+        // The read runs over the emulator's own in-process channel
+        // (`ctx.callback().http_client()`, as every cross-service read of this crate does):
+        // the `region` above only addresses that channel, nothing opens a socket and no
+        // address is dialled. What one request costs is bounded before it starts: the
+        // membership reader follows at most the pages it publishes
+        // ([`crate::state::MAX_RESOURCE_GROUP_PAGES`]) and reports at most
+        // [`crate::state::MAX_RESOURCE_GROUPS_REPORTED`] memberships, so the collection built
+        // here is bounded by this crate rather than by anything a request chose — and the
+        // page below cuts it again.
+        let mut groups: Vec<CapacityReservationGroup> = match capacity_reservation_arn {
+            Some(capacity_reservation_arn) => {
+                state::groups_holding(ctx, &region, &capacity_reservation_arn)
+                    .await
+                    .into_iter()
+                    .map(|membership| CapacityReservationGroup {
+                        // "The ARN of the resource group" and "The ID of the Amazon Web
+                        // Services account that owns the resource group"
+                        // (`CapacityReservationGroup$GroupArn` / `$OwnerId`): both are the
+                        // group's own, as the service that holds it reports them.
+                        group_arn: Some(membership.group_arn),
+                        owner_id: membership.owner_id,
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        // One total order to page in, which the membership read already answers in, kept here
+        // so the page a token resumes in cannot depend on the order another service listed its
+        // groups in.
+        groups.sort_by(|left, right| left.group_arn.cmp(&right.group_arn));
+
+        // "The maximum number of items to return for this request. To get the next page of
+        // items, make another request with the token returned in the output" (`$MaxResults`),
+        // whose modelled `@range` the boundary validator has already enforced: the page is cut
+        // to it and the token names the position the next page resumes after, so a caller that
+        // follows the token walks the whole membership once. "This value is null when there
+        // are no more results to return" (`$NextToken`), so the last page carries none.
+        let limit = input.max_results.and_then(|max| usize::try_from(max).ok());
+        let (page, next_token) = state::scoped_page_from_cursor(
+            &input.capacity_reservation_id,
+            &groups,
+            start_at.as_deref(),
+            limit,
+            state::PageTokenRule::WhenAnotherItemFollows,
+            |group| group.group_arn.as_deref().unwrap_or_default(),
+        );
 
         Ok(GetGroupsForCapacityReservationOutput {
-            next_token: None,
-            capacity_reservation_groups: Some(Vec::new()),
+            next_token,
+            capacity_reservation_groups: Some(page.to_vec()),
         })
     }
 }
