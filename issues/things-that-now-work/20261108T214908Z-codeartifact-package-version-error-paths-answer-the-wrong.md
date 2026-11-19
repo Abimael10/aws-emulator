@@ -38,6 +38,52 @@ Why: a client that uploads an asset with a stale or wrong digest gets an authent
 Fix: the PublishPackageVersion request path — the signing middleware must not verify this operation's `x-amz-content-sha256` header as the payload signature hash (it is a modeled input member), and the operation's validation must compute the SHA-256 of `assetContent` and raise `ValidationException` (400) with AWS's sentence naming both hashes.
 Traces: codeartifact-generic-publish-validation-envelopes#task#5. Open issues 20261101T084500Z-codeartifact-publishpackageversion-digest-mismatch-refused-as-signaturedoesnotmatch.md and 20261103T235912Z-codeartifact-reopens-publishpackageversion-with-a-mismatched-assetsha256-is-still.md describe this same behavior but the replay reports this step as NOT owned by either (neither carries this fixture/step replay key), so it is filed here with the key attached.
 
+## Resolution
+
+Cause 1 is FIXED. Cause 2 is a vendor-level gap: the fix it needs is in the read-only
+`vendor/` tree, so it is DECLINED here and stays open as the two issues already filed for
+it.
+
+Fixed (Cause 1): `GetPackageVersionReadme` for a resolved version that carries no readme is
+refused `ResourceNotFoundException` (404) with the service's fixed sentence, instead of
+answering `200` with the `readme` member omitted. The readme is a DOCUMENT of the version,
+not an optional label on it — the same reading this service already applies to a resource
+policy nothing has attached (`src/ops/get_domain_permissions_policy.rs`), where an unset
+policy is a missing resource rather than an empty success. The sentence is entirely fixed
+text and lives once in `src/state.rs`
+(`PACKAGE_VERSION_README_NOT_FOUND_MESSAGE`); the refusal reports no `resourceId` or
+`resourceType`, because a readme carries no id of its own and is none of the kinds the
+model's `ResourceType` enum names (`domain`, `repository`, `package`, `package-version`,
+`asset`). `tests/all/package_version_readme.rs` pins it over a table spanning the format
+(`generic`, `npm`, `pypi`), the publish route the version came in through (the control-plane
+publish, an npm publish document declaring no `readme` and packing none, a PyPI upload
+sending no long description) and whether the version sits under a namespace; each row reads
+the version back through `DescribePackageVersion` first, so the 404 is about the readme and
+not about the version.
+
+Declined (Cause 2, vendor-level): a `PublishPackageVersion` whose `assetSHA256` disagrees
+with its body is still refused `403 SignatureDoesNotMatch` before dispatch. The operation's
+own validation already computes the SHA-256 of `assetContent` and raises the modeled
+`ValidationException` (400) with AWS's sentence naming both digests
+(`src/ops/publish_package_version.rs`, pinned by
+`tests/all/package_version_publish.rs::digest_mismatch_is_refused_and_stores_nothing`), so
+nothing in this service's own path refuses such a caller. What refuses it is the emulator's
+SigV4 verifier: `payload()` in `vendor/server/src/request_authentication.rs` (the match on
+the declared `x-amz-content-sha256`) treats a declared value WITHOUT a `-` — i.e. a plain
+64-character hex digest, which is exactly what this operation's member-bound header carries
+— as untrusted and re-derives the payload hash from the body, while SDKs sign the canonical
+request with the declared header value as the payload hash. The two canonical requests
+therefore differ and the signature cannot match. `SigV4Authenticator::verify` is the only
+authenticator `MultiServiceRouter::new` / `set_request_authentication` register
+(`vendor/smithy-server-runtime/src/multi_service_router.rs`), the `Service` trait has no
+authentication seam, and authentication runs before dispatch, so no service crate can
+influence it — and `vendor/` is read-only here. Closing it needs the core verifier to accept
+a member-bound 64-character lowercase-hex `x-amz-content-sha256` as the precomputed signed
+payload hash (keeping the body-versus-declared-hash check where S3 semantics require it),
+which would serve every service whose model binds a member to that header. The alternative
+reachable from a service crate — serving this operation unsigned — is not taken: an operation
+is unsigned only where its model says so.
+
 ## Evidence
 Replay of simparity-wire-aws-v1 against the emulator built from this checkout:
 

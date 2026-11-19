@@ -7,8 +7,11 @@
 //! ([`crate::state::PackageVersion::readme`]) — the text the publish that created the
 //! version carried, which for an npm version is the `readme` its publish document declared
 //! (or the `README` file inside its tarball) and for a Python version is the long
-//! description its upload sent. A version whose publish carried none reports none rather
-//! than an empty document. Reporting only: this operation writes nothing.
+//! description its upload sent. The readme is a DOCUMENT of the version rather than an
+//! optional label on it, so a version whose publish carried none holds no readme to report
+//! and the read is refused `ResourceNotFoundException` (404) — the same way this service
+//! answers a read of a resource policy nothing has attached. Reporting only: this operation
+//! writes nothing.
 //!
 //! It is an AUTHORIZED read, decided for the PACKAGE the request addressed
 //! ([`crate::service::authorization`]) ahead of everything else.
@@ -272,6 +275,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // The readme is a document the version either carries or does not: it is stored
+        // only when the publish that created the version brought one. A version that
+        // carries none therefore holds no readme to report, which is a MISSING RESOURCE
+        // rather than a successful read with the member left out — `readme` is optional on
+        // the wire, but a 200 without it cannot be told apart from a readme the emulator
+        // failed to report, and a client branching on the 404 ("no readme yet") would never
+        // take that branch. The same rule the policy reads of this service already follow
+        // for a resource policy nothing has attached
+        // ([`crate::ops::get_domain_permissions_policy`]).
+        let Some(readme) = version.readme.clone() else {
+            return Err(
+                GetPackageVersionReadmeErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::PACKAGE_VERSION_README_NOT_FOUND_MESSAGE
+                            .to_string(),
+                        // A readme carries no id of its own and is none of the resource
+                        // kinds `ResourceType` models, so neither member is reported.
+                        resource_id: None,
+                        resource_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
         Ok(GetPackageVersionReadmeOutput {
             // The coordinate the version is STORED under, not the strings the request
             // spelled: the lookup is exact, so they agree, and the answer reports the
@@ -284,9 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The text the publish carried, byte for byte: the `readme` an npm publish
             // document declared or its tarball held
             // ([`crate::service::npm_readme`]), the long description a PyPI upload sent.
-            // Absent for a version whose publish carried none, which is "this version has
-            // no readme" rather than an empty document.
-            readme: version.readme.clone(),
+            readme: Some(readme),
         })
     }
 }

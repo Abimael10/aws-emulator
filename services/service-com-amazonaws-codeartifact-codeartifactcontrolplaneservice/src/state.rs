@@ -1775,8 +1775,10 @@ pub struct PackageVersion {
     /// `GetPackageVersionReadme` "gets the readme file or descriptive text for a package
     /// version", so the text is what the publisher sent, kept verbatim and decoded as the
     /// UTF-8 it arrived as — a multi-byte readme round-trips unchanged. `None` for a version
-    /// whose publish carried none, which is "this version has no readme" rather than an
-    /// empty one.
+    /// whose publish carried none, which is "this version has no readme": a read of it is
+    /// refused `ResourceNotFoundException`
+    /// ([`PACKAGE_VERSION_README_NOT_FOUND_MESSAGE`]) rather than answered with an empty
+    /// one.
     ///
     /// Extracted at INGEST rather than on each read: the text is a property of what was
     /// published, and deriving it per read would make a readme fetch re-read a version's
@@ -2889,6 +2891,21 @@ pub fn asset_not_found_message(
         package_version_coordinate(format, namespace, package, version)
     )
 }
+
+/// The `ResourceNotFoundException` message a README-addressing read states for a package
+/// version that carries no readme.
+///
+/// ENTIRELY fixed text: a readme is not addressed by a name, an id or a coordinate of its
+/// own — it is the one document a version either carries or does not — so the sentence has
+/// no variable part to fill. The refusal reports no `resourceId` or `resourceType` for the
+/// same reason: a readme is none of the resource kinds `ResourceType` models (`domain`,
+/// `repository`, `package`, `package-version`, `asset`) and holds no id.
+///
+/// Distinct from [`asset_not_found_message`], which is the sentence for an asset of a
+/// version addressed BY NAME, and from [`package_version_not_found_message`], the sentence
+/// for a coordinate holding no version at all.
+pub const PACKAGE_VERSION_README_NOT_FOUND_MESSAGE: &str =
+    "The readme file of this package version is not found";
 
 /// The `ValidationException` a caller-supplied `resourceArn` owes when it addresses no
 /// resource of this service's namespace at all.
