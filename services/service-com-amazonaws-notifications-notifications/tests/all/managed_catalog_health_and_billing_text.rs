@@ -21,6 +21,11 @@
 //! un-derivable: the per-entry display-name forms and the per-entry delivery
 //! statement.
 //!
+//! Both clusters are pinned name AND description, per entry and on every read
+//! path, because a description is fixed per-sub-category text: a paraphrase of
+//! it, or one sibling's sentence reused for another, is the defect this suite
+//! catches.
+//!
 //! Shape source: `ManagedNotificationConfigurationStructure.{arn,name,description}`
 //! are all `@required`, `name` `@length` 1..64 and `description` `@length`
 //! 0..256
@@ -73,22 +78,42 @@ const HEALTH_PUBLISHED: &[(&str, &str, &str)] = &[
 /// The arn `category/` segment of the cluster above.
 const HEALTH_CATEGORY: &str = "AWS-Health";
 
-/// The published display names of the whole `AWS-BCM` cluster, as
-/// `(sub-category, name)`, from the same published set.
-const BCM_PUBLISHED_NAMES: &[(&str, &str)] = &[
-    ("Billing-and-Invoices", "Billing and Invoices"),
-    ("Financing", "Financing"),
-    ("Fraud-Prevention", "Fraud Prevention"),
-    ("Payment", "Payment"),
-    ("Subscriptions", "Subscriptions"),
+/// The whole `AWS-BCM` cluster of the published catalog, as
+/// `(sub-category, name, description)`, from the same published set.
+///
+/// The rows are the whole cluster: every sub-category's own published sentence,
+/// which is fixed text keyed by `category`/`sub-category` and therefore the
+/// same for every account and every read path.
+const BCM_PUBLISHED: &[(&str, &str, &str)] = &[
+    (
+        "Billing-and-Invoices",
+        "Billing and Invoices",
+        "Notifications about your AWS invoices, payments, tax documents, and billing account changes.",
+    ),
+    (
+        "Financing",
+        "Financing",
+        "Notifications about the AWS Financing program including updates about your Financing Line application, activation of your line, withdrawals and status.",
+    ),
+    (
+        "Fraud-Prevention",
+        "Fraud Prevention",
+        "Notifications about potentially unauthorized account activity and/or related remediation requirement(s).",
+    ),
+    (
+        "Payment",
+        "Payment",
+        "Notifications about payment method failures, past-due alerts, account restrictions, suspension and reinstatement, direct debit enrollment, advance pay, payment profile changes, backup payment attempts, payment verification, and FX rate renewals.",
+    ),
+    (
+        "Subscriptions",
+        "Subscriptions",
+        "Updates about your AWS subscriptions, plans, credits, and billing status, including sign-ups, plan changes, and Marketplace activity.",
+    ),
 ];
 
 /// The arn `category/` segment of the Billing and Cost Management cluster.
 const BCM_CATEGORY: &str = "AWS-BCM";
-
-/// The published description of `AWS-BCM/Subscriptions`, the entry of that
-/// cluster whose own published sentence this checkout carries.
-const BCM_SUBSCRIPTIONS_DESCRIPTION: &str = "Updates about your AWS subscriptions, plans, credits, and billing status, including sign-ups, plan changes, and Marketplace activity.";
 
 /// The clause the three `AWS-Health` sub-categories whose events AWS delivers by
 /// email open their delivery statement with.
@@ -354,28 +379,31 @@ async fn one_categorys_entries_do_not_share_a_derived_form() {
 }
 
 /// RULE applied to the Billing and Cost Management cluster: it publishes exactly
-/// the sub-categories of the table above with those display names, and the
-/// entry whose published sentence this service carries reports it on every read
-/// path.
+/// the sub-categories of the table above, each with its OWN published name and
+/// its own published description, reported identically by the listing and by the
+/// read of its arn.
 #[tokio::test]
 async fn the_billing_cluster_publishes_its_own_text_per_entry() {
     let emulator = Emulator::new();
     let listed = listing(&emulator, "the whole catalog", "maxResults=100").await;
 
-    for (sub_category, name) in BCM_PUBLISHED_NAMES {
+    for (sub_category, name, description) in BCM_PUBLISHED {
         let case = format!("{BCM_CATEGORY}/{sub_category}");
         let entry = entry_of(&listed, &case, BCM_CATEGORY, sub_category);
         assert_eq!(
-            entry.name.as_str(),
-            *name,
-            "case {case}: expected the published name {name:?}, got {:?}",
-            entry.name
+            (entry.name.as_str(), entry.description.as_str()),
+            (*name, *description),
+            "case {case}: expected the published name {name:?} and description {description:?}, \
+             got {:?} and {:?}",
+            entry.name,
+            entry.description
         );
         assert!(
             NAME_BOUNDS.contains(&entry.name.chars().count())
                 && !entry.description.is_empty()
                 && entry.description.chars().count() <= DESCRIPTION_MAX
-                && entry.description.ends_with('.'),
+                && entry.description.ends_with('.')
+                && !entry.description.chars().any(is_a_control_character),
             "case {case}: the published text must be prose inside the modelled bounds, got {entry:?}"
         );
 
@@ -392,9 +420,9 @@ async fn the_billing_cluster_publishes_its_own_text_per_entry() {
         .filter(|(category, _)| category == BCM_CATEGORY)
         .map(|(_, sub_category)| sub_category)
         .collect();
-    let expected: std::collections::BTreeSet<String> = BCM_PUBLISHED_NAMES
+    let expected: std::collections::BTreeSet<String> = BCM_PUBLISHED
         .iter()
-        .map(|(sub_category, _)| (*sub_category).to_string())
+        .map(|(sub_category, _, _)| (*sub_category).to_string())
         .collect();
     assert_eq!(
         published, expected,
@@ -402,18 +430,97 @@ async fn the_billing_cluster_publishes_its_own_text_per_entry() {
          {published:?}"
     );
 
-    let subscriptions = entry_of(
-        &listed,
-        "AWS-BCM/Subscriptions",
-        BCM_CATEGORY,
-        "Subscriptions",
-    );
+    // Per entry, not one sentence shared by the cluster: no two sub-categories
+    // publish the same description.
+    let distinct: std::collections::BTreeSet<&str> = BCM_PUBLISHED
+        .iter()
+        .map(|(_, _, description)| *description)
+        .collect();
     assert_eq!(
-        subscriptions.description.as_str(),
-        BCM_SUBSCRIPTIONS_DESCRIPTION,
-        "case {BCM_CATEGORY}/Subscriptions: expected the published description \
-         {BCM_SUBSCRIPTIONS_DESCRIPTION:?}, got {:?}",
-        subscriptions.description
+        distinct.len(),
+        BCM_PUBLISHED.len(),
+        "case {BCM_CATEGORY}: every sub-category must publish its own description, got \
+         {distinct:?}"
+    );
+}
+
+/// Whether `c` is one of the characters
+/// `ManagedNotificationConfigurationDescription`'s modelled pattern
+/// `^[^\u0001-\u001F\u007F-\u009F]*$` excludes.
+fn is_a_control_character(c: char) -> bool {
+    matches!(c, '\u{1}'..='\u{1F}') || matches!(c, '\u{7F}'..='\u{9F}')
+}
+
+/// RULE: a published description is FIXED text keyed only by the entry's
+/// `category`/`sub-category` — nothing of the request or of the account is
+/// substituted into it, so a repeated read, a store a caller has written an
+/// unrelated configuration into, and a second store all answer the same string.
+#[tokio::test]
+async fn a_published_description_carries_nothing_of_the_request_or_the_account() {
+    let emulator = Emulator::new();
+    let baseline = listing(&emulator, "a fresh store", "maxResults=100").await;
+
+    // No description carries the account id its own arn renders, and none of
+    // them is a rendering of the arn's own segments: the text is published
+    // prose, not a template filled from the arn or from the environment.
+    for entry in &baseline {
+        let (category, sub_category) = managed_configuration_arn_segments(&entry.arn)
+            .unwrap_or_else(|| panic!("case {}: the arn matches the modelled pattern", entry.arn));
+        let case = format!("{category}/{sub_category}");
+        let account = entry.arn.split(':').nth(4).unwrap_or_default();
+        assert!(
+            !account.is_empty() && !entry.description.contains(account),
+            "case {case}: a published description must carry no account id, got {:?}",
+            entry.description
+        );
+        for rendering in [
+            category.clone(),
+            sub_category.clone(),
+            format!("{category}/{sub_category}"),
+            format!("{category}-{sub_category}"),
+            format!("{category}{sub_category}"),
+        ] {
+            assert_ne!(
+                entry.description, rendering,
+                "case {case}: a published description must be prose rather than the arn \
+                 rendering {rendering:?}"
+            );
+        }
+    }
+
+    // Rows: a repeated read, a store with an unrelated configuration written
+    // into it, and a second, independently booted store.
+    let repeated = listing(&emulator, "a repeated read", "maxResults=100").await;
+    assert_eq!(
+        repeated, baseline,
+        "case a repeated read: reading the catalog must not change what it publishes"
+    );
+
+    let (status, created) = emulator
+        .send(
+            "POST",
+            "/notification-configurations",
+            Some(serde_json::json!({
+                "name": "unrelated-to-the-catalog",
+                "description": "a caller's own configuration description",
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 201,
+        "case an unrelated write: create must answer 201, got {status} {created:?}"
+    );
+    let after_write = listing(&emulator, "an unrelated write", "maxResults=100").await;
+    assert_eq!(
+        after_write, baseline,
+        "case an unrelated write: a caller's own configuration must not change the published text"
+    );
+
+    let other = Emulator::new();
+    let other_store = listing(&other, "another store", "maxResults=100").await;
+    assert_eq!(
+        other_store, baseline,
+        "case another store: every store publishes the same text"
     );
 }
 
@@ -472,14 +579,16 @@ async fn every_path_and_every_store_reports_the_same_account_cluster_text() {
                 entry.description
             );
         }
-        for (sub_category, name) in BCM_PUBLISHED_NAMES {
+        for (sub_category, name, description) in BCM_PUBLISHED {
             let row = format!("{case}: {BCM_CATEGORY}/{sub_category}");
             let entry = entry_of(entries, &row, BCM_CATEGORY, sub_category);
             assert_eq!(
-                entry.name.as_str(),
-                *name,
-                "case {row}: expected the published name {name:?}, got {:?}",
-                entry.name
+                (entry.name.as_str(), entry.description.as_str()),
+                (*name, *description),
+                "case {row}: expected the published name {name:?} and description \
+                 {description:?}, got {:?} and {:?}",
+                entry.name,
+                entry.description
             );
         }
     }

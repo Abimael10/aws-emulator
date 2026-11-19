@@ -677,35 +677,35 @@ struct PublishedManagedNotification {
 /// category whose events nothing delivers.
 const MANAGED_NOTIFICATION_CATALOG: &[PublishedManagedNotification] = &[
     // The Billing and Cost Management cluster. Each display name is the words
-    // its sub-category segment spells, and the `Subscriptions` entry carries the
-    // published sentence for that sub-category. For the four entries below it
-    // the published wording is not recoverable in this checkout, so each
-    // description says what the sub-category delivers rather than carrying
-    // wording nothing attests to. The arn — what every read path keys an entry
-    // on — is the published one.
+    // its sub-category segment spells, and every description below is the
+    // sentence the service itself publishes for that sub-category, carried
+    // verbatim: the catalog is read-only, so a description is fixed text keyed
+    // only by `category`/`sub-category` and is never paraphrased or composed
+    // here. The arn — what every read path keys an entry on — is the published
+    // one.
     PublishedManagedNotification {
         category: "AWS-BCM",
         sub_category: "Billing-and-Invoices",
         name: "Billing and Invoices",
-        description: "Notifications about your bills and invoices, including invoice availability, charges that differ from your usual spend, and changes to the billing documents for your account.",
+        description: "Notifications about your AWS invoices, payments, tax documents, and billing account changes.",
     },
     PublishedManagedNotification {
         category: "AWS-BCM",
         sub_category: "Financing",
         name: "Financing",
-        description: "Notifications about AWS financing for your account, including financing application outcomes, installment schedules, and upcoming financed payments.",
+        description: "Notifications about the AWS Financing program including updates about your Financing Line application, activation of your line, withdrawals and status.",
     },
     PublishedManagedNotification {
         category: "AWS-BCM",
         sub_category: "Fraud-Prevention",
         name: "Fraud Prevention",
-        description: "Notifications about suspected fraudulent activity on your account, including unusual usage, credentials that may be compromised, and the action needed to secure the account.",
+        description: "Notifications about potentially unauthorized account activity and/or related remediation requirement(s).",
     },
     PublishedManagedNotification {
         category: "AWS-BCM",
         sub_category: "Payment",
         name: "Payment",
-        description: "Notifications about your payments, including upcoming and overdue payments, payment confirmations, failed payment methods, and refunds.",
+        description: "Notifications about payment method failures, past-due alerts, account restrictions, suspension and reinstatement, direct debit enrollment, advance pay, payment profile changes, backup payment attempts, payment verification, and FX rate renewals.",
     },
     PublishedManagedNotification {
         category: "AWS-BCM",
