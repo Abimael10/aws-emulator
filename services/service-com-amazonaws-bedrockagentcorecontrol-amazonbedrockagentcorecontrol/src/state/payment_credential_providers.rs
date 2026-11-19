@@ -57,7 +57,7 @@ use crate::ops::types::{
     CoinbaseCdpConfigurationOutput, CreatePaymentCredentialProviderOutput,
     GetPaymentCredentialProviderOutput, PaymentProviderConfigurationInput,
     PaymentProviderConfigurationOutput, ResourceNotFoundException, Secret, SecretReference,
-    StripePrivyConfigurationOutput, ValidationException,
+    StripePrivyConfigurationOutput, UpdatePaymentCredentialProviderOutput, ValidationException,
 };
 
 /// How this service words a payment credential provider no name of this account
@@ -76,6 +76,26 @@ pub const PAYMENT_CREDENTIAL_PROVIDER_NOT_FOUND_MESSAGE: &str =
 pub fn payment_credential_provider_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(PAYMENT_CREDENTIAL_PROVIDER_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// How the UPDATE route words the same miss: the resource's own modelled name,
+/// then the member the request addressed the provider by and the value it
+/// carried — the identifier the caller has to correct, which the routes that
+/// merely report a provider leave out. The service's recorded answer to an
+/// update naming a provider the account does not hold carries exactly this
+/// sentence, with the name the request sent in it; a replay of that recording is
+/// what fixes the wording here rather than the read routes' shorter one.
+///
+/// Kept here beside the sentence the reads use rather than in one `ops/` file,
+/// so neither route's wording can drift from the other's, exactly as the API key
+/// credential provider's two sentences live beside each other
+/// ([`super::api_key_credential_provider_not_found_on_update`]).
+pub fn payment_credential_provider_not_found_on_update(name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "{PAYMENT_CREDENTIAL_PROVIDER_NOT_FOUND_MESSAGE} for name: {name}"
+        )),
     }
 }
 
@@ -842,6 +862,42 @@ impl PaymentCredentialProviderRecord {
             credential_provider_vendor: self.configuration.vendor().to_string(),
             credential_provider_arn: self.credential_provider_arn.clone(),
             provider_configuration_output: self.configuration.output(),
+        }
+    }
+
+    /// Replace the vendor configuration this provider authenticates with by the
+    /// one an update supplied, and record the instant it happened.
+    ///
+    /// An update carries the whole configuration — the vendor and the member of
+    /// the union that vendor's credentials are carried in — so the provider
+    /// afterwards carries exactly what the update asked for, with nothing of the
+    /// previous configuration left mixed in. What the update does NOT touch is
+    /// what identifies the provider rather than configures it: the name it is
+    /// addressed by, the ARN minted from that name, the tags it carries and the
+    /// instant it was created.
+    pub fn apply_update(
+        &mut self,
+        configuration: StoredPaymentProviderConfiguration,
+        at: SystemTime,
+    ) {
+        self.configuration = configuration;
+        self.updated_at = at;
+    }
+
+    /// This provider as `UpdatePaymentCredentialProvider`'s response envelope —
+    /// the members the read reports that this response declares, off the one
+    /// record the update has just written, so the update and a later read cannot
+    /// disagree. `UpdatePaymentCredentialProviderResponse` declares no `tags`, so
+    /// the tags the provider carries are reported by the read alone.
+    pub fn update_output(&self) -> UpdatePaymentCredentialProviderOutput {
+        let read = self.get_output();
+        UpdatePaymentCredentialProviderOutput {
+            name: read.name,
+            credential_provider_vendor: read.credential_provider_vendor,
+            credential_provider_arn: read.credential_provider_arn,
+            provider_configuration_output: read.provider_configuration_output,
+            created_time: read.created_time,
+            last_updated_time: read.last_updated_time,
         }
     }
 

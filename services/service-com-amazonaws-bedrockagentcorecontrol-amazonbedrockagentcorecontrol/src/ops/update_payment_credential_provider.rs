@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePaymentCredentialProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePaymentCredentialProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePaymentCredentialProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +170,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePaymentCredentialProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePaymentCredentialProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdatePaymentCredentialProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the payment credential provider store is unavailable".to_string(),
+                    ),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // The credentials of a provider of this account live in the account's
+        // token vault, which the provider's own ARN is nested under; this
+        // request names no vault, so they live in the one every account holds.
+        let token_vault_id = crate::state::DEFAULT_TOKEN_VAULT_ID;
+
+        // The configuration an update asks the provider to carry is decided
+        // exactly as a create's is — the vendor decides which member of the
+        // union carries the credentials, and the same three members describe
+        // each of that vendor's secrets — and decided BEFORE anything is
+        // written, so a refused update leaves the provider and its secrets as
+        // they were.
+        let requested = crate::state::RequestedPaymentProviderConfiguration::from_input(
+            &input.credential_provider_vendor,
+            &region,
+            &input.provider_configuration_input,
+        )
+        .map_err(configuration_refused)?;
+
+        // This operation "updates an existing payment credential provider", and
+        // the store is keyed by the `name` every payment-credential-provider
+        // route addresses a provider by, so a name naming no stored provider is
+        // the modelled 404 rather than a provider minted by an update. The guard
+        // is dropped before the await below.
+        {
+            let store = state.lock();
+            if !store.payment_credential_providers.contains_key(&input.name) {
+                return Err(provider_not_found(&input.name).into());
+            }
+        }
+
+        // The secrets the updated provider reports are secrets Secrets Manager
+        // really holds: the ones this update puts the caller's new values into
+        // for a managed source, and the ones the request references for an
+        // external one. Each ARN is `@required` on this operation's own answer,
+        // so the provider is left untouched — and no success reported — when
+        // there is no secret to name.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePaymentCredentialProvider"))
+        // A secret the caller's account already owns is written as a new VERSION
+        // of itself, so a refusal after one of them was written leaves that
+        // version behind rather than a resource the caller did not ask for: the
+        // secret belongs to the account either way, exactly as it does when a
+        // create is refused or a provider deleted, and the provider this
+        // operation answers about is reported only when every secret of it
+        // resolved.
+        let configuration = requested
+            .resolve(ctx, &region, token_vault_id, &input.name)
+            .await
+            .map_err(|problem| secret_problem(problem, &input.name))?;
+
+        let mut store = state.lock();
+        // The provider was there when this request started and the secret
+        // resolution above awaited: one deleted in the meantime is gone, so the
+        // update is refused rather than re-creating it.
+        let record = store
+            .payment_credential_providers
+            .get_mut(&input.name)
+            .ok_or_else(|| provider_not_found(&input.name))?;
+
+        record.apply_update(configuration, now);
+
+        Ok(record.update_output())
+    }
+}
+
+/// The refusal of an update whose `name` resolves to no payment credential
+/// provider of this account, worded as the UPDATE route words it: the resource's
+/// own modelled name, then the member the request addressed the provider by and
+/// the value it carried, which is the identifier the caller has to correct.
+fn provider_not_found(name: &str) -> UpdatePaymentCredentialProviderErrorModeled {
+    UpdatePaymentCredentialProviderErrorModeled::ResourceNotFoundException(
+        crate::state::payment_credential_provider_not_found_on_update(name),
+    )
+}
+
+/// How an update answers a vendor configuration it cannot serve, on the same
+/// rule the create beside it follows: a member rule of this control plane is the
+/// modelled `ValidationException`, with the `reason` and the `fieldList` that
+/// name the member; a secret that is not a key in the format its vendor issues
+/// is the identity plane's own refusal, which carries its sentence and nothing
+/// besides. Both are the modelled 400.
+fn configuration_refused(
+    refusal: crate::state::PaymentConfigurationRefusal,
+) -> UpdatePaymentCredentialProviderError {
+    match refusal {
+        crate::state::PaymentConfigurationRefusal::Member(modelled) => {
+            UpdatePaymentCredentialProviderErrorModeled::ValidationException(modelled).into()
+        }
+        crate::state::PaymentConfigurationRefusal::SecretFormat(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
+    }
+}
+
+/// How an update answers when the secrets the provider authenticates with could
+/// not be reported, on the same rule the create beside it follows: a reference
+/// naming no secret of this account is the modelled 404 for "a resource
+/// referenced by the operation does not exist"; a secret whose KMS key Secrets
+/// Manager will not decrypt under is the modelled `DecryptionFailure`, which
+/// tells the caller the secret's key rather than the request is at fault;
+/// anything else is this emulator failing to reach Secrets Manager, which is a
+/// server failure rather than a statement about the request.
+fn secret_problem(
+    problem: crate::state::PaymentSecretProblem,
+    provider: &str,
+) -> UpdatePaymentCredentialProviderError {
+    match problem {
+        crate::state::PaymentSecretProblem::Absent => {
+            UpdatePaymentCredentialProviderErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_SECRET),
+            )
+            .into()
+        }
+        crate::state::PaymentSecretProblem::Undecryptable => {
+            UpdatePaymentCredentialProviderErrorModeled::DecryptionFailure(DecryptionFailure {
+                message: crate::state::SECRET_UNDECRYPTABLE_MESSAGE.to_string(),
+            })
+            .into()
+        }
+        crate::state::PaymentSecretProblem::Unavailable(detail) => {
+            ::tracing::warn!(
+                %provider,
+                %detail,
+                "the payment credential provider's secrets could not be stored in or resolved \
+                 against Secrets Manager, so the provider was left unchanged",
+            );
+            UpdatePaymentCredentialProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the payment credentials could not be stored in Secrets Manager"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into()
+        }
     }
 }
