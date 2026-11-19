@@ -4,8 +4,10 @@
 //! Maps an IAM Identity Center user or group to the named studio with the session
 //! policy the request carries, so a later `GetStudioSessionMapping` reports it. A
 //! studio id no studio carries, a request naming neither or both of `IdentityId` and
-//! `IdentityName`, and an identity the studio is already mapped to are all refused
-//! with `InvalidRequestException`.
+//! `IdentityName`, an identity the Studio's own Identity Center directory holds no user or
+//! group of that kind for, a `SessionPolicyArn` that is not the ARN of an IAM policy, and an
+//! identity the studio is already mapped to are all refused with
+//! `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -201,23 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.identity_id.as_ref(),
             input.identity_name.as_ref(),
         ) else {
-            return Err(refuse(
-                "Either IdentityName or IdentityId must be specified, but not both".to_string(),
-            ));
+            return Err(refuse(crate::state::identity_members_message()));
         };
-
-        // ONE identity, named by its GUID or by its name: the member the request did not
-        // carry is resolved in the identity store that owns the user or group, so the
-        // mapping holds both and a later read reports both
-        // (`crate::state::studio_identities`).
-        let mapped = crate::state::resolve_identity(
-            &*self.engine,
-            &input.identity_type,
-            &crate::state::MappedIdentity {
-                identity_id,
-                identity_name,
-            },
-        );
+        let requested = crate::state::MappedIdentity {
+            identity_id,
+            identity_name,
+        };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -227,10 +218,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let mut store = state.lock();
 
         // A mapping belongs to a studio, so the studio is resolved before anything is
-        // stored: an unknown studio id maps nothing.
+        // stored: an unknown studio id maps nothing. The guard is taken for the read and
+        // RELEASED again — the identity store is reached below, and no other service's state
+        // is ever reached while this one's guard is held.
+        let studio = state.lock().studios.get(&input.studio_id).cloned();
+        let Some(studio) = studio else {
+            return Err(not_found(crate::state::unknown_studio_message()));
+        };
+
+        // ONE identity, named by its GUID or by its name, and it has to be one the Studio's
+        // own IAM Identity Center directory holds — of the KIND the request asked for. The
+        // member the request did not carry is filled in from that directory, so the mapping
+        // holds both and a later read reports both (`crate::state::studio_identities`).
+        let lookup =
+            crate::state::look_up_identity(&*self.engine, &input.identity_type, &requested);
+        if crate::state::directory_refuses_identity(&studio, &lookup) {
+            return Err(refuse(crate::state::invalid_identity_message(
+                crate::state::identity_member_of(&requested),
+            )));
+        }
+        let mapped = match lookup {
+            crate::state::IdentityLookup::Held(mapped) => mapped,
+            // Nothing is invented for an identity no directory could resolve: the request's
+            // own members stand exactly as they arrived.
+            crate::state::IdentityLookup::WrongType | crate::state::IdentityLookup::Unknown => {
+                requested
+            }
+        };
+
+        // "The Amazon Resource Name (ARN) for the session policy that will be applied to the
+        // user or group" (`CreateStudioSessionMapping$SessionPolicyArn` doc): a value that is
+        // not that ARN names no policy, so nothing is mapped under it.
+        if !crate::state::names_a_session_policy(&input.session_policy_arn) {
+            return Err(refuse(
+                crate::state::malformed_session_policy_arn_message(),
+            ));
+        }
+
+        let mut store = state.lock();
+        // The studio is resolved again under the guard that stores the mapping, so a studio
+        // deleted while the identity was being resolved still maps nothing.
         if !store.studios.contains_key(&input.studio_id) {
             return Err(not_found(crate::state::unknown_studio_message()));
         }
@@ -241,11 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .session_mapping_key_of(&input.studio_id, &input.identity_type, &identity)
             .is_some()
         {
-            return Err(refuse(format!(
-                "Studio '{}' is already mapped to {} '{identity}'. Use \
-                 UpdateStudioSessionMapping to change its session policy.",
-                input.studio_id, input.identity_type
-            )));
+            return Err(refuse(crate::state::existing_session_mapping_message()));
         }
 
         // One Studio holds a bounded number of mappings, and the identity each one is

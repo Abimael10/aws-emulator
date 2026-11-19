@@ -223,8 +223,11 @@ async fn an_absent_studio_or_session_mapping_is_refused_with_the_not_found_code(
             assert_not_found(&case, status, &payload);
             let said = message(&case, &payload);
             assert!(
-                said.contains(&live) && said.contains(identity),
-                "case {case:?}: the refusal names the Studio and the identity, got {said:?}"
+                said.starts_with("Studio session mapping does not exist.")
+                    && !said.contains(&live)
+                    && !said.contains(identity),
+                "case {case:?}: the refusal states that the mapping does not exist and echoes \
+                 neither the Studio nor the identity, got {said:?}"
             );
         }
     }

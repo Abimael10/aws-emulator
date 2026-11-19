@@ -29,11 +29,15 @@
 //!
 //! A step's application is owed from the instant its cluster STARTED the step — the queue,
 //! the concurrency slots and the timeline are the cluster's own runner's
-//! ([`ClusterRecord::advance_to`]) — and it is performed by the next operation that reports
-//! that step or its cluster, with no store guard held, exactly as a Glue job run's script is
-//! performed by the next call that reads the run. A step whose application has not run yet
-//! does not END ([`StepRecord::awaits_application`]): the state it ends in is the one its
-//! application answered, so the step stays `RUNNING` until there is an answer, and no step
+//! ([`ClusterRecord::advance_to`]) — and it is STARTED by the next operation that reports that
+//! step or its cluster, with no store guard held, exactly as a Glue job run's script is
+//! started by the next call that reads the run. The call that starts one waits a moment for it
+//! ([`APPLICATION_FIRST_WAIT`]) and no longer: an application is caller-supplied work of
+//! whatever size, so a run that has not answered goes on without the call that started it and
+//! a later call collects its answer ([`PendingApplicationRun`]) — which is also what makes one
+//! application run ONCE however often its step is read. A step whose application has not
+//! answered does not END ([`StepRecord::awaits_application`]): the state it ends in is the one
+//! its application answered, so the step stays `RUNNING` until there is an answer, and no step
 //! is ever reported COMPLETED for work nothing performed.
 //!
 //! # Bounds
@@ -41,12 +45,13 @@
 //! An application is caller-supplied code, so every bound is this emulator's and none of them
 //! is reachable from the application: how many applications this process runs at once
 //! ([`MAX_CONCURRENT_APPLICATION_RUNS`], with a bounded wait for a permit), how many ONE call
-//! performs ([`MAX_APPLICATION_RUNS_PER_CALL`]), how large the application may be
-//! ([`MAX_APPLICATION_BYTES`], enforced by the ranged read), and the wall clock, step,
-//! memory, recursion and output ceilings the interpreter is given
-//! ([`application_budget`]). The containment — the native modules that are never registered,
-//! the host surface that is compiled out and the stop no guest call can clear — is that
-//! engine's, which is why nothing of it is stood up again here.
+//! starts ([`MAX_APPLICATION_RUNS_PER_CALL`]), how large the application may be
+//! ([`MAX_APPLICATION_BYTES`], enforced by the ranged read), the span of the RUN's own time it
+//! may last and the step, memory, recursion and output ceilings the interpreter is given
+//! ([`application_budget`]), and the HOST time one run may take beside them
+//! ([`APPLICATION_HOST_CEILING`]). The containment — the native modules that are never
+//! registered, the host surface that is compiled out and the stop no guest call can clear — is
+//! that engine's, which is why nothing of it is stood up again here.
 
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::python;
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::{
@@ -63,18 +68,70 @@ use super::*;
 /// enforced by the RANGED read, so nothing larger is ever buffered.
 pub const MAX_APPLICATION_BYTES: usize = 1024 * 1024;
 
-/// The longest ONE run of a submitted application may take.
+/// The longest ONE run of a submitted application may last, in the RUN's own time.
 ///
-/// CHOSEN, not an AWS duration: a real Spark application runs for as long as its cluster
-/// gives it, and here the operation that reports the step waits for the run — so this is the
-/// wall clock an application gets, and an application that runs past it fails the step on
-/// that bound rather than being left running.
-pub const APPLICATION_RUN_CEILING: Duration = Duration::from_secs(5);
+/// CHOSEN, not an AWS duration: a real Spark application runs for as long as its cluster gives
+/// it, so this is the span an application gets here, and one that runs past it fails the step
+/// on that bound rather than being left running.
+///
+/// It is a span of the RUN's own time rather than of this host's: it is spent by the waits the
+/// application asks for and by one tick per traced event it delivers
+/// ([`APPLICATION_CLOCK_TICK`]), and by nothing of this host's speed — so what a step comes to
+/// rest in is the same on an idle host and on a loaded one. What the run may take of THIS host
+/// is bounded beside it ([`APPLICATION_HOST_CEILING`]), and no request waits for either: the
+/// call that STARTS a run waits only [`APPLICATION_FIRST_WAIT`] for it and the run goes on
+/// without it ([`PendingApplicationRun`]).
+pub const APPLICATION_RUN_CEILING: Duration = Duration::from_secs(60);
 
-/// How long after its budget is spent an application's thread is still waited for: the
-/// interpreter's stop lands at the next traced event, so the answer of a run that was stopped
-/// arrives a little after its wall clock rather than at it.
-pub const APPLICATION_ABANDON_GRACE: Duration = Duration::from_secs(2);
+/// How far ONE reading of an application run's clock moves it.
+///
+/// The span above is spent by what the RUN does, and a traced event is one of those: the engine
+/// reads the run's clock once per event the application delivers and once per sample the host's
+/// watch takes over it. The tick is sized so that the whole step budget
+/// ([`MAX_APPLICATION_STEPS`]) spends well under that span — which is what leaves an
+/// application that computes without end to be answered by the step budget, a count of its OWN
+/// work, and leaves the span itself for the waits an application asks for.
+pub const APPLICATION_CLOCK_TICK: Duration = Duration::from_nanos(100);
+
+/// How much of THIS HOST's own time ONE run of an application may take, past which the engine
+/// stops it whatever its own clock reads.
+///
+/// CHOSEN: the span above is the RUN's own time, so it bounds no CPU of this host — an
+/// application spending traced events, or sitting in one long native call that delivers none,
+/// would hold a thread of this process for as long as the host took over it. This is the bound
+/// that stops it: the engine reads it from this host's own clock at every traced event and from
+/// the host's own watch over the run ([`python::Clock::within`]), so a run of caller-supplied
+/// code is bounded on this host however its own time is read.
+///
+/// It is generous beside the spans the engine's phases take in the run's own time
+/// ([`::service_com_amazonaws_lambda_awsgirapiservice::state::execution::INIT_PHASE_LIMIT`]
+/// standing the execution environment up, then [`APPLICATION_RUN_CEILING`] of application): the
+/// interpreter traces every event it executes, so the aggregate a submitted job computes over
+/// an input of the size a client really submits takes this host several times as long as the
+/// run's own span, and an application that FINISHED must be reported on what it came to rather
+/// than on how fast this host read it.
+pub const APPLICATION_HOST_CEILING: Duration =
+    ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::INIT_PHASE_LIMIT
+        .saturating_add(APPLICATION_RUN_CEILING)
+        .saturating_mul(HOST_CEILING_OVER_THE_ENGINE_SPAN);
+
+/// How many times the engine's own spans the host ceiling allows for
+/// ([`APPLICATION_HOST_CEILING`]).
+const HOST_CEILING_OVER_THE_ENGINE_SPAN: u32 = 3;
+
+/// How long after the host time one run may take this emulator still waits for its thread: the
+/// engine's stop is latched by the host and raised at the next traced event the interpreter
+/// delivers, so a thread it has stopped answers a moment after the ceiling rather than at it.
+pub const APPLICATION_ABANDON_GRACE: Duration = Duration::from_secs(10);
+
+/// How long the call that STARTS a run waits for it before leaving it to run on.
+///
+/// CHOSEN: short, because the run is caller-supplied code and no client's call may be held for
+/// it. A run that answers inside this slice decides its step on the call that started it —
+/// which is every application small enough to finish at once — and one that does not stays
+/// in flight, with the step still `RUNNING`, until a later call collects its answer
+/// ([`PendingApplicationRun`]).
+pub const APPLICATION_FIRST_WAIT: Duration = Duration::from_secs(2);
 
 /// How many applications this process runs AT ONCE.
 ///
@@ -104,14 +161,13 @@ pub const MAX_APPLICATION_RUNS_PER_CALL: usize = 2;
 /// emulator ran no application for ends ([`not_executed`]) — never a status nothing produced.
 pub const MAX_ABANDONED_APPLICATION_RUNS: u32 = 3;
 
-/// How long ONE call spends performing owed applications before it leaves the rest to the
-/// next call.
+/// How long ONE call spends STARTING owed applications before it leaves the rest to the next
+/// call.
 ///
 /// CHOSEN: the ceiling on what a REQUEST costs, beside the ceiling on what one run costs. A
-/// further application is started only while a whole run still fits inside this span, so the
-/// longest a reporting operation can be held is this span plus the grace one run is given to
-/// stop ([`APPLICATION_ABANDON_GRACE`]) rather than the product of the per-run ceiling and
-/// [`MAX_APPLICATION_RUNS_PER_CALL`].
+/// further application is started only while a whole first wait still fits inside this span,
+/// so the longest a reporting operation can be held is this span rather than the product of
+/// the per-run ceiling and [`MAX_APPLICATION_RUNS_PER_CALL`].
 pub const APPLICATION_CALL_CEILING: Duration = Duration::from_secs(8);
 
 /// The stack an application's thread is given: well above the interpreter's clamped
@@ -120,9 +176,12 @@ pub const APPLICATION_CALL_CEILING: Duration = Duration::from_secs(8);
 const APPLICATION_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// How many traced events one application may execute. CHOSEN: large enough for the
-/// transformations a submitted job computes, small enough that a loop with no exit ends
-/// inside the wall clock above.
-const MAX_APPLICATION_STEPS: u64 = 20_000_000;
+/// transformations a submitted job computes — the interpreter traces every event, so this is
+/// the budget that has to cover an aggregate over an input of the size a client really submits
+/// — and small enough that the whole of it spends well under the run's own span
+/// ([`APPLICATION_CLOCK_TICK`]), so an application that computes without end is answered by
+/// THIS budget, a count of its own work, rather than by a span of time.
+const MAX_APPLICATION_STEPS: u64 = 200_000_000;
 
 /// How much memory one application may add to this process. CHOSEN, for the same reason.
 const MAX_APPLICATION_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
@@ -286,14 +345,14 @@ pub async fn run_due_step_applications<Eng: Send + Sync + 'static>(
     // its own presents, which is nothing at all where that profile carries no role those
     // instances may assume.
     let instance_credentials = cluster_step_credentials(ctx, region, &job_flow_role).await;
-    // What this CALL may spend performing them: a further application is started only while
-    // a whole run still fits, so the rest stay owed to the next call.
+    // What this CALL may spend starting them: a further application is started only while a
+    // whole first wait still fits, so the rest stay owed to the next call.
     let started = ::std::time::Instant::now();
-    // The steps this call has already run, or given up on, so re-reading the queue below
-    // never runs one application twice and never spins on a step nothing ran.
+    // The steps this call has already started, collected or given up on, so re-reading the
+    // queue below never starts one application twice and never spins on a step nothing ran.
     let mut attempted: HashSet<String> = HashSet::new();
     while attempted.len() < MAX_APPLICATION_RUNS_PER_CALL {
-        if started.elapsed().saturating_add(APPLICATION_RUN_CEILING) > APPLICATION_CALL_CEILING {
+        if started.elapsed().saturating_add(APPLICATION_FIRST_WAIT) > APPLICATION_CALL_CEILING {
             return;
         }
         // The queue is RE-READ every time round rather than listed once: the answer this run
@@ -316,15 +375,40 @@ pub async fn run_due_step_applications<Eng: Send + Sync + 'static>(
             return;
         };
         attempted.insert(plan.step_id.clone());
-        // A step's own runtime role is what its application's calls are signed as where it
-        // carries one; every other step presents what the cluster's instances obtained.
-        let credentials = match plan.execution_role_arn.as_deref() {
-            Some(role_arn) => StepCredentials::Role(role_arn.to_string()),
-            None => instance_credentials.clone(),
+        let key = step_application_run_key(cluster_id, &plan.step_id);
+        // A run this process has already STARTED for the step is not started again: its
+        // answer is collected if it has one, and otherwise it is left running and the step
+        // stays `RUNNING` — so one application runs once however often its step is read.
+        let in_flight = state.lock().take_step_application_run(&key);
+        let answered = match in_flight {
+            Some(pending) => match collect_application_run(pending, now) {
+                CollectedRun::Answered(outcome) => Some(outcome),
+                CollectedRun::Waiting(pending) => {
+                    state.lock().hold_step_application_run(key, pending);
+                    continue;
+                }
+                CollectedRun::NoAnswer => None,
+            },
+            None => {
+                // A step's own runtime role is what its application's calls are signed as
+                // where it carries one; every other step presents what the cluster's
+                // instances obtained.
+                let credentials = match plan.execution_role_arn.as_deref() {
+                    Some(role_arn) => StepCredentials::Role(role_arn.to_string()),
+                    None => instance_credentials.clone(),
+                };
+                match run_step_application(engine, ctx, region, &plan, &credentials, now).await {
+                    Some(StartedApplication::Answered(outcome)) => Some(outcome),
+                    Some(StartedApplication::Pending(pending)) => {
+                        state.lock().hold_step_application_run(key, pending);
+                        continue;
+                    }
+                    None => None,
+                }
+            }
         };
-        let Some(outcome) = run_step_application(engine, ctx, region, &plan, &credentials).await
-        else {
-            // Nothing ran: the step stays owed its application, so a later call performs it
+        let Some(outcome) = answered else {
+            // Nothing answered: the step stays owed its application, so a later call runs it
             // rather than this one reporting an outcome nothing produced — but the ATTEMPT is
             // counted, so a run that never answers cannot leave the step `RUNNING` for good
             // ([`MAX_ABANDONED_APPLICATION_RUNS`]).
@@ -367,24 +451,96 @@ pub async fn run_due_step_applications<Eng: Send + Sync + 'static>(
     }
 }
 
-/// Run ONE owed application and answer what the step ends in, or `None` when nothing ran at
-/// all.
+/// The key the run of ONE step's application is held under while it is in flight: the step and
+/// the cluster that submitted it, which is what addresses that step.
+#[must_use]
+pub fn step_application_run_key(cluster_id: &str, step_id: &str) -> String {
+    format!("{cluster_id}\u{1f}{step_id}")
+}
+
+/// A run this process STARTED and that has not answered yet.
+///
+/// The run itself is a thread of this process ([`run_application`]); what is held here is
+/// where its answer arrives and when this emulator gives up waiting for one. It is held in the
+/// SERVICE STATE rather than in a process-wide table, so a run belongs to the store whose step
+/// submitted it.
+#[derive(Debug)]
+pub struct PendingApplicationRun {
+    /// Where the run's own answer arrives, once its thread has one.
+    answer: ::tokio::sync::oneshot::Receiver<python::Finished>,
+    /// When this emulator gives up on it: the host time one run may take plus the grace its
+    /// stop needs to land ([`APPLICATION_HOST_CEILING`], [`APPLICATION_ABANDON_GRACE`]). A run
+    /// that has not answered by then is one nothing is known about.
+    abandon_at: SystemTime,
+}
+
+/// What a step's in-flight run has come to.
+enum CollectedRun {
+    /// The run answered, and this is what its step ends in.
+    Answered(StepOutcome),
+    /// The run is still going: the step stays `RUNNING`, so no state is reported for work
+    /// that has not finished.
+    Waiting(PendingApplicationRun),
+    /// Nothing is known about what the application came to — this emulator gave up waiting
+    /// for it, or its thread ended without reporting. The step stays OWED its application.
+    NoAnswer,
+}
+
+/// What a step's in-flight run has come to, and the run itself back when it is still going.
+fn collect_application_run(mut pending: PendingApplicationRun, now: SystemTime) -> CollectedRun {
+    match pending.answer.try_recv() {
+        Ok(finished) => CollectedRun::Answered(read_outcome(&finished.completion)),
+        Err(::tokio::sync::oneshot::error::TryRecvError::Empty) if now < pending.abandon_at => {
+            CollectedRun::Waiting(pending)
+        }
+        Err(_) => CollectedRun::NoAnswer,
+    }
+}
+
+impl ComAmazonawsEmrElasticmapreduceState {
+    /// Take the in-flight run held under `key`, if this store holds one.
+    ///
+    /// Taken rather than borrowed, because what the caller does with it — collect its answer
+    /// or hold it again ([`Self::hold_step_application_run`]) — happens with no guard on this
+    /// store.
+    fn take_step_application_run(&mut self, key: &str) -> Option<PendingApplicationRun> {
+        self.step_application_runs.remove(key)
+    }
+
+    /// Hold `pending` under `key` until a later call collects its answer.
+    fn hold_step_application_run(&mut self, key: String, pending: PendingApplicationRun) {
+        self.step_application_runs.insert(key, pending);
+    }
+}
+
+/// What starting one application came to: an answer already, or a run still going.
+enum StartedApplication {
+    /// The run answered inside the slice the call that started it waited, or there was
+    /// nothing to run and the step fails for that.
+    Answered(StepOutcome),
+    /// The run is still going, and its answer is collected by a later call.
+    Pending(PendingApplicationRun),
+}
+
+/// Start ONE owed application and answer what its step ends in, the run itself when it is
+/// still going, or `None` when nothing ran at all.
 async fn run_step_application<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     plan: &StepApplicationPlan,
     credentials: &StepCredentials,
-) -> Option<StepOutcome> {
+    now: SystemTime,
+) -> Option<StartedApplication> {
     let source = match read_application(ctx, region, &plan.application).await {
         Ok(source) => source,
         // The application's own file could not be read, which is a failure of the step
         // itself: there is nothing to run, and the step says exactly that.
         Err(detail) => {
-            return Some(failed(
+            return Some(StartedApplication::Answered(failed(
                 APPLICATION_UNREADABLE_REASON,
                 application_unreadable_message(&plan.application.path, &detail),
-            ))
+            )))
         }
     };
     let permit = ::tokio::time::timeout(
@@ -404,7 +560,7 @@ async fn run_step_application<Eng: Send + Sync + 'static>(
         }
         StepCredentials::Absent => None,
     };
-    run_application(plan, &source, access, permit).await
+    run_application(plan, &source, access, permit, now).await
 }
 
 /// The application's own source, read from the object its path names.
@@ -459,27 +615,29 @@ pub fn application_budget() -> python::Budget {
 }
 
 /// Run `source` as the step's application, on a thread of its own, and answer what the step
-/// ends in — or `None` when the run ANSWERED NOTHING at all.
+/// ends in, the run that is still going, or `None` when the run ANSWERED NOTHING at all.
 ///
 /// The interpreter is synchronous and CPU-bound, so it runs on a thread with a stack of its
-/// own rather than on the async runtime, and the caller's wait for it is bounded by the run's
-/// own budget plus [`APPLICATION_ABANDON_GRACE`]. `permit` is this run's share of
+/// own rather than on the async runtime. The CALLER's wait for it is [`APPLICATION_FIRST_WAIT`]
+/// and no longer: a run that has not answered by then goes on without it, and its step stays
+/// `RUNNING` until a later call collects the answer. `permit` is this run's share of
 /// [`MAX_CONCURRENT_APPLICATION_RUNS`] and is MOVED into that thread, so it comes back when
-/// the thread ends.
+/// the thread ends — including a thread nobody is waiting for any more.
 ///
-/// A run this call gave up waiting for, and one whose thread could not be started at all, is
-/// `None`: nothing is known about what the application came to, so the step stays OWED its
-/// application and a later call runs it — exactly as a command nothing answered for does
-/// ([`super::command_step_run`]). Reporting it as a step whose application was not started
-/// would settle the step on this process's own timing rather than on anything the submitted
-/// work answered. The run's OWN bounds are unaffected: an application that spends its budget
-/// is reported as stopped by the interpreter, which IS an answer.
+/// A run whose thread could not be started at all, and one whose thread ended without
+/// reporting, is `None`: nothing is known about what the application came to, so the step
+/// stays OWED its application and a later call runs it — exactly as a command nothing
+/// answered for does ([`super::command_step_run`]). Reporting it as a step whose application
+/// was not started would settle the step on this process's own timing rather than on anything
+/// the submitted work answered. The run's OWN bounds are unaffected: an application that
+/// spends its budget is reported as stopped by the interpreter, which IS an answer.
 async fn run_application(
     plan: &StepApplicationPlan,
     source: &str,
     access: Option<AwsAccess>,
     permit: ::tokio::sync::OwnedSemaphorePermit,
-) -> Option<StepOutcome> {
+    now: SystemTime,
+) -> Option<StartedApplication> {
     let budget = application_budget();
     let event = ::serde_json::json!({
         "path": plan.application.path,
@@ -490,7 +648,7 @@ async fn run_application(
     .to_string();
     let step_id = plan.step_id.clone();
     let plan_spark_version = plan.spark_version.clone();
-    let (sender, receiver) = ::tokio::sync::oneshot::channel();
+    let (sender, mut receiver) = ::tokio::sync::oneshot::channel();
     let spawned = ::std::thread::Builder::new()
         .name("emr-spark-application".to_string())
         .stack_size(APPLICATION_STACK_BYTES)
@@ -499,44 +657,65 @@ async fn run_application(
             let _permit = permit;
             let modules = spark_runtime_modules(plan_spark_version.as_deref());
             let handler = application_entry_handler();
-            let finished = python::run(&python::Run {
-                modules: &modules,
-                handler: &handler,
-                // A Spark application reads its parameters off its command line, so the run
-                // is given no environment of its own.
-                environment: &BTreeMap::new(),
-                // The instruction set the environment the application runs in has, which
-                // the run reports as its own machine. A step names none, so it is the one
-                // the engine's own runtime reports when none is named.
-                architecture:
-                    ::service_com_amazonaws_lambda_awsgirapiservice::state::DEFAULT_ARCHITECTURE,
-                event: Some(&event),
-                request_id: &step_id,
-                invoked_function_arn: "",
-                client_context: None,
-                tenant_id: None,
-                budget,
-                aws: access.as_ref(),
-                // A Spark step is no Lambda durable execution's run, so it takes no step of
-                // one and checkpoints nothing onto one.
-                durable: None,
-            });
+            let finished = python::run_against(
+                &python::Run {
+                    modules: &modules,
+                    handler: &handler,
+                    // A Spark application reads its parameters off its command line, so the
+                    // run is given no environment of its own.
+                    environment: &BTreeMap::new(),
+                    // The instruction set the environment the application runs in has, which
+                    // the run reports as its own machine. A step names none, so it is the one
+                    // the engine's own runtime reports when none is named.
+                    architecture:
+                        ::service_com_amazonaws_lambda_awsgirapiservice::state::DEFAULT_ARCHITECTURE,
+                    event: Some(&event),
+                    request_id: &step_id,
+                    invoked_function_arn: "",
+                    client_context: None,
+                    tenant_id: None,
+                    budget,
+                    aws: access.as_ref(),
+                    // A Spark step is no Lambda durable execution's run, so it takes no step
+                    // of one and checkpoints nothing onto one.
+                    durable: None,
+                },
+                // The clock the run's own span is read against: one the RUN drives, a tick per
+                // traced event it delivers and the waits it asks for, so the state the STEP
+                // comes to rest in is what the application came to rather than what this
+                // host's load made of it — stating what the run may take of THIS host besides,
+                // which is the bound the engine stops it on whatever its own clock reads. The
+                // waits it asks for really PASS ([`python::Clock::waiting`]): a step is
+                // observed by a client while it is in flight, so an application that waits
+                // keeps its step `RUNNING` for that span and the effects it makes after
+                // waiting are made after it.
+                &python::Clock::driven(APPLICATION_CLOCK_TICK)
+                    .waiting()
+                    .within(APPLICATION_HOST_CEILING),
+            );
             let _ = sender.send(finished);
         });
     if spawned.is_err() {
         return None;
     }
-    let waited = ::tokio::time::timeout(
-        budget.wall_clock.saturating_add(APPLICATION_ABANDON_GRACE),
-        receiver,
-    )
-    .await;
-    match waited {
-        Ok(Ok(finished)) => Some(read_outcome(&finished.completion)),
-        // The run was given up on, or its thread ended without reporting: nothing is known
-        // about what the application came to, so the step stays owed it rather than being
-        // settled on an outcome nothing produced.
-        Ok(Err(_)) | Err(_) => None,
+    match ::tokio::time::timeout(APPLICATION_FIRST_WAIT, &mut receiver).await {
+        Ok(Ok(finished)) => Some(StartedApplication::Answered(read_outcome(
+            &finished.completion,
+        ))),
+        // The thread ended without reporting: nothing is known about what the application
+        // came to, so the step stays owed it rather than being settled on an outcome nothing
+        // produced.
+        Ok(Err(_)) => None,
+        // Still running, which is what every application larger than a moment's work is: the
+        // run goes on and a later call collects its answer. The instant this emulator gives
+        // up on it is reached by CHECKED addition, so an instant no clock can hold is one it
+        // gives up on at once rather than one it faults on.
+        Err(_) => Some(StartedApplication::Pending(PendingApplicationRun {
+            answer: receiver,
+            abandon_at: now
+                .checked_add(APPLICATION_HOST_CEILING.saturating_add(APPLICATION_ABANDON_GRACE))
+                .unwrap_or(now),
+        })),
     }
 }
 

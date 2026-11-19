@@ -27,19 +27,23 @@ const REGION: &str = "us-east-1";
 
 /// The identity store the identities live in, in the form the model's `IdentityStoreId`
 /// pattern gives one (`d-` plus ten lowercase hex characters).
-const IDENTITY_STORE: &str = "d-1234567890";
+///
+/// `pub(crate)` so a sibling suite creates its identities in the same store through this
+/// harness rather than standing up a second one.
+pub(crate) const IDENTITY_STORE: &str = "d-1234567890";
 
-/// The session policy every mapping below carries.
-const SESSION_POLICY: &str = "arn:aws:iam::aws:policy/AmazonEMRFullAccessPolicy_v2";
+/// The session policy every mapping below carries, shared with the sibling suite for the
+/// same reason.
+pub(crate) const SESSION_POLICY: &str = "arn:aws:iam::aws:policy/AmazonEMRFullAccessPolicy_v2";
 
 static NULL: Value = Value::Null;
 
 /// Amazon EMR and the IAM Identity Center identity store on one engine.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -55,7 +59,7 @@ fn emulator() -> Emulator {
 impl Emulator {
     /// One `awsJson1_1` call to the service published under `host`, with the target
     /// prefix `prefix`.
-    async fn call(
+    pub(crate) async fn call(
         &self,
         host: &str,
         signing_name: &str,
@@ -90,7 +94,7 @@ impl Emulator {
         (status, payload)
     }
 
-    async fn emr(&self, case: &str, operation: &str, body: Value) -> Value {
+    pub(crate) async fn emr(&self, case: &str, operation: &str, body: Value) -> Value {
         let (status, payload) = self
             .call(
                 &format!("elasticmapreduce.{REGION}.amazonaws.com"),
@@ -107,7 +111,7 @@ impl Emulator {
         payload
     }
 
-    async fn emr_call(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn emr_call(&self, operation: &str, body: Value) -> (u16, Value) {
         self.call(
             &format!("elasticmapreduce.{REGION}.amazonaws.com"),
             "elasticmapreduce",
@@ -118,7 +122,12 @@ impl Emulator {
         .await
     }
 
-    async fn identity_store(&self, case: &str, operation: &str, body: Value) -> Value {
+    pub(crate) async fn identity_store(
+        &self,
+        case: &str,
+        operation: &str,
+        body: Value,
+    ) -> Value {
         let (status, payload) = self
             .call(
                 &format!("identitystore.{REGION}.amazonaws.com"),
@@ -135,25 +144,63 @@ impl Emulator {
         payload
     }
 
-    /// A Studio to map identities into, answering its id.
-    async fn studio(&self, name: &str) -> String {
-        let out = self
-            .emr(
-                name,
-                "CreateStudio",
-                json!({
-                    "Name": name,
-                    "AuthMode": "SSO",
-                    "VpcId": "vpc-0a1b2c3d",
-                    "SubnetIds": ["subnet-0a1b2c3d"],
-                    "ServiceRole": "EMR_Studio_ServiceRole",
-                    "UserRole": "EMR_Studio_UserRole",
-                    "WorkspaceSecurityGroupId": "sg-0a1b2c3d",
-                    "EngineSecurityGroupId": "sg-1a2b3c4d",
-                    "DefaultS3Location": "s3://emr-studio/backup/",
-                }),
+    /// A USER of the identity store, created through that service's own `CreateUser`,
+    /// answering the GUID it minted.
+    ///
+    /// `pub(crate)` so a sibling suite maps identities the directory really holds rather than
+    /// GUIDs a test invented.
+    pub(crate) async fn user(&self, case: &str, user_name: &str) -> String {
+        let created = self
+            .identity_store(
+                case,
+                "CreateUser",
+                json!({ "IdentityStoreId": IDENTITY_STORE, "UserName": user_name }),
             )
             .await;
+        created["UserId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a UserId, got {created}"))
+            .to_string()
+    }
+
+    /// A GROUP of the identity store, created the same way.
+    pub(crate) async fn group(&self, case: &str, display_name: &str) -> String {
+        let created = self
+            .identity_store(
+                case,
+                "CreateGroup",
+                json!({ "IdentityStoreId": IDENTITY_STORE, "DisplayName": display_name }),
+            )
+            .await;
+        created["GroupId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a GroupId, got {created}"))
+            .to_string()
+    }
+
+    /// A Studio to map identities into, answering its id.
+    pub(crate) async fn studio(&self, name: &str) -> String {
+        self.studio_with(name, json!({})).await
+    }
+
+    /// The same Studio, with `members` added to the create — the members a case needs beside
+    /// the ones every Studio is created with.
+    pub(crate) async fn studio_with(&self, name: &str, members: Value) -> String {
+        let mut body = json!({
+            "Name": name,
+            "AuthMode": "SSO",
+            "VpcId": "vpc-0a1b2c3d",
+            "SubnetIds": ["subnet-0a1b2c3d"],
+            "ServiceRole": "EMR_Studio_ServiceRole",
+            "UserRole": "EMR_Studio_UserRole",
+            "WorkspaceSecurityGroupId": "sg-0a1b2c3d",
+            "EngineSecurityGroupId": "sg-1a2b3c4d",
+            "DefaultS3Location": "s3://emr-studio/backup/",
+        });
+        for (member, value) in members.as_object().into_iter().flatten() {
+            body[member] = value.clone();
+        }
+        let out = self.emr(name, "CreateStudio", body).await;
         out["StudioId"]
             .as_str()
             .unwrap_or_else(|| panic!("case {name:?}: expected a StudioId, got {out}"))

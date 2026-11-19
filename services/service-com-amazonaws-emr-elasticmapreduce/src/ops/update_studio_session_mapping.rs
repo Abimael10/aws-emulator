@@ -190,13 +190,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Either `IdentityName` or `IdentityId` must be specified, but not both."
-        let Some((_, _, identity)) = crate::state::session_mapping_identity(
+        let Some((identity_id, identity_name, identity)) = crate::state::session_mapping_identity(
             input.identity_id.as_ref(),
             input.identity_name.as_ref(),
         ) else {
-            return Err(refuse(
-                "Either IdentityName or IdentityId must be specified, but not both".to_string(),
-            ));
+            return Err(refuse(crate::state::identity_members_message()));
+        };
+        let requested = crate::state::MappedIdentity {
+            identity_id,
+            identity_name,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -207,8 +209,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let mut store = state.lock();
 
+        // The studio is resolved under a guard that is RELEASED again before the identity
+        // store is reached: no other service's state is ever reached while this one's guard
+        // is held.
+        let studio = state.lock().studios.get(&input.studio_id).cloned();
+        let Some(studio) = studio else {
+            return Err(not_found(crate::state::unknown_studio_message()));
+        };
+
+        // A mapping is keyed by its identity TYPE as well as by the identity, so a value the
+        // Studio's own Identity Center directory holds as the other kind of identity names no
+        // identity of the kind this request asked for: the member that carried it is what is
+        // wrong, not the mapping that is missing — and the mapping the identity really has
+        // under its own kind is left exactly as it was.
+        let lookup =
+            crate::state::look_up_identity(&*self.engine, &input.identity_type, &requested);
+        if crate::state::directory_holds_other_type(&studio, &lookup) {
+            return Err(refuse(crate::state::invalid_identity_message(
+                crate::state::identity_member_of(&requested),
+            )));
+        }
+
+        // The policy an update replaces the stored one with is held to the same form the
+        // create holds it to: a value that is not the ARN of an IAM policy names none, so
+        // nothing is changed under it.
+        if !crate::state::names_a_session_policy(&input.session_policy_arn) {
+            return Err(refuse(
+                crate::state::malformed_session_policy_arn_message(),
+            ));
+        }
+
+        let mut store = state.lock();
         if !store.studios.contains_key(&input.studio_id) {
             return Err(not_found(crate::state::unknown_studio_message()));
         }
@@ -217,10 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .session_mapping_key_of(&input.studio_id, &input.identity_type, &identity)
             .and_then(|key| store.studio_session_mappings.get_mut(&key))
         else {
-            return Err(not_found(format!(
-                "Studio '{}' has no session mapping for {} '{identity}'.",
-                input.studio_id, input.identity_type
-            )));
+            return Err(not_found(crate::state::absent_session_mapping_message()));
         };
 
         // Only the session policy changes; the identity and the creation instant are

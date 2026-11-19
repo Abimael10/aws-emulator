@@ -90,6 +90,16 @@ pub use studio_network::*;
 mod studio_identities;
 pub use studio_identities::*;
 
+/// What a Studio SESSION MAPPING request has to satisfy and how each refusal of one is
+/// worded; split out and re-exported the same way.
+mod studio_session_mappings;
+pub use studio_session_mappings::*;
+
+/// The IDLE TIMER an auto-termination policy is — when a cluster carrying one shuts itself
+/// down — split out and re-exported the same way.
+mod idle_termination;
+pub use idle_termination::*;
+
 /// The notebook-execution lifecycle, split out of this root as its own concern for the
 /// same reason, and re-exported the same way.
 mod notebook_executions;
@@ -2008,6 +2018,16 @@ pub struct ComAmazonawsEmrElasticmapreduceState {
     /// when the run answers or when it is abandoned, so this holds no more entries than
     /// there are executions ([`MAX_NOTEBOOK_EXECUTIONS`]).
     notebook_runs: BTreeMap<String, ::tokio::task::JoinHandle<()>>,
+    /// The application runs this process has STARTED for a step and that have not answered
+    /// yet, keyed by [`step_application_run_key`] ([`PendingApplicationRun`]).
+    ///
+    /// A submitted application runs on a thread of its own and takes as long as the work it
+    /// was given does, which is longer than any client's call may be held: the run is left
+    /// going and its answer is collected by a later call that reports the step, which is what
+    /// keeps that step `RUNNING` until there IS an answer and what makes one application run
+    /// once however often its step is read. An entry goes as soon as the run answers or is
+    /// given up on, so this holds no more entries than there are steps still running.
+    step_application_runs: BTreeMap<String, PendingApplicationRun>,
 }
 
 /// The account's default configuration is in place before any caller puts one, so the
@@ -2043,6 +2063,7 @@ impl Default for ComAmazonawsEmrElasticmapreduceState {
             cluster_clock_pump_generation: 0,
             cluster_clock_pump: None,
             notebook_runs: BTreeMap::new(),
+            step_application_runs: BTreeMap::new(),
         }
     }
 }
@@ -3017,6 +3038,10 @@ impl ClusterRecord {
         // `TERMINATED_WITH_ERRORS`/`STEP_FAILURE` rather than for having run its queue.
         self.begin_step_failure_shutdown(now);
         self.stop_once_every_step_has_run(now);
+        // The shutdown an attached auto-termination policy owes is applied last, so a cluster
+        // that has just taken a step or that is shutting down for its own queue is not also
+        // shut down for having been idle ([`ClusterRecord::idle_since`]).
+        self.stop_once_idle_timeout_elapsed(now);
     }
 
     /// The instant the shutdown a cluster that does not stay up is owed comes due, or

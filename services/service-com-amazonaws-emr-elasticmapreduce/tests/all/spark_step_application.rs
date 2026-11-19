@@ -42,7 +42,10 @@ use smithy_server_runtime::MultiServiceRouter;
 const REGION: &str = "us-east-1";
 
 /// The bucket every application and every output of this suite lives in.
-const BUCKET: &str = "emr-spark-applications";
+///
+/// `pub(crate)` so a sibling suite drives the same Amazon S3 and Amazon EMR pair through this
+/// harness rather than standing up a second one.
+pub(crate) const BUCKET: &str = "emr-spark-applications";
 
 /// The roles a launch names.
 const INSTANCE_PROFILE: &str = "EMR_EC2_DefaultRole";
@@ -62,7 +65,7 @@ const TERMINAL: [&str; 4] = ["COMPLETED", "CANCELLED", "FAILED", "INTERRUPTED"];
 const TERMINAL_CLUSTER: [&str; 2] = ["TERMINATED", "TERMINATED_WITH_ERRORS"];
 
 /// Amazon EMR and Amazon S3 on one engine, the shape the router mounts them in.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -76,7 +79,7 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One `awsJson1_1` Amazon EMR call that must be served.
-async fn emr_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+pub(crate) async fn emr_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let host = format!("elasticmapreduce.{REGION}.amazonaws.com");
     let request = ::http::Request::builder()
         .method("POST")
@@ -110,7 +113,12 @@ async fn emr_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Va
 }
 
 /// One path-style Amazon S3 request, answered as `(status, body)`.
-async fn s3(router: &MultiServiceRouter, method: &str, uri: &str, body: &[u8]) -> (u16, Vec<u8>) {
+pub(crate) async fn s3(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
     let host = format!("s3.{REGION}.amazonaws.com");
     let request = ::http::Request::builder()
         .method(method)
@@ -131,7 +139,12 @@ async fn s3(router: &MultiServiceRouter, method: &str, uri: &str, body: &[u8]) -
 }
 
 /// Put `body` at `key`, which must be served.
-async fn put_object(router: &MultiServiceRouter, case: &str, key: &str, body: &[u8]) {
+pub(crate) async fn put_object(
+    router: &MultiServiceRouter,
+    case: &str,
+    key: &str,
+    body: &[u8],
+) {
     let (status, answered) = s3(router, "PUT", &format!("/{BUCKET}/{key}"), body).await;
     assert!(
         (200..300).contains(&status),
@@ -141,7 +154,7 @@ async fn put_object(router: &MultiServiceRouter, case: &str, key: &str, body: &[
 }
 
 /// The object at `key`, or `None` when the store holds none.
-async fn object(router: &MultiServiceRouter, key: &str) -> Option<String> {
+pub(crate) async fn object(router: &MultiServiceRouter, key: &str) -> Option<String> {
     let (status, answered) = s3(router, "GET", &format!("/{BUCKET}/{key}"), &[]).await;
     (200..300)
         .contains(&status)
@@ -373,7 +386,12 @@ fn step_config(case: &Case, ordinal: usize) -> Value {
 }
 
 /// A cluster that stays up, launched with `steps`.
-async fn launch(router: &MultiServiceRouter, name: &str, steps: Value, kept_alive: bool) -> String {
+pub(crate) async fn launch(
+    router: &MultiServiceRouter,
+    name: &str,
+    steps: Value,
+    kept_alive: bool,
+) -> String {
     let launched = emr_ok(
         router,
         "RunJobFlow",
@@ -400,7 +418,11 @@ async fn launch(router: &MultiServiceRouter, name: &str, steps: Value, kept_aliv
 
 /// Poll `ListSteps` until every step of `cluster_id` is terminal, answering them in
 /// submission order.
-async fn drained(case: &str, router: &MultiServiceRouter, cluster_id: &str) -> Vec<Value> {
+pub(crate) async fn drained(
+    case: &str,
+    router: &MultiServiceRouter,
+    cluster_id: &str,
+) -> Vec<Value> {
     let started = Instant::now();
     loop {
         let listed = emr_ok(router, "ListSteps", json!({ "ClusterId": cluster_id })).await;

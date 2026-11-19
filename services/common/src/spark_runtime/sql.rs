@@ -19,6 +19,278 @@ AnalysisException = filesystem.AnalysisException
 # The column names a read gives the columns of a source that names none, as Spark names them.
 UNNAMED_COLUMN = "_c%d"
 
+# The names Spark gives the types a column carries, as `DataType.simpleString()` answers them.
+BIGINT = "bigint"
+DOUBLE = "double"
+STRING = "string"
+BOOLEAN = "boolean"
+VOID = "void"
+
+# What a `cast(<column> as <type>)` names a type by, mapped onto the name above and the
+# function that reads a value as it. The aliases are the ones Spark's own SQL accepts.
+CAST_TYPES = {
+    "long": (BIGINT, int),
+    "bigint": (BIGINT, int),
+    "int": (BIGINT, int),
+    "integer": (BIGINT, int),
+    "short": (BIGINT, int),
+    "smallint": (BIGINT, int),
+    "byte": (BIGINT, int),
+    "tinyint": (BIGINT, int),
+    "double": (DOUBLE, float),
+    "float": (DOUBLE, float),
+    "real": (DOUBLE, float),
+    "string": (STRING, str),
+    "boolean": (BOOLEAN, bool),
+}
+
+# The aggregate functions an expression may name.
+AGGREGATES = ("sum", "count", "min", "max", "avg", "mean")
+
+
+def _type_of(value):
+    """The type name Spark gives a value the Python type of this one."""
+    if isinstance(value, bool):
+        return BOOLEAN
+    if isinstance(value, int):
+        return BIGINT
+    if isinstance(value, float):
+        return DOUBLE
+    if value is None:
+        return VOID
+    return STRING
+
+
+class DataType(object):
+    """One column's type, as a schema reports it."""
+
+    def __init__(self, name):
+        self._name = name
+
+    def simpleString(self):
+        return self._name
+
+    def typeName(self):
+        return self._name
+
+    def __eq__(self, other):
+        if isinstance(other, DataType):
+            return self._name == other._name
+        return self._name == other
+
+    def __repr__(self):
+        return "DataType(%s)" % (self._name,)
+
+
+class StructField(object):
+    """One field of a schema: its name and its type."""
+
+    def __init__(self, name, dataType, nullable=True):
+        self.name = name
+        self.dataType = dataType
+        self.nullable = nullable
+
+    def simpleString(self):
+        return "%s:%s" % (self.name, self.dataType.simpleString())
+
+    def __repr__(self):
+        return "StructField(%s,%s)" % (self.name, self.dataType.simpleString())
+
+
+class StructType(object):
+    """A dataset's schema: its fields, in column order."""
+
+    def __init__(self, fields):
+        self.fields = list(fields)
+
+    def __getitem__(self, item):
+        if isinstance(item, str):
+            for field in self.fields:
+                if field.name == item:
+                    return field
+            raise KeyError(item)
+        return self.fields[item]
+
+    def __iter__(self):
+        return iter(self.fields)
+
+    def __len__(self):
+        return len(self.fields)
+
+    def fieldNames(self):
+        return [field.name for field in self.fields]
+
+    def simpleString(self):
+        return "struct<%s>" % (",".join(field.simpleString() for field in self.fields),)
+
+    def __repr__(self):
+        return "StructType(%r)" % (self.fields,)
+
+
+class _Read(object):
+    """One SQL expression of a projection, as its own grammar reads it.
+
+    `selectExpr` takes "SQL expressions" (`DataFrame.selectExpr`), and this is the reading of
+    the ones this engine computes: a column, optionally cast, optionally inside an aggregate
+    function, optionally named by an alias. It is read by walking the expression's own
+    grammar — the function's parentheses, the `cast(<column> as <type>)` form and the trailing
+    `as <alias>` — and never by matching the expression's text against a known one.
+    """
+
+    def __init__(self, function, column, cast, alias):
+        self.function = function
+        self.column = column
+        self.cast = cast
+        self.alias = alias
+
+
+def _split_alias(text):
+    """`text` and the alias a trailing `as <name>` gives it, or `None` when it names none.
+
+    The `as` that names an alias is one OUTSIDE every bracket: the `cast(<column> as <type>)`
+    form carries an `as` of its own, so the split is made at bracket depth zero and never
+    inside a call. The LAST such `as` is the alias marker, as the expression's own grammar
+    puts it at the end.
+    """
+    lowered = text.lower()
+    depth = 0
+    at = -1
+    for index, character in enumerate(text):
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif depth == 0 and lowered[index : index + 4] == " as ":
+            at = index
+    if at < 0:
+        return text.strip(), None
+    alias = text[at + 4 :].strip().strip("`").strip('"')
+    return text[:at].strip(), alias or None
+
+
+def _call(text):
+    """The function `text` calls and its argument, or `None` when it calls none."""
+    if not text.endswith(")"):
+        return None
+    at = text.find("(")
+    if at <= 0:
+        return None
+    return text[:at].strip().lower(), text[at + 1 : -1].strip()
+
+
+def _read_expression(text):
+    """[`_Read`] of one SQL expression."""
+    body, alias = _split_alias(text.strip())
+    function = None
+    called = _call(body)
+    if called is not None and called[0] in AGGREGATES:
+        function, body = called
+    cast = None
+    called = _call(body)
+    if called is not None and called[0] == "cast":
+        inner, kind = _split_alias(called[1])
+        if kind is None:
+            raise AnalysisException("a cast names the type to read the value as: %s" % (text,))
+        if kind.lower() not in CAST_TYPES:
+            raise AnalysisException("cannot resolve the data type %s" % (kind,))
+        cast = kind.lower()
+        body = inner.strip()
+    column = body.strip().strip("`")
+    if alias is None:
+        alias = text.strip()
+    return _Read(function, column, cast, alias)
+
+
+def _range_aggregate(function, span):
+    """The aggregate of an arithmetic progression, from the progression's own definition.
+
+    The values of a `range` are an arithmetic progression, so its count, its bounds and its
+    sum follow from its first value, its last and how many there are — exactly, in whole
+    numbers, and without walking the progression. That is what lets an aggregate over a
+    dataset of two hundred million values be answered at all: the answer is the one walking it
+    would give, computed from the definition of the values rather than by adding them one by
+    one, which is also why it is EXACT where a float accumulation would not be.
+    """
+    count = len(span)
+    if function == "count":
+        return count, BIGINT
+    if count == 0:
+        # Every aggregate of no rows is null, as Spark reports one.
+        return None, BIGINT
+    first = span[0]
+    last = span[count - 1]
+    # The product is always even: with an odd count the bounds sum to an even number, so the
+    # halving below is exact in whole numbers whichever way round the progression runs.
+    total = (first + last) * count // 2
+    if function == "sum":
+        return total, BIGINT
+    if function == "min":
+        return min(first, last), BIGINT
+    if function == "max":
+        return max(first, last), BIGINT
+    if function in ("avg", "mean"):
+        return float(total) / count, DOUBLE
+    raise AnalysisException("Undefined function: %s" % (function,))
+
+
+def _values_aggregate(function, values):
+    """The same aggregate over the values a dataset holds, folded with the builtin.
+
+    A column whose values cannot be folded — text where a number is needed, or a mixture of
+    the two — is a data-type mismatch, which is what the engine says rather than letting the
+    builtin's own error out of the expression.
+    """
+    if function == "count":
+        return len([value for value in values if value is not None]), BIGINT
+    held = [value for value in values if value is not None]
+    if not held:
+        return None, BIGINT
+    try:
+        if function == "sum":
+            total = sum(held)
+            return total, _type_of(total)
+        if function == "min":
+            return min(held), _type_of(min(held))
+        if function == "max":
+            return max(held), _type_of(max(held))
+        if function in ("avg", "mean"):
+            return float(sum(held)) / len(held), DOUBLE
+    except TypeError:
+        raise AnalysisException(
+            "cannot resolve %s due to data type mismatch" % (function,)
+        )
+    raise AnalysisException("Undefined function: %s" % (function,))
+
+
+def _cast_value(value, cast):
+    """`value` read as the type a cast names.
+
+    A value the type cannot be read from is NULL, which is what a cast answers by default
+    rather than ending the program: "the default (non-ANSI) mode returns null for a value it
+    cannot cast". A boolean is read from the word a string spells rather than from whether the
+    string is empty, so the text of `false` is false.
+    """
+    if value is None or cast is None:
+        return value
+    kind, reader = CAST_TYPES[cast]
+    if kind == STRING:
+        return str(value)
+    if kind == BOOLEAN:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            spelled = value.strip().lower()
+            if spelled in ("true", "yes", "t", "y", "1"):
+                return True
+            if spelled in ("false", "no", "f", "n", "0"):
+                return False
+            return None
+        return bool(value)
+    try:
+        return reader(value)
+    except (TypeError, ValueError):
+        return None
+
 
 def _truth(value):
     """A reader option's value as the boolean Spark reads it as."""
@@ -293,12 +565,28 @@ class DataFrameWriter(object):
 
 
 class DataFrame(object):
-    """A dataset of rows: the rows themselves, and the computations over them."""
+    """A dataset of rows: the rows themselves, and the computations over them.
 
-    def __init__(self, rows, columns, numPartitions=1):
-        self._rows = list(rows)
+    A dataset the application named by its VALUES holds those rows. One named as a span of
+    numbers (`SparkSession.range`) holds the span itself instead and makes its rows only when
+    something asks for them: a span is a progression, so what an aggregate over it comes to
+    follows from its definition ([`_range_aggregate`]) and a dataset far larger than this
+    process could hold rows for is still one every aggregate answers for.
+    """
+
+    def __init__(self, rows, columns, numPartitions=1, span=None, types=None):
+        self._span = span
+        self._rows = None if span is not None else list(rows)
         self._columns = list(columns)
         self._partitions = max(int(numPartitions or 1), 1)
+        self._types = dict(types or {})
+
+    def _frame_rows(self):
+        """The rows of this dataset, made from its span the first time one is asked for."""
+        if self._rows is None:
+            name = self._columns[0] if self._columns else "id"
+            self._rows = [Row(**{name: value}) for value in self._span]
+        return self._rows
 
     @property
     def columns(self):
@@ -309,40 +597,84 @@ class DataFrame(object):
         return self._partitions
 
     @property
+    def schema(self):
+        """This dataset's schema: one field per column, carrying that column's own type."""
+        return StructType(
+            [
+                StructField(name, DataType(self._column_type(name)))
+                for name in self._columns
+            ]
+        )
+
+    def dtypes(self):
+        return [(name, self._column_type(name)) for name in self._columns]
+
+    def printSchema(self):
+        print(self.schema.simpleString())
+        return None
+
+    def _column_type(self, name):
+        """The type the column `name` carries: the one it was built with, or the one the first
+        value of it that is not null has."""
+        if name in self._types:
+            return self._types[name]
+        if self._span is not None and self._columns and name == self._columns[0]:
+            return BIGINT
+        for row in self._frame_rows():
+            value = row[name]
+            if value is not None:
+                return _type_of(value)
+        return VOID
+
+    @property
     def rdd(self):
-        return RDD(slices(self._rows, self._partitions))
+        return RDD(slices(self._frame_rows(), self._partitions))
 
     def coalesce(self, numPartitions):
         """The same rows over FEWER partitions — a coalesce never raises the count."""
         asked = max(int(numPartitions), 1)
-        return DataFrame(self._rows, self._columns, min(self._partitions, asked))
+        return self._over(min(self._partitions, asked))
 
     def repartition(self, numPartitions=None, *columns):
         """The same rows over the partitions asked for, as many as were named."""
         if numPartitions is None or not isinstance(numPartitions, int):
-            return DataFrame(self._rows, self._columns, self._partitions)
-        return DataFrame(self._rows, self._columns, max(int(numPartitions), 1))
+            return self._over(self._partitions)
+        return self._over(max(int(numPartitions), 1))
+
+    def _over(self, partitions):
+        """The same dataset over `partitions` partitions, span and all."""
+        if self._span is not None:
+            return DataFrame([], self._columns, partitions, self._span, self._types)
+        return DataFrame(self._rows, self._columns, partitions, None, self._types)
 
     @property
     def write(self):
         return DataFrameWriter(self)
 
     def collect(self):
-        return list(self._rows)
+        return list(self._frame_rows())
 
     def count(self):
+        if self._span is not None:
+            return len(self._span)
         return len(self._rows)
 
     def take(self, num):
+        if self._span is not None:
+            name = self._columns[0] if self._columns else "id"
+            return [
+                Row(**{name: value}) for value in self._span[: max(int(num), 0)]
+            ]
         return self._rows[: max(int(num), 0)]
 
     def first(self):
-        if not self._rows:
+        taken = self.take(1)
+        if not taken:
             return None
-        return self._rows[0]
+        return taken[0]
 
     def toLocalIterator(self):
-        return iter(self._rows)
+        return iter(self._frame_rows())
 
     def select(self, *columns):
         names = [str(column) for column in columns]
@@ -350,12 +682,84 @@ class DataFrame(object):
             if name not in self._columns:
                 raise ValueError("no such column: %s" % (name,))
         rows = [
-            Row(**dict((name, row[name]) for name in names)) for row in self._rows
+            Row(**dict((name, row[name]) for name in names))
+            for row in self._frame_rows()
         ]
-        return DataFrame(rows, names, self._partitions)
+        types = dict((name, self._column_type(name)) for name in names)
+        return DataFrame(rows, names, self._partitions, None, types)
+
+    def selectExpr(self, *exprs):
+        """The dataset the SQL expressions project, as `selectExpr` takes them.
+
+        Each expression is read by its own grammar ([`_read_expression`]) and then COMPUTED
+        over this dataset: a projection answers one row per row of it, and an aggregate
+        answers the one row every aggregate answers — over the span's own definition where
+        this dataset is a span, and over its values otherwise.
+        """
+        reads = [_read_expression(str(expr)) for expr in exprs]
+        if not reads:
+            raise AnalysisException("a projection names no expression")
+        aggregates = [read for read in reads if read.function]
+        if aggregates and len(aggregates) != len(reads):
+            raise AnalysisException(
+                "grouping expressions sequence is empty, and %s is not an aggregate function"
+                % (reads[0].alias,)
+            )
+        if aggregates:
+            values = {}
+            types = {}
+            for read in reads:
+                value, kind = self._aggregate(read)
+                values[read.alias] = value
+                types[read.alias] = kind
+            names = [read.alias for read in reads]
+            return DataFrame([Row(**values)], names, 1, None, types)
+        names = [read.alias for read in reads]
+        rows = []
+        for row in self._frame_rows():
+            projected = {}
+            for read in reads:
+                projected[read.alias] = _cast_value(self._value_of(row, read.column), read.cast)
+            rows.append(Row(**projected))
+        types = {}
+        for read in reads:
+            if read.cast is not None:
+                types[read.alias] = CAST_TYPES[read.cast][0]
+            else:
+                types[read.alias] = self._column_type(read.column)
+        return DataFrame(rows, names, self._partitions, None, types)
+
+    def _value_of(self, row, column):
+        if column not in self._columns:
+            raise AnalysisException("cannot resolve the column %s" % (column,))
+        return row[column]
+
+    def _aggregate(self, read):
+        """What one aggregate expression comes to over this dataset, and the type it has."""
+        if read.function == "count" and read.column in ("*", "1", ""):
+            return self.count(), BIGINT
+        if read.column not in self._columns:
+            raise AnalysisException("cannot resolve the column %s" % (read.column,))
+        if self._span is not None and read.column == self._columns[0]:
+            # The span's own definition answers it, so no row of it is ever made.
+            value, kind = _range_aggregate(read.function, self._span)
+        else:
+            values = [
+                _cast_value(row[read.column], read.cast) for row in self._frame_rows()
+            ]
+            value, kind = _values_aggregate(read.function, values)
+            return value, kind
+        if read.cast is None or value is None:
+            return value, kind
+        # A cast inside the aggregate reads every value as that type, so the aggregate's own
+        # type is that one. The value is the aggregate of the span, read as the cast type:
+        # the sum of a progression is exact in whole numbers, so reading it as a double is
+        # ONE rounding of the true total — which is what a client comparing the two sees the
+        # loss of, rather than the accumulation order of an engine it cannot observe.
+        return _cast_value(value, read.cast), CAST_TYPES[read.cast][0]
 
     def show(self, n=20, truncate=True, vertical=False):
-        for row in self._rows[: max(int(n), 0)]:
+        for row in self.take(n):
             print(row)
         return None
 
@@ -460,10 +864,16 @@ class SparkSession(object):
         return DataFrame(built, columns)
 
     def range(self, start, end=None, step=1, numPartitions=None):
+        """The dataset of one bigint column over a span of numbers, as `range` names one.
+
+        The span itself is what the dataset holds: its rows are made only when something asks
+        for them, and an aggregate over it is answered from the span's own definition
+        ([`DataFrame`]).
+        """
         if end is None:
             start, end = 0, start
-        rows = [Row(**{"id": value}) for value in range(start, end, step)]
-        return DataFrame(rows, ["id"])
+        span = range(int(start), int(end), int(step or 1))
+        return DataFrame([], ["id"], numPartitions or 1, span, {"id": BIGINT})
 
     def stop(self):
         self._stopped = True
@@ -486,5 +896,14 @@ class SparkSession(object):
 # `SparkSession.builder`, the attribute an application starts from.
 SparkSession.builder = SparkSession.Builder()
 
-__all__ = ["DataFrame", "DataFrameReader", "DataFrameWriter", "Row", "SparkSession"]
+__all__ = [
+    "DataFrame",
+    "DataFrameReader",
+    "DataFrameWriter",
+    "DataType",
+    "Row",
+    "SparkSession",
+    "StructField",
+    "StructType",
+]
 "#;
