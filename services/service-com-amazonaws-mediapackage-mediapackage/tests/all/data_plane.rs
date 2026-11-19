@@ -22,6 +22,12 @@
 //!    list is empty.
 //! 5. An ingest or playback address this service never published is routed to nothing:
 //!    `404`, not a refusal class of either plane.
+//! 6. An origin endpoint's playback URLs are announced at the endpoint the CREATING request
+//!    reached, every projection of the endpoint re-reports them, and dialing one as
+//!    published reaches this emulator's playback plane.
+//! 7. A caller that addressed one of AWS's own hostnames is announced the port this
+//!    emulator is SERVED on, and only an emulator served on no port at all announces the
+//!    hostname AWS itself publishes, having no own address to announce in its place.
 //!
 //! Every suite dials the published URL two ways — as published, and at the emulator's own
 //! endpoint with the published PATH, which is what a client that resolves no AWS hostname
@@ -31,7 +37,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_mediapackage_mediapackage::state;
 use service_com_amazonaws_mediapackage_mediapackage::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EndpointUrl, MultiServiceRouter};
 use std::sync::Arc;
 
 /// A fresh emulator holding only this service, with request authentication off (this suite
@@ -1198,9 +1204,9 @@ fn is_path_label(label: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-/// Assert `url` is a playback URL announced under `expected_origin`, keeping the playback
-/// path this service publishes below it: `/out/v1/<endpoint label>/…`.
-fn assert_playback_url(case: &str, url: &str, expected_origin: &str) {
+/// Assert `url` keeps the playback path this service publishes below `expected_origin`:
+/// `/out/v1/<endpoint label>/…`.
+fn assert_playback_path(case: &str, url: &str, expected_origin: &str) {
     let under = format!("{expected_origin}/out/v1/");
     let tail = url.strip_prefix(&under).unwrap_or_default();
     let label = tail.split('/').next().unwrap_or_default();
@@ -1209,6 +1215,12 @@ fn assert_playback_url(case: &str, url: &str, expected_origin: &str) {
         "case {case:?}: a playback URL must be {under:?} plus the endpoint's 32-hex label, \
          got {url:?}"
     );
+}
+
+/// Assert `url` is a playback URL announced under `expected_origin`, keeping the playback
+/// path this service publishes below it: `/out/v1/<endpoint label>/…`.
+fn assert_playback_url(case: &str, url: &str, expected_origin: &str) {
+    assert_playback_path(case, url, expected_origin);
     // The point of the rule: the address handed to a viewer is not a host off this process.
     assert!(
         !url.contains("amazonaws.com"),
@@ -1456,6 +1468,233 @@ async fn the_published_playback_url_is_announced_where_this_emulator_serves_it()
                     answer.text()
                 );
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE 7 — a caller on an AWS hostname is announced the port this emulator is served on
+// ---------------------------------------------------------------------------
+
+/// One row of RULE 7: how this emulator is SERVED, and the origin the playback URLs of an
+/// origin endpoint created by a caller on AWS's own hostname are then announced under.
+struct Served {
+    case: &'static str,
+    /// The authority this emulator is served at, as the base URL
+    /// `OperationContext::endpoint` reports names it; `None` is an emulator served on no
+    /// port at all.
+    served: Option<&'static str>,
+    /// The authority every published URL must be announced under, and `None` when this
+    /// emulator has no own address to announce in place of AWS's own regional host.
+    announced: Option<&'static str>,
+    id: &'static str,
+    /// The endpoint-level `manifestName` every write of this endpoint sends, when it sends
+    /// one.
+    manifest_name: Option<&'static str>,
+    /// The single packaging member every write of this endpoint sends.
+    package_member: &'static str,
+    package: Value,
+}
+
+/// Assert `url` is a playback URL announced under AWS's OWN regional host — the account's
+/// own 32-hex label, then the regional service domain — keeping the playback path this
+/// service publishes below it.
+fn assert_aws_host_playback_url(case: &str, url: &str) {
+    let authority = url
+        .strip_prefix(state::MEDIA_ORIGIN_PREFIX)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or_default();
+    let (label, domain) = authority.split_once('.').unwrap_or_default();
+    assert_eq!(
+        domain,
+        format!("mediapackage.{REGION}.amazonaws.com"),
+        "case {case:?}: expected AWS's own regional host, got {url:?}"
+    );
+    assert!(
+        is_path_label(label),
+        "case {case:?}: expected a 32-hex account label in the host, got {authority:?}"
+    );
+    assert_playback_path(case, url, &announced_origin(authority));
+}
+
+/// RULE — an origin endpoint created by a caller that addressed one of AWS's own hostnames
+/// publishes its playback URLs under the port this emulator is SERVED on, which is the one
+/// address this process answers on, so the URLs stay dialable by a client of this machine;
+/// only an emulator served on no port at all, which has no own address to announce, falls
+/// back on the host AWS itself publishes. Whatever is announced is persisted on the
+/// endpoint, so the create, both reads and the update all report it.
+///
+/// The rows differ along what the rule generalises over: whether this emulator is served at
+/// all and the shape of the address it is served at (an IPv4 literal, a loopback name on
+/// another port, a bracketed IPv6 literal), the packaging format and so the manifest the
+/// URL ends in, whether the endpoint publishes child manifests of its own, whether it
+/// carries a `manifestName` of its own, and the endpoint's identity.
+#[tokio::test]
+async fn an_endpoint_created_on_an_aws_hostname_is_announced_the_port_the_emulator_serves() {
+    let manifest = b"#EXTM3U\n#EXT-X-VERSION:3\n";
+    let rows = vec![
+        Served {
+            case: "served on the data port",
+            served: Some("127.0.0.1:9297"),
+            announced: Some("127.0.0.1:9297"),
+            id: "served-hls",
+            manifest_name: None,
+            package_member: "hlsPackage",
+            package: json!({}),
+        },
+        Served {
+            case: "served on a loopback name on another port",
+            served: Some("localhost:39355"),
+            announced: Some("localhost:39355"),
+            id: "served-named-hls",
+            manifest_name: Some("stream"),
+            package_member: "hlsPackage",
+            package: json!({}),
+        },
+        Served {
+            case: "served on a bracketed IPv6 literal",
+            served: Some("[::1]:443"),
+            announced: Some("[::1]:443"),
+            id: "served-cmaf",
+            manifest_name: None,
+            package_member: "cmafPackage",
+            package: json!({ "hlsManifests": [{ "id": "a" }, { "id": "b", "manifestName": "master" }] }),
+        },
+        Served {
+            case: "served on no port at all",
+            served: None,
+            announced: None,
+            id: "served-dash",
+            manifest_name: Some("live"),
+            package_member: "dashPackage",
+            package: json!({}),
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let mut router = emulator();
+        if let Some(served) = row.served {
+            let base = announced_origin(served);
+            router.set_url_base(
+                EndpointUrl::parse(&base)
+                    .unwrap_or_else(|| panic!("case {case:?}: {base} must parse as a base URL")),
+            );
+        }
+
+        // The channel this endpoint packages, pushed one playlist at its ingest plane, so
+        // the playback URL published below has media to serve.
+        let ingests = channel_with_ingest(&router, "served-ch").await;
+        let ingest = ingests.first().cloned().expect("an ingest endpoint");
+        let pushed = push(&router, &ingest, "index.m3u8", manifest, &ingest.password).await;
+        assert_eq!(
+            pushed.status,
+            200,
+            "case {case:?}: the setup push must be accepted, got {} {}",
+            pushed.status,
+            pushed.text()
+        );
+
+        // Every call below addresses this service's own regional hostname, as an SDK client
+        // that resolves AWS's names does, so no call reaches an own endpoint of this
+        // emulator and the announcement rests on where the emulator is served.
+        let mut request = json!({ "channelId": "served-ch", "id": row.id });
+        request[row.package_member] = row.package.clone();
+        if let Some(name) = row.manifest_name {
+            request["manifestName"] = json!(name);
+        }
+        let (status, created) = control(&router, "POST", "/origin_endpoints", Some(&request)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateOriginEndpoint expected 200, got {status} {created}"
+        );
+
+        let published = published_urls(&created);
+        assert!(
+            !published.is_empty(),
+            "case {case:?}: the create must publish a playback URL, got {created}"
+        );
+        for url in &published {
+            match row.announced {
+                Some(authority) => assert_playback_url(case, url, &announced_origin(authority)),
+                None => assert_aws_host_playback_url(case, url),
+            }
+        }
+
+        // Persisted: every projection of the endpoint renders the announced URLs, so the
+        // address a viewer is handed does not depend on which call reported it.
+        let path = format!("/origin_endpoints/{}", row.id);
+        let (status, described) = control(&router, "GET", &path, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeOriginEndpoint expected 200, got {status} {described}"
+        );
+        let (status, listed) = control(&router, "GET", "/origin_endpoints", None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: ListOriginEndpoints expected 200, got {status} {listed}"
+        );
+        let element = listed
+            .get("originEndpoints")
+            .and_then(Value::as_array)
+            .and_then(|endpoints| {
+                endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.get("id").and_then(Value::as_str) == Some(row.id))
+                    .cloned()
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: ListOriginEndpoints must report {}, got {listed}",
+                    row.id
+                )
+            });
+        let mut rewrite = json!({});
+        rewrite[row.package_member] = row.package.clone();
+        if let Some(name) = row.manifest_name {
+            rewrite["manifestName"] = json!(name);
+        }
+        let (status, updated) = control(&router, "PUT", &path, Some(&rewrite)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: UpdateOriginEndpoint expected 200, got {status} {updated}"
+        );
+        for (projection, body) in [
+            ("DescribeOriginEndpoint", described),
+            ("ListOriginEndpoints", element),
+            ("UpdateOriginEndpoint", updated),
+        ] {
+            assert_eq!(
+                published_urls(&body),
+                published,
+                "case {case:?}: {projection} must re-report the published playback URLs, \
+                 expected {published:?}, got {body}"
+            );
+        }
+
+        // The promise an own address makes: dialed AS PUBLISHED, it is this emulator's
+        // playback plane that answers, serving what the channel ingested. A row with no own
+        // address announces a host nothing on this machine resolves, so it has no published
+        // address to dial — its assertion is the form of that host, above.
+        if row.announced.is_some() {
+            let url = published
+                .first()
+                .cloned()
+                .expect("the endpoint's own playback URL");
+            let answer = plane(&router, "GET", &url, &[], b"").await;
+            assert_eq!(
+                answer.status,
+                200,
+                "case {case:?}: expected the ingested playlist at {url:?}, got {} {}",
+                answer.status,
+                answer.text()
+            );
+            assert_eq!(
+                answer.body,
+                manifest,
+                "case {case:?}: the published URL serves the ingested playlist, got {:?}",
+                answer.text()
+            );
         }
     }
 }
