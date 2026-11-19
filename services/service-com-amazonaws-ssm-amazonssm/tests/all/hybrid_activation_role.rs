@@ -65,14 +65,14 @@ struct Row {
     verdict: Verdict,
 }
 
-/// A trust policy carrying `statements`.
-fn trust(statements: Value) -> Value {
+/// A trust policy carrying `statements`. Shared with the sibling suites above.
+pub(crate) fn trust(statements: Value) -> Value {
     json!({ "Version": "2012-10-17", "Statement": statements })
 }
 
 /// One trust statement: `effect` the actions `action` names for the service principals
-/// `principals` names.
-fn statement(effect: &str, principals: Value, action: Value) -> Value {
+/// `principals` names. Shared with the sibling suites above.
+pub(crate) fn statement(effect: &str, principals: Value, action: Value) -> Value {
     json!({ "Effect": effect, "Principal": { "Service": principals }, "Action": action })
 }
 
@@ -210,6 +210,13 @@ fn rows() -> Vec<Row> {
 /// own handlers hold. Shared with the sibling suite that resolves a cloud connector's role
 /// through IAM ([`crate::cloud_connector_role_and_deletion`]).
 pub(crate) fn router_with_iam() -> MultiServiceRouter {
+    router_with_iam_and_engine().0
+}
+
+/// The same router beside the engine it is mounted on — for a suite that must also seed a
+/// record no call of this model makes, the way the sibling suite that moves a registered
+/// node to another role does ([`crate::managed_node_role_moves`]).
+pub(crate) fn router_with_iam_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The signature itself is not under test here; the router still reads the SigV4
@@ -219,9 +226,11 @@ pub(crate) fn router_with_iam() -> MultiServiceRouter {
         Arc::clone(&engine),
     ));
     router.register_service(
-        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(engine),
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
     );
-    router
+    (router, engine)
 }
 
 /// One awsQuery call to IAM that must succeed, answering the XML body it served. Shared with
@@ -312,12 +321,13 @@ pub(crate) fn form_encode(value: &str) -> String {
     encoded
 }
 
-/// The `IamRole` value a row's create names: the role NAME, carrying the path IAM holds
-/// it under, which is what a hybrid activation's member takes.
-fn iam_role_value(row: &Row) -> String {
-    match row.path.trim_matches('/') {
-        "" => row.role_name.to_string(),
-        path => format!("{path}/{}", row.role_name),
+/// The `IamRole` value a create names for the role `role_name` IAM holds under `path`: the
+/// role NAME, carrying that path, which is what every role member of this service takes.
+/// Shared with the sibling suites above.
+pub(crate) fn iam_role_value(path: &str, role_name: &str) -> String {
+    match path.trim_matches('/') {
+        "" => role_name.to_string(),
+        path => format!("{path}/{role_name}"),
     }
 }
 
@@ -364,7 +374,7 @@ async fn an_activation_is_minted_only_for_a_role_this_service_may_assume() {
         if let Some(document) = row.trust.as_ref() {
             create_role(&router, case, row.path, row.role_name, document).await;
         }
-        let iam_role = iam_role_value(&row);
+        let iam_role = iam_role_value(row.path, row.role_name);
 
         let (status, body) = call(
             &router,

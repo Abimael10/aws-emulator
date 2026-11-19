@@ -86,8 +86,9 @@ fn service() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// Register a node in `region` the way its own registration would, carrying the properties a
-/// node reports about itself.
-fn register(
+/// node reports about itself. Shared with the sibling suite that moves a registered node to
+/// another IAM role ([`crate::managed_node_role_moves`]), which needs the same seeded node.
+pub(crate) fn register(
     engine: &Arc<engine::InMemoryEngine>,
     region: &str,
     node_id: &str,
