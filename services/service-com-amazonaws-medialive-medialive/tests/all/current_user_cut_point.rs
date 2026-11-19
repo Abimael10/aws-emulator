@@ -531,3 +531,285 @@ async fn deleting_a_group_right_after_its_last_user_reports_no_user_and_idle() {
         );
     }
 }
+
+/// The ids one derived member of a group projection carries, sorted so a
+/// comparison is about membership rather than about the store's iteration order.
+fn member_ids(case: &str, phase: &str, reader: &str, member: &str, group: &Value) -> Vec<String> {
+    let entries = group[member].as_array().unwrap_or_else(|| {
+        panic!("case {case:?} / {phase}: expected {reader} to report a {member} list, got {group}")
+    });
+    let mut ids: Vec<String> = entries
+        .iter()
+        .map(|entry| entry.as_str().unwrap_or_default().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// The same ids, sorted, for the side the test built up itself.
+fn sorted(mut ids: Vec<String>) -> Vec<String> {
+    ids.sort();
+    ids
+}
+
+/// The group one id names, as `ListInputSecurityGroups` reports it (GET
+/// /prod/inputSecurityGroups, `ListInputSecurityGroupsResponse$InputSecurityGroups`,
+/// jsonName `inputSecurityGroups`).
+async fn listed_group(router: &MultiServiceRouter, case: &str, phase: &str, id: &str) -> Value {
+    let (status, listing) = call(router, "GET", "/prod/inputSecurityGroups", None).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?} / {phase}: ListInputSecurityGroups: expected 200, got {status}: {listing}"
+    );
+    listing["inputSecurityGroups"]
+        .as_array()
+        .and_then(|groups| {
+            groups
+                .iter()
+                .find(|group| group["id"] == json!(id))
+                .cloned()
+        })
+        .unwrap_or_else(|| {
+            panic!("case {case:?} / {phase}: expected the listing to report the group, got {listing}")
+        })
+}
+
+/// What a group reports as its current users right now — its `inputs`, its
+/// `channels` and the `state` derived from the two — read through BOTH
+/// serializers that emit those members and asserted to agree, since one
+/// derivation backs them.
+async fn membership(
+    router: &MultiServiceRouter,
+    case: &str,
+    phase: &str,
+    id: &str,
+) -> (Vec<String>, Vec<String>, String) {
+    let (status, described) = call(
+        router,
+        "GET",
+        &format!("/prod/inputSecurityGroups/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?} / {phase}: DescribeInputSecurityGroup: expected 200, got {status}: {described}"
+    );
+    let listed = listed_group(router, case, phase, id).await;
+
+    let inputs = member_ids(case, phase, "DescribeInputSecurityGroup", "inputs", &described);
+    let channels = member_ids(
+        case,
+        phase,
+        "DescribeInputSecurityGroup",
+        "channels",
+        &described,
+    );
+    let state = described["state"].as_str().unwrap_or_default().to_string();
+    assert_eq!(
+        member_ids(case, phase, "ListInputSecurityGroups", "inputs", &listed),
+        inputs,
+        "case {case:?} / {phase}: expected both readers to report the same inputs, \
+         got {listed} beside {described}"
+    );
+    assert_eq!(
+        member_ids(case, phase, "ListInputSecurityGroups", "channels", &listed),
+        channels,
+        "case {case:?} / {phase}: expected both readers to report the same channels, \
+         got {listed} beside {described}"
+    );
+    assert_eq!(
+        listed["state"].as_str().unwrap_or_default(),
+        state,
+        "case {case:?} / {phase}: expected both readers to report the same state, \
+         got {listed} beside {described}"
+    );
+    (inputs, channels, state)
+}
+
+/// Rule: a group's membership is derived from the resources that CURRENTLY use
+/// it, so each accepted delete takes exactly that one resource out of the member
+/// that lists it and the `State` derived from the pair is `IN_USE` exactly while
+/// either list is non-empty — IDLE once the last user's delete is accepted,
+/// whatever reader emits the projection and however many users the group had.
+///
+/// The rows differ along what the rule generalises over: HOW MANY resources use
+/// the group (one, two, three), and WHICH KINDS use it — inputs alone, or an
+/// input beside a channel, where deleting the input empties `inputs` while
+/// `channels` keeps the group `IN_USE`. The projection is read through both
+/// serializers that emit those members, because one derivation backs them. No
+/// read waits on the clock: the cut falls where the delete is ACCEPTED, so a
+/// deleted user is out of the membership before its terminal state is due.
+#[tokio::test]
+async fn a_group_reports_the_users_left_after_each_accepted_delete() {
+    // (case, how many inputs name the group, whether a channel also names it)
+    let table: [(&str, usize, bool); 4] = [
+        ("one input", 1, false),
+        ("two inputs", 2, false),
+        ("three inputs", 3, false),
+        ("one input beside a channel", 1, true),
+    ];
+
+    for (case, input_count, with_channel) in table {
+        let router = medialive();
+        let group_id = crate::support::input_security_group(&router).await;
+
+        let mut input_ids: Vec<String> = Vec::new();
+        for index in 0..input_count {
+            let input = create_input(
+                &router,
+                case,
+                json!({
+                    "name": format!("group-user-{index}"),
+                    "type": "RTP_PUSH",
+                    "inputSecurityGroups": [group_id.clone()],
+                }),
+            )
+            .await;
+            input_ids.push(input["id"].as_str().unwrap_or_default().to_string());
+        }
+        // The channel row's channel is created through the same helper the rows
+        // above use, so it is settled and its own delete is accepted when the
+        // teardown reaches it.
+        let mut channel_ids: Vec<String> = if with_channel {
+            vec![
+                idle_channel(
+                    &router,
+                    case,
+                    json!({
+                        "name": "group-user-channel",
+                        "channelSecurityGroups": [group_id.clone()],
+                    }),
+                )
+                .await,
+            ]
+        } else {
+            Vec::new()
+        };
+
+        let mut live = sorted(input_ids.clone());
+        let (inputs, channels, state) = membership(&router, case, "every user live", &group_id).await;
+        assert_eq!(
+            inputs, live,
+            "case {case:?}: expected the group to report every live input, got {inputs:?}"
+        );
+        assert_eq!(
+            channels,
+            sorted(channel_ids.clone()),
+            "case {case:?}: expected the group to report every live channel, got {channels:?}"
+        );
+        assert_eq!(
+            state, "IN_USE",
+            "case {case:?}: expected IN_USE while a user holds the group, got {state:?}"
+        );
+
+        // One accepted delete at a time: the group drops that input and keeps
+        // every other user, and its state follows the two lists.
+        for (index, input_id) in input_ids.iter().enumerate() {
+            let (status, deleted) = call(
+                &router,
+                "DELETE",
+                &format!("/prod/inputs/{input_id}"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: DeleteInput: expected 200, got {status}: {deleted}"
+            );
+            live.retain(|id| id != input_id);
+
+            let phase = format!("after {} of {input_count} input delete(s)", index + 1);
+            let (inputs, channels, state) = membership(&router, case, &phase, &group_id).await;
+            assert_eq!(
+                inputs, live,
+                "case {case:?} / {phase}: expected only the inputs left to be reported, \
+                 got {inputs:?}"
+            );
+            assert_eq!(
+                channels,
+                sorted(channel_ids.clone()),
+                "case {case:?} / {phase}: expected an input delete to leave the channels alone, \
+                 got {channels:?}"
+            );
+            let expected = if live.is_empty() && channel_ids.is_empty() {
+                "IDLE"
+            } else {
+                "IN_USE"
+            };
+            assert_eq!(
+                state, expected,
+                "case {case:?} / {phase}: expected {expected} with {} input(s) and {} channel(s) \
+                 left, got {state:?}",
+                live.len(),
+                channel_ids.len()
+            );
+        }
+
+        // The other kind of user goes the same way: deleting the channel empties
+        // the second list too, so the group reports no user at all.
+        for channel_id in channel_ids.clone() {
+            let (status, deleted) = call(
+                &router,
+                "DELETE",
+                &format!("/prod/channels/{channel_id}"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: DeleteChannel: expected 200, got {status}: {deleted}"
+            );
+            channel_ids.retain(|id| id != &channel_id);
+
+            let phase = "after the channel delete";
+            let (inputs, channels, state) = membership(&router, case, phase, &group_id).await;
+            assert_eq!(
+                channels,
+                sorted(channel_ids.clone()),
+                "case {case:?} / {phase}: expected only the channels left to be reported, \
+                 got {channels:?}"
+            );
+            assert_eq!(
+                inputs, live,
+                "case {case:?} / {phase}: expected a channel delete to leave the inputs alone, \
+                 got {inputs:?}"
+            );
+            let expected = if live.is_empty() && channel_ids.is_empty() {
+                "IDLE"
+            } else {
+                "IN_USE"
+            };
+            assert_eq!(
+                state, expected,
+                "case {case:?} / {phase}: expected {expected} with {} input(s) and {} channel(s) \
+                 left, got {state:?}",
+                live.len(),
+                channel_ids.len()
+            );
+        }
+
+        // The teardown this unblocks, reached by every row: once no user of
+        // either kind is left the group is released, and the delete reports it as
+        // the unused group it has become.
+        let (status, deleted) = crate::input_security_group::delete_group(&router, &group_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DeleteInputSecurityGroup: expected 200, got {status}: {deleted}"
+        );
+        for member in ["inputs", "channels"] {
+            assert_eq!(
+                deleted[member],
+                json!([]),
+                "case {case:?}: expected the released group to name no {member}, got {:?}",
+                deleted[member]
+            );
+        }
+        assert_eq!(
+            deleted["state"],
+            json!("IDLE"),
+            "case {case:?}: expected the released group to report IDLE, got {:?}",
+            deleted["state"]
+        );
+    }
+}

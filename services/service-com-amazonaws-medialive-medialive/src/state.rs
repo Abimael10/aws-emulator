@@ -4014,9 +4014,10 @@ impl InputRecord {
     /// Whether a delete has been accepted for this input, in either half of the
     /// deletion lifecycle — so a repeated `DeleteInput` is idempotent rather
     /// than restarting the clock, and the id names no input a caller may still
-    /// CHANGE ([`ComAmazonawsMedialiveMedialiveState::live_input`]). NOT what
-    /// decides whether this input still USES the resources it references: that
-    /// is cut at the terminal `DELETED` state alone
+    /// CHANGE ([`ComAmazonawsMedialiveMedialiveState::live_input`]). It is ALSO
+    /// what decides whether this input still USES the resources it references:
+    /// accepting the delete releases them, so the cut falls here rather than at
+    /// the terminal `DELETED` state
     /// ([`ComAmazonawsMedialiveMedialiveState::inputs_using_security_group`]).
     pub fn is_delete_accepted(&self) -> bool {
         self.is_deleting() || self.is_deleted()
