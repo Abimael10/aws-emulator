@@ -826,13 +826,12 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
 
     /// The view a query must use: the one the caller named, else the Region's default.
     ///
-    /// `None` is the ONE refusal both ways of failing to resolve a view carry — "if the
-    /// Region either doesn't have a default view or if you don't have permission to use
-    /// the default view, then the operation fails with a 401 Unauthorized exception"
-    /// (`ViewArn`'s own documentation on both query operations), and an ARN that resolves
-    /// to no view this account holds is the same authorization failure rather than a
-    /// report that the view is absent: authorization matches the ARN before the query
-    /// runs.
+    /// `None` means no view resolved. For an ARN the request NAMED that is the
+    /// authorization failure `ViewArn` documents — "if you don't have permission to use
+    /// the default view, then the operation fails with a 401 Unauthorized exception" —
+    /// rather than a report that the view is absent: authorization matches the ARN before
+    /// the query runs. What a caller that named NO view gets when the Region has no
+    /// default is the calling operation's own business, so each one decides it.
     ///
     /// A named ARN resolves wherever the request was signed: a view ARN carries its own
     /// Region, and the index the query then reads is that view's. `region` is used only

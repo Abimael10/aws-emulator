@@ -1019,12 +1019,15 @@ async fn the_match_pages_with_an_opaque_next_token() {
     );
 }
 
-/// A query must use a view, and both ways of failing to resolve one are the same
-/// authorization failure: "if the Region either doesn't have a default view or if you
-/// don't have permission to use the default view, then the operation fails with a 401
-/// Unauthorized exception". The refusal carries nothing from the request.
+/// A `ViewArn` the request NAMES and that resolves to no view this account holds is the
+/// authorization failure that member documents: "if you don't have permission to use the
+/// default view, then the operation fails with a 401 Unauthorized exception". The refusal
+/// carries nothing from the request.
+///
+/// A request that names NO view is not one of these rows: it has no ARN to authorize, and
+/// [`a_listing_with_no_view_reports_the_regions_index`] pins what it answers instead.
 #[tokio::test]
-async fn a_query_that_cannot_resolve_a_view_is_unauthorized() {
+async fn a_named_view_that_cannot_be_resolved_is_unauthorized() {
     let fixture = Fixture::new().await;
 
     // A Region with an index of its own, cleared of the default view turning Resource
@@ -1039,7 +1042,6 @@ async fn a_query_that_cannot_resolve_a_view_is_unauthorized() {
         .ok("clear the Region's default view");
 
     let unresolvable: Vec<(&str, Value)> = vec![
-        ("a Region with no default view", json!({})),
         (
             "a view ARN never minted",
             json!({
@@ -1071,6 +1073,211 @@ async fn a_query_that_cannot_resolve_a_view_is_unauthorized() {
             "Unauthorized",
             "case {case:?}: the refusal carries nothing from the request, got {}",
             answer.body
+        );
+    }
+}
+
+/// `ViewArn` is optional, and a Region with no default view does not make a listing
+/// unanswerable: the operation reports that Region's index scoped by no view at all,
+/// names no `ViewArn` because it used none, and still honours the caller's own filter
+/// string, page size and refusals. A view the Region holds but has not made its default
+/// scopes nothing until a request names it — which the positive control pins.
+///
+/// The rows span the filter NAME and operator, the number of resources selected, the page
+/// size, a Region with no index at all, and the refusals a filter string still earns with
+/// no view in play.
+#[tokio::test]
+async fn a_listing_with_no_view_reports_the_regions_index() {
+    let fixture = Fixture::new().await;
+
+    // Turning Resource Explorer on in a Region left it a default view, so having none is
+    // a state the Region has to be CLEARED into.
+    fixture
+        .emulator
+        .explorer(REGION, "DisassociateDefaultView", json!({}))
+        .await
+        .ok("clear the Region's default view");
+
+    // A view the Region holds but has NOT made its default: its own filter string must
+    // not scope a listing that does not name it.
+    let unassociated = fixture
+        .emulator
+        .create_view(
+            REGION,
+            json!({
+                "ViewName": "topics-only",
+                "Filters": { "FilterString": "service:sns" },
+            }),
+        )
+        .await;
+    let mut every = fixture.every_arn();
+    every.insert(unassociated.clone());
+    let without_queues: BTreeSet<String> = every
+        .iter()
+        .filter(|arn| *arn != &fixture.queue && *arn != &fixture.fifo_queue)
+        .cloned()
+        .collect();
+
+    let unscoped: Vec<(&str, Value, BTreeSet<String>)> = vec![
+        ("no Filters member at all", json!({}), every.clone()),
+        (
+            "an empty filter string",
+            json!({ "Filters": { "FilterString": "" } }),
+            every.clone(),
+        ),
+        (
+            "one service",
+            json!({ "Filters": { "FilterString": "service:sqs" } }),
+            set(&[&fixture.queue, &fixture.fifo_queue]),
+        ),
+        (
+            "that service negated",
+            json!({ "Filters": { "FilterString": "-service:sqs" } }),
+            without_queues,
+        ),
+        (
+            "a qualified resource type",
+            json!({ "Filters": { "FilterString": "resourcetype:sns:topic" } }),
+            set(&[&fixture.topic]),
+        ),
+        (
+            "a suffix wildcard on the Region",
+            json!({ "Filters": { "FilterString": "region:us-east-*" } }),
+            every.clone(),
+        ),
+    ];
+
+    for (case, request, expected) in unscoped {
+        let answer = fixture
+            .emulator
+            .explorer(REGION, "ListResources", request.clone())
+            .await;
+        assert_eq!(
+            answer.arns(case),
+            expected,
+            "case {case:?}: expected the Region's index scoped by the filter alone, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.ok(case).get("ViewArn"),
+            None,
+            "case {case:?}: a listing that used no view names none, got {}",
+            answer.body
+        );
+        for resource in answer.resources(case) {
+            assert_eq!(
+                resource.get("Properties"),
+                None,
+                "case {case:?}: no view included the {TAGS_PROPERTY} property, so no \
+                 resource carries it, got {resource}"
+            );
+        }
+    }
+
+    // The page size still applies, and the token still resumes the same listing.
+    let case = "a page of two with no view";
+    let first = fixture
+        .emulator
+        .explorer(REGION, "ListResources", json!({ "MaxResults": 2 }))
+        .await;
+    let page = first.arns(case);
+    assert_eq!(
+        page.len(),
+        2,
+        "case {case:?}: expected a page of two, got {}",
+        first.body
+    );
+    assert_eq!(
+        first.ok(case).get("ViewArn"),
+        None,
+        "case {case:?}: a listing that used no view names none, got {}",
+        first.body
+    );
+    let token = first.ok(case)["NextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: a partial page leaves a NextToken: {}", first.body))
+        .to_string();
+    let case = "the rest of that listing";
+    let rest = fixture
+        .emulator
+        .explorer(
+            REGION,
+            "ListResources",
+            json!({ "MaxResults": 100, "NextToken": token }),
+        )
+        .await;
+    let whole: BTreeSet<String> = page.union(&rest.arns(case)).cloned().collect();
+    assert_eq!(
+        whole, every,
+        "case {case:?}: the pages together are the whole listing, got {}",
+        rest.body
+    );
+
+    // A Region with no index at all holds nothing, which is an empty listing and not a
+    // refusal either.
+    let case = "a Region with no index and no default view";
+    let empty = fixture
+        .emulator
+        .explorer("ap-south-1", "ListResources", json!({}))
+        .await;
+    assert!(
+        empty.arns(case).is_empty(),
+        "case {case:?}: expected an empty Resources list, got {}",
+        empty.body
+    );
+    assert_eq!(
+        empty.ok(case).get("ViewArn"),
+        None,
+        "case {case:?}: a listing that used no view names none, got {}",
+        empty.body
+    );
+
+    // The positive control: naming that view scopes the listing by its filter string and
+    // echoes its ARN.
+    let case = "the view named explicitly";
+    let scoped = fixture
+        .emulator
+        .list_through(REGION, &unassociated, "")
+        .await;
+    assert_eq!(
+        scoped.arns(case),
+        set(&[&fixture.topic]),
+        "case {case:?}: expected the view's own filter string to scope the listing, got {}",
+        scoped.body
+    );
+    assert_eq!(
+        scoped.ok(case)["ViewArn"].as_str(),
+        Some(unassociated.as_str()),
+        "case {case:?}: the answer names the view it used, got {}",
+        scoped.body
+    );
+
+    // The refusals a filter string earns do not depend on a view resolving: a term that
+    // is not a filter prefix is still free-form text, and a tag filter still needs the
+    // `tags` property, which a listing scoped by no view includes no more than a view
+    // without it does.
+    let refusals: Vec<(&str, Value, &str)> = vec![
+        (
+            "free-form text with no view",
+            json!({ "Filters": { "FilterString": "orders" } }),
+            "free-form text",
+        ),
+        (
+            "a tag filter with no view",
+            json!({ "Filters": { "FilterString": "tag:stage=prod" } }),
+            "not included in the view",
+        ),
+    ];
+    for (case, request, expected) in refusals {
+        let answer = fixture
+            .emulator
+            .explorer(REGION, "ListResources", request.clone())
+            .await;
+        answer.failed(case, 400, "ValidationException");
+        assert!(
+            answer.error_message().contains(expected),
+            "case {case:?}: expected a message stating {expected:?}, got {:?}",
+            answer.error_message()
         );
     }
 }

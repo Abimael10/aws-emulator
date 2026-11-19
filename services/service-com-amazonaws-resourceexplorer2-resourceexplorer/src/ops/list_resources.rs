@@ -12,10 +12,14 @@
 //! against every indexed field.
 //!
 //! An explicit `ViewArn` identifies the view wherever the request was signed for, and
-//! the index read is the one belonging to THAT view's Region. Its contents are resolved
-//! the one way `crate::state` resolves them, so what this operation reports includes the
-//! resources the services in `crate::state::owners` hold in that Region, read from their
-//! own records.
+//! the index read is the one belonging to THAT view's Region; an ARN that resolves to no
+//! view this account holds is the 401 `UnauthorizedException` that member documents. A
+//! request that names no view uses the Region's default view, and a Region that has no
+//! default view leaves the listing unscoped — reported over that Region's index, with no
+//! `ViewArn` to name — rather than refused. Its contents are resolved the one way
+//! `crate::state` resolves them, so what this operation reports includes the resources
+//! the services in `crate::state::owners` hold in that Region, read from their own
+//! records.
 //!
 //! ## Shape of an operation
 //!
@@ -223,17 +227,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read, so the only write is the index lifecycle the clock already owed.
         guard.settle(now);
 
-        // "This query must use a view. If you don't explicitly specify a view, then
-        // Resource Explorer uses the default view for the Region in which you call this
-        // operation" — and a Region with no default view, like an ARN that resolves to
-        // no view this account holds, is the 401 that `ViewArn` documents.
-        let view = guard
-            .query_view(&region, input.view_arn.as_deref())
-            .ok_or_else(|| {
-                ListResourcesErrorModeled::UnauthorizedException(UnauthorizedException {
+        // "If you don't specify a value for this parameter, then the operation
+        // automatically uses the default view for the Region in which you called this
+        // operation." `ViewArn` is an OPTIONAL member, and the 401 it documents is the
+        // answer to a view the request cannot be authorized for: an ARN that resolves to
+        // no view this account holds. A Region that simply has no default view leaves
+        // this listing with no view to scope it, which it reports over that Region's own
+        // index rather than refusing — the documented 401 for a missing default is not
+        // what the service does.
+        let view = guard.query_view(&region, input.view_arn.as_deref());
+        if view.is_none() && input.view_arn.is_some() {
+            return Err(ListResourcesErrorModeled::UnauthorizedException(
+                UnauthorizedException {
                     message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
-                })
-            })?;
+                },
+            )
+            .into());
+        }
 
         // "This query string in the context of this operation supports only filter
         // prefixes with optional operators. It doesn't support free-form text." Asked
@@ -257,14 +267,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A view's own filter string scopes what the view can return, so what this
-        // operation reports is the intersection of it with the caller's: both match.
-        let view_filter = view.filter_string.clone().unwrap_or_default();
-        let include_tags = view.includes_property(crate::state::TAGS_PROPERTY);
+        // operation reports is the intersection of it with the caller's: both match. With
+        // no view, nothing but the caller's own filter string scopes the listing.
+        let view_filter = view
+            .and_then(|view| view.filter_string.clone())
+            .unwrap_or_default();
+        let include_tags =
+            view.is_some_and(|view| view.includes_property(crate::state::TAGS_PROPERTY));
 
-        // A tag filter reads a resource's TAGS, which a view only carries when it
-        // includes the `tags` property — so a query that filters on tags, whether from
-        // the caller's filter string or from the view's own, is refused unless the view
-        // includes that property. The refusal names the filter at fault.
+        // A tag filter reads a resource's TAGS, which a result only carries when the
+        // view the listing used includes the `tags` property — so a query that filters on
+        // tags, whether from the caller's filter string or from the view's own, is refused
+        // unless that property is included, and a listing scoped by no view includes no
+        // optional property at all. The refusal names the filter at fault.
         if !include_tags {
             if let Some(filter) = crate::state::tags_filter_name(query)
                 .or_else(|| crate::state::tags_filter_name(&view_filter))
@@ -282,8 +297,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The index this listing reads is the resolved view's own Region's, and the
+        // Region the request was signed for when no view scopes it.
+        let indexed_region = view.map_or(region.as_str(), |view| view.region.as_str());
         let matched: Vec<crate::state::IndexedResource> = guard
-            .indexed_resources(&view.region, &owned)
+            .indexed_resources(indexed_region, &owned)
             .into_iter()
             .filter(|resource| {
                 crate::state::query_matches(query, resource)
@@ -300,13 +318,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|resource| resource.to_wire(include_tags))
             .collect();
 
-        let view_arn = view.view_arn.clone();
+        let view_arn = view.map(|view| view.view_arn.clone());
         // The cursor is bound to the request it was issued for, so a NextToken from one
         // query or view cannot resume a different one at that offset.
         let cursor = format!(
             "{}:{}",
             Self::NAME,
-            crate::state::request_fingerprint(&[query, &view_arn])
+            crate::state::request_fingerprint(&[query, view_arn.as_deref().unwrap_or_default()])
         );
         let (page, next_token) = crate::state::paginate(
             &resources,
@@ -325,8 +343,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
             // "The Amazon resource name (ARN) of the view that this operation used to
             // perform the search": the view the caller named, or the default view it
-            // resolved to.
-            view_arn: Some(view_arn),
+            // resolved to — and absent when the listing used no view, because there is
+            // then no view for it to name.
+            view_arn,
         })
     }
 }
