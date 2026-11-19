@@ -154,9 +154,12 @@ macro_rules! ci_read_member {
     ($d:ident, $m:expr, timestamp) => {
         $d.read_timestamp($m)?
     };
+    // The map is read into an ORDERED container, the one every structure built with this
+    // macro declares its map members as: the entries keep one order, rather than the order a
+    // hash table happens to hold them in, which differs from table to table.
     ($d:ident, $m:expr, map_of_string) => {{
-        let mut __out: ::std::collections::HashMap<::std::string::String, ::std::string::String> =
-            ::std::collections::HashMap::new();
+        let mut __out: ::std::collections::BTreeMap<::std::string::String, ::std::string::String> =
+            ::std::collections::BTreeMap::new();
         $d.read_map($m, &mut |__key, __dm| {
             let __value = __dm.read_string($m)?;
             __out.insert(__key, __value);

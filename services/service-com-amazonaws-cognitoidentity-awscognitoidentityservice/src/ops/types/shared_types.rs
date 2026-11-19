@@ -38,12 +38,17 @@ pub struct ReportedIdentityPool {
     pub identity_pool_name: String,
     pub allow_unauthenticated_identities: bool,
     pub allow_classic_flow: Option<bool>,
-    pub supported_login_providers: Option<std::collections::HashMap<String, String>>,
+    /// An ORDERED map, keyed as the stored pool keys it: the entries are serialized in that
+    /// one order, where a `HashMap` of them would serialize the same unchanged pool in a
+    /// different order on every call.
+    pub supported_login_providers: Option<std::collections::BTreeMap<String, String>>,
     pub developer_provider_name: Option<String>,
     pub open_id_connect_provider_ar_ns: Option<Vec<String>>,
     pub cognito_identity_providers: Option<Vec<CognitoIdentityProvider>>,
     pub saml_provider_ar_ns: Option<Vec<String>>,
-    pub identity_pool_tags: Option<std::collections::HashMap<String, String>>,
+    /// Ordered for the same reason as `supported_login_providers`: two reads of one
+    /// unchanged pool report its tags in the same order.
+    pub identity_pool_tags: Option<std::collections::BTreeMap<String, String>>,
     pub identity_pool_arn: Option<String>,
     pub creation_date: Option<::aws_smithy_types::DateTime>,
     pub last_modified_date: Option<::aws_smithy_types::DateTime>,

@@ -20,6 +20,9 @@ pub struct ListTagsForResourceInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.cognitoidentity#ListTagsForResourceResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct ListTagsForResourceOutput {
-    pub tags: Option<std::collections::HashMap<String, String>>,
+    /// An ORDERED map, keyed as the resource's stored tags key them: the entries are
+    /// serialized in that one order, where a `HashMap` of them would serialize the same
+    /// stored tags in a different order on every call.
+    pub tags: Option<std::collections::BTreeMap<String, String>>,
 }
 

@@ -21,7 +21,12 @@ pub struct GetIdentityPoolRolesInput {
 #[derive(Debug, Clone, Default)]
 pub struct GetIdentityPoolRolesOutput {
     pub identity_pool_id: Option<String>,
-    pub roles: Option<std::collections::HashMap<String, String>>,
-    pub role_mappings: Option<std::collections::HashMap<String, RoleMapping>>,
+    /// An ORDERED map, keyed as the pool's stored role configuration keys it: the entries
+    /// are serialized in that one order, where a `HashMap` of them would serialize the same
+    /// unchanged configuration in a different order on every call.
+    pub roles: Option<std::collections::BTreeMap<String, String>>,
+    /// Ordered for the same reason as `roles`: two reads of one unchanged pool report its
+    /// mapped providers in the same order.
+    pub role_mappings: Option<std::collections::BTreeMap<String, RoleMapping>>,
 }
 

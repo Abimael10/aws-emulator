@@ -65,6 +65,31 @@ impl Emulator {
         operation: &str,
         body: &Value,
     ) -> (u16, Value, String) {
+        let written = serde_json::to_string(body).expect("the request body serializes");
+        let (status, text, request_id) = self.answered_text_in(region, operation, &written).await;
+        let parsed = if text.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or_else(|error| {
+                panic!("operation {operation} answered a body that is not JSON ({error}): {text}")
+            })
+        };
+        (status, parsed, request_id)
+    }
+
+    /// The same call with the request body written on the wire EXACTLY as the text given,
+    /// answering the response body as TEXT beside its status and the id it was answered
+    /// under.
+    ///
+    /// Taking and giving back text is what lets a suite whose rule is about the ORDER a
+    /// request or a response writes its members in see that order at all: a parser rebuilds
+    /// a JSON object as a map and does not keep it.
+    pub(crate) async fn answered_text_in(
+        &self,
+        region: &str,
+        operation: &str,
+        body: &str,
+    ) -> (u16, String, String) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("https://cognito-identity.{region}.amazonaws.com/"))
@@ -84,9 +109,7 @@ impl Emulator {
                      SignedHeaders=host;x-amz-target, Signature=0"
                 ),
             )
-            .body(bytes::Bytes::from(
-                serde_json::to_vec(body).expect("the request body serializes"),
-            ))
+            .body(bytes::Bytes::from(body.to_string()))
             .expect("the request builds");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
@@ -96,18 +119,21 @@ impl Emulator {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        let bytes = response.into_body();
-        let parsed = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-                panic!(
-                    "operation {operation} answered a body that is not JSON ({error}): {}",
-                    String::from_utf8_lossy(&bytes)
-                )
-            })
-        };
-        (status, parsed, request_id)
+        let text = String::from_utf8_lossy(&response.into_body()).to_string();
+        (status, text, request_id)
+    }
+
+    /// Call an operation that must succeed with its request body written exactly as the text
+    /// given, answering the response body as TEXT.
+    pub(crate) async fn ok_text(&self, operation: &str, body: &str) -> String {
+        let (status, text, _) = self
+            .answered_text_in(DEFAULT_REGION, operation, body)
+            .await;
+        assert_eq!(
+            status, 200,
+            "operation {operation} on {body} expected HTTP 200, got {status} with {text}"
+        );
+        text
     }
 
     /// Every event recorded in the account's management-event log of the SAME shared

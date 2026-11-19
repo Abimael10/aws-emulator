@@ -26,6 +26,9 @@ pub struct SetPrincipalTagAttributeMapOutput {
     pub identity_pool_id: Option<String>,
     pub identity_provider_name: Option<String>,
     pub use_defaults: Option<bool>,
-    pub principal_tags: Option<std::collections::HashMap<String, String>>,
+    /// An ORDERED map, keyed as the stored attribute map keys it: the entries are serialized
+    /// in that one order, where a `HashMap` of them would serialize the same stored mapping
+    /// in a different order on every call.
+    pub principal_tags: Option<std::collections::BTreeMap<String, String>>,
 }
 
