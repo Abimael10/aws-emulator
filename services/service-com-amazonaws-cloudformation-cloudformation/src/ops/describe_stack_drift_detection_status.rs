@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there are no detection results to read, so
@@ -205,17 +205,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             timestamp: crate::state::timestamp(detection.initiated_at),
         };
         // The settle above is what concluded this detection, and that status change owes the
-        // account's default event bus one event
-        // ([`crate::state::drift_events`]) — this read publishes what the clock had already
-        // made due, and states nothing of its own. The store's lock is RELEASED first: the
-        // work that publishes takes it itself, and this service's lock is not reentrant.
-        let region = detection.region.clone();
-        drop(store);
-        crate::state::drift_events::publish_pending(
-            ::std::sync::Arc::clone(&self.engine),
-            ctx.callback().clone(),
-            region,
-        );
+        // account's default event bus one event ([`crate::state::drift_events`]). It is
+        // published before this read answers, by the one path every request of this service
+        // takes ([`crate::service::query_error_envelope`]) — so a client that gates on the
+        // event and one that polls this detection cannot disagree about a conclusion this
+        // call has already recorded; this read publishes what the clock had already made
+        // due, and states nothing of its own.
         Ok(answered)
     }
 }

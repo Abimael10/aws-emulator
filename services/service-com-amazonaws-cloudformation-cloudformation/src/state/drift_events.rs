@@ -38,10 +38,15 @@
 //!
 //! Publishing is a call to ANOTHER service, which cannot be made where the change is
 //! recorded: that is under this store's lock. So each change is queued on the detection it
-//! belongs to and [`publish_pending`] is what makes the call, on a task of its own, exactly
-//! as the sibling publisher [`super::stack_set_events`] does for a stack set's changes —
-//! it CLAIMS every event the detections of a Region owe and publishes what it claimed.
-//! Claiming is TAKING, so an event is published exactly once however many callers drive it.
+//! belongs to and [`publish_pending`] is what makes the call, exactly as the sibling
+//! publisher [`super::stack_set_events`] does for a stack set's changes — it CLAIMS every
+//! event the detections of a Region owe under one lock, releases it and publishes what it
+//! claimed. Claiming is TAKING, so an event is published exactly once however many callers
+//! drive it.
+//!
+//! A change a call has already RECORDED is published BY that call, awaited before it answers,
+//! and never handed to a background task: a publication left to a task is one a full task
+//! pool would drop, and no later read re-queues an event that was never published.
 //!
 //! A detection's conclusion falls due after the call that started it has answered, and a
 //! client driven by these events never calls again — so that call also starts
@@ -175,77 +180,45 @@ impl super::StoredDriftDetection {
 }
 
 impl super::ComAmazonawsCloudformationCloudformationState {
-    /// Take every event the drift detections of `region` owe, in the order the statuses were
-    /// reached.
+    /// Take every event the drift detections of this store owe, in the order the statuses
+    /// were reached, each carrying the Region it is published in.
     ///
     /// Claiming is TAKING: an event leaves the queue as it is claimed, so each one is
     /// published once however many callers drive [`publish_pending`].
-    pub fn claim_drift_events(&mut self, region: &str) -> Vec<DriftDetectionEvent> {
+    pub fn claim_drift_events(&mut self) -> Vec<DriftDetectionEvent> {
         let mut claimed: Vec<DriftDetectionEvent> = Vec::new();
-        for detection in self
-            .drift_detections
-            .iter_mut()
-            .filter(|detection| detection.region == region)
-        {
+        for detection in &mut self.drift_detections {
             claimed.append(&mut detection.pending_events);
         }
         claimed
     }
 }
 
-/// Publish every event the drift detections of `region` owe, on a task of its own.
+/// Publish every event the drift detections of this store owe, each onto the default bus of
+/// the Region its change happened in, and answer once they are published.
 ///
-/// Called by the operation that queued them, which may still hold this store's lock: the
-/// publication has to CLAIM what it publishes, which needs that lock, and it then reaches
-/// EventBridge's own handler, which matches the event against the account's rules and
-/// delivers it to their targets — a target that calls back into this service would deadlock
-/// against the very call the event set off. So the publication is taken on a task, which
-/// takes the lock once the call that queued the events has answered and holds none of its
-/// own while it publishes.
+/// Called with this store's lock RELEASED: the publication CLAIMS what it publishes, which
+/// needs that lock, and it then reaches EventBridge's own handler, which matches the event
+/// against the account's rules and delivers it to their targets — so the claim takes the
+/// lock itself and holds none of it while it publishes, and a target that calls back into
+/// this service finds the lock free.
+///
+/// Awaited by the call that recorded the change rather than handed to a task, for the reason
+/// the sibling publisher states ([`super::stack_set_events::publish_pending`]): a change
+/// this store has already recorded is owed the bus, and a publication a full task pool
+/// skipped is one nothing afterwards would ever make.
 ///
 /// Claiming is TAKING, so an event is published exactly once however many callers drive
-/// this. The task takes one of the slots this service's event tasks share and gives it back
-/// however it ends; a call that finds none free publishes nothing, and the events it queued
-/// are published by the next call that does.
-pub fn publish_pending<Eng: Send + Sync + 'static>(
-    engine: Arc<Eng>,
-    callback: EmbeddedEmulator,
-    region: String,
-) {
-    if super::service_state(&*engine).is_none() {
-        return;
-    }
-    let Some(slot) = TaskSlot::claim() else {
-        ::tracing::warn!(
-            "{MAX_TASKS_IN_FLIGHT} CloudFormation event tasks are already in flight; these \
-             drift detection events will be published by the next call that drains them"
-        );
-        return;
-    };
-    ::tokio::spawn(async move {
-        let _slot = slot;
-        let claimed = match super::service_state(&*engine) {
-            None => Vec::new(),
-            Some(state) => state.lock().claim_drift_events(&region),
-        };
-        publish(&callback, &region, &claimed).await;
-    });
-}
-
-/// Publish what the detection `settling` names owes and settle its conclusion when it comes
-/// due: what the call that STARTS a drift detection owes this bus, in one call, so no
-/// handler states half of it.
-pub fn publish_and_settle<Eng: Send + Sync + 'static>(
-    engine: &Arc<Eng>,
+/// this.
+pub async fn publish_pending<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     callback: &EmbeddedEmulator,
-    settling: SettlingDetection,
 ) {
-    publish_pending(
-        Arc::clone(engine),
-        callback.clone(),
-        settling.region.clone(),
-    );
-    settle_when_due(Arc::clone(engine), callback.clone(), settling);
+    let claimed = match super::service_state(engine) {
+        None => return,
+        Some(state) => state.lock().claim_drift_events(),
+    };
+    publish(callback, &claimed).await;
 }
 
 /// WHICH detection one [`settle_when_due`] task waits for.
@@ -308,10 +281,10 @@ pub fn settle_when_due<Eng: Send + Sync + 'static>(
                 Some(state) => {
                     let mut store = state.lock();
                     store.settle(SystemTime::now());
-                    store.claim_drift_events(&settling.region)
+                    store.claim_drift_events()
                 }
             };
-            publish(&callback, &settling.region, &claimed).await;
+            publish(&callback, &claimed).await;
         }
     });
 }
@@ -328,8 +301,27 @@ fn conclusion_due<Eng: Send + Sync + 'static>(
     Some(pending.due_at)
 }
 
+/// Publish `events`, each onto the default bus of the Region its change happened in.
+async fn publish(callback: &EmbeddedEmulator, events: &[DriftDetectionEvent]) {
+    let mut by_region: ::std::collections::BTreeMap<&str, Vec<&DriftDetectionEvent>> =
+        ::std::collections::BTreeMap::new();
+    for event in events {
+        by_region
+            .entry(event.region.as_str())
+            .or_default()
+            .push(event);
+    }
+    for (region, owed) in by_region {
+        publish_in(callback, region, &owed).await;
+    }
+}
+
 /// Publish `events` onto the default bus of `region`.
-async fn publish(callback: &EmbeddedEmulator, region: &str, events: &[DriftDetectionEvent]) {
+async fn publish_in(
+    callback: &EmbeddedEmulator,
+    region: &str,
+    events: &[&DriftDetectionEvent],
+) {
     if events.is_empty() {
         return;
     }

@@ -33,18 +33,23 @@
 //! Publishing is a call to ANOTHER service, which cannot be made where the change is
 //! recorded — that is under this store's lock. So each change is queued on the stack set it
 //! belongs to and [`publish_pending`] is what makes the call: it CLAIMS every event the
-//! stack sets of a Region owe and publishes what it claimed, on a task of its own, since the
-//! operation that queued them still holds the lock the claim needs — the same shape
-//! [`super::stack_notifications`] uses for the other notification a change of this store
-//! owes. Claiming is TAKING, so an event is published exactly once however many callers
-//! drive it.
+//! stack sets of a Region owe under one lock, RELEASES it and publishes what it claimed —
+//! the same shape the sibling publishers of this store use for the other fan-outs a change
+//! of it owes ([`super::stack_status_events::deliver`],
+//! [`super::stack_notifications::deliver`]). Claiming is TAKING, so an event is published
+//! exactly once however many callers drive it.
+//!
+//! A change a call has already RECORDED is published BY that call, awaited before it answers,
+//! and never handed to a background task: the publication of a recorded change is not
+//! optional work, so it cannot be skipped because a bounded pool of tasks happens to be
+//! full — a change published by nobody is one a client listening on the bus never learns of,
+//! whatever it polls afterwards.
 //!
 //! A conclusion the clock owes falls due after the call that started the operation has
 //! answered, and a client driven by these events never calls again — so the operation that
 //! starts one also starts [`settle_when_due`], which materialises exactly the transition
 //! the clock has made due, through the same one settle path a status read uses, and
-//! publishes what that settled. The work both of those start is bounded
-//! ([`MAX_TASKS_IN_FLIGHT`]).
+//! publishes what that settled. That task's work is bounded ([`MAX_TASKS_IN_FLIGHT`]).
 //!
 //! Publication is BEST EFFORT: an emulator with no EventBridge mounted has nowhere to
 //! publish, and no caller is failed because the fan-out could not be made.
@@ -94,15 +99,16 @@ pub(super) const MAX_PUT_EVENTS_ENTRIES: usize = 10;
 pub const MAX_PENDING_EVENTS: usize = 512;
 
 /// How many tasks THIS SERVICE's event publishers may have outstanding at once across this
-/// process — the publications [`publish_pending`] starts and the settles
-/// [`settle_when_due`] does, here and in the sibling publisher ([`super::drift_events`]),
-/// which takes its slots from the same count.
+/// process — the settles [`settle_when_due`] does, here and in the sibling publisher
+/// ([`super::drift_events`]), which takes its slots from the same count, and the progress
+/// [`super::stack_progress`] carries.
 ///
 /// THIS CEILING IS THE EMULATOR'S: each task is one timer, one claim and one `PutEvents`,
 /// and a stream of calls must not leave unbounded work outstanding. A call that
-/// finds no slot free starts no task — its events stay on the (bounded) queue for the next
-/// publication, and its conclusion is settled by the next read of it, exactly as it was
-/// before this existed.
+/// finds no slot free starts no task — the conclusion the clock owes its operation is
+/// settled by the next read of it, exactly as it was before this existed. Nothing a call has
+/// already RECORDED waits on a slot: that publication is the call's own
+/// ([`publish_pending`]).
 pub(super) const MAX_TASKS_IN_FLIGHT: usize = 64;
 
 /// How long after the conclusion fell due [`settle_when_due`] settles it: enough that the
@@ -249,63 +255,53 @@ pub struct StackSetEvent {
     pub at: SystemTime,
 }
 
-/// Publish every event the stack sets of `region` owe, on a task of its own.
+/// Publish every event the stack sets of this store owe, each onto the default bus of the
+/// Region its change happened in, and answer once they are published.
 ///
-/// Called by the operation that queued them, which still holds this store's lock: the
-/// publication has to CLAIM what it publishes, which needs that lock, and it then reaches
-/// EventBridge's own handler, which matches the event against the account's rules and
-/// delivers it to their targets — a target that calls back into this service would deadlock
-/// against the very call the event set off. So the publication is taken on a task, which
-/// takes the lock once the call that queued the events has answered and holds none of its
-/// own while it publishes.
+/// Called with this store's lock RELEASED: the publication CLAIMS what it publishes, which
+/// needs that lock, and it then reaches EventBridge's own handler, which matches the event
+/// against the account's rules and delivers it to their targets — so the claim takes the
+/// lock itself and holds none of it while it publishes, and a target that calls back into
+/// this service finds the lock free.
+///
+/// Awaited by the call that recorded the change rather than handed to a task, because a
+/// change this store has already recorded is owed the bus: a publication left to a task is
+/// one a full task pool would drop, and nothing afterwards would ever make it — a reader can
+/// materialise a transition the clock owes, but no read re-queues an event that was never
+/// published. It takes what every Region owes rather than one Region's, because a settle is
+/// over the whole store: the call that materialises a transition is not always signed for
+/// the Region the record it concluded belongs to.
 ///
 /// Claiming is TAKING, so an event is published exactly once however many callers drive
-/// this. The task takes one of [`MAX_TASKS_IN_FLIGHT`] slots and gives it back however it
-/// ends; a call that finds none free publishes nothing, and the events it queued are
-/// published by the next call that does.
-pub fn publish_pending<Eng: Send + Sync + 'static>(
-    engine: Arc<Eng>,
-    callback: EmbeddedEmulator,
-    region: String,
+/// this.
+pub async fn publish_pending<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    callback: &EmbeddedEmulator,
 ) {
-    if super::service_state(&*engine).is_none() {
-        return;
-    }
-    let Some(slot) = TaskSlot::claim() else {
-        ::tracing::warn!(
-            "{MAX_TASKS_IN_FLIGHT} StackSet event tasks are already in flight; these events \
-             will be published by the next StackSet call"
-        );
-        return;
+    let claimed = match super::service_state(engine) {
+        None => return,
+        Some(state) => state.lock().claim_stack_set_events(),
     };
-    ::tokio::spawn(async move {
-        let _slot = slot;
-        let claimed = match super::service_state(&*engine) {
-            None => Vec::new(),
-            Some(state) => state.lock().claim_stack_set_events(&region),
-        };
-        publish(&callback, &region, &claimed).await;
-    });
+    publish(callback, &claimed).await;
 }
 
-/// Publish what the stack set of `settling` owes and settle that operation's conclusion when
-/// it comes due: what every call that STARTS a stack-set operation owes this bus, in one
-/// call, so no handler states half of it.
-pub fn publish_and_settle<Eng: Send + Sync + 'static>(
-    engine: &Arc<Eng>,
-    callback: &EmbeddedEmulator,
-    settling: SettlingOperation,
-) {
-    publish_pending(
-        Arc::clone(engine),
-        callback.clone(),
-        settling.region.clone(),
-    );
-    settle_when_due(Arc::clone(engine), callback.clone(), settling);
+/// Publish `events`, each onto the default bus of the Region its change happened in.
+async fn publish(callback: &EmbeddedEmulator, events: &[StackSetEvent]) {
+    let mut by_region: ::std::collections::BTreeMap<&str, Vec<&StackSetEvent>> =
+        ::std::collections::BTreeMap::new();
+    for event in events {
+        by_region
+            .entry(event.region.as_str())
+            .or_default()
+            .push(event);
+    }
+    for (region, owed) in by_region {
+        publish_in(callback, region, &owed).await;
+    }
 }
 
 /// Publish `events` onto the default bus of `region`.
-async fn publish(callback: &EmbeddedEmulator, region: &str, events: &[StackSetEvent]) {
+async fn publish_in(callback: &EmbeddedEmulator, region: &str, events: &[&StackSetEvent]) {
     if events.is_empty() {
         return;
     }
@@ -406,10 +402,10 @@ pub fn settle_when_due<Eng: Send + Sync + 'static>(
                 Some(state) => {
                     let mut store = state.lock();
                     store.settle(SystemTime::now());
-                    store.claim_stack_set_events(&settling.region)
+                    store.claim_stack_set_events()
                 }
             };
-            publish(&callback, &settling.region, &claimed).await;
+            publish(&callback, &claimed).await;
         }
     });
 }
@@ -468,17 +464,14 @@ fn epoch_millis(at: SystemTime) -> i64 {
 }
 
 impl super::ComAmazonawsCloudformationCloudformationState {
-    /// Take every event the stack sets of `region` owe, in the order the changes happened.
+    /// Take every event the stack sets of this store owe, in the order the changes happened,
+    /// each carrying the Region it is published in.
     ///
     /// Claiming is TAKING: an event leaves the queue as it is claimed, so each one is
     /// published once however many callers drive [`publish_pending`].
-    pub fn claim_stack_set_events(&mut self, region: &str) -> Vec<StackSetEvent> {
+    pub fn claim_stack_set_events(&mut self) -> Vec<StackSetEvent> {
         let mut claimed: Vec<StackSetEvent> = Vec::new();
-        for stack_set in self
-            .stack_sets
-            .iter_mut()
-            .filter(|stack_set| stack_set.region == region)
-        {
+        for stack_set in &mut self.stack_sets {
             claimed.append(&mut stack_set.pending_events);
         }
         claimed

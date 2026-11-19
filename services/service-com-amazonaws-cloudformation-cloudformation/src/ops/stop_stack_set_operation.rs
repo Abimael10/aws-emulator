@@ -274,12 +274,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         );
         let stack_set_id = stack_set.stack_set_id.clone();
-        // The store's lock is RELEASED before the publication and the settle below: both
-        // take it themselves, and this service's lock is not reentrant.
+        // The store's lock is RELEASED before the settle below: it takes the lock itself, and
+        // this service's lock is not reentrant. The STOPPING status this call has recorded is
+        // published before this request answers, by the one path every request of this
+        // service takes ([`crate::service::query_error_envelope`]).
         drop(store);
-        crate::state::stack_set_events::publish_and_settle(
-            &self.engine,
-            ctx.callback(),
+        crate::state::stack_set_events::settle_when_due(
+            ::std::sync::Arc::clone(&self.engine),
+            ctx.callback().clone(),
             crate::state::stack_set_events::SettlingOperation {
                 region,
                 stack_set_id,

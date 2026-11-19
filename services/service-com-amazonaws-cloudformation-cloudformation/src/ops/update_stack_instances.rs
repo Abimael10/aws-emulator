@@ -868,12 +868,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // What this operation owes the account's default event bus: the Operation Status
-        // Change its START is, published here, and the conclusion the clock has made due by
-        // the time the settle below runs ([`crate::state::stack_set_events`]) — so a client
-        // gating on these events, which never polls, observes the update finish.
-        crate::state::stack_set_events::publish_and_settle(
-            &self.engine,
-            ctx.callback(),
+        // Change its START is, published before this request answers by the one path every
+        // request of this service takes ([`crate::service::query_error_envelope`]), and the
+        // conclusion the clock has made due by the time the settle below runs
+        // ([`crate::state::stack_set_events`]) — so a client gating on these events, which
+        // never polls, observes the update finish.
+        crate::state::stack_set_events::settle_when_due(
+            ::std::sync::Arc::clone(&self.engine),
+            ctx.callback().clone(),
             crate::state::stack_set_events::SettlingOperation {
                 region: region.clone(),
                 stack_set_id,

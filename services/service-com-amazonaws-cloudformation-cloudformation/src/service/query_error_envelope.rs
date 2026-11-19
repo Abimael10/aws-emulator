@@ -36,6 +36,16 @@
 //! ([`service_common::query_error_envelope::reported_request_id`], which the audit wrapper
 //! inside this one has already named every response it answers by), and a minted one only
 //! where no layer named it.
+//!
+//! [`RequestIdEnvelopeOperation`] carries two duties that are not about the envelope at all,
+//! for one reason: it is the ONE path every request of this service takes, and it holds no
+//! lock of this service's store. Both are things a REQUEST owes that no single handler can
+//! be relied on to do — concluding a resource-signal wait whose timeout has run out, whose
+//! rollback reaches the services that own the stack's resources
+//! ([`crate::state::provisioning::settle_expired_wait_failures`]), and publishing the status
+//! changes the request recorded onto the account's default event bus
+//! ([`crate::state::stack_set_events::publish_pending`]). Each is stated at its call below,
+//! and neither decides anything about the response.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_types::body::SdkBody;
@@ -175,11 +185,14 @@ pub struct RequestIdEnvelopeOperation<Eng: Send + Sync + 'static> {
 }
 
 impl<Eng: Send + Sync + 'static> RequestIdEnvelopeOperation<Eng> {
-    /// Build the wrapper from the shared engine — which it holds for one reason: it is the
+    /// Build the wrapper from the shared engine — which it holds for two reasons: it is the
     /// ONE place every request of this service passes through, so the transitions the CLOCK
     /// has made due whose conclusion needs calls into other services are concluded here,
     /// once, rather than by each handler
-    /// ([`crate::state::provisioning::settle_expired_wait_failures`]).
+    /// ([`crate::state::provisioning::settle_expired_wait_failures`]), and the status
+    /// changes a request RECORDED are published onto the account's default event bus from
+    /// here, once, before that request answers
+    /// ([`crate::state::stack_set_events::publish_pending`]).
     pub fn new(engine: std::sync::Arc<Eng>) -> Self {
         Self { engine }
     }
@@ -254,7 +267,27 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for RequestIdEnvelopeOperation<
                         &*self.engine,
                     )
                     .await;
-                    with_request_id(op.run(svc, req, ctx).await)
+                    let answered = op.run(svc, req, ctx).await;
+                    // Every status change the handler RECORDED — a stack set's, a stack-set
+                    // operation's, a stack instance's, a drift detection's — owes the
+                    // account's default event bus one event, and the publication is a call
+                    // to ANOTHER service, which cannot be made where the change is recorded:
+                    // that is under this store's lock. So it is made HERE, before this
+                    // request answers: this wrapper is the one path every request of this
+                    // service takes and it holds no lock of this store, so a change a call
+                    // has recorded is on the bus by the time that call is answered, whatever
+                    // else this emulator has in flight. The conclusion the CLOCK still owes
+                    // an operation nobody reads is a different matter, and the call that
+                    // started it waits for that one itself
+                    // ([`crate::state::stack_set_events::settle_when_due`]).
+                    crate::state::stack_set_events::publish_pending(
+                        &*self.engine,
+                        ctx.callback(),
+                    )
+                    .await;
+                    crate::state::drift_events::publish_pending(&*self.engine, ctx.callback())
+                        .await;
+                    with_request_id(answered)
                 }
                 // Unreachable through `Service::override_operation`, which claims a
                 // request only when the routing table holds its key; answered as the

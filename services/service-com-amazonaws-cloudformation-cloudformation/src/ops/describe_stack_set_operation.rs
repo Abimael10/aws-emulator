@@ -243,14 +243,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // The settle above is what moved this operation to its terminal status, and that
         // change owes the account's default event bus an Operation Status Change
-        // ([`crate::state::stack_set_events`]). The store's lock is RELEASED first: the work
-        // that publishes takes it itself, and this service's lock is not reentrant.
-        drop(store);
-        crate::state::stack_set_events::publish_pending(
-            ::std::sync::Arc::clone(&self.engine),
-            ctx.callback().clone(),
-            region,
-        );
+        // ([`crate::state::stack_set_events`]). It is published before this read answers, by
+        // the one path every request of this service takes
+        // ([`crate::service::query_error_envelope`]) — so a client that gates on the event
+        // and one that polls this operation cannot disagree about a conclusion this call has
+        // already recorded. Publishing is a call to another service, which cannot be made
+        // under this store's lock, and this read holds it until it has answered.
         Ok(answered)
     }
 }

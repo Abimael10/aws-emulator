@@ -213,16 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         stack_set.status = status::DELETED.to_string();
         // That status is a change of the stack set, so it is published onto the account's
         // default event bus the way every other change of one is
-        // ([`crate::state::stack_set_events`]), stamped with the instant this call wrote it.
+        // ([`crate::state::stack_set_events`]), stamped with the instant this call wrote it:
+        // QUEUED here, where the status is written, and published before this request
+        // answers by the one path every request of this service takes
+        // ([`crate::service::query_error_envelope`]).
         stack_set.note_status_change(now);
-        // The store's lock is RELEASED before the publication below: the work that publishes
-        // takes it itself, and this service's lock is not reentrant.
-        drop(store);
-        crate::state::stack_set_events::publish_pending(
-            ::std::sync::Arc::clone(&self.engine),
-            ctx.callback().clone(),
-            region,
-        );
 
         // `DeleteStackSetOutput` models no member: the deletion is immediate, so there is no
         // StackSet operation for a caller to monitor.

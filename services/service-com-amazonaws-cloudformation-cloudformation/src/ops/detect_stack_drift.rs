@@ -237,17 +237,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // detection reaches is published onto the account's default event bus
             // ([`crate::state::drift_events`]) — so a client that reacts to drift through a
             // rule on that bus, and never polls, observes the detection start. Queued here,
-            // where the status is written; published below, with this store's lock released.
+            // where the status is written; published below, with this store's lock released
+            // and BEFORE the comparison this call then performs, so the start reaches the
+            // bus while the detection it reports is still running.
             if let Some(detection) = store.drift_detection_mut(&detection_id) {
                 detection.queue_event(now);
             }
             (stack_id, stack_region, resources)
         };
-        crate::state::drift_events::publish_pending(
-            ::std::sync::Arc::clone(&self.engine),
-            ctx.callback().clone(),
-            stack_region.clone(),
-        );
+        crate::state::drift_events::publish_pending(&*self.engine, ctx.callback()).await;
 
         // The comparison itself: one read per covered resource, from the service that owns
         // it, in the stack's own Region — where its resources live.
@@ -286,12 +284,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // What this detection still owes the default event bus: the conclusion the clock has
         // made due by the time the settle below runs, published for the client that gates on
-        // these events and never polls. The store's lock is RELEASED first: the work that
-        // publishes and settles takes it itself, and this service's lock is not reentrant.
+        // these events and never polls. The status this call has ALREADY recorded is
+        // published before this request answers, by the one path every request of this
+        // service takes ([`crate::service::query_error_envelope`]).
         drop(store);
-        crate::state::drift_events::publish_and_settle(
-            &self.engine,
-            ctx.callback(),
+        crate::state::drift_events::settle_when_due(
+            ::std::sync::Arc::clone(&self.engine),
+            ctx.callback().clone(),
             crate::state::drift_events::SettlingDetection {
                 region: stack_region,
                 detection_id: detection_id.clone(),
