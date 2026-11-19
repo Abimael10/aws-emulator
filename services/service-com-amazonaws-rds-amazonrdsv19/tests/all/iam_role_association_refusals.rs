@@ -47,6 +47,8 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_rds_amazonrdsv19::state as st;
+
 use crate::db_instances::{call, expect_error, expect_ok, subtrees, text, REGION};
 use crate::lifecycle_poll_loops::poll_until;
 use crate::rds_s3_integration::{
@@ -232,7 +234,12 @@ async fn a_role_arn_outside_the_iam_role_form_is_refused_for_its_form() {
     let (router, _engine) = emulator();
     let identifier = "emu-role-arn-form";
     available_instance(&router, identifier, "postgres", "db.t3.micro", 20).await;
-
+    // The role the WELL-FORMED rows name, created in the IAM mounted beside this service and
+    // trusting the principal Amazon RDS acts under: the role gate the association takes next
+    // resolves the value against that service, so a row that is here to pass the FORM gate has
+    // to name a role IAM really holds. IAM holds one role per name whatever case it is written
+    // in, which is why the row naming it in another case needs no second role.
+    role(&router, "emu-rds-role", st::RDS_SERVICE_PRINCIPAL, None).await;
     for row in ROLE_ARN_ROWS {
         let request = params(&[
             ("DBInstanceIdentifier", identifier),
@@ -723,12 +730,9 @@ async fn cluster_role_call(
 /// One row of the quota table: the role an association names and the feature it names it for.
 struct QuotaRow {
     case: &'static str,
-    /// Whether the `RoleArn` names a role this emulator's IAM HOLDS, created trusting
-    /// `rds.amazonaws.com`. An association does not require the role to exist — only a role
-    /// IAM holds whose trust policy excludes Amazon RDS is refused (rule 5) — so both sides
-    /// of that are rows, and both count against the quota.
-    held_by_iam: bool,
-    /// The role NAME, which the created role and the un-held ARN alike carry.
+    /// The role NAME, created in IAM trusting `rds.amazonaws.com`: an association names a
+    /// role Amazon RDS can take on, which is the gate the association is taken past first
+    /// (rule 5), so every row of the quota table names such a role.
     name: &'static str,
     /// The `FeatureName` the association names, or `None` for the cluster-wide association
     /// that names no feature.
@@ -737,59 +741,47 @@ struct QuotaRow {
 
 /// The quota table: [`ROLES_PER_CLUSTER`] associations that FIT, then one PAST the bound.
 ///
-/// The rows differ along what the rule generalises over — a role IAM holds and an ARN it
-/// holds nothing under, four of the engine's published feature names and an association that
-/// names none — because the quota counts the associations a cluster holds whatever they name.
+/// The rows differ along what the rule generalises over — five of the engine's published
+/// feature names and an association that names none — because the quota counts the
+/// associations a cluster holds whatever they name.
 const QUOTA_ROWS: &[QuotaRow] = &[
     QuotaRow {
         case: "a role IAM holds, for the Bedrock feature",
-        held_by_iam: true,
         name: "emu-quota-bedrock",
         feature: Some("Bedrock"),
     },
     QuotaRow {
         case: "a role IAM holds, associated with the cluster itself",
-        held_by_iam: true,
         name: "emu-quota-cluster-wide",
         feature: None,
     },
     QuotaRow {
-        case: "an ARN IAM holds nothing under, for the S3 import feature",
-        held_by_iam: false,
-        name: "emu-quota-absent-import",
+        case: "a role IAM holds, for the S3 import feature",
+        name: "emu-quota-import",
         feature: Some("s3Import"),
     },
     QuotaRow {
-        case: "an ARN IAM holds nothing under, for the S3 export feature",
-        held_by_iam: false,
-        name: "emu-quota-absent-export",
+        case: "a role IAM holds, for the S3 export feature",
+        name: "emu-quota-export",
         feature: Some("s3Export"),
     },
     QuotaRow {
         case: "a role IAM holds, for the SageMaker feature",
-        held_by_iam: true,
         name: "emu-quota-sagemaker",
         feature: Some("SageMaker"),
     },
     QuotaRow {
         case: "one association past the published quota, for the Comprehend feature",
-        held_by_iam: true,
         name: "emu-quota-comprehend",
         feature: Some("Comprehend"),
     },
 ];
 
-/// The `RoleArn` each quota row names, creating the role in IAM where the row says the value
-/// names a role IAM holds.
+/// The `RoleArn` each quota row names, created in the IAM mounted beside this service.
 async fn quota_role_arns(router: &MultiServiceRouter) -> Vec<String> {
     let mut arns = Vec::with_capacity(QUOTA_ROWS.len());
     for row in QUOTA_ROWS {
-        let arn = if row.held_by_iam {
-            role(router, row.name, "rds.amazonaws.com", None).await
-        } else {
-            format!("arn:aws:iam::{ACCOUNT}:role/{}", row.name)
-        };
-        arns.push(arn);
+        arns.push(role(router, row.name, st::RDS_SERVICE_PRINCIPAL, None).await);
     }
     arns
 }

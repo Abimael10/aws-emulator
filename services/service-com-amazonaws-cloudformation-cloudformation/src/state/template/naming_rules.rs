@@ -261,9 +261,13 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // states "from 1 to 255 letters or numbers") and
         // `CreateDBSubnetGroup.DBSubnetGroupName` ("Must contain no more than 255 letters,
         // numbers, periods, underscores, spaces, or hyphens", "First character must be a
-        // letter") — RDS's model carries no `@length` for any of the three.
+        // letter") and `CreateOptionGroup.OptionGroupName` ("Must be 1 to 255 letters,
+        // digits, or hyphens", "First character must be a letter", "Can't end with a hyphen
+        // or contain two consecutive hyphens") — RDS's model carries no `@length` for any of
+        // them.
         "AWS::RDS::DBParameterGroup"
         | "AWS::RDS::DBClusterParameterGroup"
+        | crate::state::provisioner::rds_option_groups::RDS_OPTION_GROUP
         | "AWS::RDS::DBSubnetGroup" => rules(255, Characters::LowercaseAlphanumeric),
         // Amazon RDS `CreateDBProxy.DBProxyName`: `@length(min: 1, max: 63)` with pattern
         // `^[a-zA-Z](?:-?[a-zA-Z0-9]+)*$` (`smithy_query(query="operation",

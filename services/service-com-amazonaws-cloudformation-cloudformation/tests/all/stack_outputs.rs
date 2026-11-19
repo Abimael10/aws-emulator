@@ -1063,28 +1063,33 @@ fn output_cases() -> Vec<OutputCase> {
                     },
                 ),
                 (
+                    // The cluster's engine is one this emulator SERVES a native wire for, so
+                    // Amazon RDS publishes the host its own engine listener is bound to and
+                    // the stack's output carries that — the address a client dials, exactly as
+                    // the served DB instance row below does.
                     "ClusterEndpoint",
                     Expected::Form {
-                        described: "the Aurora cluster endpoint DNS name",
-                        check: |value| {
-                            is_rds_endpoint(value, "probe-app-cluster", ".cluster-")
-                        },
+                        described: "the loopback host the cluster's engine listener is bound \
+                                    to",
+                        check: |value| value == "127.0.0.1",
                     },
                 ),
                 (
                     "ClusterReaderEndpoint",
                     Expected::Form {
-                        described: "the Aurora reader endpoint DNS name",
-                        check: |value| {
-                            is_rds_endpoint(value, "probe-app-cluster", ".cluster-ro-")
-                        },
+                        described: "the loopback host the cluster's reader endpoint is served \
+                                    on",
+                        check: |value| value == "127.0.0.1",
                     },
                 ),
                 (
-                    // The engine's documented default port, since the template declares
-                    // none: "RDS for PostgreSQL - 5432".
+                    // And the port that listener was assigned, which is the port the cluster
+                    // publishes beside that host.
                     "ClusterPort",
-                    Expected::Value("5432".to_string()),
+                    Expected::Form {
+                        described: "the port that engine listener was assigned",
+                        check: |value| value.parse::<u16>().is_ok_and(|port| port > 0),
+                    },
                 ),
             ],
         },
@@ -1203,10 +1208,13 @@ fn output_cases() -> Vec<OutputCase> {
         OutputCase {
             // The port and the engine of a DB resource are what the TEMPLATE declares, and
             // a template declares them with an intrinsic as readily as with a literal: this
-            // row takes both from parameters, so `Endpoint.Port` can only be right if the
-            // declared properties were evaluated. Both resources of this row are DB
-            // CLUSTERS, which this emulator PROVISIONS in Amazon RDS, so each declaration
-            // has to be one that service accepts.
+            // row takes both from parameters, and neither cluster could have been created at
+            // all had the engine not resolved — `Engine` is required on `CreateDBCluster` — so
+            // reaching an endpoint port for each is what shows the declared properties were
+            // evaluated. The engine is one this emulator SERVES, so the port each output
+            // carries is the one that cluster's own engine listener was assigned, which is
+            // what Amazon RDS publishes beside the host (the declared `Port` is recorded by
+            // that service, whose own suite pins it).
             case: "a db port and engine declared through intrinsics",
             stack_name: "db-intrinsics",
             template: concat!(
@@ -1241,11 +1249,20 @@ fn output_cases() -> Vec<OutputCase> {
             .to_string(),
             parameters: params(&[("DBPort", "15432"), ("EngineName", "aurora-postgresql")]),
             expected: vec![
-                // The port the template declared, through a parameter.
-                ("FixedPort", Expected::Value("15432".to_string())),
-                // No port declared: the default of the engine the parameter named, which
-                // is only reachable if the engine itself resolved.
-                ("DefaultPort", Expected::Value("5432".to_string())),
+                (
+                    "FixedPort",
+                    Expected::Form {
+                        described: "the port the cluster's engine listener was assigned",
+                        check: |value| value.parse::<u16>().is_ok_and(|port| port > 0),
+                    },
+                ),
+                (
+                    "DefaultPort",
+                    Expected::Form {
+                        described: "the port the cluster's engine listener was assigned",
+                        check: |value| value.parse::<u16>().is_ok_and(|port| port > 0),
+                    },
+                ),
             ],
         },
         OutputCase {
@@ -1343,6 +1360,98 @@ async fn declared_outputs_are_evaluated_and_reported_by_describe_stacks() {
                 }
             }
         }
+    }
+}
+
+/// Rule: the endpoint a stack publishes for a DB resource is the one Amazon RDS published for
+/// it — so the output is CROSS-CHECKED against that service's own answer rather than against a
+/// form, which is also what shows the declared `Port` intrinsic was evaluated: a cluster whose
+/// `Engine` and `Port` resolved to nothing is a cluster Amazon RDS refuses to create, so there
+/// would be no endpoint to compare.
+///
+/// The rows above read the same two attributes for their own purpose (every declared output is
+/// reported); this is the comparison that can only hold for the published value.
+#[tokio::test]
+async fn a_db_clusters_published_endpoint_is_the_one_amazon_rds_reports() {
+    const STACK: &str = "db-endpoint-cross-checked";
+    const IDENTIFIER: &str = "probe-cross-checked";
+    let router = router();
+    let template = concat!(
+        "Parameters:\n",
+        "  DBPort:\n",
+        "    Type: String\n",
+        "Resources:\n",
+        "  Cluster:\n",
+        "    Type: AWS::RDS::DBCluster\n",
+        "    Properties:\n",
+        "      DBClusterIdentifier: probe-cross-checked\n",
+        "      Engine: aurora-postgresql\n",
+        "      Port: !Ref DBPort\n",
+        "Outputs:\n",
+        "  Address:\n",
+        "    Value: !GetAtt Cluster.Endpoint.Address\n",
+        "  Port:\n",
+        "    Value: !GetAtt Cluster.Endpoint.Port\n",
+        "  ReaderAddress:\n",
+        "    Value: !GetAtt Cluster.ReadEndpoint.Address\n",
+    )
+    .to_string();
+    let (status_code, body) = create_stack(
+        &router,
+        STACK,
+        &template,
+        &acknowledging_iam(&params(&[("DBPort", "15432")])),
+    )
+    .await;
+    assert_eq!(
+        status_code, 200,
+        "expected CreateStack to succeed, got {status_code} {body}"
+    );
+    wait_for_the_transition().await;
+    let (status_code, body) = describe_stack(&router, STACK).await;
+    assert_eq!(
+        status_code, 200,
+        "expected DescribeStacks to succeed, got {status_code} {body}"
+    );
+    assert!(
+        body.contains("<StackStatus>CREATE_COMPLETE</StackStatus>"),
+        "the stack must have reached CREATE_COMPLETE, got {body}"
+    );
+    let outputs = wire_outputs(&body);
+
+    // What the OWNING service publishes for the cluster, which is what each output has to
+    // carry: a DB cluster reports both of its endpoints and its port as members of its own
+    // structure.
+    let (status_code, cluster) = crate::stack_lifecycle::rds(
+        &router,
+        "DescribeDBClusters",
+        &[("DBClusterIdentifier", IDENTIFIER)],
+    )
+    .await;
+    assert_eq!(
+        status_code, 200,
+        "expected Amazon RDS to resolve {IDENTIFIER:?}, got {status_code} {cluster}"
+    );
+    for (key, member) in [
+        ("Address", "Endpoint"),
+        ("Port", "Port"),
+        ("ReaderAddress", "ReaderEndpoint"),
+    ] {
+        let published = element(&cluster, member).unwrap_or_default();
+        assert!(
+            !published.is_empty(),
+            "expected Amazon RDS to publish <{member}> for {IDENTIFIER:?}, got {cluster}"
+        );
+        let Some(output) = output_for(&outputs, key) else {
+            panic!("no Output with OutputKey {key:?}; got {outputs:?}");
+        };
+        assert_eq!(
+            output.value.as_deref(),
+            Some(published.as_str()),
+            "output {key:?} must carry the <{member}> Amazon RDS published ({published:?}), got \
+             {:?}",
+            output.value
+        );
     }
 }
 

@@ -20,7 +20,7 @@
 //! `CreateDBCluster` answers the cluster `creating`, in which it serves no connection, so
 //! the resource's creation is held open until Amazon RDS reports it `available`
 //! ([`db_cluster_readiness`]) and the endpoints the type publishes are read off it then
-//! ([`db_cluster_ready_attributes`]).
+//! ([`super::rds_published_endpoints::db_cluster_ready_attributes`]).
 
 use super::*;
 
@@ -198,7 +198,7 @@ pub(crate) const DB_CLUSTER_PROPERTIES_NOT_SENT: &[&str] = &[
 /// assign, and the whole point of provisioning the cluster is that the handles the stack
 /// publishes address the cluster RDS really holds. The ENDPOINTS are not read here — a
 /// cluster that is still `creating` publishes none it serves on — so they are read once RDS
-/// reports it up ([`db_cluster_ready_attributes`]).
+/// reports it up ([`super::rds_published_endpoints::db_cluster_ready_attributes`]).
 pub(crate) async fn create_db_cluster(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -330,18 +330,15 @@ pub(crate) async fn db_cluster_readiness(
     )))
 }
 
-// The endpoints `AWS::RDS::DBCluster` publishes are NOT read off the cluster, which is why
-// this type has no `ready_attributes` arm.
+// The endpoints `AWS::RDS::DBCluster` publishes are read off the CLUSTER once Amazon RDS
+// reports it available ([`super::rds_published_endpoints::db_cluster_ready_attributes`]).
 //
 // The type publishes the cluster endpoint (`Endpoint.Address`, `Endpoint.Port`) and the
-// reader endpoint (`ReadEndpoint.Address`) in the DNS forms Amazon RDS gives an Aurora
-// cluster — `<identifier>.cluster-<label>` and `<identifier>.cluster-ro-<label>` under the
-// regional suffix — which is what CloudFormation computes for the resource and what a stack
-// output of a real deployment carries. The ADDRESS this emulator's Amazon RDS publishes for
-// a cluster whose engine it serves is the host its own listener is bound to, so that a
-// client can actually connect; that is the data plane's answer, not the handle a stack
-// publishes, and overriding the computed attributes with it would make every template that
-// reads the cluster endpoint report a value of a different shape from the deployed one.
+// reader endpoint (`ReadEndpoint.Address`), and a client that reads one out of a stack
+// output CONNECTS to it — so what the stack publishes is the address the service that owns
+// the cluster really serves it on rather than a handle computed for the resource, which
+// would be a name nothing resolves and no database answers on. A cluster that is still
+// `creating` has no endpoint at all, which is why the create's answer carries none of them.
 //
 // What the create does read off the cluster is its IDENTITY — the ARN and the resource id
 // Amazon RDS assigned — which `create_db_cluster` re-points above.

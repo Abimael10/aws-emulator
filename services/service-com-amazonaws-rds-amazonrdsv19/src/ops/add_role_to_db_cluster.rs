@@ -231,32 +231,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `FeatureName` names "the feature for the DB cluster that the IAM role is to be
-        // associated with. For information about supported feature names, see
-        // DBEngineVersion": a value outside the `SupportedFeatureNames` of the engine
-        // version this cluster runs names no feature of it, which is the Query API's
-        // `InvalidParameterValue`. The member is optional, and a request that names no
-        // feature associates the role with the cluster itself, which no catalogue entry
-        // gates.
-        if let Some(feature_name) = &input.feature_name {
-            if !crate::state::feature_name_is_supported(
-                &engine,
-                engine_version.as_deref(),
-                feature_name,
-            ) {
-                return Err(AddRoleToDBClusterError::invalid_parameter_value(
-                    crate::state::unsupported_feature_name_message(&engine, feature_name),
-                ));
-            }
-        }
-
-        // The association lets the engine ACT under the role, so the role has to be one
-        // Amazon RDS can assume: a role this account's IAM holds whose trust policy does
-        // not grant `sts:AssumeRole` to `rds.amazonaws.com` is refused with
-        // `InvalidParameterValue`. A role IAM holds nothing under is not refused here — see
-        // `service_common::iam_role` for why that answer is about this store rather than
-        // about the role.
-        if ::service_common::iam_role::held_role_is_unassumable(
+        // THE ROLE comes before the feature: the association lets the engine ACT under the
+        // role, so a value that names no role Amazon RDS can take on cannot be associated
+        // for any feature, and it is refused for the role rather than for the feature name
+        // ([`crate::state::ROLE_NOT_TRUSTED_MESSAGE`] records the one sentence both
+        // conditions carry).
+        if ::service_common::iam_role::role_is_unassumable(
             ctx,
             &region,
             &input.role_arn,
@@ -267,6 +247,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(AddRoleToDBClusterError::invalid_parameter_value(
                 crate::state::ROLE_NOT_TRUSTED_MESSAGE,
             ));
+        }
+
+        // `FeatureName` names "the feature for the DB cluster that the IAM role is to be
+        // associated with. For information about supported feature names, see
+        // DBEngineVersion": a value outside the `SupportedFeatureNames` of the engine
+        // version this cluster runs names no feature of it, which is the Query API's
+        // `InvalidParameterValue`. The member is optional, and a request that names no
+        // feature associates the role with the cluster itself, which no catalogue entry
+        // gates. It is asked of a role that passed the gate above, which is why that
+        // sentence is the one a request carrying both defects gets.
+        if let Some(feature_name) = &input.feature_name {
+            if !crate::state::feature_name_is_supported(
+                &engine,
+                engine_version.as_deref(),
+                feature_name,
+            ) {
+                return Err(AddRoleToDBClusterError::invalid_parameter_value(
+                    crate::state::unsupported_feature_name_message(&engine, feature_name),
+                ));
+            }
         }
 
         let mut store = state.lock();

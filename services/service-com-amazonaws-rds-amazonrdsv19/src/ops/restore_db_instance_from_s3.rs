@@ -515,25 +515,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // THE BACKUP the restore reads: the location is a resource of ANOTHER service, so it
-        // is resolved where that service holds it. A bucket Amazon S3 holds nothing under, one
-        // it holds outside this Region, and a prefix holding no file at all
-        // leave this call nothing to migrate, which is the modelled `InvalidS3BucketFault` —
-        // and an engine with no object store beside this service establishes nothing and
-        // refuses nothing. It is read AFTER every request-only refusal above, so a request
-        // whose parameters cannot hold together is answered without the bucket being touched.
-        if crate::state::ingestion_backup_is_absent(
+        // is resolved where that service holds it, and each of the two conditions that leave
+        // this call nothing to migrate is answered as Amazon RDS answers it — a bucket this
+        // Region's object store does not reach is the parameter value it is, and a bucket
+        // that IS there holding no file under the prefix is the modelled
+        // `InvalidS3BucketFault`. An engine with no object store beside this service
+        // establishes nothing and refuses nothing. It is read AFTER every request-only
+        // refusal above, so a request whose parameters cannot hold together is answered
+        // without the bucket being touched.
+        match crate::state::ingestion_location_defect(
             &*self.engine,
             &region,
             &input.s3_bucket_name,
             input.s3_prefix.as_deref(),
-        ) == Some(true)
-        {
-            return Err(RestoreDBInstanceFromS3ErrorModeled::InvalidS3BucketFault(
-                InvalidS3BucketFault {
-                    message: Some(crate::state::invalid_ingestion_bucket_message()),
-                },
-            )
-            .into());
+        ) {
+            Some(crate::state::IngestionLocationDefect::BucketUnreachable) => {
+                return Err(RestoreDBInstanceFromS3Error::invalid_parameter_value(
+                    crate::state::invalid_ingestion_bucket_message(),
+                ));
+            }
+            Some(crate::state::IngestionLocationDefect::NoBackupUnderPrefix) => {
+                return Err(RestoreDBInstanceFromS3ErrorModeled::InvalidS3BucketFault(
+                    InvalidS3BucketFault {
+                        message: Some(crate::state::invalid_ingestion_bucket_message()),
+                    },
+                )
+                .into());
+            }
+            None => {}
         }
 
         // `EnableCloudwatchLogsExports` is STORED on the restored instance, so the list's

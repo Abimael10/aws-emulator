@@ -156,8 +156,14 @@ pub fn invalid_role_arn_message(role_arn: &str) -> String {
     format!("Invalid Role ARN: {role_arn}")
 }
 
-/// What a request naming a role Amazon RDS cannot assume is refused with: the role's trust
-/// policy has to grant `sts:AssumeRole` to the service principal that will act under it.
+/// What a request naming a role Amazon RDS cannot assume is refused with: the value has to
+/// name a role this account's IAM holds, and that role's trust policy has to grant
+/// `sts:AssumeRole` to the service principal that will act under it. Both conditions leave
+/// the engine with no role to act under, which is what the one sentence reports.
+///
+/// It is answered BEFORE the `FeatureName` is held to the engine's published feature names:
+/// a role the service cannot take on is associable for no feature at all, so a request whose
+/// role AND feature name are both unusable is refused for the role.
 ///
 /// ONE fixed sentence, with no variable part: this refusal names neither the role ARN the
 /// request carried nor the principal the trust policy is missing — it reports only that the

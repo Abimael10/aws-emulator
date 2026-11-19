@@ -10,8 +10,10 @@
 //!   and `SourceEngineVersion` members publish. Any other is two parameters that cannot hold
 //!   together — `InvalidParameterCombination` — answered from the REQUEST alone, before the
 //!   bucket is read.
-//! * A location holding no file this Region can migrate is the modelled
-//!   `InvalidS3BucketFault`.
+//! * A location holding no file this Region can migrate is refused as that location is: a
+//!   bucket this Region's object store does not reach is `InvalidParameterValue`, and a
+//!   bucket that IS there holding no backup under the prefix is the modelled
+//!   `InvalidS3BucketFault`; both carry the one sentence that error class states.
 //! * A request whose engine pair and backup both resolve CREATES the instance, which
 //!   `DescribeDBInstances` then reports, reaching `available` on its own.
 
@@ -178,18 +180,23 @@ async fn an_engine_pair_the_instance_migration_does_not_read_is_refused() {
     }
 }
 
-/// One row of the backup-location table: the case, and the bucket and prefix the request names.
+/// One row of the backup-location table: the case, the bucket and prefix the request names,
+/// and the refusal that location carries.
 struct LocationRow {
     case: &'static str,
     identifier: &'static str,
     bucket: &'static str,
     prefix: Option<&'static str>,
+    /// The Query API error code the location is refused with: which code says whether the
+    /// value named a bucket this Region's object store holds at all.
+    code: &'static str,
 }
 
 /// Rule: a location holding no file this Region can migrate leaves the restore nothing to
-/// read, which is the modelled `InvalidS3BucketFault`.
+/// read, and each of the two conditions is refused the way Amazon RDS refuses it — the rule
+/// the sibling cluster suite pins, which holds for this operation too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_location_holding_no_backup_is_refused_with_the_bucket_fault() {
+async fn a_location_holding_no_backup_is_refused_as_that_location_is() {
     const ELSEWHERE: &str = "emu-s3-inst-elsewhere";
     const PREFIXED: &str = "emu-s3-inst-prefixed";
     const ROWS: &[LocationRow] = &[
@@ -198,18 +205,21 @@ async fn a_location_holding_no_backup_is_refused_with_the_bucket_fault() {
             identifier: "emu-s3-inst-absent",
             bucket: "emu-s3-inst-never-created",
             prefix: None,
+            code: "InvalidParameterValue",
         },
         LocationRow {
             case: "a prefix the backup is not under",
             identifier: "emu-s3-inst-wrong-prefix",
             bucket: PREFIXED,
             prefix: Some("ledger/"),
+            code: "InvalidS3BucketFault",
         },
         LocationRow {
             case: "a bucket that exists in another Region",
             identifier: "emu-s3-inst-cross-region",
             bucket: ELSEWHERE,
             prefix: None,
+            code: "InvalidParameterValue",
         },
     ];
 
@@ -239,17 +249,17 @@ async fn a_location_holding_no_backup_is_refused_with_the_bucket_fault() {
             )
             .await,
             400,
-            "InvalidS3BucketFault",
+            row.code,
         );
-        // The sentence the model states for this error class, which names the two members a
-        // caller can act on.
+        // The sentence that error class states for this operation, which names the two
+        // members a caller can act on and carries no value of the request.
         let message = text(&body, "Message");
         let expected = "The specified Amazon S3 bucket name can't be found or Amazon RDS isn't \
                         authorized to access the specified Amazon S3 bucket. Verify the \
                         SourceS3BucketName and S3IngestionRoleArn values and try again.";
         assert_eq!(
             message, expected,
-            "case {:?}: expected the fault's sentence {expected:?}, got {message:?}",
+            "case {:?}: expected the sentence {expected:?}, got {message:?}",
             row.case
         );
         expect_error(

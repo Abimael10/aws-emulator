@@ -88,11 +88,16 @@ impl S3RestorePair {
     }
 }
 
-/// What an `InvalidS3BucketFault` carries on the restore path: the sentence the MODEL states
-/// for that error class on these two operations — "The specified Amazon S3 bucket name can't be
-/// found or Amazon RDS isn't authorized to access the specified Amazon S3 bucket. Verify the
-/// SourceS3BucketName and S3IngestionRoleArn values and try again." — which states the two
-/// conditions that leave a location unusable and names the two members a caller can act on.
+/// What a refusal of the LOCATION a restore reads carries, whichever of the two conditions
+/// it was: the sentence the MODEL states for that error class on these two operations — "The
+/// specified Amazon S3 bucket name can't be found or Amazon RDS isn't authorized to access
+/// the specified Amazon S3 bucket. Verify the SourceS3BucketName and S3IngestionRoleArn
+/// values and try again." — which states the two conditions that leave a location unusable
+/// and names the two members a caller can act on.
+///
+/// One sentence, two codes: WHICH code the refusal carries is what says whether the value
+/// named a bucket at all ([`IngestionLocationDefect`]), while what is wrong is the one thing
+/// this sentence reports — the location the restore cannot read a backup out of.
 ///
 /// It carries no variable part of its own: the bucket and the role are values the request
 /// already holds, and the sentence names the MEMBERS rather than their values.
@@ -104,43 +109,57 @@ pub fn invalid_ingestion_bucket_message() -> String {
         .to_string()
 }
 
+/// What a restore from Amazon S3 cannot read its backup out of: the two conditions a source
+/// location is refused for, which Amazon RDS answers differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestionLocationDefect {
+    /// This Region's object store holds NO bucket of that name, or holds one that belongs to
+    /// another Region: the value `SourceS3BucketName`/`S3BucketName` carried names no bucket
+    /// the restore can reach, so it is refused as the parameter value it is — the Query
+    /// API's `InvalidParameterValue`, carrying the sentence this operation words a location
+    /// it cannot find in ([`invalid_ingestion_bucket_message`]).
+    BucketUnreachable,
+    /// The bucket IS there and holds no file under the prefix the request named, so there is
+    /// no backup under it for the migration to read: the modelled `InvalidS3BucketFault`,
+    /// whose own sentence reports a location that "can't be found" and names the two members
+    /// a caller can act on ([`invalid_ingestion_bucket_message`]).
+    NoBackupUnderPrefix,
+}
+
 /// Whether the object store on this engine holds NO data for a restore to migrate at
-/// `bucket`/`prefix`: there is no such bucket, the bucket it holds is outside this Region, or
-/// the bucket holds no object under the prefix.
+/// `bucket`/`prefix`, and which of the two conditions that is.
 ///
-/// The first two questions are the ones this crate already resolves a destination bucket with
-/// ([`super::bucket_is_absent`], [`super::bucket_region`]), so they are asked there rather than
-/// a second time here; the prefix is the one question this path adds. `S3Prefix` is "the prefix
-/// for all of the file names that contain the data used to create the Amazon Aurora DB
-/// cluster", and a bucket and prefix that name no file at all contain no backup for the
-/// migration to read — which is what the fault's own sentence reports as a location that
-/// "can't be found". WHAT those files hold is read by the migration itself, afterwards, so it
-/// decides nothing here.
+/// The bucket's existence and its Region are the questions this crate already resolves a
+/// destination bucket with ([`super::bucket_is_absent`], [`super::bucket_region`]), so they
+/// are asked there rather than a second time here; the prefix is the one question this path
+/// adds. `S3Prefix` is "the prefix for all of the file names that contain the data used to
+/// create the Amazon Aurora DB cluster", and a bucket and prefix that name no file at all
+/// contain no backup for the migration to read. WHAT those files hold is read by the
+/// migration itself, afterwards, so it decides nothing here.
 ///
-/// `None` means nothing was established — there is no object store beside this service to ask
-/// — so a refusal grounded in this answer is only given where that store really answered.
+/// `None` means nothing was established — either there is no object store beside this
+/// service to ask, or the location holds a backup — so a refusal grounded in this answer is
+/// only given where that store really answered.
 #[must_use]
-pub fn ingestion_backup_is_absent<Eng: Send + Sync + 'static>(
+pub fn ingestion_location_defect<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
     bucket: &str,
     prefix: Option<&str>,
-) -> Option<bool> {
+) -> Option<IngestionLocationDefect> {
     if super::bucket_is_absent(engine, bucket)? {
-        return Some(true);
+        return Some(IngestionLocationDefect::BucketUnreachable);
     }
     // "The Amazon S3 bucket … must be in the same Amazon Web Services Region as the DB
-    // cluster": a bucket this Region's endpoint does not reach holds no backup for it, which
-    // the one fault covers as a bucket that "can't be found".
-    if super::bucket_region(engine, bucket)
-        .is_some_and(|held| !held.is_empty() && held != region)
-    {
-        return Some(true);
+    // cluster": a bucket this Region's endpoint does not reach is a bucket this restore
+    // cannot be run with, the same parameter refusal as one that is not there at all.
+    if super::bucket_region(engine, bucket).is_some_and(|held| !held.is_empty() && held != region) {
+        return Some(IngestionLocationDefect::BucketUnreachable);
     }
     let state = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
     let store = state.lock();
     let held = store.bucket(bucket)?;
     let under = prefix.unwrap_or_default();
     let holds_a_file = held.objects().any(|(key, _)| key.starts_with(under));
-    Some(!holds_a_file)
+    (!holds_a_file).then_some(IngestionLocationDefect::NoBackupUnderPrefix)
 }

@@ -875,6 +875,13 @@ pub(super) enum Provisioner {
     /// the resource's creation is held open until ElastiCache reports it `available`.
     ElastiCacheCacheCluster,
     RdsDbSubnetGroup,
+    /// `AWS::RDS::OptionGroup`: an option group of Amazon RDS, which `CreateOptionGroup`
+    /// creates under the name the stack decided — the name this type's `Ref` returns — and
+    /// `DeleteOptionGroup` deletes by it. Amazon RDS resolves a DB instance's
+    /// `OptionGroupName` against the groups it HOLDS, and a client's own
+    /// `DescribeOptionGroups` reports the group a completed stack declared, so a stack
+    /// declaring one has to create it there for real.
+    RdsOptionGroup,
     RdsDbParameterGroup,
     RdsDbClusterParameterGroup,
     /// `AWS::RDS::DBProxy`: an RDS proxy, which `CreateDBProxy` creates under the name the
@@ -1347,6 +1354,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         RDS_DB_CLUSTER => Some(Provisioner::RdsDbCluster),
         ELASTICACHE_CACHE_CLUSTER => Some(Provisioner::ElastiCacheCacheCluster),
         RDS_DB_SUBNET_GROUP => Some(Provisioner::RdsDbSubnetGroup),
+        rds_option_groups::RDS_OPTION_GROUP => Some(Provisioner::RdsOptionGroup),
         RDS_DB_PARAMETER_GROUP => Some(Provisioner::RdsDbParameterGroup),
         RDS_DB_CLUSTER_PARAMETER_GROUP => Some(Provisioner::RdsDbClusterParameterGroup),
         RDS_DB_PROXY => Some(Provisioner::RdsDbProxy),
@@ -1806,6 +1814,18 @@ impl Provisioner {
             }
             Self::RdsDbSubnetGroup => {
                 create_db_subnet_group(ctx, region, resource, propagated).await
+            }
+            // `AWS::RDS::OptionGroup` publishes `Tags` as the `{Key, Value}` list
+            // `CreateOptionGroup`'s own `Tags` member takes, so a group a stack creates
+            // carries the tags CloudFormation gives it beside the declared ones.
+            Self::RdsOptionGroup => {
+                Box::pin(rds_option_groups::create_option_group(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                ))
+                .await
             }
             Self::RdsDbParameterGroup => {
                 create_parameter_group(
@@ -2847,10 +2867,27 @@ impl Provisioner {
                 ))
                 .await
             }
-            // A DB cluster's endpoints are the DNS forms CloudFormation computes for the
-            // resource rather than the listener address this emulator's Amazon RDS
-            // publishes for the data plane, so there is nothing to read back off the
-            // cluster (see the note in `rds_db_clusters`).
+            // A DB cluster and a DB instance are both `creating` when their create answers,
+            // and a resource that is still coming up publishes no endpoint: the address and
+            // the port a client connects to are what Amazon RDS publishes once it serves, so
+            // the endpoint attributes either type publishes are read off the resource when
+            // that service reports it `available`.
+            Self::RdsDbCluster => {
+                Box::pin(rds_published_endpoints::db_cluster_ready_attributes(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                ))
+                .await
+            }
+            Self::RdsDbInstance => {
+                Box::pin(rds_published_endpoints::db_instance_ready_attributes(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                ))
+                .await
+            }
             _ => Ok(BTreeMap::new()),
         }
     }
@@ -3957,6 +3994,9 @@ impl Provisioner {
             Self::RdsDbSubnetGroup => {
                 delete_db_subnet_group(ctx, region, physical_resource_id).await
             }
+            Self::RdsOptionGroup => {
+                rds_option_groups::delete_option_group(ctx, region, physical_resource_id).await
+            }
             Self::RdsDbParameterGroup => {
                 delete_parameter_group(
                     ctx,
@@ -4520,6 +4560,14 @@ mod rds_role_associations;
 /// it: the DB instance is the type whose create and modify carry no `AssociatedRoles` member
 /// at all.
 mod rds_db_instance_roles;
+/// The endpoints an `AWS::RDS::DBCluster` and an `AWS::RDS::DBInstance` publish, read off
+/// Amazon RDS once it reports the resource serving so a stack output carries the address a
+/// client really connects to.
+mod rds_published_endpoints;
+/// The Amazon RDS OPTION GROUP arm: the group an `AWS::RDS::OptionGroup` declares, created in
+/// the service that owns it so a DB instance's `OptionGroupName` and a client's own read of
+/// that service resolve the name the stack publishes.
+pub(super) mod rds_option_groups;
 pub(super) mod redshift_parameter_groups;
 /// The Amazon Redshift SNAPSHOT COPY GRANT arm: the grant an
 /// `AWS::Redshift::SnapshotCopyGrant` declares, created in the service that owns it so a
