@@ -433,6 +433,15 @@ pub mod wait_conditions;
 /// than changed in place, and the name the replacement is created under.
 mod replacing_update;
 
+/// The REPLACEMENT an update cannot carry out: one that targets a resource whose physical
+/// name the template states itself, which CloudFormation refuses rather than attempts.
+pub mod custom_named_replacement;
+
+/// What refuses a stack update before it deploys anything: the verdicts CloudFormation
+/// reaches from the plan alone.
+pub mod refused_update;
+pub use refused_update::RefusedUpdate;
+
 /// The rollback TRIGGERS of one stack operation: the CloudWatch alarms a
 /// `RollbackConfiguration` names, and the rollback an alarm in `ALARM` forces.
 pub mod rollback_triggers;

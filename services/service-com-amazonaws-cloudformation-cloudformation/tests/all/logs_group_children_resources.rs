@@ -696,6 +696,11 @@ async fn a_declared_data_protection_policy_masks_what_the_group_ingests() {
 
 /// The template of the move case: two groups, and one subscription filter on the group
 /// `on_group` of them, delivering to the stream both revisions declare.
+///
+/// The filter's NAME is left to CloudFormation, which is what makes the move performable: the
+/// replacement the move requires is created under a name of its own
+/// (`crate::custom_named_replacement` is the suite of the refusal a filter the template NAMES
+/// gets instead, and `a_moved_custom_named_filter_is_refused` below pins it for this type).
 fn moved_filter_template(on_group: &str) -> String {
     json!({
         "Resources": {
@@ -739,16 +744,25 @@ fn moved_filter_template(on_group: &str) -> String {
             "Subscription": {
                 "Type": "AWS::Logs::SubscriptionFilter",
                 "Properties": {
-                    "FilterName": "moved-subscription",
                     "LogGroupName": {"Ref": on_group},
                     "FilterPattern": "ERROR",
                     "DestinationArn": {"Fn::GetAtt": ["DestStream", "Arn"]},
                     "RoleArn": {"Fn::GetAtt": ["CWLRole", "Arn"]}
                 }
             }
-        }
+        },
+        "Outputs": {"FilterName": {"Value": {"Ref": "Subscription"}}}
     })
     .to_string()
+}
+
+/// The same template with the filter NAMED, which is what makes the same move unperformable.
+fn named_filter_template(on_group: &str, filter_name: &str) -> String {
+    let mut template: Value = serde_json::from_str(&moved_filter_template(on_group))
+        .expect("the move template is JSON");
+    template["Resources"]["Subscription"]["Properties"]["FilterName"] =
+        Value::String(filter_name.to_string());
+    template.to_string()
 }
 
 /// A declaration that names ANOTHER log group for a subscription filter replaces it: the
@@ -781,7 +795,12 @@ async fn pointing_a_subscription_filter_at_another_group_replaces_it() {
          failures {:?}",
         failure_reasons(&router, stack).await
     );
-    let held = subscription_filters(&router, "moved-filter-first", "moved-subscription").await;
+    let name_in_force = output(&body, "FilterName").unwrap_or_default();
+    assert!(
+        !name_in_force.is_empty(),
+        "case {case:?}: expected the stack to publish the filter's name, got {body}"
+    );
+    let held = subscription_filters(&router, "moved-filter-first", &name_in_force).await;
     assert_eq!(
         held.len(),
         1,
@@ -812,7 +831,9 @@ async fn pointing_a_subscription_filter_at_another_group_replaces_it() {
          failures {:?}",
         failure_reasons(&router, stack).await
     );
-    let held = subscription_filters(&router, "moved-filter-second", "moved-subscription").await;
+    // The replacement the move required is a filter of its own, which the stack publishes.
+    let replacement = output(&body, "FilterName").unwrap_or_default();
+    let held = subscription_filters(&router, "moved-filter-second", &replacement).await;
     assert_eq!(
         held.len(),
         1,
@@ -824,17 +845,103 @@ async fn pointing_a_subscription_filter_at_another_group_replaces_it() {
         "case {case:?}: expected the filter to name the group now declared, got {:?}",
         held[0]
     );
-    let left_behind =
-        subscription_filters(&router, "moved-filter-first", "moved-subscription").await;
+    for name in [&name_in_force, &replacement] {
+        let left_behind = subscription_filters(&router, "moved-filter-first", name).await;
+        assert!(
+            left_behind.is_empty(),
+            "case {case:?}: expected the filter to have been taken off the group it was on, \
+             got {left_behind:?}"
+        );
+    }
+}
+
+/// RULE (the other side of the move above): a filter the template NAMES cannot be moved to
+/// another group, because the replacement that move requires would have to be created under
+/// the name the filter already holds — so the update is refused, the stack rolls back and the
+/// filter stays on the group it was on.
+#[tokio::test]
+async fn a_moved_custom_named_filter_is_refused() {
+    let router = router();
+    let stack = "logs-subscription-named-move";
+    let filter_name = "named-moved-subscription";
+    let case = "the first revision, which puts the named filter on the first group";
+    let (status, body) = create_stack(
+        &router,
+        stack,
+        &named_filter_template("First", filter_name),
+        &[member("Capabilities.member.1", "CAPABILITY_NAMED_IAM")],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from CreateStack, got {status} with {body}"
+    );
+    wait_for_the_transition().await;
+    // The Kinesis stream the filter delivers to is ACTIVE a span after it is created.
+    wait_for_the_transition().await;
+    let (_, body) = describe_stack(&router, stack).await;
+    assert_eq!(
+        xml_text(&body, "StackStatus").as_deref(),
+        Some("CREATE_COMPLETE"),
+        "case {case:?}: expected the stack to complete, got {body} with the resource \
+         failures {:?}",
+        failure_reasons(&router, stack).await
+    );
+
+    let case = "the revision that would move the named filter";
+    let (status, body) = call(
+        &router,
+        "UpdateStack",
+        &[
+            member("StackName", stack),
+            member("TemplateBody", &named_filter_template("Second", filter_name)),
+            member("Capabilities.member.1", "CAPABILITY_NAMED_IAM"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from UpdateStack, got {status} with {body}"
+    );
+    wait_for_the_transition().await;
+    wait_for_the_transition().await;
+    let (_, body) = describe_stack(&router, stack).await;
+    assert_eq!(
+        xml_text(&body, "StackStatus").as_deref(),
+        Some("UPDATE_ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the refused move to roll the stack back, got {body} with the \
+         resource failures {:?}",
+        failure_reasons(&router, stack).await
+    );
+    let reasons = failure_reasons(&router, stack).await;
+    let wanted = format!(
+        "CloudFormation cannot update a stack when a custom-named resource requires replacing. \
+         Rename {filter_name} and update the stack again."
+    );
     assert!(
-        left_behind.is_empty(),
-        "case {case:?}: expected the filter to have been taken off the group it was on, got \
-         {left_behind:?}"
+        reasons.contains(&wanted),
+        "case {case:?}: expected the refusal {wanted:?}, got {reasons:?}"
+    );
+    // Nothing was asked of CloudWatch Logs: the filter is where it was.
+    let held = subscription_filters(&router, "moved-filter-first", filter_name).await;
+    assert_eq!(
+        held.len(),
+        1,
+        "case {case:?}: expected the filter to stay on the group it was on, got {held:?}"
+    );
+    let moved = subscription_filters(&router, "moved-filter-second", filter_name).await;
+    assert!(
+        moved.is_empty(),
+        "case {case:?}: expected no filter on the group the refused update named, got {moved:?}"
     );
 }
 
-/// The template of the rename case: a named group with one stream in it, and the group's ARN
-/// as an output.
+/// The template of the rename case: a named group with one stream in it, the group's ARN and
+/// the stream's own name as outputs.
+///
+/// The STREAM's name is left to CloudFormation, which is what makes the rename performable:
+/// renaming the group replaces the stream too, and the replacement is created under a name of
+/// its own (`renaming_a_group_with_a_custom_named_stream_is_refused` below is the other side).
 fn rename_template(group: &str) -> String {
     json!({
         "Resources": {
@@ -844,18 +951,26 @@ fn rename_template(group: &str) -> String {
             },
             "LogStream": {
                 "Type": "AWS::Logs::LogStream",
-                "Properties": {
-                    "LogGroupName": {"Ref": "LogGroup"},
-                    "LogStreamName": "renamed-stream"
-                }
+                "Properties": {"LogGroupName": {"Ref": "LogGroup"}}
             }
         },
         "Outputs": {
             "GroupName": {"Value": {"Ref": "LogGroup"}},
-            "GroupArn": {"Value": {"Fn::GetAtt": ["LogGroup", "Arn"]}}
+            "GroupArn": {"Value": {"Fn::GetAtt": ["LogGroup", "Arn"]}},
+            "StreamName": {"Value": {"Ref": "LogStream"}}
         }
     })
     .to_string()
+}
+
+/// The same template with the stream NAMED, which is what makes the same rename
+/// unperformable.
+fn named_stream_rename_template(group: &str, stream: &str) -> String {
+    let mut template: Value =
+        serde_json::from_str(&rename_template(group)).expect("the rename template is JSON");
+    template["Resources"]["LogStream"]["Properties"]["LogStreamName"] =
+        Value::String(stream.to_string());
+    template.to_string()
 }
 
 /// Renaming a declared log group REPLACES the group and the stream inside it: the update
@@ -884,6 +999,12 @@ async fn renaming_a_declared_log_group_replaces_the_group_and_its_stream() {
         Some(old_group),
         "case {case:?}: expected the stack to publish the declared group name, got {body}"
     );
+    // The name CloudFormation gave the stream, which is what the events below are written to.
+    let stream_in_force = output(&body, "StreamName").unwrap_or_default();
+    assert!(
+        !stream_in_force.is_empty(),
+        "case {case:?}: expected the stack to publish the stream's name, got {body}"
+    );
 
     // One event in the old group, read back so the replacement can be shown to carry none of
     // them.
@@ -892,7 +1013,7 @@ async fn renaming_a_declared_log_group_replaces_the_group_and_its_stream() {
         "PutLogEvents",
         &json!({
             "logGroupName": old_group,
-            "logStreamName": "renamed-stream",
+            "logStreamName": stream_in_force,
             "logEvents": [{"timestamp": now_ms(), "message": "before the rename"}]
         }),
     )
@@ -904,7 +1025,7 @@ async fn renaming_a_declared_log_group_replaces_the_group_and_its_stream() {
     let (_, document) = logs(
         &router,
         "GetLogEvents",
-        &json!({"logGroupName": old_group, "logStreamName": "renamed-stream"}),
+        &json!({"logGroupName": old_group, "logStreamName": stream_in_force}),
     )
     .await;
     assert_eq!(
@@ -948,6 +1069,13 @@ async fn renaming_a_declared_log_group_replaces_the_group_and_its_stream() {
         )),
         "case {case:?}: expected the published ARN to name the replacement group, got {body}"
     );
+    // The stream was replaced with the group it lives in, so the stack publishes the
+    // replacement's own name.
+    let stream = output(&body, "StreamName").unwrap_or_default();
+    assert!(
+        !stream.is_empty(),
+        "case {case:?}: expected the stack to publish the replacement stream's name, got {body}"
+    );
 
     assert!(
         !group_exists(&router, old_group).await,
@@ -956,7 +1084,7 @@ async fn renaming_a_declared_log_group_replaces_the_group_and_its_stream() {
     let (status, document) = logs(
         &router,
         "GetLogEvents",
-        &json!({"logGroupName": old_group, "logStreamName": "renamed-stream"}),
+        &json!({"logGroupName": old_group, "logStreamName": stream_in_force}),
     )
     .await;
     assert_eq!(
@@ -974,14 +1102,14 @@ async fn renaming_a_declared_log_group_replaces_the_group_and_its_stream() {
     let held = stream_names(&router, new_group).await;
     assert_eq!(
         held,
-        vec!["renamed-stream".to_string()],
+        vec![stream.clone()],
         "case {case:?}: expected the replacement group to hold exactly the recreated stream, \
          got {held:?}"
     );
     let (status, document) = logs(
         &router,
         "GetLogEvents",
-        &json!({"logGroupName": new_group, "logStreamName": "renamed-stream"}),
+        &json!({"logGroupName": new_group, "logStreamName": stream}),
     )
     .await;
     assert_eq!(
@@ -1003,7 +1131,7 @@ async fn renaming_a_declared_log_group_replaces_the_group_and_its_stream() {
         "PutLogEvents",
         &json!({
             "logGroupName": new_group,
-            "logStreamName": "renamed-stream",
+            "logStreamName": stream,
             "logEvents": [{"timestamp": now_ms(), "message": "after the rename"}]
         }),
     )
@@ -1014,3 +1142,120 @@ async fn renaming_a_declared_log_group_replaces_the_group_and_its_stream() {
          {document}"
     );
 }
+
+/// RULE (the other side of the rename above): a stream the template NAMES cannot be carried
+/// into a renamed group, because the replacement that rename requires of the stream would have
+/// to be created under the name the stream already holds — so the update is refused, the stack
+/// rolls back, and the group, the stream and the events in it are left exactly as they were.
+#[tokio::test]
+async fn renaming_a_group_with_a_custom_named_stream_is_refused() {
+    let router = router();
+    let stack = "logs-group-rename-named-stream";
+    let (old_group, new_group) = ("named-rename-before", "named-rename-after");
+    let stream = "named-rename-stream";
+    let case = "the first revision, which creates the group and its named stream";
+    let (status, body) = create_stack(
+        &router,
+        stack,
+        &named_stream_rename_template(old_group, stream),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from CreateStack, got {status} with {body}"
+    );
+    wait_for_the_transition().await;
+    let (_, body) = describe_stack(&router, stack).await;
+    assert_eq!(
+        xml_text(&body, "StackStatus").as_deref(),
+        Some("CREATE_COMPLETE"),
+        "case {case:?}: expected the stack to complete, got {body} with the resource \
+         failures {:?}",
+        failure_reasons(&router, stack).await
+    );
+    let (status, document) = logs(
+        &router,
+        "PutLogEvents",
+        &json!({
+            "logGroupName": old_group,
+            "logStreamName": stream,
+            "logEvents": [{"timestamp": now_ms(), "message": "before the refused rename"}]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the group to accept an event, got {status} with {document}"
+    );
+
+    let case = "the revision that would rename the group under the named stream";
+    let (status, body) = call(
+        &router,
+        "UpdateStack",
+        &[
+            member("StackName", stack),
+            member(
+                "TemplateBody",
+                &named_stream_rename_template(new_group, stream),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from UpdateStack, got {status} with {body}"
+    );
+    wait_for_the_transition().await;
+    wait_for_the_transition().await;
+    let (_, body) = describe_stack(&router, stack).await;
+    assert_eq!(
+        xml_text(&body, "StackStatus").as_deref(),
+        Some("UPDATE_ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the refused rename to roll the stack back, got {body} with \
+         the resource failures {:?}",
+        failure_reasons(&router, stack).await
+    );
+    let reasons = failure_reasons(&router, stack).await;
+    let wanted = format!(
+        "CloudFormation cannot update a stack when a custom-named resource requires replacing. \
+         Rename {stream} and update the stack again."
+    );
+    assert!(
+        reasons.contains(&wanted),
+        "case {case:?}: expected the refusal {wanted:?}, got {reasons:?}"
+    );
+
+    // Nothing was asked of CloudWatch Logs: the group the stack created is still there, with
+    // its stream and the event that was written to it, and the renamed group was never made.
+    assert!(
+        group_exists(&router, old_group).await,
+        "case {case:?}: expected the group the create made to be left alone"
+    );
+    assert!(
+        !group_exists(&router, new_group).await,
+        "case {case:?}: expected the group the refused rename named never to be created"
+    );
+    let held = stream_names(&router, old_group).await;
+    assert_eq!(
+        held,
+        vec![stream.to_string()],
+        "case {case:?}: expected the group to still hold exactly its stream, got {held:?}"
+    );
+    let (status, document) = logs(
+        &router,
+        "GetLogEvents",
+        &json!({"logGroupName": old_group, "logStreamName": stream}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the stream to still be readable, got {status} with {document}"
+    );
+    assert_eq!(
+        document["events"][0]["message"],
+        json!("before the refused rename"),
+        "case {case:?}: expected the stream to keep the event it took, got {document}"
+    );
+}
+

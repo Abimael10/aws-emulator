@@ -62,6 +62,15 @@
 //! every resource exactly as they were. `StackPolicyBody` replaces the stack's stored
 //! policy, which `GetStackPolicy` reports back.
 //!
+//! An update that would REPLACE a resource whose physical name the template states itself is
+//! refused the same way, and before anything is deployed
+//! ([`crate::state::custom_named_replacement`]): a replacement is created beside the resource
+//! it supersedes, so there is no name left for it to take while that resource still holds the
+//! one the template asks for. That resource fails with CloudFormation's own reason — which
+//! asks the caller to rename it — and the stack rolls back to `UPDATE_ROLLBACK_COMPLETE` with
+//! the live resource untouched. An update that states a DIFFERENT name has said what the
+//! replacement is to be called, and is carried out.
+//!
 //! The policy the stack ALREADY carries is also validated against the submitted template
 //! before any of that ([`crate::state::stack_policy::unknown_logical_id`]): a stored
 //! statement protecting a logical id the submitted template does not declare refuses the
@@ -390,23 +399,25 @@ fn planned_changes(
     )
 }
 
-/// The resource actions an update PLANS, as the stack policy in force is asked about them.
+/// The verdict that refuses this update before it deploys anything, or `None` where none
+/// does ([`crate::state::RefusedUpdate`]).
 ///
 /// Computed from the resource-level plan [`planned_changes`] answers for the two revisions —
-/// the one the stack is in force with and the one this update would deploy — so the policy is
-/// evaluated against the actions the deployment really performs.
-fn planned_actions(
+/// the one the stack is in force with and the one this update would deploy — so every verdict
+/// is reached against the actions the deployment really performs, and from the resources the
+/// stack has right now, which is what a replacement's name would collide with.
+fn refused_update(
     previous: &PreviousValues,
+    governing_policy: Option<&str>,
     submitted_body: &str,
     submitted_stage: &crate::state::template::Processed,
     parameters: &[StoredParameter],
-) -> Vec<crate::state::stack_policy::PlannedAction> {
-    crate::state::stack_policy::planned_actions(&planned_changes(
-        previous,
-        submitted_body,
-        submitted_stage,
-        parameters,
-    ))
+) -> Option<crate::state::RefusedUpdate> {
+    crate::state::RefusedUpdate::of(
+        governing_policy,
+        &planned_changes(previous, submitted_body, submitted_stage, parameters),
+        &previous.deployed,
+    )
 }
 
 // The request's `Parameters` are resolved against the stack's stored values by the shared
@@ -986,10 +997,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // been deployed.
         let operation_id = crate::state::new_operation_id();
 
-        // "Updates on the resources you specify are denied": the stack policy in force
-        // governs every resource action this update plans, so it is weighed BEFORE anything
-        // about the stack is written — a denied update deploys nothing, and so changes
-        // neither the stack's configuration nor its resources.
+        // What refuses this update from the PLAN alone, weighed BEFORE anything about the
+        // stack is written — a refused update deploys nothing, and so changes neither the
+        // stack's configuration nor its resources ([`crate::state::RefusedUpdate`]): the
+        // stack policy in force ("updates on the resources you specify are denied"), and a
+        // replacement CloudFormation cannot carry out because the resource it would replace
+        // is one the template NAMES ITSELF.
         //
         // Which policy is in force is what `StackPolicyDuringUpdateBody` decides: "a
         // temporary overriding stack policy during this update. If you don't specify a stack
@@ -1006,18 +1019,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .stack_policy_during_update_body
             .clone()
             .or_else(|| previous.stack_policy_body.clone());
-        let denial = match (&governing_policy, &transform_failure) {
+        let refusal = match &transform_failure {
             // Asked about the body the stage was computed OVER — the spliced document where a
-            // transform named an `AWS::Include` snippet — so the plan the policy is weighed
-            // against covers the resources that snippet contributes too.
-            (Some(policy), None) => crate::state::stack_policy::denied(
-                policy,
-                &planned_actions(&previous, &included_body, &processed_template, &parameters),
+            // transform named an `AWS::Include` snippet — so the plan every verdict is
+            // reached against covers the resources that snippet contributes too.
+            None => refused_update(
+                &previous,
+                governing_policy.as_deref(),
+                &included_body,
+                &processed_template,
+                &parameters,
             ),
-            _ => None,
+            Some(_) => None,
         };
-        if let Some(denial) = denial {
-            // The denied resource's update FAILS, and the stack rolls back: "if the stack
+        if let Some(refusal) = refusal {
+            // The refused resource's update FAILS, and the stack rolls back: "if the stack
             // update fails, CloudFormation rolls back the stack to the previous stack
             // configuration" — which here is the configuration still in force, nothing
             // having been deployed. A caller that asked for a failed update's state to be
@@ -1062,23 +1078,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(client_request_token),
             );
             // The resource's own events come before the stack's terminal one, exactly as a
-            // deployment's do: the denial is what the event stream reports about the
-            // protected resource, and the rollback that follows a failed update is what then
-            // skips it ([`crate::state::stack_policy::Denial::transitions`]).
+            // deployment's do: the verdict is what the event stream reports about that
+            // resource, and the rollback that follows a failed update is what then skips it
+            // ([`crate::state::RefusedUpdate::transitions`]).
             let rolls_back = !disables_rollback(&input).unwrap_or(stack.disable_rollback);
-            stack.schedule_resource_events(&denial.transitions(rolls_back));
+            stack.schedule_resource_events(&refusal.transitions(rolls_back));
             let failed_at = ::std::time::SystemTime::now();
-            // What the STACK reports it failed for is the policy's verdict itself, not the
-            // summary of which resources failed ([`crate::state::resource_failure_summary`],
-            // the sentence an update whose RESOURCES failed reports): nothing was asked of
-            // any resource here — CloudFormation denied the action by the policy in force —
-            // so the denial is the whole account of why the update did not happen, and it is
-            // what a client reading the stack has to act on.
-            let reason = denial.reason();
+            // What the STACK reports it failed for is the verdict's own account of the
+            // refusal ([`crate::state::RefusedUpdate::stack_reason`]).
+            let reason = refusal.stack_reason();
             // "Preserve the state of previously provisioned resources when an operation
             // fails": the request's own `DisableRollback` where it carries one, else the
             // value in force on the stack — the same reading the deploying path gives that
-            // member, so a denied update and a failed one answer it alike. It decides
+            // member, so a refused update and a failed one answer it alike. It decides
             // whether the stack RESTS in `UPDATE_FAILED`, and so whether an event of its
             // own reports that status
             // ([`crate::state::StoredStack::fail_transition_superseded`]).

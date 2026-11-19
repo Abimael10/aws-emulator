@@ -305,6 +305,21 @@ pub struct StoredResourceChange {
     pub after_context: Option<String>,
 }
 
+impl StoredResourceChange {
+    /// The evaluated `Properties` document this change would put in force, read back out of
+    /// [`Self::after_context`] — the one place that document is held.
+    ///
+    /// `None` for a change that leaves no resource behind (a `Remove`) and for one computed
+    /// without a declaration to read. The context is written here ([`property_context`]) and
+    /// read here, so a caller that needs the document the update would deploy — rather than
+    /// the text the template states — cannot decode it differently from the way it was
+    /// encoded.
+    pub fn after_properties(&self) -> Option<Value> {
+        let context: Value = ::serde_json::from_str(self.after_context.as_deref()?).ok()?;
+        context.get(PROPERTIES_ATTRIBUTE).cloned()
+    }
+}
+
 /// The revision of a stack a change set is computed AGAINST: the template in force on it,
 /// the parameter values in force with it, the resources it has deployed and the stack the
 /// pseudo parameters resolve to.

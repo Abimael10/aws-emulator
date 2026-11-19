@@ -553,25 +553,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             // The stack policy in force governs an UPDATE change set's execution exactly
-            // as it governs `UpdateStack`: the plan the change set STORED is what this
-            // execution would do to each of the stack's resources, so an action the policy
-            // does not permit does not happen — the change set's configuration never
-            // reaches the stack, the protected resource reports the policy's verdict, and
-            // the stack rolls back (`crate::state::stack_policy`). A CREATE change set
+            // as it governs `UpdateStack`, and so does every other verdict CloudFormation
+            // reaches from the plan alone ([`crate::state::RefusedUpdate`]): the plan the
+            // change set STORED is what this execution would do to each of the stack's
+            // resources, so an action the policy does not permit — and a replacement that
+            // would have to re-create a resource the template names itself — does not
+            // happen: the change set's configuration never reaches the stack, the resource
+            // the verdict is about reports it, and the stack rolls back. A CREATE change set
             // brings the stack into existence, which performs no update action on a resource
-            // a policy could protect.
-            let denial = (!creates_the_stack)
-                .then_some(stack.stack_policy_body.as_deref())
-                .flatten()
-                .and_then(|policy| {
-                    crate::state::stack_policy::denied(
-                        policy,
-                        &crate::state::stack_policy::planned_actions(&planned_changes),
+            // a policy could protect and replaces nothing.
+            let refusal = (!creates_the_stack)
+                .then(|| {
+                    crate::state::RefusedUpdate::of(
+                        stack.stack_policy_body.as_deref(),
+                        &planned_changes,
+                        &stack.resources,
                     )
-                });
-            if let Some(denial) = denial {
-                // The same shape `UpdateStack` answers a denial with: the operation is
-                // opened so the client reads back the one it asked for, the denied
+                })
+                .flatten();
+            if let Some(refusal) = refusal {
+                // The same shape `UpdateStack` answers a refusal with: the operation is
+                // opened so the client reads back the one it asked for, the refused
                 // resource's own events carry the verdict, and the stack rolls back to the
                 // configuration still in force — nothing having been deployed — unless this
                 // execution asked for its failed state to be kept.
@@ -589,9 +591,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(client_request_token),
                 );
                 let rolls_back = !disable_rollback.unwrap_or(stack.disable_rollback);
-                stack.schedule_resource_events(&denial.transitions(rolls_back));
+                stack.schedule_resource_events(&refusal.transitions(rolls_back));
                 let failed_at = ::std::time::SystemTime::now();
-                let reason = denial.reason();
+                let reason = refusal.stack_reason();
                 // The flag in force on THIS execution: the request's, the change set's
                 // `OnStackFailure` where it chose one, else the stack's — the same reading
                 // the deploying path below gives that member. It decides whether the stack

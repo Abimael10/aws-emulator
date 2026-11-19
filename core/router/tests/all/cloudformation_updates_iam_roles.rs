@@ -28,7 +28,10 @@
 //!
 //! A change to the role's NAME is the other half of the same rule and is its own test: the
 //! name is the role's identity, so that change is a REPLACEMENT — a new role, with a new
-//! `RoleId`, and the one the stack had created deleted.
+//! `RoleId`, and the one the stack had created deleted. An update that writes down the name
+//! CloudFormation GENERATED is the third case, and its own test too: it asks for a
+//! replacement under the name the role already holds, which cannot be created, so that update
+//! is refused and the stack rolls back with the role untouched.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -426,8 +429,8 @@ struct UpdateRow {
     /// The `Properties` the create declares, given the name the row's template names the
     /// role (unused by a row that leaves the name to CloudFormation).
     created: fn(&str) -> Value,
-    /// The `Properties` the update declares, given the name the role REALLY has — so a row
-    /// may state the name CloudFormation generated and have it read as no change at all.
+    /// The `Properties` the update declares, given the name the role REALLY has — which a
+    /// row that NAMES the role restates, since that name is the role's identity.
     updated: fn(&str) -> Value,
 }
 
@@ -637,7 +640,7 @@ const UPDATE_ROWS: &[UpdateRow] = &[
         },
     },
     UpdateRow {
-        case: "a generated name written down by the update, beside a changed description",
+        case: "a changed description on a role whose name CloudFormation generated",
         stack_name: "named-later-stack",
         named: false,
         created: |_| {
@@ -646,17 +649,15 @@ const UPDATE_ROWS: &[UpdateRow] = &[
                 "Description": "a role CloudFormation named",
             })
         },
-        // `name` here is the name the role REALLY has, so this revision states the very
-        // name the create left to CloudFormation: the role keeps it, and the only change to
-        // apply is the description.
-        updated: |name| {
-            with_name(
-                Some(name),
-                json!({
-                    "AssumeRolePolicyDocument": trust(json!({"Service": "ec2.amazonaws.com"})),
-                    "Description": "the description the update declares",
-                }),
-            )
+        // The revision leaves the name to CloudFormation exactly as the create did, so the
+        // role keeps it and the only change to apply is the description. A revision that
+        // WRITES THAT NAME DOWN is a different update, and not an in-place one:
+        // `an_update_that_writes_down_the_generated_role_name_is_refused` below is its test.
+        updated: |_| {
+            json!({
+                "AssumeRolePolicyDocument": trust(json!({"Service": "ec2.amazonaws.com"})),
+                "Description": "the description the update declares",
+            })
         },
     },
     UpdateRow {
@@ -867,6 +868,91 @@ async fn an_update_that_changes_the_role_name_replaces_the_role() {
     assert_eq!(
         status, 404,
         "case {case:?}: expected the replaced role to be deleted, got {status} with {body}"
+    );
+}
+
+/// RULE: a replacement cannot be created under the identity the resource it replaces still
+/// holds, so an update that WRITES DOWN the name CloudFormation generated — making the role
+/// custom-named under the very name it already has — is refused rather than attempted: the
+/// role reports `UPDATE_FAILED` carrying CloudFormation's own sentences, the stack rolls back,
+/// and IAM still holds the role the create made, untouched.
+///
+/// `RoleName`'s own update behaviour is `Replacement` and its documentation states that a role
+/// the template names cannot be replaced by an update ("if you must replace the resource,
+/// specify a new name"), which is what this refusal says and what the rename above does.
+#[tokio::test]
+async fn an_update_that_writes_down_the_generated_role_name_is_refused() {
+    let router = build_router();
+    let case = "the generated name written down by the update";
+    let stack_name = "write-down-the-name-stack";
+    let created = json!({
+        "AssumeRolePolicyDocument": trust(json!({"Service": "ec2.amazonaws.com"})),
+        "Description": "a role CloudFormation named",
+    });
+
+    let body = create_and_settle(&router, case, stack_name, &one_role_template(&created)).await;
+    assert_eq!(
+        xml_text(&body, "StackStatus").as_deref(),
+        Some("CREATE_COMPLETE"),
+        "case {case:?}: expected the stack to complete before the update, got {body}"
+    );
+    let role_name = outputs_of(&body)
+        .get("RoleName")
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: no RoleName output in {body}"));
+    let (held, identity_before) = reported_role(&router, case, &role_name).await;
+
+    // The same template with the generated name written into it, beside a changed
+    // description: declaring the name is a change to a property whose update behaviour is
+    // `Replacement`, and the name it states is the one the role already holds.
+    let updated = with_name(
+        Some(&role_name),
+        json!({
+            "AssumeRolePolicyDocument": trust(json!({"Service": "ec2.amazonaws.com"})),
+            "Description": "the description the refused update declares",
+        }),
+    );
+    let body = update_and_settle(&router, case, stack_name, &one_role_template(&updated)).await;
+    assert_eq!(
+        xml_text(&body, "StackStatus").as_deref(),
+        Some("UPDATE_ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the refused update to roll the stack back, got {body}"
+    );
+
+    // The role's own event says what cannot be done and what the caller has to do about it.
+    let (status, events) =
+        cloudformation(&router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DescribeStackEvents, got {status} with {events}"
+    );
+    let reasons: Vec<String> = crate::query_wire::members_of(&events)
+        .into_iter()
+        .filter(|event| {
+            xml_text(event, "LogicalResourceId").as_deref() == Some(ROLE_LOGICAL_ID)
+                && xml_text(event, "ResourceStatus").as_deref() == Some("UPDATE_FAILED")
+        })
+        .filter_map(|event| xml_text(event, "ResourceStatusReason"))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![format!(
+            "CloudFormation cannot update a stack when a custom-named resource requires \
+             replacing. Rename {role_name} and update the stack again."
+        )],
+        "case {case:?}: expected one refusal naming the role to rename, got {reasons:?}"
+    );
+
+    // Nothing was asked of IAM: the role is the one the create made, with the configuration
+    // it was created with and the identity it was created under.
+    let (now, identity_after) = reported_role(&router, case, &role_name).await;
+    assert_eq!(
+        now, held,
+        "case {case:?}: expected IAM to still report the created configuration"
+    );
+    assert_eq!(
+        identity_after, identity_before,
+        "case {case:?}: expected the role to keep the identity it was created under"
     );
 }
 
