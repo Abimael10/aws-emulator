@@ -672,4 +672,11 @@ fn a_deployed_pipeline_runs_on_the_emulator_a_client_starts() {
     // a started emulator and not a second one.
     crate::dynamodb_discovered_endpoint_is_dialled_by_a_client::
         a_client_re_targeted_at_the_discovered_authority_is_served_there(&emulator);
+
+    // The fifth leg, on this same started emulator: a MediaConvert job's own state changes,
+    // announced on an EventBridge rule's Amazon SQS target by the binary's own clock with no
+    // MediaConvert call waiting on them — which needs the started emulator, because the
+    // publication is made from a task that outlives the request that armed the clock.
+    crate::mediaconvert_job_state_change_on_a_started_emulator::
+        a_jobs_state_changes_reach_its_rules_queue_on_the_emulator_a_client_starts(&emulator);
 }
