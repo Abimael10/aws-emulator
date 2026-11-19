@@ -20494,6 +20494,7 @@ dependencies = [
 name = "service-com-amazonaws-sfn-awsstepfunctions"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-credential-types",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",

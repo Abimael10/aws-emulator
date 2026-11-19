@@ -140,6 +140,25 @@ pub fn work_spent() -> bool {
     LEFT.with(Cell::get) == 0
 }
 
+/// What is LEFT of the allowance the interpretation running on this thread may spend.
+///
+/// Read together with [`put_work_back`] by the one turn a walk takes TWICE: a `Map`
+/// iteration's slice is walked once to hand over the call it then waits for and again to
+/// take that call's answer ([`super::map_items`]), so the charges of the first turn are
+/// given back and a slice costs what it would have cost had it been walked once.
+pub fn work_left() -> u64 {
+    LEFT.with(Cell::get)
+}
+
+/// Give back what [`work_left`] answered before a turn that is being walked again.
+///
+/// It can only ever give back: the allowance is set to `left` or to what is left of it
+/// now, whichever is SMALLER, so nothing reached from a walk can grant itself work it
+/// never had.
+pub fn put_work_back(left: u64) {
+    LEFT.with(|remaining| remaining.set(remaining.get().min(left)));
+}
+
 /// What a run that asked for more work than [`MAX_INTERPRET_WORK`] fails with: the
 /// quota it went past, stated the way the step quota beside it is.
 pub fn out_of_work() -> Failure {

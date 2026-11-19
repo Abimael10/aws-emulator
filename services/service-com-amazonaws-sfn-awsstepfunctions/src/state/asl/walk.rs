@@ -40,7 +40,8 @@ impl Interpreter<'_> {
         work_spent().then(out_of_work)
     }
 
-    /// Record that a service-integration call this walk waited for took `waited`.
+    /// Record that a service-integration call this walk waited for blocked it for
+    /// `waited`.
     ///
     /// The walk is BLOCKED while a call it asked for is in flight — in another
     /// service's handler, which for a Lambda invocation runs a caller's own code — so
@@ -50,6 +51,11 @@ impl Interpreter<'_> {
     /// clamped to what is left of ([`Interpreter::call_within`]): the thread one run
     /// holds is bounded, and a call that does not answer inside the span it was given
     /// is the task's own timeout rather than the execution's end.
+    ///
+    /// What is charged is the span the walk really WAITED, which is not the span the
+    /// work took: the calls of a `Map` state's items are in flight together, so a run
+    /// holds its thread once over spans that overlap and the allowance is debited once
+    /// for them ([`Interpreter::perform_call`], which charges every call of the walk).
     pub(super) fn spent_calling(&mut self, waited: Duration) {
         self.call_wait_left = self.call_wait_left.saturating_sub(waited);
     }
@@ -70,6 +76,83 @@ impl Interpreter<'_> {
             Some(declared) => declared.min(self.call_wait_left),
             None => self.call_wait_left,
         })
+    }
+
+    /// Do the work of `call` with `request` as its request, and report WHEN that work
+    /// began — which for a call this turn had already started is the instant it was
+    /// started at, so the span the task reports is the span its work really took.
+    ///
+    /// The waiting is charged here, to the allowance that bounds it
+    /// ([`Interpreter::spent_calling`]): what it costs is the span the walk was really
+    /// BLOCKED, which for a call that answered while a sibling item's was in flight is
+    /// less than the span the work took — the allowance bounds the thread one run holds,
+    /// and a run holds it once however many calls are in flight.
+    ///
+    /// `None` says the call has been STARTED and left in flight, and this turn is
+    /// UNWINDING: the walk is inside one item of a `Map` state whose items run together,
+    /// so the item yields here and its siblings' own calls are started beside this one.
+    /// The item is walked again from where this turn began once the call answers, and
+    /// takes the answer then ([`super::map_items`]); nothing of the turn that unwound is
+    /// kept, so from this point on the walk runs nothing further.
+    ///
+    /// Every call this answers for is made exactly once. The turn that starts one is
+    /// walked again only to the state that started it, where the answer of that very
+    /// call — the same call with the same request — is what it takes; and a turn that
+    /// somehow reached ANOTHER call fails the task there rather than making it, because
+    /// the work of the call it already started has been performed and making this one
+    /// would perform the task's work a second time.
+    pub(super) fn perform_call(
+        &mut self,
+        call: &super::super::integration::Call,
+        request: &Value,
+        within: Option<Duration>,
+    ) -> Option<(super::super::integration::Answer, ::std::time::SystemTime)> {
+        if let Some(started) = self.started.take() {
+            if !started.is_for(call, request) {
+                return Some((Err(started_another_call(call)), started.began()));
+            }
+            let began = started.began();
+            // The turn has taken the call it was waiting for, so what it does from here
+            // is done with it waiting: it cannot unwind past an answer it has taken.
+            self.probing = None;
+            let waited_from = super::super::now();
+            let answer = started.settle();
+            self.spent_calling(
+                super::super::now()
+                    .duration_since(waited_from)
+                    .unwrap_or_default(),
+            );
+            return Some((answer, began));
+        }
+        // Only a call that IS the whole task may be left in flight: a run-a-job call
+        // parks the walk at the job it started and a callback call hands a token out,
+        // and both of those are records of the turn that made the call, which a turn
+        // that unwinds does not keep. And only a turn that has SAMPLED nothing may,
+        // because it is walked again from where it began: what it reaches the second
+        // time is the same states over the same data, so the call it hands over is the
+        // same call — unless something it ran sampled a value, which would make the
+        // second turn ask for a different request ([`super::super::samples_drawn`]).
+        let repeatable = self
+            .probing
+            .is_some_and(|drawn| drawn == super::super::samples_drawn());
+        if repeatable && call.job.is_none() && !call.callback {
+            if let Some(started) = self.tasks.begin(call, request, within) {
+                self.started = Some(started);
+                self.unwinding = true;
+                return None;
+            }
+        }
+        // Every other call is made with this turn waiting for it, so no later call of
+        // the same turn can unwind what this one has already done.
+        self.probing = None;
+        let began = super::super::now();
+        let answer = self.tasks.perform(call, request, within);
+        self.spent_calling(
+            super::super::now()
+                .duration_since(began)
+                .unwrap_or_default(),
+        );
+        Some((answer, began))
     }
 
     /// Whether the definition's own `TimeoutSeconds` has run out by `at`, the offset
@@ -131,6 +214,12 @@ impl Interpreter<'_> {
         if iteration {
             self.map_depth += 1;
         }
+        // A nested state list is walked to its OWN END inside the enclosing state's
+        // turn, so once one has run the turn may no longer hand a call over and be put
+        // down: what the nested list already did would be undone with it
+        // ([`Interpreter::perform_call`]). It is not put back after the walk for the same
+        // reason.
+        self.probing = None;
         // A nested machine's states carry their OWN retry counts; the enclosing
         // state's is not theirs.
         let enclosing = std::mem::take(&mut self.retry_count);
@@ -2251,7 +2340,6 @@ impl Interpreter<'_> {
                 me.push_submit_failure(name, &work, &failure, at, &call);
                 return (Err(failure), at);
             }
-            let began = super::super::now();
             // The PUBLICATION a `Task` state makes is this service's own call: the entries
             // are the state's document, and what Step Functions adds to each of them is
             // the attribution of the publication to the run that made it — the execution's
@@ -2273,7 +2361,15 @@ impl Interpreter<'_> {
             if let Some(token) = &token {
                 me.tasks.hand_over(token, &me.execution_arn, name);
             }
-            let answered = me.tasks.perform(&call, called, me.call_within(within));
+            // The work is done here — and for one item of a `Map` state whose items run
+            // together, this is where the item's own call is STARTED and the item yields
+            // so that a sibling's is started beside it: the turn unwinds, and the walk
+            // takes it up again at this very state once the call answers
+            // ([`Interpreter::perform_call`]).
+            let Some((answered, began)) = me.perform_call(&call, called, me.call_within(within))
+            else {
+                return (Err(unwound()), at);
+            };
             // A publication the service SERVED but which rejected an entry did not do
             // this task's work, so it is read as the failure it is before the answer
             // becomes a result
@@ -2290,13 +2386,15 @@ impl Interpreter<'_> {
             let replied = token
                 .as_ref()
                 .and_then(|token| me.tasks.settle_handover(token));
+            // What the WORK really took, which is the span the event that closes this
+            // attempt reports: measured from the instant the call was started, so a call
+            // started while a sibling item's was in flight reports its own span. What the
+            // walk spent BLOCKED in it is charged to the allowance that bounds the
+            // waiting one run may do, by the call itself
+            // ([`Interpreter::perform_call`]).
             let spent = super::super::now()
                 .duration_since(began)
                 .unwrap_or_default();
-            // The span the walk spent BLOCKED in that call is not interpretation, so it
-            // is charged to the allowance that bounds the waiting one run may do
-            // ([`Interpreter::spent_calling`]) and to nothing else.
-            me.spent_calling(spent);
             // The identifier of the job a run-a-job call STARTED is read from the
             // answer as the invoked model spells it, before that answer becomes the
             // task's result in the convention the `Resource` reports it in
@@ -2501,6 +2599,13 @@ impl Interpreter<'_> {
         at: Duration,
     ) -> Result<StateStep, Fault> {
         self.push_entered("MapStateEntered", name, at, &raw);
+        // A `Map` state inside the turn of another `Map`'s item records a Map Run of its
+        // own, reads the dataset its `ItemReader` names and runs items of its own, so
+        // from here that turn may no longer hand a call over and be put down: what this
+        // state has already done would be undone with it
+        // ([`Interpreter::perform_call`]). The ITEMS of this state are a turn each, and
+        // each of those sets its own ([`super::map_items`]).
+        self.probing = None;
         let (processor, distributed) = map_processor(name, state).map_err(|failure| failure.at(at))?;
         let (processor_states, processor_start) =
             states_of(processor, &format!("the 'ItemProcessor' of state '{name}'"))
@@ -3150,7 +3255,8 @@ impl Interpreter<'_> {
     /// returned offset reports. The items of one batch really do make progress
     /// CONCURRENTLY — each is walked a state at a time and yields to the sibling due
     /// before it ([`super::map_items`]) — so an iteration whose own control flow waits
-    /// on an effect a sibling commits observes that effect.
+    /// on an effect a sibling commits observes that effect; and their WORK is really
+    /// performed at the same time, up to that many calls in flight together.
     ///
     /// `tally` is counted up as the items are run, so it holds what this attempt's
     /// items did however the attempt ended.
@@ -3586,6 +3692,26 @@ fn member_path_value(
 /// The error names a reply reports BESIDE the one its failure carries, for an outcome
 /// that answers to that one name alone: everything a caller reported.
 pub(super) const NO_OTHER_ERRORS: &[&str] = &[];
+
+/// What a task fails with when the turn that had already STARTED a call reached another
+/// one instead ([`Interpreter::perform_call`]).
+///
+/// It is unreachable by construction: a turn is put down only where walking it again
+/// cannot ask for anything else, so the call it reaches the second time is the call it
+/// started. If it ever were not, the work of the started call has already been performed
+/// — so this one is NOT made, because making it would perform the task's work a second
+/// time, and the task fails with the name every other call this emulator declines to make
+/// carries ([`RUNTIME_ERROR`], which is neither retried nor caught).
+fn started_another_call(call: &super::super::integration::Call) -> super::super::integration::Failed {
+    super::super::integration::Failed {
+        error: RUNTIME_ERROR.to_string(),
+        cause: format!(
+            "{} is not the call this item had already started, whose work has been performed, so \
+             nothing further was run for it",
+            call.described()
+        ),
+    }
+}
 
 /// The event an activity's task records for having been CLOSED without a result: the
 /// language's own timeout event where a bound the state declared ran out, and the

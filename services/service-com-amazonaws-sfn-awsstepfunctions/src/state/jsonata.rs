@@ -277,6 +277,12 @@ fn evaluate(
         variables.push((name.as_str(), value));
     }
     let began = Instant::now();
+    // An expression is a caller's own code, evaluated by an engine that binds functions
+    // which SAMPLE — the instant, a draw — and says nothing about which of them the
+    // expression used. So every evaluation counts as a sample: what decides whether a
+    // span of work may be walked again is that nothing it did was sampled
+    // ([`super::samples_drawn`]), and an expression that may have sampled is not that.
+    super::drew_a_sample();
     let answered = engine::evaluate(&engine::Expression {
         text: expression,
         input: bindings.input,

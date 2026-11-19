@@ -270,6 +270,20 @@ pub const MAX_CALL_CHAIN_DEPTH: u8 = 3;
 /// [`super::asl::MAX_CALL_WAIT_DURATION`], which this stays well inside.
 pub const MAX_CALL_DURATION: Duration = Duration::from_secs(60);
 
+/// How many integration calls ONE walk may leave in flight while it walks on, for a walk
+/// serving an inbound request; a walk already inside a chain of in-process calls may leave
+/// fewer ([`Tasks::calls_in_flight`]).
+///
+/// Emulator bound. The calls a walk makes at one instant are the ones a `Map` state's
+/// `MaxConcurrency` lets its items run together ([`super::asl::map_items`]), and that
+/// figure is a caller's: a state declaring no limit asks for one call per item, of which
+/// there may be as many as the dataset holds. Each in-flight call is work really running
+/// in this process — a function's own code for a `lambda:invoke` task — so how many of
+/// them this emulator runs beside each other is bounded here, and a state asking for more
+/// concurrency than this runs that many at a time instead. It is wide enough for the
+/// fan-out a definition is written for and far below what the host would have to hold.
+pub const MAX_CALLS_IN_FLIGHT: usize = 16;
+
 /// The ARN namespace every service-integration `Resource` is written under: the
 /// `Resource` names Step Functions' own integration, not the target resource.
 const STATES_NAMESPACE: &str = "states";
@@ -1757,7 +1771,10 @@ impl Call {
     /// How a refusal of this call NAMES the work it is: the operation and the service
     /// for a call to a service's API, and the request itself for the HTTP Task, which
     /// calls no operation of any service ([`Call::endpoint`]).
-    fn described(&self) -> String {
+    ///
+    /// `pub(crate)`, because the walk words one refusal of its own about a call: the one
+    /// it declines to make a SECOND time ([`super::asl`]).
+    pub(crate) fn described(&self) -> String {
         match self.endpoint {
             true => "the HTTP request this task makes".to_string(),
             false => format!("the '{}' call of {}", self.operation, self.api.sdk_id),
@@ -2488,6 +2505,78 @@ pub struct FinishedChild {
 pub type MapRuns =
     ::std::sync::Arc<dyn Fn(usize, &str) -> Option<ResumedMapRun> + Send + Sync>;
 
+/// One integration call that has been STARTED and has not answered yet
+/// ([`Tasks::begin`]): the work is being done while the walk holds this, and
+/// [`InFlight::settle`] is what takes its answer.
+pub struct InFlight {
+    /// The call that was started, and the request it was started with: what
+    /// [`InFlight::is_for`] answers by, so the answer of a started call is never read as
+    /// the answer of a different one.
+    call: Call,
+    request: Value,
+    /// Where the answer arrives: the same channel [`Tasks::perform`] waits on.
+    answered: ::std::sync::mpsc::Receiver<Answer>,
+    /// The whole span the walk may wait for this call, as `within` bounded it, measured
+    /// from the instant it was started.
+    waited: Duration,
+    /// When it was started, which is when the work it asks for BEGAN: the span a task
+    /// reports is measured from here, so a call started while a sibling's was in flight
+    /// reports the span it really took rather than what was left of it.
+    began: ::std::time::SystemTime,
+}
+
+impl InFlight {
+    /// Whether this is the call `call` with `request` asks for, so the walk that started
+    /// it takes exactly its own answer.
+    #[must_use]
+    pub fn is_for(&self, call: &Call, request: &Value) -> bool {
+        ::std::ptr::eq(self.call.api, call.api)
+            && self.call.operation == call.operation
+            && self.call.invokes == call.invokes
+            && self.call.endpoint == call.endpoint
+            && self.call.callback == call.callback
+            && self.request == *request
+    }
+
+    /// When the call was started, which is when the work it asks for began.
+    #[must_use]
+    pub fn began(&self) -> ::std::time::SystemTime {
+        self.began
+    }
+
+    /// Wait for this call's answer, for what is left of the span it was given.
+    ///
+    /// The bound is the one [`Tasks::perform`] holds a call to, counted from the instant
+    /// the call was STARTED: a call that has not answered inside it is the task's own
+    /// timeout, and the thread the walk holds is released there.
+    pub fn settle(self) -> Answer {
+        match self.answered.try_recv() {
+            Ok(answer) => return answer,
+            Err(::std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(unavailable(&self.call))
+            }
+            Err(::std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        let left = self.waited.saturating_sub(
+            super::now()
+                .duration_since(self.began)
+                .unwrap_or_default(),
+        );
+        if left.is_zero() {
+            return Err(timed_out(&self.call, self.waited));
+        }
+        match self.answered.recv_timeout(left) {
+            Ok(answer) => answer,
+            Err(::std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(timed_out(&self.call, self.waited))
+            }
+            Err(::std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(unavailable(&self.call))
+            }
+        }
+    }
+}
+
 /// What performs a `Task` state's service integration for one walk.
 ///
 /// The walk is synchronous — it runs on a blocking thread and its states are a
@@ -2506,6 +2595,33 @@ pub trait Tasks: Send + Sync {
     /// emulator's own ceiling ([`MAX_CALL_DURATION`]) as the only bound, and a
     /// declared timeout longer than that ceiling does not lift it.
     fn perform(&self, call: &Call, request: &Value, within: Option<Duration>) -> Answer;
+
+    /// START `call` with `request` and answer what the walk takes its answer from later,
+    /// without waiting for it here.
+    ///
+    /// It is what lets the items of one `Map` state's concurrency run their work AT THE
+    /// SAME TIME: each item's call is started as the walk reaches it and the walk goes on
+    /// to the next item, so the calls are in flight together and the answer each waits for
+    /// is taken through [`InFlight::settle`] ([`super::asl::map_items`]). `within` bounds
+    /// the wait exactly as it bounds [`Tasks::perform`]'s, counted from the instant the
+    /// call was started.
+    ///
+    /// `None` means nothing was started and nothing was handed over — which is what the
+    /// default answers, for a [`Tasks`] that performs one call at a time — so the caller
+    /// performs the call instead.
+    fn begin(&self, _call: &Call, _request: &Value, _within: Option<Duration>) -> Option<InFlight> {
+        None
+    }
+
+    /// How many calls this walk may leave IN FLIGHT while it walks on, beside the one it
+    /// is waiting for ([`Tasks::begin`]).
+    ///
+    /// The default is none, which is what a [`Tasks`] that starts nothing has: its calls
+    /// are performed one at a time, so a caller that asks before leaving one in flight is
+    /// told there is no room for it.
+    fn calls_in_flight(&self) -> usize {
+        0
+    }
 
     /// Record that this walk has handed `token` to the work `call` performs, over the
     /// state `state_name` of the execution `execution_arn` ([`CallbackHandovers`]).
@@ -3177,11 +3293,13 @@ struct Handover {
 
 /// The [`Tasks`] a walk inside an operation performs its calls through: each call is
 /// handed to that operation's own asynchronous task, which makes it and hands the
-/// answer back.
+/// answer back — and several of a walk's calls may be in flight together, which is what
+/// the items of a `Map` state's concurrency run their work at the same time through
+/// ([`Tasks::begin`], [`MAX_CALLS_IN_FLIGHT`]).
 ///
 /// One of these exists only INSIDE the blocking closure [`interpret`] spawns — it is
 /// private, its field is private, and nothing else constructs one — which is what
-/// makes the blocking handover below sound: a blocking send from an async worker
+/// makes the blocking wait below sound: a blocking wait from an async worker
 /// would be a defect, and there is no way to reach this from one.
 struct Dispatcher {
     calls: ::tokio::sync::mpsc::Sender<Handover>,
@@ -3227,22 +3345,23 @@ fn unavailable(call: &Call) -> Failed {
     }
 }
 
-/// What a task fails with when the operation running the execution is STILL inside
-/// the previous call of this walk, so there is nothing to hand this one to.
+/// What a task fails with when the operation running the execution has not taken the
+/// calls already handed to it, so there is nowhere to hand this one.
 ///
-/// One call is in flight at a time, and the walk waits for each answer before it
-/// transitions — so this is reachable only after a call TIMED OUT server-side while
-/// its target went on holding it. The walk is not held with it: NOTHING is handed
-/// over for this call, so the failure is the one every other decline of this module
-/// carries ([`super::asl::RUNTIME_ERROR`], as [`too_deep`] and [`unavailable`] do)
-/// rather than ASL's timeout name, which names work that ran past a bound the state
+/// The serving half takes each handover as it arrives and performs it beside the ones
+/// already in flight ([`interpret_through`]), so the queue it is handed over through is
+/// normally empty — this is reachable only when as many calls are queued as this emulator
+/// queues for one walk and none of them has been taken. The walk is not held with them:
+/// NOTHING is handed over for this call, so the failure is the one every other decline of
+/// this module carries ([`super::asl::RUNTIME_ERROR`], as [`too_deep`] and [`unavailable`]
+/// do) rather than ASL's timeout name, which names work that ran past a bound the state
 /// declared for it.
 fn still_calling(call: &Call) -> Failed {
     Failed {
         error: super::asl::RUNTIME_ERROR.to_string(),
         cause: format!(
-            "{} could not be made while the call this execution made before it has still not \
-             answered, so nothing was run for it",
+            "{} could not be made while the calls this execution made before it have still not \
+             been taken, so nothing was run for it",
             call.described()
         ),
     }
@@ -3282,8 +3401,20 @@ fn timed_out(call: &Call, waited: Duration) -> Failed {
     }
 }
 
-impl Tasks for Dispatcher {
-    fn perform(&self, call: &Call, request: &Value, within: Option<Duration>) -> Answer {
+impl Dispatcher {
+    /// Hand `call` with `request` to the asynchronous task that makes it, and answer what
+    /// the walk takes its answer from.
+    ///
+    /// The call is in flight from here: the serving half takes the handover as it arrives
+    /// and performs it beside whatever else this walk has started
+    /// ([`interpret_through`]), so what the caller decides is only whether it waits for
+    /// the answer now ([`Tasks::perform`]) or later ([`Tasks::begin`]).
+    fn hand_over_call(
+        &self,
+        call: &Call,
+        request: &Value,
+        within: Option<Duration>,
+    ) -> Result<InFlight, Failed> {
         // The chain's depth is decided BEFORE the handover: a call this deep is not
         // made at all, so the chain stops pinning threads here.
         if self.depth >= MAX_CALL_CHAIN_DEPTH {
@@ -3300,14 +3431,12 @@ impl Tasks for Dispatcher {
         };
         // The walk runs on a blocking thread (`spawn_blocking`), never on an async
         // worker, so it may block here — but the handover must not be able to block
-        // WITHOUT a bound. The walk has at most one call outstanding, so the single
-        // buffered slot is normally free; it is NOT free when a previous call of this
-        // walk timed out server-side and its target has still not answered, because
-        // the serving half is then still inside that call. A send that waited there
-        // would hold this blocking thread for the stuck target's own hold time rather
-        // than for any ceiling this module states, so the handover is attempted
-        // WITHOUT waiting and a slot that is not free fails the task instead:
-        // nothing was handed over for it, and nothing is faked.
+        // WITHOUT a bound. The serving half takes every handover as it arrives, so the
+        // buffered slots are normally free; a send that waited for one would hold this
+        // blocking thread for however long the half that has not taken them is busy,
+        // rather than for any ceiling this module states. So the handover is attempted
+        // WITHOUT waiting and a queue that is full fails the task instead: nothing was
+        // handed over for it, and nothing is faked.
         match self.calls.try_send(handover) {
             Ok(()) => {}
             Err(::tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -3317,13 +3446,42 @@ impl Tasks for Dispatcher {
                 return Err(still_calling(call))
             }
         }
+        Ok(InFlight {
+            call: call.clone(),
+            request: request.clone(),
+            answered,
+            waited,
+            began: super::now(),
+        })
+    }
+}
+
+impl Tasks for Dispatcher {
+    fn perform(&self, call: &Call, request: &Value, within: Option<Duration>) -> Answer {
         // The wait is CLAMPED server-side: whatever the call is doing, this thread
         // is released at that bound.
-        match answered.recv_timeout(waited) {
-            Ok(answer) => answer,
-            Err(::std::sync::mpsc::RecvTimeoutError::Timeout) => Err(timed_out(call, waited)),
-            Err(::std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(unavailable(call)),
-        }
+        self.hand_over_call(call, request, within)
+            .map_or_else(Err, InFlight::settle)
+    }
+
+    fn begin(&self, call: &Call, request: &Value, within: Option<Duration>) -> Option<InFlight> {
+        // A call that could not be handed over has started nothing, so the caller is told
+        // nothing is in flight and performs it instead — which reports the refusal above
+        // as the task's own failure rather than losing it here.
+        self.hand_over_call(call, request, within).ok()
+    }
+
+    /// How many calls THIS walk may leave in flight: the figure for a walk serving an
+    /// inbound request, halved for each level of in-process calls it already sits in.
+    ///
+    /// Every level of a chain holds a blocking thread per walk, and a call in flight may
+    /// be an execution of its own ([`MAX_CALL_CHAIN_DEPTH`]), so what bounds the threads
+    /// one inbound request can pin is the PRODUCT over the levels rather than the figure
+    /// at any one of them. Halving per level keeps that product inside the blocking pool
+    /// a runtime keeps by default, and never below one call, which is what lets the items
+    /// of a `Map` state nested one level down run their work together at all.
+    fn calls_in_flight(&self) -> usize {
+        (MAX_CALLS_IN_FLIGHT >> u32::from(self.depth)).max(1)
     }
 
     fn authorize(&self, call: &Call, request: &Value) -> Option<Failed> {
@@ -3350,7 +3508,9 @@ impl Tasks for Dispatcher {
 ///
 /// The walk is CPU work a caller's definition sizes, so it does not run on an async
 /// worker; the calls it asks for are asynchronous, so they are made here, on the
-/// operation's own task, with the walk waiting for each answer. Both halves are
+/// operation's own task, with the walk waiting for each answer — and the calls a `Map`
+/// state's concurrency starts for its items are served beside each other, so they run at
+/// the same time ([`Tasks::begin`]). Both halves are
 /// polled together, and the serving half ends when the walk drops its sender — so
 /// the call returns exactly when the interpretation is over.
 ///
@@ -3394,9 +3554,13 @@ where
     Work: FnOnce(&dyn Tasks) -> Outcome + Send + 'static,
     Outcome: Send + 'static,
 {
-    // One call is in flight at a time: the walk waits for each answer before it
-    // transitions, so a deeper channel would buffer nothing.
-    let (calls, mut handovers) = ::tokio::sync::mpsc::channel::<Handover>(1);
+    // As many calls as this emulator carries in flight for one walk, plus the one a
+    // handover that has not been taken yet sits in: the walk hands over without waiting
+    // ([`Dispatcher::hand_over_call`]), and the serving half takes each handover as it
+    // arrives, so the queue is what keeps a handover from failing while the half that
+    // serves it is between two of them.
+    let (calls, mut handovers) =
+        ::tokio::sync::mpsc::channel::<Handover>(MAX_CALLS_IN_FLIGHT + 1);
     let role = acting.role;
     let connections = acting.connections;
     let handed = acting.handovers;
@@ -3416,59 +3580,77 @@ where
         work(&dispatcher)
     });
     let serve = async {
+        // Each handover is served on a task of its own, so the calls one walk has handed
+        // over are IN FLIGHT TOGETHER: that is what makes the items of a `Map` state's
+        // concurrency really run at the same time ([`super::asl::map_items`]), and it is
+        // also what lets this half go back to the queue while a target holds a call
+        // (`GetActivityTask` is a long poll) instead of serving one call at a time. The
+        // tasks are owned by this set, so none of them outlives the interpretation.
+        let mut serving = ::tokio::task::JoinSet::new();
         while let Some(handover) = handovers.recv().await {
-            // The SERVING half is bounded by the same ceiling the waiting half is:
-            // a call that has not answered inside it is abandoned here too, so this
-            // loop returns to `handovers.recv()` and the walk's next call is handed
-            // over rather than waiting for a target that is still holding the
-            // previous one (`GetActivityTask` is a long poll). Nothing is faked for
-            // an abandoned call: the walk reported the timeout itself.
-            // The HTTP Task's work is a request to the endpoint its own parameters
-            // name rather than a call on a service's operation, so it is made by the
-            // module that owns that reading — over the same transport, under the same
-            // ceiling, and reported to the walk through the same seam.
-            //
-            // That transport is what makes the endpoint a caller's parameters name safe
-            // to hand over here: BOTH arms below go to
-            // `EmbeddedEmulator::http_connector`, this emulator's own in-process router,
-            // so no client is built, no name is resolved and no address is dialled — an
-            // `ApiEndpoint` naming anything this emulator does not serve reaches nothing
-            // and is answered by the front door's own refusal
-            // (`super::http_task`, "Where the request goes"). There is therefore no
-            // address for an allowlist to screen and nothing of the host on the request:
-            // neither a header of the request being served nor the emulator's own
-            // credentials travel on it, and the only credential it carries is the
-            // emulated connection's own.
-            let made = async {
-                match handover.call.endpoint {
-                    true => {
-                        super::http_task::invoke(
-                            callback,
-                            connections.as_ref(),
-                            &handover.request,
-                        )
-                        .await
+            // The tasks that have already answered are reaped here rather than left to
+            // accumulate: the set holds exactly the calls still in flight.
+            while serving.try_join_next().is_some() {}
+            let callback = callback.clone();
+            let connections = connections.clone();
+            let signing = signing.clone();
+            let region = region.to_string();
+            serving.spawn(async move {
+                // The SERVING half is bounded by the same ceiling the waiting half is:
+                // a call that has not answered inside it is abandoned here too, so
+                // nothing holds the walk's answer past that bound. Nothing is faked for
+                // an abandoned call: the walk reported the timeout itself.
+                // The HTTP Task's work is a request to the endpoint its own parameters
+                // name rather than a call on a service's operation, so it is made by the
+                // module that owns that reading — over the same transport, under the same
+                // ceiling, and reported to the walk through the same seam.
+                //
+                // That transport is what makes the endpoint a caller's parameters name
+                // safe to hand over here: BOTH arms below go to
+                // `EmbeddedEmulator::http_connector`, this emulator's own in-process
+                // router, so no client is built, no name is resolved and no address is
+                // dialled — an `ApiEndpoint` naming anything this emulator does not serve
+                // reaches nothing and is answered by the front door's own refusal
+                // (`super::http_task`, "Where the request goes"). There is therefore no
+                // address for an allowlist to screen and nothing of the host on the
+                // request: neither a header of the request being served nor the
+                // emulator's own credentials travel on it, and the only credential it
+                // carries is the emulated connection's own.
+                let made = async {
+                    match handover.call.endpoint {
+                        true => {
+                            super::http_task::invoke(
+                                &callback,
+                                connections.as_ref(),
+                                &handover.request,
+                            )
+                            .await
+                        }
+                        false => {
+                            call_api_as(
+                                &callback,
+                                &region,
+                                &handover.call,
+                                &handover.request,
+                                signing.as_ref(),
+                            )
+                            .await
+                        }
                     }
-                    false => {
-                        call_api_as(
-                            callback,
-                            region,
-                            &handover.call,
-                            &handover.request,
-                            signing.as_ref(),
-                        )
-                        .await
-                    }
-                }
-            };
-            let answer = match ::tokio::time::timeout(MAX_CALL_DURATION, made).await {
-                Ok(answer) => answer,
-                Err(_elapsed) => Err(timed_out(&handover.call, MAX_CALL_DURATION)),
-            };
-            // A walk that has stopped waiting — it timed out, or it is gone — cannot
-            // be told; it reported the timeout itself.
-            let _ = handover.answer.send(answer);
+                };
+                let answer = match ::tokio::time::timeout(MAX_CALL_DURATION, made).await {
+                    Ok(answer) => answer,
+                    Err(_elapsed) => Err(timed_out(&handover.call, MAX_CALL_DURATION)),
+                };
+                // A walk that has stopped waiting — it timed out, or it is gone — cannot
+                // be told; it reported the timeout itself.
+                let _ = handover.answer.send(answer);
+            });
         }
+        // The walk has dropped its sender, so no further call is coming: the calls still
+        // in flight are waited out here, which is what makes every call this
+        // interpretation asked for over by the time it returns.
+        while serving.join_next().await.is_some() {}
     };
     let (walked, ()) = ::tokio::join!(walk, serve);
     walked
@@ -3532,530 +3714,6 @@ pub fn reported_result(call: &Call, answer: &Value) -> Value {
         None => task_result(answer),
     }
 }
-
-/// The document `request` goes on the wire as: every TOP-LEVEL member under the
-/// spelling the invoked service's model uses for it ([`MemberCase`]), and every
-/// member the integration documents as a document the operation types as a string
-/// carried as that document's JSON text ([`Call::json_text`]).
-///
-/// A `Task` state's integration parameters are the invoked operation's input, and
-/// they are written in the integration's own convention — PascalCase — whatever the
-/// invoked API spells its members in, so the spelling is settled here rather than
-/// handing a service a member name its model does not carry.
-///
-/// Only the TOP level is re-spelled. Below it a document carries a caller's DATA
-/// beside the operation's members — a DynamoDB attribute name is a map key, an
-/// EventBridge detail is a caller's own document — and data is never re-spelled. A
-/// member the operation types as a STRING is carried as JSON text wherever it sits,
-/// top level or nested ([`Call::json_text_at`]), because that is a fact of the invoked
-/// operation's own model rather than of the request's shape. A value already a string
-/// is left as it is, so a member written as the text the operation types goes through
-/// untouched.
-fn wire_request(call: &Call, request: &Value) -> Value {
-    let Some(members) = request.as_object() else {
-        return request.clone();
-    };
-    let mut wire = Map::new();
-    for (member, value) in members {
-        let member = call.api.member_case.spell(member);
-        let value = match call.json_text.contains(&member.as_str()) {
-            true if !value.is_string() => Value::String(value.to_string()),
-            _ => value.clone(),
-        };
-        wire.insert(member, value);
-    }
-    let mut document = Value::Object(wire);
-    for path in call.json_text_at {
-        as_json_text(&mut document, path);
-    }
-    document
-}
-
-/// Replace the document the member `path` names in `document` with that document's JSON
-/// text, leaving `document` as it is where the path names nothing and leaving a value
-/// that is already text untouched.
-///
-/// The inverse of [`parse_in_place`], and the nested form of [`Call::json_text`]: a LIST
-/// on the way is walked element by element, so one path names the same member of every
-/// entry of a request that takes a list of them.
-fn as_json_text(document: &mut Value, path: &[&str]) {
-    if let Some(items) = document.as_array_mut() {
-        for item in items {
-            as_json_text(item, path);
-        }
-        return;
-    }
-    let Some((member, rest)) = path.split_first() else {
-        return;
-    };
-    let Some(node) = document.get_mut(*member) else {
-        return;
-    };
-    if !rest.is_empty() {
-        as_json_text(node, rest);
-        return;
-    }
-    if !node.is_string() {
-        *node = Value::String(node.to_string());
-    }
-}
-
-/// One request, built for the protocol the invoked service's model declares.
-struct Wired {
-    method: &'static str,
-    /// The request-target, which for an AWS JSON service is the root and for a REST
-    /// one is the operation's own path and query.
-    uri: String,
-    /// The operation's name as the AWS JSON protocol carries it
-    /// (`<target prefix>.<OperationName>`); `None` for a REST request, which names
-    /// the operation by its method and path.
-    target: Option<String>,
-    /// The headers this operation's own members are bound to, beside the ones every
-    /// request carries.
-    headers: Vec<(&'static str, String)>,
-    body: Vec<u8>,
-}
-
-/// The request `call` makes with `request` as the operation's input, or why it could
-/// not be built.
-fn wired(call: &Call, request: &Value) -> Result<Wired, String> {
-    let document = wire_request(call, &call.operation_input(request));
-    let Some(rest) = call.rest else {
-        // An AWS JSON request body IS the operation's input document, posted to the
-        // root and named in a header.
-        let target = match call.api.wire {
-            Wire::Json { target_prefix, .. } => format!("{target_prefix}.{}", call.operation),
-            // An `awsQuery` request is a FORM, posted to the root, with the operation
-            // named in it rather than in a header.
-            Wire::Query { version, .. } => {
-                return Ok(Wired {
-                    method: "POST",
-                    uri: "/".to_string(),
-                    target: None,
-                    headers: Vec::new(),
-                    body: form_body(&call.operation, version, &document, call.form_maps)?
-                        .into_bytes(),
-                })
-            }
-            // A service whose protocol is a REST one reaches this only for a call
-            // carrying no binding, which [`read`] does not produce.
-            Wire::Rest(_) => {
-                return Err(format!(
-                    "the '{}' call of {} carries no request binding for that service's REST \
-                     protocol",
-                    call.operation, call.api.sdk_id
-                ))
-            }
-        };
-        let body = ::serde_json::to_vec(&document).map_err(|error| error.to_string())?;
-        return Ok(Wired {
-            method: "POST",
-            uri: "/".to_string(),
-            target: Some(target),
-            headers: Vec::new(),
-            body,
-        });
-    };
-    rest.wired(&document, call.payload_document)
-}
-
-/// The `application/x-www-form-urlencoded` body an `awsQuery` request carries:
-/// `Action` naming the operation, `Version` naming the service's API version, and one
-/// field per LEAF of the operation's input.
-///
-/// Each field name and each value is percent-encoded by the maintained encoder
-/// ([`::percent_encoding`]), over RFC 3986's unreserved set — which is the encoding
-/// AWS's own canonical request states — so a value carrying a delimiter is one field
-/// rather than several, and a map key the caller chose cannot read as the protocol's
-/// own `.` separator.
-///
-/// A member whose value is a MAP is spread as this protocol spreads one: one numbered
-/// `entry` per pair, each carrying the pair's key and its value under the names that
-/// map's own key and value members are written with ([`FormMap`]), and a value that is
-/// a structure carrying its own members as one field each below it. Those names are the
-/// invoked shape's, so a collection member no entry is carried for — any list, and a
-/// map or structure this emulator does not state the field names of — is still NOT
-/// bound: the call is not made for one rather than made with a field the service does
-/// not carry.
-fn form_body(
-    operation: &str,
-    version: &str,
-    document: &Value,
-    maps: &[FormMap],
-) -> Result<String, String> {
-    let mut body = format!("Action={operation}&Version={version}");
-    for (member, value) in document.as_object().into_iter().flatten() {
-        let spread = match maps.iter().find(|map| map.member == *member) {
-            Some(map) => Spread::Map(map),
-            None => Spread::Scalar,
-        };
-        let mut fields = Vec::new();
-        form_fields(&encoded(member), value, spread, &mut fields)?;
-        for (field, value) in fields {
-            body.push('&');
-            body.push_str(&field);
-            body.push('=');
-            body.push_str(&encoded(&value));
-        }
-    }
-    Ok(body)
-}
-
-/// What one node of a form request's document is spread over fields AS, which is a
-/// fact of the member the invoked model declares at that place rather than of the
-/// value.
-#[derive(Debug, Clone, Copy)]
-enum Spread<'a> {
-    /// One field, which is what every scalar is; a structure or a list reached here
-    /// is a member whose field names this emulator does not carry, so no call is made
-    /// for it.
-    Scalar,
-    /// A MAP, whose pairs are numbered `entry` fields under the names its key and
-    /// value members are written with.
-    Map(&'a FormMap),
-    /// A STRUCTURE, each of whose members is one field named `<this>.<member>`.
-    Structure,
-}
-
-/// The `entry` wrapper this protocol numbers a map's pairs under
-/// (`<member>.entry.<n>.<key>`).
-const MAP_ENTRY: &str = "entry";
-
-/// The fields the node `name` of a form request goes on the wire as, appended to
-/// `fields` as (already-encoded name, raw value) pairs.
-fn form_fields(
-    name: &str,
-    value: &Value,
-    spread: Spread<'_>,
-    fields: &mut Vec<(String, String)>,
-) -> Result<(), String> {
-    // A member the request did not carry is no field at all.
-    match value {
-        Value::Null => Ok(()),
-        Value::String(text) => {
-            fields.push((name.to_string(), text.clone()));
-            Ok(())
-        }
-        Value::Bool(_) | Value::Number(_) => {
-            fields.push((name.to_string(), value.to_string()));
-            Ok(())
-        }
-        Value::Object(members) => match spread {
-            Spread::Map(map) => {
-                for (index, (key, held)) in members.iter().enumerate() {
-                    let entry = format!("{name}.{MAP_ENTRY}.{}", index + 1);
-                    fields.push((format!("{entry}.{}", encoded(map.key)), key.clone()));
-                    let at = format!("{entry}.{}", encoded(map.value));
-                    let held_as = match map.structured {
-                        true => Spread::Structure,
-                        false => Spread::Scalar,
-                    };
-                    form_fields(&at, held, held_as, fields)?;
-                }
-                Ok(())
-            }
-            Spread::Structure => {
-                for (member, held) in members {
-                    let at = format!("{name}.{}", encoded(member));
-                    form_fields(&at, held, Spread::Scalar, fields)?;
-                }
-                Ok(())
-            }
-            Spread::Scalar => Err(unbound_form_member(name, "structure")),
-        },
-        Value::Array(_) => Err(unbound_form_member(name, "list")),
-    }
-}
-
-/// Why no call is made for a request carrying the member `name` as the collection
-/// `kind`: this protocol spreads such a member over one field per leaf, under names
-/// that are the invoked shape's own.
-fn unbound_form_member(name: &str, kind: &str) -> String {
-    format!(
-        "this task's '{name}' is a {kind}, which this emulator does not bind to that service's \
-         form-field protocol"
-    )
-}
-
-/// `text` percent-encoded as ONE field of a form ([`UNRESERVED_ONLY`]).
-fn encoded(text: &str) -> String {
-    ::percent_encoding::utf8_percent_encode(text, UNRESERVED_ONLY).to_string()
-}
-
-/// The characters a value percent-encoded as ONE component escapes: everything but RFC
-/// 3986's unreserved set, which is the encoding AWS's own canonical request states for a
-/// query component and what a form field carries.
-///
-/// `pub(super)`, because it is the same set wherever a value of this crate is written
-/// into a query or a form: the field of the form an `awsQuery` request IS
-/// ([`form_body`]), and the query parameter and form field an HTTP Task sends
-/// ([`super::http_task`]).
-pub(super) const UNRESERVED_ONLY: &::percent_encoding::AsciiSet =
-    &::percent_encoding::NON_ALPHANUMERIC
-        .remove(b'-')
-        .remove(b'.')
-        .remove(b'_')
-        .remove(b'~');
-
-impl Rest {
-    /// The request this operation's bindings put `document` on the wire as.
-    ///
-    /// `payload_document` says what the payload member's value IS: a value out of a
-    /// JSON document a state built, whose bytes are that value's own JSON text, or the
-    /// bytes a caller handed the member already rendered ([`Call::payload_document`]).
-    fn wired(&self, document: &Value, payload_document: bool) -> Result<Wired, String> {
-        let mut uri = String::new();
-        let mut remaining = self.uri;
-        // Each `{<member>}` of the path stands for the value the request names that
-        // member with; a request naming none has no path to send, so the call is not
-        // made rather than made against a path with a hole in it.
-        while let Some((before, after)) = remaining.split_once('{') {
-            uri.push_str(before);
-            let (label, tail) = after
-                .split_once('}')
-                .ok_or_else(|| format!("the '{}' path binding is malformed", self.operation))?;
-            // A label written `{<member>+}` is a GREEDY one, which spans as many path
-            // segments as the value has: an object key is bound that way, so the
-            // separator between its segments is part of the value rather than a
-            // delimiter the value may not carry.
-            let (label, component) = match label.strip_suffix('+') {
-                Some(greedy) => (greedy, Component::GreedyLabel),
-                None => (label, Component::Label),
-            };
-            let named = member_text(document, label).ok_or_else(|| {
-                format!("this task's parameters name no '{label}', which the call's path needs")
-            })?;
-            uri.push_str(&one_component(&named, label, component)?);
-            remaining = tail;
-        }
-        uri.push_str(remaining);
-        for (member, parameter) in self.query {
-            let Some(named) = member_text(document, member) else {
-                continue;
-            };
-            let value = one_component(&named, member, Component::Query)?;
-            // The operation's own `http.uri` may already carry a literal query — which
-            // is how a service names a subresource (`?list-type=2`) — so what separates
-            // this parameter from what is already there is read off the target as it
-            // stands rather than assumed to be its first.
-            uri.push(if uri.contains('?') { '&' } else { '?' });
-            uri.push_str(parameter);
-            uri.push('=');
-            uri.push_str(&value);
-        }
-        let headers = self
-            .headers
-            .iter()
-            .filter_map(|(member, field)| Some((*field, member_text(document, member)?)))
-            .collect();
-        let body = match self.request_body {
-            // Every member is bound to the path, the query or a header, so there is no
-            // body to send.
-            Body::Empty => Vec::new(),
-            // The payload member IS the body. For a value out of the document a state
-            // built, the bytes are that JSON value's own TEXT — a string arrives as the
-            // JSON string literal it is in that document, an object or an array as its
-            // own document — because what the member carries is a value of that
-            // document rather than bytes. A member handed bytes already rendered
-            // carries them as they stand.
-            Body::Member(member) | Body::Text(member) => match document.get(member) {
-                None | Some(Value::Null) => Vec::new(),
-                Some(Value::String(text)) if !payload_document => text.clone().into_bytes(),
-                Some(value) => ::serde_json::to_vec(value).map_err(|error| error.to_string())?,
-            },
-            // The document of every member no other binding carries: one already on
-            // the wire in the path, the query or a header is not in the body as well,
-            // and a request whose members are all bound elsewhere carries no body.
-            Body::Document => {
-                let carried = self.unbound(document);
-                match carried.is_empty() {
-                    true => Vec::new(),
-                    false => ::serde_json::to_vec(&Value::Object(carried))
-                        .map_err(|error| error.to_string())?,
-                }
-            }
-        };
-        Ok(Wired {
-            method: self.method,
-            uri,
-            target: None,
-            headers,
-            body,
-        })
-    }
-
-    /// The response document this operation's bindings read a 2xx answer as: the
-    /// status, the headers and the body each under the member they are bound to.
-    ///
-    /// Every value in it is the ANSWER's own, and a member the answer carried nothing
-    /// for is absent rather than filled in.
-    fn result(&self, answered: &Answered) -> Value {
-        let mut members = Map::new();
-        if !self.response_status.is_empty() {
-            members.insert(
-                self.response_status.to_string(),
-                Value::Number(answered.status.into()),
-            );
-        }
-        for (member, field) in self.response_headers {
-            if let Some(value) = answered.header(field) {
-                members.insert((*member).to_string(), Value::String(value));
-            }
-        }
-        if !answered.payload.is_empty() {
-            // The body is reported as the document it holds, which is what the
-            // integration's result carries; a body that is not one is reported as
-            // its own text rather than dropped.
-            let payload = ::serde_json::from_slice::<Value>(&answered.payload).unwrap_or_else(
-                |_| Value::String(String::from_utf8_lossy(&answered.payload).to_string()),
-            );
-            match self.response_body {
-                Body::Member(member) => {
-                    members.insert(member.to_string(), payload);
-                }
-                // A payload member the model types as a BLOB is the bytes themselves,
-                // so it is reported as the TEXT it is even where those bytes parse as a
-                // document: that is the string the integration answers, and the one a
-                // state reads with `States.StringToJson`.
-                Body::Text(member) => {
-                    members.insert(
-                        member.to_string(),
-                        Value::String(String::from_utf8_lossy(&answered.payload).to_string()),
-                    );
-                }
-                // The body IS the operation's output document, so the members it
-                // holds are the answer's own: they are reported beside the ones the
-                // status and the headers carry rather than under a member of their
-                // own. A body that is not that document carries no member of this
-                // operation's, and nothing is invented for one.
-                Body::Document => {
-                    if let Value::Object(carried) = payload {
-                        members.extend(carried);
-                    }
-                }
-                // An operation that binds no body reports none, whatever bytes the
-                // answer happened to carry.
-                Body::Empty => {}
-            }
-        }
-        Value::Object(members)
-    }
-
-    /// The members of `document` this operation binds NOWHERE else — not to its path,
-    /// its query or a header — which are the ones its body carries
-    /// ([`Body::Document`]).
-    fn unbound(&self, document: &Value) -> Map<String, Value> {
-        let labels = self.labels();
-        document
-            .as_object()
-            .into_iter()
-            .flatten()
-            .filter(|(member, _)| {
-                !labels.iter().any(|label| label == member)
-                    && !self.query.iter().any(|(bound, _)| bound == member)
-                    && !self.headers.iter().any(|(bound, _)| bound == member)
-            })
-            .map(|(member, value)| (member.clone(), value.clone()))
-            .collect()
-    }
-
-    /// The members this operation binds to its PATH, as the `{<member>}` holes of its
-    /// `http.uri` name them, a GREEDY label's own `+` dropped.
-    fn labels(&self) -> Vec<&'static str> {
-        let mut labels = Vec::new();
-        let mut remaining = self.uri;
-        while let Some((_, after)) = remaining.split_once('{') {
-            let Some((label, tail)) = after.split_once('}') else {
-                break;
-            };
-            labels.push(label.strip_suffix('+').unwrap_or(label));
-            remaining = tail;
-        }
-        labels
-    }
-
-    /// The output member this operation binds the answer's BODY to, for an operation
-    /// that binds one ([`Body::Member`]); `None` where the body is the output document
-    /// itself or the answer carries none.
-    fn response_member(&self) -> Option<&'static str> {
-        match self.response_body {
-            Body::Member(member) | Body::Text(member) => Some(member),
-            Body::Document | Body::Empty => None,
-        }
-    }
-}
-
-/// The text `document` names `member` with: a value given as a string is that string,
-/// and any other value is its JSON text, which is how a path, a query parameter or a
-/// header carries one. `None` for a member the document does not carry.
-fn member_text(document: &Value, member: &str) -> Option<String> {
-    match document.get(member) {
-        None | Some(Value::Null) => None,
-        Some(Value::String(text)) => Some(text.clone()),
-        Some(value) => Some(value.to_string()),
-    }
-}
-
-/// Which part of a request-target a member's value goes into, which decides one thing:
-/// whether an EMPTY value is one that part can carry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Component {
-    /// A path label, which stands for one whole segment: an empty one would collapse
-    /// the path it is part of, so there is no request to send for it.
-    Label,
-    /// A GREEDY path label (`{Key+}`), which stands for as many segments as the value
-    /// holds: the separator between them is part of the value, so it is carried rather
-    /// than refused. An empty one still collapses the path.
-    GreedyLabel,
-    /// A query parameter's value, which an operation may model as admitting the empty
-    /// string (`Invoke`'s `Qualifier` does), and which a request carries as the
-    /// parameter with nothing after its `=`.
-    Query,
-}
-
-/// `value`, when it is text a request-target carries as ONE component — a path segment
-/// or a query parameter's value — and `Err` naming `member` when it is not.
-///
-/// A member an operation binds to the path or the query is one whose own modelled
-/// pattern admits only characters a URI component admits: a function's name, its ARN and
-/// a version qualifier are written with the unreserved characters plus `:` and `$`, all
-/// of which a component carries as they stand. A caller's parameter CAN hold anything,
-/// so a value outside that set is one the request cannot address — the delimiters are
-/// what would make it more than one component — and the call is not made rather than
-/// made against a target assembled out of it. Nothing is escaped here: a value that
-/// needed escaping names no resource of the invoked operation either.
-///
-/// The path SEPARATOR is the one character whose place depends on the component: a
-/// greedy label spans several segments and a prefix or a key written in a query names
-/// one, so each of those carries it, while a single-segment label does not.
-fn one_component(value: &str, member: &str, component: Component) -> Result<String, String> {
-    let punctuation = match component {
-        Component::Label => URI_COMPONENT_PUNCTUATION,
-        Component::GreedyLabel | Component::Query => URI_PATH_PUNCTUATION,
-    };
-    let carried = value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || punctuation.contains(&byte));
-    let empty = value.is_empty()
-        && matches!(component, Component::Label | Component::GreedyLabel);
-    if empty || !carried {
-        return Err(format!(
-            "this task's '{member}' is not text a request-target carries as one component, so it \
-             addresses nothing the call can be made against"
-        ));
-    }
-    Ok(value.to_string())
-}
-
-/// The punctuation a URI component carries unescaped beside the alphanumerics: RFC
-/// 3986's unreserved set (`-`, `.`, `_`, `~`) and the two sub-delimiters an ARN and a
-/// version qualifier are written with (`:`, `$`).
-const URI_COMPONENT_PUNCTUATION: &[u8] = b"-._~:$";
-
-/// [`URI_COMPONENT_PUNCTUATION`] plus the path separator, for the components that span
-/// segments: a greedy label (an object's key) and a query parameter naming a path (a
-/// listing's prefix).
-const URI_PATH_PUNCTUATION: &[u8] = b"-._~:$/";
 
 /// Stop every job a walk started and then ABANDONED.
 ///
@@ -4737,3 +4395,9 @@ pub use published_events::*;
 /// The result schema of the operation an integration calls, which a MOCKED result is
 /// judged against.
 pub mod mock_result;
+
+/// How one call's REQUEST is rendered for the wire: the invoked operation's own
+/// document, the HTTP request a REST protocol binds it to, and the fields a FORM
+/// protocol spreads it over.
+mod wire_request;
+pub(crate) use wire_request::*;

@@ -4598,9 +4598,38 @@ pub fn after(time: SystemTime, offset: Duration) -> SystemTime {
 
 /// Now, in nanoseconds since the Unix epoch — only an id-generator seed.
 fn now_nanos() -> u64 {
+    drew_a_sample();
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos() as u64)
+}
+
+::std::thread_local! {
+    /// How many values the code running on THIS thread has SAMPLED rather than computed
+    /// ([`drew_a_sample`]).
+    static SAMPLES_DRAWN: ::std::cell::Cell<u64> = const { ::std::cell::Cell::new(0) };
+}
+
+/// Record that a value the code running on this thread produced was SAMPLED: drawn from
+/// the clock, from a generator, or by an engine that has both — so running the same code
+/// again would produce a different one.
+///
+/// Called wherever this service samples: the ids and names it mints and the jitter it
+/// spreads a retry by (through [`now_nanos`]), and every evaluation of a caller's own
+/// JSONata expression, whose engine binds functions that sample and does not say whether
+/// one was used ([`asl::jsonata`]).
+fn drew_a_sample() {
+    SAMPLES_DRAWN.with(|drawn| drawn.set(drawn.get().wrapping_add(1)));
+}
+
+/// How many values this thread has sampled so far ([`drew_a_sample`]).
+///
+/// What it answers is of no interest on its own: two readings are compared to tell
+/// whether a span of work SAMPLED anything, which is what decides whether walking that
+/// span again would produce the same values ([`asl::map_items`]). Nothing about an
+/// emulated resource is derived from it.
+fn samples_drawn() -> u64 {
+    SAMPLES_DRAWN.with(::std::cell::Cell::get)
 }
 
 /// SplitMix64: the id generator's mixing step, so consecutive seeds do not produce

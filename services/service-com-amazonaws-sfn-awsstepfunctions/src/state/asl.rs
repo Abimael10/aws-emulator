@@ -168,11 +168,20 @@
 //! concurrently on the real service, so a batch's span is its longest member's
 //! rather than the sum.
 //!
-//! That offset is also what ORDERS the work of a `Map` state's items, which run at the
-//! same time up to its `MaxConcurrency`: the iteration that runs is the one whose own
+//! That offset is also what ORDERS the walk of a `Map` state's items, which run at the
+//! same time up to its `MaxConcurrency`: the iteration that is walked is the one whose own
 //! clock is earliest, so one that waits on an effect its siblings commit yields to them
-//! and sees it ([`map_items`]). The order their work is done in is therefore decided by
-//! the definition and never by the host's own speed.
+//! and sees it ([`map_items`]). What each state of an iteration records, and the order the
+//! iterations are walked in, is therefore decided by the definition and never by the
+//! host's own speed.
+//!
+//! Their WORK is another matter, and has to be: `MaxConcurrency` is "an upper bound on how
+//! many invocations of the Iterator may run in parallel", so up to that many of a state's
+//! items have their work — a `Task` state's own call, which for a `lambda:invoke` task RUNS
+//! the caller's function — IN FLIGHT at one instant, really being performed beside each
+//! other ([`map_items`], [`super::integration::Tasks::begin`]). A client sizing a workload
+//! on the member therefore gets the parallelism it configured, and in what order two such
+//! calls finish is the work's own business, as it is on the real service.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1549,6 +1558,20 @@ fn runtime(cause: String) -> Failure {
     named(RUNTIME_ERROR, cause)
 }
 
+/// What the turn of a `Map` item that has STARTED its call and yielded to its siblings
+/// returns, so the walk of that item stops at the state that started it
+/// ([`Interpreter::perform_call`]).
+///
+/// It is never reported: the turn it ends is UNWOUND — every event, count and document
+/// of it is dropped, and the item is walked again from where that turn began once its
+/// call answers ([`map_items`]). It carries [`RUNTIME_ERROR`] so that nothing of the
+/// definition can act on it on the way out: that name is neither retried nor caught
+/// ([`errors_match`]), so no `Retry` re-runs the state and no `Catch` routes anywhere
+/// while the walk unwinds.
+fn unwound() -> Failure {
+    runtime("the work of this item was started and its turn put down".to_string())
+}
+
 /// A failure carrying one of ASL's other predefined error names.
 fn named(error: &str, cause: String) -> Failure {
     Failure {
@@ -2680,6 +2703,10 @@ fn interpret(
         continued_entry,
         // Decided when that entry is taken, for the state that takes it.
         skipping_entry: false,
+        // Nothing has been started or unwound where a walk begins ([`map_items`]).
+        started: None,
+        probing: None,
+        unwinding: false,
     };
     // And the same documents for the diagnoses this walk's own expressions word, which
     // quote the document they could not be applied to ([`GivenDocuments`]).
@@ -3310,6 +3337,21 @@ struct Interpreter<'tasks> {
     /// state's turn ends, so it suppresses exactly that one event
     /// ([`Interpreter::push_entered`]).
     skipping_entry: bool,
+    /// The integration call the concurrent unit being walked has already STARTED and is
+    /// waiting for, for the one kind of unit that starts one: an item of a `Map` state
+    /// whose items run together ([`map_items`]). Swapped in while that item's own turn
+    /// runs, as the rest of what an item owns is, so no item takes another's answer.
+    started: Option<super::integration::InFlight>,
+    /// Whether the turn being walked may START the first integration call it reaches and
+    /// leave it in flight instead of waiting for it, which is what puts the calls of a
+    /// `Map` state's items in flight together ([`map_items`]) — and, when it may, how
+    /// many values the thread had drawn from the clock when the turn began
+    /// ([`Interpreter::perform_call`]).
+    probing: Option<u64>,
+    /// Whether the walk is UNWINDING the turn that started such a call: the turn is
+    /// walked again once the call it is waiting for answers, so from here nothing further
+    /// is run and nothing of the turn is kept ([`map_items`]).
+    unwinding: bool,
 }
 
 /// Where a walk applied an [`ActivityReply`]: the step its own events begin at, and

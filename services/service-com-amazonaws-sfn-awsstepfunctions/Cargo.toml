@@ -118,6 +118,9 @@ uuid = { version = "1", features = ["v4"] }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so this crate's single integration-test
+# target (`tests/all/main.rs`) picks a new suite up as a new file.
+automod = { workspace = true }
 # The REST-protocol service a `Task` state's AWS SDK integration calls in
 # `tests/all/backup_task_integration.rs`: mounted beside Step Functions on the one
 # engine the test router builds, so the backup job a task starts is stored by AWS

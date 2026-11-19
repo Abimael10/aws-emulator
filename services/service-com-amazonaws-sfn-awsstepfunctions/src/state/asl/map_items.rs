@@ -16,9 +16,21 @@
 //!
 //! The walk still sleeps for none of it ([`super`]): the clock each iteration carries is
 //! the offset into the run at which its next state falls due, so what decides the ORDER
-//! of their work is that offset and never the host's own speed. Two iterations due at
-//! the same instant run in the order their items are listed, so a definition whose items
-//! never wait runs exactly as it reads.
+//! the iterations are WALKED in is that offset and never the host's own speed. Two
+//! iterations due at the same instant are walked in the order their items are listed, so
+//! a definition whose items never wait reads exactly as it runs.
+//!
+//! What IS really concurrent is their WORK, because the bound above is a bound on work
+//! running in parallel and nothing else would honour it: an iteration that reaches the
+//! call its `Task` state is made of hands that call over and is PUT DOWN at it
+//! ([`Interpreter::perform_call`]), so the next item begins and hands its own call over
+//! beside it, and a chunk of `MaxConcurrency` items has up to that many calls being
+//! performed at the same instant ([`Interpreter::run_chunk`]). An iteration that is put
+//! down leaves NOTHING of its turn behind — it is walked again from the state it handed
+//! the call over at, with its events, its counts and its data taken back to where that
+//! turn began ([`Interpreter::put_down`], [`Interpreter::take_up`]) — so what the run
+//! RECORDS is what it would have recorded had each turn been walked once, and the
+//! concurrency shows only in the work.
 //!
 //! One concern in a file of its own, reached from the walk through
 //! [`Interpreter::run_map_items`]; the names stay reachable unqualified from the module
@@ -41,6 +53,35 @@ pub(super) struct Cursor {
     pub(super) name: String,
     pub(super) value: Value,
     pub(super) at: Duration,
+}
+
+/// Where one item's turn BEGAN: what a turn of an iteration is taken back to when it is
+/// PUT DOWN at the call it handed over ([`Interpreter::put_down`],
+/// [`Interpreter::take_up`]) — the item's own position and data, and where the walk's own
+/// lists and counts stood when the turn began.
+struct Putdown {
+    cursor: Cursor,
+    retry_count: u64,
+    variables: BTreeMap<String, Value>,
+    assigned: BTreeMap<String, String>,
+    base_context: Value,
+    /// How many history events the walk had recorded, and how many of them this
+    /// iteration's unit had claimed: the turn's own events sit at the end of both, so both
+    /// are cut back to these.
+    steps: usize,
+    recorded: usize,
+    /// The attempts the state being run had spent as the turn began.
+    attempts_spent: Vec<u64>,
+    /// What the execution being recorded for had left of its own history allowance, and
+    /// the figures of the CHILD execution's history for an item that runs as one
+    /// ([`ChildHistory`]): a turn's events are counted once however many times it is
+    /// walked, whichever history they belong to, and that allowance is also what bounds
+    /// the transitions one run makes.
+    events_left: usize,
+    history: Option<ChildHistory>,
+    /// What was left of the interpretation work this run may do, so the turn is charged
+    /// for once however many times it is walked ([`work_left`]).
+    work_left: u64,
 }
 
 /// One iteration of a `Map` state that is RUNNING: where its own walk has got to, and
@@ -75,6 +116,12 @@ struct Iteration {
     started_at: Duration,
     /// Which [`Unit`] of the state's concurrent work this iteration's events belong to.
     unit: usize,
+    /// The integration call this iteration has already STARTED and not taken the answer
+    /// of: the work of one item, in flight while its siblings' own work is started
+    /// beside it. `None` for an iteration with no work outstanding, which is every
+    /// iteration of a state whose items do not run together
+    /// ([`Interpreter::items_run_together`]).
+    started: Option<super::super::integration::InFlight>,
     /// The history this iteration records into when it is a CHILD workflow execution's
     /// own, for a Distributed Map's item; `None` for an inline `Map`'s iteration, whose
     /// events are steps of the execution around it ([`ChildHistory`]).
@@ -95,6 +142,11 @@ struct Iteration {
 /// them, so holding them would make what one `Map` state's concurrent items keep in
 /// memory grow with the events they record. Two figures are all an iteration carries
 /// between its slices.
+///
+/// `Copy`, because a turn that is PUT DOWN is taken back to the figures its own history
+/// stood at ([`Putdown`]): what a turn recorded is counted once however many times it is
+/// walked.
+#[derive(Clone, Copy)]
 pub(super) struct ChildHistory {
     /// What is left of that execution's own allowance: a child whose `Next` chain forms
     /// a cycle is stopped by its OWN history, with the same failure its parent would
@@ -277,6 +329,20 @@ impl Interpreter<'_> {
     /// live iteration's clock, so it is started as soon as every live one has moved past
     /// that instant — which is how a chunk whose items never wait runs them in the order
     /// they are listed, one after another.
+    ///
+    /// Their WORK, though, is in flight together: an iteration that reaches the call its
+    /// `Task` state is made of hands that call over and is PUT DOWN there
+    /// ([`Interpreter::perform_call`]), so the next item begins and hands its own call
+    /// over beside it, and an iteration waiting for an answer is taken up again as soon
+    /// as no sibling due at or before it has work left to start. A chunk of
+    /// `MaxConcurrency` items therefore has up to that many calls really being made at
+    /// the same time, which is what the member bounds
+    /// ([`super::super::integration::Tasks::calls_in_flight`] bounds how many of them
+    /// this walk runs beside each other). An iteration that is put down leaves NOTHING of
+    /// its turn behind ([`Interpreter::take_up`]): it is walked again from the state it
+    /// handed the call over at, so the events the chunk records, the counts it spends and
+    /// the data its items carry are what they would have been had each turn been walked
+    /// once.
     #[allow(clippy::too_many_arguments)]
     fn run_chunk(
         &mut self,
@@ -289,6 +355,10 @@ impl Interpreter<'_> {
         tolerant: bool,
     ) -> Result<Duration, Attempt> {
         let mut batch_end = batch_start;
+        // Whether the work of this chunk's items may be in flight together: a chunk of
+        // one item has nothing to run beside, and what else decides it is the walk
+        // itself.
+        let together = chunk.len() > 1 && self.items_run_together();
         // Every iteration of this chunk that is still RUNNING, by the slot the schedule
         // names it by: a slot keeps its place so the schedule goes on naming the others,
         // and what an iteration that has ended carried is dropped there and then.
@@ -296,6 +366,10 @@ impl Interpreter<'_> {
         // Which iteration runs next: the live one due earliest, by the position of its
         // item where two are due together.
         let mut ready: BinaryHeap<Reverse<(Duration, usize, usize)>> = BinaryHeap::new();
+        // The iterations whose own work is IN FLIGHT, ordered the same way: each was
+        // walked up to the call it handed over, and is taken up again — to take that
+        // call's answer — once there is no sibling left to start work for.
+        let mut in_flight: BinaryHeap<Reverse<(Duration, usize, usize)>> = BinaryHeap::new();
         let mut begun = 0usize;
         loop {
             let begins = begun < chunk.len()
@@ -315,7 +389,23 @@ impl Interpreter<'_> {
                 }
                 continue;
             }
-            let Some(Reverse((_, _, slot))) = ready.pop() else {
+            // An iteration with no work outstanding runs before one that is waiting for
+            // its own where the two are due TOGETHER: that is what gets the work of as
+            // many of this chunk's items as may run together started before any of their
+            // answers is waited for. An iteration due EARLIER still runs first, whichever
+            // queue it sits in, so the order the iterations are walked in is the clock's
+            // as it has always been.
+            let next_ready = ready.peek().map(|Reverse((due, _, _))| *due);
+            let next_in_flight = in_flight.peek().map(|Reverse((due, _, _))| *due);
+            let takes_ready = match (next_ready, next_in_flight) {
+                (Some(ready_at), Some(flight_at)) => ready_at <= flight_at,
+                (ready_at, _) => ready_at.is_some(),
+            };
+            let turn = match takes_ready {
+                true => ready.pop().map(|next| (next, true)),
+                false => in_flight.pop().map(|next| (next, false)),
+            };
+            let Some((Reverse((_, _, slot)), has_no_work_outstanding)) = turn else {
                 break;
             };
             let Some(unit) = running
@@ -332,7 +422,39 @@ impl Interpreter<'_> {
                 let Some(recorded) = tallied.units.get_mut(unit).map(|unit| &mut unit.steps) else {
                     break;
                 };
-                self.run_slice(plan, iteration, recorded)
+                // This turn may hand its call over and be put down when the items run
+                // together, it has no work outstanding already, and this walk has room
+                // for another call in flight.
+                let may_be_put_down = has_no_work_outstanding
+                    && together
+                    && in_flight.len() < self.tasks.calls_in_flight();
+                let putdown = may_be_put_down.then(|| self.put_down(iteration, recorded));
+                let ended = self.run_slice(plan, iteration, recorded, may_be_put_down);
+                if self.unwinding {
+                    self.unwinding = false;
+                    // The turn handed its work over and was put down: NOTHING of it is
+                    // kept, and the iteration waits at the state that handed the call
+                    // over until there is no sibling left to start work for.
+                    //
+                    // Only a turn that MAY be put down hands a call over, so there is
+                    // always something to take it back to; a turn that somehow unwound
+                    // without one cannot be taken back, and nothing of this attempt is
+                    // reported as having run rather than its items being left half-run.
+                    let Some(putdown) = putdown else {
+                        return Err((
+                            Err(runtime(format!(
+                                "the work of an item of state '{}' was handed over by a turn \
+                                 that cannot be walked again, so nothing was run for it",
+                                plan.name
+                            ))),
+                            batch_end,
+                        ));
+                    };
+                    self.take_up(iteration, recorded, putdown);
+                    in_flight.push(Reverse((iteration.cursor.at, iteration.index, slot)));
+                    continue;
+                }
+                ended
             };
             let Some(branch) = ended else {
                 // The iteration yielded: its own clock has moved past a sibling's, so
@@ -605,6 +727,8 @@ impl Interpreter<'_> {
             },
             started_at: batch_start,
             unit,
+            // Nothing is in flight for an iteration that has not been walked yet.
+            started: None,
             history,
         })))
     }
@@ -626,11 +750,17 @@ impl Interpreter<'_> {
     /// as the slice runs — so the events of one item, their numbering and the quota they
     /// are held to are the CHILD execution's, none of them is kept, and nothing of them
     /// sits in the parent's list for a cut to name.
+    ///
+    /// `may_be_put_down` is whether this turn may hand the first call it reaches over and
+    /// stop there, leaving it in flight while a sibling's own work is started: the walk
+    /// then reports it UNWOUND ([`Interpreter::unwinding`]), and the caller takes the turn
+    /// back to where it began.
     fn run_slice(
         &mut self,
         plan: &MapPlan<'_>,
         iteration: &mut Iteration,
         recorded: &mut Vec<usize>,
+        may_be_put_down: bool,
     ) -> Option<Branch> {
         // One level deeper for as long as this slice runs, exactly as a walk that runs
         // the iteration to its end in one go is: the nesting a definition may ask for is
@@ -652,6 +782,16 @@ impl Interpreter<'_> {
         let enclosing_context = std::mem::replace(
             &mut self.base_context,
             std::mem::take(&mut iteration.base_context),
+        );
+        // The work this iteration already has in flight, and whether it may put another
+        // one there: both belong to the iteration that is running, so they are swapped in
+        // with the rest of what it owns. The reading the sample count is taken at is THIS
+        // turn's beginning, which is what says whether walking it again would ask for the
+        // same call ([`Interpreter::perform_call`]).
+        let enclosing_started = std::mem::replace(&mut self.started, iteration.started.take());
+        let enclosing_probing = std::mem::replace(
+            &mut self.probing,
+            may_be_put_down.then(super::super::samples_drawn),
         );
         // The child execution's own history, for an item that runs as one: its
         // allowance, its numbering and the count of what it has recorded are swapped in
@@ -692,7 +832,92 @@ impl Interpreter<'_> {
         iteration.variables = std::mem::replace(&mut self.variables, enclosing_variables);
         iteration.assigned = std::mem::replace(&mut self.assigned, enclosing_assigned);
         iteration.base_context = std::mem::replace(&mut self.base_context, enclosing_context);
+        iteration.started = std::mem::replace(&mut self.started, enclosing_started);
+        self.probing = enclosing_probing;
         ended
+    }
+
+    /// Whether the items of the `Map` state being run may have their work IN FLIGHT
+    /// TOGETHER, which is what makes `MaxConcurrency` a number of items whose work is
+    /// really being done at the same time.
+    ///
+    /// Two kinds of walk run them one at a time instead. The items of a NESTED `Map` do:
+    /// the item of the state around them is itself a turn that may be put down, and one
+    /// turn is put down at a time, so it is the outermost state whose items run together.
+    /// And so do the items of a walk that CONTINUES an execution — from a worker's reply,
+    /// from a job that ended, from an answered token, or from a redrive — because what
+    /// such a walk applies to the state it continues at is TAKEN as that state runs, and
+    /// a turn that is put down and walked again would have to apply it twice.
+    fn items_run_together(&self) -> bool {
+        self.map_depth == 0
+            && self.reply.is_none()
+            && self.job_reply.is_none()
+            && self.callback_reply.is_none()
+            && self.resumed.is_none()
+            && self.resumed_attempts.is_none()
+            && self.continued_entry.is_none()
+            && self.resume_frames.is_empty()
+            && !self.skipping_entry
+            && self.waiting.is_none()
+            && self.parked.is_none()
+    }
+
+    /// Where one item's turn BEGAN, as everything that turn may change stood then: what
+    /// a turn that handed its call over and was put down is taken back to
+    /// ([`Interpreter::take_up`]).
+    ///
+    /// A turn is put down only at the FIRST call it reaches, and only when nothing it has
+    /// already done can be undone by walking it again: it has performed no call of its
+    /// own ([`Interpreter::perform_call`]), entered no `Map` or `Parallel` state
+    /// ([`Interpreter::nested_walk`], [`Interpreter::map_state`]) and sampled no value
+    /// ([`super::super::samples_drawn`]). So what it may have changed is the data the
+    /// item carries, the history events of the states it walked, and the counts those
+    /// states spent.
+    ///
+    /// The item's own data is COPIED here, which is what a turn that may be put down
+    /// costs: one copy of the document it carries and of the variables in scope, per
+    /// turn, taken only while the items run together.
+    fn put_down(&self, iteration: &Iteration, recorded: &[usize]) -> Putdown {
+        Putdown {
+            cursor: Cursor {
+                name: iteration.cursor.name.clone(),
+                value: iteration.cursor.value.clone(),
+                at: iteration.cursor.at,
+            },
+            retry_count: iteration.retry_count,
+            variables: iteration.variables.clone(),
+            assigned: iteration.assigned.clone(),
+            base_context: iteration.base_context.clone(),
+            steps: self.steps.len(),
+            recorded: recorded.len(),
+            attempts_spent: self.attempts_spent.clone(),
+            events_left: self.events_left,
+            history: iteration.history,
+            work_left: work_left(),
+        }
+    }
+
+    /// Take `iteration` back to where the turn that was put down began, so the item is
+    /// walked again from the state it handed its call over at.
+    ///
+    /// Everything that turn did is undone: the history events it recorded are dropped —
+    /// or, for an item that records into a child execution's own history, uncounted — the
+    /// counts it spent are given back, and the data it carries is the data it was handed.
+    /// So the turn costs the run nothing, and what the run reports is what it would have
+    /// reported had the turn been walked once — the only difference being that the work
+    /// the call asks for is now being done while a sibling's is started.
+    fn take_up(&mut self, iteration: &mut Iteration, recorded: &mut Vec<usize>, from: Putdown) {
+        iteration.cursor = from.cursor;
+        iteration.retry_count = from.retry_count;
+        iteration.variables = from.variables;
+        iteration.assigned = from.assigned;
+        iteration.base_context = from.base_context;
+        iteration.history = from.history;
+        self.steps.truncate(from.steps);
+        recorded.truncate(from.recorded);
+        self.attempts_spent = from.attempts_spent;
+        self.events_left = from.events_left;
+        put_work_back(from.work_left);
     }
 
     /// Record the child workflow execution ONE item ran as, as it ended: an item that

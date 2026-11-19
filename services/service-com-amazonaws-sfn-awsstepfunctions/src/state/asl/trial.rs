@@ -192,6 +192,11 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // by this walk and names the event this walk numbers for it.
         continued_entry: None,
         skipping_entry: false,
+        // The trial of a single state starts no call of its own beside another's
+        // ([`super::map_items`]).
+        started: None,
+        probing: None,
+        unwinding: false,
     };
     // And the same document for the diagnoses the trial's own expressions word, which
     // quote the document they could not be applied to ([`GivenDocuments`]).
