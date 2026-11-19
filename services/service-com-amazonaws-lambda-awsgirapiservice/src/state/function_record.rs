@@ -976,7 +976,15 @@ impl FunctionRecord {
                 subnet_ids: vpc.subnet_ids.clone(),
                 security_group_ids: vpc.security_group_ids.clone(),
                 vpc_id: config.vpc_id.clone(),
-                ipv6_allowed_for_dual_stack: vpc.ipv6_allowed_for_dual_stack,
+                // "Allows outbound IPv6 traffic on VPC functions that are connected to
+                // dual-stack subnets" (`VpcConfigResponse$Ipv6AllowedForDualStack`): a
+                // SETTING of the attachment, which every attachment therefore has — it is
+                // off on one whose request did not turn it on, and is reported as off rather
+                // than omitted, so a client reads the setting unconditionally instead of
+                // inferring it from a missing member.
+                ipv6_allowed_for_dual_stack: Some(
+                    vpc.ipv6_allowed_for_dual_stack.unwrap_or(false),
+                ),
             }),
             dead_letter_config: config.dead_letter_config.clone(),
             // A function the caller mounted no file system on carries no

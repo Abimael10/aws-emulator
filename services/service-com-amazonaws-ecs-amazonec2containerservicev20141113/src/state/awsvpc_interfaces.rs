@@ -196,7 +196,10 @@ fn allocate_interface(
     };
     let attachment = NetworkInterfaceAttachment {
         attach_time: Some(ec2::system_time_to_date_time(SystemTime::now())),
-        attachment_id: Some(ec2_store.next_id(ec2::NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX)),
+        // The attachment id is of the SERVICE-MANAGED kind: no instance of the account holds
+        // this interface, the task does, so the id's own form tells a caller reading the
+        // inventory that the attachment is not one it may take down.
+        attachment_id: Some(ec2_store.next_id(ec2::SERVICE_NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX)),
         // The interface Amazon ECS creates for a task is torn down with that task.
         delete_on_termination: Some(true),
         device_index: Some(TASK_INTERFACE_DEVICE_INDEX),

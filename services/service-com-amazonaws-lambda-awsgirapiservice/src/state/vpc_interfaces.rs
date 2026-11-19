@@ -337,7 +337,14 @@ fn place_in_subnets(
         // is minted by the store that mints every other id of this inventory.
         let attachment = ec2_types::NetworkInterfaceAttachment {
             attach_time: Some(ec2::system_time_to_date_time(::std::time::SystemTime::now())),
-            attachment_id: Some(store.next_id(ec2::NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX)),
+            // The attachment id is of the SERVICE-MANAGED kind
+            // ([`ec2::SERVICE_NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX`]): no instance of the
+            // account holds this interface, the function does, so a caller reading the
+            // inventory can tell from the id's own form that the attachment is not one it may
+            // take down — which is what `DetachNetworkInterface` then refuses it as.
+            attachment_id: Some(
+                store.next_id(ec2::SERVICE_NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX),
+            ),
             // "Indicates whether the network interface is deleted when the instance is
             // terminated": no instance terminates this one — it is given back when the
             // attachment that asked for it is.

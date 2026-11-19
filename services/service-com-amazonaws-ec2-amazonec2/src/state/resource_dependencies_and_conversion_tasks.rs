@@ -269,8 +269,20 @@ impl ComAmazonawsEc2Amazonec2State {
     /// Instance Connect Endpoint ([`Self::instance_connect_endpoints_in_subnet`]) — needs no
     /// entry of its own: its subnet is a dependency of the VPC here, and that subnet cannot
     /// be deleted while the record is in it, so the VPC is held for as long as it is.
+    ///
+    /// A VPC ENDPOINT of the VPC is one, whatever type it is of: it is a resource
+    /// "associated with the VPC" that `DeleteVpc` does not remove — only
+    /// `DeleteVpcEndpoints` does — so the caller takes it away first. A GATEWAY endpoint has
+    /// no network interface of its own to be found by the interface sweep above, and it holds
+    /// the VPC through its route-table routes rather than through a subnet, so it is only
+    /// reached here.
     pub fn vpc_dependencies(&self, vpc_id: &str) -> Vec<String> {
         let mut found: Vec<String> = Vec::new();
+        for (endpoint_id, endpoint) in &self.vpc_endpoints {
+            if endpoint.vpc_id.as_deref() == Some(vpc_id) {
+                found.push(endpoint_id.clone());
+            }
+        }
         for (subnet_id, subnet) in &self.subnets {
             if subnet.vpc_id.as_deref() == Some(vpc_id) {
                 found.push(subnet_id.clone());

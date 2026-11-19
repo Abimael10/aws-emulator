@@ -273,7 +273,10 @@ fn place_interface(ec2_store: &mut ComAmazonawsEc2Amazonec2State, wanted: &Wante
     let groups = group_identifiers(ec2_store, wanted);
     let attachment = NetworkInterfaceAttachment {
         attach_time: Some(ec2::system_time_to_date_time(::std::time::SystemTime::now())),
-        attachment_id: Some(ec2_store.next_id(ec2::NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX)),
+        // The attachment id is of the SERVICE-MANAGED kind: no instance of the account holds
+        // this interface, the cache node does, so the id's own form tells a caller reading the
+        // inventory that the attachment is not one it may take down.
+        attachment_id: Some(ec2_store.next_id(ec2::SERVICE_NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX)),
         // The interface ElastiCache creates for a node is torn down with that node.
         delete_on_termination: Some(true),
         device_index: Some(CACHE_INTERFACE_DEVICE_INDEX),

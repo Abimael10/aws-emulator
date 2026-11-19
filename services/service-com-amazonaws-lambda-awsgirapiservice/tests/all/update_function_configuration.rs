@@ -366,6 +366,10 @@ fn cases() -> Vec<Case> {
                 "VpcConfig": {
                     "SubnetIds": ["subnet-0a1b2c3d", "subnet-4e5f6a7b"],
                     "SecurityGroupIds": ["sg-0123456789abcdef0"],
+                    // The attachment's dual-stack egress setting is a setting it HAS, so the
+                    // response reports it as off rather than omitting it for a request that
+                    // did not turn it on.
+                    "Ipv6AllowedForDualStack": false,
                 },
             }),
         },

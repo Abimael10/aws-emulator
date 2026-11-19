@@ -25,7 +25,8 @@
 //!   account carries, which is what a second detach of one already taken down reads.
 //! * `OperationNotPermitted` (400) — the attachment is the instance's PRIMARY interface
 //!   (device index 0), which goes with the instance rather than being detachable on its own,
-//!   or it is one another Amazon Web Services service made and manages.
+//!   or it is one another Amazon Web Services service made and manages (an attachment of the
+//!   service-managed kind, or an interface that service manages).
 //! * `DryRunOperation` (412) — a request that would have succeeded, with `DryRun` set.
 //!
 //! ## Shape of an operation
@@ -239,14 +240,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Indicates whether the network interface is being managed by Amazon Web Services"
         // (`NetworkInterface$RequesterManaged`): an interface another service created for its
         // own resource is not the account's to take down, whatever state it is in — the same
-        // reading `DetachVolume` takes of an attachment to a managed resource.
-        if store
-            .network_interfaces
-            .get(&network_interface_id)
-            .and_then(|interface| interface.requester_managed)
-            == Some(true)
+        // reading `DetachVolume` takes of an attachment to a managed resource. An attachment of
+        // the SERVICE-MANAGED kind reads the same refusal whoever manages the interface it is
+        // of: an attachment no instance of the account holds was made by the service that holds
+        // it, so it is that service's to take away and not this caller's.
+        if state::is_service_network_interface_attachment_id(attachment_id)
+            || store
+                .network_interfaces
+                .get(&network_interface_id)
+                .and_then(|interface| interface.requester_managed)
+                == Some(true)
         {
-            return Err(state::attachment_is_not_the_accounts_to_manage());
+            return Err(state::attachment_is_not_the_accounts_to_manage(
+                attachment_id,
+            ));
         }
 
         // The request is one that would have succeeded, so a dry run stops HERE: "If you have

@@ -48,6 +48,48 @@ pub const NETWORK_INTERFACE_ID_PREFIX: &str = "eni";
 /// `NetworkInterfaceAttachmentId` ids in EC2's own documentation read).
 pub const NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX: &str = "eni-attach";
 
+/// The id prefix EC2 mints the attachment of a network interface NO INSTANCE of the account
+/// holds with — one an Amazon Web Services service made, for a resource of its own, out of an
+/// address of the account's subnet (a VPC-attached function's interface, a task's, a cache
+/// node's).
+///
+/// A different KIND of attachment from the one above, and EC2 prints it in a different form
+/// (`ela-attach-…`): the attachment belongs to the service that made it, not to the account,
+/// which is why reading the prefix is enough to tell a caller that this is not an attachment
+/// it may manage ([`attachment_is_not_the_accounts_to_manage`] words that refusal with the
+/// kind). The one definition of the form, so every seam that places such an interface mints
+/// an id a reader can tell apart from an instance attachment's.
+pub const SERVICE_NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX: &str = "ela-attach";
+
+/// The KIND of attachment `attachment_id` names, as its printed form says: the
+/// service-managed kind for an id of that form
+/// ([`SERVICE_NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX`]), and the instance-attachment kind for
+/// every other.
+///
+/// Read off the ID rather than off the record it resolves to, because this is what a refusal
+/// names before anything is looked up, and because the form is what a caller holding the id
+/// can see.
+#[must_use]
+pub fn network_interface_attachment_id_kind(attachment_id: &str) -> &'static str {
+    if prefixed_id_is_well_formed(
+        SERVICE_NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX,
+        attachment_id,
+    ) {
+        SERVICE_NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX
+    } else {
+        NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX
+    }
+}
+
+/// Whether `attachment_id` is an attachment of the SERVICE-MANAGED kind
+/// ([`SERVICE_NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX`]) — the question an operation that
+/// would MANAGE the attachment asks, the account holding none of these.
+#[must_use]
+pub fn is_service_network_interface_attachment_id(attachment_id: &str) -> bool {
+    network_interface_attachment_id_kind(attachment_id)
+        == SERVICE_NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX
+}
+
 /// "The type of network interface. The default is interface"
 /// (`CreateNetworkInterfaceRequest$InterfaceType`) — the `NetworkInterfaceType` member an
 /// interface a caller creates without asking for another type carries
@@ -195,13 +237,16 @@ pub fn primary_network_interface_cannot_be_detached<E>(
 /// resource — an interface VPC endpoint's, say — so its attachment is not the account's to
 /// take down, and the refusal is about the ATTACHMENT rather than about the interface's state.
 ///
-/// The sentence names the KIND of attachment the caller may not manage — the id PREFIX of that
-/// kind, [`NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX`] — which is the form EC2 words this class
-/// of refusal in, rather than the one id the request happened to name: what the caller may not
-/// do is manage attachments of that kind at all, so the text carries no per-request value.
-pub fn attachment_is_not_the_accounts_to_manage<E>() -> Scaffolded<E> {
+/// The sentence names the KIND of attachment the caller may not manage — the id PREFIX of
+/// that kind, read off the attachment the request named
+/// ([`network_interface_attachment_id_kind`]) — which is the form EC2 words this class of
+/// refusal in, rather than the one id the request happened to name: what the caller may not do
+/// is manage attachments of that kind at all, so the text carries no per-request value beyond
+/// the kind.
+pub fn attachment_is_not_the_accounts_to_manage<E>(attachment_id: &str) -> Scaffolded<E> {
     Scaffolded::operation_not_permitted(format!(
-        "You are not allowed to manage '{NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX}' attachments."
+        "You are not allowed to manage '{kind}' attachments.",
+        kind = network_interface_attachment_id_kind(attachment_id),
     ))
 }
 
@@ -454,8 +499,17 @@ impl ComAmazonawsEc2Amazonec2State {
     /// ([`invalid_network_interface_id_not_found`]'s callers) — and
     /// [`INVALID_NETWORK_INTERFACE_ATTACHMENT_ID_MALFORMED`] is left for a value outside the
     /// form, which names no attachment that could ever have existed.
+    /// An id of the SERVICE-MANAGED kind
+    /// ([`SERVICE_NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX`]) is one EC2 issues too, so it is
+    /// well formed here as well: a caller that holds such an id — off an interface a service
+    /// attached — is told that this is not an attachment it may manage rather than that the
+    /// id it just read is not an id.
     pub fn network_interface_attachment_id_is_well_formed(&self, attachment_id: &str) -> bool {
         prefixed_id_is_well_formed(NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX, attachment_id)
+            || prefixed_id_is_well_formed(
+                SERVICE_NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX,
+                attachment_id,
+            )
     }
 
     /// The network interface the attachment `attachment_id` holds, or `None` when no interface
