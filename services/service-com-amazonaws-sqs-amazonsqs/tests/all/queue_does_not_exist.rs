@@ -16,9 +16,10 @@
 //! a queue, addressed by url and by name), and the FORM of the absence (a name never
 //! created, a url of another account, an owner id that is not this emulator's, a bare name
 //! no queue carries, and a queue that was deleted), and the DIALECT the client speaks (the
-//! native JSON one, and the query-compatible one a client opts into, which is answered the
-//! legacy query code and fault BESIDE the same sentence). The expected message is the
-//! constant exported by [`service_com_amazonaws_sqs_amazonsqs::state`], which one test
+//! native JSON one and the query-compatible one, each answered the legacy query code and
+//! fault BESIDE the same sentence, because an `awsQueryCompatible` service reports both
+//! names of a class on every error whatever the request asked for). The expected message is
+//! the constant exported by [`service_com_amazonaws_sqs_amazonsqs::state`], which one test
 //! pins to AWS's own sentence written out literally.
 
 use serde_json::{json, Value};
@@ -313,8 +314,8 @@ async fn every_refusal_of_an_absent_queue_carries_awss_own_sentence() {
     }
 }
 
-/// The legacy query code this class travels under for a client that asked for the report:
-/// the model's `awsQueryError.code` for the error shape
+/// The legacy query code this class travels under on every answer that reports it: the
+/// model's `awsQueryError.code` for the error shape
 /// (`smithy_query(query="shape", shape="QueueDoesNotExist",
 /// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
 /// beside the fault side a refusal the caller caused is reported under.
@@ -328,14 +329,15 @@ fn header_of(headers: &http::HeaderMap, name: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// The DIALECT a client speaks decides only what the answer reports ALONGSIDE the error —
-/// the legacy query code and fault a query-compatible client opts into — and never the
-/// message: a client that asked for the legacy report is answered the same fixed sentence,
-/// with no clause of the retired endpoint appended to it, as a native client.
+/// The DIALECT a client speaks decides NOTHING about this refusal: the fixed sentence, the
+/// error class and the legacy query code reported beside it are the same for a client that
+/// opts into the legacy report and for a native one that sends no opt-in at all — an
+/// `awsQueryCompatible` service reports both names of a class on every error it answers, so
+/// no clause of either vocabulary is withheld from either client.
 ///
 /// This is the half of the rule a dialect could drift on: the rows run every operation
 /// that resolves a queue, over the forms of absence, through BOTH dialects of the one
-/// answer and compare the sentence across them.
+/// answer and compare the sentence and the report across them.
 #[tokio::test]
 async fn the_refusal_reads_the_same_in_both_wire_dialects() {
     let router = emulator();
@@ -413,18 +415,30 @@ async fn the_refusal_reads_the_same_in_both_wire_dialects() {
                 native_message.as_str(),
                 header_of(&native_headers, QUERY_ERROR_HEADER),
             ),
-            (400, "QueueDoesNotExist", AWS_SENTENCE, None),
+            (
+                400,
+                "QueueDoesNotExist",
+                AWS_SENTENCE,
+                Some(NON_EXISTENT_QUEUE_REPORT.to_string()),
+            ),
             "case {operation} on {case} in the native dialect: expected a 400 \
-             QueueDoesNotExist reading {AWS_SENTENCE:?} and no {QUERY_ERROR_HEADER}, got \
+             QueueDoesNotExist reading {AWS_SENTENCE:?} reported as \
+             {NON_EXISTENT_QUEUE_REPORT:?}, got \
              {native_status} with {native_body} and {QUERY_ERROR_HEADER} {:?}",
             header_of(&native_headers, QUERY_ERROR_HEADER)
         );
 
         assert_eq!(
-            query_message, native_message,
-            "case {operation} on {case}: the sentence must not depend on the dialect the \
-             client speaks, got {query_message:?} for a query-compatible client and \
-             {native_message:?} for a native one"
+            (query_message.as_str(), header_of(&query_headers, QUERY_ERROR_HEADER)),
+            (
+                native_message.as_str(),
+                header_of(&native_headers, QUERY_ERROR_HEADER)
+            ),
+            "case {operation} on {case}: neither the sentence nor the legacy report may \
+             depend on the dialect the client speaks, got {query_message:?} / {:?} for a \
+             query-compatible client and {native_message:?} / {:?} for a native one",
+            header_of(&query_headers, QUERY_ERROR_HEADER),
+            header_of(&native_headers, QUERY_ERROR_HEADER)
         );
     }
 }

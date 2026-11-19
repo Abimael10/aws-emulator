@@ -27,7 +27,7 @@
 //!   answered with a bare HTTP 413 instead of reaching a handler — and, for every other
 //!   request, [`QueryCompatibleErrors`], which is NOT a re-route: the key and the handler
 //!   stay the generated routing table's, and the wrapper only completes the error envelope
-//!   this `awsQueryCompatible` service owes a client that asked for the legacy query code.
+//!   this `awsQueryCompatible` service owes on every error it answers.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -225,14 +225,8 @@ impl ErasedOperation for RequestEntityTooLarge {
 }
 
 /// The response header a service whose model carries `awsQueryCompatible` reports the
-/// legacy query error code in, for a client that asked for it.
+/// legacy query error code in, on every error it answers.
 const QUERY_ERROR_HEADER: &str = "x-amzn-query-error";
-
-/// The request header a query-compatible SDK opts into that report with.
-const QUERY_MODE_HEADER: &str = "x-amzn-query-mode";
-
-/// The value that opt-in carries.
-const QUERY_MODE_ON: &str = "true";
 
 /// The fault side the report names for a refusal the CALLER caused — every 4xx.
 const SENDER_FAULT: &str = "Sender";
@@ -248,50 +242,31 @@ const FIRST_FAILURE_STATUS: u16 = 400;
 const FIRST_SERVER_FAULT_STATUS: u16 = 500;
 
 /// The modelled class this service words a refused attribute NAME with ([`refusal_for`]),
-/// and — because the model defaults that shape's `awsQueryError` binding — the legacy query
-/// code of the same class.
+/// whose legacy query code is that same name because the model defaults the shape's
+/// `awsQueryError` binding ([`modelled_query_error_code`]).
 const UNKNOWN_ATTRIBUTE_NAME: &str = "InvalidAttributeName";
 
-/// Every error class this service words a BOUNDARY refusal with: what [`refusal_for`] can
-/// answer, which is also the only error a response carries no legacy code for by the time
-/// it leaves the framework. Each entry is BOTH the shape name the renderer writes into
-/// `__type` and the legacy query code of that class, because the model defaults the
-/// `awsQueryError` binding of every shape named here.
-const BOUNDARY_REFUSAL_CLASSES: &[&str] = &[UNKNOWN_ATTRIBUTE_NAME];
-
-/// Whether `req` asked for the legacy query error report.
+/// The legacy query code of the error class the answer `resp` names, and `None` for an
+/// answer that names no class of this service's API.
 ///
-/// A query-compatible SDK sends the opt-in on every request it makes to this service; a
-/// native JSON client sends nothing, and gets the unadorned JSON error. The report is
-/// additive, so only the opt-in decides — nothing of the answer is withheld without it.
-fn asked_for_the_query_error(req: &aws_smithy_runtime_api::http::Request) -> bool {
-    req.headers()
-        .get(QUERY_MODE_HEADER)
-        .is_some_and(|value| value.eq_ignore_ascii_case(QUERY_MODE_ON))
-}
-
-/// The legacy query code the answer `resp` owes, when it is an error this service worded
-/// at the BOUNDARY — and `None` for every other answer.
-///
-/// Only the boundary refusal is read here, and that is the whole point of reading a
-/// response at all: every error the per-operation sequence renders states its own legacy
-/// code through the error channel ([`crate::scaffolded`]'s `query_error_code`), so the
-/// framework has already reported it. A refusal the constraint walk raised is rendered
-/// OUTSIDE that sequence, from a code and a message alone ([`refusal_for`]), with no error
-/// value left to ask — so the class is recovered from the `__type` the renderer wrote, and
-/// only for the classes that seam words ([`BOUNDARY_REFUSAL_CLASSES`]).
+/// The class is read from the `__type` the renderer wrote, which is the one name every layer
+/// that can answer an error states: a handler's modelled error, a refusal the constraint
+/// walk raised and this service reworded ([`refusal_for`]) — rendered OUTSIDE the
+/// per-operation sequence, from a code and a message alone, with no error value left to ask
+/// — and a parameter refusal of the request-validation framework in front of this service.
+/// The code itself comes from the MODEL for a class the model declares
+/// ([`modelled_query_error_code`]) and from the error channel that words the others
+/// ([`crate::scaffolded::legacy_query_code_of_shape`]) for the rest, so no name is invented
+/// here.
 ///
 /// A body naming anything else is left without a report rather than given a guessed one: the
-/// framework's own refusal classes (its generic validation failure, the scaffold's 501) are
-/// not error classes of this service's API, so they have no legacy code to name.
-fn boundary_refusal_code(resp: &aws_smithy_runtime_api::http::Response) -> Option<&'static str> {
+/// framework's own classes (its generic validation failure, the scaffold's 501) are not
+/// error classes of this service's API, so they have no legacy code to name.
+fn legacy_query_code(resp: &aws_smithy_runtime_api::http::Response) -> Option<&'static str> {
     let document: serde_json::Value = serde_json::from_slice(resp.body().bytes()?).ok()?;
-    let shape = document.get("__type")?.as_str()?;
-    let local = shape.split('#').next_back().unwrap_or(shape);
-    BOUNDARY_REFUSAL_CLASSES
-        .iter()
-        .find(|class| **class == local)
-        .copied()
+    let named = document.get(TYPE_MEMBER)?.as_str()?.trim();
+    modelled_query_error_code(named.split('#').next_back().unwrap_or(named))
+        .or_else(|| crate::scaffolded::legacy_query_code_of_shape(named))
 }
 
 /// The body member the JSON error renderers name the error shape in.
@@ -304,19 +279,42 @@ const TYPE_MEMBER: &str = "__type";
 /// COMPILE-TIME read of that file: a model that moves fails this crate's build.
 const MODEL: &str = include_str!("../smithy-model/com-amazonaws-sqs-amazonsqs.json");
 
-/// The fully qualified shape id this service's model declares for the error shape whose local
-/// name is `local`, or `None` when its model declares no error shape of that name.
+/// The trait a model binds an error shape's LEGACY query code with, and the member of that
+/// trait holding the code.
 ///
-/// The map is built once per process, out of the model's own shapes: every shape it marks
-/// with `@error`, under the local name the JSON renderer writes into `__type` and the
-/// qualified id the model gives it. A name the model declares no error shape for — the
-/// request-validation framework's own classes, which already name their own package, and the
-/// scaffold's synthetic signal — is not one of this service's classes and is answered as the
-/// layer that built it wrote it.
-fn modelled_error_id(local: &str) -> Option<&'static str> {
-    static IDS: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+/// A class a query-era client knows by another name than its shape — a queue that does not
+/// exist — is bound here; a class the model leaves unbound is known by the error shape's own
+/// name, which is what [`ModelledClass::query_code`] falls back to.
+const QUERY_ERROR_TRAIT: &str = "aws.protocols#awsQueryError";
+const QUERY_ERROR_TRAIT_CODE: &str = "code";
+
+/// The trait a model marks an error shape with.
+const ERROR_TRAIT: &str = "smithy.api#error";
+
+/// One error class of this service's model, under the local name the JSON renderer writes
+/// into `__type`: the two names `awsQueryCompatible` makes a client know one class by.
+#[derive(Debug)]
+struct ModelledClass {
+    /// The fully qualified shape id the model declares for the class, which is what a modern
+    /// client resolves its typed exception from.
+    shape_id: String,
+    /// The legacy query code a query-era client knows the class by: the model's own
+    /// `awsQueryError` code where it binds one, and the error shape's own name where the
+    /// model defaults that binding.
+    query_code: String,
+}
+
+/// Every error class this service's model declares, built once per process out of the
+/// model's own shapes: every shape it marks with `@error`, under the local name the JSON
+/// renderer writes into `__type`.
+///
+/// A name the model declares no error shape for — the request-validation framework's own
+/// classes, which already name their own package, and the scaffold's synthetic signal — is
+/// not one of this service's classes and is answered as the layer that built it wrote it.
+fn modelled_classes() -> &'static std::collections::BTreeMap<String, ModelledClass> {
+    static CLASSES: std::sync::OnceLock<std::collections::BTreeMap<String, ModelledClass>> =
         std::sync::OnceLock::new();
-    IDS.get_or_init(|| {
+    CLASSES.get_or_init(|| {
         let shapes = serde_json::from_str::<serde_json::Value>(MODEL)
             .ok()
             .and_then(|document| document.get("shapes").cloned());
@@ -330,16 +328,44 @@ fn modelled_error_id(local: &str) -> Option<&'static str> {
                     && shape
                         .get("traits")
                         .and_then(serde_json::Value::as_object)
-                        .is_some_and(|traits| traits.contains_key("smithy.api#error"))
+                        .is_some_and(|traits| traits.contains_key(ERROR_TRAIT))
             })
-            .filter_map(|(id, _)| {
+            .filter_map(|(id, shape)| {
                 let name = id.split('#').next_back()?;
-                (!name.is_empty()).then(|| (name.to_string(), id.clone()))
+                if name.is_empty() {
+                    return None;
+                }
+                let bound = shape
+                    .get("traits")
+                    .and_then(|traits| traits.get(QUERY_ERROR_TRAIT))
+                    .and_then(|binding| binding.get(QUERY_ERROR_TRAIT_CODE))
+                    .and_then(serde_json::Value::as_str);
+                Some((
+                    name.to_string(),
+                    ModelledClass {
+                        shape_id: id.clone(),
+                        query_code: bound.unwrap_or(name).to_string(),
+                    },
+                ))
             })
             .collect()
     })
-    .get(local)
-    .map(String::as_str)
+}
+
+/// The fully qualified shape id this service's model declares for the error shape whose local
+/// name is `local`, or `None` when its model declares no error shape of that name.
+fn modelled_error_id(local: &str) -> Option<&'static str> {
+    modelled_classes()
+        .get(local)
+        .map(|class| class.shape_id.as_str())
+}
+
+/// The legacy query code this service's model gives the error shape whose local name is
+/// `local`, or `None` when its model declares no error shape of that name.
+fn modelled_query_error_code(local: &str) -> Option<&'static str> {
+    modelled_classes()
+        .get(local)
+        .map(|class| class.query_code.as_str())
 }
 
 /// `resp` with the error class its body names stated in FULL — the qualified shape id this
@@ -393,47 +419,47 @@ fn qualified_type_document(mut document: serde_json::Value) -> Option<Vec<u8>> {
 }
 
 /// `resp` as this `awsQueryCompatible` service answers it: the error class named in full in
-/// the body ([`naming_the_class_in_full`]), and its legacy query code reported in the header
-/// for a client that asked for one ([`reporting_the_query_error`]).
+/// the body ([`naming_the_class_in_full`]) and its legacy query code reported in the header
+/// ([`reporting_the_query_error`]).
 ///
 /// A success names no class and passes through untouched.
 fn completing_the_envelope(
-    req: &aws_smithy_runtime_api::http::Request,
     resp: aws_smithy_runtime_api::http::Response,
 ) -> aws_smithy_runtime_api::http::Response {
     if resp.status().as_u16() < FIRST_FAILURE_STATUS {
         return resp;
     }
-    reporting_the_query_error(req, naming_the_class_in_full(resp))
+    reporting_the_query_error(naming_the_class_in_full(resp))
 }
 
-/// `resp` with the legacy query error report added, for a request that asked for one.
+/// `resp` with the legacy query error report added.
 ///
-/// `awsQueryCompatible` names an error class TWICE: the body's `__type` names the error
+/// `awsQueryCompatible` names an error class TWICE, and an error answer of such a service
+/// carries BOTH names whatever the request asked for: the body's `__type` names the error
 /// SHAPE, and this header reports the legacy query code of the same class beside the fault
 /// side — `Sender` for a refusal the caller caused, `Receiver` for a failure this service
 /// caused — which is the only place a client still speaking the query vocabulary can
-/// recover the code from, since the body carries a shape id instead.
+/// recover the code from, since the body carries a shape id instead. Nothing of the REQUEST
+/// decides it: a client that sends no opt-in reads the class out of the same two names as
+/// one that does, so two SDKs cannot disagree about one answer.
 ///
-/// The framework's own per-operation sequence already writes this header from the error
-/// value's own legacy code, so a response that carries one keeps it. What is left for this
-/// to complete is the refusal the framework renders OUTSIDE that sequence
-/// ([`boundary_refusal_code`]).
+/// The framework's own per-operation sequence writes this header from the error value's own
+/// legacy code for a request that opted in, so a response that already carries the report
+/// keeps it; every other error answer — including the refusal the framework renders OUTSIDE
+/// that sequence — is reported here, from the class its body names ([`legacy_query_code`]).
 ///
 /// A success is left alone (there is no class to name), and so is a header the HTTP layer
 /// will not carry: a report that could not be built costs the answer its header, never the
 /// answer.
 fn reporting_the_query_error(
-    req: &aws_smithy_runtime_api::http::Request,
     mut resp: aws_smithy_runtime_api::http::Response,
 ) -> aws_smithy_runtime_api::http::Response {
     if resp.status().as_u16() < FIRST_FAILURE_STATUS
         || resp.headers().get(QUERY_ERROR_HEADER).is_some()
-        || !asked_for_the_query_error(req)
     {
         return resp;
     }
-    let Some(code) = boundary_refusal_code(&resp) else {
+    let Some(code) = legacy_query_code(&resp) else {
         return resp;
     };
     let fault = if resp.status().as_u16() >= FIRST_SERVER_FAULT_STATUS {
@@ -500,7 +526,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for QueryCompatibleErrors<Eng> 
                 // claimed the key.
                 None => svc.definition().routing_error_response(req),
             };
-            let answered = completing_the_envelope(req, response);
+            let answered = completing_the_envelope(response);
             // Every response an AWS service sends NAMES the request it answered, in the
             // header this protocol reports that id in (`x-amzn-RequestId`) — on a success
             // exactly as on a failure, which is where an SDK reads the response's own
@@ -542,8 +568,9 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for QueryCompatibleErrors<Eng> 
 /// (`crate::state::validate_attributes`). This covers the LIST form
 /// (`GetQueueAttributes` `AttributeNames`), which the walk does validate.
 fn refusal_for(violation: &Violation) -> Option<Refused> {
-    // The class below is the one [`BOUNDARY_REFUSAL_CLASSES`] holds, read from there so the
-    // refusal and the legacy report of that same refusal cannot name two different classes.
+    // The class this service words the refusal with; the legacy query code reported beside
+    // it is read off the MODEL for this same class ([`modelled_query_error_code`]), so the
+    // refusal and the legacy report of it cannot name two different classes.
     let class = UNKNOWN_ATTRIBUTE_NAME;
     let ViolationKind::EnumValue(allowed) = &violation.kind else {
         return None;

@@ -332,6 +332,27 @@ impl SerializableStruct for InvalidParameterValue {
 /// it.
 pub const ACCESS_DENIED: &str = "AccessDenied";
 
+/// The legacy query code of the class a rendered answer names in `__type`, for the classes
+/// this channel words OUTSIDE this service's model — and `None` for a name that is no class
+/// of this service's API.
+///
+/// The pair such a class is known by — the error SHAPE the body names and the legacy query
+/// code reported beside it — is stated once, in [`OperationError::query_error_code`] below,
+/// and read back through here by the one place that has to report the code off a RENDERED
+/// answer rather than off the error value: the envelope `crate::service` completes for every
+/// error this service answers, including the refusals the framework renders outside the
+/// per-operation sequence. The classes this channel invents rather than Amazon SQS — the
+/// generic validation failure and the scaffold's own not-implemented signal — name no legacy
+/// code here for the same reason they name none there.
+pub fn legacy_query_code_of_shape(shape: &str) -> Option<&'static str> {
+    match shape {
+        MISSING_PARAMETER_SHAPE_ID => Some(MISSING_PARAMETER),
+        INVALID_PARAMETER_VALUE_SHAPE_ID => Some(INVALID_PARAMETER_VALUE),
+        ACCESS_DENIED => Some(ACCESS_DENIED),
+        _ => None,
+    }
+}
+
 /// The HTTP status that refusal carries: Amazon SQS reports an authorization failure as
 /// a 403, the status its own 403-class errors (`InvalidSecurity`, `RequestThrottled`)
 /// carry in this model.

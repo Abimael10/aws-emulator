@@ -195,7 +195,7 @@ pub async fn post_bytes_in(
     body: Vec<u8>,
 ) -> (u16, Vec<u8>) {
     let response = router
-        .dispatch(request_for(region, operation, body, false))
+        .dispatch(request_for(region, operation, body, None))
         .await;
     (response.status().as_u16(), response.body().to_vec())
 }
@@ -209,14 +209,15 @@ pub const QUERY_MODE_HEADER: &str = "x-amzn-query-mode";
 pub const QUERY_ERROR_HEADER: &str = "x-amzn-query-error";
 
 /// One request as this service's wire protocol carries it: `awsJson1_0` over `POST /`
-/// with the target header, and — for `query_mode` — the header a query-compatible SDK
-/// sends on every call it makes to this service. It arrives on `region`'s own endpoint,
-/// which is where a client configured for that region addresses it.
+/// with the target header, and — for `query_mode` — the [`QUERY_MODE_HEADER`] carrying
+/// that value VERBATIM, which is how a suite drives what a client does and does not send.
+/// It arrives on `region`'s own endpoint, which is where a client configured for that
+/// region addresses it.
 fn request_for(
     region: &str,
     operation: &str,
     body: Vec<u8>,
-    query_mode: bool,
+    query_mode: Option<&str>,
 ) -> http::Request<Bytes> {
     request_arriving_on(&host_in(region), region, operation, body, query_mode)
 }
@@ -231,7 +232,7 @@ fn request_arriving_on(
     region: &str,
     operation: &str,
     body: Vec<u8>,
-    query_mode: bool,
+    query_mode: Option<&str>,
 ) -> http::Request<Bytes> {
     let mut builder = http::Request::builder()
         .method("POST")
@@ -240,8 +241,8 @@ fn request_arriving_on(
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", format!("AmazonSQS.{operation}"))
         .header("authorization", authorization_in(region));
-    if query_mode {
-        builder = builder.header(QUERY_MODE_HEADER, "true");
+    if let Some(value) = query_mode {
+        builder = builder.header(QUERY_MODE_HEADER, value);
     }
     builder
         .body(Bytes::from(body))
@@ -262,7 +263,7 @@ pub async fn call_on_host(
         region,
         operation,
         serde_json::to_vec(body).expect("the request body serializes"),
-        false,
+        None,
     );
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
@@ -294,7 +295,7 @@ pub async fn call_with_headers(
     operation: &str,
     body: &Value,
 ) -> (u16, http::HeaderMap, Value) {
-    answered(router, operation, body, false).await
+    answered(router, operation, body, None).await
 }
 
 /// The same call as a query-compatible SDK makes it, with the [`QUERY_MODE_HEADER`]
@@ -304,7 +305,22 @@ pub async fn call_in_query_mode(
     operation: &str,
     body: &Value,
 ) -> (u16, http::HeaderMap, Value) {
-    answered(router, operation, body, true).await
+    answered(router, operation, body, Some(QUERY_MODE_ON)).await
+}
+
+/// The value the opt-in carries when a query-compatible SDK sends it.
+pub const QUERY_MODE_ON: &str = "true";
+
+/// The same call carrying whatever `opt_in` says in the [`QUERY_MODE_HEADER`] — `None` for
+/// a client that does not send the header at all, `Some(value)` for one that sends that
+/// value: the seam for asserting what the opt-in does and does not decide about an answer.
+pub async fn call_with_query_mode(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+    opt_in: Option<&str>,
+) -> (u16, http::HeaderMap, Value) {
+    answered(router, operation, body, opt_in).await
 }
 
 /// `operation` dispatched through the emulator, as its status, headers and parsed body.
@@ -312,7 +328,7 @@ async fn answered(
     router: &MultiServiceRouter,
     operation: &str,
     body: &Value,
-    query_mode: bool,
+    query_mode: Option<&str>,
 ) -> (u16, http::HeaderMap, Value) {
     let request = request_for(
         REGION,

@@ -3,25 +3,33 @@
 //! End-to-end tests for the ERROR ENVELOPE this service answers in, driven over the wire
 //! through the shared harness in [`super::support`].
 //!
-//! The rule under test: **this service's model carries `awsQueryCompatible`, so every
-//! error it answers names its class TWICE — the body's `__type` names the error SHAPE that
-//! was thrown, and the `x-amzn-query-error` response header reports that class's LEGACY
-//! QUERY CODE and the fault side (`Sender` for a refusal the caller caused, `Receiver` for
-//! a failure the service caused) to a client that asked for the report with
-//! `x-amzn-query-mode: true`.** The code is the error shape's modelled `awsQueryError`
-//! where the model states one and the shape's own error code where the model defaults that
-//! binding; a parameter refusal raised by the request-validation framework in front of the
-//! service names that framework's shape in the body and the service's own legacy code in
-//! the header, which is why the two names cannot be read off each other.
+//! The rule under test: **this service's model carries `awsQueryCompatible`, so every error
+//! it answers names its class TWICE — the body's `__type` names the error SHAPE that was
+//! thrown, and the `x-amzn-query-error` response header reports that class's LEGACY QUERY
+//! CODE and the fault side (`Sender` for a refusal the caller caused, `Receiver` for a
+//! failure the service caused) — and nothing in the REQUEST decides whether it does.** The
+//! code is the error shape's modelled `awsQueryError` where the model states one and the
+//! shape's own error code where the model defaults that binding; a parameter refusal raised
+//! by the request-validation framework in front of the service names that framework's shape
+//! in the body and the service's own legacy code in the header, which is why the two names
+//! cannot be read off each other.
+//!
+//! `x-amzn-query-mode` is a REQUEST-side opt-in with which a client says which vocabulary
+//! it prefers to read — not a switch that turns the response carrier on — so an error answer
+//! is the same whether a client sends it, sends it set to something else, or sends none at
+//! all. That is what makes two SDKs agree about one refusal: one that resolves a class the
+//! model shapes no exception for from the legacy code (the AWS SDK for JavaScript v3, which
+//! sends no opt-in) and one that reads it from the same header after opting in (botocore)
+//! report the same error class.
 //!
 //! The table spans what the rule generalises over rather than one recorded request: the
 //! LAYER the refusal comes from (a handler's modelled error, a refusal this service words
 //! for a value the boundary walk rejected, and the framework parameter refusals), the
 //! source of the CODE (stated by the model's `awsQueryError`, defaulted by the model so the
-//! shape's own name is the code, and not modelled at all), the operation, and the STATUS
-//! (400 and 403 — both a Sender fault, which is what the fault column pins). Every
-//! expected shape id and legacy code is the constant the service itself declares, never a
-//! string copied out of an answer.
+//! shape's own name is the code, and not modelled at all), the operation, the STATUS (400
+//! and 403 — both a Sender fault, which is what the fault column pins) and the OPT-IN the
+//! answer is asked for with. Every expected shape id and legacy code is the constant the
+//! model or the service itself declares, never a string copied out of an answer.
 //!
 //! A MODELLED error's `__type` is its FULLY QUALIFIED shape id — `com.amazonaws.sqs#<Shape>`,
 //! the id the service's own model declares for the class — which is what a modern client
@@ -37,8 +45,8 @@ use service_com_amazonaws_sqs_amazonsqs::scaffolded::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{
-    call_in_query_mode, call_with_headers, create_ok, emulator, error_shape, expected_url, ok,
-    QUERY_ERROR_HEADER,
+    call_with_query_mode, create_ok, emulator, error_shape, expected_url, ok,
+    QUERY_ERROR_HEADER, QUERY_MODE_ON,
 };
 
 /// The legacy query code the model states for a queue that does not exist, and for a purge
@@ -60,6 +68,24 @@ const NAMESPACE: &str = "com.amazonaws.sqs";
 /// The shape id a body names the modelled class `local` under.
 fn modelled(local: &str) -> String {
     format!("{NAMESPACE}#{local}")
+}
+
+/// Every way a client can spell the opt-in, including not spelling it at all: the first row
+/// is a native JSON client (and the AWS SDK for JavaScript v3), the second a
+/// query-compatible SDK, and the rest spell the header in ways nothing about the ANSWER may
+/// key on. Every row of [`rows`] is asked for with each of these.
+fn opt_ins() -> Vec<(&'static str, Option<&'static str>)> {
+    vec![
+        ("no opt-in header at all", None),
+        (
+            "the opt-in a query-compatible SDK sends",
+            Some(QUERY_MODE_ON),
+        ),
+        ("the opt-in in another case", Some("TRUE")),
+        ("an opt-in turned off", Some("false")),
+        ("an opt-in carrying something else", Some("maybe")),
+        ("an empty opt-in", Some("")),
+    ]
 }
 
 /// One row: the case, the operation, the request, the status it owes, the error SHAPE its
@@ -130,6 +156,16 @@ async fn rows(router: &MultiServiceRouter) -> Vec<Row> {
             shape: INVALID_PARAMETER_VALUE_SHAPE_ID.to_string(),
             code: INVALID_PARAMETER_VALUE.to_string(),
         },
+        // The same class on a send: the answer a client with no typed exception for the
+        // modern code has to read its error off the LEGACY code in.
+        Row {
+            case: "a DelaySeconds above the range the parameter documents",
+            operation: "SendMessage",
+            request: json!({"QueueUrl": queue, "MessageBody": "body", "DelaySeconds": 901}),
+            status: 400,
+            shape: INVALID_PARAMETER_VALUE_SHAPE_ID.to_string(),
+            code: INVALID_PARAMETER_VALUE.to_string(),
+        },
         // A required parameter supplied with nothing in it: the other framework class.
         Row {
             case: "a MessageBody holding no character",
@@ -190,6 +226,16 @@ async fn rows(router: &MultiServiceRouter) -> Vec<Row> {
             shape: modelled("QueueDoesNotExist"),
             code: NON_EXISTENT_QUEUE.to_string(),
         },
+        // The same class reached by NAME rather than by url, which is the operation a
+        // client resolves a queue through before it has a url at all.
+        Row {
+            case: "a name naming a queue this account does not have",
+            operation: "GetQueueUrl",
+            request: json!({"QueueName": "envelope-never-created"}),
+            status: 400,
+            shape: modelled("QueueDoesNotExist"),
+            code: NON_EXISTENT_QUEUE.to_string(),
+        },
         // A refusal that is a 4xx but not a 400: still the caller's fault.
         Row {
             case: "a purge of a queue whose purge is still running",
@@ -202,59 +248,79 @@ async fn rows(router: &MultiServiceRouter) -> Vec<Row> {
     ]
 }
 
-/// A client that asked for the legacy report gets it on every refusal, beside the error
-/// shape in the body.
+/// Every refusal reports its legacy query code and fault side beside the error shape in the
+/// body — for a client that opted in, for one that sent no opt-in at all, and for one that
+/// spelled the opt-in any other way.
 #[tokio::test]
 async fn every_refusal_reports_its_legacy_query_code_and_fault() {
     let router = emulator();
     for row in rows(&router).await {
-        let (status, headers, body) = call_in_query_mode(&router, row.operation, &row.request).await;
-        let report = header(&headers, QUERY_ERROR_HEADER);
-        assert_eq!(
-            (status, error_shape(&body), report.clone()),
-            (
+        let expected = expected_report(&row.code, row.status);
+        for (opt_in_case, opt_in) in opt_ins() {
+            let (status, headers, body) =
+                call_with_query_mode(&router, row.operation, &row.request, opt_in).await;
+            let report = header(&headers, QUERY_ERROR_HEADER);
+            assert_eq!(
+                (status, error_shape(&body), report.clone()),
+                (row.status, row.shape.clone(), Some(expected.clone())),
+                "case {:?} with {opt_in_case:?}: expected HTTP {} with __type {:?} and \
+                 {QUERY_ERROR_HEADER} {expected:?}, got {status} with {body} and {report:?}",
+                row.case,
                 row.status,
-                row.shape.clone(),
-                Some(expected_report(&row.code, row.status)),
-            ),
-            "case {:?}: expected HTTP {} with __type {:?} and {QUERY_ERROR_HEADER} {:?}, got \
-             {status} with {body} and {report:?}",
-            row.case,
-            row.status,
-            row.shape,
-            expected_report(&row.code, row.status),
-        );
+                row.shape,
+            );
+        }
     }
 }
 
-/// A native JSON client asks for no legacy report and is sent none — and the error shape
-/// its SDK resolves the typed exception from is the same one either way.
+/// The whole error answer — status, the class its body names, the sentence and the report
+/// beside them — is the same for every way a client can spell the opt-in, which is what "the
+/// request does not decide it" means: a client that sends nothing reads the answer a
+/// query-compatible SDK reads.
 #[tokio::test]
-async fn a_client_that_asked_for_no_report_is_sent_none() {
+async fn the_opt_in_decides_nothing_about_an_error_answer() {
     let router = emulator();
     for row in rows(&router).await {
-        let (status, headers, body) = call_with_headers(&router, row.operation, &row.request).await;
-        let report = header(&headers, QUERY_ERROR_HEADER);
-        assert_eq!(
-            (status, error_shape(&body), report.clone()),
-            (row.status, row.shape.clone(), None),
-            "case {:?}: expected HTTP {} with __type {:?} and no {QUERY_ERROR_HEADER}, got \
-             {status} with {body} and {report:?}",
-            row.case,
-            row.status,
-            row.shape,
-        );
+        let mut answers = Vec::new();
+        for (opt_in_case, opt_in) in opt_ins() {
+            let (status, headers, body) =
+                call_with_query_mode(&router, row.operation, &row.request, opt_in).await;
+            answers.push((
+                opt_in_case,
+                status,
+                error_shape(&body),
+                body.get("message").cloned().unwrap_or(Value::Null),
+                header(&headers, QUERY_ERROR_HEADER),
+            ));
+        }
+        let (first_case, first_status, first_shape, first_message, first_report) =
+            answers[0].clone();
+        for (opt_in_case, status, shape, message, report) in &answers[1..] {
+            assert_eq!(
+                (*status, shape, message, report),
+                (first_status, &first_shape, &first_message, &first_report),
+                "case {:?} with {opt_in_case:?}: expected the same answer as with \
+                 {first_case:?} (HTTP {first_status}, __type {first_shape}, message \
+                 {first_message}, {QUERY_ERROR_HEADER} {first_report:?}), got {status} with \
+                 __type {shape}, message {message} and {report:?}",
+                row.case,
+            );
+        }
     }
 }
 
-/// An ACCEPTED call names no error class, so it carries no report — even for the client
-/// that asked for one.
+/// An ACCEPTED call names no error class, so it carries no report — whatever the request
+/// said about the opt-in.
 #[tokio::test]
 async fn an_accepted_call_reports_no_error_class() {
     let router = emulator();
     let url = create_ok(&router, "envelope-accepted", &json!({})).await;
     for (case, operation, request) in [
-        ("a create", "CreateQueue", json!({"QueueName": "envelope-created"})),
+        (
+            "a create",
+            "CreateQueue",
+            json!({"QueueName": "envelope-created"}),
+        ),
         (
             "a send",
             "SendMessage",
@@ -266,13 +332,16 @@ async fn an_accepted_call_reports_no_error_class() {
             json!({"QueueUrl": url, "AttributeNames": ["All"]}),
         ),
     ] {
-        let (status, headers, body) = call_in_query_mode(&router, operation, &request).await;
-        let report = header(&headers, QUERY_ERROR_HEADER);
-        assert_eq!(
-            (status, report.clone()),
-            (200, None),
-            "case {case:?}: expected HTTP 200 with no {QUERY_ERROR_HEADER}, got {status} with \
-             {body} and {report:?}"
-        );
+        for (opt_in_case, opt_in) in opt_ins() {
+            let (status, headers, body) =
+                call_with_query_mode(&router, operation, &request, opt_in).await;
+            let report = header(&headers, QUERY_ERROR_HEADER);
+            assert_eq!(
+                (status, report.clone()),
+                (200, None),
+                "case {case:?} with {opt_in_case:?}: expected HTTP 200 with no \
+                 {QUERY_ERROR_HEADER}, got {status} with {body} and {report:?}"
+            );
+        }
     }
 }
