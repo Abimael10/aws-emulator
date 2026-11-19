@@ -332,14 +332,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let verb = method_key(&input.http_method);
         let mut store = state.lock();
 
-        let api = store
-            .rest_apis
-            .get_mut(&input.rest_api_id)
-            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
-        let resource = api
-            .resources
-            .get_mut(&input.resource_id)
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
+        // An integration response is addressed THROUGH its resource, so the
+        // `(restApiId, resourceId)` pair is resolved as ONE lookup for that resource:
+        // either half resolving to nothing leaves it unresolvable, and the refusal reports
+        // the resource.
+        let resource = store
+            .resource_mut(&input.rest_api_id, &input.resource_id)
+            .map_err(|message| not_found(&message))?;
         let method = resource
             .methods
             .get_mut(&verb)

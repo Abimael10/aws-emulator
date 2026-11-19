@@ -17,11 +17,12 @@
 //! whichever error class that operation models for the failure.
 //!
 //! Where the rule STOPS: a call addressed by a record NESTED under the API — a stage of
-//! it, a resource of it — resolves that record by its whole key in one lookup and reports
-//! THAT record instead, which `nested_record_refusals` asserts.
+//! it, a resource of it, or a record hanging off one of those — resolves that record by its
+//! whole key in one lookup and reports THAT record instead, which
+//! `nested_record_refusals` asserts.
 //!
 //! The rows span what the rule generalises over rather than repeating one recorded call:
-//! fourteen operations that resolve a `restApiId` (so the sentence is shown not to be one
+//! nine operations that resolve a `restApiId` (so the sentence is shown not to be one
 //! handler's), a set of unknown identifiers differing in length, alphabet and case (so
 //! the identifier is shown to be quoted from the request rather than fixed), both
 //! bindings the identifier arrives on (a URI label and a body member), and both error
@@ -31,7 +32,7 @@
 
 use serde_json::{json, Value};
 
-use crate::rest_api_lifecycle::{create_api, create_resource, string_member, Answer, Gateway};
+use crate::rest_api_lifecycle::{create_api, string_member, Answer, Gateway};
 
 /// The sentence this service states for an API identifier that resolves to no API.
 ///
@@ -66,12 +67,10 @@ fn patch(path: &str, value: &str) -> Value {
 }
 
 /// Every request of this slice that resolves a `restApiId` from the URI, with `api` the
-/// identifier under test. `resource`, `verb` and `deployment` name records of a
-/// DIFFERENT, stored API, so the only thing wrong with the request is the API
-/// identifier.
+/// identifier under test. `deployment` names a record of a DIFFERENT, stored API, so the
+/// only thing wrong with the request is the API identifier.
 fn requests(
     api: &str,
-    resource: &str,
     deployment: &str,
 ) -> Vec<(&'static str, &'static str, String, Option<Value>)> {
     vec![
@@ -90,45 +89,15 @@ fn requests(
             None,
         ),
         (
-            "GetMethod",
+            "GetModels",
             "GET",
-            format!("/restapis/{api}/resources/{resource}/methods/GET"),
+            format!("/restapis/{api}/models"),
             None,
         ),
         (
-            "UpdateMethod",
-            "PATCH",
-            format!("/restapis/{api}/resources/{resource}/methods/GET"),
-            Some(patch("/authorizationType", "NONE")),
-        ),
-        (
-            "DeleteMethod",
-            "DELETE",
-            format!("/restapis/{api}/resources/{resource}/methods/GET"),
-            None,
-        ),
-        (
-            "PutIntegration",
-            "PUT",
-            format!("/restapis/{api}/resources/{resource}/methods/GET/integration"),
-            Some(json!({ "type": "MOCK" })),
-        ),
-        (
-            "GetIntegration",
+            "GetAuthorizers",
             "GET",
-            format!("/restapis/{api}/resources/{resource}/methods/GET/integration"),
-            None,
-        ),
-        (
-            "PutMethodResponse",
-            "PUT",
-            format!("/restapis/{api}/resources/{resource}/methods/GET/responses/200"),
-            Some(json!({})),
-        ),
-        (
-            "GetMethodResponse",
-            "GET",
-            format!("/restapis/{api}/resources/{resource}/methods/GET/responses/200"),
+            format!("/restapis/{api}/authorizers"),
             None,
         ),
         (
@@ -178,9 +147,7 @@ async fn an_unresolvable_api_identifier_is_stated_with_the_account_and_the_ident
     let gateway = Gateway::new();
     // One stored API supplies the resource and deployment identifiers the rows reuse, so
     // every refusal below is about the API identifier alone.
-    let (stored, root) = create_api(&gateway, "identifier-refusals").await;
-    let resource = create_resource(&gateway, &stored, &root, "pets").await;
-    let resource_id = string_member(&resource, "id", "CreateResource(pets)");
+    let (stored, _root) = create_api(&gateway, "identifier-refusals").await;
     // A deployment is the snapshot of the API's methods, so the API must carry one.
     crate::rest_api_lifecycle::make_deployable(&gateway, &stored).await;
     let created = gateway
@@ -198,7 +165,7 @@ async fn an_unresolvable_api_identifier_is_stated_with_the_account_and_the_ident
     let deployment = string_member(&created.body, "id", "CreateDeployment(stored)");
 
     for missing in UNKNOWN_IDS {
-        for (operation, method, uri, body) in requests(missing, &resource_id, &deployment) {
+        for (operation, method, uri, body) in requests(missing, &deployment) {
             let case = format!("{operation} [{method} {uri}]");
             let answer = gateway.call(method, &uri, body).await;
             assert_stated(

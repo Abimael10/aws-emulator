@@ -217,16 +217,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let store = state.lock();
-        let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
-            GetMethodErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-            })
-        })?;
-        let resource = api.resources.get(&input.resource_id).ok_or_else(|| {
-            GetMethodErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
-            })
-        })?;
+        // A method is addressed THROUGH its resource, so the `(restApiId, resourceId)`
+        // pair is resolved as one lookup for that resource and either half resolving to
+        // nothing reports the resource — see [`crate::state::…::resource`].
+        let resource = store
+            .resource(&input.rest_api_id, &input.resource_id)
+            .map_err(|message| {
+                GetMethodErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(message),
+                })
+            })?;
         let method = resource
             .methods
             .get(&super::put_method::method_key(&input.http_method))

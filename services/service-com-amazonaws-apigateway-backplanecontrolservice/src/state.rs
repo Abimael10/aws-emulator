@@ -3205,19 +3205,42 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
             .ok_or_else(|| NO_SUCH_STAGE.to_string())
     }
 
+    /// The API a call addressed by a RESOURCE of it — or by a record hanging off that
+    /// resource — names, or the message that address is refused with.
+    ///
+    /// A resource cannot exist without its API, so a `restApiId` that resolves to nothing
+    /// leaves the resource the call addresses unresolvable too: the refusal reports the
+    /// RESOURCE ([`NO_SUCH_RESOURCE`]) rather than the API identifier, the way a
+    /// stage-addressed call reports the stage ([`Self::api_and_stage`]) and a snapshot's
+    /// lookup reports the snapshot. The account-qualified identifier sentence
+    /// ([`no_such_rest_api`]) belongs to a call whose own target IS the API — the record
+    /// itself, a collection of it, or an API an input member references.
+    ///
+    /// The API is what is handed back, rather than the resource, because the records UNDER
+    /// one — a method, its integration, their responses — are addressed through the same
+    /// pair, and several of those calls read api-level state beside the resource.
+    pub fn resource_api(&self, rest_api_id: &str) -> Result<&RestApiEntry, String> {
+        self.rest_apis
+            .get(rest_api_id)
+            .ok_or_else(|| NO_SUCH_RESOURCE.to_string())
+    }
+
+    /// The same lookup as [`Self::resource_api`], for a call that WRITES under the resource
+    /// it addresses.
+    pub fn resource_api_mut(&mut self, rest_api_id: &str) -> Result<&mut RestApiEntry, String> {
+        self.rest_apis
+            .get_mut(rest_api_id)
+            .ok_or_else(|| NO_SUCH_RESOURCE.to_string())
+    }
+
     /// The resource a `(restApiId, resourceId)` pair addresses, or the message that pair is
     /// refused with.
     ///
-    /// The pair is refused by naming the identifier that did not resolve: an API this
-    /// account does not hold is reported as the API ([`no_such_rest_api`], which names the
-    /// identifier it could not resolve), and only an API that IS held but holds no such
-    /// resource is reported as the resource ([`NO_SUCH_RESOURCE`]). A stage's own lookup
-    /// ([`Self::api_and_stage`]) reports the STAGE either way, which is that operation's own
-    /// recorded contract rather than a disagreement with this one.
+    /// The pair is resolved as ONE lookup for the resource the request addresses — see
+    /// [`Self::resource_api`] — so the refusal reports the RESOURCE whichever half of the
+    /// pair resolves to nothing.
     pub fn resource(&self, rest_api_id: &str, resource_id: &str) -> Result<&ResourceEntry, String> {
-        self.rest_apis
-            .get(rest_api_id)
-            .ok_or_else(|| no_such_rest_api(rest_api_id))?
+        self.resource_api(rest_api_id)?
             .resources
             .get(resource_id)
             .ok_or_else(|| NO_SUCH_RESOURCE.to_string())
@@ -3230,9 +3253,7 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
         rest_api_id: &str,
         resource_id: &str,
     ) -> Result<&mut ResourceEntry, String> {
-        self.rest_apis
-            .get_mut(rest_api_id)
-            .ok_or_else(|| no_such_rest_api(rest_api_id))?
+        self.resource_api_mut(rest_api_id)?
             .resources
             .get_mut(resource_id)
             .ok_or_else(|| NO_SUCH_RESOURCE.to_string())
@@ -3853,7 +3874,11 @@ pub const INVALID_STAGE_VARIABLE: &str =
 /// `Invalid API identifier specified <accountId>:<restApiId>` — so the message is BUILT
 /// FROM THE REQUEST. The account segment is the emulator's one account
 /// ([`::emulator_server::emulator_account_id`]), never a literal. Shared so every
-/// operation that resolves an API says the same thing about the same failure.
+/// operation whose own target IS the API — the record itself, a collection of it, or an API
+/// an input member references — says the same thing about the same failure. A call
+/// addressed by a record NESTED under the API reports THAT record instead (see
+/// [`ComAmazonawsApigatewayBackplanecontrolserviceState::resource_api`] and
+/// [`ComAmazonawsApigatewayBackplanecontrolserviceState::api_and_stage`]).
 pub fn no_such_rest_api(rest_api_id: &str) -> String {
     format!(
         "Invalid API identifier specified {}:{rest_api_id}",
@@ -3874,6 +3899,12 @@ pub fn no_such_rest_api(rest_api_id: &str) -> String {
 pub const INVALID_REST_API_IDENTIFIER: &str = "Invalid REST API identifier specified";
 
 /// The `NotFoundException` message for a `resourceId` that names no stored resource.
+///
+/// Fixed text in full: neither the identifier nor the account is quoted back. It answers
+/// an address that resolves to no resource whichever half of the
+/// `(restApiId, resourceId)` pair is unresolvable, because a resource-addressed call
+/// resolves that pair as ONE lookup — see
+/// [`ComAmazonawsApigatewayBackplanecontrolserviceState::resource_api`].
 pub const NO_SUCH_RESOURCE: &str = "Invalid Resource identifier specified";
 
 /// The `NotFoundException` message for an `httpMethod` with no method on the resource.

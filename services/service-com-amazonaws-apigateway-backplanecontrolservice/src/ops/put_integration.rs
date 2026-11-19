@@ -806,14 +806,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        let api = store
-            .rest_apis
-            .get_mut(&input.rest_api_id)
-            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
-        let resource = api
-            .resources
-            .get_mut(&input.resource_id)
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
+        // An integration is attached THROUGH its resource, so the
+        // `(restApiId, resourceId)` pair is resolved as ONE lookup for that resource:
+        // either half resolving to nothing leaves it unresolvable, and the refusal reports
+        // the resource.
+        let resource = store
+            .resource_mut(&input.rest_api_id, &input.resource_id)
+            .map_err(|message| not_found(&message))?;
         let resource_id = resource.id.clone();
         // An integration belongs to a METHOD: the verb in the URI must already name one
         // on the resource, or there is nothing to attach it to.

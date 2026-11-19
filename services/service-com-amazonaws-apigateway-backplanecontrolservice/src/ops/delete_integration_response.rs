@@ -173,15 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every identifier the request carries is resolved against stored state before
         // anything is removed, each naming its own record so the refusal says which one
         // was not found — the same walk `GetIntegrationResponse` reads the record
-        // through.
-        let api = store
-            .rest_apis
-            .get_mut(&input.rest_api_id)
-            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
-        let resource = api
-            .resources
-            .get_mut(&input.resource_id)
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
+        // through, with the `(restApiId, resourceId)` pair resolved as ONE lookup for the
+        // resource the response hangs off.
+        let resource = store
+            .resource_mut(&input.rest_api_id, &input.resource_id)
+            .map_err(|message| not_found(&message))?;
         let method = resource
             .methods
             .get_mut(&method_key(&input.http_method))

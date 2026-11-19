@@ -805,17 +805,16 @@ async fn an_identifier_no_record_carries_is_answered_not_found() {
     put_integration(&gateway, &api, &resource, "GET", json!({ "type": "MOCK" })).await;
 
     // Rows differ along WHICH of the three identifiers is unresolvable, each worded as
-    // every other reader of the same records words it.
+    // every other reader of the same records words it. A method is addressed THROUGH its
+    // resource, so an api id no API carries leaves that resource unresolvable too and is
+    // reported as the resource.
     let cases: Vec<(&str, String, String, &str, String)> = vec![
         (
             "an api id no API carries",
             "ghostapi".to_string(),
             resource.clone(),
             "GET",
-            format!(
-                "Invalid API identifier specified {}:ghostapi",
-                engine::emulator_account_id()
-            ),
+            "Invalid Resource identifier specified".to_string(),
         ),
         (
             "a resource id no resource of the api carries",

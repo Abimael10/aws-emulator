@@ -166,17 +166,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every identifier the request carries is resolved against stored state before
         // anything is removed, each naming its own record so the refusal says which one
-        // was not found.
-        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
-            DeleteMethodErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-            })
-        })?;
-        let resource = api.resources.get_mut(&input.resource_id).ok_or_else(|| {
-            DeleteMethodErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
-            })
-        })?;
+        // was not found. A method is addressed THROUGH its resource, so the
+        // `(restApiId, resourceId)` pair is resolved as ONE lookup for that resource.
+        let resource = store
+            .resource_mut(&input.rest_api_id, &input.resource_id)
+            .map_err(|message| {
+                DeleteMethodErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(message),
+                })
+            })?;
         // A verb names at most one method on a resource, under the same key
         // `PutMethod` stored it with; removing it is what makes a later read answer
         // `NotFoundException`.

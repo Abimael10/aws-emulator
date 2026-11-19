@@ -304,10 +304,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // A method response is added THROUGH its resource, so the
+        // `(restApiId, resourceId)` pair is resolved as ONE lookup for that resource: an
+        // api this account does not hold leaves the addressed resource unresolvable too,
+        // and the refusal reports that resource.
         let api = store
-            .rest_apis
-            .get_mut(&input.rest_api_id)
-            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
+            .resource_api_mut(&input.rest_api_id)
+            .map_err(|message| not_found(&message))?;
         // A `responseModels` value "specifies the Model resources used for the response's
         // content type" (`MethodResponse$responseModels`), so it has to name a `Model` of
         // THIS api: a value no model of the api answers to configures nothing and is

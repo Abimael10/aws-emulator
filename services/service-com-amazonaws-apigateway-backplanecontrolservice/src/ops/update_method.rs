@@ -284,11 +284,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let verb = super::put_method::method_key(&input.http_method);
         let mut store = state.lock();
 
-        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
-            UpdateMethodErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-            })
-        })?;
+        // A method is addressed THROUGH its resource, so the `(restApiId, resourceId)`
+        // pair is resolved as one lookup for that resource: an api this account does not
+        // hold leaves the addressed resource unresolvable too, and the refusal reports
+        // that resource.
+        let api = store
+            .resource_api_mut(&input.rest_api_id)
+            .map_err(|message| {
+                UpdateMethodErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(message),
+                })
+            })?;
         let api_model_names: ::std::collections::BTreeSet<String> =
             api.models.keys().cloned().collect();
         // The authorizers this api holds, read once per request before the resource is
