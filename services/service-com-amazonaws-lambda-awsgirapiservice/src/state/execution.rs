@@ -90,6 +90,10 @@ mod run_memory;
 /// it.
 pub mod python;
 
+/// The RELEASE of that interpreter a run reports, which is the one the function's `Runtime`
+/// names.
+mod python_release;
+
 /// The execution ENVIRONMENTS this process keeps standing, which an invocation of an
 /// already-initialized one is served by.
 pub mod warm_pool;
@@ -1815,6 +1819,19 @@ pub fn run_heap_bytes(memory_size: i32) -> usize {
 /// configures the language's own logging interface from.
 const APPLICATION_LOG_LEVEL_VARIABLE: &str = "AWS_LAMBDA_LOG_LEVEL";
 
+/// The variable a managed runtime exports the identifier of the runtime it IS as
+/// ("AWS_EXECUTION_ENV – The runtime identifier, prefixed by `AWS_Lambda_`", the Lambda
+/// Developer Guide's reserved runtime environment variables).
+///
+/// It is a reserved variable, so it is the service's statement of which runtime a run is of
+/// rather than anything the function set: what a run reports of its own runtime is read out of
+/// it — the release of the interpreter ([`python_release`]) and the library directory the
+/// runtime's own modules are reported under ([`bootstrap`]).
+pub(super) const EXECUTION_ENV_VARIABLE: &str = "AWS_EXECUTION_ENV";
+
+/// What that variable's value begins with, as the sentence above states it.
+pub(super) const EXECUTION_ENV_PREFIX: &str = "AWS_Lambda_";
+
 /// The variable a managed runtime reads the log STREAM of its execution environment as. It is
 /// the environment's own for as long as the environment stands, so the environments the pool
 /// keeps re-state it for every invocation they serve ([`warm_pool`]).
@@ -1933,9 +1950,9 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
             invocation.handler.clone().unwrap_or_default(),
         ),
         (
-            "AWS_EXECUTION_ENV",
+            EXECUTION_ENV_VARIABLE,
             format!(
-                "AWS_Lambda_{}",
+                "{EXECUTION_ENV_PREFIX}{}",
                 invocation.runtime.clone().unwrap_or_default()
             ),
         ),

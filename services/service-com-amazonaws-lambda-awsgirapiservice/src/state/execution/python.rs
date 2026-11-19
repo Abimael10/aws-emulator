@@ -1110,6 +1110,11 @@ fn prepare(
         .as_object()
         .set_attr("builtin_module_names", vm.ctx.new_tuple(names), vm)?;
     clamp_recursion(vm, recursion_limit)?;
+    // WHICH RELEASE of the language this execution environment is, which the function's own
+    // `Runtime` names ([`super::python_release`]). Installed LAST, so every module the host
+    // itself imported on the way up was imported by the interpreter as it was built, and the
+    // release the run reports is read by the guest's own imports and by nothing else.
+    super::python_release::install(vm, environment)?;
     Ok(environ)
 }
 
