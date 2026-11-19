@@ -70,8 +70,16 @@ png = "0.18"
 # The AgentCore CONTROL plane, whose store owns the browsers a browser session is
 # started on: `StartBrowserSession` names one it did not create, so the data plane
 # resolves the `browserIdentifier` against the component that owns it rather than
-# taking a session's existence on trust (src/state/browser.rs).
+# taking a session's existence on trust (src/state/browser.rs). Its store also owns the
+# account's token vault, so `GetResourceApiKey` resolves the credential provider it
+# names against it (src/state/resource_api_keys.rs).
 service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol = { workspace = true }
+# `aws-sdk-secretsmanager`: an API key credential provider keeps its key in a Secrets
+# Manager secret rather than in either AgentCore plane's store, so `GetResourceApiKey`
+# reads the key out of the service that holds it, through the in-process callback into
+# this same emulator (src/state/resource_api_keys.rs). Default features only — the SDK's
+# own TLS and DNS stacks are never used, because the transport is the callback's.
+aws-sdk-secretsmanager = { version = "1", default-features = false }
 # The two stores the identity plane's authorization gate reads
 # (`src/state/authorization.rs`): every operation models `AccessDeniedException`, and a
 # workload access token is scoped to ONE workload identity, so a mint decides whether IAM

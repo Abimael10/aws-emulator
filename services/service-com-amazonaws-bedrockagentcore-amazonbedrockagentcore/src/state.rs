@@ -46,6 +46,13 @@
 //! first too ([`presented_user_tokens`]): the token is a value to be checked, never one to
 //! be trusted.
 //!
+//! That registry is what the plane's FIRST-PARTY calls check a presented
+//! `workloadIdentityToken` against ([`workload_identity_tokens`]): a token the registry does
+//! not resolve at this instant is refused, so the only tokens accepted are the ones this
+//! service issued and has not seen expire. A call that gets past it resolves the credential
+//! provider it named against the plane that owns the account's token vault, and reads the
+//! credential out of the service holding it ([`resource_api_keys`]).
+//!
 //! # The store has an explicit ceiling
 //!
 //! `CreateEvent` and `IngestData` are the memory plane's growth sites, and a caller
@@ -119,6 +126,18 @@ pub use authorization::*;
 /// call is refused as.
 mod presented_user_tokens;
 pub use presented_user_tokens::*;
+
+/// The reading this plane makes of a WORKLOAD IDENTITY token of its own minting:
+/// [`workload_of_identity_token`], which says which issuance a presented token stands for or
+/// which class the call is refused as.
+mod workload_identity_tokens;
+pub use workload_identity_tokens::*;
+
+/// The resource-credential half of the identity plane: [`api_key_secret_of_provider`] and
+/// [`api_key_held_for`], which resolve the API key credential provider a call names against
+/// the plane that owns it and read the key out of the secret holding it.
+mod resource_api_keys;
+pub use resource_api_keys::*;
 
 /// The batch-evaluation plane: [`BatchEvaluationRecord`], the job records
 /// `StartBatchEvaluation` writes and `GetBatchEvaluation` reports back.

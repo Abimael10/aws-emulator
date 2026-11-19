@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceApiKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceApiKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The first-party exchange of a workload identity token for a resource's API key: the call
+//! a workload makes, with the token it was minted, to obtain the key of the API key
+//! credential provider it names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceApiKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three steps, in this order, so a refusal says only what the caller is entitled to know:
+//!
+//! 1. the presented `workloadIdentityToken` is CHECKED against the issuances this service
+//!    recorded ([`crate::state::workload_of_identity_token`]) — a token this service did not
+//!    issue, or one the clock has run out on, is `UnauthorizedException` (401) and nothing is
+//!    resolved;
+//! 2. the `resourceCredentialProviderName` is resolved against the plane that owns the
+//!    account's token vault ([`crate::state::api_key_secret_of_provider`]) — a name it holds
+//!    no provider under is `ResourceNotFoundException` (404). Reaching this refusal is how a
+//!    caller confirms the token it just minted is already usable;
+//! 3. the key itself is read out of the Secrets Manager secret the provider keeps it in
+//!    ([`crate::state::api_key_held_for`]), so the key answered is the key the provider's
+//!    create really stored.
+//!
+//! Whether the CALLER may obtain the key of the provider it named is decided first, from the
+//! IAM policies in force on the principal the request signed with
+//! ([`crate::state::authorize`]), as on every other call of this plane.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +174,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceApiKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceApiKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceApiKey"))
+        let region = crate::state::request_region(ctx.parts());
+        // The resource this call addresses: the credential provider the request names, built
+        // from the request alone, so a refusal discloses nothing about what exists.
+        let resource = crate::state::api_key_credential_provider_resource(
+            &region,
+            &input.resource_credential_provider_name,
+        );
+        // IAM decides BEFORE anything the request named is resolved.
+        crate::state::authorize(&*self.engine, ctx, Self::NAME, &resource)
+            .map_err(GetResourceApiKeyErrorModeled::AccessDeniedException)?;
+
+        // The TOKEN first: a call presenting one this service did not issue, or one its
+        // window has closed on, is refused without the provider being looked up at all — so
+        // the 404 below is itself the proof that the token was accepted.
+        {
+            let state = crate::state::service_state(&*self.engine).ok_or_else(missing_state)?;
+            let store = state.lock();
+            crate::state::workload_of_identity_token(
+                &store.workload_access_tokens,
+                &input.workload_identity_token,
+                ::std::time::SystemTime::now(),
+            )
+            .map_err(|refusal| {
+                GetResourceApiKeyErrorModeled::UnauthorizedException(UnauthorizedException {
+                    message: Some(refusal.message().to_string()),
+                })
+            })?;
+        }
+
+        // Then the provider, against the plane that owns the account's token vault. The
+        // guard above is released first: the read below takes that plane's store, and the
+        // key read after it awaits.
+        let secret = crate::state::api_key_secret_of_provider(
+            &*self.engine,
+            &input.resource_credential_provider_name,
+        )
+        .map_err(provider_problem)?;
+
+        // And the key itself, out of the secret the provider keeps it in.
+        let api_key = crate::state::api_key_held_for(ctx, &region, &secret)
+            .await
+            .map_err(provider_problem)?;
+
+        Ok(GetResourceApiKeyOutput { api_key })
     }
+}
+
+/// How this operation answers when the API key the request asked for cannot be reported: a
+/// name the account holds no credential provider under is the modelled 404, and everything
+/// else — the owning plane's store out of reach, or a secret this emulator's own Secrets
+/// Manager would not yield the key from — is a server failure rather than a statement about
+/// the request, because the provider the request named is there.
+fn provider_problem(problem: crate::state::ResourceApiKeyProblem) -> GetResourceApiKeyError {
+    match problem {
+        crate::state::ResourceApiKeyProblem::NoSuchProvider => {
+            GetResourceApiKeyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(
+                    crate::state::RESOURCE_CREDENTIAL_PROVIDER_NOT_FOUND_MESSAGE.to_string(),
+                ),
+            })
+            .into()
+        }
+        crate::state::ResourceApiKeyProblem::OwnerStoreUnavailable => missing_state(),
+        crate::state::ResourceApiKeyProblem::SecretUnreadable(detail) => {
+            ::tracing::warn!(
+                %detail,
+                "the API key of a credential provider could not be read out of the secret it \
+                 lives in, so no key was reported",
+            );
+            GetResourceApiKeyErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the API key could not be read from Secrets Manager".to_string()),
+            })
+            .into()
+        }
+    }
+}
+
+/// The modelled server failure for an engine that carries no store this operation needs.
+fn missing_state() -> GetResourceApiKeyError {
+    GetResourceApiKeyErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the credential provider store is unavailable".to_string()),
+    })
+    .into()
 }

@@ -15,6 +15,13 @@
 //! `GetWorkloadAccessToken` is the same mint for a workload acting for NO user, so its
 //! token names the workload identity alone and its issuance records no user.
 //!
+//! The last two cases close the loop the mints exist for: a token this plane has just minted
+//! is immediately usable against a FIRST-PARTY call of the same plane
+//! (`GetResourceApiKey`) — which gets past the token and is refused only on the credential
+//! provider it named, with the sentence AWS words that miss with — while a presented value no
+//! live issuance stands behind is refused `UnauthorizedException` before anything the request
+//! named is resolved.
+//!
 //! Every case drives real HTTP through the same `MultiServiceRouter` the emulator serves
 //! with, so the wire shape (route, status code, `restJson1` body, modelled error code) is
 //! exercised, not just the handler function.
@@ -749,4 +756,276 @@ async fn the_workload_mint_refuses_input_outside_a_modelled_constraint_with_400(
             "case {case:?}: a refused request must mint and record nothing"
         );
     }
+}
+
+// --- the minted token presented back to a first-party call --------------------------------
+
+/// `GetResourceApiKey`: `POST /identities/api-key` (source: smithy_query query="operation"
+/// operation="GetResourceApiKey": `http`). The first-party call a minted token is exercised
+/// against here.
+const API_KEY_ROUTE: &str = "/identities/api-key";
+
+/// The sentence AWS refuses a resource credential provider this account does not hold with:
+/// fixed text carrying no part of the request. Spelled out here rather than read off the
+/// emulator, so the assertion states the expectation instead of restating the code.
+const PROVIDER_NOT_FOUND_MESSAGE: &str = "Resource Credential Provider not found";
+
+/// The two sentences the plane refuses a presented bearer token with.
+const TOKEN_EXPIRED_MESSAGE: &str = "Token has expired";
+const TOKEN_INVALID_MESSAGE: &str = "Invalid JWT token";
+
+/// `GetResourceApiKey` with `token` presented for the provider `provider`.
+async fn get_resource_api_key(
+    router: &MultiServiceRouter,
+    token: &str,
+    provider: &str,
+) -> (u16, Value) {
+    post(
+        router,
+        "us-east-1",
+        API_KEY_ROUTE,
+        json!({
+            "workloadIdentityToken": token,
+            "resourceCredentialProviderName": provider,
+        }),
+    )
+    .await
+}
+
+/// Record an issuance whose window has already closed, the way a mint records one: a token
+/// minted an hour ago for the plane's own time-to-live. The test reaches into the store the
+/// handlers share rather than waiting for a clock, which is not an emulator behaviour.
+fn aged_issuance(engine: &engine::InMemoryEngine, workload: &str, user: &str) -> String {
+    let issued_at = SystemTime::now() - Duration::from_secs(3_600);
+    let expires_at = issued_at + agentcore::state::WORKLOAD_ACCESS_TOKEN_TTL;
+    let token = agentcore::state::mint_workload_access_token(
+        "us-east-1",
+        workload,
+        Some(user),
+        issued_at,
+        expires_at,
+        11,
+    );
+    let state = agentcore::state::service_state(engine).expect("the service state");
+    state.lock().workload_access_tokens.record(
+        token.clone(),
+        issuance_record(workload, user, issued_at, expires_at),
+        issued_at,
+    );
+    token
+}
+
+/// A token this service never issued, in the form the plane's own mint produces: built here
+/// and recorded nowhere.
+fn unissued_token(workload: &str, user: &str) -> String {
+    let issued_at = SystemTime::now();
+    agentcore::state::mint_workload_access_token(
+        "us-east-1",
+        workload,
+        Some(user),
+        issued_at,
+        issued_at + agentcore::state::WORKLOAD_ACCESS_TOKEN_TTL,
+        4_242,
+    )
+}
+
+/// A token this plane has just minted is ACCEPTED by the plane's first-party
+/// resource-credential call: the call gets past the token and is refused only on the
+/// credential provider it named, with the fixed sentence AWS words that miss with.
+///
+/// This engine carries no credential provider at all — those are created by the AgentCore
+/// control plane, a different service, and the key an existing one answers is proven end to
+/// end over all three services in
+/// `core/router/tests/all/bedrock_agentcore_resource_api_key.rs` — so every provider name
+/// here is one the account does not hold. The rows span which mint the presented token came
+/// from (two distinct tokens of one workload and user, and the mint for the workload itself)
+/// and the form of the name asked for.
+#[tokio::test]
+async fn a_minted_token_is_accepted_by_the_first_party_api_key_call() {
+    let (router, engine) = emulator();
+
+    let (status, body) = get_token(
+        &router,
+        "us-east-1",
+        json!({"workloadName": "exchange.agent", "userId": "user-1"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the first mint must answer 200, got {status} with {body:?}"
+    );
+    let first = text(&body, "workloadAccessToken").to_string();
+    let (status, body) = get_token(
+        &router,
+        "us-east-1",
+        json!({"workloadName": "exchange.agent", "userId": "user-1"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the second mint must answer 200, got {status} with {body:?}"
+    );
+    let second = text(&body, "workloadAccessToken").to_string();
+    assert_ne!(
+        first, second,
+        "two mints must hand out two distinct tokens, got the same value twice"
+    );
+    let (status, body) = get_workload_token(
+        &router,
+        "us-east-1",
+        json!({"workloadName": "exchange.agent"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the workload's own mint must answer 200, got {status} with {body:?}"
+    );
+    let for_the_workload = text(&body, "workloadAccessToken").to_string();
+
+    // Rows: the form of the provider name the call asks for — every character class
+    // `CredentialProviderName`'s pattern `^[a-zA-Z0-9\-_]+$` admits, and both published
+    // bounds of its 1..128 length.
+    let names: Vec<(&str, String)> = vec![
+        ("a-name-nothing-created", "nonexistent-provider".to_string()),
+        (
+            "every-character-class-the-pattern-admits",
+            "Partner_api-2024".to_string(),
+        ),
+        ("the-shortest-name-the-shape-admits", "p".to_string()),
+        ("the-longest-name-the-shape-admits", "n".repeat(128)),
+    ];
+
+    for (token_case, token) in [
+        ("the-first-token", &first),
+        ("the-second-token", &second),
+        ("the-workloads-own-token", &for_the_workload),
+    ] {
+        for (case, name) in &names {
+            let (status, body) = get_resource_api_key(&router, token, name).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?} with {token_case:?}: expected HTTP 404, got {status} with {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {case:?} with {token_case:?}: expected ResourceNotFoundException, got \
+                 {body:?}"
+            );
+            assert_eq!(
+                text(&body, "message"),
+                PROVIDER_NOT_FOUND_MESSAGE,
+                "case {case:?} with {token_case:?}: expected the fixed sentence, got {body:?}"
+            );
+            // Fixed text: the refusal quotes neither the name asked for nor the token.
+            assert!(
+                !text(&body, "message").contains(name.as_str())
+                    && !text(&body, "message").contains(token.as_str()),
+                "case {case:?} with {token_case:?}: the sentence must carry no part of the \
+                 request, got {body:?}"
+            );
+        }
+    }
+
+    // Presenting a token is a READ: the three issuances are still the three the mints
+    // recorded, and each still resolves.
+    assert_eq!(
+        issuance_count(&engine),
+        3,
+        "the exchanges must record nothing of their own"
+    );
+    let now = SystemTime::now();
+    for (case, token) in [
+        ("the-first-token", &first),
+        ("the-second-token", &second),
+        ("the-workloads-own-token", &for_the_workload),
+    ] {
+        assert!(
+            issuance(&engine, token, now).is_some(),
+            "case {case:?}: presenting a token must leave its issuance resolvable"
+        );
+    }
+}
+
+/// A presented value no LIVE issuance of this service stands behind is refused
+/// `UnauthorizedException` (HTTP 401) — decided before the provider the request named is
+/// looked up, so the refusal says nothing about what the account holds.
+///
+/// The rows span why no live issuance backs the value: one whose window the clock has closed,
+/// one well-formed token of the plane's own form that was never issued here, and values that
+/// are no token at all.
+#[tokio::test]
+async fn the_api_key_call_refuses_a_token_no_live_issuance_backs() {
+    let (router, engine) = emulator();
+    let expired = aged_issuance(&engine, "exchange.agent", "user-1");
+    let unissued = unissued_token("exchange.agent", "user-1");
+
+    let cases: Vec<(&str, String, &str)> = vec![
+        (
+            "an-issuance-whose-window-has-closed",
+            expired,
+            TOKEN_EXPIRED_MESSAGE,
+        ),
+        (
+            "a-well-formed-token-this-service-never-issued",
+            unissued,
+            TOKEN_INVALID_MESSAGE,
+        ),
+        (
+            "three-segments-that-are-not-base64url-json",
+            "abc.def.ghi".to_string(),
+            TOKEN_INVALID_MESSAGE,
+        ),
+        (
+            "a-value-that-is-no-token-at-all",
+            "not-a-token".to_string(),
+            TOKEN_INVALID_MESSAGE,
+        ),
+        (
+            "two-segments-rather-than-three",
+            "header.claims".to_string(),
+            TOKEN_INVALID_MESSAGE,
+        ),
+    ];
+
+    for (case, token, expected) in cases {
+        let (status, body) = get_resource_api_key(&router, &token, "nonexistent-provider").await;
+        assert_eq!(
+            status, 401,
+            "case {case:?}: expected HTTP 401, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "UnauthorizedException",
+            "case {case:?}: expected UnauthorizedException, got {body:?}"
+        );
+        assert_eq!(
+            text(&body, "message"),
+            expected,
+            "case {case:?}: expected {expected:?}, got {body:?}"
+        );
+        assert!(
+            !text(&body, "message").contains(&token),
+            "case {case:?}: the refusal must not quote the presented token, got {body:?}"
+        );
+    }
+
+    // A token this plane has just minted gets past the token check, which is what makes the
+    // refusals above about the token rather than about the call.
+    let (status, body) = get_token(
+        &router,
+        "us-east-1",
+        json!({"workloadName": "exchange.agent", "userId": "user-1"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the fixture mint must answer 200, got {status} with {body:?}"
+    );
+    let live = text(&body, "workloadAccessToken").to_string();
+    let (status, body) = get_resource_api_key(&router, &live, "nonexistent-provider").await;
+    assert_eq!(
+        status, 404,
+        "a live token must get past the token check, got {status} with {body:?}"
+    );
 }
