@@ -457,6 +457,15 @@ pub(super) fn insert_number(document: &mut Map<String, Value>, name: &str, value
     }
 }
 
+/// Put a FRACTIONAL numeric member on it, the same way: a ratio or a per-unit figure a service
+/// reports as a `double`. A value no JSON number can hold (an infinity, a NaN) is left off
+/// rather than reported as something else.
+pub(super) fn insert_double(document: &mut Map<String, Value>, name: &str, value: Option<f64>) {
+    if let Some(number) = value.and_then(::serde_json::Number::from_f64) {
+        document.insert(name.to_string(), Value::Number(number));
+    }
+}
+
 /// Put a TIMESTAMP member on it, as the epoch seconds an AWS JSON protocol carries a timestamp
 /// as — which is the form this seam hands every service's timestamps over in.
 pub(super) fn insert_timestamp(

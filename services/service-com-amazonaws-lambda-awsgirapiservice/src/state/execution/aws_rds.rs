@@ -13,7 +13,12 @@
 //! its own. A handler that cannot reach this service cannot carry out that step at all, so
 //! the rotation it is driven through never finishes.
 //!
-//! EXPORTING A DATABASE'S DATA TO AMAZON S3 is the other shape, and the one a CloudFormation
+//! READING WHAT THE SERVICE OFFERS is the shape of a handler that decides before it acts: the
+//! engine versions an account can launch and the configurations each of them can be launched in
+//! are reference data the service publishes, and a periodic or scheduled handler reads them to
+//! report what has become available. A handler that cannot reach this service reads none of it.
+//!
+//! EXPORTING A DATABASE'S DATA TO AMAZON S3 is the third shape, and the one a CloudFormation
 //! custom resource's provider takes: the handler starts an export task for a snapshot, polls it
 //! to a terminal status, cancels one that is no longer wanted, and associates or drops the IAM
 //! role under which the engine reaches Amazon S3. A handler that cannot reach this service can
@@ -57,7 +62,10 @@ use ::serde_json::{Map, Value};
 use ::smithy_server_runtime::EmbeddedEmulator;
 
 use super::aws_api::{Answer, CallerIdentity, Refusal};
-use super::sdk_call::{insert_flag, insert_number, insert_text, insert_timestamp, Input, Observed, PROVIDER_NAME};
+use super::sdk_call::{
+    insert_double, insert_flag, insert_number, insert_text, insert_timestamp, Input, Observed,
+    PROVIDER_NAME,
+};
 
 /// The service a refusal of one of these calls names, as the AWS SDKs name it.
 const SERVICE: &str = "Amazon RDS";
@@ -67,7 +75,9 @@ const SERVICE: &str = "Amazon RDS";
 /// One entry per operation [`call`] builds a request for: the surface a handler that manages
 /// a database credential uses — reading the DB instance or DB cluster the credential belongs
 /// to, and changing that resource's own configuration, which is how the master credential is
-/// put in force (`MasterUserPassword` / `RotateMasterUserPassword` on either modify) — and the
+/// put in force (`MasterUserPassword` / `RotateMasterUserPassword` on either modify) — the
+/// CATALOGUE a handler reads to learn what the service offers before it acts on a database (the
+/// engine versions it can launch and the configurations each can be launched in) — and the
 /// surface a handler that drives the database's Amazon S3 integration uses: the export task it
 /// starts, reads and cancels, and the role associations that let the engine reach Amazon S3 at
 /// all. A handler naming any other operation of the service is told the call was not made and
@@ -77,6 +87,8 @@ pub const BOUND_OPERATIONS: &[&str] = &[
     "ModifyDBInstance",
     "DescribeDBClusters",
     "ModifyDBCluster",
+    "DescribeDBEngineVersions",
+    "DescribeOrderableDBInstanceOptions",
     "StartExportTask",
     "DescribeExportTasks",
     "CancelExportTask",
@@ -101,6 +113,12 @@ pub async fn call(
         Some("ModifyDBInstance") => modify_db_instance(&client, &input, &observed).await,
         Some("DescribeDBClusters") => describe_db_clusters(&client, &input, &observed).await,
         Some("ModifyDBCluster") => modify_db_cluster(&client, &input, &observed).await,
+        Some("DescribeDBEngineVersions") => {
+            describe_db_engine_versions(&client, &input, &observed).await
+        }
+        Some("DescribeOrderableDBInstanceOptions") => {
+            describe_orderable_db_instance_options(&client, &input, &observed).await
+        }
         Some("StartExportTask") => start_export_task(&client, &input, &observed).await,
         Some("DescribeExportTasks") => describe_export_tasks(&client, &input, &observed).await,
         Some("CancelExportTask") => cancel_export_task(&client, &input, &observed).await,
@@ -667,6 +685,108 @@ async fn modify_db_cluster(
     observed.answer(document)
 }
 
+/// `DescribeDBEngineVersions`: the engine versions this account can launch, which is the
+/// CATALOGUE a handler reads to learn what the service offers before it acts on a database.
+async fn describe_db_engine_versions(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&[
+        "Engine",
+        "EngineVersion",
+        "DBParameterGroupFamily",
+        "Filters",
+        "MaxRecords",
+        "Marker",
+        "DefaultOnly",
+        "ListSupportedCharacterSets",
+        "ListSupportedTimezones",
+        "IncludeAll",
+    ])?;
+    let described = client
+        .describe_db_engine_versions()
+        .set_engine(input.text("Engine")?)
+        .set_engine_version(input.text("EngineVersion")?)
+        .set_db_parameter_group_family(input.text("DBParameterGroupFamily")?)
+        .set_filters(filters(input)?)
+        .set_max_records(input.integer("MaxRecords")?)
+        .set_marker(input.text("Marker")?)
+        .set_default_only(input.boolean("DefaultOnly")?)
+        .set_list_supported_character_sets(input.boolean("ListSupportedCharacterSets")?)
+        .set_list_supported_timezones(input.boolean("ListSupportedTimezones")?)
+        .set_include_all(input.boolean("IncludeAll")?)
+        .send()
+        .await;
+    let described = match described {
+        Ok(described) => described,
+        Err(error) => return observed.refused(&error),
+    };
+    let mut document = Map::new();
+    insert_text(&mut document, "Marker", described.marker());
+    document.insert(
+        "DBEngineVersions".to_string(),
+        Value::Array(
+            described
+                .db_engine_versions()
+                .iter()
+                .map(db_engine_version_document)
+                .collect(),
+        ),
+    );
+    observed.answer(document)
+}
+
+/// `DescribeOrderableDBInstanceOptions`: the configurations an engine version can be launched
+/// in, the other half of the catalogue a handler reads before it creates or resizes a database.
+async fn describe_orderable_db_instance_options(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&[
+        "Engine",
+        "EngineVersion",
+        "DBInstanceClass",
+        "LicenseModel",
+        "AvailabilityZoneGroup",
+        "Vpc",
+        "Filters",
+        "MaxRecords",
+        "Marker",
+    ])?;
+    let described = client
+        .describe_orderable_db_instance_options()
+        .engine(input.required_text("Engine")?)
+        .set_engine_version(input.text("EngineVersion")?)
+        .set_db_instance_class(input.text("DBInstanceClass")?)
+        .set_license_model(input.text("LicenseModel")?)
+        .set_availability_zone_group(input.text("AvailabilityZoneGroup")?)
+        .set_vpc(input.boolean("Vpc")?)
+        .set_filters(filters(input)?)
+        .set_max_records(input.integer("MaxRecords")?)
+        .set_marker(input.text("Marker")?)
+        .send()
+        .await;
+    let described = match described {
+        Ok(described) => described,
+        Err(error) => return observed.refused(&error),
+    };
+    let mut document = Map::new();
+    insert_text(&mut document, "Marker", described.marker());
+    document.insert(
+        "OrderableDBInstanceOptions".to_string(),
+        Value::Array(
+            described
+                .orderable_db_instance_options()
+                .iter()
+                .map(orderable_option_document)
+                .collect(),
+        ),
+    );
+    observed.answer(document)
+}
+
 /// The `Filters` a describe carries, read as the name/values pairs the service takes; `None`
 /// where the call carries none, so the member is left off the request rather than sent
 /// emptied.
@@ -947,6 +1067,358 @@ fn insert_vpc_security_groups(
     document.insert("VpcSecurityGroups".to_string(), Value::Array(held));
 }
 
+/// One `DBEngineVersion` as the answer's document carries it, read the same way
+/// (`smithy_query(query="shape",shape="DBEngineVersion")`): the engine and version it names, the
+/// parameter-group family and descriptions a client shows, the status it is published in, the
+/// versions it can be upgraded to, and what the version SUPPORTS — which is the whole reason a
+/// handler reads this catalogue before it launches or changes a database.
+fn db_engine_version_document(version: &::aws_sdk_rds::types::DbEngineVersion) -> Value {
+    let mut document = Map::new();
+    insert_text(&mut document, "Engine", version.engine());
+    insert_text(&mut document, "EngineVersion", version.engine_version());
+    insert_text(
+        &mut document,
+        "MajorEngineVersion",
+        version.major_engine_version(),
+    );
+    insert_text(
+        &mut document,
+        "DBParameterGroupFamily",
+        version.db_parameter_group_family(),
+    );
+    insert_text(
+        &mut document,
+        "DBEngineDescription",
+        version.db_engine_description(),
+    );
+    insert_text(
+        &mut document,
+        "DBEngineVersionDescription",
+        version.db_engine_version_description(),
+    );
+    insert_text(
+        &mut document,
+        "DBEngineVersionArn",
+        version.db_engine_version_arn(),
+    );
+    insert_text(
+        &mut document,
+        "DBEngineMediaType",
+        version.db_engine_media_type(),
+    );
+    insert_text(&mut document, "Status", version.status());
+    insert_text(&mut document, "KMSKeyId", version.kms_key_id());
+    insert_timestamp(&mut document, "CreateTime", version.create_time());
+    insert_flag(
+        &mut document,
+        "SupportsLogExportsToCloudwatchLogs",
+        version.supports_log_exports_to_cloudwatch_logs(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsReadReplica",
+        version.supports_read_replica(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsParallelQuery",
+        version.supports_parallel_query(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsGlobalDatabases",
+        version.supports_global_databases(),
+    );
+    insert_flag(&mut document, "SupportsBabelfish", version.supports_babelfish());
+    insert_flag(
+        &mut document,
+        "SupportsLimitlessDatabase",
+        version.supports_limitless_database(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsIntegrations",
+        version.supports_integrations(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsCertificateRotationWithoutRestart",
+        version.supports_certificate_rotation_without_restart(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsLocalWriteForwarding",
+        version.supports_local_write_forwarding(),
+    );
+    insert_list(
+        &mut document,
+        "ExportableLogTypes",
+        version.exportable_log_types(),
+    );
+    insert_list(
+        &mut document,
+        "SupportedEngineModes",
+        version.supported_engine_modes(),
+    );
+    insert_list(
+        &mut document,
+        "SupportedFeatureNames",
+        version.supported_feature_names(),
+    );
+    insert_list(
+        &mut document,
+        "SupportedCACertificateIdentifiers",
+        version.supported_ca_certificate_identifiers(),
+    );
+    insert_list(
+        &mut document,
+        "DatabaseInstallationFiles",
+        version.database_installation_files(),
+    );
+    let upgrades: Vec<Value> = version
+        .valid_upgrade_target()
+        .iter()
+        .map(|target| {
+            let mut held = Map::new();
+            insert_text(&mut held, "Engine", target.engine());
+            insert_text(&mut held, "EngineVersion", target.engine_version());
+            insert_text(&mut held, "Description", target.description());
+            insert_flag(&mut held, "AutoUpgrade", target.auto_upgrade());
+            insert_flag(
+                &mut held,
+                "IsMajorVersionUpgrade",
+                target.is_major_version_upgrade(),
+            );
+            insert_list(&mut held, "SupportedEngineModes", target.supported_engine_modes());
+            Value::Object(held)
+        })
+        .collect();
+    if !upgrades.is_empty() {
+        document.insert("ValidUpgradeTarget".to_string(), Value::Array(upgrades));
+    }
+    insert_character_sets(
+        &mut document,
+        "SupportedCharacterSets",
+        version.supported_character_sets(),
+    );
+    insert_character_sets(
+        &mut document,
+        "SupportedNcharCharacterSets",
+        version.supported_nchar_character_sets(),
+    );
+    if let Some(default) = version.default_character_set() {
+        document.insert(
+            "DefaultCharacterSet".to_string(),
+            character_set_document(default),
+        );
+    }
+    let zones: Vec<Value> = version
+        .supported_timezones()
+        .iter()
+        .map(|zone| {
+            let mut held = Map::new();
+            insert_text(&mut held, "TimezoneName", zone.timezone_name());
+            Value::Object(held)
+        })
+        .collect();
+    if !zones.is_empty() {
+        document.insert("SupportedTimezones".to_string(), Value::Array(zones));
+    }
+    Value::Object(document)
+}
+
+/// The CHARACTER SETS an engine version publishes for a member, where it publishes any.
+fn insert_character_sets(
+    document: &mut Map<String, Value>,
+    name: &str,
+    sets: &[::aws_sdk_rds::types::CharacterSet],
+) {
+    if sets.is_empty() {
+        return;
+    }
+    let held: Vec<Value> = sets.iter().map(character_set_document).collect();
+    document.insert(name.to_string(), Value::Array(held));
+}
+
+/// One `CharacterSet` as the answer's document carries it.
+fn character_set_document(set: &::aws_sdk_rds::types::CharacterSet) -> Value {
+    let mut held = Map::new();
+    insert_text(&mut held, "CharacterSetName", set.character_set_name());
+    insert_text(
+        &mut held,
+        "CharacterSetDescription",
+        set.character_set_description(),
+    );
+    Value::Object(held)
+}
+
+/// One `OrderableDBInstanceOption` as the answer's document carries it, read the same way
+/// (`smithy_query(query="shape",shape="OrderableDBInstanceOption")`): the engine version and
+/// instance class the option is for, where it can be launched, and the storage and feature
+/// bounds a handler sizes a database against.
+fn orderable_option_document(
+    option: &::aws_sdk_rds::types::OrderableDbInstanceOption,
+) -> Value {
+    let mut document = Map::new();
+    insert_text(&mut document, "Engine", option.engine());
+    insert_text(&mut document, "EngineVersion", option.engine_version());
+    insert_text(&mut document, "DBInstanceClass", option.db_instance_class());
+    insert_text(&mut document, "LicenseModel", option.license_model());
+    insert_text(
+        &mut document,
+        "AvailabilityZoneGroup",
+        option.availability_zone_group(),
+    );
+    insert_text(&mut document, "StorageType", option.storage_type());
+    insert_flag(&mut document, "Vpc", option.vpc());
+    insert_flag(&mut document, "MultiAZCapable", option.multi_az_capable());
+    insert_flag(
+        &mut document,
+        "ReadReplicaCapable",
+        option.read_replica_capable(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsStorageEncryption",
+        option.supports_storage_encryption(),
+    );
+    insert_flag(&mut document, "SupportsIops", option.supports_iops());
+    insert_flag(
+        &mut document,
+        "SupportsStorageThroughput",
+        option.supports_storage_throughput(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsEnhancedMonitoring",
+        option.supports_enhanced_monitoring(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsIAMDatabaseAuthentication",
+        option.supports_iam_database_authentication(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsPerformanceInsights",
+        option.supports_performance_insights(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsGlobalDatabases",
+        option.supports_global_databases(),
+    );
+    insert_flag(&mut document, "SupportsClusters", option.supports_clusters());
+    insert_flag(
+        &mut document,
+        "SupportsStorageAutoscaling",
+        option.supports_storage_autoscaling(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsKerberosAuthentication",
+        option.supports_kerberos_authentication(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsDedicatedLogVolume",
+        option.supports_dedicated_log_volume(),
+    );
+    insert_flag(
+        &mut document,
+        "SupportsHttpEndpoint",
+        option.supports_http_endpoint(),
+    );
+    insert_flag(&mut document, "OutpostCapable", option.outpost_capable());
+    insert_number(
+        &mut document,
+        "MinStorageSize",
+        option.min_storage_size().map(i64::from),
+    );
+    insert_number(
+        &mut document,
+        "MaxStorageSize",
+        option.max_storage_size().map(i64::from),
+    );
+    insert_number(
+        &mut document,
+        "MinIopsPerDbInstance",
+        option.min_iops_per_db_instance().map(i64::from),
+    );
+    insert_number(
+        &mut document,
+        "MaxIopsPerDbInstance",
+        option.max_iops_per_db_instance().map(i64::from),
+    );
+    insert_number(
+        &mut document,
+        "MinStorageThroughputPerDbInstance",
+        option.min_storage_throughput_per_db_instance().map(i64::from),
+    );
+    insert_number(
+        &mut document,
+        "MaxStorageThroughputPerDbInstance",
+        option.max_storage_throughput_per_db_instance().map(i64::from),
+    );
+    insert_double(&mut document, "MinIopsPerGib", option.min_iops_per_gib());
+    insert_double(&mut document, "MaxIopsPerGib", option.max_iops_per_gib());
+    insert_double(
+        &mut document,
+        "MinStorageThroughputPerIops",
+        option.min_storage_throughput_per_iops(),
+    );
+    insert_double(
+        &mut document,
+        "MaxStorageThroughputPerIops",
+        option.max_storage_throughput_per_iops(),
+    );
+    insert_list(
+        &mut document,
+        "SupportedEngineModes",
+        option.supported_engine_modes(),
+    );
+    insert_list(
+        &mut document,
+        "SupportedNetworkTypes",
+        option.supported_network_types(),
+    );
+    insert_list(
+        &mut document,
+        "SupportedActivityStreamModes",
+        option.supported_activity_stream_modes(),
+    );
+    let zones: Vec<Value> = option
+        .availability_zones()
+        .iter()
+        .map(|zone| {
+            let mut held = Map::new();
+            insert_text(&mut held, "Name", zone.name());
+            Value::Object(held)
+        })
+        .collect();
+    if !zones.is_empty() {
+        document.insert("AvailabilityZones".to_string(), Value::Array(zones));
+    }
+    let features: Vec<Value> = option
+        .available_processor_features()
+        .iter()
+        .map(|feature| {
+            let mut held = Map::new();
+            insert_text(&mut held, "Name", feature.name());
+            insert_text(&mut held, "DefaultValue", feature.default_value());
+            insert_text(&mut held, "AllowedValues", feature.allowed_values());
+            Value::Object(held)
+        })
+        .collect();
+    if !features.is_empty() {
+        document.insert(
+            "AvailableProcessorFeatures".to_string(),
+            Value::Array(features),
+        );
+    }
+    Value::Object(document)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{bound_operation, BOUND_OPERATIONS};
@@ -982,6 +1454,16 @@ mod tests {
                 Some("ModifyDBCluster"),
             ),
             ("a lower-cased name", "describedbclusters", Some("DescribeDBClusters")),
+            (
+                "the engine-version catalogue read, titled word by word",
+                "DescribeDbEngineVersions",
+                Some("DescribeDBEngineVersions"),
+            ),
+            (
+                "the orderable-options catalogue read, titled the same way",
+                "DescribeOrderableDbInstanceOptions",
+                Some("DescribeOrderableDBInstanceOptions"),
+            ),
             ("an operation of this service the seam does not bind", "DeleteDBInstance", None),
             ("an operation of no service at all", "Elsewhere", None),
             ("the empty name", "", None),
