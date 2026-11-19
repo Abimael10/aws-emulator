@@ -28,6 +28,10 @@
 //!   region holds, paging by `maxResults` and resuming from its own
 //!   `nextToken`, while its default view reports only current member accounts
 //!   (which is `member_relationship_status_filter`'s rule);
+//! * `DeleteMember` drops exactly the association it addresses, leaving every
+//!   other association — and the same account's association in another region —
+//!   where it is, and states its postcondition, the region holding no
+//!   association for that account, whether or not a record was there to drop;
 //! * associating an account that is already a member states that one
 //!   association again rather than doubling it.
 
@@ -86,6 +90,59 @@ async fn create(
         body["tags"] = serde_json::json!(tags);
     }
     call_in(router, region, "POST", MEMBERS_URI, &body.to_string()).await
+}
+
+/// Delete the association of `account` in `region`.
+async fn delete(
+    router: &MultiServiceRouter,
+    region: &str,
+    account: &str,
+) -> (u16, serde_json::Value) {
+    call_in(
+        router,
+        region,
+        "DELETE",
+        &format!("{MEMBERS_URI}/{account}"),
+        "",
+    )
+    .await
+}
+
+/// The accounts `region` holds an association for, asked for as ALL accounts —
+/// which is the whole enumeration of what the region holds — in account-id
+/// order.
+async fn associated_accounts(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+) -> Vec<String> {
+    let (status, page) = call_in(
+        router,
+        region,
+        "GET",
+        &format!("{MEMBERS_URI}?onlyAssociated=false&maxResults=25"),
+        "",
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: ListMembers must answer 200, got {status} with {page:?}"
+    );
+    assert!(
+        page["nextToken"].is_null(),
+        "case {case:?}: every association of this case fits one page, got {page:?}"
+    );
+    let mut accounts: Vec<String> = page["members"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["accountId"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    accounts.sort();
+    accounts
 }
 
 /// Read the association of `account` in `region`.
@@ -758,6 +815,12 @@ async fn the_member_plane_needs_a_macie_session() {
         ),
         ("ListMembers", "GET", MEMBERS_URI.to_string(), String::new()),
         (
+            "DeleteMember",
+            "DELETE",
+            format!("{MEMBERS_URI}/111122223333"),
+            String::new(),
+        ),
+        (
             "CreateMember naming the caller's own account",
             "POST",
             MEMBERS_URI.to_string(),
@@ -782,4 +845,269 @@ async fn the_member_plane_needs_a_macie_session() {
              got {reply:?}"
         );
     }
+}
+
+/// Whether a reply carries no document of its own: `DeleteMemberResponse` models
+/// no members, so an accepted delete answers an empty body or an empty object
+/// and nothing else.
+fn is_empty_document(reply: &serde_json::Value) -> bool {
+    reply.is_null() || reply.as_object().is_some_and(|members| members.is_empty())
+}
+
+/// A delete drops EXACTLY the association it addresses: the account it names is
+/// no longer readable and no longer enumerated, every other association the
+/// region holds is untouched, and an association of the SAME account in another
+/// region stays where it is — an association belongs to the region it was made
+/// in. The rows are the associations the region holds, each deleted in turn out
+/// of a registry that still holds the rest, so what is pinned is the whole
+/// registry after each delete rather than one call.
+#[tokio::test]
+async fn a_delete_drops_exactly_the_association_it_addresses() {
+    let router = emulator();
+    enable_in(&router, REGION, "{}").await;
+    enable_in(&router, OTHER_REGION, "{}").await;
+
+    let accounts: Vec<String> = (1..=5)
+        .map(|index| format!("1111222233{index:02}"))
+        .collect();
+    for account in &accounts {
+        let (status, reply) = create(
+            &router,
+            REGION,
+            account,
+            &format!("{account}@example.com"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {account:?}: a create must answer 200, got {status} with {reply:?}"
+        );
+    }
+    // The first account is associated in the OTHER region too, so the delete of
+    // its association here has a second association of the same account to
+    // leave alone.
+    let shared = accounts[0].clone();
+    let (status, reply) = create(
+        &router,
+        OTHER_REGION,
+        &shared,
+        "shared@example.com",
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"associate the same account in another region\": expected 200, \
+         got {status} with {reply:?}"
+    );
+
+    let mut remaining: Vec<String> = accounts.clone();
+    remaining.sort();
+
+    for account in &accounts {
+        let (status, reply) = delete(&router, REGION, account).await;
+        assert_eq!(
+            status, 200,
+            "case {account:?}: DeleteMember must answer 200, got {status} with {reply:?}"
+        );
+        assert!(
+            is_empty_document(&reply),
+            "case {account:?}: a delete reports no document of its own, got {reply:?}"
+        );
+
+        let (read_status, read_reply) = read(&router, REGION, account).await;
+        assert_eq!(
+            read_status, 400,
+            "case {account:?}: the deleted association must not be readable, \
+             got {read_status} with {read_reply:?}"
+        );
+        assert_eq!(
+            error_message(&read_reply),
+            NOT_AN_ASSOCIATED_MEMBER_MESSAGE,
+            "case {account:?}: expected {NOT_AN_ASSOCIATED_MEMBER_MESSAGE:?}, \
+             got {read_reply:?}"
+        );
+
+        remaining.retain(|held| held != account);
+        let enumerated = associated_accounts(&router, REGION, account).await;
+        assert_eq!(
+            enumerated, remaining,
+            "case {account:?}: the enumeration must report exactly the associations \
+             still held, got {enumerated:?}"
+        );
+        for held in &remaining {
+            let (status, record) = read(&router, REGION, held).await;
+            assert_eq!(
+                status, 200,
+                "case {account:?} with {held:?} still held: another association must be \
+                 untouched, got {status} with {record:?}"
+            );
+        }
+    }
+
+    let (status, record) = read(&router, OTHER_REGION, &shared).await;
+    assert_eq!(
+        status, 200,
+        "case \"the same account in another region\": its own association survives a \
+         delete addressed elsewhere, got {status} with {record:?}"
+    );
+    assert_eq!(
+        record["email"].as_str(),
+        Some("shared@example.com"),
+        "case \"the same account in another region\": that region's association is \
+         reported unchanged, got {record:?}"
+    );
+    let elsewhere = associated_accounts(&router, OTHER_REGION, "another region").await;
+    assert_eq!(
+        elsewhere,
+        vec![shared.clone()],
+        "case \"another region\": each region holds its own associations, got {elsewhere:?}"
+    );
+}
+
+/// What a delete STATES is its postcondition — the region holds no association
+/// for the account it names — rather than the state it found, so it reports that
+/// outcome whether or not a record was there to drop, and one delete cannot be
+/// told from another by its reply. The rows span what the addressed id can be:
+/// an association that exists, the same account a second time, an account never
+/// associated, a value that is not account-shaped at all, the caller's own
+/// account (which can never be a member) and an account associated only in
+/// another region. The READ of each of those accounts keeps its own contract and
+/// is refused, and afterwards the account can be associated again — so what the
+/// delete dropped was the record itself.
+#[tokio::test]
+async fn a_delete_reports_the_region_holding_no_association_whatever_was_there() {
+    let router = emulator();
+    enable_in(&router, REGION, "{}").await;
+    enable_in(&router, OTHER_REGION, "{}").await;
+
+    let associated = "111122223333";
+    let (status, reply) = create(
+        &router,
+        REGION,
+        associated,
+        "associated@example.com",
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"associate the account to delete\": expected 200, got {status} with {reply:?}"
+    );
+
+    let elsewhere = "555566667777";
+    let (status, reply) = create(
+        &router,
+        OTHER_REGION,
+        elsewhere,
+        "elsewhere@example.com",
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"associate in another region\": expected 200, got {status} with {reply:?}"
+    );
+
+    let own = own_account();
+    let rows: Vec<(&str, &str)> = vec![
+        ("an association that exists", associated),
+        ("the same account a second time", associated),
+        ("an account never associated", "222233334444"),
+        ("a value that is not account-shaped", "not-an-account"),
+        ("the caller's own account", own.as_str()),
+        ("an account associated only in another region", elsewhere),
+    ];
+
+    // The reply the row that DID drop a record answered, which every other row
+    // has to answer too: what the call states is its postcondition, so one
+    // delete cannot be told from another by its reply.
+    let mut answered: Option<(u16, serde_json::Value)> = None;
+
+    for (case, id) in rows {
+        let (status, reply) = delete(&router, REGION, id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DeleteMember must answer 200, got {status} with {reply:?}"
+        );
+        assert!(
+            is_empty_document(&reply),
+            "case {case:?}: a delete reports no document of its own, got {reply:?}"
+        );
+        match answered.as_ref() {
+            None => answered = Some((status, reply.clone())),
+            Some((first_status, first_reply)) => assert_eq!(
+                (status, &reply),
+                (*first_status, first_reply),
+                "case {case:?}: every delete answers what the one that removed a record \
+                 answered, got {status} with {reply:?}"
+            ),
+        }
+
+        // The READ of such an account keeps its own contract: it has nothing to
+        // report, so it is refused with the modelled ValidationException and the
+        // service's sentence. Asserting both here is what keeps this case from
+        // passing against a member plane that simply accepts everything.
+        let (read_status, read_reply) = read(&router, REGION, id).await;
+        assert_eq!(
+            read_status, 400,
+            "case {case:?}: the region must hold no association for the account \
+             afterwards, got {read_status} with {read_reply:?}"
+        );
+        assert_eq!(
+            error_code(&read_reply),
+            "ValidationException",
+            "case {case:?}: the read refusal must be the modelled ValidationException, \
+             got {read_reply:?}"
+        );
+        assert_eq!(
+            error_message(&read_reply),
+            NOT_AN_ASSOCIATED_MEMBER_MESSAGE,
+            "case {case:?}: expected {NOT_AN_ASSOCIATED_MEMBER_MESSAGE:?}, \
+             got {read_reply:?}"
+        );
+    }
+
+    let held = associated_accounts(&router, REGION, "after every delete").await;
+    assert_eq!(
+        held,
+        Vec::<String>::new(),
+        "case \"after every delete\": the region holds no association at all, got {held:?}"
+    );
+
+    // A delete addressed at this region never reached the other region's
+    // association.
+    let (status, record) = read(&router, OTHER_REGION, elsewhere).await;
+    assert_eq!(
+        status, 200,
+        "case \"an account associated only in another region\": that association is \
+         untouched, got {status} with {record:?}"
+    );
+
+    // The record itself went, so the account is associated afresh rather than
+    // restated: the association reports what this create named.
+    let (status, reply) = create(&router, REGION, associated, "again@example.com", None).await;
+    assert_eq!(
+        status, 200,
+        "case \"associate again after the delete\": expected 200, got {status} with {reply:?}"
+    );
+    let (status, record) = read(&router, REGION, associated).await;
+    assert_eq!(
+        status, 200,
+        "case \"associate again after the delete\": the new association must be readable, \
+         got {status} with {record:?}"
+    );
+    assert_eq!(
+        record["email"].as_str(),
+        Some("again@example.com"),
+        "case \"associate again after the delete\": the details the new create named are \
+         the stored ones, got {record:?}"
+    );
+    assert_eq!(
+        record["relationshipStatus"].as_str(),
+        Some(CREATED_RELATIONSHIP_STATUS),
+        "case \"associate again after the delete\": a fresh association starts in the \
+         status the service assigns it, got {record:?}"
+    );
 }

@@ -927,6 +927,20 @@ impl ComAmazonawsMacie2Macie2State {
             .get_mut(&(region.to_string(), account_id.to_string()))
     }
 
+    /// Drop the association of `account_id` in `region`, handing back the record
+    /// that went, or `None` when that region holds no association for the
+    /// account — which is what an account associated only in another region
+    /// answers too, the way [`Self::member`] does.
+    ///
+    /// `DeleteMember` "Deletes the association between an Amazon Macie
+    /// administrator account and an account", so the record goes outright:
+    /// nothing of it is reported afterwards, by a read of that account or by an
+    /// enumeration of the region's members.
+    pub fn remove_member(&mut self, region: &str, account_id: &str) -> Option<Member> {
+        self.members
+            .remove(&(region.to_string(), account_id.to_string()))
+    }
+
     /// The accounts associated in `region`, in account-id order — the order the
     /// store holds them in, so the total order a page boundary rests on is
     /// stable.
