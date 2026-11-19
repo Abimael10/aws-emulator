@@ -43,6 +43,12 @@
 //! `GET /2020-05-31/origin-access-control` answers an `OriginAccessControlList`: an origin
 //! this emulator really serves, so a served request has an origin answer to be a cache miss
 //! of, on either of two paths.
+//!
+//! The harness below — the router carrying Kinesis and IAM, the stream, role and
+//! configuration builders, and the record reader and its field-by-field check — is
+//! `pub(crate)` so a sibling suite addressing the edge another way reuses it rather than
+//! growing a copy of it ([`crate::dialled_edge_address_realtime_logs`] dials the address the
+//! distribution published).
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -86,7 +92,7 @@ fn emulator_with_kinesis() -> MultiServiceRouter {
 
 /// The same router with IAM beside them, for the rules about what the DELIVERY ROLE allows:
 /// that decision is IAM's, so IAM has to be there to answer it.
-fn emulator_with_kinesis_and_iam() -> MultiServiceRouter {
+pub(crate) fn emulator_with_kinesis_and_iam() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -186,7 +192,7 @@ fn element(body: &str, name: &str) -> Option<String> {
 ///
 /// The ARN is read out of Kinesis's own answer, never built here: it is the identifier that
 /// service assigned, and it is what a real-time log configuration's endpoint names.
-async fn data_stream(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn data_stream(router: &MultiServiceRouter, name: &str) -> String {
     kinesis(
         router,
         "CreateStream",
@@ -207,7 +213,7 @@ async fn data_stream(router: &MultiServiceRouter, name: &str) -> String {
 
 /// Look again until the stream `name` reports itself `ACTIVE` — a stream that is still being
 /// created serves no write — or a generous deadline passes.
-async fn awaited_active(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn awaited_active(router: &MultiServiceRouter, name: &str) {
     let deadline = Instant::now() + READY_DEADLINE;
     loop {
         let described = kinesis(
@@ -232,7 +238,7 @@ async fn awaited_active(router: &MultiServiceRouter, name: &str) {
 /// Read through Kinesis itself: the shards the stream reports, an iterator at each shard's
 /// horizon, and the records that iterator answers — the same walk a client polling the stream
 /// makes.
-async fn stream_records(router: &MultiServiceRouter, stream_arn: &str) -> Vec<String> {
+pub(crate) async fn stream_records(router: &MultiServiceRouter, stream_arn: &str) -> Vec<String> {
     let shards = kinesis(
         router,
         "ListShards",
@@ -275,14 +281,14 @@ async fn stream_records(router: &MultiServiceRouter, stream_arn: &str) -> Vec<St
 }
 
 /// One Kinesis endpoint a real-time log configuration delivers through.
-struct EndPoint {
-    role_arn: String,
-    stream_arn: String,
+pub(crate) struct EndPoint {
+    pub(crate) role_arn: String,
+    pub(crate) stream_arn: String,
 }
 
 /// Create one real-time log configuration and answer its ARN beside the field list the
 /// service reported for it — which is the list each record's values are read by.
-async fn realtime_log_config(
+pub(crate) async fn realtime_log_config(
     router: &MultiServiceRouter,
     name: &str,
     sampling_rate: i64,
@@ -386,9 +392,9 @@ fn distribution_config_xml(
 
 /// One distribution this suite created: the id its deployment is polled by and the domain
 /// name a viewer dials it at.
-struct Distribution {
-    id: String,
-    domain: String,
+pub(crate) struct Distribution {
+    pub(crate) id: String,
+    pub(crate) domain: String,
 }
 
 /// Create one distribution, WITHOUT waiting for its configuration to reach the edge
@@ -397,7 +403,7 @@ struct Distribution {
 /// Split in two for the reason [`data_stream`] is: the clock owes each distribution its
 /// deployment from the moment it was created, so a suite with several of them creates them
 /// all and then waits once.
-async fn distribution(
+pub(crate) async fn distribution(
     router: &MultiServiceRouter,
     reference: &str,
     realtime_log_config_arn: Option<&str>,
@@ -476,31 +482,31 @@ async fn view(router: &MultiServiceRouter, domain: &str, method: &str, target: &
 }
 
 /// The request one record is expected to describe, and the answer it got.
-struct Probe {
-    method: &'static str,
-    path: String,
-    query: &'static str,
-    domain: String,
-    status: u16,
-    result_type: &'static str,
-    request_id: String,
+pub(crate) struct Probe {
+    pub(crate) method: &'static str,
+    pub(crate) path: String,
+    pub(crate) query: &'static str,
+    pub(crate) domain: String,
+    pub(crate) status: u16,
+    pub(crate) result_type: &'static str,
+    pub(crate) request_id: String,
     /// The `PathPattern` of the cache behaviour that served the request: the ordered
     /// behaviour's own pattern, or [`DEFAULT_BEHAVIOR_PATTERN`] for the default behaviour.
-    pattern: String,
+    pub(crate) pattern: String,
     /// The caller's own clock window the record's `timestamp` has to fall inside.
-    window: (u64, u64),
+    pub(crate) window: (u64, u64),
 }
 
 /// The pattern a record reports for the DEFAULT cache behaviour, which matches by being last
 /// rather than by a pattern of its own: the pattern that matches every path.
-const DEFAULT_BEHAVIOR_PATTERN: &str = "*";
+pub(crate) const DEFAULT_BEHAVIOR_PATTERN: &str = "*";
 
 /// Assert `record` is the record `probe` owes, read by the field list the configuration
 /// reported: one value per field, in that order.
 ///
 /// Each field is checked against what THIS request and THIS answer carry, so a record of
 /// another request, or a value from another part of the request, fails the row.
-fn assert_record(case: &str, fields: &[String], record: &str, probe: &Probe) {
+pub(crate) fn assert_record(case: &str, fields: &[String], record: &str, probe: &Probe) {
     let values: Vec<&str> = record.split('\t').collect();
     assert_eq!(
         values.len(),
@@ -602,7 +608,7 @@ fn assert_record(case: &str, fields: &[String], record: &str, probe: &Probe) {
 
 /// The caller's own clock window, as the record's `timestamp` is checked against: the second
 /// the run started in, through a generous span past it.
-fn window() -> (u64, u64) {
+pub(crate) fn window() -> (u64, u64) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -943,7 +949,7 @@ async fn a_record_reports_how_the_edge_classified_the_answer_it_served() {
 
 /// An inline policy document carrying one statement per `(effect, action)` pair, on
 /// `resource`.
-fn policy(statements: &[(&str, &str)], resource: &str) -> String {
+pub(crate) fn policy(statements: &[(&str, &str)], resource: &str) -> String {
     let rendered: Vec<String> = statements
         .iter()
         .map(|(effect, action)| {
@@ -959,7 +965,11 @@ fn policy(statements: &[(&str, &str)], resource: &str) -> String {
 
 /// Create one IAM role CloudFront can assume, carrying `document` as its one inline policy,
 /// and answer the ARN IAM minted for it.
-async fn delivery_role(router: &MultiServiceRouter, name: &str, document: &str) -> String {
+pub(crate) async fn delivery_role(
+    router: &MultiServiceRouter,
+    name: &str,
+    document: &str,
+) -> String {
     let trust = ::serde_json::json!({
         "Version": "2012-10-17",
         "Statement": [{
