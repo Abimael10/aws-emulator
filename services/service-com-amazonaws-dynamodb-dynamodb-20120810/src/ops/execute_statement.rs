@@ -325,6 +325,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is reported and NOTHING is written
             // ([`crate::state::check_table_key_accessible`]).
             crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
+            // A source keyed by several `HASH` or several `RANGE` attributes is addressed
+            // by no equality a statement's `WHERE` clause can pin, so the statement is
+            // refused for its SOURCE before any clause of it is judged
+            // ([`crate::state::MULTI_ATTRIBUTE_KEY_MESSAGE`]).
+            crate::state::check_single_attribute_source_key(table, statement.index())
+                .map_err(lift)?;
         }
         let answered = match &statement {
             crate::state::PartiqlStatement::Select(select) => {
@@ -408,19 +414,28 @@ fn select_items(
                 "Strongly consistent read is not supported on Global Secondary Indexes",
             ));
         }
-        // A predicate is judged against what the SOURCE reports, so a filter on an
-        // attribute the named index does not project could never be decided from it.
-        let unprojected = crate::state::unprojected_filter_attributes(
-            table,
-            Some(index),
-            select.filter.as_ref(),
-        );
-        if !unprojected.is_empty() {
-            return Err(lift(crate::state::unprojected_filter_refusal(
-                index,
-                &unprojected,
-            )));
+        // What the statement REPORTS is served from the index, and a global one cannot
+        // fetch what it does not project ([`crate::state::index_projection_refusal`]).
+        if let Some(refusal) =
+            crate::state::index_projection_refusal(table, index, select.projection.as_ref())
+        {
+            return Err(lift(refusal));
         }
+        // A predicate is judged against what the SOURCE reports, so a filter on an
+        // attribute the named index does not project could never be decided from the
+        // range of its keys a KEY CONDITION addresses — while a walk of the whole index
+        // evaluates the same predicate against each entry, which matches nothing
+        // ([`crate::state::index_filter_refusal`]).
+        if let Some(refusal) =
+            crate::state::index_filter_refusal(table, index, select.filter.as_ref())
+        {
+            return Err(lift(refusal));
+        }
+    }
+    // A projection item that is no document path is refused once the SOURCE it reads has
+    // been resolved ([`crate::state::projection_defect`]).
+    if let Some(defect) = crate::state::projection_defect(select.projection.as_ref()) {
+        return Err(lift(defect));
     }
     // Which low-level plan the statement is served by is decided HERE, from what its
     // `WHERE` clause pins: "a WHERE clause on the partition key" is planned as a Query
@@ -577,23 +592,37 @@ fn select_items(
     // READ: the bytes a row costs are the bytes its source holds for that row, which for
     // a statement whose source is a secondary index are the attributes that index
     // projects and not the whole stored item.
-    let projected = crate::state::projected_attributes(table, select.index.as_deref());
+    let projected = crate::state::statement_source_attributes(
+        table,
+        select.index.as_deref(),
+        select.projection.as_ref(),
+        select.filter.as_ref(),
+    );
     let mut evaluated = 0usize;
-    let mut rows: Vec<(&crate::state::ItemKey, &crate::state::Item)> = Vec::new();
-    for (key, item) in &candidates {
+    // What each row the page KEPT reports: the attributes its source held for it.
+    let mut rows: Vec<crate::state::Item> = Vec::new();
+    for (_key, item) in &candidates {
         // The first row always fits, the way DynamoDB always returns at least one
         // item it found; after that the page stops once the rows it holds have CROSSED
         // the budget ([`crate::state::page_budget_spent`]).
         if evaluated >= limit || (evaluated > 0 && crate::state::page_budget_spent(page_size)) {
             break;
         }
-        let size = held_size(item, projected.as_ref());
-        page_size = page_size.saturating_add(size);
+        // What the SOURCE holds for this row, which is what the predicate is judged
+        // against, what the response carries and what the read is charged for. A source
+        // that holds the whole stored item — the table itself, and an index read that
+        // fetched — IS that item, so it is read where it stands and copied only for the
+        // rows the page keeps.
+        let narrowed = projected
+            .as_ref()
+            .map(|allowed| held_item(item, Some(allowed)));
+        let held: &crate::state::Item = narrowed.as_ref().unwrap_or(item);
+        page_size = page_size.saturating_add(crate::state::item_size(held));
         // What the row is BILLED for is what its source holds for it, weighed as this
         // table meters an item ([`crate::state::Table::metered_item_size`]) — a vector at
         // the four bytes per dimension it is held as — while the page's own budget above
         // stays the bytes the response carries.
-        let metered = table.metered_item_size(&held_item(item, projected.as_ref()));
+        let metered = table.metered_item_size(held);
         metered_size = metered_size.saturating_add(metered);
         // A plan that walks a SECONDARY INDEX is charged over what that index holds for
         // each row, in whole read units, exactly as the `Scan` of the same index is — one
@@ -606,12 +635,18 @@ fn select_items(
             input.consistent_read.unwrap_or(false),
         );
         evaluated += 1;
+        // The predicate is judged against what the source REPORTS for the row — the
+        // index's entry where the statement reads an index, which is the same item a
+        // `Scan` of that index judges its filter against.
         if let Some(condition) = condition.as_ref() {
-            if !condition.evaluate(Some(*item)).map_err(lift)? {
+            if !condition.evaluate(Some(held)).map_err(lift)? {
                 continue;
             }
         }
-        rows.push((*key, *item));
+        rows.push(match narrowed {
+            Some(narrowed) => narrowed,
+            None => (*item).clone(),
+        });
     }
     // A page that spent its 1 MB budget stopped there, whether or not a row remains, by
     // the rule every reader that pages follows ([`crate::state::page_budget_spent`]).
@@ -627,10 +662,7 @@ fn select_items(
     // The statement's own projection narrows what the source holds for a row further.
     let items: Vec<crate::state::Item> = rows
         .iter()
-        .map(|(_, item)| {
-            let held = held_item(item, projected.as_ref());
-            crate::state::project_item(&held, select.projection.as_ref())
-        })
+        .map(|held| crate::state::project_item(held, select.projection.as_ref()))
         .collect();
     // A page that stopped short of the end of what it walked carries on from where it
     // stopped: rows left to evaluate, or the caller's `Limit` reached, whether or not a
@@ -721,17 +753,6 @@ fn held_item(
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
         None => item.clone(),
-    }
-}
-
-/// The bytes that source holds for one row, which is what reading the row costs.
-fn held_size(
-    item: &crate::state::Item,
-    projected: Option<&::std::collections::BTreeSet<String>>,
-) -> i64 {
-    match projected {
-        Some(_) => crate::state::item_size(&held_item(item, projected)),
-        None => crate::state::item_size(item),
     }
 }
 

@@ -588,6 +588,11 @@ fn read_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         if select.order_by.is_some() {
             return Err(refused(ORDER_BY_MESSAGE));
         }
+        // A projection item that is no document path is refused once the source it reads
+        // has been resolved ([`crate::state::projection_defect`]).
+        if let Some(defect) = crate::state::projection_defect(select.projection.as_ref()) {
+            return Err(lift(in_slot(at, defect)));
+        }
         let Some(filter) = select.filter.as_ref() else {
             return Err(refused(SINGLE_ITEM_READ_MESSAGE));
         };
@@ -901,6 +906,11 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             // applied under, so a check that does not hold cancels the transaction like
             // any other unmet predicate.
             crate::state::PartiqlStatement::Exists(select) => {
+                // A projection item that is no document path is refused once the source
+                // it reads has been resolved ([`crate::state::projection_defect`]).
+                if let Some(defect) = crate::state::projection_defect(select.projection.as_ref()) {
+                    return Err(lift(in_slot(at, defect)));
+                }
                 // The check must name the ONE item it is about and state something
                 // besides that item's key
                 // ([`crate::state::EXISTS_SINGLE_ITEM_MESSAGE`]).

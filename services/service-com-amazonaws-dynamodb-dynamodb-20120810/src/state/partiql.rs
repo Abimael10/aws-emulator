@@ -95,7 +95,7 @@ pub const MAX_STATEMENT_DEPTH: usize = 16;
 /// token it opens with, with that token's own width, which is what every positioned
 /// sentence of this surface states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Position {
+pub struct Position {
     line: usize,
     column: usize,
     width: usize,
@@ -406,6 +406,96 @@ fn statement_refused(detail: &str) -> RequestError {
     RequestError::Validation(format!("Invalid Statement: {detail}"))
 }
 
+/// How a step into a list that addresses no member of one is refused: the index the
+/// statement spelled, and where it spells it.
+///
+/// A `[index]` step addresses one member of a stored list, and a list is addressed from 0
+/// upwards — so an index below that, or one past what a position can be, addresses no
+/// member of any list the store could hold. The refusal echoes the index as the statement
+/// WROTE it (its sign included) and positions it at the token the index opens with
+/// ([`Position`]), so every part of the sentence is a fact of the request's own text.
+fn list_index_out_of_range(index: &str, at: Position) -> RequestError {
+    RequestError::Validation(format!(
+        "List index is not within the allowable range; index: [{index}] at {}",
+        at.stated()
+    ))
+}
+
+/// How an arithmetic operator a `SET` clause cannot apply is refused, naming the operator
+/// the statement spelled.
+///
+/// A `SET` clause assigns one operand, or two joined by `+` or `-` — the two operators the
+/// update grammar applies to a stored number ([`SetExpression`]) — so a statement joining
+/// its operands with any other arithmetic operator asks for an operation no update action
+/// performs, and is told WHICH operator that was.
+fn unsupported_update_operator(operator: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "Unsupported operator in Update Expression. Operator: {operator}"
+    ))
+}
+
+/// How a bag whose members are not all of one type DynamoDB stores a set of is refused.
+///
+/// A `<<…>>` bag denotes a DynamoDB set, and a set's members are all of one scalar type
+/// ("String Set ... Number Set ... Binary Set", the `AttributeValue` doc), so a bag mixing
+/// them denotes no stored value at all. The sentence is fixed and names neither the
+/// attribute nor the members.
+pub const UNSUPPORTED_BAG_MEMBERS_MESSAGE: &str =
+    "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in bags";
+
+/// How an `INSERT` that states a `RETURNING` clause is refused.
+///
+/// The clause projects the item a write left or replaced, and an `INSERT` adds an item that
+/// was not there: there is no image of it to project, so the clause asks for something the
+/// verb cannot report. The sentence is fixed and names the verb.
+pub const RETURNING_NOT_SUPPORTED_IN_INSERT_MESSAGE: &str = "RETURNING is not supported in INSERT";
+
+/// How a statement addressed at a source whose key is spelled over SEVERAL attributes is
+/// refused.
+///
+/// "Each global secondary index supports up to 4 partition keys and up to 4 sort keys"
+/// (`CreateTable$GlobalSecondaryIndexes`), so a source a statement names can be keyed by
+/// more than one `HASH` or more than one `RANGE` attribute — and a statement addresses
+/// items by the equalities its `WHERE` clause pins on ONE partition key and ONE sort key,
+/// which such a source has none of. The sentence is fixed and names neither the table nor
+/// the index.
+pub const MULTI_ATTRIBUTE_KEY_MESSAGE: &str = "PartiQL statements cannot be executed on tables \
+                                               with multi-attribute HASH keys or \
+                                               multi-attribute RANGE keys.";
+
+/// Refuse a statement whose SOURCE — the table, or the index of it the statement names —
+/// is keyed by more than one `HASH` or more than one `RANGE` attribute
+/// ([`MULTI_ATTRIBUTE_KEY_MESSAGE`]).
+///
+/// This is decided from the SCHEMA alone, before any clause of the statement is judged, so
+/// it is what a statement addressed at such a source is told rather than the rule about
+/// the clause it happens to state.
+pub fn check_single_attribute_source_key(
+    table: &Table,
+    index: Option<&str>,
+) -> Result<(), RequestError> {
+    let schemas = ::std::iter::once(table.key_schema.as_slice()).chain(
+        index
+            .and_then(|index| index_shape(table, index))
+            .map(|(key_schema, _)| key_schema),
+    );
+    for key_schema in schemas {
+        for key_type in ["HASH", "RANGE"] {
+            if key_schema
+                .iter()
+                .filter(|element| element.key_type == key_type)
+                .count()
+                > 1
+            {
+                return Err(RequestError::Validation(
+                    MULTI_ATTRIBUTE_KEY_MESSAGE.to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// How a statement that reads as a COMPLETE statement and is then followed by more
 /// tokens is refused.
 ///
@@ -671,6 +761,11 @@ enum Token {
     Semicolon,
     Minus,
     Plus,
+    /// `/`, one of the two arithmetic operators a `SET` clause cannot apply
+    /// ([`unsupported_update_operator`]): it is lexed so the refusal can NAME the
+    /// operator the statement spelled rather than report a character the scanner could
+    /// not read.
+    Slash,
 }
 
 /// Which characters make up a bare word.
@@ -816,6 +911,10 @@ fn tokenize(statement: &str) -> Result<Lexemes, RequestError> {
             }
             '+' => {
                 tokens.push(Token::Plus);
+                at += 1;
+            }
+            '/' => {
+                tokens.push(Token::Slash);
                 at += 1;
             }
             _ => return Err(statement_parse_error(ParseDefect::UnexpectedTerm)),
@@ -999,23 +1098,48 @@ impl StatementPath {
     }
 }
 
-/// One item of a `SELECT`'s projection: the path it reports and the name it reports
-/// it under.
+/// One item of a `SELECT`'s projection.
+///
+/// The language's grammar admits two things where this surface's projection reports one:
+/// a document path into the item, and a CALL. A call is READ as the item it is and the
+/// statement carrying it is refused once its SOURCE has been resolved
+/// ([`projection_defect`]) — the order AWS reports the two in: a statement addressed at a
+/// source this surface cannot serve at all is told that about the source, and one whose
+/// source is fine is told about the component ([`unexpected_path_component`]). Holding the
+/// two apart in the TYPE is what makes that refusal unavoidable: an item that is no path
+/// carries none, so nothing of any stored item can be reported for it.
 #[derive(Debug, Clone)]
-pub struct ProjectionItem {
-    path: StatementPath,
-    alias: Option<String>,
+pub enum ProjectionItem {
+    /// A path into the item, reported under the name the list gives it: the alias the
+    /// statement stated, if any.
+    Path {
+        path: StatementPath,
+        alias: Option<String>,
+    },
+    /// A call, at the position the statement spells it.
+    NotAPath(Position),
 }
 
 impl ProjectionItem {
+    /// The path this item reports, and `None` for an item that is no path.
+    fn path(&self) -> Option<&StatementPath> {
+        match self {
+            Self::Path { path, .. } => Some(path),
+            Self::NotAPath(_) => None,
+        }
+    }
+
     /// The identifier this item is reported under: the alias the statement gave it, and
     /// otherwise the path's own label ([`StatementPath::label`]). The ONE place that is
     /// decided, so what a served statement reports an item under and what a refusal calls
     /// it cannot drift ([`check_distinct_identifiers`], [`project_item`]).
-    fn identifier(&self) -> String {
-        match self.alias.as_deref() {
-            Some(alias) => alias.to_string(),
-            None => self.path.label(),
+    fn identifier(&self) -> Option<String> {
+        match self {
+            Self::Path { path, alias } => Some(match alias {
+                Some(alias) => alias.clone(),
+                None => path.label(),
+            }),
+            Self::NotAPath(_) => None,
         }
     }
 }
@@ -1035,8 +1159,7 @@ impl ProjectionItem {
 fn check_distinct_identifiers(projection: &[ProjectionItem]) -> Result<(), RequestError> {
     let mut stated: Vec<String> = Vec::new();
     let mut repeated: Vec<String> = Vec::new();
-    for item in projection {
-        let identifier = item.identifier();
+    for identifier in projection.iter().filter_map(ProjectionItem::identifier) {
         if stated.contains(&identifier) {
             if !repeated.contains(&identifier) {
                 repeated.push(identifier);
@@ -1249,6 +1372,19 @@ impl PartiqlStatement {
             Self::Insert(insert) => &insert.table,
             Self::Update(update) => &update.table,
             Self::Delete(delete) => &delete.table,
+        }
+    }
+
+    /// The index of that table this statement reads THROUGH, when its source names one.
+    ///
+    /// Only a read states a qualifier: a write addresses the item it changes through the
+    /// path it names, and an index holds a projection of a table's items rather than items
+    /// of its own, so a qualified write is refused where it is parsed
+    /// ([`unsupported_on_an_index`]).
+    pub fn index(&self) -> Option<&str> {
+        match self {
+            Self::Select(select) | Self::Exists(select) => select.index.as_deref(),
+            Self::Insert(_) | Self::Update(_) | Self::Delete(_) => None,
         }
     }
 
@@ -1808,17 +1944,15 @@ impl StatementParser<'_> {
         } else {
             let mut items = Vec::new();
             loop {
-                let path = self.projection_path()?;
-                let alias = if self.accept_word("as") {
-                    Some(self.identifier()?)
-                } else {
-                    None
-                };
-                items.push(ProjectionItem { path, alias });
+                let item = self.projection_item()?;
+                items.push(item);
                 if !self.accept(&Token::Comma) {
                     break;
                 }
             }
+            // Two items reported under one identifier is a fact of the PATHS the list
+            // names, and an item that is no path at all names none: such a list is refused
+            // for that item once the source is resolved ([`projection_defect`]).
             check_distinct_identifiers(&items)?;
             Some(items)
         };
@@ -1878,6 +2012,15 @@ impl StatementParser<'_> {
                 "the VALUE an INSERT carries must be a tuple of attribute names and values",
             ));
         };
+        // The clause is READ as the clause of the grammar it is and refused for the verb
+        // it stands on ([`RETURNING_NOT_SUPPORTED_IN_INSERT_MESSAGE`]), so an `INSERT`
+        // asking to see an image reports that rule rather than a token after the
+        // statement.
+        if self.peek_word("returning") {
+            return Err(RequestError::Validation(
+                RETURNING_NOT_SUPPORTED_IN_INSERT_MESSAGE.to_string(),
+            ));
+        }
         Ok(InsertStatement { table, item })
     }
 
@@ -2119,18 +2262,34 @@ impl StatementParser<'_> {
             }
         }
         let left = self.set_operand()?;
+        self.refuse_unsupported_update_operator()?;
         if self.accept(&Token::Plus) {
             let right = self.set_operand()?;
+            self.refuse_unsupported_update_operator()?;
             return Ok(UpdateClause::Set(path, SetExpression::Sum(left, right)));
         }
         if self.accept(&Token::Minus) {
             let right = self.set_operand()?;
+            self.refuse_unsupported_update_operator()?;
             return Ok(UpdateClause::Set(
                 path,
                 SetExpression::Difference(left, right),
             ));
         }
         Ok(UpdateClause::Set(path, SetExpression::Single(left)))
+    }
+
+    /// Refuse an arithmetic operator standing where a `SET` clause has just read an
+    /// operand: the clause joins two operands with `+` or `-` and applies no other
+    /// arithmetic, so the statement is told WHICH operator it asked for
+    /// ([`unsupported_update_operator`]) rather than refused for the clause that then
+    /// does not read.
+    fn refuse_unsupported_update_operator(&self) -> Result<(), RequestError> {
+        match self.peek() {
+            Some(Token::Star) => Err(unsupported_update_operator("*")),
+            Some(Token::Slash) => Err(unsupported_update_operator("/")),
+            _ => Ok(()),
+        }
     }
 
     /// One operand of a `SET`: `list_append`, a path, or a value.
@@ -2452,19 +2611,54 @@ impl StatementParser<'_> {
         }
     }
 
-    /// One path of a `SELECT`'s projection list.
+    /// One item of a `SELECT`'s projection: a path into the item, and the name the list
+    /// reports it under.
     ///
-    /// A projection names paths into the item and nothing else, so a CALL standing there
-    /// is refused as the path component it is not
-    /// ([`unexpected_path_component`]) — whether or not the dialect defines the function
-    /// called, because what the parse stopped on is the component rather than the call.
-    fn projection_path(&mut self) -> Result<StatementPath, RequestError> {
+    /// A projection names paths into the item, and the language's grammar also reads a
+    /// CALL there: the call is read whole and kept as the item it is
+    /// ([`ProjectionItem::NotAPath`]), so the statement is refused for it only once its
+    /// source has been resolved — whether or not the dialect defines the function called,
+    /// because what is wrong is the component rather than the call.
+    fn projection_item(&mut self) -> Result<ProjectionItem, RequestError> {
         if self.tokens.get(self.at + 1) == Some(&Token::Open)
             && matches!(self.peek(), Some(Token::Word(_)))
         {
-            return Err(unexpected_path_component(self.position()));
+            let at = self.position();
+            self.skip_call()?;
+            // The binding a call may carry is read as part of the grammar too, so the
+            // statement still parses whole and is refused for the component.
+            if self.accept_word("as") {
+                self.identifier()?;
+            }
+            return Ok(ProjectionItem::NotAPath(at));
         }
-        self.path()
+        let path = self.path()?;
+        let alias = if self.accept_word("as") {
+            Some(self.identifier()?)
+        } else {
+            None
+        };
+        Ok(ProjectionItem::Path { path, alias })
+    }
+
+    /// Read one CALL whole — its name, its `(` and everything up to the `)` that closes
+    /// it — so the statement around it still parses.
+    ///
+    /// The walk is a COUNT over the tokens already read, not a recursion, so a call nested
+    /// inside a call is read without the parser's stack growing with the caller's text;
+    /// a call the statement never closes runs out of tokens and is refused as the term the
+    /// parse stopped at.
+    fn skip_call(&mut self) -> Result<(), RequestError> {
+        self.at += 2;
+        let mut depth = 1usize;
+        while depth > 0 {
+            match self.bump()? {
+                Token::Open => depth += 1,
+                Token::Close => depth -= 1,
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// One document path: an attribute name, then the `.name` and `[index]` steps
@@ -2495,12 +2689,30 @@ impl StatementParser<'_> {
                 continue;
             }
             if self.accept(&Token::OpenBracket) {
+                let negative = self.accept(&Token::Minus);
+                // Where the INDEX itself is spelled: a refusal about it reports the token
+                // that states the position, with that token's own width
+                // ([`list_index_out_of_range`]).
+                let at = self.position();
                 let Token::Number(lexeme) = self.bump()?.clone() else {
                     return Err(statement_parse_error(ParseDefect::UnexpectedTerm));
                 };
-                let index = lexeme
-                    .parse::<usize>()
-                    .map_err(|_| statement_parse_error(ParseDefect::UnexpectedTerm))?;
+                // A step into a list addresses a POSITION, which is a whole number: a
+                // lexeme spelling anything else is no index the grammar admits there,
+                // while one that IS a whole number and still addresses no position —
+                // negative, or past what a position can be — is refused as the range it
+                // is outside ([`list_index_out_of_range`]).
+                if lexeme.contains(['.', 'e', 'E']) {
+                    return Err(statement_parse_error(ParseDefect::UnexpectedTerm));
+                }
+                let Some(index) = lexeme.parse::<usize>().ok().filter(|_| !negative) else {
+                    let spelled = if negative {
+                        format!("-{lexeme}")
+                    } else {
+                        lexeme
+                    };
+                    return Err(list_index_out_of_range(&spelled, at));
+                };
                 self.expect(&Token::CloseBracket)?;
                 segments.push(PathSegment::Index(index));
                 continue;
@@ -2712,8 +2924,8 @@ fn set_of(members: Vec<AttributeValue>) -> Result<AttributeValue, RequestError> 
                 .collect(),
         ));
     }
-    Err(statement_refused(
-        "the members of a set must all be strings, all numbers or all binary values",
+    Err(RequestError::Validation(
+        UNSUPPORTED_BAG_MEMBERS_MESSAGE.to_string(),
     ))
 }
 
@@ -3304,8 +3516,9 @@ pub fn predicate_attributes(predicate: &Predicate) -> BTreeSet<String> {
 /// An index holds "attributes that are copied (projected) from the table into the
 /// index" (`GlobalSecondaryIndex$Projection`), and a predicate is judged against what
 /// the source reports — so a filter on an attribute the index does not project could
-/// never be decided from the index. The statement surface refuses that rather than
-/// answering from the parent table, and the refusal names the index and the attributes.
+/// never be decided from the index. The refusal that reports them names the index and the
+/// attributes ([`unprojected_filter_refusal`]), and WHICH reads earn it is
+/// [`index_filter_refusal`]'s business.
 pub fn unprojected_filter_attributes(
     table: &Table,
     index: Option<&str>,
@@ -3321,6 +3534,160 @@ pub fn unprojected_filter_attributes(
         .into_iter()
         .filter(|attribute| !attribute.is_empty() && !projected.contains(attribute))
         .collect()
+}
+
+/// The refusal a statement reading `index` earns for a `WHERE` clause that index cannot
+/// decide — and `None` for one evaluated against the index's own entries instead.
+///
+/// A clause that states a condition on the index's PARTITION key constrains that index's
+/// key space, which is the query of the index the read is served as, and a query "pointed
+/// at a secondary index sees that index's entries", so a predicate on an attribute the
+/// index does not project could never be decided from them and the read is refused rather
+/// than answered with the page that predicate would match — the rule the classic reader
+/// states ([`super::unprojected_read_filter_attributes`]). A clause that names no partition
+/// key of the index constrains nothing of it and walks the whole index, and that walk
+/// evaluates its predicate against each entry, which simply matches nothing: nothing is
+/// refused, exactly as a `Scan` of the same index is not.
+///
+/// What counts as stating that condition is the attribute being NAMED in the clause, in any
+/// form — an inequality, or an equality inside a disjunction, as much as an equality the
+/// clause pins outright. That is the scope the recorded behaviour has: the narrower reading
+/// (only an equality on the partition key, outside a disjunction) leaves a recorded refusal
+/// unanswered, while this one answers it and still serves the clauses the recording serves
+/// ([`states_index_key_condition`]).
+pub fn index_filter_refusal(
+    table: &Table,
+    index: &str,
+    predicate: Option<&Predicate>,
+) -> Option<RequestError> {
+    if !states_index_key_condition(table, index, predicate) {
+        return None;
+    }
+    let unprojected = unprojected_filter_attributes(table, Some(index), predicate);
+    (!unprojected.is_empty()).then(|| unprojected_filter_refusal(index, &unprojected))
+}
+
+/// The refusal a statement reading `index` earns for REPORTING an attribute that index
+/// neither projects nor fetches, and `None` where the read reports what it can.
+///
+/// "If you query or scan a global secondary index, you can only request attributes that
+/// are projected into the index. Global secondary index queries cannot fetch attributes
+/// from the parent table" (`Query$Select`), so a projection naming an attribute a global
+/// index does not hold cannot be served from it at all — the sentence the classic reader
+/// states it with ([`super::unprojected_projection_refusal`]). A LOCAL index fetches what
+/// it does not project from the table instead ([`statement_source_attributes`]), so it
+/// earns no refusal.
+pub fn index_projection_refusal(
+    table: &Table,
+    index: &str,
+    projection: Option<&Vec<ProjectionItem>>,
+) -> Option<RequestError> {
+    let (Some(projection), Some(found)) = (projection, table.secondary_index(index)) else {
+        return None;
+    };
+    if !found.global {
+        return None;
+    }
+    let unprojected = super::unprojected_of(
+        &found,
+        &table.key_schema,
+        &statement_attributes(projection, None),
+    );
+    (!unprojected.is_empty())
+        .then(|| super::unprojected_projection_refusal(index, &unprojected))
+}
+
+/// Whether this clause states a condition on the PARTITION key of `index`, which is what
+/// serves the read as a query of that index — the range of its keys the clause constrains
+/// — rather than as a walk of the whole index.
+///
+/// The question is whether the clause SPEAKS ABOUT that key at all: an attribute of the
+/// index's `HASH` key named anywhere in the predicate constrains the index's key space,
+/// whether the clause pins it by equality, bounds it by an inequality, or offers a choice
+/// of values across an `OR`. A clause that names none of them asks nothing of that key
+/// space and is served by walking the index instead ([`index_filter_refusal`] is where that
+/// distinction is applied).
+pub fn states_index_key_condition(
+    table: &Table,
+    index: &str,
+    predicate: Option<&Predicate>,
+) -> bool {
+    let (Some(predicate), Some((key_schema, _))) = (predicate, index_shape(table, index)) else {
+        return false;
+    };
+    let named = predicate_attributes(predicate);
+    key_schema
+        .iter()
+        .filter(|element| element.key_type == "HASH")
+        .any(|element| named.contains(&element.attribute_name))
+}
+
+/// Which attributes of an item the SOURCE one statement reads reports for one row.
+///
+/// An index reports what it projects ([`projected_attributes`]) — with one exception the
+/// index KIND decides: "If any of the requested attributes are not projected into the
+/// local secondary index, DynamoDB fetches each of these attributes from the parent
+/// table", while a read of a global secondary index "cannot fetch attributes from the
+/// parent table" (`Query$Select`). So a statement naming an attribute a LOCAL index does
+/// not project is served the stored item, fetched from the table — and charged for it,
+/// since the bytes a row costs are the bytes its source held for it — and the same
+/// statement through a GLOBAL index is served what that index holds, which reports nothing
+/// for an attribute it does not project.
+///
+/// What a statement NEEDS from the table is what it REPORTS: the attributes its projection
+/// names, held to the one projection test the classic reader uses
+/// ([`super::unprojected_of`]). A `SELECT *` through an index names no attribute in
+/// particular and asks for what that index HOLDS — the `ALL_PROJECTED_ATTRIBUTES` a classic
+/// read of an index takes by default, not the `ALL_ATTRIBUTES` that sends a local read to
+/// the table — so it needs nothing beyond the entry and fetches nothing.
+///
+/// Its `WHERE` clause does not pull the table in either, and that is the one place this
+/// differs from the classic reader's [`super::needs_unprojected`], deliberately: a classic
+/// read holds what it SAW and what it REPORTS apart (`Read::seen()` against
+/// `Read::projected()`), so fetching for its filter changes no response, while a statement
+/// reports exactly the item its predicate was judged against — so a fetch made for the
+/// clause alone would widen the tuple the statement answers. A clause the source cannot
+/// decide is instead refused where the read is a query of the index, and judged against the
+/// entry — matching nothing — where it walks the whole index ([`index_filter_refusal`]).
+pub fn statement_source_attributes(
+    table: &Table,
+    index: Option<&str>,
+    projection: Option<&Vec<ProjectionItem>>,
+    filter: Option<&Predicate>,
+) -> Option<BTreeSet<String>> {
+    let projected = projected_attributes(table, index)?;
+    let found = index.and_then(|index| table.secondary_index(index))?;
+    let fetches = !found.global
+        && projection.is_some_and(|projection| {
+            !super::unprojected_of(
+                &found,
+                &table.key_schema,
+                &statement_attributes(projection, filter),
+            )
+            .is_empty()
+        });
+    if fetches {
+        return None;
+    }
+    Some(projected)
+}
+
+/// The top-level attributes a `SELECT` names: the ones its projection REPORTS, and the
+/// ones its clause reads when `filter` is given. A path that reaches inside an attribute
+/// names that attribute, which is the top-level name it starts at, and an item that is no
+/// path at all names none ([`ProjectionItem`]).
+fn statement_attributes(
+    projection: &[ProjectionItem],
+    filter: Option<&Predicate>,
+) -> BTreeSet<String> {
+    let mut named: BTreeSet<String> = filter.map(predicate_attributes).unwrap_or_default();
+    named.extend(
+        projection
+            .iter()
+            .filter_map(ProjectionItem::path)
+            .map(|path| path.attribute().to_string()),
+    );
+    named
 }
 
 /// AWS's sentence for that refusal: the index the statement named and the filter
@@ -3552,12 +3919,30 @@ pub fn check_pinned_key_types(
     Ok(())
 }
 
+/// The refusal a `SELECT` whose projection list holds an item that is NO document path
+/// earns — `None` for a list of paths.
+///
+/// The language's grammar reads a call in a projection list and this surface's projection
+/// reports paths into the item, so such a statement is refused for that component
+/// ([`unexpected_path_component`]) — but only once its SOURCE has been resolved, because a
+/// statement addressed at a source this surface cannot serve at all is told that about the
+/// source first. Every surface that serves a `SELECT` asks this before it reports
+/// anything.
+pub fn projection_defect(projection: Option<&Vec<ProjectionItem>>) -> Option<RequestError> {
+    projection?.iter().find_map(|item| match item {
+        ProjectionItem::NotAPath(at) => Some(unexpected_path_component(*at)),
+        ProjectionItem::Path { .. } => None,
+    })
+}
+
 /// Just what a statement's projection names, in the item that holds it.
 ///
 /// A projection reports one entry per path it names, under the path as the clause spells
 /// it (or the alias the statement gave it), and reports nothing at all for a path the
 /// item does not hold — so `SELECT a, b.c` over an item carrying neither reports an
-/// empty tuple rather than nulls.
+/// empty tuple rather than nulls. An item that is NO path names nothing of any stored item
+/// and so reports nothing: a statement carrying one is refused before anything is read
+/// ([`projection_defect`]).
 pub fn project_item(item: &Item, projection: Option<&Vec<ProjectionItem>>) -> Item {
     let Some(projection) = projection else {
         return item.clone();
@@ -3565,10 +3950,11 @@ pub fn project_item(item: &Item, projection: Option<&Vec<ProjectionItem>>) -> It
     projection
         .iter()
         .filter_map(|projected| {
+            let identifier = projected.identifier()?;
             projected
-                .path
+                .path()?
                 .read(item)
-                .map(|value| (projected.identifier(), value.clone()))
+                .map(|value| (identifier, value.clone()))
         })
         .collect()
 }

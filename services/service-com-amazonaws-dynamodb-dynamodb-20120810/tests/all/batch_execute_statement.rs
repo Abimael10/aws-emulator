@@ -245,12 +245,13 @@ async fn every_read_statement_reports_into_its_own_slot() {
             "case {case}: expected Item {:?}, got {answered_slot}",
             row.item
         );
-        // A slot reports the table its statement addressed — whether the statement ran
-        // or failed — so a batch spread over several tables can be attributed slot by
-        // slot. Only a statement that never resolved a table names none.
-        let expected_table = match row.case {
-            "the statement does not parse" => None,
-            "the table is not there" => Some("absent"),
+        // A slot reports the table its statement REACHED — the one it ran against, and
+        // the one it resolved and then failed on — so a batch spread over several tables
+        // can be attributed slot by slot. A statement refused on its own merits before it
+        // read anything reached no table, and its slot carries the error alone.
+        let expected_table = match row.code {
+            Some("ValidationError") => None,
+            Some("ResourceNotFound") => Some("absent"),
             _ => Some("items"),
         };
         assert_eq!(

@@ -302,6 +302,30 @@ fn duplicate_attribute_name(name: &str) -> RequestError {
 /// used it have to say.
 const LEGACY_PROJECTION_MEMBER: &str = "AttributesToGet";
 
+/// Which of `names` an index does NOT project, in name order — the ONE projection test
+/// every reader asks, over whatever set of attribute names it needs.
+///
+/// An index holds "attributes that are copied (projected) from the table into the index"
+/// (`GlobalSecondaryIndex$Projection`), and which names those are is
+/// [`SecondaryIndex::projects`]'s answer: this is that answer over a SET of names, so
+/// "can this index serve these attributes" has one implementation — for the members a
+/// classic read states its projection and filter in, and for the paths a statement
+/// spells alike.
+pub fn unprojected_of(
+    index: &SecondaryIndex<'_>,
+    table_key_schema: &[KeySchemaElement],
+    names: &BTreeSet<String>,
+) -> Vec<String> {
+    if index.projects_all() {
+        return Vec::new();
+    }
+    names
+        .iter()
+        .filter(|name| !index.projects(table_key_schema, name))
+        .cloned()
+        .collect()
+}
+
 /// Whether a read needs an attribute its index does not project, which is what sends it
 /// on to the parent table.
 ///
@@ -325,9 +349,7 @@ pub fn needs_unprojected(
     if let Selection::Specific(paths) = selection {
         needed.extend(paths.iter().map(|path| path.attribute().to_string()));
     }
-    needed
-        .iter()
-        .any(|name| !index.projects(table_key_schema, name))
+    !unprojected_of(index, table_key_schema, &needed).is_empty()
 }
 
 /// The attributes one read's PROJECTION names that a GLOBAL secondary index does not
@@ -353,17 +375,14 @@ pub fn unprojected_projection_attributes(
     let Selection::Specific(paths) = selection else {
         return Vec::new();
     };
-    if !index.global || index.projects_all() {
+    if !index.global {
         return Vec::new();
     }
     let named: BTreeSet<String> = paths
         .iter()
         .map(|path| path.attribute().to_string())
         .collect();
-    named
-        .into_iter()
-        .filter(|name| !index.projects(table_key_schema, name))
-        .collect()
+    unprojected_of(index, table_key_schema, &named)
 }
 
 /// How a projection a global secondary index cannot answer is refused: the index the
@@ -393,14 +412,7 @@ pub fn unprojected_read_filter_attributes(
     table_key_schema: &[KeySchemaElement],
     filter_attributes: &BTreeSet<String>,
 ) -> Vec<String> {
-    if index.projects_all() {
-        return Vec::new();
-    }
-    filter_attributes
-        .iter()
-        .filter(|name| !index.projects(table_key_schema, name))
-        .cloned()
-        .collect()
+    unprojected_of(index, table_key_schema, filter_attributes)
 }
 
 /// One row a read evaluated: the stored item, and the entry the index it was read

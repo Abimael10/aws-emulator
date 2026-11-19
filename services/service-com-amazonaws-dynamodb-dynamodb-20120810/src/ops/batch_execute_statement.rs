@@ -36,10 +36,11 @@
 //!   request is refused rather than half-applied.
 //! * Each statement reports what it did in its own slot: a read reports the item it
 //!   found (none at all when the key holds none), a write reports what its `RETURNING`
-//!   clause asked for, every slot that resolved a table echoes that table under
-//!   `TableName` — so a batch spread over several tables can be attributed slot by slot
-//!   — and `ConsumedCapacity` carries one entry per statement that consumed capacity,
-//!   "ordered according to the ordering of the statements".
+//!   clause asked for, every slot that REACHED its table echoes that table under
+//!   `TableName` — so a batch spread over several tables can be attributed slot by slot,
+//!   while a statement refused on its own merits before it read or wrote anything carries
+//!   the error alone — and `ConsumedCapacity` carries one entry per statement that
+//!   consumed capacity, "ordered according to the ordering of the statements".
 //! * A statement's write is admitted from the capacity its table is provisioned for
 //!   ([`crate::state::Table::admit_write`]): one past that budget is throttled in its
 //!   own slot, with the `ProvisionedThroughputExceeded` code, rather than applied.
@@ -358,9 +359,10 @@ struct SlotFailure {
     /// The `BatchStatementErrorCodeEnum` value for what was wrong.
     code: &'static str,
     message: String,
-    /// The table the statement addressed, once it resolved one: "The table name
-    /// associated with a failed PartiQL batch statement"
-    /// (`BatchStatementResponse$TableName`).
+    /// The table the statement REACHED: "The table name associated with a failed PartiQL
+    /// batch statement" (`BatchStatementResponse$TableName`) — the table a statement that
+    /// ran against its items failed on, and `None` for a statement refused on its own
+    /// merits before it read or wrote anything, which reached no table.
     table: Option<String>,
     /// "The item which caused the condition check to fail. This will be set if
     /// ReturnValuesOnConditionCheckFailure is specified as ALL_OLD"
@@ -384,7 +386,7 @@ impl SlotFailure {
         Self::new(VALIDATION_ERROR_CODE, message)
     }
 
-    /// The same failure, reported against the table the statement addressed.
+    /// The same failure, reported against the table the statement reached.
     fn at(mut self, table: &str) -> Self {
         self.table = Some(table.to_string());
         self
@@ -470,6 +472,11 @@ fn run_slot<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // ([`crate::state::check_table_key_accessible`]).
         crate::state::check_table_key_accessible(engine, table)
             .map_err(|error| SlotFailure::from(error).at(&name))?;
+        // A source keyed by several `HASH` or several `RANGE` attributes is addressed by
+        // no equality a statement's `WHERE` clause can pin, so this slot reports that
+        // before the clause it states is judged at all
+        // ([`crate::state::MULTI_ATTRIBUTE_KEY_MESSAGE`]).
+        crate::state::check_single_attribute_source_key(table, statement.index())?;
     }
     let return_old_on_failure =
         request.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD");
@@ -511,9 +518,13 @@ fn run_slot<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             crate::state::EXISTS_ONLY_IN_TRANSACTION_MESSAGE,
         )),
     }
-    // Every slot is reported against the table its statement addressed — the one it
-    // failed on, and the one it ran against — so a caller that batched statements over
-    // several tables can attribute each slot's result to its table.
+    // A slot reports the table its statement RAN against: "The table name associated
+    // with a failed PartiQL batch statement" (`BatchStatementResponse$TableName`) is what
+    // a slot that reached the table answers, so a caller that batched statements over
+    // several tables can attribute each slot's result to its table — and a statement
+    // refused on its own merits before it read or wrote anything reached no table, so its
+    // slot carries the error alone (the paths below name the table on the failures that
+    // DID reach it).
     .map(|(response, capacity)| {
         (
             BatchStatementResponse {
@@ -523,7 +534,6 @@ fn run_slot<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             capacity,
         )
     })
-    .map_err(|failure| failure.at(&name))
 }
 
 /// Refuse a WRITE batch that addresses one item twice.
@@ -587,8 +597,28 @@ fn read_item(
 ) -> Result<SlotOutcome, SlotFailure> {
     // An index is not keyed by the table's primary key, so no `WHERE` clause over it
     // addresses one item of the table — which is what a batch read must do.
+    let source = store.active_table(region, name, now)?;
+    // A clause whose `OR` branches each ask for their own range of the source's keys asks
+    // for ranges that overlap, which no one range read answers: that is a defect of the
+    // CLAUSE, reported ahead of the rule about the key it pins
+    // ([`crate::state::overlapping_range_key_conditions`]).
+    if let (Some(filter), Some(sort_key)) = (
+        select.filter.as_ref(),
+        crate::state::source_sort_key_name(source, select.index.as_deref()),
+    ) {
+        if crate::state::overlapping_range_key_conditions(filter, &sort_key) {
+            return Err(SlotFailure::validation(
+                crate::state::OVERLAPPING_RANGE_KEY_MESSAGE,
+            ));
+        }
+    }
     if select.index.is_some() {
         return Err(SlotFailure::validation(KEY_EQUALITY_MESSAGE));
+    }
+    // A projection item that is no document path is refused once the source it reads has
+    // been resolved ([`crate::state::projection_defect`]).
+    if let Some(defect) = crate::state::projection_defect(select.projection.as_ref()) {
+        return Err(SlotFailure::from(defect));
     }
     // `ORDER BY` orders a result set; a batch read reports at most one item, so a
     // statement that asks for an order asks for something no batch read can serve.
@@ -684,10 +714,9 @@ fn insert_item(
         table.key_of_item(&item)?
     };
     if store.active_table(region, name, now)?.items.contains_key(&key) {
-        return Err(SlotFailure::new(
-            DUPLICATE_ITEM_CODE,
-            DUPLICATE_ITEM_MESSAGE,
-        ));
+        return Err(
+            SlotFailure::new(DUPLICATE_ITEM_CODE, DUPLICATE_ITEM_MESSAGE).at(name),
+        );
     }
     let capacity = store
         .active_table(region, name, now)?
@@ -754,11 +783,10 @@ fn update_item(
             before.as_ref(),
             now,
         );
-        return Err(condition_failed(if return_old_on_failure {
-            before
-        } else {
-            None
-        }));
+        return Err(condition_failed(
+            if return_old_on_failure { before } else { None },
+        )
+        .at(name));
     }
 
     let mut item = before.clone().unwrap_or_default();
@@ -860,11 +888,10 @@ fn delete_item(
             before.as_ref(),
             now,
         );
-        return Err(condition_failed(if return_old_on_failure {
-            before
-        } else {
-            None
-        }));
+        return Err(condition_failed(
+            if return_old_on_failure { before } else { None },
+        )
+        .at(name));
     }
     let capacity = store
         .active_table(region, name, now)?
@@ -911,7 +938,7 @@ fn admit_write(
     store
         .active_table_mut(region, name, now)?
         .admit_item_write(&key.partition, capacity, now)
-        .map_err(|throttle| SlotFailure::new(throttle.code(), throttle.message()))
+        .map_err(|throttle| SlotFailure::new(throttle.code(), throttle.message()).at(name))
 }
 
 /// The slot failure a write whose `WHERE` clause the stored item does not satisfy
