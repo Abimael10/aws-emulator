@@ -270,6 +270,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The utilization a `managedScaling` block TARGETS is a percentage: a value outside
+        // it asks for a utilization no group can be held at, which Amazon ECS refuses in the
+        // same class as the step-size pair below and with its own fixed sentence
+        // ([`crate::state::managed_scaling_target_capacity_violation`]). Judged on the value
+        // the request carried and BEFORE the request is weighed against what the account
+        // holds, for the same reason that one is.
+        if let Some(message) = crate::state::managed_scaling_target_capacity_violation(
+            input
+                .auto_scaling_group_provider
+                .as_ref()
+                .and_then(|provider| provider.managed_scaling.as_ref()),
+        ) {
+            return Err(
+                CreateCapacityProviderErrorModeled::ClientException(ClientException {
+                    message: Some(message.to_string()),
+                })
+                .into(),
+            );
+        }
+
         // `managedScaling` is a RANGE: its minimum scaling step size is the floor and its
         // maximum the ceiling of one scale-out step, so a block whose minimum is above its
         // maximum describes no step at all. It is the same class of fault as a name no

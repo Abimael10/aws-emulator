@@ -87,6 +87,46 @@ pub fn stored_managed_scaling(requested: Option<&ManagedScaling>) -> ManagedScal
     }
 }
 
+/// The smallest utilization `ManagedScaling$targetCapacity` may ask for: that member's own
+/// documentation, "the specified value must be greater than `0` and less than or equal to
+/// `100`", which the model states as `@range` 1..100 on `ManagedScalingTargetCapacity`.
+pub const MANAGED_SCALING_MIN_TARGET_CAPACITY: i32 = 1;
+
+/// The largest one, from the same sentence: a provider cannot be asked to use more of its
+/// group than all of it.
+pub const MANAGED_SCALING_MAX_TARGET_CAPACITY: i32 = 100;
+
+/// `ClientException$message` for a `targetCapacity` outside those bounds: one fixed sentence
+/// that states the bounds and carries neither the value the request sent nor the member's
+/// own name.
+pub const MANAGED_SCALING_TARGET_CAPACITY_MESSAGE: &str =
+    "The managed scaling target capacity value is invalid. Specify an integer greater than 0 \
+     and less than or equal to 100 and try again.";
+
+/// The refusal a `managedScaling` block earns when the utilization it targets is outside the
+/// percentage its member takes, or `None` when it is inside it (and for a request that names
+/// no block, or no target).
+///
+/// `targetCapacity` is "the target capacity utilization as a percentage for the capacity
+/// provider", bounded by its own documentation at
+/// [`MANAGED_SCALING_MIN_TARGET_CAPACITY`]..=[`MANAGED_SCALING_MAX_TARGET_CAPACITY`]. Amazon
+/// ECS answers a value outside it in the class it answers a request whose VALUES it will not
+/// take — `ClientException`, the class the step-size pair below is refused in too — rather
+/// than in the one a request it cannot read earns, so a client branching on the code sees
+/// one class for "this managed-scaling block is not usable". That is why the bound is judged
+/// HERE, by the operations that take such a block, rather than at the framework's boundary
+/// walk: the walk answers this service's `InvalidParameterException` for every bound the
+/// model declares, which is the other class (see the member's own `skip_validation` in
+/// `src/ops/types/`).
+pub fn managed_scaling_target_capacity_violation(
+    requested: Option<&ManagedScaling>,
+) -> Option<&'static str> {
+    let targeted = requested?.target_capacity?;
+    (!(MANAGED_SCALING_MIN_TARGET_CAPACITY..=MANAGED_SCALING_MAX_TARGET_CAPACITY)
+        .contains(&targeted))
+    .then_some(MANAGED_SCALING_TARGET_CAPACITY_MESSAGE)
+}
+
 /// The refusal a `managedScaling` block earns when its two scaling step sizes do not bound
 /// each other, or `None` when they do.
 ///

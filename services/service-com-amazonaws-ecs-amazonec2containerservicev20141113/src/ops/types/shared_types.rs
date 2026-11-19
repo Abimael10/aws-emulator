@@ -755,7 +755,17 @@ pub struct AutoScalingGroupProvider {
     pub managed_draining: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ecs#ManagedScaling")]
+// `skip_validation = ["targetCapacity"]`: Amazon ECS refuses a target utilization outside
+// the percentage this member takes in its OWN error class and with its own fixed sentence
+// (`crate::state::managed_scaling_target_capacity_violation`, asked by every operation that
+// takes a `managedScaling` block), which the boundary walk cannot express: this service
+// answers every bound the model declares in `InvalidParameterException`, and this one is a
+// `ClientException`. The bound itself is still enforced, against the same 1..100 the model
+// states, before anything is stored.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ecs#ManagedScaling",
+    skip_validation = ["targetCapacity"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ManagedScaling {
     pub scaling_approach: Option<String>,

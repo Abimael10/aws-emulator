@@ -221,18 +221,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let instance = guard
-            .container_instances
-            .get_mut(&arn)
-            .expect("the ARN was just resolved out of the map under this lock");
+        // The work already placed on this host is what `force` is about: "if you have tasks
+        // running on the container instance when you deregister it with the `force` option,
+        // these tasks remain running ... but they're orphaned (no longer monitored or
+        // accounted for by Amazon ECS)". Orphaning them is the CALLER's decision, so a
+        // deregistration that does not ask for it, of a host that still holds a task, is
+        // refused with the sentence that condition carries and the host left registered —
+        // and the same call is served once every task on it has stopped
+        // ([`crate::state::container_instance_holds_tasks`]). A host already out of the
+        // cluster has nothing left to orphan, so the call that changes nothing stays the
+        // report it was.
+        // Read BEFORE the record is taken mutably below, so this operation looks the host's
+        // own tasks up once and the instance is reached exactly once.
+        let holds_tasks = guard.container_instance_holds_tasks(&arn);
+        // The resolution above read a record of this store under this same lock, so the ARN
+        // names one — and the lookup is still answered rather than asserted, so no request
+        // can make this operation panic: a store that no longer holds it is this service's
+        // own failure and is reported as one.
+        let Some(instance) = guard.container_instances.get_mut(&arn) else {
+            return Err(
+                DeregisterContainerInstanceErrorModeled::ServerException(ServerException {
+                    message: Some(
+                        "the container instance this call resolved is no longer stored"
+                            .to_string(),
+                    ),
+                })
+                .into(),
+            );
+        };
+        if input.force != Some(true)
+            && instance.status != crate::state::CONTAINER_INSTANCE_INACTIVE
+            && holds_tasks
+        {
+            return Err(
+                DeregisterContainerInstanceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::CONTAINER_INSTANCE_RUNNING_TASKS_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // "Deregistering a container instance removes the instance from a cluster": the
         // instance stops counting towards the cluster's registered capacity and "then
         // transitions to an INACTIVE status", which is the status
-        // `ListContainerInstances` leaves out by default. `force` changes nothing here:
-        // it governs the tasks that were placed ON the instance, which "remain running
-        // until you terminate the instance or the tasks stop through some other means,
-        // but they're orphaned" — so a task placed on it is left exactly as it stands.
+        // `ListContainerInstances` leaves out by default. A task the forced call left on it
+        // is left exactly as it stands: it "remains running until you terminate the instance
+        // or the tasks stop through some other means".
         //
         // An instance that has already been deregistered is reported as it stands: it is
         // already out of the cluster's capacity, so there is no second transition to

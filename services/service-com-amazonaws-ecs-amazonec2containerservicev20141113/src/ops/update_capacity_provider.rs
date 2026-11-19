@@ -214,6 +214,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The utilization a `managedScaling` block TARGETS is a percentage, judged the same
+        // way and in the same class as the step sizes below
+        // ([`crate::state::managed_scaling_target_capacity_violation`]).
+        if let Some(message) = crate::state::managed_scaling_target_capacity_violation(
+            input
+                .auto_scaling_group_provider
+                .as_ref()
+                .and_then(|provider| provider.managed_scaling.as_ref()),
+        ) {
+            return Err(
+                UpdateCapacityProviderErrorModeled::ClientException(ClientException {
+                    message: Some(message.to_string()),
+                })
+                .into(),
+            );
+        }
+
         // `managedScaling` is a RANGE: its minimum scaling step size is the floor and its
         // maximum the ceiling of one scale-out step, so a block whose minimum is above its
         // maximum describes no step at all — judged on the values the request carried, each

@@ -509,6 +509,11 @@ pub use task_definition_capabilities::*;
 mod task_placement_constraints;
 pub use task_placement_constraints::*;
 
+/// The tasks a container instance still holds, and the deregistration of it they refuse
+/// while the call does not ask for them to be orphaned.
+mod container_instance_tasks;
+pub use container_instance_tasks::*;
+
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
 /// credential scope to read a region from). `emulator_arn`'s own documented default.
 pub const DEFAULT_REGION: &str = "us-east-1";
