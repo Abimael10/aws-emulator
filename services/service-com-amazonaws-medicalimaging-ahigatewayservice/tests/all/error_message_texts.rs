@@ -2,7 +2,7 @@
 
 //! How this service WORDS a refusal, end to end over real HTTP.
 //!
-//! Three rules, each asserted over a SET of inputs rather than one recorded request:
+//! Four rules, each asserted over a SET of inputs rather than one recorded request:
 //!
 //! 1. An input-constraint refusal states the AWS envelope
 //!    (`N validation error(s) detected: `) over the framework's own clauses, quoting
@@ -14,15 +14,41 @@
 //!    does not vary with the token supplied.
 //! 3. A request naming a resource that does not exist is refused with a text that is a
 //!    constant of the resource KIND and carries no identifier from the request.
+//! 4. A query filter whose value names no member of the modelled enum it is typed by is
+//!    refused with the same enum-value clause whichever listing takes the filter — the
+//!    one `crate::state::enum_value_error` both of them now word that class through.
 //!
 //! The harness is the sibling suite's (`crate::datastore_lifecycle`): real requests
-//! through `MultiServiceRouter::dispatch`, nothing reaching into the state struct.
+//! through `MultiServiceRouter::dispatch`, nothing reaching into the state struct. The
+//! one exception is the last suite, which reaches the branch a caller BYPASSING the
+//! boundary validator takes by calling the two listings' handlers themselves — the only
+//! way to drive that branch, since the boundary refuses such a value before the handler
+//! runs.
+
+use std::sync::Arc;
 
 use serde_json::{json, Value};
+use smithy_server_runtime::{
+    EmbeddedEmulator, MultiServiceRouter, Operation, OperationContext, Service,
+};
 
-use service_com_amazonaws_medicalimaging_ahigatewayservice::state::DATASTORE_DELETION_DELAY;
+use service_com_amazonaws_medicalimaging_ahigatewayservice::ops::list_datastores::{
+    ListDatastores, ListDatastoresErrorModeled,
+};
+use service_com_amazonaws_medicalimaging_ahigatewayservice::ops::list_dicom_import_jobs::{
+    ListDICOMImportJobs, ListDICOMImportJobsErrorModeled,
+};
+use service_com_amazonaws_medicalimaging_ahigatewayservice::ops::types::{
+    ListDICOMImportJobsInput, ListDatastoresInput, DATASTORE_STATUS_VALUES, JOB_STATUS_VALUES,
+};
+use service_com_amazonaws_medicalimaging_ahigatewayservice::scaffolded::Scaffolded;
+use service_com_amazonaws_medicalimaging_ahigatewayservice::state::{
+    enum_value_error, DATASTORE_DELETION_DELAY,
+};
+use service_com_amazonaws_medicalimaging_ahigatewayservice::EmulatedService;
 
-use crate::datastore_lifecycle::{Emulator, SETTLE_MULTIPLE};
+use crate::datastore_lifecycle::{Answer, Emulator, SETTLE_MULTIPLE};
+use crate::import_job_listing::list_jobs;
 use crate::page_token_payload_forgery::{split_issued_token, token_carrying};
 
 /// The `KmsKeyArn` `@pattern` with its anchors stripped — the expression this service
@@ -789,4 +815,287 @@ async fn a_missing_import_job_is_refused_with_a_constant_text() {
         read.status, 200,
         "case \"a real job\": expected the real job to read back, got {read:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 4. The enum-value clause a status filter is refused with
+// ---------------------------------------------------------------------------
+
+/// The requirement half of an enum-value clause: the members the enum declares, joined
+/// in the order the caller lists them.
+///
+/// Built from the enum's own generated value list rather than spelled out here
+/// (`smithy_query(query="shape",shape="DatastoreStatus,JobStatus")`), so a member added
+/// to the model joins this expectation instead of being left behind by it.
+fn enum_value_requirement(allowed: &[&str]) -> String {
+    format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+}
+
+/// Assert that `message` is this service's single-violation envelope over the enum-value
+/// clause about `member`: the rejected value echoed, and the requirement naming exactly
+/// the members the enum declares.
+///
+/// The SET is what is asserted, not the order it is listed in: the order is the one the
+/// shape that stated the violation carries its values in, which is the model's business
+/// and not this rule's.
+fn assert_enum_value_clause(case: &str, message: &str, member: &str, value: &str, allowed: &[&str]) {
+    let opened = format!(
+        "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
+         constraint: Member must satisfy enum value set: ["
+    );
+    let listed = message
+        .strip_prefix(&opened)
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected the envelope {opened:?}…], got {message:?}")
+        });
+    let mut stated: Vec<&str> = listed.split(", ").collect();
+    stated.sort_unstable();
+    let mut expected: Vec<&str> = allowed.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        stated, expected,
+        "case {case:?}: expected the clause to name exactly the modelled members \
+         {expected:?}, got {stated:?} in {message:?}"
+    );
+}
+
+/// A paginated listing that narrows its walk by a `@httpQuery` status filter, which is
+/// the one input each of them re-checks against a modelled enum.
+#[derive(Debug, Clone, Copy)]
+enum StatusFiltered {
+    /// `ListDatastores`, filtered by `datastoreStatus`.
+    Datastores,
+    /// `ListDICOMImportJobs`, filtered by `jobStatus`.
+    ImportJobs,
+}
+
+impl StatusFiltered {
+    /// The filter member, in the spelling a validation path uses.
+    fn member(self) -> &'static str {
+        match self {
+            StatusFiltered::Datastores => "datastoreStatus",
+            StatusFiltered::ImportJobs => "jobStatus",
+        }
+    }
+
+    /// Every value the model declares for the enum that member is typed by.
+    fn allowed(self) -> &'static [&'static str] {
+        match self {
+            StatusFiltered::Datastores => DATASTORE_STATUS_VALUES,
+            StatusFiltered::ImportJobs => JOB_STATUS_VALUES,
+        }
+    }
+
+    /// The values the OTHER listing's filter declares, so a row can send a status that
+    /// is modelled by this service but not by this member's enum.
+    fn foreign(self) -> &'static [&'static str] {
+        match self {
+            StatusFiltered::Datastores => JOB_STATUS_VALUES,
+            StatusFiltered::ImportJobs => DATASTORE_STATUS_VALUES,
+        }
+    }
+
+    /// The output member this listing's page arrives in.
+    fn page_member(self) -> &'static str {
+        match self {
+            StatusFiltered::Datastores => "datastoreSummaries",
+            StatusFiltered::ImportJobs => "jobSummaries",
+        }
+    }
+
+    /// This listing, asked for the records `value` selects.
+    async fn filtered(self, emulator: &Emulator, datastore_id: &str, value: &str) -> Answer {
+        let query = format!("{}={value}", self.member());
+        match self {
+            StatusFiltered::Datastores => emulator.list_datastores(&query).await,
+            StatusFiltered::ImportJobs => list_jobs(emulator, datastore_id, &query).await,
+        }
+    }
+}
+
+/// The values one listing's status filter must be refused for: a name no status spells, a
+/// modelled value in the wrong case, a modelled value with a suffix, a status the OTHER
+/// listing's enum declares, and a number. Each is paired with the case it names.
+fn unmodelled_values(listing: StatusFiltered) -> Vec<(&'static str, String)> {
+    let first = listing.allowed().first().copied().unwrap_or_default();
+    let rows = vec![
+        ("a name no status spells", "NOT_A_STATUS".to_string()),
+        ("a modelled value in the wrong case", first.to_lowercase()),
+        ("a modelled value with a suffix", format!("{first}_LATER")),
+        (
+            "a status the other listing's enum declares",
+            listing
+                .foreign()
+                .first()
+                .copied()
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        ("a number", "0".to_string()),
+    ];
+    for (row, value) in &rows {
+        assert!(
+            !listing.allowed().contains(&value.as_str()),
+            "case {:?}: the row must send a value the model does not declare, got one of {:?}",
+            format!("{} {row}={value}", listing.member()),
+            listing.allowed()
+        );
+    }
+    rows
+}
+
+/// RULE: a query filter whose value names no member of the modelled enum it is typed by
+/// is refused with HTTP 400 `ValidationException` whose message is this service's single
+/// validation envelope over the enum-value clause for that member — the rejected value
+/// echoed and the requirement naming exactly the members the enum declares — whichever
+/// listing takes the filter, while every value the model DOES declare is served.
+///
+/// Rows span both axes the rule generalises over: the listing (`ListDatastores`'s
+/// `datastoreStatus` and `ListDICOMImportJobs`'s `jobStatus`, the two listings that
+/// re-check a filter against a modelled enum) and the rejected value
+/// ([`unmodelled_values`]).
+#[tokio::test]
+async fn an_unmodelled_status_filter_is_refused_with_the_services_enum_value_clause() {
+    let emulator = Emulator::new();
+    let datastore_id = emulator
+        .active_datastore("enum.filter.store", "enum-filter-store")
+        .await;
+
+    for listing in [StatusFiltered::Datastores, StatusFiltered::ImportJobs] {
+        let allowed = listing.allowed();
+        for (row, value) in unmodelled_values(listing) {
+            let case = format!("{} {row}={value}", listing.member());
+            let answer = listing.filtered(&emulator, &datastore_id, &value).await;
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: expected HTTP 400, got {answer:?}"
+            );
+            assert_eq!(
+                answer.error_code, "ValidationException",
+                "case {case:?}: expected ValidationException, got {answer:?}"
+            );
+            assert!(
+                answer.field(&[listing.page_member()]).is_null(),
+                "case {case:?}: expected no page beside the refusal, got {answer:?}"
+            );
+            assert_enum_value_clause(
+                &case,
+                &answer.string(&["message"]),
+                listing.member(),
+                &value,
+                allowed,
+            );
+        }
+
+        // The control: every value the model DOES declare is served, so the refusals
+        // above are about the value naming no member and not about the filter itself.
+        for value in allowed {
+            let case = format!("{} a modelled value={value}", listing.member());
+            let answer = listing.filtered(&emulator, &datastore_id, value).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected HTTP 200 for a modelled status, got {answer:?}"
+            );
+        }
+    }
+}
+
+/// RULE, the same one a layer in: the re-check each listing's handler makes of its own
+/// status filter — the branch a caller that BYPASSES the boundary validator reaches —
+/// states that refusal through the one wording this service owns for the class
+/// (`crate::state::enum_value_error`), so both listings answer the identical envelope and
+/// the identical clause, built from the member's own generated value list.
+///
+/// Driven by calling the two handlers directly, which is what bypassing the boundary
+/// validator means: over the wire the validator refuses such a value first (the suite
+/// above asserts that), so this branch is reachable no other way. A copy of this rule
+/// reappearing in either handler with a wording of its own fails here.
+#[tokio::test]
+async fn each_listings_own_enum_recheck_states_the_one_shared_clause() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let service = EmulatedService::new(Arc::clone(&engine));
+    let identity = service.definition().identity().clone();
+    // A bare request, carrying no credential scope: the refusal below is raised before
+    // anything regional is read, so what the parts hold does not enter it.
+    let (parts, ()) = http::Request::builder()
+        .method("GET")
+        .uri("/datastore")
+        .body(())
+        .expect("a request this test builds")
+        .into_parts();
+    let ctx = OperationContext::new(
+        &parts,
+        &identity,
+        EmbeddedEmulator::from_router(MultiServiceRouter::new()),
+    );
+    // A well-formed `DatastoreId` (`^[0-9a-z]{32}$`); the job listing refuses the status
+    // before it resolves one, so no data store has to exist.
+    let datastore_id = "0".repeat(32);
+
+    for listing in [StatusFiltered::Datastores, StatusFiltered::ImportJobs] {
+        for (row, value) in unmodelled_values(listing) {
+            let case = format!("{} {row}={value}, past the boundary", listing.member());
+            let message = match listing {
+                StatusFiltered::Datastores => {
+                    let answered = ListDatastores::new(Arc::clone(&engine))
+                        .handle(
+                            ListDatastoresInput {
+                                datastore_status: Some(value.clone()),
+                                ..Default::default()
+                            },
+                            &ctx,
+                        )
+                        .await;
+                    match answered {
+                        Err(Scaffolded::Modeled(
+                            ListDatastoresErrorModeled::ValidationException(refusal),
+                        )) => refusal.message,
+                        other => panic!(
+                            "case {case:?}: expected a ValidationException from the \
+                             handler's own re-check, got {other:?}"
+                        ),
+                    }
+                }
+                StatusFiltered::ImportJobs => {
+                    let answered = ListDICOMImportJobs::new(Arc::clone(&engine))
+                        .handle(
+                            ListDICOMImportJobsInput {
+                                datastore_id: datastore_id.clone(),
+                                job_status: Some(value.clone()),
+                                ..Default::default()
+                            },
+                            &ctx,
+                        )
+                        .await;
+                    match answered {
+                        Err(Scaffolded::Modeled(
+                            ListDICOMImportJobsErrorModeled::ValidationException(refusal),
+                        )) => refusal.message,
+                        other => panic!(
+                            "case {case:?}: expected a ValidationException from the \
+                             handler's own re-check, got {other:?}"
+                        ),
+                    }
+                }
+            };
+
+            assert_enum_value_clause(&case, &message, listing.member(), &value, listing.allowed());
+            let expected = envelope(&[clause_with_value(
+                &value,
+                listing.member(),
+                &enum_value_requirement(listing.allowed()),
+            )]);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected message {expected:?}, got {message:?}"
+            );
+            let through_helper = enum_value_error(listing.member(), &value, listing.allowed());
+            assert_eq!(
+                message, through_helper,
+                "case {case:?}: expected the text this service's one enum-value refusal \
+                 words ({through_helper:?}), got {message:?}"
+            );
+        }
+    }
 }

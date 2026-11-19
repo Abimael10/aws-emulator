@@ -795,6 +795,37 @@ pub fn handler_requirement_error(path: &str, value: Option<&str>, requirement: &
     format!("1 validation error detected: {clause}")
 }
 
+/// The `ValidationException` message for a value that names no member of a modelled
+/// enum, found by a HANDLER re-checking one past the boundary validator — the
+/// `@httpQuery` status filter a listing narrows its walk by, or an enum a request
+/// carries inside a member the boundary validator does not walk as that enum.
+///
+/// Lives here, like the page-size clamp ([`list_page_size`]) and the token codec
+/// ([`encode_page_token`]), because more than one operation re-checks a modelled enum
+/// and a refusal class spelled once per handler drifts: one site updated and the others
+/// left behind, or the same class worded a different way at each site. `allowed_values`
+/// is the enum's generated `*_VALUES` constant, so the requirement lists exactly the
+/// members the model declares, in the order that constant carries them, and a member
+/// added to the model cannot go unlisted at one site.
+///
+/// Worded through [`one_validation_error`] over a [`ViolationKind::EnumValue`]
+/// violation, so a refusal raised here reads like one the boundary validator stated
+/// about the same member — including whether the rejected value is echoed, which
+/// [`withholds_value`] decides for every refusal this service words.
+pub fn enum_value_error(path: &str, value: &str, allowed_values: &[&str]) -> String {
+    one_validation_error(&Violation {
+        path: path.to_string(),
+        kind: ViolationKind::EnumValue(
+            allowed_values
+                .iter()
+                .map(|allowed| (*allowed).to_string())
+                .collect(),
+        ),
+        value: Some(value.to_string()),
+        sensitive: false,
+    })
+}
+
 /// The requirement a member documented as carrying a document in the shape of the
 /// aggregated DICOM metadata document states when its text does not parse as JSON at all.
 pub const METADATA_DOCUMENT_REQUIREMENT: &str = "Member must be a JSON document";

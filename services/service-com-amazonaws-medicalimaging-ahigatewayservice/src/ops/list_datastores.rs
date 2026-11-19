@@ -146,7 +146,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The status filter must name a modelled `DatastoreStatus`. The boundary
         // validator already refused anything else, so an unparseable value here can
-        // only come from a caller bypassing it.
+        // only come from a caller bypassing it. The refusal is worded by the service's
+        // one rule for an unmodelled enum value
+        // ([`crate::state::enum_value_error`]), so every handler that re-checks a
+        // modelled enum states that class the same way.
         let status_filter = match input.datastore_status.as_deref() {
             None => None,
             Some(value) => match DatastoreStatus::from_wire(value) {
@@ -154,21 +157,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(ListDatastoresErrorModeled::ValidationException(
                         ValidationException {
-                            // Worded through the one refusal formatter this service
-                            // owns, so a refusal raised here reads exactly like one
-                            // the boundary validator stated.
-                            message: crate::state::one_validation_error(
-                                &smithy_server_runtime::Violation {
-                                    path: "datastoreStatus".to_string(),
-                                    kind: smithy_server_runtime::ViolationKind::EnumValue(
-                                        DATASTORE_STATUS_VALUES
-                                            .iter()
-                                            .map(|value| (*value).to_string())
-                                            .collect(),
-                                    ),
-                                    value: Some(value.to_string()),
-                                    sensitive: false,
-                                },
+                            message: crate::state::enum_value_error(
+                                "datastoreStatus",
+                                value,
+                                DATASTORE_STATUS_VALUES,
                             ),
                         },
                     )
