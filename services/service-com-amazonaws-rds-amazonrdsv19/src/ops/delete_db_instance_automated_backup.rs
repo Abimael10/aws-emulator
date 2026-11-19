@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBInstanceAutomatedBackup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDBInstanceAutomatedBackup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDBInstanceAutomatedBackup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the RETAINED automated backup of a DB instance that has been deleted — the
+//! record `DeleteDBInstance` kept when its `DeleteAutomatedBackups` was turned off
+//! ([`crate::state::RetainedInstanceBackupRecord`]) — named by the source instance's
+//! `DbiResourceId` or by the ARN of the backups themselves, and reports the backup it
+//! removed. The backups of an instance this store still holds go with that instance, so
+//! naming one of those is the modelled `InvalidDBInstanceAutomatedBackupStateFault`, and a
+//! reference that resolves to no backup is the modelled
+//! `DBInstanceAutomatedBackupNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +146,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDBInstanceAutomatedBackup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDBInstanceAutomatedBackupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region = crate::state::request_region(ctx)
+            .map_err(DeleteDBInstanceAutomatedBackupError::validation)?;
+
+        // "Deletes automated backups using the DbiResourceId value of the source DB
+        // instance or the Amazon Resource Name (ARN) of the automated backups": the call
+        // has to name WHICH backups it deletes, so a request that names neither member
+        // names no resource at all and is refused with the `InvalidParameterCombination`
+        // the Query API answers members that cannot hold together with. Naming both is
+        // served only while the two agree — the id the ARN carries is the id the other
+        // member gives — because a request whose two references name different backups has
+        // no one answer.
+        let reference = crate::state::AutomatedBackupReference {
+            dbi_resource_id: input.dbi_resource_id.clone(),
+            automated_backups_arn: input.db_instance_automated_backups_arn.clone(),
+        };
+        match (
+            &reference.dbi_resource_id,
+            &reference.automated_backups_arn,
+        ) {
+            (None, None) => {
+                return Err(
+                    DeleteDBInstanceAutomatedBackupError::invalid_parameter_combination(
+                        "DbiResourceId must be specified when DBInstanceAutomatedBackupsArn \
+                         isn't specified",
+                    ),
+                )
+            }
+            (Some(resource_id), Some(arn))
+                if !crate::state::instance_automated_backups_arn(&region, resource_id)
+                    .eq_ignore_ascii_case(arn) =>
+            {
+                return Err(
+                    DeleteDBInstanceAutomatedBackupError::invalid_parameter_combination(
+                        "DBInstanceAutomatedBackupsArn must name the same automated backups \
+                         as DbiResourceId",
+                    ),
+                )
+            }
+            _ => {}
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a delete nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — owed at this instant whether or not
+        // anybody called — so the backup this delete is judged against is the current one:
+        // an instance whose own delete has run its course is gone by now, which is what
+        // leaves its RETAINED backup as the only one under this id.
+        store.settle_due_transitions(&region);
+
+        // WHICH backup the reference names: the retained backup of a deleted instance, or
+        // the `active` backup of an instance this store still holds — those two are all
+        // the backups there are ([`crate::state::DbInstanceRecord::has_automated_backup`]).
+        // Each candidate is matched against the reference by BOTH of its own values, its
+        // source instance's resource id and its own ARN, so neither member of the request is
+        // taken apart to resolve it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDBInstanceAutomatedBackup"))
+        // "The automated backup is in an invalid state. For example, this automated backup
+        // is associated with an active instance": the backups of a LIVE instance go with
+        // that instance — `DeleteDBInstance` is what removes them — so this call refuses
+        // them and deletes nothing.
+        let active = store
+            .instance_with_automated_backup_named(&region, &reference)
+            .map(|instance| instance.identifier.clone());
+        if let Some(identifier) = active {
+            return Err(
+                DeleteDBInstanceAutomatedBackupErrorModeled::InvalidDBInstanceAutomatedBackupStateFault(
+                    InvalidDBInstanceAutomatedBackupStateFault {
+                        message: Some(format!(
+                            "The automated backup is associated with the active DB instance \
+                             {identifier} and can't be deleted."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The retained backup is REMOVED and reported back as it was: "an automated backup
+        // of a DB instance ... the database instance properties that existed at the time
+        // you deleted the source instance", which is what the caller is told it deleted. A
+        // reference that resolves to no backup at all is the modelled not-found fault,
+        // naming the value the request carried.
+        let removed = store
+            .retained_instance_backup_named(&region, &reference)
+            .map(|backup| backup.dbi_resource_id.clone())
+            .and_then(|resource_id| store.remove_retained_instance_backup(&region, &resource_id));
+        let Some(removed) = removed else {
+            return Err(
+                DeleteDBInstanceAutomatedBackupErrorModeled::DBInstanceAutomatedBackupNotFoundFault(
+                    DBInstanceAutomatedBackupNotFoundFault {
+                        message: Some(
+                            crate::ops::describe_db_instance_automated_backups::automated_backup_not_found_message(
+                                reference.describe(),
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(DeleteDBInstanceAutomatedBackupOutput {
+            db_instance_automated_backup: Some(removed.to_wire()),
+        })
     }
 }

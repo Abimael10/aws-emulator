@@ -82,7 +82,8 @@ use crate::ops::types::{
     CreateDBClusterEndpointOutput, CreateDBShardGroupOutput,
     DBCluster, DBClusterAutomatedBackup, DBClusterMember, DBClusterOptionGroupStatus,
     DBClusterParameterGroup, DBClusterRole, DBClusterSnapshot, DBClusterSnapshotAttribute,
-    DBClusterSnapshotAttributesResult, DBInstance, DBInstanceRole, DBInstanceStatusInfo,
+    DBClusterSnapshotAttributesResult, DBInstance, DBInstanceAutomatedBackup, DBInstanceRole,
+    DBInstanceStatusInfo,
     DBParameterGroup,
     DBParameterGroupStatus,
     DBSecurityGroup, DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
@@ -299,6 +300,10 @@ pub mod ec2_images;
 pub mod parameter_formula;
 mod instances;
 mod clusters;
+// The AUTOMATED BACKUP of a DB instance: the one every instance that keeps continuous
+// backups has, and the record a delete that asked to keep it leaves behind.
+mod instance_automated_backups;
+pub use instance_automated_backups::*;
 // The weekly maintenance window both resource kinds keep: the form it is STORED in, and
 // when its next occurrence begins.
 pub mod maintenance_window;
@@ -381,6 +386,20 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     pub db_instances: BTreeMap<RegionalKey, DbInstanceRecord>,
     /// DB snapshots by `(region, DBSnapshotIdentifier)`. Ordered, for the same reason.
     pub db_snapshots: BTreeMap<RegionalKey, DbSnapshotRecord>,
+    /// The RETAINED automated backups of DB instances that have been DELETED, by
+    /// `(region, DbiResourceId)` — the id of the source instance, which "can't be changed
+    /// and ... is unique to an Amazon Web Services Region", so one deleted instance leaves
+    /// one record here. Ordered, so `DescribeDBInstanceAutomatedBackups` pages
+    /// deterministically within a region.
+    ///
+    /// `DeleteDBInstance` with `DeleteAutomatedBackups` turned off inserts here — bounded
+    /// by [`RETAINED_INSTANCE_BACKUP_QUOTA_PER_REGION`] per region and by [`MAX_REGIONS`]
+    /// regions — and `DeleteDBInstanceAutomatedBackup` is the reclamation path. The
+    /// `active` backups of instances this store still holds are NOT here: they are
+    /// projected from the instance records themselves
+    /// ([`DbInstanceRecord::automated_backup_to_wire`]), so an instance and its automated
+    /// backup cannot disagree.
+    pub db_instance_automated_backups: BTreeMap<RegionalKey, RetainedInstanceBackupRecord>,
     /// DB CLUSTER snapshots by `(region, DBClusterSnapshotIdentifier)` — the identifier
     /// always stored lowercased, as `DBClusterSnapshotIdentifier` documents ("This value
     /// is stored as a lowercase string"). Ordered, so `DescribeDBClusterSnapshots` pages
@@ -1879,6 +1898,9 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .db_instances
             .keys()
             .chain(self.db_snapshots.keys())
+            // A retained automated backup outlives the instance it was taken of, so its
+            // region is counted here too rather than only while that instance is stored.
+            .chain(self.db_instance_automated_backups.keys())
             .chain(self.db_cluster_snapshots.keys())
             .chain(self.db_clusters.keys())
             .chain(self.db_cluster_endpoints.keys())

@@ -16,6 +16,8 @@ Issue-Commit: 8b0f35809934c567f1bf7b94b8ce8845151fefb8
 
 > _Note: this issue was identified against the code base at commit `8b0f35809934c567f1bf7b94b8ce8845151fefb8`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Cause 4 (retained automated backups) is FIXED here, and causes 2, 3 and 5 were already implemented on mainline by the time this report was worked — each verified over the wire. Causes 1 and 6 (the `Endpoint.Address` and `Endpoint.Port` a served engine publishes) are NOT: they are blocked on the core listener surface, and they are re-filed, with the core change they need and with what was ruled out for the three checks that die in a wait of their own, as `issues/things-that-do-not-work/20261118T181500Z-rds-the-published-endpoint-of-a-served-engine-is-the-core-listeners.md`, which carries their replay keys so they are not recorded as working._
+
 ## Operation
 DescribeDBInstances
 

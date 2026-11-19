@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBInstanceAutomatedBackups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBInstanceAutomatedBackups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBInstanceAutomatedBackups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the automated backups of a region's DB instances: the `active` backup of every
+//! instance that keeps continuous backups, projected from the instance's own record, and
+//! the `retained` backup of every instance a delete kept one for
+//! ([`crate::state::RetainedInstanceBackupRecord`]) — "displays backups for both current
+//! and deleted instances". `DbiResourceId`, `DBInstanceIdentifier` and
+//! `DBInstanceAutomatedBackupsArn` each narrow the report to one backup, and a value that
+//! resolves to none is the modelled `DBInstanceAutomatedBackupNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +167,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBInstanceAutomatedBackups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBInstanceAutomatedBackupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeDBInstanceAutomatedBackupsError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBInstanceAutomatedBackupsError::invalid_parameter_value)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters)
+            .map_err(DescribeDBInstanceAutomatedBackupsError::invalid_parameter_value)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeDBInstanceAutomatedBackupsError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called — which includes the removal of an
+        // instance whose delete has run its course, whose backup is reported from the
+        // retained record from then on.
+        store.settle_due_transitions(&region);
+
+        // "Displays backups for both current and deleted instances": the backups of the
+        // instances this store still holds, projected from their own records, and the
+        // retained backups of instances that have been deleted. RDS is regional, so only
+        // the region the request was signed for is in scope, and only an instance that
+        // KEEPS automated backups has one at all — "current instances with retention
+        // periods greater than zero (0) are returned".
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBInstanceAutomatedBackups"))
+        // Keyed by the source instance's `DbiResourceId`, which "can't be changed", so a
+        // page boundary is a cursor that cannot move when an instance is renamed, and the
+        // two sources interleave in one stable order.
+        let mut backups: Vec<(String, DBInstanceAutomatedBackup)> = store
+            .instances_in(&region)
+            .into_iter()
+            .filter(|instance| instance.has_automated_backup())
+            .map(|instance| {
+                (
+                    instance.dbi_resource_id.clone(),
+                    instance.automated_backup_to_wire(),
+                )
+            })
+            .chain(
+                store
+                    .retained_instance_backups_in(&region)
+                    .into_iter()
+                    .map(|backup| (backup.dbi_resource_id.clone(), backup.to_wire())),
+            )
+            .collect();
+        backups.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        // The three members that NARROW the report to one backup. Each is matched against
+        // the backup itself — a retained backup's source instance is gone, so the match
+        // cannot be a lookup of a live instance — and a value that resolves to no backup is
+        // the modelled not-found fault rather than an empty list, which is what tells a
+        // caller polling for a retained backup that there is none.
+        //
+        // `DbiResourceId` and `DBInstanceAutomatedBackupsArn` are resolved through the ONE
+        // reading of those two members ([`crate::state::AutomatedBackupReference`]), which
+        // `DeleteDBInstanceAutomatedBackup` resolves its own reference through, so the
+        // report and the delete cannot disagree about which backup a value names.
+        let reference = crate::state::AutomatedBackupReference {
+            dbi_resource_id: input.dbi_resource_id.clone(),
+            automated_backups_arn: input.db_instance_automated_backups_arn.clone(),
+        };
+        let mut named: Option<String> = None;
+        if let Some(requested) = &input.dbi_resource_id {
+            backups.retain(|(_, backup)| {
+                backup
+                    .dbi_resource_id
+                    .as_deref()
+                    .is_some_and(|stored| reference.names_resource_id(stored))
+            });
+            named = Some(requested.clone());
+        }
+        if let Some(requested) = &input.db_instance_identifier {
+            // "The user-supplied instance identifier", which "isn't case-sensitive" — and
+            // every member that names a DB instance also accepts its ARN.
+            let identifier = crate::state::arn_resource_name_of(requested);
+            backups.retain(|(_, backup)| {
+                backup
+                    .db_instance_identifier
+                    .as_deref()
+                    .is_some_and(|stored| stored.eq_ignore_ascii_case(identifier))
+            });
+            named = Some(requested.clone());
+        }
+        if let Some(requested) = &input.db_instance_automated_backups_arn {
+            backups.retain(|(_, backup)| {
+                backup
+                    .db_instance_automated_backups_arn
+                    .as_deref()
+                    .is_some_and(|stored| reference.names_arn(stored))
+            });
+            named = Some(requested.clone());
+        }
+        if let (Some(named), true) = (named, backups.is_empty()) {
+            return Err(not_found(&named));
+        }
+
+        let matching: Vec<(String, DBInstanceAutomatedBackup)> = backups
+            .into_iter()
+            .filter(|(_, backup)| filters.iter().all(|filter| matches_filter(backup, filter)))
+            .collect();
+
+        // A `Marker` is placed in the report's own order and the page resumes BEYOND it; a
+        // token this codec could not have produced is refused: see `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBInstanceAutomatedBackupsError::invalid_parameter_value)?;
+        Ok(DescribeDBInstanceAutomatedBackupsOutput {
+            marker: page.next_marker,
+            db_instance_automated_backups: Some(page.items),
+        })
     }
+}
+
+/// The modelled not-found fault for a value that resolves to no automated backup, worded
+/// as Amazon RDS words it — a statement about the backups, naming the value the request
+/// carried, whichever member narrowed the report.
+pub(crate) fn automated_backup_not_found_message(requested: &str) -> String {
+    format!("Automated backups could not be found for: {requested}")
+}
+
+/// That fault, for this operation's error channel.
+fn not_found(requested: &str) -> DescribeDBInstanceAutomatedBackupsError {
+    DescribeDBInstanceAutomatedBackupsErrorModeled::DBInstanceAutomatedBackupNotFoundFault(
+        DBInstanceAutomatedBackupNotFoundFault {
+            message: Some(automated_backup_not_found_message(requested)),
+        },
+    )
+    .into()
+}
+
+/// The filter names this operation's `Filters` member documents: "`status`",
+/// "`db-instance-id`" and "`dbi-resource-id`". RDS refuses any other name, and so does this
+/// operation — with a 400, because quietly ignoring a filter would report backups the
+/// caller excluded.
+const SUPPORTED_FILTER_NAMES: [&str; 3] = ["status", "db-instance-id", "dbi-resource-id"];
+
+/// Refuse a filter this operation does not support. "Filter names are case-sensitive."
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(crate::state::unrecognized_filter_name_message(
+                &filter.name,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `backup` matches one filter: true when any of the filter's values matches the
+/// member that filter names. "Filter values are case-sensitive."
+fn matches_filter(backup: &DBInstanceAutomatedBackup, filter: &Filter) -> bool {
+    filter.values.iter().any(|wanted| match filter.name.as_str() {
+        // The status the backup reports: `active`, `creating` or `retained`.
+        "status" => backup.status.as_deref() == Some(wanted.as_str()),
+        // "Accepts DB instance identifiers and Amazon Resource Names (ARNs)."
+        "db-instance-id" => {
+            backup.db_instance_identifier.as_deref() == Some(wanted.as_str())
+                || backup.db_instance_arn.as_deref() == Some(wanted.as_str())
+        }
+        // "Accepts DB resource identifiers and Amazon Resource Names (ARNs)" — the source
+        // instance's resource id, and the ARN of the automated backups themselves.
+        "dbi-resource-id" => {
+            backup.dbi_resource_id.as_deref() == Some(wanted.as_str())
+                || backup.db_instance_automated_backups_arn.as_deref() == Some(wanted.as_str())
+        }
+        // Unreachable: `check_filter_names` has already refused every name outside
+        // `SUPPORTED_FILTER_NAMES`. A `&str` match needs the arm all the same.
+        _ => false,
+    })
 }

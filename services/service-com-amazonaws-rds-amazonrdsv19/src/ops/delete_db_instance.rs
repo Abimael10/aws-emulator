@@ -345,6 +345,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // `DeleteAutomatedBackups`: "Specifies whether to remove automated backups
+        // immediately after the DB instance is deleted ... The default is to remove
+        // automated backups immediately after the DB instance is deleted." So a delete
+        // keeps them only where the request asked it to, and only an instance that HAS an
+        // automated backup leaves one behind — one whose `BackupRetentionPeriod` is zero
+        // keeps no backups to retain, and a cluster member's data is the cluster's
+        // (`DbInstanceRecord::has_automated_backup`).
+        //
+        // The backup is taken here, from the instance as it stands: "the database instance
+        // properties that existed at the time you deleted the source instance". It is kept
+        // only once every refusal below has been answered, so a delete that is refused
+        // retains nothing.
+        let retained = match input.delete_automated_backups == Some(false) {
+            true => store
+                .db_instances
+                .get(&key)
+                .filter(|instance| instance.has_automated_backup())
+                .map(crate::state::RetainedInstanceBackupRecord::of),
+            false => None,
+        };
+        // The region's RETAINED automated backup allowance, read before the delete is
+        // accepted: "the quota for retained automated backups was exceeded. This prevents
+        // you from retaining any additional automated backups", which is the modelled
+        // fault, and the instance is not deleted either — a delete that cannot keep the
+        // backup it was asked to keep performs nothing.
+        if retained.as_ref().is_some_and(|backup| {
+            !store.has_room_for_retained_instance_backup(&region, &backup.dbi_resource_id)
+        }) {
+            return Err(
+                DeleteDBInstanceErrorModeled::DBInstanceAutomatedBackupQuotaExceededFault(
+                    DBInstanceAutomatedBackupQuotaExceededFault {
+                        message: Some(format!(
+                            "the request would exceed the allowed number of retained \
+                             automated backups ({} per region)",
+                            crate::state::RETAINED_INSTANCE_BACKUP_QUOTA_PER_REGION
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
         if let Some(snapshot_identifier) = &input.final_db_snapshot_identifier {
             let snapshot_key = (region.clone(), snapshot_identifier.clone());
             if store.db_snapshots.contains_key(&snapshot_key) {
@@ -443,6 +484,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 replica.promote_from_read_replica();
             }
+        }
+        // The automated backup the delete was asked to KEEP: the instance's properties as
+        // they are at this instant, kept after the instance record itself is dropped, so
+        // `DescribeDBInstanceAutomatedBackups` reports the backup of an instance that is
+        // gone and `DeleteDBInstanceAutomatedBackup` is what removes it.
+        if let Some(retained) = retained {
+            store.retain_instance_automated_backup(retained);
         }
         // The engine is going away with the instance, so the sessions it held end here
         // rather than running SQL against an instance that is being deleted. The listener
