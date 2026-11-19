@@ -843,14 +843,17 @@ async fn a_launch_lost_after_the_rollout_completed_does_not_fail_that_rollout() 
     )
     .await;
     let deployment = primary(&service, case);
-    // Scaling a service that has settled puts the scheduler back to work, so the rollout is
-    // under way again — what it must NOT be is failed: the breaker fails a rollout that
-    // cannot reach a steady state, not one that lost a launch after reaching one.
+    // Scaling a service that has settled puts the SCHEDULER back to work, but it starts no
+    // deployment ("A service deployment happens when you release a software update for the
+    // service", `ListServiceDeployments`), so the rollout keeps the `COMPLETED` it reached:
+    // `Deployment$rolloutState` gives that state machine no transition out of either end, and
+    // the breaker — which is what would otherwise give a rollout a terminal state — is past a
+    // rollout that reached its steady state. What it must NOT be is failed.
     assert_eq!(
         string(&deployment, "rolloutState", case),
-        IN_PROGRESS,
-        "case {case:?}: expected the rollout that reached its steady state not to be failed, \
-         got {deployment}"
+        COMPLETED,
+        "case {case:?}: expected the rollout that reached its steady state to keep it, got \
+         {deployment}"
     );
     assert_ne!(
         string(&deployment, "rolloutState", case),

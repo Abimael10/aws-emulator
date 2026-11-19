@@ -2367,6 +2367,24 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         let tally = self.service_tally(&service.cluster_name, &service.name);
         let scheduler_owned = service.places_tasks();
         let settled = service.deployment_steady_due_at.is_none();
+        // Whether this rollout has TAKEN THE SERVICE OVER — reached the steady state its own
+        // state machine ends at, now or at any earlier instant.
+        //
+        // `Deployment$rolloutState` names every transition that machine has: a deployment
+        // "begins in an IN_PROGRESS state", transitions to `COMPLETED` "when the service
+        // reaches a steady state", and to `FAILED` when it "fails to reach a steady state and
+        // circuit breaker is turned on". There is no transition OUT of either end, and the
+        // machine belongs to ONE deployment: a deployment is started by a release of a
+        // software update (`ListServiceDeployments`: "A service deployment happens when you
+        // release a software update for the service"), so changing the count a service wants
+        // starts no deployment and cannot put a rollout that already completed back under way
+        // — which is also why a completed rollout is past the deployment circuit breaker
+        // ([`super::circuit_breaker`]) and why its own record stays
+        // [`SERVICE_DEPLOYMENT_SUCCESSFUL`]. A rollout that reported COMPLETED and then went
+        // back to IN_PROGRESS would have no end left to reach: the steady state it is waiting
+        // for may never arrive, and the breaker that gives such a rollout a terminal state is
+        // no longer watching it.
+        let took_the_service_over = settled || service.deployment_rollout_completed;
         // "A service will return either a capacityProviderStrategy or launchType
         // parameter, but not both, depending where one was specified when it was
         // created."
@@ -2474,12 +2492,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // breaker is turned on, the deployment transitions to a FAILED state" — the
             // steady state is the clock-owed transition the record holds the due instant
             // of, so a rollout the scheduler has not settled yet is IN_PROGRESS whatever
-            // the counts already say, and one the breaker failed carries the terminal
-            // state and the reason it failed for.
+            // the counts already say, one the breaker failed carries the terminal state and
+            // the reason it failed for, and one that HAS taken the service over keeps the
+            // `COMPLETED` it reached ([`took_the_service_over`]) however much work the
+            // scheduler is given afterwards.
             rollout_state: Some(
                 match &service.deployment_rollout_failure {
                     Some(_) => ROLLOUT_FAILED,
-                    None if settled => ROLLOUT_COMPLETED,
+                    None if took_the_service_over => ROLLOUT_COMPLETED,
                     None => ROLLOUT_IN_PROGRESS,
                 }
                 .to_string(),
@@ -2488,7 +2508,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 service
                     .deployment_rollout_failure
                     .clone()
-                    .unwrap_or_else(|| rollout_state_reason(&service.deployment_id, settled)),
+                    .unwrap_or_else(|| {
+                        rollout_state_reason(&service.deployment_id, took_the_service_over)
+                    }),
             ),
             service_connect_configuration: service.service_connect_configuration.clone(),
             // A Service Connect resource is registered in Cloud Map, which this
