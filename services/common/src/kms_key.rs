@@ -23,7 +23,9 @@
 //! `service-com-amazonaws-pipes-pipes`, `service-com-amazonaws-kinesis-kinesis-20131202` and
 //! `service-com-amazonaws-elasticache-amazonelasticachev9`, and the per-crate `kms_client`
 //! builders beside them — are to be MIGRATED onto it, each in the change that owns its
-//! service. Nothing new should build the client or re-decide the answer by hand.
+//! service. Nothing new should build the client or re-decide the answer by hand: the client
+//! itself is public ([`kms_client`]), so a service with another question for KMS — the
+//! authorization a grant records, a key policy — asks it over the same hop.
 
 /// Whether KMS ANSWERED that this account and Region hold no key the identifier `identifier`
 /// resolves to.
@@ -86,7 +88,8 @@ pub async fn key_is_absent(
     false
 }
 
-/// The KMS client every question about a key is put through, for the Region the key lives in.
+/// The KMS client every question about a key, and every authorization taken on one, is put
+/// through — for the Region the key lives in.
 ///
 /// That Region is CALLER-SUPPLIED text and here it ends up in an endpoint URL's AUTHORITY, so
 /// it is read as a Region LABEL rather than interpolated as given: `None` for a value that
@@ -99,7 +102,7 @@ pub async fn key_is_absent(
 /// transport is not given. The credentials the callback hands over are the emulator's own: the
 /// caller's `Authorization` header is never forwarded.
 #[must_use]
-fn kms_client(
+pub fn kms_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> Option<::aws_sdk_kms::Client> {

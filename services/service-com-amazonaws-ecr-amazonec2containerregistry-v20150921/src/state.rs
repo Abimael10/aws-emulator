@@ -2172,6 +2172,15 @@ pub struct Repo {
     /// The one lifecycle policy preview this repository carries; a later start replaces
     /// it.
     pub lifecycle_preview: Option<LifecyclePreview>,
+    /// The grants this repository holds on the customer managed key its contents are
+    /// encrypted under, as KMS minted them ([`key_grant`]).
+    ///
+    /// EMPTY for every repository that needs none: one encrypted with an Amazon S3-managed
+    /// key, one whose KMS configuration names no key of the account's, and one whose key KMS
+    /// established nothing about. They live on the repository record because they were taken
+    /// FOR this repository (their `SourceArn` constraint names this ARN), so deleting the
+    /// repository is what retires them.
+    pub key_grants: Vec<key_grant::KeyGrant>,
 }
 
 impl Repo {
@@ -2216,6 +2225,10 @@ impl Repo {
             // A new repository carries no lifecycle policy, and no preview of one.
             lifecycle_policy: None,
             lifecycle_preview: None,
+            // A repository encrypted with an Amazon S3-managed key ([`DEFAULT_ENCRYPTION_TYPE`])
+            // needs no authorization on a key of the account's, so a new record holds none
+            // until the create that names a key takes it.
+            key_grants: Vec::new(),
         }
     }
 
@@ -4737,6 +4750,11 @@ pub mod signing;
 /// of the store it reaches) here, so it is reached as `crate::state::replication::…` like
 /// every other part of this store.
 pub mod replication;
+/// The KMS grant a repository encrypted with a customer managed key holds on that key, in
+/// `state/key_grant.rs`. Declared (and not glob re-exported, so a handler names the KMS hop
+/// it makes) here, so it is reached as `crate::state::key_grant::…` like every other part of
+/// this store.
+pub mod key_grant;
 mod image_scan;
 mod layer_download;
 /// The two refusals of a rule ACROSS members this registry raises, worded in the clause

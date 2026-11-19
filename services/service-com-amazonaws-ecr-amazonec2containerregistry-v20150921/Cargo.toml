@@ -56,6 +56,12 @@ service-com-amazonaws-signer-wallabyservice = { workspace = true }
 # (`state::image_events`). Only the generated client is needed — the emulator
 # supplies the transport, so the SDK's own HTTPS stack and runtime are left out.
 aws-sdk-eventbridge = { version = "1", default-features = false }
+# The AWS SDK for KMS, driven over the in-process callback: a repository encrypted
+# with a customer managed key takes a grant on that key, and the delete retires it
+# (`state::key_grant`), through the tree's one construction of that client
+# (`service_common::kms_key::kms_client`). Only the generated client is needed — the
+# emulator supplies the transport.
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # Computes the query-string SigV4 signature a published layer download URL carries, and
 # the one the download plane verifies before serving a byte
 # (`state::presigned_layer_download_url`).

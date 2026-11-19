@@ -20,6 +20,21 @@
 //! This is the workspace's ONE rendering of that envelope, so a client parsing the service,
 //! the status or the request id back out of a message reads one form whichever emulated
 //! service relayed the call.
+//!
+//! AWS states that envelope in TWO renderings, because two generations of SDK render a failed
+//! call differently, and which one a message carries is the called service's own answer
+//! rather than anything the relaying service chooses: [`relay_envelope`] is the
+//! comma-separated one that counts attempts, and [`caught_exception_message`] the
+//! semicolon-separated one that names the exception CLASS the SDK caught and the proxy it
+//! came through. Both live here so a client parses one form per rendering whichever service
+//! relayed the call, and so does the reading of the relayed answer's own request id
+//! ([`answered_request_id`]). The copies that predate them — `state::kms_reference` in
+//! `service-com-amazonaws-ebs-ebs`, `state::encryption` in
+//! `service-com-amazonaws-dynamodb-dynamodb-20120810`, `state::ecs_services` in
+//! `service-com-amazonaws-codedeploy-codedeploy-20141006` and the request-id readings in
+//! `service-com-amazonaws-secretsmanager-secretsmanager`'s `state::envelope` and its siblings
+//! — are to be MIGRATED onto them, each in the change that owns its service; nothing new
+//! should build either envelope, or read that id, by hand.
 
 use crate::query_error_envelope::new_request_id;
 
@@ -81,9 +96,103 @@ pub fn relayed_refusal_message(reason: &str, call: RelayedCall<'_>) -> String {
     format!("{reason}{}", relay_envelope(call))
 }
 
+/// The relayed call a CAUGHT service exception is reported from: the service that answered,
+/// the HTTP status the refusal's class carries, the error code it answered under — which is
+/// also the simple name of the exception class the SDK caught — and the identifier of that
+/// answer.
+///
+/// The four travel TOGETHER for the same reason [`RelayedCall`]'s three do: they are what a
+/// client parses back out of the message, and a message mixing two calls' facts attributes
+/// the failure to the wrong call. `request_id` belongs to the ANSWER, so a caller passes the
+/// one that answer carried (or, where the answer carried none, one it minted for it) rather
+/// than anything derived from the request.
+#[derive(Debug, Clone, Copy)]
+pub struct CaughtCall<'a> {
+    /// The called service's name, as the SDK layer that relayed the call reports it.
+    pub service: &'a str,
+    /// The HTTP status the refusal's class is answered with.
+    pub status: u16,
+    /// The error code the called service answered under.
+    pub code: &'a str,
+    /// The identifier of the answer being relayed.
+    pub request_id: &'a str,
+}
+
+/// How this rendering states a field the relayed answer did not carry — the proxy above all,
+/// there being no proxy in front of an in-process call.
+const ABSENT_FIELD: &str = "null";
+
+/// The headers an answer's own request identifier is read from, in the order they are read:
+/// the two spellings AWS reports it under.
+const REQUEST_ID_HEADERS: [&str; 2] = ["x-amzn-requestid", "x-amz-request-id"];
+
+/// The identifier of the ANSWER a refusal is relayed from: the one that answer's headers
+/// carried, or a fresh one of the same form when it carried none.
+///
+/// A request identifier belongs to the ANSWER, so the relay reports the one the relayed answer
+/// carried; an answer that carries none is still the answer to one call, so the envelope states
+/// an identifier of that form for it rather than leaving out a field it states. Never derived
+/// from the request.
+///
+/// `headers` is the relayed response's own header map, as the SDK's `raw_response` reports it.
+#[must_use]
+pub fn answered_request_id(headers: &::aws_smithy_runtime_api::http::Headers) -> String {
+    REQUEST_ID_HEADERS
+        .into_iter()
+        .find_map(|header| headers.get(header))
+        .map_or_else(new_request_id, str::to_string)
+}
+
+/// A caught service exception as the calling service reports it: its own fixed `opening`, the
+/// caught exception's fully qualified class (`class_package` and the answered code), the
+/// sentence the called service worded, and the clause naming the call it came from.
+///
+/// `opening` is the relaying service's own introduction, WITHOUT its colon, and `class_package`
+/// the package the called service's exception classes live in; either may be empty, for a
+/// service that states no opening of its own or relays an answer that names no class. Nothing
+/// here is worded by the relaying service beyond its opening: `reason` is the called service's
+/// own sentence and every other part comes from that answer.
+#[must_use]
+pub fn caught_exception_message(
+    opening: &str,
+    class_package: &str,
+    reason: &str,
+    call: CaughtCall<'_>,
+) -> String {
+    let CaughtCall {
+        service,
+        status,
+        code,
+        request_id,
+    } = call;
+    let clause = format!(
+        "(Service: {service}; Status Code: {status}; Error Code: {code}; Request ID: \
+         {request_id}; Proxy: {ABSENT_FIELD})"
+    );
+    let mut message = String::new();
+    if !opening.is_empty() {
+        message.push_str(opening);
+        message.push_str(": ");
+    }
+    if !class_package.is_empty() {
+        message.push_str(class_package);
+        message.push('.');
+        message.push_str(code);
+        message.push_str(": ");
+    }
+    if !reason.is_empty() {
+        message.push_str(reason);
+        message.push(' ');
+    }
+    message.push_str(&clause);
+    message
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{relay_envelope, relayed_refusal_message, RelayedCall};
+    use super::{
+        caught_exception_message, relay_envelope, relayed_refusal_message, CaughtCall, RelayedCall,
+    };
     use crate::query_error_envelope::is_request_id;
 
     /// The envelope states the relayed call's own facts, and the reason it follows is
@@ -139,5 +248,54 @@ mod tests {
             "case \"a call made once\": expected one attempt, got {}",
             call.attempts
         );
+    }
+
+    /// The other rendering states the opening, the caught class, the called service's own
+    /// sentence and the clause — and leaves out the part a row does not carry rather than
+    /// rendering it empty.
+    #[test]
+    fn a_caught_exception_states_its_class_and_the_call_it_came_from() {
+        // (case, opening, class package, the called service's sentence, the expected message)
+        let rows = [
+            (
+                "an opening, a class and a sentence",
+                "KMS Exception",
+                "com.amazonaws.services.kms.model",
+                "Invalid arn eu-west-1",
+                "KMS Exception: com.amazonaws.services.kms.model.NotFoundException: Invalid arn \
+                 eu-west-1 (Service: AWSKMS; Status Code: 400; Error Code: NotFoundException; \
+                 Request ID: r-1; Proxy: null)",
+            ),
+            (
+                "no opening of the relaying service's own",
+                "",
+                "com.amazonaws.services.kms.model",
+                "Invalid arn eu-west-1",
+                "com.amazonaws.services.kms.model.NotFoundException: Invalid arn eu-west-1 \
+                 (Service: AWSKMS; Status Code: 400; Error Code: NotFoundException; Request ID: \
+                 r-1; Proxy: null)",
+            ),
+            (
+                "an answer that names no class and no sentence",
+                "KMS Exception",
+                "",
+                "",
+                "KMS Exception: (Service: AWSKMS; Status Code: 400; Error Code: \
+                 NotFoundException; Request ID: r-1; Proxy: null)",
+            ),
+        ];
+        for (case, opening, package, reason, expected) in rows {
+            let call = CaughtCall {
+                service: "AWSKMS",
+                status: 400,
+                code: "NotFoundException",
+                request_id: "r-1",
+            };
+            let message = caught_exception_message(opening, package, reason, call);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+        }
     }
 }

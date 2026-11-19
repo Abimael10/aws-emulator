@@ -105,6 +105,16 @@ impl Grant {
     /// recorded AWS wire (`simparity-wire-aws-v1`, the `kms-grant-*` fixtures)
     /// reports the empty string, so that is what a reader answers.
     ///
+    /// `GranteePrincipal` is the grant's grantee IDENTITY rather than the member the
+    /// creating request happened to name it in: "if the grantee principal is an Amazon Web
+    /// Services service, the GranteePrincipal field contains an Amazon Web Services service
+    /// principal"
+    /// (`smithy_query(query="doc",shape="GrantListEntry",member="GranteePrincipal")`), so a
+    /// grant created for a service reports that service principal there — and under
+    /// `GranteeServicePrincipal` as well, which is what says the grantee IS a service. A
+    /// client reading who holds a key's grants therefore reads one member for all of them
+    /// ([`Self::grantee_identity`]).
+    ///
     /// The permitted operations are reported in the order the `GrantOperation` enum
     /// declares its values ([`GRANT_OPERATION_ORDER`]) rather than in the order the
     /// creating request listed them: they are a SET of permissions (which is also how
@@ -119,7 +129,7 @@ impl Grant {
             grant_id: Some(self.grant_id.clone()),
             name: Some(self.name.clone().unwrap_or_default()),
             creation_date: Some(date_time(self.creation_date)),
-            grantee_principal: self.grantee_principal.clone(),
+            grantee_principal: self.grantee_identity().map(str::to_string),
             retiring_principal: self.retiring_principal.clone(),
             issuing_account: Some(self.issuing_account.clone()),
             operations: Some(operations),
@@ -127,6 +137,22 @@ impl Grant {
             grantee_service_principal: self.grantee_service_principal.clone(),
             retiring_service_principal: self.retiring_service_principal.clone(),
         }
+    }
+
+    /// The identity that got the permissions in this grant: "the identity that gets the
+    /// permissions in the grant"
+    /// (`smithy_query(query="doc",shape="GrantListEntry",member="GranteePrincipal")`) — the
+    /// principal the creating request named, or the SERVICE principal for a grant created
+    /// for a service, since that member's documentation says the field carries a service
+    /// principal when the grantee is a service.
+    ///
+    /// The ONE reading of a grant's grantee, so what a reader REPORTS as the grantee and
+    /// what it FILTERS on cannot disagree: a client that filters by the grantee it just
+    /// read is answered that grant.
+    pub fn grantee_identity(&self) -> Option<&str> {
+        self.grantee_principal
+            .as_deref()
+            .or(self.grantee_service_principal.as_deref())
     }
 
     /// Everything about this grant that came from the request that created it,

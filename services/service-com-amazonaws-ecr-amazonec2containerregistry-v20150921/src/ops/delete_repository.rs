@@ -187,40 +187,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(input.repository_name.as_str()),
         )?;
 
-        let mut store = state.lock();
-        let repo = store
-            .repository(&region, &input.repository_name)
-            .map_err(fault_error)?;
+        // The record leaves the store under the lock, and the lock is RELEASED before KMS is
+        // reached below: that call runs another service's handler.
+        let removed = {
+            let mut store = state.lock();
+            let repo = store
+                .repository(&region, &input.repository_name)
+                .map_err(fault_error)?;
 
-        // "If true, deleting the repository force deletes the contents of the
-        // repository": without it a repository that still holds images is left alone.
-        if !input.force && !repo.images.is_empty() {
-            return Err(DeleteRepositoryErrorModeled::RepositoryNotEmptyException(
-                RepositoryNotEmptyException {
+            // "If true, deleting the repository force deletes the contents of the
+            // repository": without it a repository that still holds images is left alone.
+            if !input.force && !repo.images.is_empty() {
+                return Err(DeleteRepositoryErrorModeled::RepositoryNotEmptyException(
+                    RepositoryNotEmptyException {
+                        message: Some(format!(
+                            "The repository with name '{}' in registry with id '{}' cannot be \
+                             deleted because it still contains images",
+                            repo.name, repo.registry_id
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // The repository the caller gets back is the one that was stored, including the
+            // images' own removal: the record and every image in it leaves the store.
+            let removed = store
+                .repositories
+                .remove(&crate::state::repository_key(&region, &input.repository_name));
+            let Some(removed) = removed else {
+                return Err(DeleteRepositoryErrorModeled::ServerException(ServerException {
                     message: Some(format!(
-                        "The repository with name '{}' in registry with id '{}' cannot be \
-                         deleted because it still contains images",
-                        repo.name, repo.registry_id
+                        "the repository '{}' vanished while being deleted",
+                        input.repository_name
                     )),
-                },
-            )
-            .into());
-        }
-
-        // The repository the caller gets back is the one that was stored, including the
-        // images' own removal: the record and every image in it leaves the store.
-        let removed = store
-            .repositories
-            .remove(&crate::state::repository_key(&region, &input.repository_name));
-        let Some(removed) = removed else {
-            return Err(DeleteRepositoryErrorModeled::ServerException(ServerException {
-                message: Some(format!(
-                    "the repository '{}' vanished while being deleted",
-                    input.repository_name
-                )),
-            })
-            .into());
+                })
+                .into());
+            };
+            removed
         };
+
+        // The grants this repository held on the account's key were taken FOR this
+        // repository, so the delete that removes it RETIRES those authorizations
+        // (`crate::state::key_grant`): nothing is left holding permission on the key for a
+        // repository that is gone.
+        crate::state::key_grant::retire(ctx, &region, &removed.key_grants).await;
 
         Ok(DeleteRepositoryOutput {
             repository: Some(removed.to_repository()),

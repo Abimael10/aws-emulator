@@ -165,6 +165,51 @@ fn fault_error(fault: crate::state::Fault) -> CreateRepositoryErrorModeled {
     }
 }
 
+/// Whether this registry can hold a repository named `name` in `region` at all: no
+/// repository of that name there already, and room under the store's own cap.
+///
+/// Judged TWICE by this operation — once before the grant a KMS-encrypted repository needs is
+/// taken on the account's key, and once on the state the record is finally written against —
+/// so the two readings are one function and cannot word the same refusal differently.
+fn available(
+    store: &crate::state::ComAmazonawsEcrAmazonec2containerregistryV20150921State,
+    region: &str,
+    name: &str,
+) -> Result<(), CreateRepositoryError> {
+    if store
+        .repositories
+        .contains_key(&crate::state::repository_key(region, name))
+    {
+        return Err(
+            CreateRepositoryErrorModeled::RepositoryAlreadyExistsException(
+                RepositoryAlreadyExistsException {
+                    message: Some(format!(
+                        "The repository with name '{name}' already exists in the registry \
+                         with id '{}'",
+                        crate::state::registry_id()
+                    )),
+                },
+            )
+            .into(),
+        );
+    }
+
+    // The store is bounded: past its cap a create is refused rather than adding another
+    // record. See [`crate::state::MAX_REPOSITORIES`].
+    if store.repositories.len() >= crate::state::MAX_REPOSITORIES {
+        return Err(
+            CreateRepositoryErrorModeled::LimitExceededException(LimitExceededException {
+                message: Some(format!(
+                    "this registry already holds the maximum of {} repositories",
+                    crate::state::MAX_REPOSITORIES
+                )),
+            })
+            .into(),
+        );
+    }
+    Ok(())
+}
+
 /// The `CreateRepository` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -268,57 +313,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it (`crate::state::registry_address`).
         let region = crate::state::request_region(ctx.parts());
         let name = input.repository_name;
-        let mut store = state.lock();
 
-        if store.repositories.contains_key(&crate::state::repository_key(&region, &name)) {
-            return Err(
-                CreateRepositoryErrorModeled::RepositoryAlreadyExistsException(
-                    RepositoryAlreadyExistsException {
-                        message: Some(format!(
-                            "The repository with name '{name}' already exists in the \
-                             registry with id '{}'",
-                            crate::state::registry_id()
-                        )),
-                    },
-                )
-                .into(),
-            );
+        // Whether this registry can hold the repository at all is judged BEFORE the key is
+        // granted on, so a refused create takes no authorization on anybody's key.
+        available(&state.lock(), &region, &name)?;
+
+        // A repository whose encryption configuration names a key of the account's is
+        // encrypted under a key this service may use only with an authorization KMS itself
+        // holds, so creating it TAKES the grants on the key
+        // (`crate::state::key_grant`) — with no store lock held, since the call reaches
+        // another service's handler. A grant that could not be taken is not a repository
+        // that is encrypted anyway, so KMS's own answer about the key is relayed as the
+        // modelled `KmsException` and nothing is created.
+        let mut granted = Vec::new();
+        if let Some(kms_key) = crate::state::key_grant::granted_key(&encryption) {
+            match crate::state::key_grant::take(
+                ctx,
+                &region,
+                kms_key,
+                &crate::state::repository_arn(&region, &name),
+            )
+            .await
+            {
+                crate::state::key_grant::Taken::Grants(grants) => granted = grants,
+                crate::state::key_grant::Taken::Refused { kms_error, message } => {
+                    return Err(CreateRepositoryErrorModeled::KmsException(KmsException {
+                        message: Some(message),
+                        kms_error: Some(kms_error),
+                    })
+                    .into());
+                }
+                // KMS established nothing about the key, so nothing is refused: the
+                // repository is created and holds no grant (see that module's docs).
+                crate::state::key_grant::Taken::Unknown => {}
+            }
         }
 
-        // The store is bounded: past its cap a create is refused rather than adding
-        // another record. See [`crate::state::MAX_REPOSITORIES`].
-        if store.repositories.len() >= crate::state::MAX_REPOSITORIES {
-            return Err(
-                CreateRepositoryErrorModeled::LimitExceededException(LimitExceededException {
-                    message: Some(format!(
-                        "this registry already holds the maximum of {} repositories",
-                        crate::state::MAX_REPOSITORIES
-                    )),
-                })
-                .into(),
-            );
-        }
+        // Judged again under the SAME guard the record is written with: the grants above were
+        // taken with no store lock held, so another call may have taken the name in the
+        // meantime, and nothing may come between the judgement and the write.
+        let written = {
+            let mut store = state.lock();
+            match available(&store, &region, &name) {
+                Err(refusal) => Err(refusal),
+                Ok(()) => {
+                    let mut repo = crate::state::Repo::created(&region, &name, now);
+                    repo.image_tag_mutability = mutability;
+                    repo.image_tag_mutability_exclusion_filters = exclusion_filters;
+                    // "If this parameter is not specified, it will default to false and images
+                    // will not be scanned unless a scan is manually started" — the modelled
+                    // `@default(false)` on `ImageScanningConfiguration$scanOnPush`. A request
+                    // that names no scanning configuration still creates a repository that
+                    // reports one, with scanning off.
+                    repo.image_scanning_config =
+                        input.image_scanning_configuration.unwrap_or_default();
+                    repo.encryption_config = encryption;
+                    // The authorizations KMS holds for this repository's contents, so the
+                    // delete that removes the record is what retires them.
+                    repo.key_grants = granted.clone();
 
-        let mut repo = crate::state::Repo::created(&region, &name, now);
-        repo.image_tag_mutability = mutability;
-        repo.image_tag_mutability_exclusion_filters = exclusion_filters;
-        // "If this parameter is not specified, it will default to false and images
-        // will not be scanned unless a scan is manually started" — the modelled
-        // `@default(false)` on `ImageScanningConfiguration$scanOnPush`. A request
-        // that names no scanning configuration still creates a repository that
-        // reports one, with scanning off.
-        repo.image_scanning_config = input.image_scanning_configuration.unwrap_or_default();
-        repo.encryption_config = encryption;
+                    // The create's tags go in through the same merge `TagResource` uses, so
+                    // one key carries one value here too: a request naming a key twice stores
+                    // the last value for it rather than two entries for one key.
+                    repo.merge_tags(tags);
 
-        // The create's tags go in through the same merge `TagResource` uses, so one key
-        // carries one value here too: a request naming a key twice stores the last value
-        // for it rather than two entries for one key.
-        repo.merge_tags(tags);
+                    let repository = repo.to_repository();
+                    store
+                        .repositories
+                        .insert(crate::state::repository_key(&region, &name), repo);
+                    Ok(repository)
+                }
+            }
+        };
 
-        let repository = repo.to_repository();
-        store
-            .repositories
-            .insert(crate::state::repository_key(&region, &name), repo);
+        // A create that does not go through leaves no authorization behind on anybody's key,
+        // so the grants it took are retired — with the lock released — before its refusal is
+        // answered.
+        let repository = match written {
+            Ok(repository) => repository,
+            Err(refusal) => {
+                crate::state::key_grant::retire(ctx, &region, &granted).await;
+                return Err(refusal);
+            }
+        };
 
         Ok(CreateRepositoryOutput {
             repository: Some(repository),

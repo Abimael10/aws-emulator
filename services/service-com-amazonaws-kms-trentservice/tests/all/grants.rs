@@ -925,10 +925,24 @@ async fn the_grant_principals_must_hold_together() {
                     "GranteeServicePrincipal",
                     "RetiringPrincipal",
                 ] {
+                    // Each member reports what the request named it — except that
+                    // `GranteePrincipal` is the grantee IDENTITY: "if the grantee principal
+                    // is an Amazon Web Services service, the GranteePrincipal field
+                    // contains an Amazon Web Services service principal"
+                    // (`smithy_query(query="doc",shape="GrantListEntry",member="GranteePrincipal")`),
+                    // so a grant created FOR a service reports that principal there too.
+                    let expected = request
+                        .get(member)
+                        .or_else(|| {
+                            (member == "GranteePrincipal")
+                                .then(|| request.get("GranteeServicePrincipal"))
+                                .flatten()
+                        })
+                        .cloned()
+                        .unwrap_or(Value::Null);
                     assert_eq!(
-                        entry[member],
-                        request.get(member).cloned().unwrap_or(Value::Null),
-                        "case {case}: expected {member} to round-trip, got {entry}"
+                        entry[member], expected,
+                        "case {case}: expected {member} {expected}, got {entry}"
                     );
                 }
             }

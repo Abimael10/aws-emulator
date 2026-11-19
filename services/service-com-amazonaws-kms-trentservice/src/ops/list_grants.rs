@@ -281,7 +281,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can filter the grant list by grant ID, grantee principal, or grantee
         // service principal" (`smithy_query(query="doc",shape="ListGrants")`); a filter
-        // the request omits narrows nothing.
+        // the request omits narrows nothing. The grantee a grant is filtered by is the
+        // grantee it is REPORTED with (`crate::state::Grant::grantee_identity`), so a
+        // client that filters by the grantee principal it just read is answered that grant,
+        // including a grant whose grantee is a service.
         let listed: Vec<&crate::state::Grant> = state
             .grants_for_key(&region, &key_id)
             .into_iter()
@@ -293,9 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && input
                         .grantee_principal
                         .as_deref()
-                        .is_none_or(|principal| {
-                            grant.grantee_principal.as_deref() == Some(principal)
-                        })
+                        .is_none_or(|principal| grant.grantee_identity() == Some(principal))
                     && input
                         .grantee_service_principal
                         .as_deref()
