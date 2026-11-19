@@ -41,6 +41,13 @@
 //! statement states a `Sid`, how many instances the launch asks for, and which document
 //! reached the decision (a session policy's explicit `Deny`, the absence of any allow). No
 //! row is the specification: each is one input along the rule.
+//!
+//! The four pieces of that drive which are about no launch in particular — the role with its
+//! own document, the session minted of it, the split of a refusal into its sentence and its
+//! blob, and the decode of that blob — are `pub(crate)` so that the suite covering the SAME
+//! rule on the other operation whose refusals carry the trailer
+//! ([`super::denied_volume_probe_encoded_message`]) drives it through this one copy rather
+//! than a second.
 
 use serde_json::Value;
 
@@ -106,7 +113,7 @@ async fn scoped_session(
 /// A session of `role_name`, scoped by the session policy `inline` when the mint passes one:
 /// answers its access key id, the ARN `sts:GetCallerIdentity` reports for it and its
 /// `AssumedRoleId`.
-async fn assumed(
+pub(crate) async fn assumed(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     role_name: &str,
@@ -143,7 +150,7 @@ async fn assumed(
 
 /// Create the role `role_name`, assumable by the account's own principals, with `inline` as
 /// its one identity-based policy.
-async fn role_with(
+pub(crate) async fn role_with(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     role_name: &str,
@@ -254,10 +261,10 @@ fn judged_instance_resource() -> String {
 ///
 /// The blob is one opaque run of characters, which is what lets a client capture it off the
 /// message it was given.
-fn sentence_and_blob(case: &str, message: &str) -> (String, String) {
+pub(crate) fn sentence_and_blob(case: &str, message: &str) -> (String, String) {
     let (sentence, blob) = message.split_once(ENCODED_MESSAGE_MARKER).unwrap_or_else(|| {
         panic!(
-            "case {case:?}: a refusal reached by a session policy's explicit deny must hand the \
+            "case {case:?}: a refusal of an operation whose refusals carry one must hand the \
              caller an encoded authorization failure message, got {message:?}"
         )
     });
@@ -270,7 +277,7 @@ fn sentence_and_blob(case: &str, message: &str) -> (String, String) {
 
 /// The document `sts:DecodeAuthorizationMessage` answers for `blob`, decoded through the
 /// service that issued it.
-async fn decoded(
+pub(crate) async fn decoded(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     blob: &str,

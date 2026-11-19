@@ -54,7 +54,12 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The long-term key every emulator publishes, which is the account's own credential: what
 /// the roles, users and buckets here are created with.
-const AMBIENT_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+///
+/// `pub(crate)`, like the wire helpers around it: the sibling suites that drive this same gate
+/// ([`super::sts_session_context_keys`],
+/// [`super::sts_session_tag_decides_its_session_policy`]) provision their fixtures as the
+/// same account rather than spelling a second credential for it.
+pub(crate) const AMBIENT_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 
 /// The object key whose bytes are not ASCII: accented Latin and CJK, which a policy's
 /// `Resource` element has to match exactly.
@@ -142,7 +147,7 @@ async fn form_call(
 }
 
 /// One IAM call, as the account's own credential.
-async fn iam(
+pub(crate) async fn iam(
     router: &MultiServiceRouter,
     action: &str,
     members: &[(&str, &str)],
