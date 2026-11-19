@@ -228,7 +228,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &*self.engine,
                 ctx.callback().clone(),
                 &url_id,
-                &region,
             )
             .await
         } else {

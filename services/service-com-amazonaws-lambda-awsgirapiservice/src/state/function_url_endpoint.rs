@@ -29,10 +29,15 @@
 //! signature under, the function's own resource policy, the CORS answer and the invocation
 //! itself — stays in [`crate::service::function_url`], which serves the same request however
 //! it was addressed. So the handler here hands the request it accepts to that one plane,
-//! through the in-process transport this emulator reaches itself over, addressed as the
-//! RESERVED data-plane path of the URL it was opened for
-//! (`/_aws/lambda-url/{url-id}/{request-path}`): one serving path, reached from several
-//! addressings.
+//! through the in-process transport this emulator reaches itself over, AS THE CLIENT ADDRESSED
+//! IT: the same method, the same `Host`, the same request target and the same body
+//! ([`forwarded`]). This hop is an address handing over a request, not a request of its own —
+//! the host, the path and the query are what the caller's SigV4 signature is computed over, and
+//! the emulator verifies that signature on the leg this hop hands it, so a leg re-addressed
+//! anywhere else is a request no correctly signed caller can be admitted by. They are also what
+//! the plane reads the addressed function URL and the path WITHIN it off
+//! ([`crate::state::function_url`], which resolves this address by the AUTHORITY the URL was
+//! published on and the announced value a client followed verbatim).
 //!
 //! An address OUTLIVES the configuration published on it, as a function URL's own host does:
 //! the handle is held on the store under the url id
@@ -99,33 +104,14 @@ fn body_ceiling() -> usize {
     usize::try_from(listener_caps::MAX_BYTES_PER_CONN).unwrap_or(usize::MAX)
 }
 
-/// The reserved path a request is handed to the plane under, ahead of the url id:
-/// `/_aws/lambda-url/{url-id}/{request-path}`.
-///
-/// The segments are [`crate::state::function_url`]'s own LOCAL-ENDPOINT addressing, which
-/// that module reads on whatever host a request arrives at — so the request this listener
-/// forwards resolves to exactly the function URL it was opened for, whatever the request path
-/// spells.
-fn forwarded_prefix(url_id: &str) -> String {
-    format!(
-        "/{marker}/{label}/{url_id}",
-        marker = ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE,
-        label = super::function_url::FUNCTION_URL_LABEL,
-    )
-}
-
-/// This service's own endpoint host in `region`, which the forwarded leg is addressed at:
-/// `lambda.<region>.amazonaws.com`, the host AWS serves this API at and the one the
-/// emulator's front door resolves this service from.
-fn service_endpoint(region: &str) -> String {
-    format!("lambda.{region}.amazonaws.com")
-}
-
 /// The headers the forwarded leg does not copy from the client's request.
 ///
-/// `Host` is the listener's own address, which the forwarded request replaces with this
-/// service's endpoint (the plane resolves the function URL from the reserved path instead),
-/// and the two framing headers describe a body this leg re-frames itself.
+/// `transfer-encoding` describes the framing of the connection the request ARRIVED on, which
+/// this leg does not speak: the body is handed over whole. Everything else the client sent
+/// travels on under the name it sent it under — the `Host` and `content-length` included,
+/// because a client signs the headers it chooses to sign and a header named in its
+/// `SignedHeaders` that the leg does not carry cannot re-sign to the signature it sent; the
+/// body handed over is the same bytes, so the length it declared still describes it.
 ///
 /// The BROWSER-SET headers are not copied either, and for a different reason: they are the
 /// browser's own classification of the request it sent to THIS address, which is where that
@@ -135,14 +121,18 @@ fn service_endpoint(region: &str) -> String {
 /// refuses as a cross-site browser request — for a request this address has already admitted.
 /// The one value the plane still needs, the client's `Origin`, is what its CORS answer is
 /// built from, so it travels under the reserved name of this emulator's own below.
-const HEADERS_NOT_FORWARDED: [&str; 7] = [
-    "host",
-    "content-length",
+///
+/// That reserved name is in this list as well, and it is the one entry here that is about the
+/// CLIENT rather than about the connection: the value under it is this module's reading of the
+/// request's `Origin`, so a header of that name the client sent itself is dropped rather than
+/// carried — otherwise a caller would choose the origin the plane answers CORS for.
+const HEADERS_NOT_FORWARDED: [&str; 6] = [
     "transfer-encoding",
     "origin",
     "sec-fetch-site",
     "sec-fetch-mode",
     "sec-fetch-dest",
+    CLIENT_ORIGIN_HEADER,
 ];
 
 /// The reserved name the client's `Origin` is forwarded under, read by the plane that answers
@@ -202,13 +192,11 @@ pub async fn open_function_url_endpoint<Eng: Send + Sync + 'static>(
     engine: &Eng,
     callback: EmbeddedEmulator,
     url_id: &str,
-    region: &str,
 ) -> Option<FunctionUrlEndpoint> {
     let shared = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()?;
     let listeners = shared.listeners();
     let handler = FunctionUrlFrontDoor {
         url_id: url_id.to_string(),
-        endpoint: service_endpoint(region),
         state: shared.state::<ServiceState>(),
         callback,
         // The core's own TLS server, lent to this plaintext listener so the `https://` half
@@ -243,8 +231,6 @@ pub async fn open_function_url_endpoint<Eng: Send + Sync + 'static>(
 /// that plane answered.
 struct FunctionUrlFrontDoor {
     url_id: String,
-    /// This service's own endpoint host, which the forwarded leg is addressed at.
-    endpoint: String,
     /// This service's store, read for the origins the URL's CORS settings admit.
     state: ::engine::ServiceState<ServiceState>,
     callback: EmbeddedEmulator,
@@ -257,7 +243,6 @@ impl ::emulator_server::NativeHandler for FunctionUrlFrontDoor {
     fn serve(&self, conn: ListenerConn) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(serve_connection(
             self.url_id.clone(),
-            self.endpoint.clone(),
             self.state.clone(),
             self.callback.clone(),
             self.upgrader.clone(),
@@ -275,7 +260,6 @@ impl ::emulator_server::NativeHandler for FunctionUrlFrontDoor {
 /// HTTP/2 streaming.
 async fn serve_connection(
     url_id: String,
-    endpoint: String,
     state: ::engine::ServiceState<ServiceState>,
     callback: EmbeddedEmulator,
     upgrader: Option<TlsUpgrader>,
@@ -287,7 +271,6 @@ async fn serve_connection(
     let io = ::hyper_util::rt::TokioIo::new(conn);
     let service = ::hyper::service::service_fn(move |request: ::http::Request<_>| {
         let url_id = url_id.clone();
-        let endpoint = endpoint.clone();
         let state = state.clone();
         let callback = callback.clone();
         async move {
@@ -300,7 +283,7 @@ async fn serve_connection(
             Ok::<_, ::std::convert::Infallible>(
                 ::emulator_server::contain_panics(
                     facts,
-                    answer(url_id, endpoint, state, callback, request),
+                    answer(url_id, state, callback, request),
                 )
                 .await,
             )
@@ -322,7 +305,6 @@ async fn serve_connection(
 /// for: the plane's own answer, reached over the in-process transport.
 async fn answer(
     url_id: String,
-    endpoint: String,
     state: ::engine::ServiceState<ServiceState>,
     callback: EmbeddedEmulator,
     request: ::http::Request<::hyper::body::Incoming>,
@@ -342,9 +324,7 @@ async fn answer(
         let Ok(collected) = limited.collect().await else {
             return generated(PAYLOAD_TOO_LARGE, BODY_TOO_LARGE);
         };
-        let Some(forwarded) =
-            forwarded(parts, collected.to_bytes(), &url_id, &endpoint)
-        else {
+        let Some(forwarded) = forwarded(parts, collected.to_bytes()) else {
             return generated(BAD_REQUEST, UNREADABLE_REQUEST);
         };
         match callback.http_connector().call(forwarded).await {
@@ -374,39 +354,47 @@ async fn answer(
     served.unwrap_or_else(|_| generated(GATEWAY_TIMEOUT, REQUEST_TIMED_OUT))
 }
 
-/// The request the plane is handed for one client request: the same method, body and headers,
-/// addressed to this service's own endpoint under the reserved data-plane path of the url id
-/// this listener serves — so the request path travels where this client can carry it.
+/// The request the plane is handed for one client request: THE CLIENT'S OWN REQUEST — the
+/// same method, the same `Host`, the same request target and the same body — carried over the
+/// in-process transport instead of over the connection it arrived on.
 ///
-/// The url-id segment is the only thing that says WHICH function URL the leg reaches, so a
-/// request path that could walk out from under it is not forwarded at all
-/// ([`within_this_url`]), and the built path is checked to still begin with this URL's own
-/// prefix before it is sent. `None` for such a path and for a request that does not render as
-/// one — in both cases this listener addresses nothing.
-fn forwarded(
-    parts: ::http::request::Parts,
-    body: Bytes,
-    url_id: &str,
-    endpoint: &str,
-) -> Option<RtRequest> {
-    let request_path = within_this_url(parts.uri.path())?;
-    let query = parts
-        .uri
-        .query()
-        .map(|query| format!("?{query}"))
-        .unwrap_or_default();
-    let within = forwarded_prefix(url_id);
-    let path = format!("{within}{request_path}");
-    // The built path still names THIS function URL's plane: a path that does not is not
-    // forwarded at all, whatever it would have resolved to.
-    if !path.starts_with(&format!("{within}/")) {
+/// Nothing about the address is rewritten, because this hop hands a request over rather than
+/// making one of its own, and the address is what two things are read off. The caller's SigV4
+/// signature is computed over the host, the path and the query it sent, and the emulator
+/// verifies that signature on the leg handed to it — so a leg re-addressed anywhere else can
+/// admit no correctly signed caller. And the plane resolves the addressed function URL and the
+/// path WITHIN it from that same address ([`crate::state::function_url`]): the authority this
+/// URL was published on names it, and the announced value a client followed verbatim names the
+/// path within it.
+///
+/// `None` for a request this listener addresses nothing with: one whose target could walk out
+/// from under the prefix a path addressing names this URL by ([`addresses_within_this_url`]),
+/// one that names no host at all, and one that does not render as a request for the transport.
+///
+/// The host is the ADDRESS this listener published, not a value the caller steers the leg by:
+/// a request naming any other host is refused before this is reached
+/// ([`refused_before_the_plane`]), so the one endpoint this leg can reach is this service's own
+/// function URL plane.
+fn forwarded(parts: ::http::request::Parts, body: Bytes) -> Option<RtRequest> {
+    if !addresses_within_this_url(parts.uri.path()) {
         return None;
     }
-    let uri = format!("https://{endpoint}{path}{query}");
+    // The request target as the client wrote it, byte for byte: the path and the query are
+    // signed, so neither is re-encoded or normalized here.
+    let target = parts
+        .uri
+        .path_and_query()
+        .map(::http::uri::PathAndQuery::as_str)?;
+    // The address the client dialled, which the leg is addressed at and which travels on as
+    // the `Host` the client sent, below with every other header of its own. It is the one the
+    // refusal above admitted: the authority this URL was published at, whole, port included.
+    let host = addressed_authority(&parts)?;
+    // `https`, because a function URL IS an HTTPS endpoint and both halves of this address
+    // serve the same plane; no part of a SigV4 signature covers the scheme.
+    let uri = format!("https://{host}{target}");
     let mut builder = ::http::Request::builder()
         .method(parts.method.clone())
-        .uri(uri)
-        .header(::http::header::HOST, endpoint);
+        .uri(uri);
     for (name, value) in parts.headers.iter() {
         if HEADERS_NOT_FORWARDED.contains(&name.as_str()) {
             continue;
@@ -414,7 +402,9 @@ fn forwarded(
         builder = builder.header(name, value);
     }
     // The client's `Origin`, under the reserved name of this emulator's own: the plane decides
-    // the CORS answer from it, and this leg stays a request no browser sent.
+    // the CORS answer from it, and this leg stays a request no browser sent. One value, this
+    // module's own — a header of that name the client sent is not forwarded
+    // ([`HEADERS_NOT_FORWARDED`]), so nothing a caller wrote decides that answer.
     if let Some(origin) = parts
         .headers
         .get(::http::header::ORIGIN)
@@ -426,30 +416,52 @@ fn forwarded(
     RtRequest::try_from(built).ok()
 }
 
-/// The request path as this listener may forward it, or `None` for one that could address
+/// The authority a request is addressed at: its `Host`, else the authority of an absolute-form
+/// target — whole, so the port it names is part of it, because one address per function URL is
+/// what this listener is.
+///
+/// The ONE reading of that value in this module, so the address the admission check compares
+/// ([`published_at`]) and the address the leg is handed over at cannot differ.
+fn addressed_authority(parts: &::http::request::Parts) -> Option<&str> {
+    parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .or_else(|| {
+            parts
+                .uri
+                .authority()
+                .map(::http::uri::Authority::as_str)
+        })
+}
+
+/// Whether the request path is one this listener may hand over, or one that could address
 /// something other than the function URL this address was opened for.
 ///
-/// The forwarded leg carries the request path under `/_aws/lambda-url/{url-id}`, and a
-/// relative path reference (RFC 3986 `.` and `..` segments, percent-encoded or not) is
-/// resolved by whoever resolves that target — so such a path could name a prefix above this
-/// URL's own, on the endpoint host this service's CONTROL plane answers on. It is refused
-/// here instead: a client addresses an object under a function URL, never a path above the
-/// URL it addressed.
+/// A relative path reference (RFC 3986 `.` and `..` segments, percent-encoded or not) is
+/// resolved by whoever resolves that target — so a client following the announced value of
+/// this URL, whose own prefix is the reserved `/_aws/lambda-url/{url-id}` addressing, could
+/// name a prefix above it with one. It is refused here instead: a client addresses an object
+/// under a function URL, never a path above the URL it addressed.
 ///
 /// The dot-segment reading is the workspace's one reading of it
 /// ([`::service_common::data_plane_addressing::carries_a_dot_segment`]), so this address and
 /// every other plane served on a reserved path refuse the same targets.
-fn within_this_url(path: &str) -> Option<&str> {
-    if !path.starts_with('/') {
-        return None;
-    }
-    (!::service_common::data_plane_addressing::carries_a_dot_segment(path)).then_some(path)
+fn addresses_within_this_url(path: &str) -> bool {
+    path.starts_with('/')
+        && !::service_common::data_plane_addressing::carries_a_dot_segment(path)
 }
 
 /// The transport-safety refusals the core applies to its OWN HTTP listeners, applied here
 /// from the core's own predicates so this address and a core listener decide them alike: the
 /// `Host` allowlist (the DNS-rebinding guard a browser needs), the WebSocket refusal and the
 /// browser check. `None` lets the request through to the plane.
+///
+/// One refusal is this address's own, beside the core's: a request whose `Host` is not the
+/// ADDRESS this listener published its function URL at. The leg handed to the plane carries the
+/// request as the client sent it ([`forwarded`]), so the host is what resolves the function URL
+/// it reaches — a request naming any other host names no function URL of this service, and is
+/// refused here rather than handed on with its path left to decide what it reaches.
 ///
 /// The browser check runs against the origins the function URL's own `Cors$AllowOrigins`
 /// names, carried by the core's own [`RemoteOrigins::Exact`] — read from this service's own
@@ -459,7 +471,13 @@ fn within_this_url(path: &str) -> Option<&str> {
 /// The `allow_remote` the check is given is `true` because this address is a function URL's
 /// data plane and nothing else: it invokes one function, never this emulator's control plane
 /// or its administrative endpoint, which is what that flag keeps a configured remote origin
-/// away from.
+/// away from. That is what the two readings above between them enforce, now that the leg
+/// travels unmodified: the `Host` must be the authority this URL was PUBLISHED at, and a
+/// request to that authority is resolved by the plane from the authority itself
+/// ([`crate::state::function_url::published_function_url`]), which the service names the plane
+/// for ahead of its routing table — so every path on this address is a path within this
+/// function URL, whatever it spells, and no path can select an operation of this service's API
+/// or reach another service's surface.
 fn refused_before_the_plane(
     parts: &::http::request::Parts,
     state: &::engine::ServiceState<ServiceState>,
@@ -470,10 +488,12 @@ fn refused_before_the_plane(
     // HTTP/1.1 requires a `Host`, and without an authority the rebinding guard cannot be run
     // at all, so a request carrying none is refused rather than served: this fails CLOSED,
     // exactly as the core's own HTTP listener does.
-    let Some(host) = header("host").or_else(|| parts.uri.host()) else {
+    let Some(host) = addressed_authority(parts) else {
         return Some(generated(MISDIRECTED_REQUEST, HOST_REQUIRED));
     };
-    if !::service_common::data_plane_addressing::host_names_the_bound_interface(host) {
+    if !::service_common::data_plane_addressing::host_names_the_bound_interface(host)
+        || !published_at(state, url_id, host)
+    {
         return Some(generated(MISDIRECTED_REQUEST, HOST_NOT_ALLOWED));
     }
     if ::emulator_server::is_websocket_upgrade(
@@ -492,6 +512,25 @@ fn refused_before_the_plane(
         return Some(generated(FORBIDDEN, reason));
     }
     None
+}
+
+/// Whether `host` is the ADDRESS this listener published the function URL `url_id` at, read
+/// off the handle this store holds open for it.
+///
+/// The authority is compared WHOLE, exactly as the leg carries it on ([`forwarded`]) and as the
+/// plane resolves the URL by: the port is part of it, because one address per function URL is
+/// the point of this listener, and a `Host` carrying anything else — userinfo, another name for
+/// the same interface — is not the address this URL was published at.
+fn published_at(
+    state: &::engine::ServiceState<ServiceState>,
+    url_id: &str,
+    host: &str,
+) -> bool {
+    state
+        .lock()
+        .function_url_endpoints
+        .get(url_id)
+        .is_some_and(|endpoint| endpoint.authority().eq_ignore_ascii_case(host))
 }
 
 /// The origins the function URL `url_id`'s own `Cors$AllowOrigins` admits, read out of this
@@ -581,64 +620,61 @@ fn generated(status: u16, message: &str) -> ::http::Response<Full<Bytes>> {
 mod tests {
     use super::*;
 
-    /// The forwarded leg addresses the LOCAL-ENDPOINT path of the url id this listener was
-    /// opened for, whatever path the client dialled it with, so the plane resolves exactly
-    /// that function URL.
+    /// RULE: the leg handed to the plane is the CLIENT'S OWN request — its method, its
+    /// `Host`, its request target and its body — because the host, the path and the query are
+    /// what the caller's signature covers and what the plane reads the addressed function URL
+    /// and the path within it off.
     ///
     /// The rows span what the rule generalises over: the root, a path of several segments, a
-    /// path carrying a query, and a path spelled like another function URL's addressing.
+    /// path carrying a query, a path spelled like another function URL's addressing, the
+    /// announced value of a URL followed verbatim, and an encoded segment, which travels as
+    /// written because it is signed as written.
     #[test]
-    fn a_request_is_forwarded_under_the_url_id_this_address_serves() {
-        let url_id = "0123456789abcdef0123456789abcdef";
-        let cases: [(&str, &str, &str, &str); 4] = [
-            ("the root", "/", "/_aws/lambda-url/0123456789abcdef0123456789abcdef/", ""),
-            (
-                "an object",
-                "/items/one.json",
-                "/_aws/lambda-url/0123456789abcdef0123456789abcdef/items/one.json",
-                "",
-            ),
-            (
-                "a path carrying a query",
-                "/items?page=2",
-                "/_aws/lambda-url/0123456789abcdef0123456789abcdef/items",
-                "page=2",
-            ),
+    fn a_request_is_handed_to_the_plane_as_the_client_addressed_it() {
+        let dialled_at = "127.0.0.1:8080";
+        let cases: [(&str, &str); 6] = [
+            ("the root", "/"),
+            ("an object", "/items/one.json"),
+            ("a path carrying a query", "/items?page=2&nonce=abc"),
             (
                 "a path spelled like another URL's addressing",
                 "/_aws/lambda-url/elsewhere/x",
-                "/_aws/lambda-url/0123456789abcdef0123456789abcdef/_aws/lambda-url/elsewhere/x",
-                "",
             ),
+            (
+                "the announced value of this URL followed verbatim",
+                "/_aws/lambda-url/0123456789abcdef0123456789abcdef/direct/ok?via=sigv4",
+            ),
+            ("an encoded segment", "/my%20items/one"),
         ];
-        for (case, dialled, expected_path, expected_query) in cases {
+        for (case, dialled) in cases {
             let request = ::http::Request::builder()
                 .method("GET")
-                .uri(format!("http://127.0.0.1:1/{}", dialled.trim_start_matches('/')))
-                .header("host", "127.0.0.1:1")
+                .uri(format!("http://{dialled_at}{dialled}"))
+                .header("host", dialled_at)
                 .body(())
                 .expect("a well-formed request");
             let (parts, ()) = request.into_parts();
-            let forwarded = forwarded(parts, Bytes::new(), url_id, "lambda.us-east-1.amazonaws.com")
+            let forwarded = forwarded(parts, Bytes::new())
                 .unwrap_or_else(|| panic!("case {case:?}: the request renders for the plane"));
             let uri = forwarded.uri().to_string();
-            let expected = if expected_query.is_empty() {
-                format!("https://lambda.us-east-1.amazonaws.com{expected_path}")
-            } else {
-                format!("https://lambda.us-east-1.amazonaws.com{expected_path}?{expected_query}")
-            };
+            let expected = format!("https://{dialled_at}{dialled}");
             assert_eq!(
                 uri, expected,
                 "case {case:?}: expected the leg addressed at {expected:?}, got {uri:?}"
             );
+            let carried = forwarded.headers().get("host");
+            assert_eq!(
+                carried,
+                Some(dialled_at),
+                "case {case:?}: expected the client's own host to travel on, got {carried:?}"
+            );
         }
     }
 
-    /// RULE: a request path that could walk out from under the url-id segment is not
-    /// forwarded at all — that segment is the only thing that says which function URL (and
-    /// which plane of this service's endpoint) the leg may reach. The dot-segment reading is
-    /// the workspace's own, so what this address refuses is what every plane served on a
-    /// reserved path refuses.
+    /// RULE: a request path that could walk out from under the prefix a path addressing names
+    /// this function URL by is not forwarded at all — that prefix is the only thing such an
+    /// addressing says which URL by. The dot-segment reading is the workspace's own, so what
+    /// this address refuses is what every plane served on a reserved path refuses.
     ///
     /// The rows span WHERE the dot segment sits and HOW it is spelled — a leading, a middle
     /// and a trailing segment, a single dot, percent-encoded dots in either case, and a dot
@@ -666,7 +702,7 @@ mod tests {
             ("a parent segment behind an encoded separator, upper case", "/items%2F..%2Fx", false),
         ];
         for (case, path, forwarded_on) in cases {
-            let actual = within_this_url(path).is_some();
+            let actual = addresses_within_this_url(path);
             assert_eq!(
                 actual, forwarded_on,
                 "case {case:?} ({path:?}): expected the path to be forwarded == \
@@ -677,7 +713,11 @@ mod tests {
 
     /// The browser-set headers a request carried are not copied onto the forwarded leg — that
     /// leg is this emulator calling itself — while the client's `Origin` travels under the
-    /// reserved name the plane reads its CORS answer from.
+    /// reserved name the plane reads its CORS answer from, with THIS module's reading of it as
+    /// the only value: a header of that reserved name the client sent itself is dropped, so no
+    /// caller chooses the origin the plane answers CORS for. The `content-length` the client
+    /// declared travels on, because a client may have signed it and the body handed over is the
+    /// same bytes.
     #[test]
     fn the_forwarded_leg_carries_the_origin_under_the_reserved_name_alone() {
         let request = ::http::Request::builder()
@@ -687,10 +727,13 @@ mod tests {
             .header("origin", "https://page.example")
             .header("sec-fetch-site", "cross-site")
             .header("authorization", "AWS4-HMAC-SHA256 Credential=x")
+            .header("content-length", "4")
+            // The client's own attempt at the reserved name, which decides nothing.
+            .header(CLIENT_ORIGIN_HEADER, "https://spoofed.example")
             .body(())
             .expect("a well-formed request");
         let (parts, ()) = request.into_parts();
-        let forwarded = forwarded(parts, Bytes::new(), "abc", "lambda.us-east-1.amazonaws.com")
+        let forwarded = forwarded(parts, Bytes::from_static(b"body"))
             .expect("the request renders for the plane");
         for (case, name, expected) in [
             ("the browser's own classification", "sec-fetch-site", None),
@@ -705,6 +748,8 @@ mod tests {
                 "authorization",
                 Some("AWS4-HMAC-SHA256 Credential=x"),
             ),
+            ("the host the client dialled", "host", Some("127.0.0.1:1")),
+            ("the length the client declared", "content-length", Some("4")),
         ] {
             let carried = forwarded.headers().get(name);
             assert_eq!(
