@@ -1599,6 +1599,21 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
         captured(&logging.capture()).write(&text);
         Ok(vm.ctx.none())
     });
+    // The same log, written a RECORD at a time: what this runtime's own logging handler
+    // hands the platform is a whole record, so it is framed as one however many line breaks
+    // its formatted message carries — a record carrying a traceback
+    // ([`super::outcome::Capture::write_record`]).
+    let framed = Arc::clone(session);
+    set_function(
+        vm,
+        &module,
+        "record",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let text: String = args.bind(vm)?;
+            captured(&framed.capture()).write_record(&text);
+            Ok(vm.ctx.none())
+        },
+    );
     let sleeping = Arc::clone(session);
     set_function(
         vm,
@@ -1970,6 +1985,7 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
 /// what that function checks it really installed.
 const HOST_MODULE_FUNCTIONS: &[&str] = &[
     "log",
+    "record",
     "sleep",
     "aws",
     "db_auth_token",
@@ -3324,6 +3340,7 @@ mod tests {
             "net",
             "pagination",
             "presign",
+            "record",
             "request",
             "sleep"
         ]);

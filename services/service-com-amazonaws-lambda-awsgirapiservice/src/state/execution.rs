@@ -1235,6 +1235,8 @@ fn answered(
         // decides ([`log_records`]): the same reading the runtime that rendered the
         // handler's own records made, because both read it off this invocation's target.
         json_log_records(invocation),
+        // The answer the invocation carries, which is what the runtime produced for it.
+        payload.len(),
         &finished,
     );
     Invoked {
@@ -1514,6 +1516,7 @@ fn run_log(
     log_stream: &str,
     started: SystemTime,
     json: bool,
+    produced_bytes: usize,
     finished: &Finished,
 ) -> RunLog {
     let version = &invocation.executed_version;
@@ -1557,6 +1560,27 @@ fn run_log(
             },
         )));
         records.extend(finished.init_records.iter().cloned());
+        // ... and the records that CLOSE that phase, which the structured format states as
+        // records of their own: the runtime reporting its half of the phase done, and the
+        // report of what the phase spent ([`log_records::init_done`]). Under the plain-text
+        // format the same span is on this run's own `REPORT` line instead, so there is
+        // nothing to write here.
+        if let (true, Some(took)) = (json, finished.init_duration) {
+            let done = started.checked_add(took).unwrap_or(started);
+            records.extend(
+                log_records::init_done(
+                    done,
+                    &log_records::InitDone {
+                        initialization_type: invocation.initialization_type,
+                        took,
+                        failed: matches!(&finished.completion, Completion::Raised { error_type, .. }
+                            if raised_during_initialization(error_type)),
+                    },
+                )
+                .into_iter()
+                .map(framed),
+            );
+        }
     }
     // The initialization record is the one record of the ENVIRONMENT's log above: everything
     // after it is the invocation's own.
@@ -1572,15 +1596,19 @@ fn run_log(
         version,
     )));
     let opened = records.len();
-    // One record of the log per RECORD the run wrote — the text of one call, line breaks of
-    // its own included ([`outcome::Finished::log_records`]) — so what the handler reported in
-    // one write is one event of the function's log group and not one event per line of it.
+    // One record of the log per RECORD the run wrote — a raw stream write framed at its line
+    // breaks, a record the runtime framed whole ([`outcome::Finished::log_records`]) — so what
+    // the handler reported in one call is one event of the function's log group.
     records.extend(finished.log_records.iter().cloned());
     records.push(framed(log_records::runtime_done(
         json,
         ended,
         request_id,
         &finished.completion,
+        log_records::RuntimeDone {
+            duration_ms,
+            produced_bytes,
+        },
     )));
     records.push(framed(log_records::report(
         json,

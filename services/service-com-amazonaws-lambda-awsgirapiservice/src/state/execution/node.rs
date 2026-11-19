@@ -485,6 +485,16 @@ fn install_host(
             Func::from(move |text: String| captured(&log).write(&text)),
         )
         .map_err(|error| format!("the invocation log could not be installed: {error}"))?;
+    // The same log, written a RECORD at a time: what the runtime's own logging interface
+    // hands the platform is a whole record, so it is framed as one however many line breaks
+    // its formatted message carries ([`super::outcome::Capture::write_record`]).
+    let framed = Arc::clone(capture);
+    globals
+        .set(
+            "__hostRecord",
+            Func::from(move |text: String| captured(&framed).write_record(&text)),
+        )
+        .map_err(|error| format!("the invocation log could not be installed: {error}"))?;
     let held = Arc::clone(sources);
     globals
         .set(

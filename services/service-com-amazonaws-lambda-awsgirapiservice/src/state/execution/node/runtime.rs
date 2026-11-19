@@ -46,6 +46,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     // The host functions, taken off the global object as soon as they are held: from
     // here on the only way to reach one is through this closure.
     var hostLog = globalThis.__hostLog;
+    var hostRecord = globalThis.__hostRecord;
     var hostModuleSource = globalThis.__hostModuleSource;
     var hostModulePaths = globalThis.__hostModulePaths;
     var hostCoreSource = globalThis.__hostCoreSource;
@@ -63,6 +64,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     var hostDecode = globalThis.__hostDecode;
     var hostBeginInvocation = globalThis.__hostBeginInvocation;
     delete globalThis.__hostLog;
+    delete globalThis.__hostRecord;
     delete globalThis.__hostModuleSource;
     delete globalThis.__hostModulePaths;
     delete globalThis.__hostCoreSource;
@@ -814,20 +816,26 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     // A line written while NO invocation is bound — at module load, before a request
     // reaches the handler — belongs to no invocation, so it is delivered as the text it is
     // rather than attributed to one.
+    //
+    // Every one of these is a record the RUNTIME framed, so it is handed to the platform as
+    // one record and reaches CloudWatch Logs as one event however many line breaks the
+    // formatted text carries — a multi-line `console.log`, the stack of an error. That is
+    // what tells it apart from a write the handler made straight to `process.stdout`, which
+    // the platform frames by its lines.
     function writeLine(level, args) {
         var text = util.format.apply(null, Array.prototype.slice.call(args));
         if (state === null || state.requestId === null || state.requestId === undefined) {
-            hostLog(text + '\n');
+            hostRecord(text + '\n');
             return;
         }
         if (!admittedLevel(level)) {
             return;
         }
         if (jsonRecords()) {
-            hostLog(jsonRecord(level, Array.prototype.slice.call(args), text) + '\n');
+            hostRecord(jsonRecord(level, Array.prototype.slice.call(args), text) + '\n');
             return;
         }
-        hostLog(new Date().toISOString() + '\t' + state.requestId + '\t' + level + '\t'
+        hostRecord(new Date().toISOString() + '\t' + state.requestId + '\t' + level + '\t'
             + text + '\n');
     }
 
@@ -1701,7 +1709,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             return;
         }
         if (jsonRecords()) {
-            hostLog(JSON.stringify({
+            hostRecord(JSON.stringify({
                 timestamp: new Date().toISOString(),
                 level: 'ERROR',
                 requestId: state.requestId,
@@ -1713,7 +1721,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             }) + '\n');
             return;
         }
-        hostLog(new Date().toISOString() + '\t' + state.requestId + '\tERROR\tInvoke Error \t'
+        hostRecord(new Date().toISOString() + '\t' + state.requestId + '\tERROR\tInvoke Error \t'
             + JSON.stringify({
                 errorType: reported.errorType,
                 errorMessage: reported.errorMessage,

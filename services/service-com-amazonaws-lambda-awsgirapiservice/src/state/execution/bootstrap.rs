@@ -131,6 +131,54 @@ sys.stderr = _LogStream()
 sys.stdin = None
 
 
+class _RecordStream:
+    """The stream this runtime's own logging handler writes through.
+
+    A record the handler formats is a WHOLE record — its message and, where the record
+    carries an exception, that exception's frames — so it is handed to the platform as one
+    record and reaches the function's log group as one event. A write made straight to
+    `sys.stdout` (`print()`, a handler writing bytes itself) is framed by the platform at
+    its line breaks instead, which is what `_LogStream` above leaves it to.
+    """
+
+    encoding = "utf-8"
+    errors = "backslashreplace"
+    name = "<record>"
+    mode = "w"
+    closed = False
+
+    def write(self, text):
+        if not isinstance(text, str):
+            text = str(text)
+        _host.record(text)
+        return len(text)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        return None
+
+    def isatty(self):
+        return False
+
+    def readable(self):
+        return False
+
+    def writable(self):
+        return True
+
+    def seekable(self):
+        return False
+
+    def fileno(self):
+        raise OSError("the invocation log has no file descriptor")
+
+    def close(self):
+        return None
+
+
 # The value of `AWS_LAMBDA_LOG_FORMAT` whose records are STRUCTURED, which is the member
 # `LoggingConfig.LogFormat` carries: "the format in which Lambda sends your function's
 # application and system logs to CloudWatch. Select between plain text and structured JSON".
@@ -267,7 +315,7 @@ def _install_logging(request_id, log_format, log_level):
     json_records = log_format == _JSON_LOG_FORMAT
     _LOGGING["json"] = json_records
     _LOGGING["requestId"] = request_id
-    handler = logging.StreamHandler(sys.stdout)
+    handler = logging.StreamHandler(_RecordStream())
     formatter = _LambdaJsonLogFormatter if json_records else _LambdaLogFormatter
     handler.setFormatter(formatter(request_id))
     root = logging.getLogger()
@@ -620,7 +668,7 @@ def _report(error_type, error_message, stack_trace):
     because a client that selected that format reads its function's log as records.
     """
     if _LOGGING["json"]:
-        sys.stderr.write(
+        _RecordStream().write(
             json.dumps(
                 {
                     "timestamp": _instant(time.time()),
@@ -642,9 +690,9 @@ def _report(error_type, error_message, stack_trace):
     for frame in stack_trace:
         for line in frame.rstrip("\n").split("\n"):
             lines.append(_indented(line))
-    # ONE write, and no break of its own: the report is one record, whose last line is its
-    # last line.
-    sys.stderr.write("\n".join(lines))
+    # ONE record the RUNTIME framed, and no break of its own: the report is one record,
+    # whose last line is its last line ([`_RecordStream`]).
+    _RecordStream().write("\n".join(lines))
 
 
 # The space the frames of a reported traceback are indented with: a non-breaking one, which

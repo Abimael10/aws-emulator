@@ -471,8 +471,9 @@ async fn the_application_log_level_decides_which_records_reach_cloudwatch_logs()
             .collect();
         assert_eq!(
             frames.len(),
-            4,
-            "case {case:?}: expected the run's four platform frames, got {frames:?}"
+            6,
+            "case {case:?}: expected the run's six platform frames — the three of the \
+             environment's initialization and the three of the invocation — got {frames:?}"
         );
     }
 }
@@ -540,7 +541,8 @@ fn assert_structured(case: &str, row: &Row, lines: &[String]) {
         };
         parsed.push(members);
     }
-    // The frames Lambda writes itself: the environment was initialized, the run opened, the
+    // The frames Lambda writes itself: the environment's initialization starting, the runtime
+    // reporting that phase done, the report of what it spent, then the run opened, the
     // handler's run ended, and what it spent — each naming the platform record it is.
     let kinds: Vec<&str> = parsed
         .iter()
@@ -550,6 +552,8 @@ fn assert_structured(case: &str, row: &Row, lines: &[String]) {
         kinds,
         vec![
             "platform.initStart",
+            "platform.initRuntimeDone",
+            "platform.initReport",
             "platform.start",
             "platform.runtimeDone",
             "platform.report"

@@ -120,12 +120,16 @@ pub struct Finished {
     pub completion: Completion,
     /// Everything the handler wrote to its output streams, capped.
     pub log: String,
-    /// That same output as the RECORDS the run wrote it in, in order: the text of one write,
+    /// That same output as the RECORDS the run wrote it in, in order: the text of one record,
     /// the break that closed it included ([`Capture::records`]).
     ///
-    /// A record is what the run wrote in ONE call, so text carrying line breaks of its own —
-    /// the stack of an error written to the console — is one record and not several: that is
-    /// what keeps one log event per thing the handler reported ([`super::log_delivery`]).
+    /// A record the RUNTIME framed — a console call, a `logging` record — is one record
+    /// however many line breaks its formatted text carries, because the runtime handed the
+    /// platform a whole record ([`Capture::write_record`]). A write the handler made STRAIGHT
+    /// to one of its standard streams is framed at its line breaks instead, one record per
+    /// line ([`Capture::write`]), because what the platform reads there is a stream of bytes
+    /// and a line of it is a record. That is what decides how many log events one thing the
+    /// handler reported becomes ([`super::log_delivery`]).
     ///
     /// These are the records of the INVOKE phase alone; what the initialization wrote is
     /// [`Finished::init_records`].
@@ -170,8 +174,8 @@ pub(super) struct Capture {
     /// The RECORDS that text was written in, each AS IT WAS WRITTEN — the break that closed
     /// it included, and no break at all for a record the run never closed.
     records: Vec<String>,
-    /// Whether the last of them is still open — written by a call that did not end on a line
-    /// break, so the next write continues it.
+    /// Whether the last of them is still open — written by a raw stream write that did not
+    /// end on a line break, so the next write continues it.
     open: bool,
     /// How many records had been written when the INVOKE phase began, for a capture the
     /// initialization wrote into as well, and `None` while no invoke phase has begun on it.
@@ -225,10 +229,38 @@ impl Capture {
         self.records[self.initialized()..].to_vec()
     }
 
-    /// Append `text`, stopping at the cap. Past it the capture keeps what it already has.
+    /// Append a RAW write — bytes the handler wrote straight to one of its standard streams
+    /// — stopping at the cap. Past it the capture keeps what it already has.
+    ///
+    /// What the platform reads off a standard stream is a byte stream, and a LINE of it is a
+    /// record, so the text is framed at its line breaks here however many of them one write
+    /// carried.
     pub(super) fn write(&mut self, text: &str) {
+        if let Some(kept) = self.kept(text) {
+            self.recorded_lines(&kept);
+        }
+    }
+
+    /// Append ONE record the runtime itself framed — a console call, a `logging` record —
+    /// stopping at the cap.
+    ///
+    /// The runtime handed the platform a whole record, so the text stays one record whatever
+    /// line breaks its formatted message carries (a traceback, a formatted object), and it is
+    /// closed by the call that wrote it rather than by a break in its text.
+    pub(super) fn write_record(&mut self, text: &str) {
+        if let Some(kept) = self.kept(text) {
+            // Whatever a raw write before this one left open is closed: this is the next
+            // record rather than a continuation of that line.
+            self.open = false;
+            self.records.push(kept);
+        }
+    }
+
+    /// The part of `text` that fits in what is left of the cap, added to the kept log, or
+    /// `None` when nothing of it fits.
+    fn kept(&mut self, text: &str) -> Option<String> {
         if self.text.len() >= self.limit {
-            return;
+            return None;
         }
         let room = self.limit - self.text.len();
         // Cut on a character boundary, so the kept log is still text.
@@ -238,28 +270,38 @@ impl Capture {
         }
         let kept = &text[..end];
         if kept.is_empty() {
-            return;
+            return None;
         }
         self.text.push_str(kept);
-        self.recorded(kept);
+        Some(kept.to_string())
     }
 
-    /// Add `kept` to those records: it continues the one still open, and a write that ends on
-    /// a line break CLOSES one — which is what makes the record the unit the run wrote in
-    /// rather than the line the text breaks into. The break stays part of the record, because
-    /// the record is the text the run wrote.
-    fn recorded(&mut self, kept: &str) {
+    /// Add `kept`, a raw write, to those records: every line break in it CLOSES a record and
+    /// stays part of it, and text past the last break continues into the record the next write
+    /// adds to — which is what makes a line of a standard stream one record whether the
+    /// handler wrote it whole or in pieces.
+    fn recorded_lines(&mut self, kept: &str) {
+        let mut rest = kept;
+        while let Some(at) = rest.find('\n') {
+            self.appended(&rest[..=at]);
+            self.open = false;
+            rest = &rest[at + 1..];
+        }
+        if !rest.is_empty() {
+            self.appended(rest);
+        }
+    }
+
+    /// Put `piece` on the record still open, or open one with it.
+    fn appended(&mut self, piece: &str) {
         if self.open {
             if let Some(last) = self.records.last_mut() {
-                last.push_str(kept);
+                last.push_str(piece);
+                return;
             }
-        } else {
-            self.records.push(kept.to_string());
-            self.open = true;
         }
-        if kept.ends_with('\n') {
-            self.open = false;
-        }
+        self.records.push(piece.to_string());
+        self.open = true;
     }
 }
 
@@ -296,39 +338,64 @@ mod tests {
         }
     }
 
-    /// A run's output is kept as the RECORDS it was written in: one per write the run closed
-    /// with a line break, each carrying the break that closed it, and a line break INSIDE one
-    /// write stays inside its record.
+    /// RULE: a write the handler made straight to a standard stream is framed at its line
+    /// breaks, one record per line and each carrying the break that closed it, while a record
+    /// the runtime framed is one record however many line breaks its text carries.
     #[test]
-    fn the_capture_keeps_one_record_per_write_the_run_closed() {
-        // (case, the writes the run made, the records they leave)
-        let cases: &[(&str, &[&str], &[&str])] = &[
-            ("one line", &["hello\n"], &["hello\n"]),
+    fn the_capture_frames_a_raw_write_by_its_lines_and_a_runtime_record_whole() {
+        /// One write the run made: the text, and whether the RUNTIME framed it as a record.
+        type Written = (bool, &'static str);
+        /// One row: the case, the writes the run made, the records they leave.
+        type Row = (&'static str, &'static [Written], &'static [&'static str]);
+        let cases: &[Row] = &[
+            ("one line", &[(false, "hello\n")], &["hello\n"]),
             (
                 "two lines, each written and closed",
-                &["a\n", "b\n"],
+                &[(false, "a\n"), (false, "b\n")],
                 &["a\n", "b\n"],
             ),
             (
-                "a write carrying line breaks of its own",
+                "one raw write carrying several lines, which the platform frames apart",
+                &[(false, "RAW1\nRAW2\n")],
+                &["RAW1\n", "RAW2\n"],
+            ),
+            (
+                "one raw write whose last line is not closed, continued by the next write",
+                &[(false, "one\ntw"), (false, "o\n")],
+                &["one\n", "two\n"],
+            ),
+            (
+                "a record the runtime framed, carrying line breaks of its own",
+                &[(true, "TypeError: boom\n    at handler\n")],
                 &["TypeError: boom\n    at handler\n"],
-                &["TypeError: boom\n    at handler\n"],
+            ),
+            (
+                "a runtime record after a raw write nothing closed",
+                &[(false, "half"), (true, "a record\n")],
+                &["half", "a record\n"],
             ),
             (
                 "a line written in pieces, as a print writes its break apart",
-                &["hello", "\n"],
+                &[(false, "hello"), (false, "\n")],
                 &["hello\n"],
             ),
-            // A record the run never closed carries no break, because the run wrote none —
-            // which is how a runtime writes a report of several lines as ONE record.
-            ("a write the run never closed", &["half"], &["half"]),
-            ("a line of its own with nothing on it", &["\n"], &["\n"]),
+            // A record the run never closed carries no break, because the run wrote none.
+            ("a write the run never closed", &[(false, "half")], &["half"]),
+            (
+                "a line of its own with nothing on it",
+                &[(false, "\n")],
+                &["\n"],
+            ),
             ("nothing written at all", &[], &[]),
         ];
         for (case, writes, expected) in cases {
             let capture = Arc::new(Mutex::new(Capture::new(4_096)));
-            for written in *writes {
-                captured(&capture).write(written);
+            for (framed, written) in *writes {
+                if *framed {
+                    captured(&capture).write_record(written);
+                } else {
+                    captured(&capture).write(written);
+                }
             }
             let actual = captured(&capture).invocation_records();
             let expected: Vec<String> = expected.iter().map(|held| (*held).to_string()).collect();
@@ -336,8 +403,8 @@ mod tests {
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
             );
-            // The records ARE the log: they are the text the run wrote, in the pieces it
-            // wrote it in.
+            // The records ARE the log: they are the text the run wrote, in the pieces the
+            // platform frames it into.
             let rebuilt: String = actual.concat();
             let text = captured(&capture).text.clone();
             assert_eq!(

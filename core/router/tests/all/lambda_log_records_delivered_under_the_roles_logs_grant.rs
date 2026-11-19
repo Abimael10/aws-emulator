@@ -75,20 +75,24 @@ const END_PREFIX: &str = "END RequestId: ";
 /// See [`START_PREFIX`].
 const REPORT_PREFIX: &str = "REPORT RequestId: ";
 /// See [`START_PREFIX`]: the frames of one run, which is the least the platform itself writes.
-const TEXT_FRAMES: [&str; 3] = [START_PREFIX, END_PREFIX, REPORT_PREFIX];
+///
+/// `pub(crate)` so the suites reading a run's own framing share one statement of its fixed
+/// text ([`crate::lambda_log_record_framing_and_system_level`]).
+pub(crate) const TEXT_FRAMES: [&str; 3] = [START_PREFIX, END_PREFIX, REPORT_PREFIX];
 
 /// The member a structured platform record names its own kind under, and the prefix every one
 /// of those kinds carries — "select between plain text and structured JSON"
 /// (`smithy_query(query="doc",shape="LoggingConfig",member="LogFormat")`), where each frame of
-/// the run is one JSON object instead of one line.
-const TYPE_MEMBER: &str = "type";
+/// the run is one JSON object instead of one line. `pub(crate)` for the same reason as above.
+pub(crate) const TYPE_MEMBER: &str = "type";
 /// The member TYPE_MEMBER's companion: see [`TYPE_MEMBER`].
-const PLATFORM_PREFIX: &str = "platform.";
+pub(crate) const PLATFORM_PREFIX: &str = "platform.";
 
-/// The `LogFormat` a row renders its records in: the two the member declares.
-const TEXT_FORMAT: &str = "Text";
+/// The `LogFormat` a row renders its records in: the two the member declares, shared with the
+/// suite above.
+pub(crate) const TEXT_FORMAT: &str = "Text";
 /// See [`TEXT_FORMAT`].
-const JSON_FORMAT: &str = "JSON";
+pub(crate) const JSON_FORMAT: &str = "JSON";
 
 /// How many records ONE run of these handlers leaves: the record that states the
 /// initialization of the execution environment it built, the three frames of the run, and the
@@ -96,9 +100,10 @@ const JSON_FORMAT: &str = "JSON";
 const RECORDS_PER_RUN: usize = 5;
 
 /// How many of those records the PLATFORM writes itself, which under the structured format are
-/// the platform records a client parses: the initialization of the environment, and the three
-/// frames of the run.
-const PLATFORM_RECORDS_PER_RUN: usize = 4;
+/// the platform records a client parses: the three records of the environment's initialization
+/// (the phase starting, the runtime reporting it done and its report), and the three frames of
+/// the run.
+const PLATFORM_RECORDS_PER_RUN: usize = 6;
 
 /// The python handler every python row deploys: it prints the marker the event carries and
 /// answers it, so the record it wrote can be told from any other row's.
@@ -256,7 +261,10 @@ impl Row {
 
 /// The group a function whose `LoggingConfig` names none logs to: "a default log group named
 /// `/aws/lambda/<function name>`", which is where every row's records go.
-fn default_group(function: &str) -> String {
+///
+/// `pub(crate)` so the suites reading a function's own group go through one statement of the
+/// documented default ([`crate::lambda_log_record_framing_and_system_level`]).
+pub(crate) fn default_group(function: &str) -> String {
     format!("{DEFAULT_GROUP_PREFIX}{function}")
 }
 

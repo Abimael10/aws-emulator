@@ -16,23 +16,36 @@
 //! known ([`super::bootstrap`] for a Python handler, [`super::node::runtime`] for a node
 //! one); both read the format out of the invocation's own environment
 //! ([`super::super::execution::runtime_environment`]). This module is the HOST's half: the
-//! frames the platform writes itself, and WHICH of a run's records Lambda sends on to
-//! CloudWatch Logs at the function's `ApplicationLogLevel` ([`admitted_at`]) — the filter is
-//! on what Lambda SENDS ("set this property to filter the application logs for your function
-//! that Lambda sends to CloudWatch"), so it is applied where the delivery is made rather than
-//! inside the runtime that wrote the record.
+//! frames the platform writes itself — of the INVOCATION, and of the INIT phase of the
+//! execution environment it was served in ([`initialization`]) — and WHICH of a run's records
+//! Lambda sends on to CloudWatch Logs at the two levels a function filters them at
+//! ([`admitted_at`]): its `ApplicationLogLevel` over the handler's own records, and its
+//! `SystemLogLevel` over the platform's. Both filters are on what Lambda SENDS ("set this
+//! property to filter the application logs for your function that Lambda sends to CloudWatch",
+//! and the same sentence for the system logs), so both are applied where the delivery is made
+//! rather than inside the runtime that wrote the record.
 //!
 //! Nothing here is synthesised. Every field of a frame is the one the plain-text framing
 //! states — the invocation's id, the version that executed, and what the run measured —
 //! under the member names the platform record carries them with.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use super::outcome::{Completion, Stop};
 
 /// The member every platform record names its own kind under, and the prefix of every one of
 /// those kinds.
 const PLATFORM_TYPE_PREFIX: &str = "platform.";
+
+/// The member a platform record of an environment's INITIALIZATION names that phase under,
+/// and the name of the phase itself.
+const PHASE_MEMBER: &str = "phase";
+const INIT_PHASE: &str = "init";
+
+/// The member such a record names WHICH kind of initialization it was under, which is the
+/// same value the invocation's own `AWS_LAMBDA_INITIALIZATION_TYPE` states
+/// ([`crate::state::execution_slot`]).
+const INITIALIZATION_TYPE_MEMBER: &str = "initializationType";
 
 /// What the run came to, as a platform record states it: the invocation answered, the
 /// function's own failure, the platform's, and a run stopped at the function's `Timeout`.
@@ -112,9 +125,6 @@ pub(super) fn init_start(json: bool, at: SystemTime, about: &Initialization<'_>)
     )
 }
 
-/// The phase a platform record of an environment's initialization names itself as.
-const INIT_PHASE: &str = "init";
-
 /// The frame that OPENS a run's log: the invocation, the function it ran and the version that
 /// executed it.
 pub(super) fn start(
@@ -138,12 +148,84 @@ pub(super) fn start(
     )
 }
 
+/// What the records that CLOSE an environment's INIT phase state: which kind of
+/// initialization it was, what the phase came to, and the span it was measured taking.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct InitDone<'a> {
+    /// Which kind of initialization it was — the value the invocation's own
+    /// `AWS_LAMBDA_INITIALIZATION_TYPE` states.
+    pub initialization_type: &'a str,
+    /// How long the phase took, as its own report states it.
+    pub took: Duration,
+    /// Whether the phase FAILED — the runtime could not resolve the handler it was
+    /// configured with — which is the status its records state.
+    ///
+    /// No engine of this emulator reports such a phase to be framed yet: both report the
+    /// span of a phase only once the runtime has begun the handler's own, which a phase that
+    /// failed never reaches, so the records of one are written from the unit table alone
+    /// until an engine latches the span where the resolution failure is detected.
+    pub failed: bool,
+}
+
+/// The frames that CLOSE the INIT phase an execution environment was built in, after the
+/// frame that opened it ([`init_start`]) and before the records of the first invocation served
+/// in it: the runtime reporting its half of the phase done, and the report of what the phase
+/// spent.
+///
+/// They are the PLATFORM's structured records: under the plain-text format the span of the
+/// phase is stated on that run's own `REPORT` line instead ([`Report::init_ms`]), which is
+/// where a client of that format reads it.
+///
+/// Every field is the phase's own: the kind of initialization it was, what the phase came to
+/// and the span it was measured taking.
+pub(super) fn init_done(at: SystemTime, phase: &InitDone<'_>) -> Vec<String> {
+    let status = if phase.failed {
+        STATUS_ERROR
+    } else {
+        STATUS_SUCCESS
+    };
+    let kind = phase.initialization_type;
+    let duration_ms = round_hundredths(phase.took.as_secs_f64() * 1_000.0);
+    vec![
+        platform(
+            at,
+            "initRuntimeDone",
+            ::serde_json::json!({
+                INITIALIZATION_TYPE_MEMBER: kind,
+                PHASE_MEMBER: INIT_PHASE,
+                "status": status,
+            }),
+        ),
+        platform(
+            at,
+            "initReport",
+            ::serde_json::json!({
+                INITIALIZATION_TYPE_MEMBER: kind,
+                PHASE_MEMBER: INIT_PHASE,
+                "status": status,
+                "metrics": { "durationMs": duration_ms },
+            }),
+        ),
+    ]
+}
+
+/// What the record that closes the handler's run states it produced: the figures that
+/// record's own metrics carry.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RuntimeDone {
+    /// How long the runtime took over the invocation, in milliseconds.
+    pub duration_ms: f64,
+    /// How many bytes of response the runtime produced for it.
+    pub produced_bytes: usize,
+}
+
 /// The frame that states the handler's run is OVER, and how it ended.
 pub(super) fn runtime_done(
     json: bool,
     at: SystemTime,
     request_id: &str,
     completion: &Completion,
+    measured: RuntimeDone,
 ) -> String {
     if !json {
         return format!("END RequestId: {request_id}");
@@ -151,7 +233,16 @@ pub(super) fn runtime_done(
     platform(
         at,
         "runtimeDone",
-        ::serde_json::json!({ "requestId": request_id, "status": status(completion) }),
+        ::serde_json::json!({
+            "requestId": request_id,
+            "status": status(completion),
+            // What the runtime spent over the invocation and how much response it produced,
+            // both measured: the span the run took and the size of the answer it carried.
+            "metrics": {
+                "durationMs": round_hundredths(measured.duration_ms),
+                "producedBytes": measured.produced_bytes,
+            },
+        }),
     )
 }
 
@@ -281,9 +372,11 @@ fn unlevelled_severity() -> u8 {
     severity(crate::state::DEFAULT_LOG_LEVEL).unwrap_or(0)
 }
 
-/// Whether the record `message` is one Lambda SENDS to CloudWatch Logs at the application log
-/// level `filter`: "Lambda only sends application logs at the selected level of detail and
-/// lower".
+/// Whether the record `message` is one Lambda SENDS to CloudWatch Logs at the levels a
+/// function filters its records at: `application` for the records the HANDLER wrote ("Lambda
+/// only sends application logs at the selected level of detail and lower") and `system` for
+/// the platform's own frames ("set this property to filter the system logs for your function
+/// that Lambda sends to CloudWatch").
 ///
 /// A PLATFORM frame is a system record rather than an application one, so the application
 /// level filters none of them — what a function's `SystemLogLevel` admits of them is a
@@ -298,13 +391,7 @@ pub(super) fn admitted_at(message: &str, filter: Option<&str>) -> bool {
         Ok(::serde_json::Value::Object(members)) => Some(members),
         _ => None,
     };
-    let platform_frame = record.as_ref().is_some_and(|members| {
-        members
-            .get(TYPE_MEMBER)
-            .and_then(::serde_json::Value::as_str)
-            .is_some_and(|kind| kind.starts_with(PLATFORM_TYPE_PREFIX))
-    });
-    if platform_frame {
+    if platform_kind(message).is_some() {
         return true;
     }
     let level = record
@@ -365,6 +452,8 @@ fn platform_kind(message: &str) -> Option<String> {
 /// [`runtime_done`], [`report`]).
 const PLATFORM_RECORD_LEVELS: &[(&str, &str)] = &[
     ("platform.initStart", "INFO"),
+    ("platform.initRuntimeDone", "INFO"),
+    ("platform.initReport", "INFO"),
     ("platform.start", "INFO"),
     ("platform.runtimeDone", "INFO"),
     ("platform.report", "INFO"),
@@ -450,6 +539,14 @@ mod tests {
         }
     }
 
+    /// One `RuntimeDone`, as a run that answered leaves one.
+    fn produced() -> RuntimeDone {
+        RuntimeDone {
+            duration_ms: 12.345,
+            produced_bytes: 16,
+        }
+    }
+
     /// The ARN of the function every frame below is a frame of.
     const FUNCTION_ARN: &str = "arn:aws:lambda:us-east-1:000000000000:function:orders";
 
@@ -466,7 +563,7 @@ mod tests {
             ),
             (
                 "the frame that closes the handler's run",
-                runtime_done(false, at(), "req-1", &completion),
+                runtime_done(false, at(), "req-1", &completion, produced()),
                 "END RequestId: req-1",
             ),
             (
@@ -545,7 +642,7 @@ mod tests {
             ),
             (
                 "the frame that closes the handler's run",
-                runtime_done(true, at(), "req-1", &completion),
+                runtime_done(true, at(), "req-1", &completion, produced()),
                 "platform.runtimeDone",
             ),
             (
@@ -699,7 +796,7 @@ mod tests {
             (
                 "the frame that closes the handler's run, one level higher in detail than the \
                  filter",
-                runtime_done(true, at(), "req-1", &completion),
+                runtime_done(true, at(), "req-1", &completion, produced()),
                 Some("WARN"),
                 false,
             ),
@@ -859,7 +956,7 @@ mod tests {
             ),
         ];
         for (case, completion, expected) in rows {
-            let rendered = runtime_done(true, at(), "req-1", &completion);
+            let rendered = runtime_done(true, at(), "req-1", &completion, produced());
             let parsed: ::serde_json::Value =
                 ::serde_json::from_str(&rendered).expect("the record is JSON");
             let actual = parsed["record"]["status"].as_str();
@@ -980,6 +1077,140 @@ mod tests {
                 actual, expected,
                 "case {case:?}: expected sent = {expected} under {filter:?}, got {actual} for \
                  {message:?}"
+            );
+        }
+    }
+
+    /// RULE: the records that CLOSE the INIT phase are the two the platform writes for it, in
+    /// the order it writes them, each naming the phase and the kind of initialization it was,
+    /// and the report states the span the phase was measured taking — one row per outcome the
+    /// phase can have.
+    #[test]
+    fn the_init_phase_is_closed_by_its_own_platform_records() {
+        // (case, whether the phase failed, the status its records state)
+        let rows: &[(&str, bool, &str)] = &[
+            (
+                "a phase that stood the environment up",
+                false,
+                STATUS_SUCCESS,
+            ),
+            ("one whose handler could not be resolved", true, STATUS_ERROR),
+        ];
+        for (case, failed, status) in rows {
+            let written = init_done(
+                at(),
+                &InitDone {
+                    initialization_type: "provisioned-concurrency",
+                    took: Duration::from_micros(123_450),
+                    failed: *failed,
+                },
+            );
+            let kinds: Vec<String> = written
+                .iter()
+                .map(|record| {
+                    let parsed: ::serde_json::Value =
+                        ::serde_json::from_str(record).unwrap_or_else(|error| {
+                            panic!("case {case:?}: expected JSON, got {error}")
+                        });
+                    parsed[TYPE_MEMBER].as_str().unwrap_or_default().to_string()
+                })
+                .collect();
+            let expected = vec![
+                "platform.initRuntimeDone".to_string(),
+                "platform.initReport".to_string(),
+            ];
+            assert_eq!(
+                kinds, expected,
+                "case {case:?}: expected {expected:?}, got {kinds:?}"
+            );
+            for record in &written {
+                let parsed: ::serde_json::Value =
+                    ::serde_json::from_str(record).expect("the record is JSON");
+                let named = parsed["record"][PHASE_MEMBER].as_str();
+                assert_eq!(
+                    named,
+                    Some(INIT_PHASE),
+                    "case {case:?}: expected the record to name the phase, got {record:?}"
+                );
+                let kind = parsed["record"][INITIALIZATION_TYPE_MEMBER].as_str();
+                assert_eq!(
+                    kind,
+                    Some("provisioned-concurrency"),
+                    "case {case:?}: expected the kind of initialization, got {record:?}"
+                );
+                assert_eq!(
+                    parsed["record"]["status"].as_str(),
+                    Some(*status),
+                    "case {case:?}: expected the status {status:?}, got {record:?}"
+                );
+            }
+            let reported: ::serde_json::Value =
+                ::serde_json::from_str(&written[1]).expect("the record is JSON");
+            // The report states the span the phase was MEASURED taking, in the milliseconds a
+            // platform record states a duration in.
+            assert_eq!(
+                reported["record"]["metrics"]["durationMs"].as_f64(),
+                Some(123.45),
+                "case {case:?}: expected the measured span, got {:?}",
+                written[1]
+            );
+        }
+    }
+
+    /// RULE: the record that closes the handler's run states what the runtime SPENT over the
+    /// invocation and how much response it produced — one row per class of answer a run
+    /// leaves.
+    #[test]
+    fn the_record_that_closes_the_run_states_what_the_runtime_produced() {
+        // (case, what the run came to, the bytes it produced)
+        let rows: Vec<(&str, Completion, usize)> = vec![
+            (
+                "a handler that answered",
+                Completion::Returned("{\"ok\":true}".to_string()),
+                11,
+            ),
+            (
+                "a handler that answered nothing at all",
+                Completion::Returned(String::new()),
+                0,
+            ),
+            (
+                "a handler that raised, whose error document is the answer",
+                Completion::Raised {
+                    error_type: "ValueError".to_string(),
+                    error_message: "no".to_string(),
+                    stack_trace: Vec::new(),
+                },
+                64,
+            ),
+        ];
+        for (case, completion, produced_bytes) in rows {
+            let rendered = runtime_done(
+                true,
+                at(),
+                "req-1",
+                &completion,
+                RuntimeDone {
+                    duration_ms: 12.345,
+                    produced_bytes,
+                },
+            );
+            let parsed: ::serde_json::Value =
+                ::serde_json::from_str(&rendered).expect("the record is JSON");
+            let metrics = &parsed["record"]["metrics"];
+            assert_eq!(
+                metrics["durationMs"].as_f64(),
+                Some(12.35),
+                "case {case:?}: expected the span the runtime took, got {rendered:?}"
+            );
+            assert_eq!(
+                metrics["producedBytes"].as_u64(),
+                u64::try_from(produced_bytes).ok(),
+                "case {case:?}: expected {produced_bytes} bytes produced, got {rendered:?}"
+            );
+            assert!(
+                metrics["producedBytes"].is_u64(),
+                "case {case:?}: expected a whole number of bytes, got {rendered:?}"
             );
         }
     }
