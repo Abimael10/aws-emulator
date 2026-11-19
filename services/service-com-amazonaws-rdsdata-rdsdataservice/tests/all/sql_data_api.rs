@@ -888,22 +888,28 @@ async fn the_json_record_format_returns_the_result_set_as_json() {
         "case JSON over a binary value: got {rendered}"
     );
 
-    // Nor a number JSON cannot represent: a non-finite REAL the engine produced is
-    // refused rather than reported as NULL, which would say the value is missing.
-    let (status, not_a_number) = api
-        .execute(json!({
+    // A number JSON has no form for: a non-finite REAL the engine produced cannot be a
+    // JSON number, and the database renders it as the STRING it displays it as — which is
+    // what this form answers instead of refusing the result. The same cell in `records` is
+    // the result the API cannot carry (`refusal_classes` pins that half of the rule).
+    let not_a_number = api
+        .run(json!({
             "sql": "SELECT 1e308 * 10 AS big",
             "formatRecordsAs": "JSON",
         }))
         .await;
     assert_eq!(
-        status, 400,
-        "case JSON over a non-finite number: got {status} {not_a_number}"
-    );
-    assert_eq!(
-        error_code(&not_a_number),
-        "UnsupportedResultException",
+        not_a_number["formattedRecords"],
+        json!("[{\"big\":\"Infinity\"}]"),
         "case JSON over a non-finite number: got {not_a_number}"
+    );
+    let (status, refused) = api
+        .execute(json!({"sql": "SELECT 1e308 * 10 AS big"}))
+        .await;
+    assert_eq!(
+        (status, error_code(&refused)),
+        (400, "UnsupportedResultException"),
+        "case records over a non-finite number: got {status} {refused}"
     );
 }
 
@@ -1361,15 +1367,29 @@ async fn one_request_cannot_consume_the_emulator() {
         "case deep expression: got {too_deep}"
     );
 
-    // VALUE SIZE: one value larger than a whole response may be.
+    // VALUE SIZE: one value larger than the DATABASE itself holds, which is the engine's
+    // own refusal. A value the database holds and one response cannot carry is a
+    // different bound — the response cap — and is the API's own size refusal
+    // (`refusal_classes` pins that one over its own rows).
+    let past_the_value_limit =
+        service_com_amazonaws_rdsdata_rdsdataservice::state::MAX_VALUE_BYTES as i64 + 1_024;
     let (status, too_big) = api
-        .execute(json!({"sql": "SELECT zeroblob(4000000)"}))
+        .execute(json!({"sql": format!("SELECT zeroblob({past_the_value_limit})")}))
         .await;
     assert_eq!(status, 400, "case oversized value: got {too_big}");
     assert_eq!(
         error_code(&too_big),
         "DatabaseErrorException",
         "case oversized value: got {too_big}"
+    );
+    let (status, past_the_response) = api
+        .execute(json!({"sql": "SELECT zeroblob(4000000)"}))
+        .await;
+    assert_eq!(
+        (status, error_code(&past_the_response)),
+        (400, "UnsupportedResultException"),
+        "case a value the database holds and no response carries: got {status} \
+         {past_the_response}"
     );
 
     // FORMATTED OUTPUT: the JSON body is charged for what it EMITS, not only for

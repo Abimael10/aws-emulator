@@ -10,9 +10,10 @@
 //! problem from a credential problem from a SQL problem. This module is that chain, in
 //! that order:
 //!
-//! 1. **the call's own shape** — a statement that is empty, and a `resourceArn` or
-//!    `secretArn` that is not an ARN, are refused as validation faults BEFORE anything is
-//!    resolved: there is nothing to resolve them against.
+//! 1. **the call's own shape** — a statement that is empty, a `resourceArn` or
+//!    `secretArn` that is not an ARN, and a `schema` member the service does not support,
+//!    are refused as validation faults BEFORE anything is resolved: there is nothing to
+//!    resolve them against.
 //! 2. **the identity** — [`super::authorization`], the identity-based IAM decision, so an
 //!    unauthorized caller learns nothing about the cluster or the secret.
 //! 3. **the cluster** — a statement runs on a cluster whose Data API HTTP endpoint is
@@ -98,6 +99,11 @@ pub struct Call<'a> {
     /// The `database` member, for a call that selects one. A call inside a transaction
     /// passes `None`: the transaction already names the database it was opened for.
     pub database: Option<&'a str>,
+    /// The `schema` member, for an operation whose model documents it as a member the
+    /// service does not support — a call carrying one is refused
+    /// ([`SCHEMA_UNSUPPORTED_MESSAGE`]). An operation whose `schema` carries no such note
+    /// passes `None`.
+    pub schema: Option<&'a str>,
     /// The `transactionId` the call carries, for the operations that take one — which the
     /// chain reads against the `resourceArn`, because a transaction belongs to the
     /// resource whose `BeginTransaction` opened it.
@@ -118,6 +124,15 @@ fn http_endpoint_not_enabled(resource_arn: &str) -> Refusal {
 /// passes the model's own constraints and is refused here — ahead of resolving the
 /// cluster, because there is no statement to run against one.
 const EMPTY_SQL_MESSAGE: &str = "SQL is empty";
+
+/// The validation fault for a call that carries the `schema` member.
+///
+/// The model's own note on it is "Currently, the schema parameter isn't supported", and the
+/// service holds the caller to that: a request carrying the member is refused outright
+/// rather than run against a schema nothing selects, so a client that populates it learns
+/// so instead of being told its call was fine. Decided on the call's own members, ahead of
+/// resolving anything, because nothing has to be resolved to see it.
+const SCHEMA_UNSUPPORTED_MESSAGE: &str = "The schema parameter isn't supported.";
 
 /// The user name the engine's access-denied diagnostic names when the secret carries
 /// none: a login with no user name is a login as nobody.
@@ -153,7 +168,7 @@ pub async fn admit<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     call: &Call<'_>,
-) -> Result<(), Refusal> {
+) -> Result<Admitted, Refusal> {
     let addressed = require_shape(call)?;
     super::authorization::authorize(engine, ctx, call.operation, call.resource_arn)
         .map_err(Refusal::AccessDenied)?;
@@ -184,7 +199,21 @@ pub async fn admit<Eng: Send + Sync + 'static>(
         cluster.require_database(database, &held)?;
     }
     require_a_transaction_id_of_the_resource(call)?;
-    Ok(())
+    Ok(Admitted {
+        engine: super::EngineFamily::of_engine(
+            cluster.as_ref().and_then(|cluster| cluster.engine.as_deref()),
+        ),
+    })
+}
+
+/// What admitting a call RESOLVED about the cluster it addressed, which the statement then
+/// runs under.
+#[derive(Debug, Clone, Copy)]
+pub struct Admitted {
+    /// The engine the cluster runs, which is what decides the words an error the DATABASE
+    /// raises reaches the caller in. A cluster no control plane answered about carries the
+    /// default family, because nothing says otherwise.
+    pub engine: super::EngineFamily,
 }
 
 /// Refuse a `transactionId` that cannot be a transaction id of the resource the call
@@ -243,6 +272,10 @@ struct Addressed<'a> {
 /// Refuse a call whose own members cannot name anything, and answer where the two it
 /// does name are resolved.
 ///
+/// A member the service does not support is refused here too, for the same reason: the
+/// `schema` an operation's model documents as unsupported names no second namespace, and
+/// a call carrying it is refused rather than served as if the member had not been sent.
+///
 /// Both ARNs are read through [`::service_common::arn`], the tree's ONE
 /// caller-supplied-ARN parse: a `resourceArn` has to be a well-formed Amazon RDS DB
 /// CLUSTER ARN and a `secretArn` a Secrets Manager SECRET ARN, because this service
@@ -256,6 +289,9 @@ fn require_shape<'call>(call: &Call<'call>) -> Result<Addressed<'call>, Refusal>
 
     if call.sql.is_some_and(|sql| sql.trim().is_empty()) {
         return Err(Refusal::Validation(EMPTY_SQL_MESSAGE.to_string()));
+    }
+    if call.schema.is_some() {
+        return Err(Refusal::Validation(SCHEMA_UNSUPPORTED_MESSAGE.to_string()));
     }
     let invalid_cluster = || {
         Refusal::Validation(format!("Invalid cluster arn: {}", call.resource_arn))
@@ -438,16 +474,13 @@ async fn describe_cluster(
 fn built_in_databases(engine: Option<&str>) -> &'static [&'static str] {
     const POSTGRESQL: &[&str] = &["postgres", "template0", "template1", "rdsadmin"];
     const MYSQL: &[&str] = &["mysql", "information_schema", "performance_schema", "sys"];
-    let Some(engine) = engine else {
-        return &[];
-    };
-    let engine = engine.to_ascii_lowercase();
-    if engine.contains("postgres") {
-        POSTGRESQL
-    } else if engine.contains("mysql") || engine.contains("mariadb") {
-        MYSQL
-    } else {
-        &[]
+    // Which family an `Engine` names is read where this service reads it once
+    // (`super::EngineFamily`), and a name NEITHER family's says nothing about the databases
+    // the cluster ships with.
+    match engine.and_then(super::EngineFamily::named_by) {
+        Some(super::EngineFamily::PostgreSql) => POSTGRESQL,
+        Some(super::EngineFamily::MySql) => MYSQL,
+        None => &[],
     }
 }
 
@@ -660,6 +693,7 @@ mod tests {
             secret_arn: "arn:aws:secretsmanager:us-east-1:000000000000:secret:demo-AbCdEf",
             sql: Some("SELECT 1"),
             database: None,
+            schema: None,
             transaction_id: None,
         }
     }
@@ -783,6 +817,31 @@ mod tests {
                     ..working_call()
                 },
                 Some(EMPTY_SQL_MESSAGE.to_string()),
+            ),
+            (
+                "a call carrying the schema member",
+                Call {
+                    schema: Some("public"),
+                    ..working_call()
+                },
+                Some(SCHEMA_UNSUPPORTED_MESSAGE.to_string()),
+            ),
+            (
+                // Whichever schema it names: the member itself is what is refused.
+                "a call carrying another schema name",
+                Call {
+                    schema: Some("reporting"),
+                    ..working_call()
+                },
+                Some(SCHEMA_UNSUPPORTED_MESSAGE.to_string()),
+            ),
+            (
+                "a call carrying an empty schema member",
+                Call {
+                    schema: Some(""),
+                    ..working_call()
+                },
+                Some(SCHEMA_UNSUPPORTED_MESSAGE.to_string()),
             ),
         ];
         for (case, call, expected) in rows {

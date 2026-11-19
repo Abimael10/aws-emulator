@@ -40,10 +40,23 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::constraints::ViolationKind;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The member every statement operation carries its statement in, as a refusal names it.
+const SQL_MEMBER: &str = "sql";
+
+/// What the service tells a caller whose statement is longer than the ceiling the model
+/// declares for it, up to that ceiling itself — fixed text, closed by the number of
+/// characters a statement may carry.
+const SQL_TOO_LONG_PREFIX: &str = "Number of characters in SQLStatement is longer than ";
+
+/// The error code this class of refusal is answered with, which is the one the framework
+/// picks for it too: a client branches on the code, so rewording the message keeps it.
+const VALIDATION_CODE: &str = "ValidationException";
 
 /// The `com-amazonaws-rdsdata-rdsdataservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -99,14 +112,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // wording.
+        //
+        // ONE of these refusals the Data API words itself: a `sql` longer than the
+        // ceiling the model declares is refused by the NUMBER OF CHARACTERS it carries,
+        // naming the statement as the service names it — where the framework's own
+        // sentence quotes the statement back, which for a statement at the ceiling is a
+        // response as long as the request. The code stays the one this class is answered
+        // with, because a client branches on it.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        violations.iter().find_map(|violation| {
+            let ViolationKind::MaxLength(ceiling) = violation.kind else {
+                return None;
+            };
+            if violation.path != SQL_MEMBER {
+                return None;
+            }
+            Some(Refused {
+                code: VALIDATION_CODE.to_string(),
+                message: format!("{SQL_TOO_LONG_PREFIX}{ceiling}"),
+            })
+        })
     }
 
     fn override_routing_error(

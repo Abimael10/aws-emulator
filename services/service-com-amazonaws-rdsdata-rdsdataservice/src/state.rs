@@ -19,6 +19,17 @@
 //! `Field` member each value comes back in. A result whose type the `Field` union
 //! has no member for is refused rather than reported as something it is not.
 //!
+//! ## The engine a cluster RUNS
+//!
+//! The Data API serves Aurora MySQL DB clusters as well as Aurora PostgreSQL ones, and an
+//! error the DATABASE raises reaches the caller in the words of the engine the ADDRESSED
+//! cluster runs — its own sentence, its own vendor error code and its own SQLSTATE, which
+//! is what a client branches, retries and logs on. Which engine that is comes from the
+//! control plane that owns the cluster, resolved by [`preconditions`] before the statement
+//! runs and carried on the [`Cluster`] ([`EngineFamily`]); the wording itself is
+//! `postgres::postgresql_diagnostic` and `mysql::mysql_diagnostic`, over the one
+//! reading of the engine's answer `condition` makes.
+//!
 //! ## Transactions
 //!
 //! `BeginTransaction` takes a private copy of the committed database
@@ -115,6 +126,14 @@ use crate::ops::types::{ArrayValue, ColumnMetadata, Field, ResultSetOptions, Sql
 /// from.
 pub mod postgres;
 
+/// What the SQL engine behind this data plane SAID, read into the condition it is about —
+/// once, for both of the wordings that condition reaches a caller in.
+mod condition;
+
+/// How an Aurora MySQL cluster words an error its database raised: the other wording of
+/// those same conditions.
+mod mysql;
+
 /// Whether IAM lets a request perform the action it asks for — the identity leg of
 /// the precondition chain.
 pub mod authorization;
@@ -164,10 +183,15 @@ const PROGRESS_HANDLER_OPS: i32 = 1_000;
 /// copied out of the engine.
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
-/// `SQLITE_LIMIT_LENGTH`: the largest single value the engine will produce. Set to
-/// the response cap above, so no one value can be bigger than the whole response
-/// a call may return.
-const MAX_VALUE_BYTES: i32 = 1024 * 1024;
+/// `SQLITE_LIMIT_LENGTH`: the largest single value the engine will hold.
+///
+/// The DATABASE's own bound, and deliberately LARGER than the response cap above: a
+/// database holds values no one response can carry — AWS stores such a value and then
+/// refuses the RESULT with `UnsupportedResultException` ("The size was too large") — so a
+/// value past the response cap has to exist for that refusal to be the API's rather than
+/// the engine's. What bounds the memory it occupies is the page cap and the heap ceiling
+/// below, and what bounds what a caller can SEND is the model's own `sql` length.
+pub const MAX_VALUE_BYTES: i32 = 8 * 1024 * 1024;
 
 /// `SQLITE_LIMIT_SQL_LENGTH`: the model's `SqlStatement` is `len ..65536`, so a
 /// statement the model would refuse is also one the engine will not parse.
@@ -309,6 +333,12 @@ const SCHEMA_INTROSPECTION_PRAGMAS: &[&str] = &["table_info", "table_xinfo"];
 /// input format (`postgres::binary_input_reader`), which [`Database::open`] defines
 /// and the authorizer admits by that same name.
 ///
+/// `repeat` is the one function of the DATABASE's own library that the engine behind this
+/// data plane does not have: both of the engines this API serves document
+/// `repeat(string, count)` ("Repeats string the specified number of times"), so
+/// [`Database::open`] defines it and it is named here like any other function caller SQL
+/// may call. It computes over its arguments and nothing else.
+///
 /// DELIBERATELY ABSENT, so they are denied by the default arm: `load_extension`
 /// (the engine's own code loader), the `sqlite3` shell's file functions
 /// (`readfile`, `writefile`, `edit`, `fsdir`), `sqlite_dbpage` and
@@ -345,6 +375,9 @@ const PERMITTED_FUNCTIONS: &[&str] = &[
     "random",
     "randomblob",
     "replace",
+    // The one function of the database's own library the engine does not have, defined by
+    // this data plane (`string_repeated`).
+    "repeat",
     "round",
     "rtrim",
     "sign",
@@ -620,9 +653,74 @@ pub struct Cluster {
     pub databases: HashMap<String, Database>,
     /// Keyed by the `transactionId` [`Transaction::open`] minted.
     pub transactions: HashMap<String, Transaction>,
+    /// Which engine this cluster RUNS, as the control plane that owns the cluster answered
+    /// it ([`preconditions::Admitted`]): what decides the words, the vendor error code and
+    /// the SQLSTATE an error the database raises reaches the caller in.
+    engine: EngineFamily,
+}
+
+/// Which database engine a DB cluster runs, as far as this data plane is concerned.
+///
+/// The Data API serves Aurora PostgreSQL and Aurora MySQL DB clusters, and each engine
+/// words a condition it raises in its own sentence, with its own error code and its own
+/// SQLSTATE — which is what a client branches, retries and logs on. So every cluster is
+/// one of these, and the wording follows it ([`Database::in_the_engines_words`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EngineFamily {
+    /// Aurora PostgreSQL, whose diagnostics are `postgres`'s — and the family a cluster
+    /// nothing answered about carries, because PostgreSQL is the engine this front end
+    /// describes its RESULTS as.
+    #[default]
+    PostgreSql,
+    /// Aurora MySQL (and MariaDB), whose diagnostics are `mysql`'s.
+    MySql,
+}
+
+impl EngineFamily {
+    /// The family an `Engine` names, and `None` for a name that is neither family's —
+    /// which says nothing about the cluster.
+    #[must_use]
+    pub fn named_by(engine: &str) -> Option<Self> {
+        let engine = engine.to_ascii_lowercase();
+        if engine.contains("postgres") {
+            Some(Self::PostgreSql)
+        } else if engine.contains("mysql") || engine.contains("mariadb") {
+            Some(Self::MySql)
+        } else {
+            None
+        }
+    }
+
+    /// The family a cluster's `Engine` names, defaulting to the one this front end
+    /// describes its results as where nothing names a family: an emulator assembled
+    /// without the control plane that owns the cluster, or a cluster whose record carries
+    /// no engine.
+    #[must_use]
+    pub fn of_engine(engine: Option<&str>) -> Self {
+        engine.and_then(Self::named_by).unwrap_or_default()
+    }
 }
 
 impl Cluster {
+    /// Record which ENGINE this cluster runs, as the call that was just admitted resolved
+    /// it from the control plane that owns the cluster.
+    ///
+    /// Every database of it — and the private copy every open transaction writes into —
+    /// reports a condition it raises in that engine's words, so the answer does not depend
+    /// on which database a call happens to address or on when the engine was first
+    /// resolved.
+    pub fn runs_engine(&mut self, engine: EngineFamily) {
+        self.engine = engine;
+        for database in self.databases.values_mut() {
+            database.engine = engine;
+        }
+        for transaction in self.transactions.values_mut() {
+            if let Some(pending) = transaction.pending.as_mut() {
+                pending.engine = engine;
+            }
+        }
+    }
+
     /// The committed database `name` holds, created empty on first use — up to
     /// [`MAX_DATABASES_PER_CLUSTER`], past which a request for a NEW database is
     /// refused. Admitting a new one first forgets the databases that naming alone
@@ -635,7 +733,10 @@ impl Cluster {
                     "this emulator serves at most {MAX_DATABASES_PER_CLUSTER} databases per cluster"
                 )));
             }
-            self.databases.insert(name.to_string(), Database::open(name)?);
+            // A database of this cluster runs the cluster's engine, which is what its
+            // diagnostics are worded as.
+            self.databases
+                .insert(name.to_string(), Database::open(name, self.engine)?);
         }
         Ok(self
             .databases
@@ -1003,6 +1104,192 @@ fn binary_input(value: ValueRef<'_>) -> SqlValue {
 /// What PostgreSQL's hex input format for a binary value opens with.
 const BYTEA_HEX_PREFIX: &[u8] = br"\x";
 
+/// The name both of this API's engines document for the function that repeats a string:
+/// `repeat(string, count)`.
+const REPEAT_FUNCTION: &str = "repeat";
+
+/// A value of an ARRAY type written out as TEXT: the array OUTPUT FORMAT the database
+/// documents, read off the JSON document this data plane holds an array as.
+///
+/// "The external text representation of an array value consists of items that are
+/// interpreted according to the I/O conversion rules for the array's element type, plus
+/// decoration that indicates the array structure" — curly braces around the value, commas
+/// between adjacent items, and the braces nested once per dimension. A value that is no
+/// array document at all is written as the engine holds it, because there is no array
+/// structure to decorate.
+fn array_output(value: ValueRef<'_>) -> SqlValue {
+    let text = match value {
+        ValueRef::Null => return SqlValue::Null,
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        ValueRef::Integer(number) => number.to_string(),
+        ValueRef::Real(number) => number.to_string(),
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Array(elements)) => SqlValue::Text(braced_array(&elements)),
+        _ => SqlValue::Text(text),
+    }
+}
+
+/// One array in that format: its items, separated by the delimiter, inside curly braces.
+///
+/// Bounded by the parse that produced the document, whose own nesting limit is what bounds
+/// this walk — the same bound [`as_stored_document`] relies on.
+fn braced_array(elements: &[serde_json::Value]) -> String {
+    let items: Vec<String> = elements.iter().map(braced_item).collect();
+    format!("{{{}}}", items.join(","))
+}
+
+/// One ITEM of that format: a nested array is braced in turn, a NULL is the unquoted word
+/// the format uses for one, and every other value is its own text — quoted where the
+/// format requires it.
+fn braced_item(element: &serde_json::Value) -> String {
+    match element {
+        serde_json::Value::Array(nested) => braced_array(nested),
+        serde_json::Value::Null => ARRAY_NULL_ITEM.to_string(),
+        serde_json::Value::String(text) => quoted_array_item(text),
+        settled => settled.to_string(),
+    }
+}
+
+/// How the array output format writes a NULL item: the unquoted word, which is why a
+/// quoted item is how the format writes the STRING of that word.
+const ARRAY_NULL_ITEM: &str = "NULL";
+
+/// One text item of that format: the text itself, in double quotes where the format
+/// requires them.
+///
+/// The documented rule: "You can add double quotes around any individual array element.
+/// You must do so if it contains commas or curly braces" — and an element that is empty,
+/// that matches the word for a NULL, or that carries whitespace, a double quote or a
+/// backslash is quoted for the same reason, with a backslash before each double quote and
+/// each backslash inside it.
+fn quoted_array_item(text: &str) -> String {
+    let must_quote = text.is_empty()
+        || text.eq_ignore_ascii_case(ARRAY_NULL_ITEM)
+        || text
+            .chars()
+            .any(|character| matches!(character, '{' | '}' | ',' | '"' | '\\') || character.is_whitespace());
+    if !must_quote {
+        return text.to_string();
+    }
+    let escaped: String = text
+        .chars()
+        .flat_map(|character| {
+            match character {
+                '"' | '\\' => vec!['\\', character],
+                settled => vec![settled],
+            }
+        })
+        .collect();
+    format!("\"{escaped}\"")
+}
+
+/// `repeat(string, count)`: the string repeated that many times, which is the value both
+/// of this API's engines compute for that call.
+///
+/// A count that is not positive repeats nothing, which is the empty string both engines
+/// answer with, and a NULL argument makes the value NULL, as every function of the
+/// database's library does.
+///
+/// BOUNDED BEFORE IT IS BUILT: the length the result would have is checked against the
+/// engine's own value limit first, so a count naming a value no column could hold is
+/// refused without allocating it. The refusal carries the ENGINE's own sentence for a value
+/// past that limit — the same one any other over-long value earns here — rather than a
+/// sentence about this function.
+fn string_repeated(
+    repeated: ValueRef<'_>,
+    count: i64,
+) -> Result<SqlValue, rusqlite::Error> {
+    let text = match repeated {
+        ValueRef::Null => return Ok(SqlValue::Null),
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        ValueRef::Integer(number) => number.to_string(),
+        ValueRef::Real(number) => number.to_string(),
+    };
+    let times = usize::try_from(count).unwrap_or(0);
+    if text.len().saturating_mul(times) > MAX_VALUE_BYTES as usize {
+        return Err(rusqlite::Error::UserFunctionError(
+            ENGINE_VALUE_TOO_BIG.into(),
+        ));
+    }
+    Ok(SqlValue::Text(text.repeat(times)))
+}
+
+/// How the engine behind this data plane states that a value is longer than it holds,
+/// which is what it answers for an over-long value of its own accord
+/// ([`MAX_VALUE_BYTES`]).
+const ENGINE_VALUE_TOO_BIG: &str = "string or blob too big";
+
+/// The value a FLOATING type's input names, as this data plane can hold it.
+///
+/// A floating type's input is a number — which the engine holds as its own real — or one of
+/// the three special values PostgreSQL documents for its floating types: `NaN`, `Infinity`
+/// and `-Infinity`. The engine has no form for those at all (it stores a NaN as NULL, which
+/// would say the value is missing), so such a value is held as the TEXT the database
+/// displays it as, which is how it comes back out again
+/// ([`non_finite_in`]).
+///
+/// Text that names neither is converted the way the ENGINE's own cast documents it: the
+/// longest prefix of it that reads as a number, and zero where it has none. So a cast
+/// rendered as this reader answers exactly what the engine's own cast would, for every
+/// value but the ones it has no form for.
+fn float_input(value: ValueRef<'_>) -> SqlValue {
+    let text = match value {
+        ValueRef::Null => return SqlValue::Null,
+        ValueRef::Integer(number) => return SqlValue::Real(number as f64),
+        ValueRef::Real(number) => return SqlValue::Real(number),
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+    };
+    if let Some(displayed) = postgres::non_finite_float(&text) {
+        return SqlValue::Text(displayed.to_string());
+    }
+    SqlValue::Real(numeric_prefix_of(&text))
+}
+
+/// The number the longest numeric PREFIX of `text` names, and 0 where it has none — the
+/// conversion the engine's own cast to its real type documents for text that is not a
+/// number.
+fn numeric_prefix_of(text: &str) -> f64 {
+    let digits = text.trim_start();
+    let mut end = 0;
+    let mut seen_point = false;
+    let mut seen_exponent = false;
+    for (offset, character) in digits.char_indices() {
+        let accepted = match character {
+            '0'..='9' => true,
+            '+' | '-' => {
+                // A sign opens the number, and opens an exponent.
+                offset == 0 || digits[..offset].ends_with(['e', 'E'])
+            }
+            '.' => !seen_point && !seen_exponent,
+            'e' | 'E' => !seen_exponent && offset > 0,
+            _ => false,
+        };
+        if !accepted {
+            break;
+        }
+        seen_point = seen_point || character == '.';
+        seen_exponent = seen_exponent || character == 'e' || character == 'E';
+        end = offset + character.len_utf8();
+    }
+    // The prefix the engine converts is the longest one that READS as a number, and the
+    // scan above accepts a trailing `e`, point or sign that nothing follows — which no
+    // number ends with. Those are the ONLY characters that can make the parse fail, so at
+    // most the last few are dropped: the loop is bounded by them and not by the length of
+    // the text.
+    while end > 0
+        && digits
+            .get(..end)
+            .is_some_and(|prefix| prefix.ends_with(['e', 'E', '.', '+', '-']))
+    {
+        end -= 1;
+    }
+    digits
+        .get(..end)
+        .and_then(|prefix| prefix.parse::<f64>().ok())
+        .unwrap_or_default()
+}
+
 /// One SQL database, run by SQLite in this process.
 #[derive(Debug)]
 pub struct Database {
@@ -1034,6 +1321,9 @@ pub struct Database {
     /// nothing, so it is not swept away as a database naming alone created
     /// ([`Self::is_empty`]).
     declared: bool,
+    /// The ENGINE the cluster holding this database runs, which is what an error the
+    /// database raises is worded as ([`Self::in_the_engines_words`]).
+    engine: EngineFamily,
 }
 
 /// What a table's declaration said about a column whose values the ENGINE assigns.
@@ -1091,8 +1381,10 @@ impl Database {
     /// docs for the whole list. This is the only place a connection is created.
     ///
     /// `name` is the name the database is held under, which is what a statement reading
-    /// the catalog relations that describe this database reports as its catalog.
-    pub fn open(name: &str) -> Result<Self, SqlError> {
+    /// the catalog relations that describe this database reports as its catalog, and
+    /// `engine` the engine the cluster that holds it runs, which its diagnostics are
+    /// worded as.
+    pub fn open(name: &str, engine: EngineFamily) -> Result<Self, SqlError> {
         let mut conn = Connection::open_in_memory().map_err(SqlError::unavailable)?;
 
         // Memory, value size, statement size and complexity. Set first, so they
@@ -1186,6 +1478,53 @@ impl Database {
         )
         .map_err(SqlError::unavailable)?;
 
+        // And the reader of the INPUT a FLOATING type takes, defined here for the same
+        // reason: a floating type accepts three values that are not numbers (`NaN`,
+        // `Infinity`, `-Infinity`), and the engine has no number for any of them — its own
+        // cast would read `'NaN'` as zero and store a value the caller never wrote. Every
+        // cast to a floating type is rendered as a call of this (see
+        // `postgres::float_input_reader`), so the input is read whatever the value turns
+        // out to be at run time.
+        conn.create_scalar_function(
+            postgres::float_input_reader(),
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| Ok(float_input(context.get_raw(0))),
+        )
+        .map_err(SqlError::unavailable)?;
+
+        // And the WRITER of the array output format, for the same reason in the other
+        // direction: this data plane holds an array as the JSON document of its elements,
+        // and the database writes such a value out in its own braced format (see
+        // `postgres::array_output_writer`).
+        conn.create_scalar_function(
+            postgres::array_output_writer(),
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| Ok(array_output(context.get_raw(0))),
+        )
+        .map_err(SqlError::unavailable)?;
+
+        // And `repeat(string, count)`, which both of the engines this API serves document
+        // and the engine behind this data plane does not have: a statement that calls it
+        // is a statement the DATABASE runs, so it is computed here rather than refused as
+        // an unknown function. Bounded by the engine's own value limit, measured BEFORE
+        // the value is built, so a count no value could hold allocates nothing.
+        conn.create_scalar_function(
+            REPEAT_FUNCTION,
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| {
+                let repeated = context.get_raw(0);
+                let count = context.get_raw(1).as_i64().unwrap_or_default();
+                string_repeated(repeated, count)
+            },
+        )
+        .map_err(SqlError::unavailable)?;
+
         // Default deny on every SQL action, installed LAST so the settings above
         // (which are themselves pragmas) are not refused by it.
         conn.authorizer(Some(confine_to_data_plane))
@@ -1196,6 +1535,7 @@ impl Database {
             sequence_columns: HashMap::new(),
             version: next_version(),
             declared: false,
+            engine,
         })
     }
 
@@ -1204,7 +1544,7 @@ impl Database {
     /// byte-identical to the source database, and bounded by the same
     /// `max_page_count` as every other database here.
     pub fn snapshot(&self) -> Result<Self, SqlError> {
-        let mut copy = Self::open(&self.name)?;
+        let mut copy = Self::open(&self.name, self.engine)?;
         {
             let backup = rusqlite::backup::Backup::new(&self.conn, &mut copy.conn)
                 .map_err(SqlError::unavailable)?;
@@ -1337,20 +1677,46 @@ impl Database {
         if outcome.as_ref().is_ok_and(StatementOutcome::changed_it) {
             self.version = next_version();
         }
-        // An error the DATABASE raised reaches the caller in the words of the database
-        // this API answers for, with its SQLSTATE — never in the words of whichever
-        // engine ran the statement.
-        outcome.map_err(|error| self.in_postgresql_words(error))
+        outcome
     }
 
-    /// The same failure, worded as Aurora PostgreSQL words that condition
-    /// ([`postgres::postgresql_diagnostic`]). A condition that front end does not word,
-    /// and every failure that is not the engine refusing a statement, is unchanged.
-    fn in_postgresql_words(&self, error: SqlError) -> SqlError {
+    /// The same failure, worded as the ENGINE THE CLUSTER RUNS words that condition:
+    /// PostgreSQL's sentence and SQLSTATE for an Aurora PostgreSQL cluster
+    /// ([`postgres::postgresql_diagnostic`]), MySQL's sentence, error number and SQLSTATE
+    /// for an Aurora MySQL one ([`mysql::mysql_diagnostic`]) — whichever engine actually
+    /// ran the statement.
+    ///
+    /// Why it follows the cluster: that text, that code and that SQLSTATE are what a client
+    /// branches, retries and logs on, so a diagnostic in another engine's words is one the
+    /// client cannot classify — and names things (a constraint, an index) the schema it
+    /// wrote does not have.
+    ///
+    /// A condition neither front end words, and every failure that is not the engine
+    /// refusing a statement, is unchanged. `plan` and `parameters` are the statement that
+    /// failed, which is where the VALUE a duplicate-key diagnostic names comes from.
+    fn in_the_engines_words(
+        &self,
+        error: SqlError,
+        plan: &Plan,
+        parameters: &[SqlParameter],
+    ) -> SqlError {
         let SqlError::Engine(message) = &error else {
             return error;
         };
-        match postgres::postgresql_diagnostic(message, &|table| self.primary_key_of(table)) {
+        let primary_key_of = |table: &str| self.primary_key_of(table);
+        let worded = match self.engine {
+            EngineFamily::PostgreSql => postgres::postgresql_diagnostic(message, &primary_key_of),
+            EngineFamily::MySql => mysql::mysql_diagnostic(
+                message,
+                &mysql::About {
+                    database: &self.name,
+                    primary_key_of: &primary_key_of,
+                    assigned: &|column: &str| assigned_text(plan, parameters, column),
+                    named_in: &|column: &str| plan.named_in(column),
+                },
+            ),
+        };
+        match worded {
             Some(worded) => SqlError::Engine(worded),
             None => error,
         }
@@ -1440,13 +1806,28 @@ impl Database {
             };
             postgres::plan(sql, &catalog)?
         };
+        // An error the DATABASE raised reaches the caller in the words of the engine the
+        // CLUSTER runs, with that engine's error code and SQLSTATE — never in the words of
+        // whichever engine ran the statement here. Worded with the statement in hand,
+        // because the value a duplicate-key diagnostic names is the statement's own.
+        self.apply(&plan, budget, parameters)
+            .map_err(|error| self.in_the_engines_words(error, &plan, parameters))
+    }
+
+    /// Run the planned statement and report what the engine did with it.
+    fn apply(
+        &mut self,
+        plan: &Plan,
+        budget: &mut RequestBudget,
+        parameters: &[SqlParameter],
+    ) -> Result<StatementOutcome, SqlError> {
         let mut statement = self.conn.prepare(&plan.sql).map_err(SqlError::from_engine)?;
-        let mut columns = self.describe(&statement, &plan);
+        let mut columns = self.describe(&statement, plan);
         // The values this statement assigns have to be values the columns it assigns
         // them to TAKE, and the values it CASTS have to be values the types it casts
         // them to read: the database decides both before it stores anything.
-        self.require_assignable_values(&plan, parameters)?;
-        self.require_readable_values(&plan, parameters)?;
+        self.require_assignable_values(plan, parameters)?;
+        self.require_readable_values(plan, parameters)?;
         bind_named_parameters(&mut statement, parameters)?;
 
         let mut rows = Vec::new();
@@ -1523,7 +1904,7 @@ impl Database {
         // — the row would be missing against this emulator and present against AWS.
         require_returnable(&columns)?;
         Ok(StatementOutcome {
-            generated_fields: self.generated_fields(&plan, changed),
+            generated_fields: self.generated_fields(plan, changed),
             columns,
             rows,
             records_updated: changed,
@@ -2564,8 +2945,12 @@ impl SqlError {
                 "the statement did not finish within {} seconds",
                 STATEMENT_TIME_BUDGET.as_secs()
             ),
+            // What AWS tells a caller whose result passed the response cap: the fixed
+            // sentence of that refusal, carrying the limit it passed — which is the
+            // response cap the operation's own doc states ("If the binary response data
+            // from the database is more than 1 MB, the call is terminated").
             Self::ResultTooLarge => format!(
-                "the result set is larger than the {} MB this call can return",
+                "The result exceeds the size limit {} MB.",
                 MAX_RESPONSE_BYTES / (1024 * 1024)
             ),
             Self::Unavailable(_) => "An internal error occurred".to_string(),
@@ -2625,6 +3010,8 @@ fn confine_to_data_plane(context: AuthContext<'_>) -> Authorization {
                 .iter()
                 .any(|allowed| function_name.eq_ignore_ascii_case(allowed))
                 || function_name.eq_ignore_ascii_case(postgres::binary_input_reader())
+                || function_name.eq_ignore_ascii_case(postgres::float_input_reader())
+                || function_name.eq_ignore_ascii_case(postgres::array_output_writer())
             {
                 Authorization::Allow
             } else {
@@ -2812,6 +3199,41 @@ fn sql_value_for(parameter: &SqlParameter) -> Result<SqlValue, SqlError> {
             ))
         }
     })
+}
+
+/// The value the statement ASSIGNED to one of its columns, as text — which is what the
+/// duplicate-key diagnostic of either engine names as the value that collided.
+///
+/// Read from the statement and the request together, because that is where the value is:
+/// the literal the statement wrote, or the value the parameter it named carries — bound
+/// exactly as the engine was handed it ([`sql_value_for`]), so the text reported is the
+/// text of the value that really collided. `None` where the statement settles no single
+/// value for that column, and for a value that has no text form (a binary value, a NULL).
+fn assigned_text(plan: &Plan, parameters: &[SqlParameter], column: &str) -> Option<String> {
+    let (_, cell) = plan
+        .assigned_cells
+        .iter()
+        .find(|(assigned, _)| assigned.eq_ignore_ascii_case(column))?;
+    match cell {
+        postgres::AssignedCell::Literal(text) => Some(text.clone()),
+        postgres::AssignedCell::Parameter(name) => {
+            let parameter = parameters
+                .iter()
+                .find(|parameter| parameter.name.as_deref() == Some(name.as_str()))?;
+            value_text(&sql_value_for(parameter).ok()?)
+        }
+    }
+}
+
+/// One stored value as a diagnostic writes it: a number as its digits and text as itself.
+/// `None` for a value with no text form of its own.
+fn value_text(value: &SqlValue) -> Option<String> {
+    match value {
+        SqlValue::Integer(number) => Some(number.to_string()),
+        SqlValue::Real(number) => Some(number.to_string()),
+        SqlValue::Text(text) => Some(text.clone()),
+        SqlValue::Null | SqlValue::Blob(_) => None,
+    }
 }
 
 /// A `stringValue` qualified by a `typeHint`, as the engine's own value.
@@ -3014,17 +3436,17 @@ pub fn field_for(
     column: &ColumnInfo,
     returns: ReturnTypes,
 ) -> Result<Field, SqlError> {
+    // A floating value that is not a number is no value of any of the union's members:
+    // `isNull` would tell the caller the value is missing and a number member cannot carry
+    // it, so the result is the one this call cannot return, in the modelled refusal's own
+    // words. The JSON form of the same result set is what rescues it ([`json_for`]).
+    if non_finite_in(value, column).is_some() {
+        return Err(SqlError::UnsupportedResult(
+            postgres::NON_FINITE_FLOAT.to_string(),
+        ));
+    }
     Ok(match value {
         SqlValue::Null => Field::isNull(true),
-        // A non-finite number is no value of any of the union's members: `isNull` would
-        // tell the caller the value is missing and a number member cannot carry it, so
-        // the result is the one this call cannot return, in the modelled refusal's own
-        // words.
-        SqlValue::Real(number) if !number.is_finite() => {
-            return Err(SqlError::UnsupportedResult(
-                postgres::NON_FINITE_FLOAT.to_string(),
-            ))
-        }
         SqlValue::Integer(number) => {
             if column.is_boolean() {
                 Field::booleanValue(*number != 0)
@@ -3121,13 +3543,21 @@ fn array_value(text: &str, pg: &PgType) -> Result<ArrayValue, SqlError> {
                 .collect::<Option<Vec<i64>>>()
                 .ok_or_else(unsupported)?,
         ),
-        TypeClass::Float => ArrayValue::doubleValues(
-            elements
+        TypeClass::Float => {
+            let numbers = elements
                 .iter()
                 .map(float_element)
                 .collect::<Option<Vec<f64>>>()
-                .ok_or_else(unsupported)?,
-        ),
+                .ok_or_else(unsupported)?;
+            // An element that is not a number is no value of `doubleValues` either, so
+            // it earns the same refusal a scalar one does.
+            if numbers.iter().any(|number| !number.is_finite()) {
+                return Err(SqlError::UnsupportedResult(
+                    postgres::NON_FINITE_FLOAT.to_string(),
+                ));
+            }
+            ArrayValue::doubleValues(numbers)
+        }
         TypeClass::Decimal | TypeClass::Text | TypeClass::Temporal => ArrayValue::stringValues(
             elements
                 .iter()
@@ -3318,6 +3748,26 @@ fn in_integer_range(number: f64) -> bool {
     number.is_finite() && number >= -(2_f64.powi(63)) && number < 2_f64.powi(63)
 }
 
+/// The non-finite floating value this result cell holds, as the DATABASE DISPLAYS it, and
+/// `None` for every other value.
+///
+/// A floating value that is not a number reaches this data plane in either of two forms,
+/// because the engine has a form for only one of them: an infinity is a real the engine
+/// holds, while a `NaN` is held as the text the database displays it as (see
+/// [`float_input`]) — a column declared with a floating type is the one place such text can
+/// be. The two are one value as far as a caller is concerned, so one answer settles both:
+/// `records` cannot carry it ([`field_for`]) and the JSON form renders it as that text
+/// ([`json_for`]).
+fn non_finite_in(value: &SqlValue, column: &ColumnInfo) -> Option<&'static str> {
+    match value {
+        SqlValue::Real(number) => postgres::non_finite_display(*number),
+        SqlValue::Text(text) if column.pg.class == TypeClass::Float => {
+            postgres::non_finite_float(text)
+        }
+        _ => None,
+    }
+}
+
 /// What the modelled `UnsupportedResultException` says about a result carrying a
 /// value of a type it has no form for — the model's own wording for the
 /// condition: "It contained an unsupported data type".
@@ -3356,17 +3806,14 @@ fn holds_an_array(elements: &[serde_json::Value]) -> bool {
 /// NULL is `null`, and an array column is a JSON array whose elements take the form
 /// their ELEMENT type names (see [`json_element`]).
 fn json_for(value: &SqlValue, column: &ColumnInfo) -> Result<serde_json::Value, SqlError> {
+    // JSON has no NUMBER form for a value that is not a number, and the database renders
+    // such a value in JSON as the STRING it displays it as — which is why asking for the
+    // JSON form of a result set `records` cannot carry answers it instead of refusing it.
+    if let Some(displayed) = non_finite_in(value, column) {
+        return Ok(serde_json::Value::String(displayed.to_string()));
+    }
     Ok(match value {
         SqlValue::Null => serde_json::Value::Null,
-        // JSON has no form for a non-finite number, and neither has the `Field` union:
-        // such a value is the result this call cannot return, stated the way the
-        // modelled refusal states it, rather than reported as NULL, which would tell
-        // the caller the value is missing.
-        SqlValue::Real(number) if !number.is_finite() => {
-            return Err(SqlError::UnsupportedResult(
-                postgres::NON_FINITE_FLOAT.to_string(),
-            ))
-        }
         SqlValue::Integer(number) => {
             if column.is_boolean() {
                 serde_json::Value::Bool(*number != 0)
@@ -3439,11 +3886,16 @@ fn json_element(element: &serde_json::Value, element_type: &PgType) -> Option<se
     match element_type.class {
         TypeClass::Boolean => boolean_element(element).map(serde_json::Value::Bool),
         TypeClass::Integer => integer_element(element).map(serde_json::Value::from),
-        // An inexact number is a JSON number, as a scalar one is above; a value JSON
-        // cannot represent is refused rather than reported as something else.
-        TypeClass::Float => float_element(element)
-            .and_then(serde_json::Number::from_f64)
-            .map(serde_json::Value::Number),
+        // An inexact number is a JSON number, as a scalar one is above; one that is not a
+        // number at all is the string the database displays it as, for the reason
+        // [`json_for`] gives.
+        TypeClass::Float => {
+            let number = float_element(element)?;
+            match postgres::non_finite_display(number) {
+                Some(displayed) => Some(serde_json::Value::String(displayed.to_string())),
+                None => serde_json::Number::from_f64(number).map(serde_json::Value::Number),
+            }
+        }
         // And an exact one is the text of its own digits, which is what both forms
         // report an exact number as.
         TypeClass::Decimal | TypeClass::Text | TypeClass::Temporal => {
@@ -3670,7 +4122,8 @@ mod tests {
     /// cannot see it.
     #[test]
     fn the_engine_heap_ceiling_refuses_an_allocation_heavy_statement() {
-        let mut database = Database::open("probe").expect("a confined database opens");
+        let mut database =
+            Database::open("probe", EngineFamily::default()).expect("a confined database opens");
         database
             .run_within(
                 &mut RequestBudget::new(),

@@ -50,7 +50,7 @@ const MASTER_USER: &str = "pgadmin";
 
 /// The database every cluster here is created with (`DBName`), which is the one a
 /// statement may name.
-const DATABASE: &str = "appdb";
+pub(crate) const DATABASE: &str = "appdb";
 
 /// The access key id standing for the account's own published credential: a key neither
 /// STS nor IAM holds a record for, which is the position AWS account root credentials are
@@ -59,12 +59,15 @@ const ACCOUNT_KEY_ID: &str = "AKIDEMULATOR";
 
 /// One emulator: the Data API with the owners of the cluster, the secret, the key it is
 /// encrypted under and the caller's identity mounted beside it, over ONE shared engine.
-struct Cloud {
+///
+/// The suites beside this one that need a cluster whose facts are REAL — a cluster of the
+/// Amazon RDS control plane, running a named engine — drive this same emulator.
+pub(crate) struct Cloud {
     router: MultiServiceRouter,
 }
 
 impl Cloud {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Verifying signatures is the emulator's concern, not this service's; these tests
@@ -140,11 +143,23 @@ impl Cloud {
     /// `http_endpoint` says, RDS managing the master user password — and answer its ARN
     /// and the ARN of the secret RDS minted for it.
     async fn create_cluster(&self, identifier: &str, http_endpoint: bool) -> (String, String) {
+        self.create_cluster_running(identifier, "aurora-postgresql", http_endpoint)
+            .await
+    }
+
+    /// The same, on a cluster running the ENGINE the case needs: the Data API serves both
+    /// of Aurora's engines, and which one a cluster runs is the control plane's own fact.
+    pub(crate) async fn create_cluster_running(
+        &self,
+        identifier: &str,
+        engine: &str,
+        http_endpoint: bool,
+    ) -> (String, String) {
         let created = self
             .rds()
             .create_db_cluster()
             .db_cluster_identifier(identifier)
-            .engine("aurora-postgresql")
+            .engine(engine)
             .master_username(MASTER_USER)
             .manage_master_user_password(true)
             .database_name(DATABASE)
@@ -226,12 +241,17 @@ impl Cloud {
     }
 
     /// `ExecuteStatement` as the account's own credential.
-    async fn execute(&self, body: Value) -> (u16, Value) {
+    pub(crate) async fn execute(&self, body: Value) -> (u16, Value) {
         self.call_as(ACCOUNT_KEY_ID, "/Execute", body).await
     }
 
+    /// `BatchExecuteStatement` as the account's own credential.
+    pub(crate) async fn batch(&self, body: Value) -> (u16, Value) {
+        self.call_as(ACCOUNT_KEY_ID, "/BatchExecute", body).await
+    }
+
     /// `ExecuteStatement` that must be served.
-    async fn run(&self, body: Value) -> Value {
+    pub(crate) async fn run(&self, body: Value) -> Value {
         let (status, answered) = self.execute(body.clone()).await;
         assert_eq!(status, 200, "statement {body} failed with {answered}");
         answered
@@ -318,12 +338,12 @@ fn form_encode(value: &str) -> String {
 }
 
 /// The wire error code restJson1 carries in `__type`.
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
 }
 
 /// The message a refusal carries.
-fn message(body: &Value) -> &str {
+pub(crate) fn message(body: &Value) -> &str {
     body.get("message").and_then(Value::as_str).unwrap_or("")
 }
 

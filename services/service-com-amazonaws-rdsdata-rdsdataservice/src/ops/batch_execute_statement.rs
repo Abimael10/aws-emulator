@@ -9,9 +9,14 @@
 //!
 //! ## Members this operation accepts and does not act on
 //!
-//! The same ones `ExecuteStatement` lists, for the same reasons: `schema` (the
-//! model says it "isn't supported"), and `database` when a `transactionId` is
-//! given, because the transaction already names the database it was opened for.
+//! `database` when a `transactionId` is given, because the transaction already names the
+//! database it was opened for — the same member `ExecuteStatement` lists, for the same
+//! reason.
+//!
+//! ## The member this operation REFUSES
+//!
+//! `schema`: the model says it "isn't supported", and a request carrying it is refused as a
+//! validation fault before anything is resolved, exactly as on `ExecuteStatement`.
 //!
 //! ## Shape of an operation
 //!
@@ -216,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The same precondition chain every call of this service is admitted by: the
         // identity, the cluster, the secret, the login and the database, all resolved
         // before the batch reaches the engine.
-        crate::state::preconditions::admit(
+        let admitted = crate::state::preconditions::admit(
             &*self.engine,
             ctx,
             &crate::state::preconditions::Call {
@@ -228,6 +233,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(_) => None,
                     None => input.database.as_deref(),
                 },
+                // The same member the model documents as unsupported here too, refused for
+                // the same reason.
+                schema: input.schema.as_deref(),
                 transaction_id: input.transaction_id.as_deref(),
             },
         )
@@ -236,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The engine work is synchronous and CPU-bound, and it holds the state
         // lock, so it runs on the blocking pool under one wall clock rather than on
         // an async worker.
-        crate::state::in_data_plane(move || execute_batch(&store, &input))
+        crate::state::in_data_plane(move || execute_batch(&store, &input, admitted.engine))
             .await
             .map_err(statement_failed)
     }
@@ -281,9 +289,13 @@ fn refused(refusal: crate::state::preconditions::Refusal) -> BatchExecuteStateme
 
 /// Run the statement once per parameter set and build the response, inside the
 /// data plane.
+///
+/// `engine` is the engine the addressed cluster runs, for the reason
+/// `ExecuteStatement`'s own handler gives.
 fn execute_batch(
     store: &crate::state::Store,
     input: &BatchExecuteStatementInput,
+    engine: crate::state::EngineFamily,
 ) -> Result<BatchExecuteStatementOutput, crate::state::SqlError> {
     let parameter_sets = input.parameter_sets.clone().unwrap_or_default();
     if parameter_sets.len() > crate::state::MAX_PARAMETER_SETS {
@@ -311,6 +323,7 @@ fn execute_batch(
     };
     let mut state = store.lock();
     let cluster = state.cluster_mut(&input.resource_arn)?;
+    cluster.runs_engine(engine);
     cluster.expire_timed_out_transactions();
 
     // Exactly one `UpdateResult` per execution, in the order the sets arrived:

@@ -596,6 +596,54 @@ async fn a_refused_result_keeps_the_write_the_statement_made() {
         );
     }
 
+    // A value the DATABASE holds and one response cannot CARRY: the same rule, on the
+    // other result the model names ("The size was too large"). The statement runs, the row
+    // stays, and the result is refused — which is why the engine's own value limit is
+    // larger than what a response may carry.
+    let over_the_cap =
+        service_com_amazonaws_rdsdata_rdsdataservice::state::MAX_RESPONSE_BYTES + 1_024;
+    let (status, refused) = api
+        .execute(json!({
+            "sql": format!(
+                "INSERT INTO ledger (id, note) VALUES (6, repeat('x', {over_the_cap})) \
+                 RETURNING note"
+            ),
+        }))
+        .await;
+    assert_eq!(
+        (status, error_code(&refused)),
+        (400, "UnsupportedResultException"),
+        "case a result larger than one response may carry: got {status} {refused}"
+    );
+    assert_eq!(
+        refused["message"],
+        json!(format!(
+            "The result exceeds the size limit {} MB.",
+            service_com_amazonaws_rdsdata_rdsdataservice::state::MAX_RESPONSE_BYTES
+                / (1024 * 1024)
+        )),
+        "case a result larger than one response may carry: expected the size refusal's \
+         own sentence, got {refused}"
+    );
+    landed.push(6);
+    let ids = ledger_ids(&api).await;
+    assert_eq!(
+        ids, landed,
+        "case a result larger than one response may carry: the row the statement wrote \
+         must be present: expected {landed:?}, got {ids:?}"
+    );
+    // And the value the row holds is the whole value the statement computed, read back
+    // through its length rather than its bytes — which no response can carry.
+    let measured = api
+        .run(json!({"sql": "SELECT length(note) AS size FROM ledger WHERE id = 6"}))
+        .await;
+    assert_eq!(
+        measured["records"],
+        json!([[{"longValue": over_the_cap as i64}]]),
+        "case a result larger than one response may carry: expected the stored value's \
+         whole length, got {measured}"
+    );
+
     // A QUERY of the rows those refusals left behind is served, so what was refused is
     // the RESULT of each write and not the rows it wrote.
     let read_back = api
@@ -616,6 +664,349 @@ async fn a_refused_result_keeps_the_write_the_statement_made() {
     assert_eq!(
         ids, landed,
         "case a statement the engine cannot parse: expected nothing written, got {ids:?}"
+    );
+}
+
+/// What AWS tells a caller whose result carries a floating value that is not a number: the
+/// fixed sentence the modelled `UnsupportedResultException` carries for that condition.
+const NON_FINITE_MESSAGE: &str = "NaN and Infinity values are not supported";
+
+/// What AWS tells a caller that carries the `schema` member, whose model documents it as a
+/// member the service does not support: the fixed sentence of that refusal.
+const SCHEMA_UNSUPPORTED_MESSAGE: &str = "The schema parameter isn't supported.";
+
+/// RULE: a floating value that is NOT A NUMBER — the `NaN`, `Infinity` and `-Infinity`
+/// values PostgreSQL documents for every one of its floating types — is kept as the value
+/// it is: the statement RUNS and the row it wrote STAYS, `records` cannot carry the value
+/// (no member of the `Field` union holds one, so the call is refused with
+/// `UnsupportedResultException` and AWS's own sentence for it) and `formatRecordsAs=JSON`
+/// renders it as the string the database displays it as.
+///
+/// The rows differ along which value it is and how the statement spells it (each
+/// documented name, its abbreviation, in either case), and every row is read back three
+/// ways: by the statement that wrote it, by a later statement, and in the JSON form. The
+/// values that come from somewhere else — a parameter the request bound, an element of an
+/// array, a number the engine itself computed (`sql_data_api`) — follow.
+#[tokio::test]
+async fn a_float_that_is_not_a_number_is_kept_and_refused_in_records() {
+    let api = DataApi::new();
+    api.run(json!({
+        "sql": "CREATE TABLE readings (id INT PRIMARY KEY, dbl DOUBLE PRECISION)",
+    }))
+    .await;
+
+    // (case, the value as the statement writes it, the text the database displays it as)
+    let rows: &[(&str, &str, &str)] = &[
+        ("not a number", "'NaN'::float8", "NaN"),
+        ("not a number, in lower case", "'nan'::double precision", "NaN"),
+        ("the positive infinity", "'Infinity'::float8", "Infinity"),
+        ("the positive infinity, abbreviated", "'inf'::float8", "Infinity"),
+        ("the negative infinity", "'-Infinity'::float8", "-Infinity"),
+        ("the negative infinity, abbreviated", "'-INF'::real", "-Infinity"),
+    ];
+    for (index, (case, written, displayed)) in rows.iter().enumerate() {
+        let id = index as i64 + 1;
+        let (status, refused) = api
+            .execute(json!({
+                "sql": format!(
+                    "INSERT INTO readings (id, dbl) VALUES ({id}, {written}) RETURNING dbl"
+                ),
+            }))
+            .await;
+        assert_eq!(
+            (status, error_code(&refused), refused["message"].clone()),
+            (
+                400,
+                "UnsupportedResultException",
+                json!(NON_FINITE_MESSAGE)
+            ),
+            "case {case:?}: expected the unsupported-result refusal, got {status} {refused}"
+        );
+
+        // The statement RAN: the row it wrote is there, read through a column the
+        // refusal is not about.
+        let stored = api
+            .run(json!({"sql": format!("SELECT id FROM readings WHERE id = {id}")}))
+            .await;
+        assert_eq!(
+            stored["records"],
+            json!([[{"longValue": id}]]),
+            "case {case:?}: the refusal shaped the result AFTER the row was written, so the \
+             row must be present, got {stored}"
+        );
+
+        // And the value the column holds is the one that was written: a LATER read of it
+        // earns the same refusal, and the JSON form of that read renders it as the text
+        // the database displays it as.
+        let read_back = format!("SELECT dbl FROM readings WHERE id = {id}");
+        let (status, again) = api.execute(json!({"sql": read_back.clone()})).await;
+        assert_eq!(
+            (status, error_code(&again), again["message"].clone()),
+            (
+                400,
+                "UnsupportedResultException",
+                json!(NON_FINITE_MESSAGE)
+            ),
+            "case {case:?}: reading the stored value back is the same refusal, got {status} \
+             {again}"
+        );
+        let formatted = api
+            .run(json!({"sql": read_back, "formatRecordsAs": "JSON"}))
+            .await;
+        assert_eq!(
+            formatted["formattedRecords"],
+            json!(format!("[{{\"dbl\":\"{displayed}\"}}]")),
+            "case {case:?}: expected the JSON string {displayed:?}, got {formatted}"
+        );
+    }
+
+    // A value the REQUEST carried, cast by the statement to a floating type: the same
+    // value, so the same answer.
+    let (status, refused) = api
+        .execute(json!({
+            "sql": "INSERT INTO readings (id, dbl) VALUES (:id, CAST(:value AS float8)) \
+                    RETURNING dbl",
+            "parameters": [
+                parameter("id", json!({"longValue": 20})),
+                parameter("value", json!({"stringValue": "NaN"})),
+            ],
+        }))
+        .await;
+    assert_eq!(
+        (status, error_code(&refused), refused["message"].clone()),
+        (
+            400,
+            "UnsupportedResultException",
+            json!(NON_FINITE_MESSAGE)
+        ),
+        "case \"a parameter the request bound\": got {status} {refused}"
+    );
+    let formatted = api
+        .run(json!({
+            "sql": "SELECT dbl FROM readings WHERE id = 20",
+            "formatRecordsAs": "JSON",
+        }))
+        .await;
+    assert_eq!(
+        formatted["formattedRecords"],
+        json!("[{\"dbl\":\"NaN\"}]"),
+        "case \"a parameter the request bound\": got {formatted}"
+    );
+
+    // An ELEMENT of an array is the same value in a list: `arrayValue`'s `doubleValues`
+    // holds a double per element and no such value either, and the JSON form renders the
+    // element as that same string.
+    let (status, refused) = api
+        .execute(json!({"sql": "SELECT '{1,NaN}'::float8[] AS vals"}))
+        .await;
+    assert_eq!(
+        (status, error_code(&refused), refused["message"].clone()),
+        (
+            400,
+            "UnsupportedResultException",
+            json!(NON_FINITE_MESSAGE)
+        ),
+        "case \"an element of an array\": got {status} {refused}"
+    );
+    let formatted = api
+        .run(json!({
+            "sql": "SELECT '{1,NaN}'::float8[] AS vals",
+            "formatRecordsAs": "JSON",
+        }))
+        .await;
+    let rendered: Value = serde_json::from_str(
+        formatted["formattedRecords"]
+            .as_str()
+            .unwrap_or_else(|| panic!("formattedRecords must be a string: {formatted}")),
+    )
+    .expect("formattedRecords parses as JSON");
+    assert_eq!(
+        rendered,
+        json!([{"vals": [1.0, "NaN"]}]),
+        "case \"an element of an array\": got {formatted}"
+    );
+
+    // A FINITE value of the same column is unchanged by any of it: it comes back as the
+    // number it is, in both forms.
+    api.run(json!({
+        "sql": "INSERT INTO readings (id, dbl) VALUES (30, '2.5'::float8)",
+    }))
+    .await;
+    let selected = api
+        .run(json!({"sql": "SELECT dbl FROM readings WHERE id = 30"}))
+        .await;
+    assert_eq!(
+        selected["records"],
+        json!([[{"doubleValue": 2.5}]]),
+        "case \"a finite value of the same column\": got {selected}"
+    );
+    let formatted = api
+        .run(json!({
+            "sql": "SELECT dbl FROM readings WHERE id = 30",
+            "formatRecordsAs": "JSON",
+        }))
+        .await;
+    assert_eq!(
+        formatted["formattedRecords"],
+        json!("[{\"dbl\":2.5}]"),
+        "case \"a finite value of the same column\": got {formatted}"
+    );
+}
+
+/// RULE: the `schema` member is one the service does not support — each operation that
+/// models it documents that — so a request carrying it is refused with HTTP 400
+/// `ValidationException` and the fixed sentence AWS words that refusal with, on every
+/// operation that models the member, and nothing the request asked for runs.
+///
+/// The rows differ along the schema the request names (the name of the default schema,
+/// another name, an empty value), along the operation carrying it, and along what the
+/// statement would have done (a read, a write) — because it is the MEMBER that is refused
+/// and not what it names.
+#[tokio::test]
+async fn a_call_carrying_the_schema_member_is_refused() {
+    let api = DataApi::new();
+    given_ledger(&api).await;
+
+    for (case, schema) in [
+        ("the default schema", "public"),
+        ("a schema of another name", "reporting"),
+        ("a schema named as the database is", "ledger"),
+        ("an empty schema", ""),
+    ] {
+        let calls = vec![
+            (
+                "ExecuteStatement over a read",
+                api.execute(json!({"sql": "SELECT 1 AS one", "schema": schema}))
+                    .await,
+            ),
+            (
+                "ExecuteStatement over a write",
+                api.execute(json!({
+                    "sql": "INSERT INTO ledger (id, note) VALUES (7, 'schema')",
+                    "schema": schema,
+                }))
+                .await,
+            ),
+            (
+                "BatchExecuteStatement",
+                api.batch(json!({
+                    "sql": "INSERT INTO ledger (id, note) VALUES (:id, :note)",
+                    "parameterSets": [[
+                        parameter("id", json!({"longValue": 8})),
+                        parameter("note", json!({"stringValue": "schema"})),
+                    ]],
+                    "schema": schema,
+                }))
+                .await,
+            ),
+        ];
+        for (operation, (status, body)) in calls {
+            assert_eq!(
+                (status, error_code(&body), body["message"].clone()),
+                (
+                    400,
+                    "ValidationException",
+                    json!(SCHEMA_UNSUPPORTED_MESSAGE)
+                ),
+                "case {case:?} on {operation}: expected the unsupported-member refusal, got \
+                 {status} {body}"
+            );
+        }
+    }
+
+    // None of those calls ran: the rows the writes would have left are not there.
+    let ids = ledger_ids(&api).await;
+    assert_eq!(
+        ids,
+        vec![1],
+        "case \"after every refusal\": a refused call runs nothing, got {ids:?}"
+    );
+
+    // The same calls without the member are served, which is what makes the refusals
+    // above the MEMBER being refused and not the statements being wrong.
+    let served = api
+        .run(json!({"sql": "INSERT INTO ledger (id, note) VALUES (7, 'no schema')"}))
+        .await;
+    assert_eq!(
+        number(&served, "numberOfRecordsUpdated"),
+        1,
+        "case \"the same statement without the member\": got {served}"
+    );
+}
+
+/// The ceiling the model declares for a statement: `ExecuteStatement$sql` targets
+/// `SqlStatement`, whose `@length` max is 65536
+/// (`smithy_query(query="operation", operation="ExecuteStatement")`).
+const SQL_CHARACTER_CEILING: usize = 65_536;
+
+/// RULE: a statement longer than the ceiling the model declares for `sql` is refused as a
+/// validation fault whose sentence names the NUMBER OF CHARACTERS a statement may carry —
+/// on every operation that takes a statement — and nothing of it runs, while a statement
+/// AT the ceiling is served.
+///
+/// The rows differ along how long the statement is: at the ceiling, one character past it,
+/// and far past it; each is sent on both operations that carry a statement.
+#[tokio::test]
+async fn a_statement_longer_than_the_ceiling_is_refused_by_its_length() {
+    let api = DataApi::new();
+    given_ledger(&api).await;
+
+    // A statement of exactly `length` characters: a read, padded out by a comment, so
+    // what differs between the rows is the LENGTH and nothing else.
+    let padded = |length: usize| -> String {
+        const PREFIX: &str = "SELECT 1 AS one /*";
+        const SUFFIX: &str = "*/";
+        let fill = length.saturating_sub(PREFIX.len() + SUFFIX.len());
+        format!("{PREFIX}{}{SUFFIX}", "x".repeat(fill))
+    };
+    let at_the_ceiling = padded(SQL_CHARACTER_CEILING);
+    assert_eq!(
+        at_the_ceiling.chars().count(),
+        SQL_CHARACTER_CEILING,
+        "case \"the statement at the ceiling\": the padded statement must be exactly at it"
+    );
+    let served = api.run(json!({"sql": at_the_ceiling})).await;
+    assert_eq!(
+        served["records"],
+        json!([[{"longValue": 1}]]),
+        "case \"a statement at the ceiling\": it must be served, got {served}"
+    );
+
+    let expected = format!(
+        "Number of characters in SQLStatement is longer than {SQL_CHARACTER_CEILING}"
+    );
+    for (case, length) in [
+        ("one character past the ceiling", SQL_CHARACTER_CEILING + 1),
+        ("far past the ceiling", SQL_CHARACTER_CEILING * 2),
+    ] {
+        let too_long = padded(length);
+        let calls = vec![
+            (
+                "ExecuteStatement",
+                api.execute(json!({"sql": too_long.clone()})).await,
+            ),
+            (
+                "BatchExecuteStatement",
+                api.batch(json!({"sql": too_long.clone(), "parameterSets": [[]]}))
+                    .await,
+            ),
+        ];
+        for (operation, (status, body)) in calls {
+            assert_eq!(
+                (status, error_code(&body), body["message"].clone()),
+                (400, "ValidationException", json!(expected)),
+                "case {case:?} on {operation}: expected the character-ceiling refusal, got \
+                 {status} {body}"
+            );
+        }
+    }
+
+    // And nothing those refusals carried ran: the ledger is as the setup left it.
+    let ids = ledger_ids(&api).await;
+    assert_eq!(
+        ids,
+        vec![1],
+        "case \"after the refusals\": a refused statement runs nothing, got {ids:?}"
     );
 }
 

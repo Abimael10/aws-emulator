@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The statements the Data API's OWN ENGINES spell, and the one result a batch of no
-//! parameter sets answers with, over the real wire.
+//! The statements the Data API's OWN ENGINES spell, the DIAGNOSTICS each of those engines
+//! words an error with, and the one result a batch of no parameter sets answers with, over
+//! the real wire.
 //!
 //! Every call goes through the router, so routing, restJson1 deserialization, the
 //! handler and serialization are all exercised; the client harness is the one
-//! `sql_data_api` builds.
+//! `sql_data_api` builds — except where a case needs a cluster whose ENGINE is a real fact
+//! of the Amazon RDS control plane, which is the emulator `call_preconditions` assembles.
 
 use serde_json::{json, Value};
 
+use crate::call_preconditions::{Cloud, DATABASE};
 use crate::sql_data_api::{error_code, list, number, parameter, DataApi};
 
 /// RULE: the Data API runs a statement written in the dialect of either engine it
@@ -542,5 +545,203 @@ async fn a_batch_of_no_parameter_sets_runs_the_statement_once() {
                  expected {remaining}, got {after}"
             );
         }
+    }
+}
+
+/// One condition the database raises, with the statement that raises it and the sentence
+/// each engine words it with.
+struct Diagnostic {
+    case: &'static str,
+    sql: &'static str,
+    /// What an Aurora MySQL cluster answers: MySQL's own sentence, its error number and
+    /// its SQLSTATE, from its "Server Error Message Reference".
+    on_mysql: &'static str,
+    /// And what an Aurora PostgreSQL one answers: PostgreSQL's own sentence and the
+    /// SQLSTATE from its "Error Codes" appendix.
+    on_postgresql: &'static str,
+}
+
+/// RULE: an error the DATABASE raised while running a statement reaches the caller in the
+/// words of the ENGINE THE ADDRESSED CLUSTER RUNS — that engine's own sentence for the
+/// condition, its own vendor error number where it has one, and its own SQLSTATE, which is
+/// what a client branches, retries and logs on — and the names and values each sentence
+/// carries (the constraint, the index, the relation, the column, the colliding value) are
+/// the ones the schema and the request really hold. So one and the same statement, refused
+/// by one and the same condition, is worded one way on an Aurora MySQL cluster and another
+/// on an Aurora PostgreSQL one, while the modelled CLASS of the refusal
+/// (`DatabaseErrorException`) is the same on both.
+///
+/// The rows differ along the condition the database raised (a value the primary key already
+/// holds, a value a unique key over another column holds, a NULL in a column that admits
+/// none, a relation that is not there, a column nothing declares) and along the engine the
+/// cluster runs. The duplicate-key rows differ further along where the colliding value
+/// comes from — the statement's own literal, a parameter of the request, and a statement
+/// that settles no single value for the key at all, which each engine words its own way.
+#[tokio::test]
+async fn an_error_the_database_raised_is_worded_as_the_clusters_engine_words_it() {
+    // (the engine the cluster runs, the identifier it is created under)
+    let engines = [
+        ("aurora-mysql", "emu-dialect-mysql"),
+        ("aurora-postgresql", "emu-dialect-postgresql"),
+    ];
+    let conditions: &[Diagnostic] = &[
+        Diagnostic {
+            case: "a value the primary key already holds, written by the statement",
+            sql: "INSERT INTO ledger (id, label, note) VALUES (1, 'other', 'again')",
+            on_mysql: "Duplicate entry '1' for key 'ledger.PRIMARY'; Error code: 1062; \
+                       SQLState: 23000",
+            on_postgresql: "ERROR: duplicate key value violates unique constraint \
+                            \"ledger_pkey\"; SQLState: 23505",
+        },
+        Diagnostic {
+            case: "a value a unique key over another column already holds",
+            sql: "INSERT INTO ledger (id, label, note) VALUES (2, 'taken', 'again')",
+            on_mysql: "Duplicate entry 'taken' for key 'ledger.label'; Error code: 1062; \
+                       SQLState: 23000",
+            on_postgresql: "ERROR: duplicate key value violates unique constraint \
+                            \"ledger_label_key\"; SQLState: 23505",
+        },
+        Diagnostic {
+            case: "a duplicate key the statement settles no single value for",
+            sql: "INSERT INTO ledger (id, label, note) SELECT id, label, note FROM ledger",
+            on_mysql: "Can't write; duplicate key in table 'ledger'; Error code: 1022; \
+                       SQLState: 23000",
+            on_postgresql: "ERROR: duplicate key value violates unique constraint \
+                            \"ledger_label_key\"; SQLState: 23505",
+        },
+        Diagnostic {
+            case: "a NULL in a column that admits none",
+            sql: "INSERT INTO ledger (id, label, note) VALUES (3, 'three', NULL)",
+            on_mysql: "Column 'note' cannot be null; Error code: 1048; SQLState: 23000",
+            on_postgresql: "ERROR: null value in column \"note\" of relation \"ledger\" \
+                            violates not-null constraint; SQLState: 23502",
+        },
+        Diagnostic {
+            case: "a relation the database does not hold",
+            sql: "INSERT INTO absent (id) VALUES (4)",
+            on_mysql: "Table 'appdb.absent' doesn't exist; Error code: 1146; SQLState: 42S02",
+            on_postgresql: "ERROR: relation \"absent\" does not exist; SQLState: 42P01",
+        },
+        Diagnostic {
+            case: "a column nothing declares, in a query",
+            sql: "SELECT missing FROM ledger",
+            on_mysql: "Unknown column 'missing' in 'field list'; Error code: 1054; \
+                       SQLState: 42S22",
+            on_postgresql: "ERROR: column \"missing\" does not exist; SQLState: 42703",
+        },
+        Diagnostic {
+            case: "a column nothing declares, compared in the condition",
+            sql: "SELECT id FROM ledger WHERE missing = 1",
+            on_mysql: "Unknown column 'missing' in 'where clause'; Error code: 1054; \
+                       SQLState: 42S22",
+            on_postgresql: "ERROR: column \"missing\" does not exist; SQLState: 42703",
+        },
+        Diagnostic {
+            case: "a column nothing declares, named in the ordering",
+            sql: "SELECT id FROM ledger ORDER BY missing",
+            on_mysql: "Unknown column 'missing' in 'order clause'; Error code: 1054; \
+                       SQLState: 42S22",
+            on_postgresql: "ERROR: column \"missing\" does not exist; SQLState: 42703",
+        },
+    ];
+
+    for (engine, identifier) in engines {
+        let cloud = Cloud::new();
+        let (resource_arn, secret_arn) = cloud
+            .create_cluster_running(identifier, engine, true)
+            .await;
+        let call = |members: Value| {
+            let mut members = members;
+            members["resourceArn"] = json!(resource_arn);
+            members["secretArn"] = json!(secret_arn);
+            members["database"] = json!(DATABASE);
+            members
+        };
+        // The schema every row below is refused against, created through the Data API
+        // itself: a key, a unique column beside it and a column that admits no NULL.
+        for ddl in [
+            "CREATE TABLE ledger (id INT PRIMARY KEY, label VARCHAR(16) UNIQUE, \
+             note VARCHAR(16) NOT NULL)",
+            "INSERT INTO ledger (id, label, note) VALUES (1, 'taken', 'first')",
+        ] {
+            let served = cloud.run(call(json!({"sql": ddl}))).await;
+            assert!(
+                served.get("message").is_none(),
+                "setup on {engine}: {ddl} must be served, got {served}"
+            );
+        }
+
+        for condition in conditions {
+            let expected = if engine == "aurora-mysql" {
+                condition.on_mysql
+            } else {
+                condition.on_postgresql
+            };
+            let (status, body) = cloud.execute(call(json!({"sql": condition.sql}))).await;
+            assert_eq!(
+                (status, error_code(&body), body["message"].clone()),
+                (400, "DatabaseErrorException", json!(expected)),
+                "case {:?} on {engine}: expected that engine's own diagnostic, got {status} \
+                 {body}",
+                condition.case
+            );
+        }
+
+        // The VALUE a duplicate-key diagnostic names is the one the call really carried,
+        // whether the statement wrote it or a parameter bound it — on either path a
+        // statement reaches the engine by.
+        let bound = json!([
+            parameter("id", json!({"longValue": 1})),
+            parameter("label", json!({"stringValue": "bound"})),
+            parameter("note", json!({"stringValue": "bound"})),
+        ]);
+        let parameterised =
+            "INSERT INTO ledger (id, label, note) VALUES (:id, :label, :note)";
+        let expected_bound = if engine == "aurora-mysql" {
+            "Duplicate entry '1' for key 'ledger.PRIMARY'; Error code: 1062; SQLState: 23000"
+        } else {
+            "ERROR: duplicate key value violates unique constraint \"ledger_pkey\"; \
+             SQLState: 23505"
+        };
+        let calls = vec![
+            (
+                "ExecuteStatement",
+                cloud
+                    .execute(call(json!({"sql": parameterised, "parameters": bound})))
+                    .await,
+            ),
+            (
+                "BatchExecuteStatement",
+                cloud
+                    .batch(call(json!({
+                        "sql": parameterised,
+                        "parameterSets": [[
+                            parameter("id", json!({"longValue": 1})),
+                            parameter("label", json!({"stringValue": "batched"})),
+                            parameter("note", json!({"stringValue": "batched"})),
+                        ]],
+                    })))
+                    .await,
+            ),
+        ];
+        for (operation, (status, body)) in calls {
+            assert_eq!(
+                (status, error_code(&body), body["message"].clone()),
+                (400, "DatabaseErrorException", json!(expected_bound)),
+                "case \"a key a parameter bound\" on {engine} through {operation}: got \
+                 {status} {body}"
+            );
+        }
+
+        // None of those refusals wrote anything: the row the setup stored is the only one.
+        let rows = cloud
+            .run(call(json!({"sql": "SELECT count(*) AS rows FROM ledger"})))
+            .await;
+        assert_eq!(
+            rows["records"],
+            json!([[{"longValue": 1}]]),
+            "case \"after every refusal\" on {engine}: a refused statement writes nothing, \
+             got {rows}"
+        );
     }
 }

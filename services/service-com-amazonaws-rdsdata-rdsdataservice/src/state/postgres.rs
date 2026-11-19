@@ -41,6 +41,13 @@
 //! rather than about the rows of one of them, and each database here is its own engine:
 //! [`namespace_statement`] is what recognises them, and the cluster applies them.
 //!
+//! ## The diagnostics here are PostgreSQL's
+//!
+//! An error the DATABASE raised reaches the caller in the words of the engine the addressed
+//! cluster RUNS, so the sentences below are the ones an Aurora PostgreSQL cluster answers
+//! with; `crate::state::mysql` holds the same conditions as an Aurora MySQL cluster words
+//! them, and `crate::state::Database::in_the_engines_words` is what chooses between them.
+//!
 //! ## The type catalog
 //!
 //! [`pg_type`] maps a type as a declaration or a cast spells it to the type
@@ -61,15 +68,17 @@ use std::ops::ControlFlow;
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CastKind, ColumnDef, ColumnOption, ColumnOptionDef,
     ConflictTarget, DataType, DoUpdate, ExactNumberInfo, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, Ident, ObjectName, ObjectNamePart, ObjectType, OnConflict,
-    OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableConstraint, TableFactor,
-    TableObject, Value, visit_expressions, visit_expressions_mut,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, ObjectName, ObjectNamePart,
+    ObjectType, OnConflict, OnConflictAction, OnInsert, OrderByKind, Query, SelectItem, SetExpr,
+    Statement, TableConstraint, TableFactor, TableObject, Value, visit_expressions,
+    visit_expressions_mut,
 };
 use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect};
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
+use super::condition::{Condition, condition_of, covers_the_same_columns};
 use super::{MAX_DECLARED_ARGUMENT, SqlError};
 
 /// How a name the caller wrote is rendered for the engine.
@@ -201,11 +210,57 @@ pub(super) const MULTISTATEMENT_REFUSAL: &str = "Multistatements aren't supporte
 /// multidimensional array."
 pub(super) const MULTIDIMENSIONAL_ARRAY: &str = "The result contains a multidimensional array.";
 
-/// What the Data API says about a floating value that is not a number at all: JSON has no
-/// form for `NaN` or `Infinity`, so a result set carrying one cannot be rendered as the
-/// single JSON string `formatRecordsAs=JSON` asks for, and the modelled
-/// `UnsupportedResultException` says so in AWS's own words.
+/// What the Data API says about a floating value that is not a number at all: a `Field`
+/// has no member that carries one — `doubleValue` is a number and `isNull` would say the
+/// value is missing — so a result set carrying one in `records` is refused, and the
+/// modelled `UnsupportedResultException` says so in AWS's own words.
 pub(super) const NON_FINITE_FLOAT: &str = "NaN and Infinity values are not supported";
+
+/// What the database DISPLAYS a floating value that is not a number as: the three spellings
+/// PostgreSQL's "Data Types" chapter documents for the special values of its floating
+/// types, which is the text such a value is written and read back as.
+const NOT_A_NUMBER: &str = "NaN";
+const POSITIVE_INFINITY: &str = "Infinity";
+const NEGATIVE_INFINITY: &str = "-Infinity";
+
+/// The non-finite value a float type's INPUT names, as the database displays it, and `None`
+/// for text that names a number or nothing at all.
+///
+/// PostgreSQL's floating types accept the special values `NaN`, `Infinity` and `-Infinity`
+/// — and the abbreviations `inf` and `-inf` — "in a case-insensitive manner", which is the
+/// input this reads. The engine behind this data plane has no form of its own for such a
+/// value, so a column holds it as this text; reading it back is the same question, which is
+/// why one function answers both.
+pub(super) fn non_finite_float(text: &str) -> Option<&'static str> {
+    let trimmed = text.trim();
+    let negative = trimmed.starts_with('-');
+    let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+    if unsigned.eq_ignore_ascii_case(NOT_A_NUMBER) {
+        return Some(NOT_A_NUMBER);
+    }
+    if unsigned.eq_ignore_ascii_case("inf") || unsigned.eq_ignore_ascii_case(POSITIVE_INFINITY) {
+        return Some(if negative {
+            NEGATIVE_INFINITY
+        } else {
+            POSITIVE_INFINITY
+        });
+    }
+    None
+}
+
+/// The same for a float the ENGINE holds as one: the text the database displays a
+/// non-finite double as, and `None` for a number.
+pub(super) fn non_finite_display(number: f64) -> Option<&'static str> {
+    if number.is_nan() {
+        Some(NOT_A_NUMBER)
+    } else if number == f64::INFINITY {
+        Some(POSITIVE_INFINITY)
+    } else if number == f64::NEG_INFINITY {
+        Some(NEGATIVE_INFINITY)
+    } else {
+        None
+    }
+}
 
 /// How the Data API renders an error the DATABASE raised: the engine's own message,
 /// introduced the way PostgreSQL introduces an error, and closed with the SQLSTATE of the
@@ -322,39 +377,19 @@ const SQLSTATE_DATATYPE_MISMATCH: &str = "42804";
 /// (class 22, invalid textual representation).
 const SQLSTATE_INVALID_TEXT_REPRESENTATION: &str = "22P02";
 
-/// How the SQL engine behind this front end introduces each condition in its own
-/// diagnostics, which is what is read to recognise the condition. Nothing is matched on
-/// the statement's text: this reads the ENGINE's answer, not the caller's SQL.
-const ENGINE_UNIQUE_VIOLATION: &str = "UNIQUE constraint failed: ";
-const ENGINE_NOT_NULL_VIOLATION: &str = "NOT NULL constraint failed: ";
-const ENGINE_UNDEFINED_TABLE: &str = "no such table: ";
-const ENGINE_UNDEFINED_COLUMN: &str = "no such column: ";
-/// The engine's other spelling of an undefined column, which names the table too: "table
-/// <table> has no column named <column>".
-const ENGINE_UNDEFINED_COLUMN_OF: &str = "table ";
-const ENGINE_UNDEFINED_COLUMN_OF_MIDDLE: &str = " has no column named ";
-
-/// The NAME the engine's diagnostic is about, read out of the text that follows its
-/// prefix: the engine adds a hint and the statement it was parsing to some of its
-/// messages, where PostgreSQL's own sentence carries the name alone.
-fn named_in(rest: &str) -> String {
-    let head = rest.split(" - ").next().unwrap_or(rest).trim();
-    let head = head.split_whitespace().next().unwrap_or(head);
-    head.trim_matches('"').to_string()
-}
-
-/// One column a constraint covers, as the engine names it: `table.column`.
-fn split_qualified(qualified: &str) -> Option<(&str, &str)> {
-    qualified.trim().rsplit_once('.')
-}
+// How the SQL engine behind this front end introduces each condition in its own
+// diagnostics is read ONCE, beside the other wording of the same conditions
+// (`super::condition`); nothing here is matched on the statement's text.
 
 /// The diagnostic the DATABASE THIS API ADVERTISES words an engine error with, or `None`
 /// for a condition this front end does not word — whose own text the caller sees.
 ///
-/// The Data API answers for Aurora PostgreSQL, so an error the database raised reaches the
-/// caller in PostgreSQL's words and with PostgreSQL's SQLSTATE, whatever engine actually
-/// ran the statement: that text and that code are what a client branches on, so an
-/// engine-specific sentence in their place is a sentence no client can classify.
+/// An error the database raised reaches the caller in PostgreSQL's words and with
+/// PostgreSQL's SQLSTATE on an Aurora PostgreSQL cluster, whatever engine actually ran the
+/// statement: that text and that code are what a client branches on, so an
+/// engine-specific sentence in their place is a sentence no client can classify. A cluster
+/// running the API's OTHER engine is answered in that engine's words instead
+/// ([`super::mysql::mysql_diagnostic`]).
 ///
 /// `primary_key_of` answers the columns a table's PRIMARY KEY covers, which is what
 /// decides the NAME of the violated constraint: PostgreSQL names a table's primary-key
@@ -364,73 +399,44 @@ pub(super) fn postgresql_diagnostic(
     engine_message: &str,
     primary_key_of: &dyn Fn(&str) -> Vec<String>,
 ) -> Option<String> {
-    if let Some(columns) = engine_message.strip_prefix(ENGINE_UNIQUE_VIOLATION) {
-        let qualified: Vec<(&str, &str)> = columns.split(',').filter_map(split_qualified).collect();
-        let (table, _) = *qualified.first()?;
-        let violated: Vec<String> = qualified
-            .iter()
-            .map(|(_, column)| (*column).to_string())
-            .collect();
-        let constraint = if covers_the_same_columns(&primary_key_of(table), &violated) {
-            format!("{table}_pkey")
-        } else {
-            format!("{table}_{}_key", violated.join("_"))
-        };
-        return Some(postgresql_error(
-            &format!("duplicate key value violates unique constraint \"{constraint}\""),
-            SQLSTATE_UNIQUE_VIOLATION,
-        ));
-    }
-    if let Some(column) = engine_message.strip_prefix(ENGINE_NOT_NULL_VIOLATION) {
-        let (table, column) = split_qualified(column)?;
-        return Some(postgresql_error(
+    Some(match condition_of(engine_message)? {
+        Condition::UniqueViolation { table, columns } => {
+            let constraint = if covers_the_same_columns(&primary_key_of(&table), &columns) {
+                format!("{table}_pkey")
+            } else {
+                format!("{table}_{}_key", columns.join("_"))
+            };
+            postgresql_error(
+                &format!("duplicate key value violates unique constraint \"{constraint}\""),
+                SQLSTATE_UNIQUE_VIOLATION,
+            )
+        }
+        Condition::NotNullViolation { table, column } => postgresql_error(
             &format!(
                 "null value in column \"{column}\" of relation \"{table}\" violates not-null \
                  constraint"
             ),
             SQLSTATE_NOT_NULL_VIOLATION,
-        ));
-    }
-    if let Some(table) = engine_message.strip_prefix(ENGINE_UNDEFINED_TABLE) {
-        return Some(postgresql_error(
-            &format!("relation \"{}\" does not exist", named_in(table)),
+        ),
+        Condition::UndefinedTable { table } => postgresql_error(
+            &format!("relation \"{table}\" does not exist"),
             SQLSTATE_UNDEFINED_TABLE,
-        ));
-    }
-    if let Some(column) = engine_message.strip_prefix(ENGINE_UNDEFINED_COLUMN) {
-        return Some(postgresql_error(
-            &format!("column \"{}\" does not exist", named_in(column)),
+        ),
+        Condition::UndefinedColumn {
+            table: None,
+            column,
+        } => postgresql_error(
+            &format!("column \"{column}\" does not exist"),
             SQLSTATE_UNDEFINED_COLUMN,
-        ));
-    }
-    if let Some((table, column)) = engine_message
-        .strip_prefix(ENGINE_UNDEFINED_COLUMN_OF)
-        .and_then(|rest| rest.split_once(ENGINE_UNDEFINED_COLUMN_OF_MIDDLE))
-    {
-        return Some(postgresql_error(
-            &format!(
-                "column \"{}\" of relation \"{}\" does not exist",
-                named_in(column),
-                named_in(table)
-            ),
+        ),
+        Condition::UndefinedColumn {
+            table: Some(table),
+            column,
+        } => postgresql_error(
+            &format!("column \"{column}\" of relation \"{table}\" does not exist"),
             SQLSTATE_UNDEFINED_COLUMN,
-        ));
-    }
-    None
-}
-
-/// Whether two lists of column names cover the same columns, compared the way the engine
-/// and the catalog spell them (without regard to case) and without regard to order.
-fn covers_the_same_columns(one: &[String], other: &[String]) -> bool {
-    if one.is_empty() || one.len() != other.len() {
-        return false;
-    }
-    let fold = |names: &[String]| {
-        let mut folded: Vec<String> = names.iter().map(|name| name.to_lowercase()).collect();
-        folded.sort_unstable();
-        folded
-    };
-    fold(one) == fold(other)
+        ),
+    })
 }
 
 /// What a value of a type is, as far as the `Field` union is concerned: the
@@ -633,6 +639,10 @@ pub struct Plan {
     /// reads one directly — which is what says that an ALIAS renamed a column of a
     /// table rather than computing a new value.
     pub result_origins: Vec<Option<ColumnOrigin>>,
+    /// Every column name the statement writes, with the CLAUSE it writes it in: what a
+    /// diagnostic about one of those names reports, where the engine's own answer names
+    /// the column alone (`crate::state::mysql`).
+    pub named_columns: Vec<(String, NamedIn)>,
     /// The ONE table this statement reads or writes, when it names exactly one: the
     /// table a wildcard's columns come from.
     pub sole_table: Option<String>,
@@ -656,6 +666,10 @@ pub struct Plan {
     /// The column each NAMED placeholder of the statement assigns its value to, where
     /// the statement assigns one directly.
     pub assigned_values: Vec<AssignedValue>,
+    /// The value the statement assigns to each column it names, where it assigns exactly
+    /// one: what the duplicate-key diagnostic of the engine the cluster runs names as the
+    /// colliding value (`crate::state::mysql`).
+    pub assigned_cells: Vec<(String, AssignedCell)>,
     /// The type a CAST the statement writes names for the value a named placeholder
     /// carries: `(placeholder, type)`, which is the type that value has to be a value
     /// OF.
@@ -697,6 +711,20 @@ pub struct AssignedValue {
     pub position: Option<usize>,
 }
 
+/// One value a statement assigns to a column, as the STATEMENT wrote it.
+///
+/// What this is for: an engine's duplicate-key diagnostic names the VALUE that collided,
+/// and the only places that value exists are the statement's own text and the parameters
+/// the request carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignedCell {
+    /// The name of the parameter that carries it, WITHOUT the prefix that introduces it in
+    /// the statement.
+    Parameter(String),
+    /// The literal the statement wrote, as the value it names.
+    Literal(String),
+}
+
 impl Plan {
     /// The type the statement's text gives result column `index`, when it gives
     /// one. The list is used only when it covers the result set exactly: a
@@ -718,6 +746,105 @@ impl Plan {
         }
         self.result_origins.get(index).and_then(Option::as_ref)
     }
+
+    /// The CLAUSE this statement writes `column` in, and `None` for a name it does not
+    /// write — one the engine resolved through a wildcard, or a name of its own.
+    ///
+    /// The FIRST clause that writes it, in the order a statement's clauses are resolved,
+    /// because that is the one a diagnostic about the name reports.
+    pub fn named_in(&self, column: &str) -> Option<NamedIn> {
+        self.named_columns
+            .iter()
+            .find(|(named, _)| named.eq_ignore_ascii_case(column))
+            .map(|(_, clause)| *clause)
+    }
+}
+
+/// Where in a statement a NAME is written, which is what a diagnostic about that name
+/// reports: the engine's own answer names the column alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedIn {
+    /// The values the statement selects, or the columns it assigns.
+    Projection,
+    /// The condition it chooses rows by.
+    Where,
+    /// The expressions it groups those rows by.
+    GroupBy,
+    /// The condition over the groups.
+    Having,
+    /// The order it returns rows in.
+    OrderBy,
+    /// The condition a join matches rows on.
+    JoinOn,
+}
+
+/// Every column name the statement writes, with the clause it writes it in — in the order
+/// a statement's clauses are RESOLVED, so the first entry for a name is the clause a
+/// diagnostic about it reports.
+///
+/// Read from the parse, like every other decision here. A statement that is not a query
+/// names its columns where it selects or assigns them, which is the clause a diagnostic
+/// about one of them reports.
+fn named_columns(statement: &Statement) -> Vec<(String, NamedIn)> {
+    let mut named = Vec::new();
+    let Statement::Query(query) = statement else {
+        collect_names(statement, NamedIn::Projection, &mut named);
+        return named;
+    };
+    if let Some(SetExpr::Select(select)) = leftmost_select(&query.body) {
+        for item in &select.projection {
+            match item {
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    collect_names(expr, NamedIn::Projection, &mut named);
+                }
+                _ => {}
+            }
+        }
+        if let Some(selection) = &select.selection {
+            collect_names(selection, NamedIn::Where, &mut named);
+        }
+        if let GroupByExpr::Expressions(expressions, _) = &select.group_by {
+            for expression in expressions {
+                collect_names(expression, NamedIn::GroupBy, &mut named);
+            }
+        }
+        if let Some(having) = &select.having {
+            collect_names(having, NamedIn::Having, &mut named);
+        }
+        // Everything the FROM clause writes, which is where a join's own condition is.
+        for item in &select.from {
+            collect_names(item, NamedIn::JoinOn, &mut named);
+        }
+    }
+    if let Some(OrderByKind::Expressions(expressions)) =
+        query.order_by.as_ref().map(|order_by| &order_by.kind)
+    {
+        for expression in expressions {
+            collect_names(&expression.expr, NamedIn::OrderBy, &mut named);
+        }
+    }
+    named
+}
+
+/// Every column name one part of a statement writes, as the NAME a diagnostic reports: the
+/// last part of a qualified reference, which is the column's own name.
+fn collect_names<V: sqlparser::ast::Visit>(
+    part: &V,
+    clause: NamedIn,
+    named: &mut Vec<(String, NamedIn)>,
+) {
+    let _ = visit_expressions(part, |expr| {
+        match expr {
+            Expr::Identifier(name) => named.push((name.value.clone(), clause)),
+            Expr::CompoundIdentifier(parts) => {
+                if let Some(column) = parts.last() {
+                    named.push((column.value.clone(), clause));
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::<()>::Continue(())
+    });
 }
 
 /// The column of the table a result column READS: which column of which table a value
@@ -768,6 +895,9 @@ pub fn plan(sql: &str, catalog: &Catalog<'_>) -> Result<Plan, SqlError> {
     // PostgreSQL target type with the engine type that holds its values.
     let result_types = result_types(&statement, catalog);
     let result_origins = result_origins(&statement);
+    // And the clause the statement writes each of its column names in, which is what a
+    // diagnostic about one of those names reports.
+    let named_columns = named_columns(&statement);
     let sole_table = sole_table(&statement);
     // A value the statement WRITES OUT as text has to be a value of the type it is
     // written as, which the database decides before it computes anything with it.
@@ -776,7 +906,16 @@ pub fn plan(sql: &str, catalog: &Catalog<'_>) -> Result<Plan, SqlError> {
     // wrap a placeholder in an expression, and what a value is assigned to is what the
     // statement itself wrote.
     let (assigned_table, assigned_values) = assigned_values(&statement, sql, &tokens);
+    // And the VALUE it assigns to each of them, for the same reason: the diagnostic a
+    // duplicate key earns names the value that collided, which only the statement and the
+    // request's parameters hold.
+    let assigned_cells = assigned_cells(&statement);
     let cast_values = cast_values(&statement);
+    // A value of an ARRAY type written out AS TEXT is written in the array output format
+    // the database documents, which only the statement's text and the schema can say is
+    // what is happening — so it is rewritten here, while the catalog is at hand and
+    // before the rewrite below replaces the cast.
+    plan_array_output(&mut statement, catalog);
     normalise(&mut statement);
     // An upsert the caller wrote in MySQL's spelling is the same upsert the engine
     // spells with the conflicting key named, which only the table's own declaration
@@ -797,10 +936,12 @@ pub fn plan(sql: &str, catalog: &Catalog<'_>) -> Result<Plan, SqlError> {
         inserted_table: inserted_table(&statement),
         assigned_table,
         assigned_values,
+        assigned_cells,
         cast_values,
         sql,
         result_types,
         result_origins,
+        named_columns,
         sole_table,
         sequence_columns,
         follow_on,
@@ -995,6 +1136,65 @@ fn assigned_values(
             (bare_name(name), assigned)
         }
         _ => (None, Vec::new()),
+    }
+}
+
+/// The value one statement assigns to each column it names, where it assigns EXACTLY ONE:
+/// an insert of one row of values, and each of an update's assignments.
+///
+/// What this is for: the duplicate-key diagnostic of either engine names the VALUE that
+/// collided, and only the statement and the request's parameters hold it.
+///
+/// A statement that assigns a column MORE than one value — an insert of several rows, one
+/// whose rows come from a query — settles no single value for it, so it reports none and
+/// the diagnostic says so in the engine's own other words for a duplicate key.
+fn assigned_cells(statement: &Statement) -> Vec<(String, AssignedCell)> {
+    match statement {
+        Statement::Insert(insert) => {
+            let Some(SetExpr::Values(values)) = insert
+                .source
+                .as_deref()
+                .map(|source| source.body.as_ref())
+            else {
+                return Vec::new();
+            };
+            let [row] = values.rows.as_slice() else {
+                return Vec::new();
+            };
+            insert
+                .columns
+                .iter()
+                .zip(row)
+                .filter_map(|(column, value)| Some((column.value.clone(), assigned_cell(value)?)))
+                .collect()
+        }
+        Statement::Update { assignments, .. } => assignments
+            .iter()
+            .filter_map(|assignment| {
+                let AssignmentTarget::ColumnName(column) = &assignment.target else {
+                    return None;
+                };
+                Some((bare_name(column)?, assigned_cell(&assignment.value)?))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One assigned value as the statement wrote it — a parameter's name, or the literal
+/// itself — and `None` for an expression that is neither, whose value only running it
+/// would answer.
+fn assigned_cell(value: &Expr) -> Option<AssignedCell> {
+    if let Some(placeholder) = placeholder_name(value) {
+        return Some(AssignedCell::Parameter(placeholder));
+    }
+    let Expr::Value(literal) = value else {
+        return None;
+    };
+    match &literal.value {
+        Value::Number(digits, _) => Some(AssignedCell::Literal(digits.clone())),
+        Value::SingleQuotedString(text) => Some(AssignedCell::Literal(text.clone())),
+        _ => None,
     }
 }
 
@@ -1345,7 +1545,7 @@ fn normalise(statement: &mut Statement) {
                 expr: value,
                 data_type,
                 ..
-            } => match read_binary_input(value, data_type) {
+            } => match read_typed_input(value, data_type) {
                 Some(built) => *expr = built,
                 None => {
                     if matches!(kind, CastKind::DoubleColon) {
@@ -1362,6 +1562,7 @@ fn normalise(statement: &mut Statement) {
                 let value = &typed.value;
                 let built = match pg.class {
                     TypeClass::Binary => parse_expression(&format!("{BINARY_INPUT}({value})")),
+                    TypeClass::Float => parse_expression(&format!("{FLOAT_INPUT}({value})")),
                     _ => parse_expression(&format!("CAST({value} AS {})", engine_type(&pg))),
                 };
                 if let Some(built) = built {
@@ -1440,13 +1641,20 @@ fn is_now(name: &str) -> bool {
 /// parameter binds.
 const BINARY_INPUT: &str = "rds_data_binary_input";
 
-/// A cast to a BINARY type, rendered as the reader of that type's input format, and
-/// `None` for a cast to any other type — which the engine's own cast performs.
-fn read_binary_input(value: &Expr, data_type: &DataType) -> Option<Expr> {
-    if pg_type(&data_type.to_string()).class != TypeClass::Binary {
-        return None;
-    }
-    parse_expression(&format!("{BINARY_INPUT}({value})"))
+/// A cast to a type whose INPUT FORMAT this data plane reads itself, rendered as that
+/// reader, and `None` for a cast the engine's own performs.
+///
+/// Two of PostgreSQL's types hold values the engine's own cast would not: a BINARY value
+/// written as text spells BYTES rather than the text's own bytes ([`BINARY_INPUT`]), and a
+/// FLOATING value has three special spellings the engine has no number for
+/// ([`FLOAT_INPUT`]).
+fn read_typed_input(value: &Expr, data_type: &DataType) -> Option<Expr> {
+    let reader = match pg_type(&data_type.to_string()).class {
+        TypeClass::Binary => BINARY_INPUT,
+        TypeClass::Float => FLOAT_INPUT,
+        _ => return None,
+    };
+    parse_expression(&format!("{reader}({value})"))
 }
 
 /// The name of that reader, for the connection that defines it and the authorizer that
@@ -1454,6 +1662,72 @@ fn read_binary_input(value: &Expr, data_type: &DataType) -> Option<Expr> {
 #[must_use]
 pub fn binary_input_reader() -> &'static str {
     BINARY_INPUT
+}
+
+/// The data plane's own reader of the INPUT a FLOATING type takes, defined on the same
+/// connection and for the same reason.
+///
+/// A floating type's input has three values that are not numbers — `NaN`, `Infinity` and
+/// `-Infinity`, which PostgreSQL's "Data Types" chapter documents as the special values
+/// every one of its floating types accepts — and the engine behind this data plane has no
+/// number for any of them: its own cast would read `'NaN'` as zero and store that, which
+/// is a value the caller never wrote. So every cast to a floating type is rendered as this
+/// reader, which answers the number for input that names one and the text the database
+/// displays the value as for input that names a special value.
+const FLOAT_INPUT: &str = "rds_data_float_input";
+
+/// The name of THAT reader, for the connection that defines it and the authorizer that
+/// admits it.
+#[must_use]
+pub fn float_input_reader() -> &'static str {
+    FLOAT_INPUT
+}
+
+/// The data plane's own writer of the OUTPUT FORMAT a value of an ARRAY type is written
+/// in, defined on the same connection as the readers above.
+///
+/// This data plane holds an array as the JSON document of its elements, which is the form
+/// the engine itself builds and reads; the DATABASE writes such a value out in its own
+/// documented array output format instead — "curly braces around the array value plus
+/// delimiter characters between adjacent items", nested once per dimension — so a
+/// statement that writes an array out AS TEXT is rendered as this writer.
+const ARRAY_OUTPUT: &str = "rds_data_array_output";
+
+/// The name of that writer, for the connection that defines it and the authorizer that
+/// admits it.
+#[must_use]
+pub fn array_output_writer() -> &'static str {
+    ARRAY_OUTPUT
+}
+
+/// Rewrite every cast that writes a value of an ARRAY type out AS TEXT into the writer of
+/// the array output format.
+///
+/// A value of an array type has a text representation of its own — the braced format
+/// PostgreSQL's "Arrays" chapter documents — and that is what a caller casting one to
+/// `text` is given, not the form the engine happens to hold it in. Which expressions are
+/// of an array type is settled by the statement's own text and the SCHEMA
+/// ([`operand_type`]), so this runs where the catalog is at hand and before [`normalise`]
+/// rewrites the cast itself.
+fn plan_array_output(statement: &mut Statement, catalog: &Catalog<'_>) {
+    let _ = visit_expressions_mut(statement, |expr| {
+        if let Expr::Cast {
+            expr: value,
+            data_type,
+            ..
+        } = expr
+        {
+            let writes_text = pg_type(&data_type.to_string()).class == TypeClass::Text;
+            let of_an_array =
+                operand_type(value, catalog).is_some_and(|pg| pg.class == TypeClass::Array);
+            if writes_text && of_an_array {
+                if let Some(built) = parse_expression(&format!("{ARRAY_OUTPUT}({value})")) {
+                    *expr = built;
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
 }
 
 /// MySQL's own name for the value an upsert's insert half would have stored, which
