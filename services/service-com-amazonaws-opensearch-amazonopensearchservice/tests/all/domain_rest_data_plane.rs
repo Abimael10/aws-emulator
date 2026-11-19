@@ -39,6 +39,16 @@ use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
 use super::data_source_registry::created_domain;
 use super::domain_lifecycle::{Answer, Emulator, DEFAULT_ACCESS_KEY_ID, REGION};
 
+/// The security plugin's AUDIT CONFIGURATION on this same surface: the resource a client
+/// reads and patches to say WHICH of the decisions the cluster takes about a request leave a
+/// record, and the records that configuration then gates.
+///
+/// The `#[path]` is what points this child at its own directory: this suite is itself
+/// reached through a `#[path]` from `tests/all.rs`, so a bare `mod` would resolve to a
+/// SIBLING suite.
+#[path = "domain_rest_data_plane/security_audit_configuration.rs"]
+mod security_audit_configuration;
+
 /// The role the unmapped session below is assumed from — the position a Firehose delivery
 /// role is in when nothing has bound it to a fine-grained-access-control role.
 const DELIVERY_ROLE: &str = "firehose-delivery";

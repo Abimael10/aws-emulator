@@ -149,6 +149,10 @@ service-com-amazonaws-opensearchserverless-opensearchserverless = { workspace = 
 # alarm evaluation read — the way the IAM, Cognito, S3, CloudWatch Logs, KMS, Certificate
 # Manager and Service Quotas stores above are reached.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# RFC 6902 JSON Patch, which is the form the security plugin's audit-configuration API takes
+# a write of that configuration in (`state::audit`): the patch document a client sends is
+# applied by the maintained implementation rather than by a walk written here.
+json-patch = { version = "4.2", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

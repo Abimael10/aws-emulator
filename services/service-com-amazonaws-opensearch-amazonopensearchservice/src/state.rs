@@ -103,6 +103,10 @@ pub mod encryption_grant;
 /// the slow-log records its own data plane produces, and the cluster's application log.
 pub mod log_publishing;
 
+/// The security plugin's AUDIT CONFIGURATION: which of the decisions the cluster takes
+/// about a request leave a record in the log group the `AUDIT_LOGS` option names.
+pub mod audit;
+
 /// The `AWS/ES` metrics a provisioned domain's cluster publishes about itself: what each
 /// gauge reads, and the cadence they are observed on.
 pub mod cluster_metrics;

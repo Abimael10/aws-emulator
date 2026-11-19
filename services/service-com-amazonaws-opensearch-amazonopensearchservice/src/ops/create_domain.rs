@@ -856,6 +856,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the domain's own security API is what writes one.
             security_roles: BTreeMap::new(),
             security_role_mappings: BTreeMap::new(),
+            // Its security plugin's audit configuration is the plugin's own default, with
+            // auditing itself switched off: enabling it is the step a client takes through
+            // that plugin's API once this domain publishes `AUDIT_LOGS`.
+            audit_config: crate::state::audit::AuditConfig::default(),
             // A new domain holds no index template either; the domain's own template API
             // is what writes one, and no component template for one to be composed of.
             index_templates: BTreeMap::new(),

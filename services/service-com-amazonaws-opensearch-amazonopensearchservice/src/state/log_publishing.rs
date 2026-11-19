@@ -25,7 +25,10 @@
 //!   as long as the index's own indexing slow-log threshold ([`INDEX_THRESHOLD_SETTING`]);
 //! * [`LOG_TYPE_APPLICATION`] — the cluster's own line for a change to the indexes it holds
 //!   (an index created, its settings updated, an index deleted), which is what the engine's
-//!   application log records and needs no threshold.
+//!   application log records and needs no threshold;
+//! * [`super::audit::LOG_TYPE_AUDIT`] — one record per decision the cluster took about a
+//!   request, which its SECURITY plugin's own audit configuration decides ([`super::audit`])
+//!   and no threshold applies to either.
 //!
 //! A threshold is an engine TIME VALUE (`"0ms"`, `"500ms"`, `"2s"`), and the engine's own
 //! default `-1` disables the level: a level the index sets no threshold for logs nothing, so
@@ -170,6 +173,9 @@ pub enum Served<'a> {
         /// What the cluster did to it.
         change: IndexChange,
     },
+    /// The cluster took one DECISION about a request — who it was, or what that identity
+    /// was permitted — which its security plugin's audit log may have a record of.
+    Audited(super::audit::Event<'a>),
 }
 
 /// A change the cluster applied to the indexes it holds — what its own application log
@@ -324,6 +330,24 @@ pub fn records(domain: &Domain, served: &[Served<'_>], at: SystemTime) -> Vec<Pu
                             &change.stated(index),
                             at,
                         ),
+                        at,
+                    },
+                ));
+            }
+            // A decision the cluster took is recorded only where the domain's own audit
+            // configuration says so — which is why a domain that publishes the log type and
+            // has configured nothing delivers no audit record at all.
+            Served::Audited(event) => {
+                if !super::audit::records(domain, event) {
+                    continue;
+                }
+                published.extend(destination(domain, super::audit::LOG_TYPE_AUDIT).map(
+                    |(log_group_arn, log_group_name)| PublishedRecord {
+                        log_group_name,
+                        log_group_arn,
+                        log_stream_name: node.clone(),
+                        region: domain.region.clone(),
+                        message: super::audit::message(domain, event, &node, at),
                         at,
                     },
                 ));
@@ -492,7 +516,7 @@ fn line(level: &str, logger: &str, node: &str, body: &str, at: SystemTime) -> St
 
 /// The instant a record states, in the ISO-8601 form every timestamp this emulator writes
 /// carries.
-fn stated_time(at: SystemTime) -> String {
+pub(super) fn stated_time(at: SystemTime) -> String {
     ::aws_smithy_types::DateTime::from(at)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_default()

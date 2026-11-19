@@ -113,7 +113,10 @@
 //! ([`component_templates`]), ingest pipelines (declared, simulated and applied to a write
 //! that names one), the index-management plugin's policy API, the security plugin's
 //! role and role-mapping API ([`security_records`]), its internal user database and account
-//! API ([`internal_users`]), the ALERTING plugin's monitors, the runs of one and the alerts
+//! API ([`internal_users`]), its AUDIT CONFIGURATION — which of the decisions this plane
+//! takes about a request leave a record in the log group the domain publishes `AUDIT_LOGS`
+//! to ([`security_audit`], [`state::audit`]) — the ALERTING plugin's monitors, the runs of
+//! one and the alerts
 //! they leave ([`alerting`], [`monitor_run`]), and the NOTIFICATIONS plugin's channel
 //! configurations a monitor's action sends through ([`notifications`]), and the SNAPSHOT API:
 //! the repositories a cluster registers, the snapshots it takes into the Amazon S3 bucket one
@@ -122,6 +125,11 @@
 //! A path outside it is answered the way the engine answers a path no handler is registered
 //! for, rather than with an invented body — including a RESERVED path ([`reserved`]), which
 //! names an API of the engine and is never read as an index name.
+//!
+//! Each plugin of the Open Distro era is reachable under its legacy `_opendistro/<plugin>`
+//! prefix as well as its current `_plugins/<plugin>` one
+//! ([`current_plugin_prefix`]): the engine kept both, and both spellings reach one handler
+//! here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
@@ -215,6 +223,10 @@ mod internal_users;
 /// principals hold it.
 mod security_records;
 use security_records::{security_role, security_role_mapping};
+
+/// The security plugin's AUDIT CONFIGURATION: which of the decisions the cluster takes
+/// about a request leave a record in the log group the domain publishes `AUDIT_LOGS` to.
+mod security_audit;
 
 /// The query-string syntax a `query_string` clause and the URI form of a search both state
 /// their clauses in.
@@ -916,25 +928,51 @@ fn answered<Eng: Send + Sync + 'static>(engine: &Eng, incoming: &Incoming<'_>) -
     // database holds ([`fgac::authentication`]). The decision is taken under a lock of its
     // own and the store released again, the way the claim above resolves the domain, so the
     // serving below still reads the domain exactly once.
-    let authenticated = {
+    let (authenticated, refused_login) = {
         let store = state.lock();
         let Some(domain) = store.domains.get(&resolved.domain_name) else {
             return Served::of(unavailable());
         };
-        fgac::authentication(
+        let authenticated = fgac::authentication(
             domain,
             incoming
                 .presented
                 .as_ref()
                 .map(|(user, password)| (user.as_str(), password.as_str())),
             incoming.sigv4,
-        )
+        );
+        // A credential the cluster REFUSES is a decision of its REST layer, and the
+        // security plugin's audit log has a record of it where the domain's audit
+        // configuration says so — stated for the user the credential claimed to be, which
+        // is all that is known about a caller the cluster did not admit. Built here, where
+        // the domain is already read, and delivered below once this store is released.
+        let refused_login = match authenticated {
+            fgac::Authentication::Refused => state::log_publishing::records(
+                domain,
+                &[state::log_publishing::Served::Audited(state::audit::Event {
+                    category: state::audit::CATEGORY_FAILED_LOGIN,
+                    layer: state::audit::Layer::Rest,
+                    effective_user: incoming
+                        .presented
+                        .as_ref()
+                        .map_or("", |(user, _)| user.as_str()),
+                    rest_path: &resolved.request_path,
+                    rest_method: &incoming.method,
+                    privilege: None,
+                    index: None,
+                })],
+                now,
+            ),
+            _ => Vec::new(),
+        };
+        (authenticated, refused_login)
     };
     // Who the request speaks for: the user the cluster authenticated it as, where it
     // authenticated one, and otherwise the AWS principal that was resolved for it.
     let internal_user = matches!(authenticated, fgac::Authentication::User(_));
     let principal = match authenticated {
         fgac::Authentication::Refused => {
+            state::log_publishing::deliver(engine, &refused_login);
             return Served::of(unauthorized(incoming.presented.is_none()));
         }
         fgac::Authentication::User(name) => name,
@@ -983,6 +1021,16 @@ fn answered<Eng: Send + Sync + 'static>(engine: &Eng, incoming: &Incoming<'_>) -
             "blocked by: [SERVICE_UNAVAILABLE/1/state not recovered / initialized]",
         ));
     }
+    // The cluster ADMITTED this request, which is a decision of its REST layer: the
+    // security plugin's audit log has a record of it where the domain's audit configuration
+    // says so. Noted before the request is served, as the plugin states it, and so before
+    // the transport-layer decision the route it reaches takes ([`guarded`]).
+    request.record_audited(
+        domain,
+        state::audit::CATEGORY_AUTHENTICATED,
+        state::audit::Layer::Rest,
+        None,
+    );
     let answer = serve_resolved(domain, &request, now, &across, &files);
     // The records the work this request did produced go to the log groups the domain
     // publishes them to — after THIS service's store is released, so the two stores are
@@ -1392,6 +1440,34 @@ impl Request<'_> {
             self.published.borrow_mut().extend(records);
         }
     }
+
+    /// Note the record the security plugin's audit log has of ONE decision the cluster took
+    /// about this request: the `category` the plugin states that decision under, at the
+    /// `layer` it was taken at, and the cluster action it was about where it was about one.
+    ///
+    /// Called by the step that TOOK the decision, because that step is what knows which one
+    /// it was; whether a record is produced at all is the domain's own audit configuration's
+    /// ([`state::audit::records`]), so a domain that has configured none produces none.
+    fn record_audited(
+        &self,
+        domain: &Domain,
+        category: &str,
+        layer: state::audit::Layer,
+        privilege: Option<&str>,
+    ) {
+        self.record_served(
+            domain,
+            &[state::log_publishing::Served::Audited(state::audit::Event {
+                category,
+                layer,
+                effective_user: self.principal,
+                rest_path: self.path,
+                rest_method: self.method,
+                privilege,
+                index: self.addressed_index(),
+            })],
+        );
+    }
     /// The path's segments, with empty ones dropped so a trailing or doubled `/` names no
     /// segment of its own.
     ///
@@ -1504,6 +1580,10 @@ fn serve_resolved(
         }
     }
     let segments = request.segments();
+    // The plugins of the Open Distro era answer under the legacy `_opendistro/<plugin>`
+    // prefix beside their current `_plugins/<plugin>` one ([`current_plugin_prefix`]), so
+    // both spellings of one route reach one handler.
+    let segments = current_plugin_prefix(segments);
     match segments.as_slice() {
         [] => match request.method {
             "GET" | "HEAD" => guarded(domain, request, fgac::ACTION_CLUSTER_STATE, |domain| {
@@ -1690,6 +1770,14 @@ fn serve_resolved(
         ["_plugins", "_security", "api", "rolesmapping", name] => {
             security_role_mapping(domain, request, name)
         }
+        // The plugin's AUDIT CONFIGURATION: which of the decisions the cluster takes about
+        // a request leave a record in the log group the domain publishes `AUDIT_LOGS` to.
+        ["_plugins", "_security", "api", "audit"] => {
+            security_audit::audit_request(domain, request)
+        }
+        ["_plugins", "_security", "api", "audit", "config"] => {
+            security_audit::audit_config_request(domain, request)
+        }
         // The tokens a text produces, for the whole cluster and for one index's own
         // analysis settings. Both arms come before the single- and two-segment arms below,
         // so neither reserved name is read as an index.
@@ -1782,6 +1870,43 @@ enum Creates {
     /// `_create`, and `_doc` with `op_type=create`: a write to an id the index already
     /// holds is REFUSED rather than replacing the document.
     Only,
+}
+
+/// The segment a plugin's API is named by today.
+const PLUGIN_SEGMENT: &str = "_plugins";
+
+/// The segment it was named by in the Open Distro era, which the engine still registers
+/// every such plugin's routes under.
+const LEGACY_PLUGIN_SEGMENT: &str = "_opendistro";
+
+/// The plugins this surface serves that existed under that name, and so answer under both
+/// prefixes: the SECURITY plugin, the INDEX-MANAGEMENT plugin and the ALERTING plugin. The
+/// notifications plugin came after the rename and has no legacy prefix, which is why it is
+/// not here.
+const LEGACY_PLUGINS: [&str; 3] = ["_security", "_ism", "_alerting"];
+
+/// `segments` with a legacy plugin prefix read as the current one.
+///
+/// A plugin of the Open Distro era kept the routes it had then: the same resource answers
+/// under `_opendistro/<plugin>/…` and under `_plugins/<plugin>/…`, and the tooling and the
+/// setup scripts written before the rename still address the first. Reading the one as the
+/// other HERE is what keeps one handler per resource — a second set of arms would be a
+/// second place for a route to drift — and the request's own path is untouched, so a refusal
+/// still names the URI the caller sent.
+fn current_plugin_prefix(segments: Vec<&str>) -> Vec<&str> {
+    match segments.split_first() {
+        Some((&LEGACY_PLUGIN_SEGMENT, rest))
+            if rest
+                .first()
+                .is_some_and(|plugin| LEGACY_PLUGINS.contains(plugin)) =>
+        {
+            let mut current = Vec::with_capacity(segments.len());
+            current.push(PLUGIN_SEGMENT);
+            current.extend_from_slice(rest);
+            current
+        }
+        _ => segments,
+    }
 }
 
 /// Whether `segment` is a RESERVED first path segment of the engine's REST surface rather
@@ -2037,7 +2162,10 @@ fn requested_op_type(request: &Request<'_>) -> Creates {
 /// Take the cluster's own authorization decision for `action`, then `answer` the request.
 ///
 /// Every route goes through this, so no route can serve a domain with fine-grained access
-/// control switched on without the decision [`fgac`] owns having been taken for it.
+/// control switched on without the decision [`fgac`] owns having been taken for it — which
+/// is also why the security plugin's audit record of that decision is left HERE
+/// ([`Request::record_audited`]): it is the one place the cluster decides what the caller
+/// may do.
 fn guarded(
     domain: &mut Domain,
     request: &Request<'_>,
@@ -2047,8 +2175,20 @@ fn guarded(
     if let Some(reason) =
         fgac::refusal(domain, request.principal, action, request.addressed_index())
     {
+        request.record_audited(
+            domain,
+            state::audit::CATEGORY_MISSING_PRIVILEGES,
+            state::audit::Layer::Transport,
+            Some(action),
+        );
         return error(403, ingest::SECURITY_EXCEPTION, &reason);
     }
+    request.record_audited(
+        domain,
+        state::audit::CATEGORY_GRANTED_PRIVILEGES,
+        state::audit::Layer::Transport,
+        Some(action),
+    );
     answer(domain)
 }
 
@@ -2116,8 +2256,11 @@ const TAGLINE: &str = "The OpenSearch Project: https://opensearch.org/";
 
 /// A domain's cluster name, which Amazon OpenSearch Service forms from the account that
 /// owns it and the domain's own name.
+///
+/// The ONE reading is [`state::cluster_name`]'s: the plugin's audit records state the same
+/// cluster name as the banner does, so neither can drift from the other.
 fn cluster_name(domain: &Domain) -> String {
-    format!("{}:{}", ::engine::emulator_account_id(), domain.domain_name)
+    state::cluster_name(domain)
 }
 
 /// The distribution and version number the domain's `EngineVersion` names: the value is

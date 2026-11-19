@@ -80,7 +80,10 @@ async fn given_fgac_domain(emulator: &Emulator, domain: &str) -> String {
 
 /// One REST request to the published host, presenting `credential` as HTTP Basic
 /// credentials — or presenting none at all where it is `None`.
-async fn rest(
+///
+/// `pub(crate)` because a sibling suite drives a Basic-authenticated request the same way
+/// rather than growing a second copy of this.
+pub(crate) async fn rest(
     emulator: &Emulator,
     host: &str,
     credential: Option<(&str, &str)>,

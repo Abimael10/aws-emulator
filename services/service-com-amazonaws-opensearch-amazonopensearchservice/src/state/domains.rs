@@ -114,6 +114,12 @@ pub struct Domain {
     /// principal that is not the master user may reach this domain at all
     /// ([`fgac::mapped_roles`]).
     pub security_role_mappings: BTreeMap<String, fgac::SecurityRoleMapping>,
+    /// The security plugin's AUDIT CONFIGURATION on this domain: which of the decisions the
+    /// cluster takes about a request leave a record in the log group the domain's
+    /// `AUDIT_LOGS` option names. Written and reported by the plugin's own audit-config API
+    /// ([`crate::service::domain_rest`]), and read by [`audit::records`] — so what a client
+    /// configured is what decides whether a record is produced. See [`audit::AuditConfig`].
+    pub audit_config: audit::AuditConfig,
     /// The index templates this domain holds, keyed by their name — unique on the domain,
     /// so the name IS the key. See [`IndexTemplate`].
     pub index_templates: BTreeMap<String, IndexTemplate>,
@@ -1554,6 +1560,17 @@ pub fn data_node_ids(domain: &Domain) -> Vec<String> {
     (0..census_size(domain.cluster_config.instance_count))
         .map(|index| node_id(&domain.domain_id, NODE_TYPE_DATA, index))
         .collect()
+}
+
+/// The name of the CLUSTER `domain` runs, which Amazon OpenSearch Service forms from the
+/// account that owns the domain and the domain's own name.
+///
+/// ONE reading, because the cluster states its own name in more than one answer: the banner
+/// a `GET /` carries, the reports of the plugins it runs, and every audit record its
+/// security plugin writes ([`super::audit`]).
+#[must_use]
+pub fn cluster_name(domain: &Domain) -> String {
+    format!("{}:{}", ::engine::emulator_account_id(), domain.domain_name)
 }
 
 /// The id of the node `domain`'s cluster does its work on, which is the node its logs come
