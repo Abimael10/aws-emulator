@@ -317,6 +317,10 @@ impl ComAmazonawsEc2Amazonec2State {
         ));
         self.forget_fast_snapshot_restores(snapshot_id);
         self.forget_snapshot_create_volume_permissions(snapshot_id);
+        // The archive or restore action asked for the snapshot goes the same way and for the
+        // same reason ([`Self::forget_snapshot_tiering`]): a storage tier is a property of a
+        // snapshot, so a snapshot that has left the inventory is in none.
+        self.forget_snapshot_tiering(snapshot_id);
         Some(record)
     }
 

@@ -2228,6 +2228,12 @@ pub use direct_api_snapshots::*;
 pub mod published_snapshots;
 pub use published_snapshots::*;
 
+/// The STORAGE TIER of one snapshot — the archive or restore action last asked for it and the
+/// tier that action leaves it in — in a module of its own, re-exported so a handler reaches
+/// them as `crate::state::<item>` like every other primitive here.
+pub mod snapshot_tiering;
+pub use snapshot_tiering::*;
+
 /// The ATTRIBUTES of one snapshot of the account-visible inventory — which snapshot an id
 /// names across the three sides that hold one, whether every account may create a volume from
 /// it, and the Marketplace codes it is billed through — in a module of its own, re-exported so

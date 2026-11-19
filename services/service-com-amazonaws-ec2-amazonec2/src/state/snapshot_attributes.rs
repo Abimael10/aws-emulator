@@ -69,6 +69,10 @@ pub fn snapshot_is_public(snapshot: &SnapshotView, account: &str) -> bool {
 /// is the precedence [`ComAmazonawsEc2Amazonec2State::image_backing_snapshots`] already
 /// applies, so one snapshot has one record whichever reader resolves it.
 ///
+/// Whichever source answers, the snapshot is reported in the tier its own tiering action has
+/// reached ([`ComAmazonawsEc2Amazonec2State::snapshot_in_tier`]), so a snapshot resolved here
+/// and the same snapshot in an inventory report cannot name two different storage tiers.
+///
 /// LOCK ORDER: called with this service's store already locked, and the direct-API read takes
 /// the EBS store second — the order every operation of this service keeps (see
 /// [`super::direct_api_snapshots`]).
@@ -79,13 +83,14 @@ pub fn visible_snapshot<Eng: Send + Sync + 'static>(
     now: Instant,
     observed: SystemTime,
 ) -> Option<SnapshotView> {
-    if let Some(record) = store.snapshots.get(snapshot_id) {
-        return Some(record.view_at(now));
-    }
-    if let Some(snapshot) = direct_api_snapshot(engine, snapshot_id, observed) {
-        return Some(snapshot);
-    }
-    store.image_backing_snapshots().remove(snapshot_id)
+    let snapshot = if let Some(record) = store.snapshots.get(snapshot_id) {
+        Some(record.view_at(now))
+    } else if let Some(snapshot) = direct_api_snapshot(engine, snapshot_id, observed) {
+        Some(snapshot)
+    } else {
+        store.image_backing_snapshots().remove(snapshot_id)
+    };
+    snapshot.map(|snapshot| store.snapshot_in_tier(snapshot, now))
 }
 
 /// The name EC2's parameter layer gives the `SnapshotId` member of a snapshot-attribute call

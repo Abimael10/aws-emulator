@@ -302,6 +302,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // snapshot the EBS direct APIs hold are kept in THIS store, so the rule is applied
         // once here rather than only inside this store's own removal.
         store.forget_fast_snapshot_restores(&input.snapshot_id);
+        // The tiering action asked for the snapshot goes the same way and for the same reason:
+        // a storage tier is a property OF a snapshot, and the action of a snapshot the EBS
+        // direct APIs hold is recorded in THIS store, so the rule is applied once here rather
+        // than only inside this store's own removal.
+        store.forget_snapshot_tiering(&input.snapshot_id);
         Ok(DeleteSnapshotOutput)
     }
 }

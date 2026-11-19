@@ -413,7 +413,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !asked_about(&record.view) {
                 continue;
             }
-            let snapshot = record.view_at(now);
+            // The tier the snapshot's own tiering action has reached, through the ONE
+            // projection of it this crate holds ([`crate::state::snapshot_in_tier`]) — so this
+            // report and the tier status read cannot name two tiers for one snapshot, and the
+            // `storage-tier` filter compares against the word the caller is shown.
+            let snapshot = store.snapshot_in_tier(record.view_at(now), now);
             // The AND/OR evaluation of EC2's `Filters`, through the one definition the crate
             // holds ([`crate::state::matches_every_filter`]); only the per-attribute lookup
             // is this operation's, so it is what gets passed in.
@@ -436,10 +440,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.snapshots.contains_key(snapshot_id) || !asked_about(snapshot) {
                 continue;
             }
+            let snapshot = store.snapshot_in_tier(snapshot.clone(), now);
             if crate::state::matches_every_filter(&selectors, &mut budget, &|name| {
-                filter_values(snapshot, name)
+                filter_values(&snapshot, name)
             }) {
-                selected.push(snapshot.clone());
+                selected.push(snapshot);
             }
         }
         // The PUBLIC snapshots of the inventory — the ones the AMI catalogue restores its
@@ -456,10 +461,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 continue;
             }
+            let snapshot = store.snapshot_in_tier(snapshot.clone(), now);
             if crate::state::matches_every_filter(&selectors, &mut budget, &|name| {
-                filter_values(snapshot, name)
+                filter_values(&snapshot, name)
             }) {
-                selected.push(snapshot.clone());
+                selected.push(snapshot);
             }
         }
         // A spent budget means the answer is INCOMPLETE, which is not something to report

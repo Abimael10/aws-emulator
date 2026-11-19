@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifySnapshotTier
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifySnapshotTier`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: archives the EBS snapshot the request names — records the archival as the
+//! tiering ACTION of that snapshot ([`crate::state::snapshot_tiering`]) and answers the instant
+//! it started. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifySnapshotTier::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Moved from the standard tier to the archive tier": the move is not instant and it is not
+//! this call's to finish — the archival is `archival-in-progress` when this call answers and
+//! the CLOCK owes it `archival-completed`, from which the snapshot is in the `archive` tier.
+//! So nothing here writes a tier: the action is recorded and every member that describes it is
+//! derived from it, which is what `DescribeSnapshotTierStatus` reports and what the snapshot's
+//! own `StorageTier` is read through.
+//!
+//! The request is held to what a snapshot in this account can be archived FROM: a value that is
+//! no snapshot id EC2 issues, an id no side of the account-visible inventory holds, a snapshot
+//! of another account, a snapshot that holds less than all of its volume's data (one that is not
+//! `completed`) and a snapshot an archival has already been asked for are each refused with
+//! EC2's own code for that cause, and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +147,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifySnapshotTier` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifySnapshotTierErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifySnapshotTier"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            SNAPSHOT_STATE_COMPLETED, dry_run_operation, echoed_resource_id, incorrect_state,
+            incorrect_state_of, invalid_snapshot_id_malformed, invalid_snapshot_id_not_found,
+            issued_snapshot_id_is_well_formed, require_service_state, system_time_to_date_time,
+            visible_snapshot,
+        };
+
+        // `ctx` carries request metadata only, and this operation reads none of it: the
+        // snapshot is named by id. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The name of the storage tier. YOU MUST SPECIFY `archive`" (`StorageTier`): the
+        // member is the one thing this call says to do, so a request that carries none is
+        // missing a parameter rather than asking for the default of anything. A word outside
+        // the modelled `TargetStorageTier` catalog is refused by the request walk before this
+        // handler runs, and `archive` is that catalog's only member — so an absent member is
+        // the only reading left to resolve here.
+        if input.storage_tier.is_none() {
+            return Err(crate::state::missing_required_parameter(
+                STORAGE_TIER_MEMBER,
+            ));
+        }
+
+        // A value that is no snapshot id EC2 could have ISSUED is refused BEFORE the inventory
+        // is looked at — a request the service cannot read as an id at all is a different
+        // cause from one naming a snapshot nobody holds, which is the ordering every operation
+        // of this crate that resolves a snapshot id keeps. The reading and the wording are the
+        // ones the operations that WRITE against one snapshot take.
+        if !issued_snapshot_id_is_well_formed(&input.snapshot_id) {
+            return Err(invalid_snapshot_id_malformed(&input.snapshot_id));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // ONE instant per clock for the whole call, the way the inventory's own report reads
+        // them: the monotonic one the account's records measure their due transitions against,
+        // and the wall-clock one the direct-API side compares its timeouts against.
+        let now = ::std::time::Instant::now();
+        let observed = ::std::time::SystemTime::now();
+        let account = ::engine::emulator_account_id();
+
+        // The tier is a property OF a snapshot, so the snapshot is resolved first, against the
+        // whole account-visible inventory ([`visible_snapshot`]) — a well-formed id no side of
+        // it holds a snapshot for is the not-found cause, in the crate's one wording for it.
+        let snapshot = visible_snapshot(&store, &*self.engine, &input.snapshot_id, now, observed)
+            .ok_or_else(|| invalid_snapshot_id_not_found(&input.snapshot_id))?;
+
+        // "Archives an Amazon EBS snapshot": moving a snapshot between storage tiers is the
+        // OWNER's to ask for, so a snapshot the calling account does not own — one of the
+        // public snapshots the AMI catalogue is published with — cannot be archived by it, and
+        // nothing is recorded against it.
+        if snapshot.owner_id.as_deref() != Some(account) {
+            return Err(Scaffolded::operation_not_permitted(format!(
+                "You do not have permission to modify the storage tier of snapshot {}",
+                echoed_resource_id(&input.snapshot_id)
+            )));
+        }
+
+        // "When you archive a snapshot, it is converted to a full snapshot that includes ALL
+        // OF THE BLOCKS OF DATA THAT WERE WRITTEN TO THE VOLUME at the time the snapshot was
+        // created": there is a full snapshot to convert only once the snapshot itself holds
+        // all of that data, which is the `completed` state — a snapshot still `pending`, or one
+        // that ended in `error`, is in a state this request cannot be served in, which is what
+        // EC2's `IncorrectState` names ([`incorrect_state_of`]).
+        let snapshot_state = snapshot.state.as_deref().unwrap_or_default();
+        if snapshot_state != SNAPSHOT_STATE_COMPLETED {
+            return Err(incorrect_state_of(
+                SNAPSHOT_REFUSAL_NAME,
+                &echoed_resource_id(&input.snapshot_id),
+                snapshot_state,
+            ));
+        }
+
+        // One snapshot has one tiering action ([`crate::state::snapshot_tiering`]), so a
+        // snapshot an archival has already been asked for is in a state this request cannot be
+        // served in either — whether that archival is still running or has already moved the
+        // snapshot into the archive tier. The refusal names the state the action it already
+        // has is in, which is what the caller has to wait for or undo.
+        if let Some(tiering) = store.snapshot_tiering_of(&input.snapshot_id) {
+            return Err(incorrect_state(format!(
+                "Snapshot '{}' already has a tiering operation in the '{}' state.",
+                echoed_resource_id(&input.snapshot_id),
+                tiering.operation_status_at(now)
+            )));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT actually
+        // making the request" (`DryRun`): it sits after every parameter has been validated and
+        // the snapshot resolved, and BEFORE the first write, so a request that would have been
+        // refused is refused with that reason instead and one that would have succeeded leaves
+        // the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        // The archival itself: recorded as the ACTION, from which every member that describes
+        // it is derived — the status, the progress, the completion instant and the tier the
+        // snapshot is in — so this write is the one place a snapshot's tier comes from. The
+        // move to `archival-completed` is owed to the CLOCK rather than to a later call, so a
+        // caller reading the snapshot straight after this call still sees the archival running.
+        let started_at = ::std::time::SystemTime::now();
+        let tiering = store.begin_snapshot_archival(&input.snapshot_id, started_at);
+
+        Ok(ModifySnapshotTierOutput {
+            snapshot_id: Some(input.snapshot_id.clone()),
+            // "The date and time when the archive process was started"
+            // (`ModifySnapshotTierResult$TieringStartTime`): the instant the record keeps, so
+            // this receipt and the `LastTieringStartTime` a tier status read reports are one
+            // instant.
+            tiering_start_time: Some(system_time_to_date_time(tiering.started_at)),
+        })
     }
 }
+
+/// The member a request has to carry to say which tier it is asking for, as the MODEL spells
+/// it — the name the `MissingParameter` refusal above names, the way every absent `@required`
+/// member of this service is named.
+const STORAGE_TIER_MEMBER: &str = "StorageTier";
+
+/// What EC2 calls an EBS snapshot in a refusal that names the resource whose state does not
+/// admit the request ([`crate::state::incorrect_state_of`], whose sentence is `<Kind> '<id>' is
+/// in the '<state>' state.`).
+const SNAPSHOT_REFUSAL_NAME: &str = "Snapshot";

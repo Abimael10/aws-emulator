@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSnapshotTierStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSnapshotTierStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports one row per ARCHIVE OR RESTORE ACTION asked for a snapshot of the
+//! calling account — the tier that action has moved the snapshot into and how far it has got —
+//! narrowed by the documented filters and paged by `MaxResults`/`NextToken`. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSnapshotTierStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Describes the STORAGE TIER STATUS of one or more Amazon EBS snapshots": the status reported
+//! here is the state of a snapshot's last archive or restore action
+//! (`DescribeSnapshotTierStatusRequest$Filters`, "the state of the last archive or restore
+//! action"), so a snapshot has a row here exactly while it HAS such an action
+//! ([`crate::state::snapshot_tiering`] holds them, keyed by `SnapshotId`). A snapshot nothing
+//! has ever archived has none, which is why this read answers an empty set for an account whose
+//! snapshots have only ever been in the standard tier they were created in — the recorded
+//! behaviour this operation's issue carries — while the account's snapshots themselves are
+//! reported by `DescribeSnapshots`, which is the read of the inventory.
+//!
+//! The snapshot each row is ABOUT is resolved out of the account's own snapshots and the ones
+//! the EBS direct APIs hold ([`crate::state::direct_api_snapshots`]): both are snapshots of
+//! this account, so an archival can be asked for either, and the row is read off whichever
+//! record owns it rather than off a copy. The public snapshots the AMI catalogue is published
+//! with are left out, because moving a snapshot between tiers is the OWNER's to ask for and
+//! those belong to the publishing account — the same narrowing `ModifySnapshotTier` applies, so
+//! no snapshot can be archived here and missed there, or the other way round.
+//!
+//! A row's snapshot members are the snapshot's own — its id, the volume it was taken of, its
+//! `SnapshotState`, its owner and its tags — so this report and an inventory read cannot
+//! disagree about one snapshot; the `Status` is the `pending` -> `completed` move the CLOCK
+//! owes it, derived by [`crate::state::SnapshotRecord::view_at`], so this read observes that
+//! move without writing anything. Everything that describes the ACTION — the tier, the status
+//! word, the progress and the completion instant — is derived from the one record that holds it,
+//! which is also what the snapshot's own `StorageTier` is projected through
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::snapshot_in_tier`]).
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +168,279 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSnapshotTierStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSnapshotTierStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSnapshotTierStatus"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_PAGE_SIZE, MatchBudget, PageTokenRule, SMALLEST_PAGE_SIZE,
+            decode_page_token, dry_run_operation, invalid_parameter_value,
+            invalid_pagination_token_for, matches_every_filter,
+            max_results_below_published_minimum, page_from_cursor, require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        // Matching cost is filters x values x held values x snapshots of the inventory, and
+        // the model bounds none of those, so the request-controlled factors are capped here
+        // before any work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // snapshot would have matched it, so an unsupported filter can never read as "no
+        // results".
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !SNAPSHOT_TIER_STATUS_FILTERS.contains(&name) {
+                return Err(invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // The model declares no `@range` on this operation's `MaxResults`, so the only bound
+        // on the page size is the largest page this operation serves: a value above it is not
+        // refused, it is served as that page with a `NextToken` for the rest (the clamp
+        // below). A page of NONE is not a page, so zero and below is still refused — the same
+        // reading as the snapshot describe this operation reports the same inventory as.
+        if let Some(max_results) = input.max_results {
+            if max_results < SMALLEST_PAGE_SIZE {
+                return Err(max_results_below_published_minimum(
+                    max_results,
+                    SMALLEST_PAGE_SIZE,
+                ));
+            }
+        }
+
+        // "The token returned from a previous paginated request. Pagination continues from
+        // the end of the items returned by the previous request" (`NextToken`) — anything
+        // else is refused rather than read as a position.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        // DryRun sits AFTER every parameter has been validated, and before the store is read
+        // at all: the flag asks whether the request WOULD have succeeded, so one that would
+        // have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+        let account = ::engine::emulator_account_id();
+        // ONE instant for the whole answer, for the same reason the monotonic one below is
+        // read once: a call that straddles a transition's due instant must not report two
+        // snapshots at different phases of the same clock.
+        let observed = ::std::time::SystemTime::now();
+        let now = ::std::time::Instant::now();
+
+        // The snapshots the EBS direct APIs hold, read out of THAT service's own store and
+        // never copied into this one, so a snapshot archived through either API is reported
+        // from the one record that owns it.
+        let direct_api = crate::state::direct_api_snapshots(&*self.engine, observed);
+
+        // One row per TIERING ACTION, in `SnapshotId` order — the store is keyed by that id,
+        // so its iteration order is already the order this report pages over and a cursor
+        // names a position in. Every comparison is charged to ONE budget, so the PRODUCT of
+        // the actions, the filters, their values and their length is bounded however the
+        // caller combines them — which is also what bounds how long this holds the state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<SnapshotTierStatus> = Vec::new();
+        for (snapshot_id, tiering) in &store.snapshot_tiering {
+            if budget.exhausted() {
+                break;
+            }
+            // The snapshot the action was asked for, as of this call: this service's own
+            // store first, then the snapshots the EBS direct APIs hold. The `pending` ->
+            // `completed` move the clock already owed a stored snapshot is OBSERVED by
+            // `view_at`, not written, so this read changes nothing a later caller sees. An id
+            // neither side holds a snapshot for is reported by nothing: a snapshot that has
+            // left the inventory has no storage tier, and a removal takes its action with it.
+            let snapshot = match store.snapshots.get(snapshot_id) {
+                Some(record) => record.view_at(now),
+                None => match direct_api.get(snapshot_id) {
+                    Some(snapshot) => snapshot.clone(),
+                    None => continue,
+                },
+            };
+            // "Describes the storage tier status of one or more Amazon EBS snapshots": the
+            // snapshots whose tier this account can be told about are the ones it OWNS — a
+            // public snapshot of another account's catalogue is reported by the inventory read
+            // and has no tier status here, which is also why the catalogue is not one of the
+            // sources resolved above.
+            if snapshot.owner_id.as_deref() != Some(account) {
+                continue;
+            }
+            let status = tier_status(&snapshot, tiering, now);
+            // The AND/OR evaluation of EC2's `Filters`, through the one definition the crate
+            // holds ([`crate::state::matches_every_filter`]); only the per-attribute lookup
+            // is this operation's, so it is what gets passed in.
+            if matches_every_filter(&selectors, &mut budget, &|name| {
+                filter_values(&status, name)
+            }) {
+                selected.push(status);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // A request that names no page size gets the largest page this service serves, so the
+        // `NextToken` path behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // The page and the token that follows it, through the one definition of EC2 paging
+        // ([`crate::state::page_from_cursor`]): the cursor names the snapshot this page ends
+        // at, and "this value is null when there are no more items to return"
+        // (`DescribeSnapshotTierStatusResult$NextToken`) is a token only while a further
+        // snapshot follows the page.
+        let (page, next_token) = page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            PageTokenRule::WhenAnotherItemFollows,
+            |status| status.snapshot_id.as_deref().unwrap_or_default(),
+        );
+
+        Ok(DescribeSnapshotTierStatusOutput {
+            snapshot_tier_statuses: Some(page.to_vec()),
+            next_token,
+        })
+    }
+}
+
+/// The filter names this operation documents, from
+/// `DescribeSnapshotTierStatusRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeSnapshotTierStatusRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// "`snapshot-id` - The snapshot ID. `volume-id` - The ID of the volume the snapshot is for.
+/// `last-tiering-operation` - The state of the last archive or restore action." The member
+/// documents no `tag:` family for this operation, so there is none to answer. Every entry must
+/// be answered by [`filter_values`].
+const SNAPSHOT_TIER_STATUS_FILTERS: [&str; 3] =
+    ["snapshot-id", "volume-id", "last-tiering-operation"];
+
+/// One snapshot's storage tier status as of `now`: what the snapshot IS, and how far the
+/// archive or restore action `tiering` records has got.
+///
+/// The snapshot's own members are read off the snapshot — the id, the source volume, the
+/// `SnapshotState` the clock has reached, the owner and the tags — so this report and an
+/// inventory read of the same snapshot cannot disagree about any of them. Everything that
+/// describes the ACTION is derived from the one record that holds it
+/// ([`crate::state::SnapshotTieringRecord`]), the storage tier included: the tier is the
+/// outcome of that action, so it is asked of the action rather than of the stored snapshot, and
+/// `DescribeSnapshots` projects the same answer through
+/// [`crate::state::ComAmazonawsEc2Amazonec2State::snapshot_in_tier`].
+fn tier_status(
+    snapshot: &crate::state::SnapshotView,
+    tiering: &crate::state::SnapshotTieringRecord,
+    now: ::std::time::Instant,
+) -> SnapshotTierStatus {
+    use crate::state::system_time_to_date_time;
+
+    SnapshotTierStatus {
+        snapshot_id: snapshot.snapshot_id.clone(),
+        volume_id: snapshot.volume_id.clone(),
+        // "The state of the snapshot" (`SnapshotTierStatus$Status`), which is the
+        // `SnapshotState` the snapshot itself reports.
+        status: snapshot.state.clone(),
+        owner_id: snapshot.owner_id.clone(),
+        tags: snapshot.tags.clone(),
+        // "The storage tier in which the snapshot is stored"
+        // (`SnapshotTierStatus$StorageTier`): where the action has moved it to by now.
+        storage_tier: Some(tiering.storage_tier_at(now).to_string()),
+        // "The date and time that the last archive or restore process was started" and "the
+        // state of the last archive or restore action", with "the progress of the last archive
+        // or restore process, as a percentage" — all three facts of the one action.
+        last_tiering_start_time: Some(system_time_to_date_time(tiering.started_at)),
+        last_tiering_progress: Some(tiering.progress_at(now)),
+        last_tiering_operation_status: Some(tiering.operation_status_at(now).to_string()),
+        // "A message describing the status of the last archive or restore process"
+        // (`$LastTieringOperationStatusDetail`): a detail is what a FAILED action has to add,
+        // and an action this emulator starts either runs or completes — so there is none to
+        // report rather than a sentence invented for a healthy action.
+        last_tiering_operation_status_detail: None,
+        // "The date and time when the last archive process was completed"
+        // (`$ArchivalCompleteTime`), which only a completed archival has.
+        archival_complete_time: tiering
+            .archival_complete_time_at(now)
+            .map(system_time_to_date_time),
+        // "Only for archived snapshots that are temporarily restored"
+        // (`Snapshot$RestoreExpiryTime`): the snapshot's own member, so one expiry is reported
+        // wherever the snapshot is read.
+        restore_expiry_time: snapshot.restore_expiry_time,
+    }
+}
+
+/// The values the EC2 filter `name` compares against this snapshot's tier status.
+///
+/// The per-attribute half of [`crate::state::matches_every_filter`], which holds EC2's AND/OR
+/// evaluation itself: a filter naming an attribute this row does not carry compares against NO
+/// values, so it selects nothing — which is the answer `volume-id` gives for a snapshot that
+/// was not taken of a volume of the account (one written block by block through the EBS direct
+/// APIs). `name` is one of [`SNAPSHOT_TIER_STATUS_FILTERS`].
+fn filter_values<'a>(
+    status: &'a SnapshotTierStatus,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "snapshot-id" => text(status.snapshot_id.as_deref()),
+        "volume-id" => text(status.volume_id.as_deref()),
+        "last-tiering-operation" => text(status.last_tiering_operation_status.as_deref()),
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check were
+        // bypassed.
+        _ => Vec::new(),
     }
 }
