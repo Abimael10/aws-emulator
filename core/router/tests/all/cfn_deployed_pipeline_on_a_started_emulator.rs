@@ -27,7 +27,8 @@
 //! [`crate::s3_notification_converts_on_a_started_emulator`] — the same chain wired by hand from
 //! the function onwards, and filtered by a key-name `Filter` whose rules this suite's template
 //! does not carry — runs on this emulator rather than starting a second one, as do the Auto
-//! Scaling notification leg and the DynamoDB endpoint-discovery dial.
+//! Scaling notification leg, the DynamoDB endpoint-discovery dial and the reason-scoped
+//! EventBridge routing of a browser form upload.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -39,7 +40,10 @@ use serde_json::{json, Value};
 use crate::query_wire::{elements, form_encode, opt_element, outputs_of};
 
 /// The Region the emulator's published configuration names, which is what an SDK signs for.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)` for the reason [`Started`] is: a leg running on the emulator this suite starts
+/// addresses the same Region, and a second spelling of it could drift from this one.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The `StackStatus` the deployment must reach.
 const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
@@ -253,6 +257,49 @@ impl Started {
             .map_err(|error| format!("nothing answered at {uri}: {error}"))?;
         let status = response.status().as_u16();
         Ok((status, response.text().unwrap_or_default()))
+    }
+
+    /// One UNSIGNED request, carrying `Host` and nothing of SigV4 — the position a browser
+    /// submitting a form is in: it holds no key at all, and the credential it names travels in
+    /// the form document rather than in an `Authorization` header (Amazon S3 API Reference,
+    /// *POST Object*).
+    ///
+    /// `host` is what the request STATES it is addressed to, which a client that was handed an
+    /// endpoint url and one that submits to a service host give different values; the connection
+    /// is made to this emulator's own address either way ([`Self::authority`]).
+    pub(crate) fn unsigned(
+        &self,
+        host: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> (u16, String) {
+        let uri = format!("https://{}{path}", self.authority());
+        let mut request = http::Request::builder().method(method).uri(&uri);
+        request = request.header("host", host);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request.body(body).expect("a well-formed request");
+        let response = self
+            .client
+            .execute(request.try_into().expect("a request reqwest can send"))
+            .unwrap_or_else(|error| panic!("nothing answered at {uri}: {error}"));
+        let status = response.status().as_u16();
+        (status, response.text().unwrap_or_default())
+    }
+
+    /// The address this emulator answers on, which is the authority a client that was handed its
+    /// published endpoint url carries as its `Host`.
+    pub(crate) fn authority(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+
+    /// The key pair this start published: what every call above is signed with, and what a form
+    /// upload's own POST policy is signed with.
+    pub(crate) fn credentials(&self) -> (&str, &str) {
+        (&self.key, &self.secret)
     }
 
     /// `request` signed with the published key pair for `signing_name`, as an SDK signs it.
@@ -679,4 +726,12 @@ fn a_deployed_pipeline_runs_on_the_emulator_a_client_starts() {
     // publication is made from a task that outlives the request that armed the clock.
     crate::mediaconvert_job_state_change_on_a_started_emulator::
         a_jobs_state_changes_reach_its_rules_queue_on_the_emulator_a_client_starts(&emulator);
+
+    // The sixth leg, on this same started emulator: the two creation paths of one
+    // EventBridge-enabled bucket, routed by the reason their envelopes carry — which needs a
+    // started emulator because the browser form upload it drives carries no `Authorization`
+    // header at all, so which service claims it is decided on a request a listening process
+    // received.
+    crate::s3_form_post_reason_rules_on_a_started_emulator::
+        reason_scoped_rules_split_the_creation_paths(&emulator);
 }

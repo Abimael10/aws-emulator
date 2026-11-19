@@ -46,3 +46,47 @@ Related already-open issues that do NOT carry this check and do not cover the de
 5. Build a SigV4-signed POST policy form (fields x-amz-algorithm, x-amz-credential, x-amz-date, success_action_status=201, policy, x-amz-signature, then key, then file) and POST it as multipart/form-data to the bucket root URL. Observe the status: AWS answers 201; the emulator does not route POST Object at all.
 6. head_object the posted key (AWS: ContentLength equals the payload) and poll the POST-Object queue for an event with detail.reason == "POST Object".
 7. Hold on the PutObject queue for 3x the measured delivery latency: it must stay empty and report queue depth 0; then put_object again and confirm the PutObject rule is still live and carries only the new key.
+
+## Resolution
+
+No emulator change was needed: the reason-scoped routing this report is about is served, and
+the replay's timeout is the check's OWN waiting rather than a withheld delivery. That was
+established by tracing the replayed check at the request level (temporary instrumentation, not
+committed) and reading back what the emulator did, beat by beat:
+
+* `PUT /<bucket>?notification` records the `EventBridgeConfiguration` and the `GET` reports it;
+* the `PUT` of the first object publishes ONE envelope to the default bus of the bucket's Region
+  with `source` `aws.s3`, `detail-type` `Object Created`, the RAW key and `detail.reason`
+  `PutObject`; the `PutObject`-scoped rule matches it, its queue target is handed the envelope
+  (`outcome=Invoked`) and the check's `ReceiveMessage` is handed exactly one message;
+* the browser form upload — a `multipart/form-data` POST to the bucket root with NO
+  `Authorization` header, addressed at the loopback authority the emulator publishes as its
+  endpoint — is attributed to S3, answers the `success_action_status` the form asked for, stores
+  the object (`HEAD` reports the posted length), and publishes ONE envelope whose
+  `detail.reason` is `POST Object`; the `POST Object`-scoped rule matches that one, and only
+  that one, and its queue is handed it;
+* the `PutObject`-scoped queue stays empty across the whole of the check's negative window, as
+  does the `POST Object`-scoped queue across the `PUT`'s.
+
+The check is nonetheless cut off, because its own client-side long polls spend the whole replay
+budget: twelve `ReceiveMessage` calls with `WaitTimeSeconds=5` return empty (two draining each
+positive, three in the first negative window, five in the hold before the fourth beat), which is
+60 s of waiting the emulator MUST honour — `WaitTimeSeconds` is "the duration (in seconds) for
+which the call waits for a message to arrive in the queue before returning" — against a 60 s
+replay cap, while the check's own declared budget is 900 s. The fourth beat is never reached.
+Nothing the emulator can answer shortens those windows, so the replay unit
+(`events__s3__sqs.a-post-object-upload-is-withheld-from-a-putobject-scoped-rule`) still ends
+`Check timed out after 60.0s`.
+
+What the fix commits is the coverage that was missing for the configuration the replay runs in:
+`core/router/tests/all/s3_form_post_reason_rules_on_a_started_emulator.rs` drives the whole
+scenario against the emulator a client STARTS — the built binary, its own port, request
+authentication on, TLS, long-polling consumers — over both ways a client addresses a bucket root
+for a form upload (the regional endpoint host, and the loopback authority with no trailing
+slash), with the target queues granting `events.amazonaws.com` the send both unconditioned and
+scoped by `aws:SourceArn`, and it asserts the drained queues' three depth attributes as well. It
+runs as a LEG of `core/router/tests/all/cfn_deployed_pipeline_on_a_started_emulator.rs`, on the
+emulator that suite already starts, rather than starting a second binary.
+The in-process sibling `core/router/tests/all/s3_form_post_upload_routes_by_event_bridge_reason.rs`
+and the S3 crate's `object_event_dual_destinations.rs` pin the same rule on an assembled router
+and beside EventBridge and Amazon SQS.
