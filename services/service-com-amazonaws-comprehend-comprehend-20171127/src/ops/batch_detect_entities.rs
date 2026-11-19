@@ -7,7 +7,10 @@
 //! ([`crate::ops::detect_entities::recognize_entities`]), so a batch answers,
 //! document by document, exactly what that operation answers for the same text. The
 //! result of document `i` carries `Index` `i`, so `ResultList` is aligned with the
-//! input list and "sorted in ascending order by the Index field".
+//! input list and "sorted in ascending order by the Index field". Each entity's
+//! `Score` is that detection's own calibrated confidence, computed by the recogniser
+//! from the evidence the document carries for it — never per batch, per position or
+//! per type.
 //!
 //! Every documented batch PRECONDITION is a precondition OF THE REQUEST, checked
 //! before any document is analysed and refusing the call whole: a `TextList` longer

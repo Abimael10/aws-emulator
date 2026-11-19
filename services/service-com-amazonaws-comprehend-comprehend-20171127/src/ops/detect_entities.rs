@@ -22,6 +22,14 @@
 //! than a constant of the rule class or of the type: two mentions of one type in one
 //! document are reported with the confidence each one's characters leave.
 //!
+//! That tally is reported on the scale a confidence is read on, not on the scale it
+//! was tallied in: the one reading no evidence closes off weighs a few hundredths of
+//! a unit against it ([`READING_NOT_AN_ENTITY`]), so a clearly delimited mention the
+//! evidence accounts for whole comes back near certainty, with its residual in the
+//! third decimal place, while a span the evidence only partly names, or one two rules
+//! read two ways, keeps the weight of what is left open and is reported materially
+//! below it.
+//!
 //! The operation holds NO state: the answer is a function of the submitted document
 //! alone, so repeating the call returns the same entities, and nothing a later caller
 //! reads is changed by calling it.
@@ -217,25 +225,48 @@ const TYPE_QUANTITY: &str = "QUANTITY";
 const TYPE_TITLE: &str = "TITLE";
 const TYPE_OTHER: &str = "OTHER";
 
-/// How much evidence ONE level of a closed form's specificity holds.
+/// The tightest a closed form in [`pattern_rules`] fixes the characters it matches:
+/// the top of the specificity ladder the rules' `priority` orders them on, where an
+/// ISO-8601 date fixes the separators and the field widths and a bare run of digits
+/// fixes nothing but that the characters are digits.
 ///
-/// A lexical form constrains the characters it matches, and the more of them it
-/// constrains the less else the span can be: the `priority` each rule in
-/// [`pattern_rules`] carries orders its form by exactly that — an ISO-8601 date
-/// fixes the separators and the field widths, a bare run of digits fixes nothing but
-/// that the characters are digits — so the level a rule sits at is weighed, rather
-/// than every rule of the class sharing one number.
-const EVIDENCE_PER_SPECIFICITY_LEVEL: f64 = 5.0;
+/// Read off the TABLE rather than written down beside it, so a rule added at a level
+/// above today's top raises the anchor with it instead of letting a form say more
+/// about a character than a lexicon entry spelling that character out. Computed once,
+/// from the rules the process compiled once.
+fn tightest_specificity_level() -> f64 {
+    static LEVEL: OnceLock<f64> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        let declared = pattern_rules()
+            .iter()
+            .map(|rule| rule.priority)
+            .max()
+            .unwrap_or(1);
+        f64::from(declared).max(1.0)
+    })
+}
 
-/// Evidence ONE CHARACTER a matched closed form fixes holds.
+/// Evidence ONE CHARACTER a matched closed form fixes holds, per LEVEL of that
+/// form's specificity.
 ///
-/// A form constrains the characters it matched one at a time, so the longer the
-/// stretch of the mention it accounts for the less room is left for the match to be
-/// a coincidence: a date written with its year is read with more confidence than the
+/// A form constrains CHARACTERS — that is the whole of what a lexical rule says about
+/// a span — so its evidence is the characters it fixed, weighed by how tightly the
+/// form fixes one: a date written with its year is read with more confidence than the
 /// same date without it, and two mentions of the SAME form are read with the
-/// confidence their own characters leave rather than with one number belonging to
-/// the form.
-const EVIDENCE_PER_FORM_CHAR: f64 = 0.45;
+/// confidence their own characters leave rather than with one number belonging to the
+/// form.
+///
+/// Anchored at the top of the ladder: a form at [`tightest_specificity_level`] names a
+/// character as tightly as a lexicon entry spelling that character out
+/// ([`EVIDENCE_PER_LEXICON_CHAR`], the strongest evidence this recogniser has), and a
+/// looser level names it proportionally less tightly. A form's level is therefore
+/// weighed OVER its characters rather than added beside them: a flat bonus per level
+/// would let the loosest form in the table — a bare calendar word, a run of four
+/// digits — outweigh a name a lexicon spells out, which no reading of the evidence
+/// supports.
+fn evidence_per_form_char_level() -> f64 {
+    EVIDENCE_PER_LEXICON_CHAR / tightest_specificity_level()
+}
 
 /// Evidence a lexicon entry holds, per character of the span it names: a name the
 /// lexicon spells out is the strongest evidence this recogniser has, and the longer
@@ -272,11 +303,33 @@ const EVIDENCE_PER_CAPITALIZED_CHAR: f64 = 0.25;
 /// it and the confidence does not depend on which occurrence a caller looks at.
 const EVIDENCE_PER_CORROBORATING_MENTION: f64 = 1.25;
 
-/// The weight of the reading in which the span names nothing at all.
+/// The weight of the reading in which the span names nothing at all, on the scale
+/// the evidence above is tallied in.
 ///
 /// Always open, because no rule-and-lexicon recogniser excludes it: this is what
-/// keeps every reported confidence strictly below 1.
-const READING_NOT_AN_ENTITY: f64 = 0.4;
+/// keeps every reported confidence strictly below 1, and — for a detection nothing
+/// else contests — it is the WHOLE residual its confidence leaves.
+///
+/// So its size is what calibrates the tally onto the scale a confidence is reported
+/// and read on, and that is the part this constant is fixed by rather than by the
+/// tally's own arithmetic. A detection whose evidence accounts for its mention's own
+/// characters — a lexicon entry spelling every character of the name out, a closed
+/// calendar form fixing its separators and its field widths — carries several units
+/// of support, a dozen and more for a long mention, and a detection like that is an
+/// unambiguous one: its residual belongs in the third decimal place, since that is
+/// where a confidence a client gates a detection on (writing the mention to a record,
+/// redacting it, routing it for review) has to sit for the gate to pass what it
+/// should. A weight of the order of the evidence itself would instead report such a
+/// detection one to four percent short of certainty — a borderline reading, below any
+/// gate set near certainty — so this weight is a few HUNDREDTHS of one unit of
+/// evidence: at the handful of units a short whole-mention reading tallies it leaves
+/// a few thousandths, and the residual keeps falling as the evidence grows. Nothing
+/// else about a detection changes with it: a span whose characters the evidence only
+/// partly accounts for keeps the competing weight of the rest
+/// ([`READING_UNNAMED_CHAR`], [`READING_UNTYPED_NAME`]) and so is still reported
+/// materially below a mention the evidence names whole, and two detections keep the
+/// order their evidence puts them in.
+const READING_NOT_AN_ENTITY: f64 = 0.04;
 
 /// The weight of the reading in which a span that IS a name belongs to a category no
 /// rule could read. Open only for the `OTHER` fallback, which is the reading that the
@@ -293,8 +346,9 @@ const READING_UNNAMED_CHAR: f64 = 0.3;
 /// reported with.
 ///
 /// The recogniser reports [`Self::confidence`], the SUPPORTED reading's share of
-/// everything the span's evidence leaves open — the same shape of calibration the
-/// service's part-of-speech tagger reports a tag with. So the confidence follows the
+/// everything the span's evidence leaves open, weighed against the one reading no
+/// evidence closes off ([`READING_NOT_AN_ENTITY`], which is what calibrates the share
+/// onto the scale a confidence is reported on). So the confidence follows the
 /// detection: the rules that fired on it, how many of the mention's own CHARACTERS
 /// they account for, what the rest of the document says about the same mention, and
 /// what else those characters could have been.
@@ -311,6 +365,12 @@ impl Evidence {
     /// The confidence this span is reported with: the supported reading's share of
     /// the whole, which is strictly inside `(0, 1)` for any span carrying evidence,
     /// since [`READING_NOT_AN_ENTITY`] is never closed off.
+    ///
+    /// Reported on the scale a confidence is read on, which is what the weight of
+    /// that never-excluded reading sets: a mention the evidence accounts for whole
+    /// leaves a residual in the third decimal place, while one the evidence only
+    /// partly accounts for, or one two rules read two ways, keeps the weight of what
+    /// is left open and lands materially below it.
     fn confidence(&self) -> f32 {
         let total = self.support + self.competing + READING_NOT_AN_ENTITY;
         (self.support / total.max(f64::MIN_POSITIVE)) as f32
@@ -1327,14 +1387,16 @@ fn pattern_entities(text: &str) -> Vec<Recognised> {
                 start,
                 end,
                 entity_type: rule.entity_type,
-                // A closed form's evidence is the span's own characters: how much it
-                // constrains them (the rule's specificity level) and how many of the
-                // mention's characters it accounts for. The completion above is
-                // rule-driven too — a deictic modifier and a day part are closed
-                // lists — so every character of the reported mention is named.
+                // A closed form's evidence is the span's own characters: how many of
+                // the mention's characters it accounts for, each weighed by how
+                // tightly the form fixes one (the rule's specificity level). The
+                // completion above is rule-driven too — a deictic modifier and a day
+                // part are closed lists — so every character of the reported mention
+                // is named.
                 evidence: Evidence {
-                    support: EVIDENCE_PER_SPECIFICITY_LEVEL * f64::from(rule.priority)
-                        + EVIDENCE_PER_FORM_CHAR * form_chars as f64,
+                    support: evidence_per_form_char_level()
+                        * f64::from(rule.priority)
+                        * form_chars as f64,
                     competing: 0.0,
                 },
                 priority: rule.priority,
