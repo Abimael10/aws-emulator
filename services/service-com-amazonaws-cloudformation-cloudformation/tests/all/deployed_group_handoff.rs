@@ -27,14 +27,12 @@
 //! capacity of two — and the group's instances are read back from Auto Scaling itself, so a
 //! group reported created is one that really holds what it was sized for.
 
-use std::time::{Duration, Instant};
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::auto_scaling_group_reads::{described_group, in_service_instances};
 use crate::stack_lifecycle::{
-    autoscaling, call, create_stack, is_service_assigned_id, member, router_with_engine, xml_text,
-    xml_texts,
+    call, create_stack, is_service_assigned_id, member, router_with_engine, xml_text,
 };
 use crate::stack_outputs::wire_outputs;
 
@@ -50,15 +48,6 @@ const IMAGE_ID: &str = "ami-00000000000000001";
 /// refuse for being outside the group's own bounds.
 const CAPACITY: usize = 2;
 const UPDATED_CAPACITY: usize = 3;
-
-/// The longest this suite waits for the instances a group was sized for to come into
-/// service: a group's launches settle on the clock at an instant Auto Scaling records, and
-/// nothing sleeps for it, so what is waited for is the CONDITION. Generous, because what the
-/// case is about is that the instances arrive at all, not how quickly the host gets there.
-const IN_SERVICE_DEADLINE: Duration = Duration::from_secs(120);
-
-/// How often the waits below look again.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What one output's value must BE, judged against what the owning services answer their own
 /// reads with rather than against a literal this suite made up.
@@ -251,57 +240,6 @@ fn value_of(case: &str, outputs: &[(String, Option<String>)], key: &str) -> Stri
     found.1.clone().unwrap_or_else(|| {
         panic!("case {case:?}: the output {key:?} carries no OutputValue, got {outputs:?}")
     })
-}
-
-/// Amazon EC2 Auto Scaling's own answer for the group `name`, asserted to report exactly that
-/// one group.
-async fn described_group(case: &str, router: &MultiServiceRouter, name: &str) -> String {
-    let (status, body) = autoscaling(
-        router,
-        "DescribeAutoScalingGroups",
-        &[("AutoScalingGroupNames.member.1", name)],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: DescribeAutoScalingGroups({name}) must answer 200, got {status} {body}"
-    );
-    assert_eq!(
-        xml_texts(&body, "AutoScalingGroupName"),
-        vec![name.to_string()],
-        "case {case:?}: expected Auto Scaling to report exactly the group {name:?} the stack \
-         reports created, got {body}"
-    );
-    body
-}
-
-/// The ids of the instances Auto Scaling reports IN SERVICE in the group, once it reports
-/// `wanted` of them — polled, because a launch settles at an instant that service records.
-async fn in_service_instances(
-    case: &str,
-    router: &MultiServiceRouter,
-    name: &str,
-    wanted: usize,
-) -> Vec<String> {
-    let deadline = Instant::now() + IN_SERVICE_DEADLINE;
-    loop {
-        let body = described_group(case, router, name).await;
-        let in_service: Vec<String> = xml_texts(&body, "InstanceId")
-            .into_iter()
-            .zip(xml_texts(&body, "LifecycleState"))
-            .filter(|(_, state)| state == "InService")
-            .map(|(instance_id, _)| instance_id)
-            .collect();
-        if in_service.len() == wanted {
-            return in_service;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: expected the group {name:?} to hold {wanted} instances in service, \
-             got {in_service:?}"
-        );
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
 }
 
 /// The stack's whole `DescribeStacks` body once it has settled, asserted to have settled on
