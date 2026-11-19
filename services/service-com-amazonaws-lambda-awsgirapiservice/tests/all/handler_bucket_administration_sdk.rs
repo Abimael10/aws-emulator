@@ -14,15 +14,17 @@
 //!
 //! The rows differ along what the rule generalises over: WHICH operation class is called (a
 //! subresource read whose answer is a nested container, a subresource replacement whose
-//! input is one, a listing of every version a bucket holds, a removal of a set of objects in
-//! one call), WHAT the container the call carries holds (one destination with a prefix rule,
-//! one with a suffix rule and two events and an id of its own, one beside the EventBridge
-//! container, the empty container that turns notifications off, one naming no events at
-//! all), whether the destination VALIDATES or is refused, whether the validation is skipped,
+//! input is one, a scalar subresource a bucket may carry no state for at all, a listing of
+//! every version a bucket holds, a removal of a set of objects in one call), WHAT the
+//! container the call carries holds (one destination with a prefix rule, one with a suffix
+//! rule and two events and an id of its own, one beside the EventBridge container, the empty
+//! container that turns notifications off, one naming no events at all, each versioning state
+//! the bucket can be put into, a default-encryption rule naming an algorithm and a key), whether
+//! the destination VALIDATES or is refused, whether the validation is skipped,
 //! and whether the bucket the objects are listed out of is versioning-enabled (so a version
 //! carries a minted id) or not (so it carries the null one). Every success is read back
 //! through Amazon S3's OWN API, so a call that answered without doing the work fails here,
-//! and two last rows show the other half of the rule: a container whose own REQUIRED member
+//! and three last rows show the other half of the rule: a container whose own REQUIRED member
 //! the handler's document does not carry stops the call rather than travelling emptied.
 //!
 //! The suite RUNS a handler, so it takes the target's one invocation stream
@@ -273,12 +275,65 @@ def lambda_handler(event, context):
     tagging["after"] = sorted([[tag["Key"], tag["Value"]] for tag in read.get("TagSet", [])])
     report["tagging"] = tagging
 
+    # The bucket's own VERSIONING and DEFAULT-ENCRYPTION subresources: what the bucket
+    # reports before anything has set its versioning state, each state the handler puts it
+    # into, and the encryption container it writes read back.
+    configuration = {}
+    unset = client.get_bucket_versioning(Bucket=bucket)
+    configuration["versioning_before"] = {
+        "members": sorted([member for member in ("Status", "MFADelete") if member in unset]),
+    }
+    states = []
+    for status in event["versioning_states"]:
+        client.put_bucket_versioning(
+            Bucket=bucket, VersioningConfiguration={"Status": status}
+        )
+        read = client.get_bucket_versioning(Bucket=bucket)
+        states.append({"asked": status, "status": read.get("Status")})
+    configuration["versioning"] = states
+
+    wanted = event["encryption"]
+    client.put_bucket_encryption(
+        Bucket=bucket,
+        ServerSideEncryptionConfiguration={
+            "Rules": [
+                {
+                    "ApplyServerSideEncryptionByDefault": {
+                        "SSEAlgorithm": wanted["algorithm"],
+                        "KMSMasterKeyID": wanted["key_id"],
+                    },
+                    "BucketKeyEnabled": True,
+                }
+            ]
+        },
+    )
+    read = client.get_bucket_encryption(Bucket=bucket)
+    rules = []
+    for rule in (read.get("ServerSideEncryptionConfiguration") or {}).get("Rules", []):
+        by_default = rule.get("ApplyServerSideEncryptionByDefault") or {}
+        rules.append(
+            {
+                "algorithm": by_default.get("SSEAlgorithm"),
+                "key_id": by_default.get("KMSMasterKeyID"),
+                "bucket_key": rule.get("BucketKeyEnabled"),
+                "bucket_key_as_boolean": isinstance(rule.get("BucketKeyEnabled"), bool),
+            }
+        )
+    configuration["encryption"] = rules
+    report["configuration"] = configuration
+
     # A container whose own REQUIRED member the document does not carry: the SDK does not
     # build the call at all, so nothing is replaced or removed.
     probes = {}
     attempts = (
         ("tagging", lambda: client.put_bucket_tagging(Bucket=bucket, Tagging={})),
         ("removal", lambda: client.delete_objects(Bucket=bucket, Delete={})),
+        (
+            "encryption",
+            lambda: client.put_bucket_encryption(
+                Bucket=bucket, ServerSideEncryptionConfiguration={}
+            ),
+        ),
     )
     for label, attempt in attempts:
         try:
@@ -515,6 +570,21 @@ fn containers(queue_arn: &str, ungranted_arn: &str, absent_arn: &str) -> Vec<Con
 /// The tag set the handler writes on the bucket.
 const TAGS: [(&str, &str); 2] = [("owner", "platform"), ("auto-delete", "true")];
 
+/// The versioning states the handler puts the bucket into, in order
+/// (`com.amazonaws.s3#BucketVersioningStatus`, whose two values these are): the bucket starts
+/// having never had one set, so the first row is also where a state first exists at all.
+const VERSIONING_STATES: [&str; 2] = ["Enabled", "Suspended"];
+
+/// The default encryption the handler writes on the bucket: an algorithm and the key it names.
+///
+/// `KMSMasterKeyID` "is allowed if and only if SSEAlgorithm is set to aws:kms or
+/// aws:kms:dsse" (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`), which is why the
+/// algorithm is the KMS one.
+const ENCRYPTION_ALGORITHM: &str = "aws:kms";
+/// See [`ENCRYPTION_ALGORITHM`].
+const ENCRYPTION_KEY_ID: &str =
+    "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000";
+
 /// Invoke `name`, handing it the table of containers, the tag set and the buckets to empty.
 async fn invoked(
     router: &MultiServiceRouter,
@@ -544,6 +614,11 @@ async fn invoked(
             "bucket": BUCKET,
             "containers": containers,
             "tags": tags,
+            "versioning_states": VERSIONING_STATES,
+            "encryption": {
+                "algorithm": ENCRYPTION_ALGORITHM,
+                "key_id": ENCRYPTION_KEY_ID,
+            },
             "object_buckets": [
                 { "case": "a versioning-enabled bucket", "bucket": VERSIONED_BUCKET },
                 { "case": "a bucket that is not versioning-enabled", "bucket": PLAIN_BUCKET },
@@ -768,7 +843,11 @@ async fn a_handler_administers_a_bucket_with_what_the_runtime_supplies() {
     // A container whose own required member the document does not carry stops the call: the
     // required member is never sent emptied, and the tag set the store holds above proves
     // the call that would have replaced it was not made.
-    for (probe, named) in [("tagging", "TagSet"), ("removal", "Objects")] {
+    for (probe, named) in [
+        ("tagging", "TagSet"),
+        ("removal", "Objects"),
+        ("encryption", "Rules"),
+    ] {
         let reported = &report["not_made"][probe];
         assert_eq!(
             reported["code"],
@@ -781,6 +860,52 @@ async fn a_handler_administers_a_bucket_with_what_the_runtime_supplies() {
             "case {probe:?}: expected the refusal to name {named:?}, got {message:?}"
         );
     }
+
+    // The bucket's versioning and default encryption: a bucket whose versioning has never
+    // been set reports NEITHER member, each state the handler puts it into is the state it
+    // then reports, and the encryption container the handler wrote is the one it reads back —
+    // in the store as well as in the handler's report.
+    let configuration = &report["configuration"];
+    assert_eq!(
+        configuration["versioning_before"]["members"],
+        json!([] as [Value; 0]),
+        "case {case:?}: a bucket whose versioning has never been set reports no state, got \
+         {configuration}"
+    );
+    let put_states: Vec<Value> = VERSIONING_STATES
+        .iter()
+        .map(|status| json!({ "asked": status, "status": status }))
+        .collect();
+    assert_eq!(
+        configuration["versioning"],
+        json!(put_states),
+        "case {case:?}: expected each versioning state the handler put to be the one read \
+         back, got {configuration}"
+    );
+    assert_eq!(
+        configuration["encryption"],
+        json!([{
+            "algorithm": ENCRYPTION_ALGORITHM,
+            "key_id": ENCRYPTION_KEY_ID,
+            "bucket_key": true,
+            "bucket_key_as_boolean": true,
+        }]),
+        "case {case:?}: expected the default encryption the handler wrote, got {configuration}"
+    );
+    let (status, document) = s3(&router, "GET", &format!("/{BUCKET}?versioning"), b"").await;
+    assert!(
+        status == 200 && document.contains(VERSIONING_STATES[VERSIONING_STATES.len() - 1]),
+        "case {case:?}: expected the store to hold the versioning state the handler last put, \
+         got {status}: {document}"
+    );
+    let (status, document) = s3(&router, "GET", &format!("/{BUCKET}?encryption"), b"").await;
+    assert!(
+        status == 200
+            && document.contains(ENCRYPTION_ALGORITHM)
+            && document.contains(ENCRYPTION_KEY_ID),
+        "case {case:?}: expected the store to hold the default encryption the handler wrote, \
+         got {status}: {document}"
+    );
 
     // One assertion block per emptied bucket: what was listed, what was removed, and what the
     // store holds afterwards.

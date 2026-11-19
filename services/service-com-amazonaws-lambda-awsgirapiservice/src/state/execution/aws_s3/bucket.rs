@@ -7,9 +7,9 @@
 //! A handler that administers storage rather than storing through it calls these: it probes
 //! whether a bucket is there and usable at all, lists the account's buckets, reads and
 //! replaces the notification container that decides where a bucket's object events are
-//! published, reads and replaces the bucket's tag set, lists the versions a bucket
-//! holds and removes a set of them in one call. Every one of them is bound exactly as the
-//! object calls
+//! published, reads and replaces the bucket's tag set, its versioning state and its default
+//! server-side encryption, lists the versions a bucket holds and removes a set of them in
+//! one call. Every one of them is bound exactly as the object calls
 //! beside it are ([`super`]): the request is built, signed and parsed by the S3 client this
 //! crate holds, over the in-process callback, so the answer is the emulated S3 service's
 //! own — that operation's output members for a success, and S3's own code, message and
@@ -24,9 +24,12 @@
 use ::serde_json::{Map, Value};
 
 use ::aws_sdk_s3::types::{
-    Delete, Event, EventBridgeConfiguration, FilterRule, FilterRuleName, LambdaFunctionConfiguration,
+    BucketVersioningStatus, ChecksumAlgorithm, Delete, Event, EventBridgeConfiguration, FilterRule,
+    FilterRuleName, LambdaFunctionConfiguration, MfaDelete, MfaDeleteStatus,
     NotificationConfiguration, NotificationConfigurationFilter, ObjectIdentifier, Owner,
-    QueueConfiguration, S3KeyFilter, TopicConfiguration,
+    QueueConfiguration, S3KeyFilter, ServerSideEncryption, ServerSideEncryptionByDefault,
+    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, TopicConfiguration,
+    VersioningConfiguration,
 };
 use ::aws_sdk_s3::Client;
 
@@ -278,6 +281,222 @@ pub(super) async fn put_bucket_tagging(
         .put_bucket_tagging()
         .bucket(input.required_text("Bucket")?)
         .tagging(read_tagging(input)?)
+        .set_expected_bucket_owner(input.text("ExpectedBucketOwner")?)
+        .send()
+        .await;
+    match sent {
+        Ok(_) => observed.answer(Map::new(), Vec::new()),
+        Err(error) => refused(&error, observed),
+    }
+}
+
+/// `GetBucketVersioning`: the versioning state the bucket is in.
+///
+/// "If the versioning state has never been set on a bucket, it has no versioning state"
+/// (`GetBucketVersioning`), so a bucket nothing has set reports neither member rather than
+/// a state it is not in.
+pub(super) async fn get_bucket_versioning(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&["Bucket", "ExpectedBucketOwner"])?;
+    let sent = client
+        .get_bucket_versioning()
+        .bucket(input.required_text("Bucket")?)
+        .set_expected_bucket_owner(input.text("ExpectedBucketOwner")?)
+        .send()
+        .await;
+    let read = match sent {
+        Ok(read) => read,
+        Err(error) => return refused(&error, observed),
+    };
+    let mut document = Map::new();
+    insert_text(
+        &mut document,
+        "Status",
+        read.status().map(BucketVersioningStatus::as_str),
+    );
+    insert_text(
+        &mut document,
+        "MFADelete",
+        read.mfa_delete().map(MfaDeleteStatus::as_str),
+    );
+    observed.answer(document, Vec::new())
+}
+
+/// `PutBucketVersioning`: the versioning state the bucket is put into.
+pub(super) async fn put_bucket_versioning(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&[
+        "Bucket",
+        "VersioningConfiguration",
+        "MFA",
+        "ChecksumAlgorithm",
+        "ContentMD5",
+        "ExpectedBucketOwner",
+    ])?;
+    // `VersioningConfiguration` is the operation's required payload
+    // (`smithy_query(query="shape",shape="VersioningConfiguration")`: `Status`, `MFADelete`).
+    let configuration = input.required_structure("VersioningConfiguration")?;
+    configuration.only(&["Status", "MFADelete"])?;
+    let sent = client
+        .put_bucket_versioning()
+        .bucket(input.required_text("Bucket")?)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .set_status(
+                    configuration
+                        .text("Status")?
+                        .map(|value| BucketVersioningStatus::from(value.as_str())),
+                )
+                .set_mfa_delete(
+                    configuration
+                        .text("MFADelete")?
+                        .map(|value| MfaDelete::from(value.as_str())),
+                )
+                .build(),
+        )
+        .set_mfa(input.text("MFA")?)
+        .set_checksum_algorithm(
+            input
+                .text("ChecksumAlgorithm")?
+                .map(|value| ChecksumAlgorithm::from(value.as_str())),
+        )
+        .set_content_md5(input.text("ContentMD5")?)
+        .set_expected_bucket_owner(input.text("ExpectedBucketOwner")?)
+        .send()
+        .await;
+    match sent {
+        // The operation's output is `Unit`: the success IS the status, with no member to
+        // report.
+        Ok(_) => observed.answer(Map::new(), Vec::new()),
+        Err(error) => refused(&error, observed),
+    }
+}
+
+/// `GetBucketEncryption`: the default server-side encryption the bucket applies.
+pub(super) async fn get_bucket_encryption(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&["Bucket", "ExpectedBucketOwner"])?;
+    let sent = client
+        .get_bucket_encryption()
+        .bucket(input.required_text("Bucket")?)
+        .set_expected_bucket_owner(input.text("ExpectedBucketOwner")?)
+        .send()
+        .await;
+    let read = match sent {
+        Ok(read) => read,
+        Err(error) => return refused(&error, observed),
+    };
+    let Some(configuration) = read.server_side_encryption_configuration() else {
+        return observed.answer(Map::new(), Vec::new());
+    };
+    let rules: Vec<Value> = configuration
+        .rules()
+        .iter()
+        .map(|rule| {
+            let mut entry = Map::new();
+            if let Some(by_default) = rule.apply_server_side_encryption_by_default() {
+                let mut carried = Map::new();
+                carried.insert(
+                    "SSEAlgorithm".to_string(),
+                    Value::String(by_default.sse_algorithm().as_str().to_string()),
+                );
+                insert_text(
+                    &mut carried,
+                    "KMSMasterKeyID",
+                    by_default.kms_master_key_id(),
+                );
+                entry.insert(
+                    "ApplyServerSideEncryptionByDefault".to_string(),
+                    Value::Object(carried),
+                );
+            }
+            if let Some(bucket_key) = rule.bucket_key_enabled() {
+                entry.insert("BucketKeyEnabled".to_string(), Value::Bool(bucket_key));
+            }
+            Value::Object(entry)
+        })
+        .collect();
+    let mut carried = Map::new();
+    // `Rules` is a required member of the container, so it is reported whether or not it
+    // holds anything (`ServerSideEncryptionConfiguration$Rules`).
+    carried.insert("Rules".to_string(), Value::Array(rules));
+    let mut document = Map::new();
+    document.insert(
+        "ServerSideEncryptionConfiguration".to_string(),
+        Value::Object(carried),
+    );
+    observed.answer(document, Vec::new())
+}
+
+/// `PutBucketEncryption`: the whole default-encryption container, replacing what the bucket
+/// carried before.
+pub(super) async fn put_bucket_encryption(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&[
+        "Bucket",
+        "ServerSideEncryptionConfiguration",
+        "ContentMD5",
+        "ChecksumAlgorithm",
+        "ExpectedBucketOwner",
+    ])?;
+    let configuration = input.required_structure("ServerSideEncryptionConfiguration")?;
+    configuration.only(&["Rules"])?;
+    let mut rules = Vec::new();
+    // `Rules` is required on the container
+    // (`smithy_query(query="shape",shape="ServerSideEncryptionConfiguration")`), so a
+    // container carrying none of it stops the call rather than replacing the bucket's
+    // encryption with nothing.
+    for rule in configuration.required_structures("Rules")? {
+        rule.only(&["ApplyServerSideEncryptionByDefault", "BucketKeyEnabled"])?;
+        let by_default = match rule.structure("ApplyServerSideEncryptionByDefault")? {
+            Some(carried) => {
+                carried.only(&["SSEAlgorithm", "KMSMasterKeyID"])?;
+                Some(
+                    ServerSideEncryptionByDefault::builder()
+                        .sse_algorithm(ServerSideEncryption::from(
+                            carried.required_text("SSEAlgorithm")?.as_str(),
+                        ))
+                        .set_kms_master_key_id(carried.text("KMSMasterKeyID")?)
+                        .build()
+                        .map_err(not_made)?,
+                )
+            }
+            None => None,
+        };
+        rules.push(
+            ServerSideEncryptionRule::builder()
+                .set_apply_server_side_encryption_by_default(by_default)
+                .set_bucket_key_enabled(rule.boolean("BucketKeyEnabled")?)
+                .build(),
+        );
+    }
+    let sent = client
+        .put_bucket_encryption()
+        .bucket(input.required_text("Bucket")?)
+        .server_side_encryption_configuration(
+            ServerSideEncryptionConfiguration::builder()
+                .set_rules(Some(rules))
+                .build()
+                .map_err(not_made)?,
+        )
+        .set_content_md5(input.text("ContentMD5")?)
+        .set_checksum_algorithm(
+            input
+                .text("ChecksumAlgorithm")?
+                .map(|value| ChecksumAlgorithm::from(value.as_str())),
+        )
         .set_expected_bucket_owner(input.text("ExpectedBucketOwner")?)
         .send()
         .await;

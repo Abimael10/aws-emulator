@@ -145,7 +145,11 @@ pub async fn unusable_remediation(
 /// transport,
 /// so there is nothing to retry, time out, cache an identity for or watch for a stalled
 /// stream.
-fn ssm_client(
+///
+/// The ONE place this crate reaches Systems Manager, so the question of whether a
+/// remediation target exists and the start of the automation that RUNS it
+/// ([`super::remediation`]) address the same Systems Manager the same way.
+pub(super) fn ssm_client(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_ssm::Client {

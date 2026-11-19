@@ -159,8 +159,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this report is computed from state.
-        let _ = ctx;
+        // `ctx` carries the request's Region and the in-process callback the runs this
+        // report is about are read back over.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
@@ -214,6 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|limit| *limit > 0)
             .unwrap_or(REMEDIATION_EXECUTION_STATUS_MAX_PAGE_SIZE);
 
+        // What each execution's RUN has got to was owed at the same instant whether or not
+        // anybody called, and only a call to the service that owns the run can learn it —
+        // so the runs still in flight are read back before this report says anything, with
+        // no store guard held (`crate::state::remediation`).
+        crate::state::follow_remediation_automations(
+            ctx.callback(),
+            &*self.engine,
+            &crate::state::request_region(ctx),
+        )
+        .await;
         let now = ::std::time::SystemTime::now();
         let store = state.lock();
 

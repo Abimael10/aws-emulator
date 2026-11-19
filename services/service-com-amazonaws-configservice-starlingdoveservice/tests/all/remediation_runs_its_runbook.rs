@@ -4,25 +4,29 @@
 //! guardrail client drives: a running recorder records a bucket, a managed rule places
 //! it `NON_COMPLIANT`, and the rule's remediation then runs and makes the bucket comply.
 //!
-//! The rule under test: a remediation execution RUNS the action of the Systems Manager
-//! automation runbook its remediation configuration names, against the resource the
-//! execution names and with the inputs that configuration's parameters resolve to (a
-//! static value, the resource value, or the runbook's own documented default), so by the
-//! time the execution reaches its terminal success the resource has been changed as the
-//! runbook specifies — and a rule with NO remediation configuration is refused
-//! `NoSuchRemediationConfigurationException`, leaving the resource exactly as it was.
+//! RULE: a remediation execution RUNS the Systems Manager automation document its
+//! remediation configuration names, by starting an execution of that document in Systems
+//! Manager with the configuration's parameters resolved for the resource — so the run exists
+//! where the service that owns automation documents holds it, that service's own steps are
+//! what change the resource, and the Config execution reports the state that automation
+//! reached. One run per started execution, whatever the document is: a run Systems Manager
+//! refuses — a document that is not an automation runbook, a configuration that leaves out a
+//! parameter the runbook requires — is reported as the failure it is, carrying that service's
+//! own error code and sentence, and changes nothing.
 //!
-//! The rows differ along what the rule generalises over: which runbook the configuration
-//! names (two of the catalogue, and one whose action this emulator does not perform),
-//! which input each one's parameters resolve (a value the request states, a value the
-//! runbook defaults, and the resource value `RESOURCE_ID`), and which state the resulting
-//! change leaves the bucket in — including one that leaves it still NON_COMPLIANT,
-//! because the state the request asked for is not the one the rule checks for.
+//! The rows differ along what the rule generalises over: which document the configuration
+//! names (two of the published runbooks, a document that is not a runbook at all, and — in
+//! the second test — a document created through Systems Manager's own API, which this crate
+//! can hold no action for), which input each one's parameters resolve (a value the
+//! configuration states, a value the document defaults, and the resource value
+//! `RESOURCE_ID`), and which state the resulting change leaves the bucket in — including
+//! one that leaves it still NON_COMPLIANT, because the state the configuration asked for is
+//! not the one the rule checks for.
 //!
-//! Config and S3 are mounted on ONE engine, reusing the harness
-//! `config_recorded_resource_compliance` builds: the recorder reads the buckets it
-//! records from S3's own API, and the remediation acts on them through the same API, so
-//! without S3 mounted there is nothing to record and nothing to remediate.
+//! Config, S3 and Systems Manager are mounted on ONE engine, reusing the harness
+//! `config_recorded_resource_compliance` builds: the recorder reads the buckets it records
+//! from S3's own API, the runbook's own steps act on them through that same API, and
+//! Systems Manager is where the run itself lives.
 
 use std::time::{Duration, Instant};
 
@@ -36,8 +40,12 @@ const BUCKET_RESOURCE_TYPE: &str = "AWS::S3::Bucket";
 /// The only published `RemediationTargetType`: an SSM automation document.
 const TARGET_TYPE: &str = "SSM_DOCUMENT";
 
-/// The `Parameters` key carrying the role a remediation runs as, which every
-/// remediation configuration must provide.
+/// The `X-Amz-Target` prefix of Systems Manager (that crate's `OPERATIONS.md`), which is
+/// how this suite asks that service about the runs Config started in it.
+const SSM_TARGET_PREFIX: &str = "AmazonSSM";
+
+/// The `Parameters` key carrying the role a remediation runs as, which the published
+/// runbooks declare as a parameter of their own.
 const AUTOMATION_ASSUME_ROLE: &str = "AutomationAssumeRole";
 
 /// The `Parameters` key the S3 runbooks take the bucket's name in.
@@ -52,10 +60,11 @@ const COMPLIANT: &str = "COMPLIANT";
 /// See [`COMPLIANT`].
 const NON_COMPLIANT: &str = "NON_COMPLIANT";
 
-/// The terminal state a remediation execution that has run reports.
+/// `RemediationExecutionState` values this suite reads back
+/// (`smithy_query(query="shape", shape="RemediationExecutionState")`).
 const SUCCEEDED: &str = "SUCCEEDED";
-/// The state a remediation execution reports before its run has started.
-const QUEUED: &str = "QUEUED";
+/// See [`SUCCEEDED`].
+const FAILED: &str = "FAILED";
 
 /// The Config rule every row writes, which the remediation under test remediates, and
 /// the managed rule it runs: "Checks if versioning is enabled for your S3 buckets".
@@ -69,29 +78,33 @@ const VERSIONING_RULE: &str = "S3_BUCKET_VERSIONING_ENABLED";
 /// `AES256` (`ServerSideEncryption`).
 const DEFAULT_ENCRYPTION: &str = "AES256";
 
-/// How long a poll waits for a span the clock owes — a recording pass, an evaluation, a
-/// remediation execution — before giving up. Each is due a fraction of a second after
-/// the call that made it due, so this is many times over and not a span the behaviour
-/// depends on.
-const CONVERGENCE_BUDGET: Duration = Duration::from_secs(10);
+/// How long a poll waits for a span the clock owes — a recording pass, an evaluation, an
+/// automation execution being picked up and walked. Every one of them is due a few seconds
+/// after the call that made it due at the outside, so this is several times over and not a
+/// span the behaviour depends on.
+const CONVERGENCE_BUDGET: Duration = Duration::from_secs(30);
 
 /// How long a poll waits between two reads.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// One row: the runbook the rule's remediation names, the parameters that configuration
-/// carries beside the role, and the state the remediation must leave the bucket in.
+/// One row: the document the rule's remediation names, the parameters that configuration
+/// carries beside the role, and what the run of it leaves behind.
 struct Case {
     /// What the row is called in every assertion of it.
     case: &'static str,
-    /// The `TargetId` of the remediation configuration: the runbook it runs.
+    /// The `TargetId` of the remediation configuration: the document it runs.
     target_id: &'static str,
     /// Parameters the configuration states as static values, beside the role.
     statics: &'static [(&'static str, &'static str)],
-    /// Whether the configuration names the bucket through the resource value rather than
-    /// leaving the runbook to act on the resource the execution names.
+    /// Whether the configuration names the bucket through the resource value, which is how
+    /// a remediation hands the resource it is about to the runbook.
     bucket_by_resource_value: bool,
-    /// Whether this emulator performs the action the runbook names at all.
-    runs_an_action: bool,
+    /// The state the execution settles at: a run Systems Manager made has succeeded, one it
+    /// refused has failed.
+    settles_at: &'static str,
+    /// The error code Systems Manager refuses the start with, which is what the execution's
+    /// one step then carries as its `ErrorMessage`; `None` for a row that is run.
+    refused_with: Option<&'static str>,
     /// The bucket's versioning status after the remediation, absent while its versioning
     /// has never been set.
     versioning: Option<&'static str>,
@@ -115,31 +128,41 @@ fn bucket_rule(bucket: &str) -> Value {
     })
 }
 
-/// The `PutRemediationConfigurations` body for this row, built from its runbook and its
-/// parameters.
-fn remediation(case: &Case) -> Value {
-    let mut parameters = json!({
+/// The `PutRemediationConfigurations` body for the document `target_id` with `parameters`.
+fn remediation_body(target_id: &str, parameters: Value) -> Value {
+    json!({
+        "RemediationConfigurations": [{
+            "ConfigRuleName": RULE_NAME,
+            "TargetType": TARGET_TYPE,
+            "TargetId": target_id,
+            "ResourceType": BUCKET_RESOURCE_TYPE,
+            "Parameters": parameters,
+        }],
+    })
+}
+
+/// The role a remediation runs as, as the one parameter every configuration here carries.
+fn assume_role_parameter() -> Value {
+    json!({
         AUTOMATION_ASSUME_ROLE: {
             "StaticValue": {
                 "Values": [format!("arn:aws:iam::{ACCOUNT_ID}:role/config-remediation")],
             },
         },
-    });
+    })
+}
+
+/// The `PutRemediationConfigurations` body for this row, built from its document and its
+/// parameters.
+fn remediation(case: &Case) -> Value {
+    let mut parameters = assume_role_parameter();
     for (name, value) in case.statics {
         parameters[*name] = json!({ "StaticValue": { "Values": [value] } });
     }
     if case.bucket_by_resource_value {
         parameters[BUCKET_NAME] = json!({ "ResourceValue": { "Value": RESOURCE_ID } });
     }
-    json!({
-        "RemediationConfigurations": [{
-            "ConfigRuleName": RULE_NAME,
-            "TargetType": TARGET_TYPE,
-            "TargetId": case.target_id,
-            "ResourceType": BUCKET_RESOURCE_TYPE,
-            "Parameters": parameters,
-        }],
-    })
+    remediation_body(case.target_id, parameters)
 }
 
 /// The `StartRemediationExecution` body for `bucket`.
@@ -151,6 +174,18 @@ fn start(bucket: &str) -> Value {
             "resourceId": bucket,
         }],
     })
+}
+
+/// One Systems Manager call (`awsJson1_1`), required to answer 200.
+async fn ssm(emulator: &Emulator, operation: &str, body: &Value) -> Value {
+    let (status, parsed) = emulator
+        .call("ssm", SSM_TARGET_PREFIX, "1.1", operation, body)
+        .await;
+    assert_eq!(
+        status, 200,
+        "{operation}: expected HTTP 200, got {status} with {parsed}"
+    );
+    parsed
 }
 
 /// The bucket's versioning status, absent while its versioning has never been set.
@@ -246,80 +281,105 @@ async fn await_verdict(case: &str, emulator: &Emulator, bucket: &str, wanted: &s
     }
 }
 
-/// The state the rule's remediation execution for `bucket` reports right now.
-async fn execution_state(case: &str, emulator: &Emulator, bucket: &str) -> String {
+/// The rule's remediation execution for `bucket`, as `DescribeRemediationExecutionStatus`
+/// reports it right now.
+async fn execution(case: &str, emulator: &Emulator, bucket: &str) -> Value {
     let body = emulator
         .config(
             "DescribeRemediationExecutionStatus",
             &json!({ "ConfigRuleName": RULE_NAME }),
         )
         .await;
-    let reported: Vec<(String, String)> = body["RemediationExecutionStatuses"]
+    let reported = body["RemediationExecutionStatuses"]
         .as_array()
         .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|status| {
-            let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
-            (
-                text(&status["ResourceKey"]["resourceId"]),
-                text(&status["State"]),
-            )
-        })
-        .collect();
+        .unwrap_or_default();
     reported
         .iter()
-        .find(|(resource, _)| resource == bucket)
-        .map(|(_, state)| state.clone())
+        .find(|status| status["ResourceKey"]["resourceId"].as_str() == Some(bucket))
+        .cloned()
         .unwrap_or_else(|| {
             panic!("case {case:?}: an execution must be reported for {bucket:?}, got {reported:?}")
         })
 }
 
-/// Wait until the rule's remediation execution for `bucket` reports `wanted`.
-async fn await_execution_state(case: &str, emulator: &Emulator, bucket: &str, wanted: &str) {
+/// Wait until the rule's remediation execution for `bucket` reports `wanted`, and answer
+/// the execution that reported it.
+async fn await_execution_state(
+    case: &str,
+    emulator: &Emulator,
+    bucket: &str,
+    wanted: &str,
+) -> Value {
     let deadline = Instant::now() + CONVERGENCE_BUDGET;
     loop {
-        let reported = execution_state(case, emulator, bucket).await;
-        if reported == wanted {
-            return;
+        let reported = execution(case, emulator, bucket).await;
+        if reported["State"].as_str() == Some(wanted) {
+            return reported;
         }
         assert!(
             Instant::now() < deadline,
             "case {case:?}: the remediation execution for {bucket:?} must reach {wanted}, \
-             got {reported:?}"
+             got {reported}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
+/// The automation executions Systems Manager holds for the document `document`, each as its
+/// id and the status it is at.
+async fn automation_executions(emulator: &Emulator, document: &str) -> Vec<(String, String)> {
+    let body = ssm(
+        emulator,
+        "DescribeAutomationExecutions",
+        // `DocumentNamePrefix` is the `AutomationExecutionFilterKey` that selects the
+        // executions of one document.
+        &json!({ "Filters": [{ "Key": "DocumentNamePrefix", "Values": [document] }] }),
+    )
+    .await;
+    body["AutomationExecutionMetadataList"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|execution| {
+            let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+            (
+                text(&execution["AutomationExecutionId"]),
+                text(&execution["AutomationExecutionStatus"]),
+            )
+        })
+        .collect()
+}
+
+/// Drive the arc every row shares up to the finding a remediation acts on: a recording
+/// recorder, a recorded bucket, the rule, and its `NON_COMPLIANT` verdict for the bucket.
+async fn with_a_non_compliant_bucket(case: &str, emulator: &Emulator, bucket: &str) {
+    emulator.recording().await;
+    emulator.create_bucket(bucket, &[]).await;
+    await_configuration_item(case, emulator, bucket).await;
+    emulator.config("PutConfigRule", &bucket_rule(bucket)).await;
+    await_verdict(case, emulator, bucket, NON_COMPLIANT).await;
+}
+
 #[tokio::test]
 async fn a_remediation_execution_runs_the_runbook_its_configuration_names() {
-    // The catalogue entries exercised below are the AWS-owned automation runbooks a
+    // The published runbooks exercised below are the AWS-owned automation documents a
     // Config remediation configuration names on an S3 bucket, from the Systems Manager
     // Automation runbook reference: `AWS-ConfigureS3BucketVersioning` (parameters
     // `BucketName` and `VersioningState`, whose default is `Enabled`) and
     // `AWS-EnableS3BucketEncryption` (parameters `BucketName` and `SSEAlgorithm`, whose
-    // default is `AES256`). `AWS-EnableS3BucketEncryption` is the entry this issue did
-    // not cite, and `AWS-UpdateSSMAgent` is a published document whose action this
-    // emulator does not perform at all.
+    // default is `AES256`). `AWS-EnableS3BucketEncryption` is the entry this issue did not
+    // cite, and `AWS-UpdateSSMAgent` is a published document that is a COMMAND document
+    // rather than a runbook, so no automation execution of it can be started at all.
     let cases: [Case; 5] = [
         Case {
             case: "the versioning runbook, left to its default state",
             target_id: "AWS-ConfigureS3BucketVersioning",
             statics: &[],
-            bucket_by_resource_value: false,
-            runs_an_action: true,
-            versioning: Some("Enabled"),
-            encryption: Some(DEFAULT_ENCRYPTION),
-            verdict_after: COMPLIANT,
-        },
-        Case {
-            case: "the versioning runbook, naming the bucket through the resource value",
-            target_id: "AWS-ConfigureS3BucketVersioning",
-            statics: &[("VersioningState", "Enabled")],
             bucket_by_resource_value: true,
-            runs_an_action: true,
+            settles_at: SUCCEEDED,
+            refused_with: None,
             versioning: Some("Enabled"),
             encryption: Some(DEFAULT_ENCRYPTION),
             verdict_after: COMPLIANT,
@@ -328,8 +388,9 @@ async fn a_remediation_execution_runs_the_runbook_its_configuration_names() {
             case: "the versioning runbook, asked to suspend versioning",
             target_id: "AWS-ConfigureS3BucketVersioning",
             statics: &[("VersioningState", "Suspended")],
-            bucket_by_resource_value: false,
-            runs_an_action: true,
+            bucket_by_resource_value: true,
+            settles_at: SUCCEEDED,
+            refused_with: None,
             versioning: Some("Suspended"),
             encryption: Some(DEFAULT_ENCRYPTION),
             // Suspended versioning is not versioning enabled, so the rule still places
@@ -341,7 +402,8 @@ async fn a_remediation_execution_runs_the_runbook_its_configuration_names() {
             target_id: "AWS-EnableS3BucketEncryption",
             statics: &[("SSEAlgorithm", "aws:kms")],
             bucket_by_resource_value: true,
-            runs_an_action: true,
+            settles_at: SUCCEEDED,
+            refused_with: None,
             // The runbook this configuration names sets no versioning state, so the
             // bucket the versioning rule checks is left NON_COMPLIANT.
             versioning: None,
@@ -349,11 +411,26 @@ async fn a_remediation_execution_runs_the_runbook_its_configuration_names() {
             verdict_after: NON_COMPLIANT,
         },
         Case {
-            case: "a runbook whose action this emulator does not perform",
+            case: "a published document that is not an automation runbook",
             target_id: "AWS-UpdateSSMAgent",
             statics: &[],
             bucket_by_resource_value: false,
-            runs_an_action: false,
+            settles_at: FAILED,
+            refused_with: Some("AutomationDefinitionNotFoundException"),
+            versioning: None,
+            encryption: Some(DEFAULT_ENCRYPTION),
+            verdict_after: NON_COMPLIANT,
+        },
+        Case {
+            // The runbook declares `BucketName` with no default, so a configuration that
+            // resolves no value for it states no bucket to act on and Systems Manager will
+            // not run the document at all.
+            case: "a configuration that leaves out a parameter the runbook requires",
+            target_id: "AWS-ConfigureS3BucketVersioning",
+            statics: &[],
+            bucket_by_resource_value: false,
+            settles_at: FAILED,
+            refused_with: Some("InvalidAutomationExecutionParametersException"),
             versioning: None,
             encryption: Some(DEFAULT_ENCRYPTION),
             verdict_after: NON_COMPLIANT,
@@ -363,14 +440,7 @@ async fn a_remediation_execution_runs_the_runbook_its_configuration_names() {
     for case in cases {
         let emulator = Emulator::new();
         let bucket = "remediated-bucket";
-        emulator.recording().await;
-        emulator.create_bucket(bucket, &[]).await;
-
-        // Everything downstream of discovery reads the configuration item the recorder
-        // captures for the bucket, so the arc starts there.
-        await_configuration_item(case.case, &emulator, bucket).await;
-        emulator.config("PutConfigRule", &bucket_rule(bucket)).await;
-        await_verdict(case.case, &emulator, bucket, NON_COMPLIANT).await;
+        with_a_non_compliant_bucket(case.case, &emulator, bucket).await;
 
         // A rule whose remediation configuration has been DELETED has no remediation to
         // run, which is the one precondition this refusal states — and the resource is
@@ -409,8 +479,9 @@ async fn a_remediation_execution_runs_the_runbook_its_configuration_names() {
             case.case
         );
 
-        // The identical configuration, put again, re-arms the identical execution: it
-        // runs the runbook's action and reaches its terminal success.
+        // The identical configuration, put again, re-arms the identical execution: it is
+        // run as an automation execution of the document it names, and settles where that
+        // run does.
         emulator
             .config("PutRemediationConfigurations", &remediation(&case))
             .await;
@@ -424,32 +495,34 @@ async fn a_remediation_execution_runs_the_runbook_its_configuration_names() {
             case.case
         );
 
-        // What the FIRST read after the call reports: an execution whose action this
-        // emulator ran has run it, so it reports the run as finished and the bucket
-        // already carries the change. One whose runbook names no action this emulator
-        // performs has nothing to report the progress of, so it reports the moves the
-        // clock makes due, starting at `QUEUED`.
-        let reported = execution_state(case.case, &emulator, bucket).await;
-        let (versioning_now, encryption_now) = (
-            versioning_of(&emulator, bucket).await,
-            encryption_of(&emulator, bucket).await,
-        );
-        assert_eq!(
-            (
-                reported.as_str(),
-                versioning_now.as_deref(),
-                encryption_now.as_deref(),
-            ),
-            if case.runs_an_action {
-                (SUCCEEDED, case.versioning, case.encryption)
-            } else {
-                (QUEUED, case.versioning, case.encryption)
-            },
-            "case {:?}: the first read after the call must report the run and the bucket \
-             it changed",
-            case.case
-        );
-        await_execution_state(case.case, &emulator, bucket, SUCCEEDED).await;
+        let settled = await_execution_state(case.case, &emulator, bucket, case.settles_at).await;
+        let step = &settled["StepDetails"][0];
+        // A run that was made reports no error; a run Systems Manager refused reports what
+        // that service answered — its own error code and sentence.
+        let reported_error = step["ErrorMessage"].as_str();
+        if let Some(code) = case.refused_with {
+            let expected_prefix = format!("{code}: ");
+            assert!(
+                reported_error.is_some_and(|message| message.starts_with(&expected_prefix)
+                    && message.len() > expected_prefix.len()),
+                "case {:?}: the failed step must carry the refusal of the service that owns \
+                 the document, got {reported_error:?}",
+                case.case
+            );
+            assert!(
+                automation_executions(&emulator, case.target_id)
+                    .await
+                    .is_empty(),
+                "case {:?}: a refused start leaves no automation execution behind",
+                case.case
+            );
+        } else {
+            assert_eq!(
+                reported_error, None,
+                "case {:?}: a step that did not fail reports no error, got {reported_error:?}",
+                case.case
+            );
+        }
 
         assert_eq!(
             (
@@ -457,7 +530,7 @@ async fn a_remediation_execution_runs_the_runbook_its_configuration_names() {
                 encryption_of(&emulator, bucket).await.as_deref(),
             ),
             (case.versioning, case.encryption),
-            "case {:?}: the execution must leave the bucket as its runbook specifies",
+            "case {:?}: the execution must leave the bucket as its document specifies",
             case.case
         );
 
@@ -470,4 +543,154 @@ async fn a_remediation_execution_runs_the_runbook_its_configuration_names() {
             case.case, case.verdict_after
         );
     }
+}
+
+/// The document this suite CREATES through Systems Manager's own API, which no table in the
+/// Config crate can hold an action for: its one step writes the name of the bucket it
+/// remediated into a Systems Manager parameter, so the parameter's value is proof that the
+/// document's own step ran.
+const NOTING_RUNBOOK: &str = "SuiteNoteTheRemediatedBucket";
+
+/// The parameter [`NOTING_RUNBOOK`] writes the remediated bucket's name into.
+const NOTED_PARAMETER: &str = "/suite/remediated-bucket";
+
+/// The body of [`NOTING_RUNBOOK`], whose parameters are the role the automation runs as and
+/// the bucket the remediation is about.
+fn noting_runbook() -> Value {
+    json!({
+        "schemaVersion": "0.3",
+        "description": "Notes the bucket a remediation acted on.",
+        "assumeRole": "{{ AutomationAssumeRole }}",
+        "parameters": {
+            AUTOMATION_ASSUME_ROLE: { "type": "String", "default": "" },
+            BUCKET_NAME: { "type": "String" },
+        },
+        "mainSteps": [{
+            "name": "noteTheBucket",
+            "action": "aws:executeAwsApi",
+            "inputs": {
+                "Service": "ssm",
+                "Api": "PutParameter",
+                "Name": NOTED_PARAMETER,
+                "Value": "{{ BucketName }}",
+                "Type": "String",
+                "Overwrite": true,
+            },
+        }],
+    })
+}
+
+/// The value Systems Manager holds for [`NOTED_PARAMETER`], absent while nothing has
+/// written it.
+async fn noted_bucket(emulator: &Emulator) -> Option<String> {
+    let (status, body) = emulator
+        .call(
+            "ssm",
+            SSM_TARGET_PREFIX,
+            "1.1",
+            "GetParameter",
+            &json!({ "Name": NOTED_PARAMETER }),
+        )
+        .await;
+    if status != 200 {
+        return None;
+    }
+    body["Parameter"]["Value"]
+        .as_str()
+        .map(ToString::to_string)
+}
+
+#[tokio::test]
+async fn concurrent_starts_run_one_automation_execution_of_the_document_they_name() {
+    let emulator = Emulator::new();
+    let bucket = "noted-bucket";
+    let case = "a document created through Systems Manager's own API";
+    with_a_non_compliant_bucket(case, &emulator, bucket).await;
+
+    // The document is the account's own, created the way a client creates one, so nothing
+    // in the Config crate can know an action for it: whatever it does is what Systems
+    // Manager's walk of its steps does.
+    ssm(
+        &emulator,
+        "CreateDocument",
+        &json!({
+            "Name": NOTING_RUNBOOK,
+            "DocumentType": "Automation",
+            "DocumentFormat": "JSON",
+            "Content": noting_runbook().to_string(),
+        }),
+    )
+    .await;
+    let mut parameters = assume_role_parameter();
+    parameters[BUCKET_NAME] = json!({ "ResourceValue": { "Value": RESOURCE_ID } });
+    emulator
+        .config(
+            "PutRemediationConfigurations",
+            &remediation_body(NOTING_RUNBOOK, parameters),
+        )
+        .await;
+
+    // THREE starts at once for the same resource key: "An existing
+    // StartRemediationExecution call for the specified resource keys must complete before
+    // you can call the API again", so one of them starts the run and the others report the
+    // key back — and the document is run ONCE.
+    let request = start(bucket);
+    let (first, second, third) = tokio::join!(
+        emulator.config("StartRemediationExecution", &request),
+        emulator.config("StartRemediationExecution", &request),
+        emulator.config("StartRemediationExecution", &request),
+    );
+    let answers = [&first, &second, &third];
+    let accepted = answers
+        .iter()
+        .filter(|answer| answer["FailedItems"].as_array().map(Vec::len) == Some(0))
+        .count();
+    assert_eq!(
+        accepted, 1,
+        "case {case:?}: exactly one of the concurrent starts may start the run, got \
+         {answers:?}"
+    );
+
+    // The run itself: ONE automation execution of the document the configuration names,
+    // which settles at success and carries the bucket the remediation was started for as
+    // the value its `BucketName` parameter resolved to.
+    let settled = await_execution_state(case, &emulator, bucket, SUCCEEDED).await;
+    let running = automation_executions(&emulator, NOTING_RUNBOOK).await;
+    assert_eq!(
+        running.len(),
+        1,
+        "case {case:?}: the document must have been run exactly once, got {running:?}"
+    );
+    assert_eq!(
+        running[0].1, "Success",
+        "case {case:?}: the automation execution must have succeeded, got {running:?}"
+    );
+    let automation = ssm(
+        &emulator,
+        "GetAutomationExecution",
+        &json!({ "AutomationExecutionId": running[0].0 }),
+    )
+    .await;
+    assert_eq!(
+        (
+            automation["AutomationExecution"]["DocumentName"].as_str(),
+            automation["AutomationExecution"]["Parameters"][BUCKET_NAME][0].as_str(),
+        ),
+        (Some(NOTING_RUNBOOK), Some(bucket)),
+        "case {case:?}: the run must be of the document the configuration names, for the \
+         resource the execution names, got {automation}"
+    );
+    assert_eq!(
+        settled["StepDetails"][0]["ErrorMessage"].as_str(),
+        None,
+        "case {case:?}: a run that succeeded reports no error, got {settled}"
+    );
+
+    // What the document's own step DID, read from the service that served it: nothing in
+    // the Config crate could have produced this.
+    assert_eq!(
+        noted_bucket(&emulator).await.as_deref(),
+        Some(bucket),
+        "case {case:?}: the document's own step must have run"
+    );
 }

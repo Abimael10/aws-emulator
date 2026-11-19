@@ -81,14 +81,19 @@ pub const BOUND_OPERATIONS: &[&str] = &[
     "DeleteObjectTagging",
     // The bucket-wide half ([`bucket`]): what a handler administering a bucket calls —
     // probing whether the bucket is there and usable, listing the account's buckets,
-    // reading and replacing the bucket's own notification and tagging subresources, listing
-    // the versions it holds, and removing a set of them in one call.
+    // reading and replacing the bucket's own notification, tagging, versioning and default
+    // encryption subresources, listing the versions it holds, and removing a set of them in
+    // one call.
     "HeadBucket",
     "ListBuckets",
     "GetBucketNotificationConfiguration",
     "PutBucketNotificationConfiguration",
     "GetBucketTagging",
     "PutBucketTagging",
+    "GetBucketVersioning",
+    "PutBucketVersioning",
+    "GetBucketEncryption",
+    "PutBucketEncryption",
     "ListObjectVersions",
     "DeleteObjects",
 ];
@@ -131,6 +136,10 @@ pub async fn call(
         }
         "GetBucketTagging" => bucket::get_bucket_tagging(&client, &input, &observed).await,
         "PutBucketTagging" => bucket::put_bucket_tagging(&client, &input, &observed).await,
+        "GetBucketVersioning" => bucket::get_bucket_versioning(&client, &input, &observed).await,
+        "PutBucketVersioning" => bucket::put_bucket_versioning(&client, &input, &observed).await,
+        "GetBucketEncryption" => bucket::get_bucket_encryption(&client, &input, &observed).await,
+        "PutBucketEncryption" => bucket::put_bucket_encryption(&client, &input, &observed).await,
         "ListObjectVersions" => bucket::list_object_versions(&client, &input, &observed).await,
         "DeleteObjects" => bucket::delete_objects(&client, &input, &observed).await,
         other => Err(Refusal::NotMade(format!(

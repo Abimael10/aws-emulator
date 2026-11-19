@@ -858,6 +858,12 @@ pub async fn run_due_recording_pass<Eng: Send + Sync + 'static>(
     }
 
     run_remediation_actions(callback, engine, region, &actions).await;
+
+    // What the runs of the remediation executions already in flight have got to: each is
+    // an automation execution another service runs, and only a call to that service can
+    // learn it, so every pass reads back the ones that have not ended
+    // (`super::remediation`).
+    super::follow_remediation_automations(callback, engine, region).await;
 }
 
 /// Start the in-process pump that runs the passes this store owes, after noting that

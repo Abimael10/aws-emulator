@@ -18,6 +18,8 @@
 //! published to EventBridge, and the bus delivers it to the SQS queue a rule targets.
 //! S3 is driven through the AWS SDK over the same in-process callback a handler uses;
 //! Config, EventBridge and SQS are driven over the wire, the way a client drives them.
+//! Systems Manager is mounted beside them because a rule's REMEDIATION runs an automation
+//! document that service owns.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -85,7 +87,7 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(10);
 /// for several passes to have run.
 const QUIET_BUDGET: Duration = Duration::from_millis(2_500);
 
-/// Config, S3, EventBridge and SQS over one shared engine.
+/// Config, S3, EventBridge, SQS, SNS and Systems Manager over one shared engine.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     callback: EmbeddedEmulator,
@@ -111,6 +113,13 @@ impl Emulator {
                 Arc::clone(&engine),
             ),
         );
+        // Systems Manager owns the automation documents a Config remediation names and RUNS
+        // their steps, so a remediation execution exists only where that service holds it:
+        // without SSM mounted there is no runbook to run and nothing to read the run back
+        // from.
+        router.register_service(service_com_amazonaws_ssm_amazonssm::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
         let callback = EmbeddedEmulator::from_router(router.clone());
         Self { router, callback }
     }

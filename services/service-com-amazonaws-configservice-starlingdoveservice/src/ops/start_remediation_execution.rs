@@ -7,12 +7,13 @@
 //! `DescribeRemediationExecutionStatus` then reports as it moves from `QUEUED` through
 //! `IN_PROGRESS` to `SUCCEEDED`.
 //!
-//! What an execution RUNS is the action of the automation runbook the configuration
-//! names, against the resource the key names and with that configuration's parameters
-//! resolved for it ([`crate::state::remediation`]): this emulator performs it through the
-//! owning service's own API, so the resource is changed and the execution reports its run
-//! as finished as soon as that call is. An execution whose runbook names an action this
-//! emulator does not perform changes nothing, and reports the moves the clock makes due.
+//! What an execution RUNS is an execution of the Systems Manager automation document the
+//! configuration names, against the resource the key names and with that configuration's
+//! parameters resolved for it ([`crate::state::remediation`]): Systems Manager owns
+//! automation documents and runs their steps, so the run exists where that service holds
+//! it and the execution reports what it says about it. A run that service refuses — it
+//! holds no document of that name, the document is not a runbook, the parameters are not
+//! the ones it declares — is reported as the failure it is, with the reason it gave.
 //!
 //! A rule with no remediation configuration attached — including a rule this account
 //! does not hold — is refused with `NoSuchRemediationConfigurationException` ("You
@@ -269,10 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         identity.0.clone(),
                         identity.1.clone(),
                     ))
-                    .is_some_and(|execution| {
-                        execution.state_at(now)
-                            != crate::state::REMEDIATION_EXECUTION_STATE_SUCCEEDED
-                    });
+                    .is_some_and(|execution| execution.in_flight(now));
                 let reason = if !non_compliant.contains(&identity) {
                     Some(NO_NON_COMPLIANT_EVALUATION.to_string())
                 } else if running {
@@ -294,14 +292,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         now,
                     ),
                 );
-                // What this execution RUNS: the action of the runbook the configuration
-                // names, with that configuration's parameters resolved for this resource.
-                // The run happens below, once the store's lock is released.
+                // What this execution RUNS: an execution of the automation document the
+                // configuration names, with that configuration's parameters resolved for
+                // this resource. It is asked for below, once the store's lock is released.
                 actions.push(crate::state::RemediationAction {
                     config_rule_name: input.config_rule_name.clone(),
                     resource_type: key.resource_type.clone(),
                     resource_id: key.resource_id.clone(),
                     target_id: target.clone(),
+                    target_version: remediation.target_version.clone(),
                     inputs: crate::state::resolved_remediation_inputs(
                         &remediation,
                         &key.resource_id,
@@ -311,10 +310,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (failed, failure_message, actions)
         };
 
-        // The runs happen with the store's lock RELEASED, so no action runs while this
-        // call still holds it. Each one acts on its resource through the owning service's
-        // own API, which is an in-process call, so the execution reports its run as
-        // finished as soon as it is.
+        // The runs are asked for with the store's lock RELEASED, so nothing is started
+        // while this call still holds it. Each one is an execution of the automation
+        // document the configuration names, started in Systems Manager — the service that
+        // owns automation documents and runs their steps — which is what the execution
+        // then reports the progress of.
         crate::state::run_remediation_actions(ctx.callback(), &*self.engine, &region, &actions)
             .await;
 

@@ -1616,6 +1616,8 @@ pub const REMEDIATION_EXECUTION_STATE_QUEUED: &str = "QUEUED";
 pub const REMEDIATION_EXECUTION_STATE_IN_PROGRESS: &str = "IN_PROGRESS";
 /// See [`REMEDIATION_EXECUTION_STATE_QUEUED`].
 pub const REMEDIATION_EXECUTION_STATE_SUCCEEDED: &str = "SUCCEEDED";
+/// See [`REMEDIATION_EXECUTION_STATE_QUEUED`].
+pub const REMEDIATION_EXECUTION_STATE_FAILED: &str = "FAILED";
 
 /// `RemediationExecutionStepState` values
 /// (`com.amazonaws.configservice#RemediationExecutionStepState`), which are the states
@@ -1625,17 +1627,22 @@ pub const REMEDIATION_EXECUTION_STEP_STATE_PENDING: &str = "PENDING";
 pub const REMEDIATION_EXECUTION_STEP_STATE_IN_PROGRESS: &str = "IN_PROGRESS";
 /// See [`REMEDIATION_EXECUTION_STEP_STATE_PENDING`].
 pub const REMEDIATION_EXECUTION_STEP_STATE_SUCCEEDED: &str = "SUCCEEDED";
+/// See [`REMEDIATION_EXECUTION_STEP_STATE_PENDING`].
+pub const REMEDIATION_EXECUTION_STEP_STATE_FAILED: &str = "FAILED";
 
-/// How long after the call that started it a remediation execution is due to leave
-/// `QUEUED` and start running, and how long after that call it is due to finish.
+/// How long after the call that started it a remediation execution whose RUN nothing
+/// could be learned about is due to leave `QUEUED` and start running, and how long after
+/// that call it is due to finish.
 ///
-/// Both moves are ones the CLOCK owes rather than ones the call makes:
-/// "[r]emediation execution is asynchronous" (`StartRemediationExecution`), so the call
-/// answers before the target has run. AWS documents no duration for either, so the two
-/// spans are CHOSEN inside the 250–750 ms window this project uses for such a
-/// transition (see [`RECORDER_STATUS_SETTLE_AFTER`]), which keeps both the queued and
-/// the running state observable to a caller that reads the status straight after
-/// starting the execution.
+/// An execution that HAS a run reports that run instead
+/// ([`RemediationExecutionEntry::state_at`]); these two spans are what is left when
+/// Systems Manager could not be asked to make one at all. Both moves are ones the CLOCK
+/// owes rather than ones the call makes: "[r]emediation execution is asynchronous"
+/// (`StartRemediationExecution`), so the call answers before the target has run. AWS
+/// documents no duration for either, so the two spans are CHOSEN inside the 250–750 ms
+/// window this project uses for such a transition (see [`RECORDER_STATUS_SETTLE_AFTER`]),
+/// which keeps both the queued and the running state observable to a caller that reads
+/// the status straight after starting the execution.
 pub const REMEDIATION_EXECUTION_STARTS_AFTER: Duration = Duration::from_millis(250);
 /// See [`REMEDIATION_EXECUTION_STARTS_AFTER`].
 pub const REMEDIATION_EXECUTION_COMPLETES_AFTER: Duration = Duration::from_millis(500);
@@ -1661,9 +1668,10 @@ pub const REMEDIATION_EXECUTIONS_KEPT: usize = 100;
 /// One remediation execution: the run of a rule's remediation action against ONE
 /// resource, as `DescribeRemediationExecutionStatus` reports it.
 ///
-/// The execution is asynchronous, so what is stored is when it was invoked and the
-/// instants its two moves are due at; the state it is in is READ OFF the clock
-/// ([`Self::state_at`]) rather than written by whoever reads it.
+/// The execution is asynchronous, so what is stored is when it was invoked, the run it
+/// belongs to ([`Self::automation`]) and the instants its two moves are due at; the state
+/// it is in is READ OFF that run, or off the clock where there is none
+/// ([`Self::state_at`]), rather than written by whoever reads it.
 #[derive(Debug, Clone)]
 pub struct RemediationExecutionEntry {
     /// The type of the remediated resource (`ResourceKey$resourceType`).
@@ -1684,18 +1692,15 @@ pub struct RemediationExecutionEntry {
     /// When the execution is due to have finished; see
     /// [`REMEDIATION_EXECUTION_COMPLETES_AFTER`].
     pub completes_at: SystemTime,
-    /// When this execution's own RUN of its action began and ended, where this emulator
-    /// performed that action (`crate::state::remediation`).
+    /// The RUN of this execution: the Systems Manager automation execution of the document
+    /// the rule's remediation configuration names, and what that service has said about it
+    /// (`crate::state::remediation`).
     ///
-    /// The run is what the execution reports the progress of, so where it happened these
-    /// are the instants the reported state moves at — an action performed in process
-    /// takes the time that call takes rather than the spans above. Both stay absent for
-    /// an execution whose runbook names an action this emulator does not perform, and for
-    /// one running where no pump could run it, and the reported state then follows the
-    /// clock's own spans.
-    pub ran_from: Option<SystemTime>,
-    /// See [`Self::ran_from`].
-    pub ran_to: Option<SystemTime>,
+    /// The run is what the execution reports the progress of, so where there is one THAT
+    /// is the state reported. It stays absent for an execution whose run Systems Manager
+    /// could not be asked for at all — nothing is then known about any run — and the
+    /// reported state follows the clock's own spans.
+    pub automation: Option<RemediationAutomation>,
 }
 
 impl RemediationExecutionEntry {
@@ -1714,8 +1719,7 @@ impl RemediationExecutionEntry {
             invoked_at: at,
             starts_at: at + REMEDIATION_EXECUTION_STARTS_AFTER,
             completes_at: at + REMEDIATION_EXECUTION_COMPLETES_AFTER,
-            ran_from: None,
-            ran_to: None,
+            automation: None,
         }
     }
 
@@ -1730,18 +1734,14 @@ impl RemediationExecutionEntry {
 
     /// The `RemediationExecutionState` this execution is in at `now`.
     ///
-    /// Where this emulator RAN the execution's action ([`Self::ran_from`]), the run is
-    /// what the state reports: running from the instant the action began, succeeded from
-    /// the instant it was performed — so a client that reads the status after the action
-    /// has changed the resource is not told the execution is still queued. Everything
-    /// else follows the clock: queued until the instant it is due to start, running until
-    /// the instant it is due to have finished, and succeeded from then on.
+    /// Where the execution HAS a run ([`Self::automation`]), that run is what the state
+    /// reports — the remediation is the automation Systems Manager runs, so this execution
+    /// has succeeded exactly when that automation has. Everything else follows the clock:
+    /// queued until the instant it is due to start, running until the instant it is due to
+    /// have finished, and succeeded from then on.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
-        if self.ran_to.is_some_and(|ran_to| now >= ran_to) {
-            return REMEDIATION_EXECUTION_STATE_SUCCEEDED;
-        }
-        if self.ran_from.is_some_and(|ran_from| now >= ran_from) {
-            return REMEDIATION_EXECUTION_STATE_IN_PROGRESS;
+        if let Some(automation) = self.automation.as_ref() {
+            return automation.state;
         }
         if now < self.starts_at {
             REMEDIATION_EXECUTION_STATE_QUEUED
@@ -1752,6 +1752,34 @@ impl RemediationExecutionEntry {
         }
     }
 
+    /// Whether this execution has NOT finished yet, which is the precondition
+    /// `StartRemediationExecution` states for a repeat call for the same resource key:
+    /// "An existing StartRemediationExecution call for the specified resource keys must
+    /// complete before you can call the API again."
+    pub fn in_flight(&self, now: SystemTime) -> bool {
+        matches!(
+            self.state_at(now),
+            REMEDIATION_EXECUTION_STATE_QUEUED | REMEDIATION_EXECUTION_STATE_IN_PROGRESS
+        )
+    }
+
+    /// When this execution's run began: the instant Config asked for the run where it
+    /// has one, and the instant the clock made the move due otherwise.
+    fn started_running_at(&self) -> SystemTime {
+        self.automation
+            .as_ref()
+            .map(|automation| automation.started_at)
+            .unwrap_or(self.starts_at)
+    }
+
+    /// When this execution's run ended; see [`Self::started_running_at`].
+    fn stopped_running_at(&self) -> SystemTime {
+        self.automation
+            .as_ref()
+            .and_then(|automation| automation.ended_at)
+            .unwrap_or(self.completes_at)
+    }
+
     /// When this execution last moved (`RemediationExecutionStatus$LastUpdatedTime`):
     /// the instant of the most recent transition — the instant its own run moved it where
     /// this emulator ran it, and the instant the clock made the move due otherwise, which
@@ -1759,10 +1787,8 @@ impl RemediationExecutionEntry {
     pub fn last_updated_at(&self, now: SystemTime) -> SystemTime {
         match self.state_at(now) {
             REMEDIATION_EXECUTION_STATE_QUEUED => self.invoked_at,
-            REMEDIATION_EXECUTION_STATE_IN_PROGRESS => {
-                self.ran_from.unwrap_or(self.starts_at)
-            }
-            _ => self.ran_to.unwrap_or(self.completes_at),
+            REMEDIATION_EXECUTION_STATE_IN_PROGRESS => self.started_running_at(),
+            _ => self.stopped_running_at(),
         }
     }
 
@@ -1770,8 +1796,8 @@ impl RemediationExecutionEntry {
     ///
     /// The one step is the target the remediation configuration names: it is pending
     /// while the execution is queued, running while the execution is, and succeeded
-    /// once it has finished — and it carries no `ErrorMessage`, because nothing has
-    /// failed.
+    /// once it has finished — and it carries an `ErrorMessage` only where the run it
+    /// reports failed, which is the one thing that interrupted it.
     pub fn to_shape(&self, now: SystemTime) -> RemediationExecutionStatus {
         let state = self.state_at(now);
         let step_state = match state {
@@ -1779,6 +1805,7 @@ impl RemediationExecutionEntry {
             REMEDIATION_EXECUTION_STATE_IN_PROGRESS => {
                 REMEDIATION_EXECUTION_STEP_STATE_IN_PROGRESS
             }
+            REMEDIATION_EXECUTION_STATE_FAILED => REMEDIATION_EXECUTION_STEP_STATE_FAILED,
             _ => REMEDIATION_EXECUTION_STEP_STATE_SUCCEEDED,
         };
         RemediationExecutionStatus {
@@ -1790,13 +1817,17 @@ impl RemediationExecutionEntry {
             step_details: Some(vec![RemediationExecutionStep {
                 name: Some(self.step_name.clone()),
                 state: Some(step_state.to_string()),
-                error_message: None,
+                error_message: self
+                    .automation
+                    .as_ref()
+                    .and_then(|automation| automation.failure_message.clone()),
                 // A step that has not started has no start instant to report, and one
                 // that has not finished no stop instant.
                 start_time: (state != REMEDIATION_EXECUTION_STATE_QUEUED)
-                    .then(|| timestamp(self.ran_from.unwrap_or(self.starts_at))),
-                stop_time: (state == REMEDIATION_EXECUTION_STATE_SUCCEEDED)
-                    .then(|| timestamp(self.ran_to.unwrap_or(self.completes_at))),
+                    .then(|| timestamp(self.started_running_at())),
+                stop_time: (state == REMEDIATION_EXECUTION_STATE_SUCCEEDED
+                    || state == REMEDIATION_EXECUTION_STATE_FAILED)
+                    .then(|| timestamp(self.stopped_running_at())),
             }]),
             invocation_time: Some(timestamp(self.invoked_at)),
             last_updated_time: Some(timestamp(self.last_updated_at(now))),
@@ -2150,6 +2181,13 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// BOUNDED at [`REMEDIATION_EXECUTIONS_KEPT`] entries: write it through
     /// [`Self::record_remediation_execution`].
     pub remediation_executions: BTreeMap<RemediationExecutionKey, RemediationExecutionEntry>,
+    /// The execution the last read-back of the runs in flight stopped at, so the next one
+    /// resumes after it ([`RemediationAutomation`]).
+    ///
+    /// One read-back covers a bounded window of the executions still waiting on their
+    /// automation, and this is what ROTATES that window: without it the same window would
+    /// be read every time and a run past it could never be learned about.
+    pub followed_automations_resume_at: Option<RemediationExecutionKey>,
     /// Stored queries, keyed by `QueryName` — unique per account per Region, which is
     /// what one engine's store stands for. A `BTreeMap` so a list of them pages over a
     /// stable ordering and a page token survives inserts and deletes.
@@ -2771,9 +2809,10 @@ pub use evaluator_authorization::*;
 pub mod resource_arn;
 pub use resource_arn::*;
 
-// What a started remediation execution DOES to the resource it names — the action of the
-// runbook its configuration names — lives in `state/remediation.rs`, re-exported here
-// like the modules above so a handler reaches its names as `crate::state::<name>`.
+// What a started remediation execution RUNS — the Systems Manager automation document its
+// configuration names, started in the service that owns and runs such documents — lives in
+// `state/remediation.rs`, re-exported here like the modules above so a handler reaches its
+// names as `crate::state::<name>`.
 pub mod remediation;
 pub use remediation::*;
 

@@ -1,98 +1,129 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a started remediation execution RUNS: the action of the Systems Manager
-//! automation runbook the rule's remediation configuration names, against the resource
-//! the execution was started for.
+//! What a started remediation execution RUNS: the Systems Manager automation document the
+//! rule's remediation configuration names, against the resource the execution was started
+//! for.
 //!
-//! The action is performed through the OWNING service's own API, reached over the
-//! in-process callback ([`smithy_server_runtime::OperationContext::callback`]) — the same
-//! seam the configuration recorder observes resources through — so this crate names no
-//! other service crate. That call is in process, so the run takes the span that call
-//! takes, and the execution reports where the run has got to
-//! ([`super::RemediationExecutionEntry::state_at`]) rather than a span this emulator
-//! chose: a client that reads the status after the resource has been changed is told the
-//! execution succeeded, not that it is still queued.
+//! A remediation target is an automation document ("the target ID is the name of the SSM
+//! document", `RemediationConfiguration$TargetId`), and automation documents are owned and
+//! RUN by Systems Manager — so what a remediation execution does is ask that service to
+//! start an execution of the document, with the configuration's parameters resolved for the
+//! resource ([`resolved_remediation_inputs`]). Nothing here performs a document's steps:
+//! the run exists where its own service holds it, which is also the only place a client can
+//! read it back.
 //!
-//! A runbook whose action this emulator cannot perform ([`REMEDIATION_RUNBOOKS`]) changes
-//! nothing rather than something made up, and its execution keeps the clock-driven arc
-//! the store records for it.
+//! Systems Manager is reached the way this crate reaches every other service — the AWS SDK
+//! driven over the in-process callback
+//! ([`smithy_server_runtime::OperationContext::callback`]) — so this crate names no other
+//! service crate and nothing leaves this process.
+//!
+//! The execution then REPORTS that automation: Config's own
+//! `RemediationExecutionState` is what the automation's `AutomationExecutionStatus` maps
+//! to ([`remediation_state_of_automation`]), learned by reading the automation back
+//! ([`follow_remediation_automations`]) at every instant such a read is owed. Three
+//! outcomes, because the start has three: Systems Manager STARTED the run, it REFUSED to
+//! (no document of that name, a document that is not a runbook, parameters it does not
+//! take), or it could not be asked at all — and only the first two say anything about the
+//! run, so the third leaves the execution reporting the moves the clock makes due.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
+use ::aws_sdk_ssm::error::ProvideErrorMetadata as _;
+
+use super::remediation_target::ssm_client;
 use super::{
-    s3_client, service_state, ComAmazonawsConfigserviceStarlingdoveserviceState, ComplianceChange,
+    service_state, ComAmazonawsConfigserviceStarlingdoveserviceState, ComplianceChange,
     RemediationConfigurationEntry, RemediationExecutionEntry, RemediationExecutionKey,
-    S3_BUCKET_RESOURCE_TYPE, COMPLIANCE_TYPE_NON_COMPLIANT,
+    COMPLIANCE_TYPE_NON_COMPLIANT, REMEDIATION_EXECUTION_STATE_FAILED,
+    REMEDIATION_EXECUTION_STATE_IN_PROGRESS, REMEDIATION_EXECUTION_STATE_QUEUED,
+    REMEDIATION_EXECUTION_STATE_SUCCEEDED,
 };
-
-/// The action one AWS-owned automation runbook performs, as this emulator performs it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunbookAction {
-    /// Set the versioning state of an Amazon S3 bucket (`PutBucketVersioning`).
-    SetBucketVersioning,
-    /// Set the default server-side encryption of an Amazon S3 bucket
-    /// (`PutBucketEncryption`).
-    SetBucketDefaultEncryption,
-}
-
-/// One automation runbook a remediation configuration can name, paired with the action
-/// this emulator performs for it.
-#[derive(Debug, Clone, Copy)]
-pub struct RemediationRunbook {
-    /// The document name a remediation configuration names it by
-    /// (`RemediationConfiguration$TargetId`).
-    pub name: &'static str,
-    /// See [`RemediationRunbook`].
-    pub action: RunbookAction,
-}
-
-/// The runbooks whose action this emulator PERFORMS.
-///
-/// Source: the "Systems Manager Automation runbook reference" entries for the AWS-owned
-/// runbooks a Config remediation configuration names on an Amazon S3 bucket, whose
-/// parameters are the ones named in the constants below. A runbook NOT listed here is
-/// left unperformed — the execution changes no resource rather than one this emulator
-/// guessed at — which is why this table is the single statement of what a remediation can
-/// do here.
-pub const REMEDIATION_RUNBOOKS: [RemediationRunbook; 2] = [
-    RemediationRunbook {
-        name: "AWS-ConfigureS3BucketVersioning",
-        action: RunbookAction::SetBucketVersioning,
-    },
-    RemediationRunbook {
-        name: "AWS-EnableS3BucketEncryption",
-        action: RunbookAction::SetBucketDefaultEncryption,
-    },
-];
-
-/// The parameter the S3 runbooks take the bucket's name in.
-pub const BUCKET_NAME_PARAMETER: &str = "BucketName";
-
-/// The parameter `AWS-ConfigureS3BucketVersioning` takes the versioning state in, and
-/// the state it applies when the configuration names none (`Enabled` is that runbook's
-/// documented default).
-const VERSIONING_STATE_PARAMETER: &str = "VersioningState";
-/// See [`VERSIONING_STATE_PARAMETER`].
-const DEFAULT_VERSIONING_STATE: &str = "Enabled";
-
-/// The parameter `AWS-EnableS3BucketEncryption` takes the default encryption algorithm
-/// in, and the algorithm it applies when the configuration names none (`AES256` is that
-/// runbook's documented default).
-const SSE_ALGORITHM_PARAMETER: &str = "SSEAlgorithm";
-/// See [`SSE_ALGORITHM_PARAMETER`].
-const DEFAULT_SSE_ALGORITHM: &str = "AES256";
 
 /// The `ResourceValue` that resolves to the resource the execution is about
 /// (`com.amazonaws.configservice#ResourceValueType`, whose one value this is).
 const RESOURCE_VALUE_RESOURCE_ID: &str = "RESOURCE_ID";
 
-/// The runbook `target_id` names, when this emulator performs its action.
-pub fn remediation_runbook_of(target_id: &str) -> Option<&'static RemediationRunbook> {
-    let target_id = target_id.trim();
-    REMEDIATION_RUNBOOKS
-        .iter()
-        .find(|runbook| runbook.name == target_id)
+/// The most automation executions ONE pass reads back.
+///
+/// A HOST bound: the store keeps at most
+/// [`super::REMEDIATION_EXECUTIONS_KEPT`] executions, each of which is one in-process read,
+/// so a single pass cannot turn into an unbounded run of calls.
+const MAX_FOLLOWED_AUTOMATIONS: usize = 25;
+
+/// The `RemediationExecutionState` a Config remediation execution is at while the Systems
+/// Manager automation execution that RUNS it reports `status`.
+///
+/// `AutomationExecutionStatus` (`com.amazonaws.ssm#AutomationExecutionStatus`) is what an
+/// automation reports; the value set is the one that enum declares. An automation nothing
+/// has picked up yet, or that is waiting to be let through, has not started running, which
+/// is what `QUEUED` says; one that ended well succeeded; one that ended any other way
+/// failed; and everything else is still running.
+pub fn remediation_state_of_automation(status: &str) -> &'static str {
+    match status {
+        "Pending" | "Scheduled" | "PendingApproval" | "PendingChangeCalendarOverride" => {
+            REMEDIATION_EXECUTION_STATE_QUEUED
+        }
+        "Success" | "CompletedWithSuccess" => REMEDIATION_EXECUTION_STATE_SUCCEEDED,
+        "Failed" | "TimedOut" | "Cancelled" | "Rejected" | "CompletedWithFailure" | "Exited"
+        | "ChangeCalendarOverrideRejected" => REMEDIATION_EXECUTION_STATE_FAILED,
+        _ => REMEDIATION_EXECUTION_STATE_IN_PROGRESS,
+    }
+}
+
+/// The RUN of one remediation execution: the Systems Manager automation execution Config
+/// asked for, and what Systems Manager has said about it.
+#[derive(Debug, Clone)]
+pub struct RemediationAutomation {
+    /// The automation execution Systems Manager started
+    /// (`StartAutomationExecutionResult$AutomationExecutionId`), absent for a start it
+    /// refused — there is then no execution to read back.
+    pub execution_id: Option<String>,
+    /// The `RemediationExecutionState` this run is at: what the automation's own status
+    /// maps to ([`remediation_state_of_automation`]), and `FAILED` for a start Systems
+    /// Manager refused, because the run that remediation needed will not happen.
+    pub state: &'static str,
+    /// When Config asked for the run.
+    pub started_at: SystemTime,
+    /// When the run ENDED, absent while it has not.
+    pub ended_at: Option<SystemTime>,
+    /// Why the run failed, as the service that owns it stated it; absent for a run that has
+    /// not failed.
+    pub failure_message: Option<String>,
+}
+
+impl RemediationAutomation {
+    /// The run Systems Manager started, as of `at`.
+    fn started(execution_id: Option<String>, at: SystemTime) -> Self {
+        Self {
+            execution_id,
+            // A started automation has been accepted and not yet picked up, which is the
+            // state its own `Pending` maps to.
+            state: REMEDIATION_EXECUTION_STATE_QUEUED,
+            started_at: at,
+            ended_at: None,
+            failure_message: None,
+        }
+    }
+
+    /// The run Systems Manager REFUSED to start, with the reason it gave.
+    fn refused(why: Option<String>, at: SystemTime) -> Self {
+        Self {
+            execution_id: None,
+            state: REMEDIATION_EXECUTION_STATE_FAILED,
+            started_at: at,
+            ended_at: Some(at),
+            failure_message: why,
+        }
+    }
+
+    /// Whether this run has ENDED, either way — so there is nothing left to read back.
+    pub fn is_settled(&self) -> bool {
+        matches!(
+            self.state,
+            REMEDIATION_EXECUTION_STATE_SUCCEEDED | REMEDIATION_EXECUTION_STATE_FAILED
+        )
+    }
 }
 
 /// One run a started remediation execution owes: what to run, and against which resource.
@@ -105,22 +136,37 @@ pub struct RemediationAction {
     pub resource_type: String,
     /// The id of the resource the execution names (`ResourceKey$resourceId`).
     pub resource_id: String,
-    /// The runbook the rule's remediation configuration names
+    /// The automation document the rule's remediation configuration names
     /// (`RemediationConfiguration$TargetId`).
     pub target_id: String,
-    /// The configuration's parameters, each resolved to the ONE value the runbook runs
+    /// The version of that document the configuration names
+    /// (`RemediationConfiguration$TargetVersion`); a configuration naming none runs the
+    /// document's own default version.
+    pub target_version: Option<String>,
+    /// The configuration's parameters, each resolved to the ONE value the document runs
     /// with; see [`resolved_remediation_inputs`].
     pub inputs: BTreeMap<String, String>,
 }
 
+impl RemediationAction {
+    /// The key the execution this action belongs to is stored under.
+    fn key(&self) -> RemediationExecutionKey {
+        (
+            self.config_rule_name.clone(),
+            self.resource_type.clone(),
+            self.resource_id.clone(),
+        )
+    }
+}
+
 /// The remediation parameters of `remediation`, each resolved to the one value the
-/// runbook runs with for the resource `resource_id`.
+/// document runs with for the resource `resource_id`.
 ///
 /// A `RemediationParameterValue` "is either a dynamic (resource) value or a static
 /// value": a static value contributes the value it carries, and a resource value
 /// contributes the resource the execution is about, which is what `RESOURCE_ID` names. A
-/// parameter this emulator cannot resolve contributes nothing, so the runbook falls back
-/// to its own documented default for it.
+/// parameter this emulator cannot resolve contributes nothing, so the document falls back
+/// to its own declared default for it.
 pub fn resolved_remediation_inputs(
     remediation: &RemediationConfigurationEntry,
     resource_id: &str,
@@ -161,8 +207,8 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// A remediation exception is what exempts one resource from being remediated under
     /// one rule, so a resource an unexpired exception covers is skipped.
     ///
-    /// The runs themselves happen with the store's lock RELEASED
-    /// ([`run_remediation_actions`]), exactly as a started execution's do.
+    /// The runs themselves are asked for with the store's lock RELEASED
+    /// ([`run_remediation_actions`]), exactly as a started execution's are.
     pub fn automatic_remediations(
         &mut self,
         changes: &[ComplianceChange],
@@ -234,6 +280,7 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
                 config_rule_name: rule_name,
                 resource_type,
                 target_id: remediation.target_id.clone(),
+                target_version: remediation.target_version.clone(),
                 inputs: resolved_remediation_inputs(&remediation, &resource_id),
                 resource_id,
             });
@@ -241,35 +288,98 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
         actions
     }
 
-    /// Note that the run of `action` began at `ran_from` and had performed it by
-    /// `ran_to`, onto the execution the run belongs to.
+    /// Note the run `automation` as the run of the execution `action` belongs to.
     ///
     /// This is what makes the reported state follow the RUN rather than the clock; an
     /// execution the store no longer holds — one dropped past the bound it keeps, or
     /// replaced by a later start for the same resource — keeps whatever its own record
     /// says.
-    pub fn note_remediation_run(
+    pub fn note_remediation_automation(
         &mut self,
         action: &RemediationAction,
-        ran_from: SystemTime,
-        ran_to: SystemTime,
+        automation: RemediationAutomation,
     ) {
-        let key = (
-            action.config_rule_name.clone(),
-            action.resource_type.clone(),
-            action.resource_id.clone(),
-        );
-        if let Some(execution) = self.remediation_executions.get_mut(&key) {
-            execution.ran_from = Some(ran_from);
-            execution.ran_to = Some(ran_to);
+        if let Some(execution) = self.remediation_executions.get_mut(&action.key()) {
+            execution.automation = Some(automation);
+        }
+    }
+
+    /// The next window of automation executions this account's remediation executions are
+    /// still waiting on: the key of each execution and the automation it runs in.
+    ///
+    /// One call answers at most [`MAX_FOLLOWED_AUTOMATIONS`] of them and ROTATES: it
+    /// resumes after the execution the last call stopped at and wraps round, so every run
+    /// in flight is read back within a few calls however many there are — a window that
+    /// always started at the same end would leave a run past it unread for as long as
+    /// anything inside it stayed in flight.
+    pub fn unsettled_remediation_automations(&mut self) -> Vec<(RemediationExecutionKey, String)> {
+        let unsettled: Vec<(RemediationExecutionKey, String)> = self
+            .remediation_executions
+            .iter()
+            .filter_map(|(key, execution)| {
+                let automation = execution.automation.as_ref()?;
+                if automation.is_settled() {
+                    return None;
+                }
+                Some((key.clone(), automation.execution_id.clone()?))
+            })
+            .collect();
+        if unsettled.is_empty() {
+            self.followed_automations_resume_at = None;
+            return unsettled;
+        }
+        // Where the last call stopped: the first execution ordered after it, and the start
+        // of the list once nothing is left after it.
+        let resume_at = self
+            .followed_automations_resume_at
+            .as_ref()
+            .and_then(|stopped_at| unsettled.iter().position(|(key, _)| key > stopped_at))
+            .unwrap_or(0);
+        let window: Vec<(RemediationExecutionKey, String)> = unsettled
+            .iter()
+            .cycle()
+            .skip(resume_at)
+            .take(MAX_FOLLOWED_AUTOMATIONS.min(unsettled.len()))
+            .cloned()
+            .collect();
+        self.followed_automations_resume_at = window.last().map(|(key, _)| key.clone());
+        window
+    }
+
+    /// Note what the automation of the execution `key` has reached: the state its own
+    /// status maps to, when it ended and why it failed.
+    ///
+    /// A run that has ENDED without the service stating when keeps `now` as that instant,
+    /// because the end is what was just learned.
+    pub fn note_remediation_automation_progress(
+        &mut self,
+        key: &RemediationExecutionKey,
+        state: &'static str,
+        ended_at: Option<SystemTime>,
+        failure_message: Option<String>,
+        now: SystemTime,
+    ) {
+        let Some(automation) = self
+            .remediation_executions
+            .get_mut(key)
+            .and_then(|execution| execution.automation.as_mut())
+        else {
+            return;
+        };
+        automation.state = state;
+        automation.failure_message = failure_message;
+        if automation.is_settled() {
+            automation.ended_at = Some(ended_at.unwrap_or(now));
         }
     }
 }
 
-/// Run `actions`, noting on each execution what its own run did.
+/// Ask Systems Manager to run the document every action of `actions` names, noting on each
+/// execution the run it belongs to.
 ///
-/// Called by `StartRemediationExecution` with the store's lock RELEASED — no lock is held
-/// across an await: the guard is taken again only to note each run.
+/// Called by `StartRemediationExecution` and by the recording pass with the store's lock
+/// RELEASED — no lock is held across an await: the guard is taken again only to note each
+/// run.
 pub async fn run_remediation_actions<Eng: Send + Sync + 'static>(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     engine: &Eng,
@@ -280,117 +390,170 @@ pub async fn run_remediation_actions<Eng: Send + Sync + 'static>(
         return;
     };
     for action in actions {
-        let ran_from = SystemTime::now();
-        if run_remediation_action(callback, region, action).await {
-            state
-                .lock()
-                .note_remediation_run(action, ran_from, SystemTime::now());
+        // Nothing is noted for a start Systems Manager could not be asked for at all:
+        // Config cannot conclude anything about a run from an answer it did not get, so
+        // the execution keeps reporting the moves the clock makes due.
+        if let Some(automation) = start_remediation_automation(callback, region, action).await {
+            state.lock().note_remediation_automation(action, automation);
         }
     }
 }
 
-/// Run ONE action: the step the runbook the configuration names performs, against the
-/// resource the execution names; `true` when it was performed.
-///
-/// A runbook outside [`REMEDIATION_RUNBOOKS`], an action whose resource this emulator
-/// cannot name, and a call the owning service refuses each leave the resource as it was;
-/// the refusal is logged, because a remediation that cannot act is worth seeing.
-async fn run_remediation_action(
+/// Ask Systems Manager to start an execution of the document `action` names, and answer
+/// what that start came to — `None` where Systems Manager could not be asked at all.
+async fn start_remediation_automation(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     action: &RemediationAction,
-) -> bool {
-    let Some(runbook) = remediation_runbook_of(&action.target_id) else {
-        return false;
-    };
-    let Some(bucket) = remediated_bucket(action) else {
-        return false;
-    };
-    let client = s3_client(callback, region);
-    let outcome = match runbook.action {
-        RunbookAction::SetBucketVersioning => {
-            let status = action
-                .inputs
-                .get(VERSIONING_STATE_PARAMETER)
-                .map(String::as_str)
-                .unwrap_or(DEFAULT_VERSIONING_STATE);
-            client
-                .put_bucket_versioning()
-                .bucket(&bucket)
-                .versioning_configuration(
-                    ::aws_sdk_s3::types::VersioningConfiguration::builder()
-                        .status(::aws_sdk_s3::types::BucketVersioningStatus::from(status))
-                        .build(),
-                )
-                .send()
-                .await
-                .map(|_| ())
-                .map_err(|error| {
-                    ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
-                })
-        }
-        RunbookAction::SetBucketDefaultEncryption => {
-            let algorithm = action
-                .inputs
-                .get(SSE_ALGORITHM_PARAMETER)
-                .map(String::as_str)
-                .unwrap_or(DEFAULT_SSE_ALGORITHM);
-            let Ok(by_default) = ::aws_sdk_s3::types::ServerSideEncryptionByDefault::builder()
-                .sse_algorithm(::aws_sdk_s3::types::ServerSideEncryption::from(algorithm))
-                .build()
-            else {
-                return false;
-            };
-            let rule = ::aws_sdk_s3::types::ServerSideEncryptionRule::builder()
-                .apply_server_side_encryption_by_default(by_default)
-                .build();
-            let Ok(configuration) =
-                ::aws_sdk_s3::types::ServerSideEncryptionConfiguration::builder()
-                    .rules(rule)
-                    .build()
-            else {
-                return false;
-            };
-            client
-                .put_bucket_encryption()
-                .bucket(&bucket)
-                .server_side_encryption_configuration(configuration)
-                .send()
-                .await
-                .map(|_| ())
-                .map_err(|error| {
-                    ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
-                })
-        }
-    };
-    match outcome {
-        Ok(()) => true,
+) -> Option<RemediationAutomation> {
+    let client = ssm_client(callback, region);
+    let mut start = client
+        .start_automation_execution()
+        .document_name(&action.target_id);
+    // "The version of the SSM document to use for remediation": a configuration naming
+    // none leaves the document's own default version to be used, which is what Systems
+    // Manager does for a start that names no version.
+    if let Some(version) = action
+        .target_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+    {
+        start = start.document_version(version);
+    }
+    // "A key-value map of execution parameters, which match the declared parameters in the
+    // Automation runbook": one value per parameter, which is what each of the
+    // configuration's parameters resolved to.
+    for (name, value) in &action.inputs {
+        start = start.parameters(name, vec![value.clone()]);
+    }
+    let asked_at = SystemTime::now();
+    match start.send().await {
+        Ok(answer) => Some(RemediationAutomation::started(
+            answer.automation_execution_id,
+            asked_at,
+        )),
         Err(error) => {
-            ::tracing::warn!(
-                runbook = runbook.name,
-                resource = %action.resource_id,
-                error = %error,
-                "a remediation execution could not run its target action"
-            );
-            false
+            // Systems Manager ANSWERING that it will not run the document is the end of
+            // this run — the service that owns automation documents has refused it — so the
+            // execution reports that failure with the reason it gave. Those answers are the
+            // CLIENT errors the operation models: every other outcome, a server-side
+            // failure and an answer this client cannot place included, says nothing about
+            // the run at all, and Config cannot conclude a run failed from an answer it did
+            // not get.
+            if !refused_the_start(&error) {
+                ::tracing::warn!(
+                    config_rule_name = %action.config_rule_name,
+                    target_id = %action.target_id,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "Config could not ask Systems Manager to run this remediation target"
+                );
+                return None;
+            }
+            Some(RemediationAutomation::refused(
+                refusal_message(error.code(), error.message()),
+                asked_at,
+            ))
         }
     }
 }
 
-/// The bucket an S3 runbook acts on: the one its `BucketName` parameter resolves to, or
-/// the resource the execution names when that resource IS a bucket — which is what the
-/// `RESOURCE_ID` resource value resolves to in the first place.
-fn remediated_bucket(action: &RemediationAction) -> Option<String> {
-    action
-        .inputs
-        .get(BUCKET_NAME_PARAMETER)
-        .map(|bucket| bucket.trim().to_string())
-        .filter(|bucket| !bucket.is_empty())
-        .or_else(|| {
-            (action.resource_type == S3_BUCKET_RESOURCE_TYPE)
-                .then(|| action.resource_id.clone())
-                .filter(|resource| !resource.trim().is_empty())
-        })
+/// Whether `error` is Systems Manager REFUSING to run the document, rather than an outcome
+/// that says nothing about the run.
+///
+/// The refusals are the client errors `StartAutomationExecution` models — no runbook of
+/// that name, no such version of it, the concurrent-execution limit, a mismatched
+/// idempotency token, parameters the runbook does not take, and a target that resolves to
+/// nothing — each of which means this remediation's run will not happen.
+fn refused_the_start(
+    error: &::aws_sdk_ssm::error::SdkError<
+        ::aws_sdk_ssm::operation::start_automation_execution::StartAutomationExecutionError,
+        ::aws_smithy_runtime_api::http::Response,
+    >,
+) -> bool {
+    use ::aws_sdk_ssm::operation::start_automation_execution::StartAutomationExecutionError as Refusal;
+    matches!(
+        error.as_service_error(),
+        Some(
+            Refusal::AutomationDefinitionNotFoundException(_)
+                | Refusal::AutomationDefinitionVersionNotFoundException(_)
+                | Refusal::AutomationExecutionLimitExceededException(_)
+                | Refusal::IdempotentParameterMismatch(_)
+                | Refusal::InvalidAutomationExecutionParametersException(_)
+                | Refusal::InvalidTarget(_)
+        )
+    )
+}
+
+/// How the step of a remediation execution reports a run Systems Manager refused to start:
+/// what that service answered, carried through unmodified.
+///
+/// `ErrorMessage` is "an error message if the step was interrupted during execution"
+/// (`RemediationExecutionStep$ErrorMessage`), and the one thing known about this
+/// interruption is the refusal of the service that owns the document — so its own code and
+/// sentence are what the step carries, and an answer that carried neither leaves the step
+/// with no message rather than one worded here. WHICH document could not be run is the
+/// step's own `Name`.
+fn refusal_message(code: Option<&str>, message: Option<&str>) -> Option<String> {
+    match (code, message) {
+        (Some(code), Some(message)) => Some(format!("{code}: {message}")),
+        (Some(code), None) => Some(code.to_string()),
+        (None, Some(message)) => Some(message.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Read back the automation execution of every remediation run that has not ended yet, and
+/// note what Systems Manager says each has reached.
+///
+/// What a run has got to is owed at the same instant whether or not anybody called, and
+/// only a call to the service that owns the run can learn it — so this is driven by the
+/// recording pass and by the read that reports those executions, with no lock held across
+/// an await.
+pub async fn follow_remediation_automations<Eng: Send + Sync + 'static>(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    engine: &Eng,
+    region: &str,
+) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    let unsettled = state.lock().unsettled_remediation_automations();
+    if unsettled.is_empty() {
+        return;
+    }
+    let client = ssm_client(callback, region);
+    for (key, execution_id) in unsettled {
+        let answered = client
+            .get_automation_execution()
+            .automation_execution_id(&execution_id)
+            .send()
+            .await;
+        let Ok(answer) = answered else {
+            // Nothing was learned about this run, so nothing about it changes.
+            continue;
+        };
+        let Some(automation) = answer.automation_execution else {
+            continue;
+        };
+        let Some(status) = automation
+            .automation_execution_status
+            .as_ref()
+            .map(|status| status.as_str().to_string())
+        else {
+            continue;
+        };
+        let ended_at = automation
+            .execution_end_time
+            .and_then(|instant| SystemTime::try_from(instant).ok());
+        state.lock().note_remediation_automation_progress(
+            &key,
+            remediation_state_of_automation(&status),
+            ended_at,
+            automation.failure_message.clone(),
+            SystemTime::now(),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -410,7 +573,7 @@ mod tests {
             &RemediationConfiguration {
                 config_rule_name: "rule".to_string(),
                 target_type: "SSM_DOCUMENT".to_string(),
-                target_id: REMEDIATION_RUNBOOKS[0].name.to_string(),
+                target_id: "AWS-ConfigureS3BucketVersioning".to_string(),
                 parameters: Some(
                     parameters
                         .into_iter()
@@ -442,12 +605,12 @@ mod tests {
         }
     }
 
-    /// Each parameter resolves to the ONE value the runbook runs with: a static value to
+    /// Each parameter resolves to the ONE value the document runs with: a static value to
     /// what it carries, the resource value to the resource the execution is about, and a
     /// value naming neither to nothing at all. The rows differ along which form the
     /// parameter takes.
     #[test]
-    fn a_parameter_resolves_to_the_value_the_runbook_runs_with() {
+    fn a_parameter_resolves_to_the_value_the_document_runs_with() {
         let cases: [(&str, RemediationParameterValue, Option<&str>); 4] = [
             (
                 "a static value",
@@ -484,74 +647,168 @@ mod tests {
         }
     }
 
-    /// The runbooks this emulator performs are exactly the catalogue's, resolved by the
-    /// name a configuration names them by; anything else performs nothing.
+    /// Every `AutomationExecutionStatus` places the remediation execution that runs in it
+    /// at one `RemediationExecutionState`: not yet picked up is queued, ended well is
+    /// succeeded, ended any other way is failed, and anything else is still running.
+    ///
+    /// The rows are the whole value set of
+    /// `com.amazonaws.ssm#AutomationExecutionStatus`, so a status this service does not
+    /// place is a row that fails here.
     #[test]
-    fn only_a_catalogued_runbook_resolves_to_an_action() {
-        for runbook in REMEDIATION_RUNBOOKS {
+    fn an_automation_status_places_the_remediation_execution() {
+        let cases: [(&str, &str); 19] = [
+            ("Pending", REMEDIATION_EXECUTION_STATE_QUEUED),
+            ("InProgress", REMEDIATION_EXECUTION_STATE_IN_PROGRESS),
+            ("Waiting", REMEDIATION_EXECUTION_STATE_IN_PROGRESS),
+            ("Success", REMEDIATION_EXECUTION_STATE_SUCCEEDED),
+            ("TimedOut", REMEDIATION_EXECUTION_STATE_FAILED),
+            ("Cancelling", REMEDIATION_EXECUTION_STATE_IN_PROGRESS),
+            ("Cancelled", REMEDIATION_EXECUTION_STATE_FAILED),
+            ("Failed", REMEDIATION_EXECUTION_STATE_FAILED),
+            ("PendingApproval", REMEDIATION_EXECUTION_STATE_QUEUED),
+            ("Approved", REMEDIATION_EXECUTION_STATE_IN_PROGRESS),
+            ("Rejected", REMEDIATION_EXECUTION_STATE_FAILED),
+            ("Scheduled", REMEDIATION_EXECUTION_STATE_QUEUED),
+            ("RunbookInProgress", REMEDIATION_EXECUTION_STATE_IN_PROGRESS),
+            (
+                "PendingChangeCalendarOverride",
+                REMEDIATION_EXECUTION_STATE_QUEUED,
+            ),
+            (
+                "ChangeCalendarOverrideApproved",
+                REMEDIATION_EXECUTION_STATE_IN_PROGRESS,
+            ),
+            (
+                "ChangeCalendarOverrideRejected",
+                REMEDIATION_EXECUTION_STATE_FAILED,
+            ),
+            ("CompletedWithSuccess", REMEDIATION_EXECUTION_STATE_SUCCEEDED),
+            ("CompletedWithFailure", REMEDIATION_EXECUTION_STATE_FAILED),
+            ("Exited", REMEDIATION_EXECUTION_STATE_FAILED),
+        ];
+
+        for (status, expected) in cases {
+            let placed = remediation_state_of_automation(status);
             assert_eq!(
-                remediation_runbook_of(runbook.name).map(|found| found.action),
-                Some(runbook.action),
-                "case {:?}: the catalogue must resolve its own entry",
-                runbook.name
-            );
-        }
-        for case in ["AWS-UpdateSSMAgent", "aws-configures3bucketversioning", ""] {
-            assert!(
-                remediation_runbook_of(case).is_none(),
-                "case {case:?}: a runbook outside the catalogue performs no action"
+                placed, expected,
+                "case {status:?}: expected {expected}, got {placed}"
             );
         }
     }
 
-    /// The bucket an S3 runbook acts on: the `BucketName` its parameters resolve, or the
-    /// bucket the execution names. The rows differ along which of the two the action
-    /// carries, and along a resource that is not a bucket at all.
+    /// A refused start reports what the service that owns the document answered, for
+    /// refusals differing along what the answer carried.
     #[test]
-    fn an_s3_runbook_acts_on_the_bucket_its_action_names() {
-        let action = |bucket_name: Option<&str>, resource_type: &str, resource_id: &str| {
-            RemediationAction {
-                config_rule_name: "rule".to_string(),
-                resource_type: resource_type.to_string(),
-                resource_id: resource_id.to_string(),
-                target_id: REMEDIATION_RUNBOOKS[0].name.to_string(),
-                inputs: bucket_name
-                    .map(|bucket| {
-                        BTreeMap::from([(BUCKET_NAME_PARAMETER.to_string(), bucket.to_string())])
-                    })
-                    .unwrap_or_default(),
-            }
-        };
-        let cases: [(&str, RemediationAction, Option<&str>); 4] = [
+    fn a_refused_start_reports_what_the_service_answered() {
+        /// One row: what it is called, the code and the sentence the service answered, and
+        /// the message the step then carries.
+        type Answered = (
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        let cases: [Answered; 4] = [
             (
-                "the parameter names the bucket",
-                action(Some("named-bucket"), S3_BUCKET_RESOURCE_TYPE, "keyed-bucket"),
-                Some("named-bucket"),
+                "a code and a sentence",
+                Some("AutomationDefinitionNotFoundException"),
+                Some("An Automation runbook with the specified name couldn't be found."),
+                Some(
+                    "AutomationDefinitionNotFoundException: An Automation runbook with the \
+                     specified name couldn't be found.",
+                ),
             ),
             (
-                "no parameter, so the resource the execution names",
-                action(None, S3_BUCKET_RESOURCE_TYPE, "keyed-bucket"),
-                Some("keyed-bucket"),
-            ),
-            (
-                "an empty parameter, so the resource the execution names",
-                action(Some("  "), S3_BUCKET_RESOURCE_TYPE, "keyed-bucket"),
-                Some("keyed-bucket"),
-            ),
-            (
-                "a resource that is not a bucket, and no parameter",
-                action(None, "AWS::EC2::Volume", "vol-0001"),
+                "a code alone",
+                Some("InvalidTarget"),
                 None,
+                Some("InvalidTarget"),
             ),
+            (
+                "a sentence alone",
+                None,
+                Some("the runbook takes no such parameter"),
+                Some("the runbook takes no such parameter"),
+            ),
+            ("neither", None, None, None),
         ];
 
-        for (case, action, expected) in cases {
-            let acted_on = remediated_bucket(&action);
+        for (case, code, message, expected) in cases {
+            let reported = refusal_message(code, message);
             assert_eq!(
-                acted_on.as_deref(),
+                reported.as_deref(),
                 expected,
-                "case {case:?}: expected {expected:?}, got {acted_on:?}"
+                "case {case:?}: expected {expected:?}, got {reported:?}"
             );
         }
+    }
+
+    /// The window of runs read back ROTATES: with more runs in flight than one call covers,
+    /// repeated calls reach every one of them, and a run that has ENDED is never read back
+    /// again.
+    #[test]
+    fn the_window_of_runs_read_back_rotates_over_every_run_in_flight() {
+        let now = SystemTime::now();
+        let rule = "a-rule";
+        let in_flight = MAX_FOLLOWED_AUTOMATIONS * 2 + 3;
+        let mut store = ComAmazonawsConfigserviceStarlingdoveserviceState::default();
+        for index in 0..in_flight {
+            let mut execution = RemediationExecutionEntry::invoked(
+                "AWS::S3::Bucket",
+                &format!("resource-{index:03}"),
+                "a-document",
+                now,
+            );
+            execution.automation = Some(RemediationAutomation::started(
+                Some(format!("automation-{index:03}")),
+                now,
+            ));
+            store
+                .remediation_executions
+                .insert(execution.key(rule), execution);
+        }
+
+        // Enough calls to cover every run in flight, each answering a full window.
+        let mut followed: BTreeSet<String> = BTreeSet::new();
+        for call in 0..in_flight.div_ceil(MAX_FOLLOWED_AUTOMATIONS) {
+            let window = store.unsettled_remediation_automations();
+            assert_eq!(
+                window.len(),
+                MAX_FOLLOWED_AUTOMATIONS,
+                "call {call}: expected a full window of {MAX_FOLLOWED_AUTOMATIONS}, got \
+                 {window:?}"
+            );
+            followed.extend(window.into_iter().map(|(_, execution_id)| execution_id));
+        }
+        assert_eq!(
+            followed.len(),
+            in_flight,
+            "expected every one of the {in_flight} runs in flight to be read back, got \
+             {followed:?}"
+        );
+
+        // A run that has ended leaves the window: there is nothing left to learn about it.
+        let settled = ("AWS::S3::Bucket".to_string(), "resource-000".to_string());
+        store.note_remediation_automation_progress(
+            &(rule.to_string(), settled.0.clone(), settled.1.clone()),
+            REMEDIATION_EXECUTION_STATE_SUCCEEDED,
+            Some(now),
+            None,
+            now,
+        );
+        let mut seen_after: BTreeSet<RemediationExecutionKey> = BTreeSet::new();
+        for _ in 0..in_flight.div_ceil(MAX_FOLLOWED_AUTOMATIONS) {
+            seen_after.extend(
+                store
+                    .unsettled_remediation_automations()
+                    .into_iter()
+                    .map(|(key, _)| key),
+            );
+        }
+        assert!(
+            !seen_after.contains(&(rule.to_string(), settled.0.clone(), settled.1.clone()))
+                && seen_after.len() == in_flight - 1,
+            "a run that has ended must not be read back again, got {seen_after:?}"
+        );
     }
 }

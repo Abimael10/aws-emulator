@@ -76,20 +76,28 @@ const ENABLED: &str = "Enabled";
 /// The only published `RemediationTargetType`: an SSM automation document.
 const TARGET_TYPE: &str = "SSM_DOCUMENT";
 
-/// The runbook the automatic remediation under test names, and the `Parameters` key
-/// carrying the role it runs as.
+/// The runbook the automatic remediation under test names, the `Parameters` key carrying
+/// the role it runs as, and the key it takes the bucket to act on in.
 const VERSIONING_RUNBOOK: &str = "AWS-ConfigureS3BucketVersioning";
 /// See [`VERSIONING_RUNBOOK`].
 const AUTOMATION_ASSUME_ROLE: &str = "AutomationAssumeRole";
+/// See [`VERSIONING_RUNBOOK`].
+const BUCKET_NAME: &str = "BucketName";
+
+/// The `ResourceValue` a parameter resolves from the resource the execution is about
+/// (`com.amazonaws.configservice#ResourceValueType`, whose one value this is), which is how
+/// a remediation hands the resource it remediates to the runbook that acts on it.
+const RESOURCE_ID: &str = "RESOURCE_ID";
 
 /// The resource type a conformance pack template declares a Config rule as, from
 /// `PutConformancePack`'s own model doc.
 const CONFIG_RULE_TYPE: &str = "AWS::Config::ConfigRule";
 
 /// How long a poll waits for a span the clock owes — a recording pass, an evaluation, a
-/// remediation run. Each falls due a fraction of a second after the call that makes it
-/// due, so this is many passes' worth of slack and not a span any assertion depends on.
-const CONVERGENCE_BUDGET: Duration = Duration::from_secs(15);
+/// remediation run being picked up and walked by the service that runs it. Each falls due a
+/// few seconds after the call that makes it due at the outside, so this is several times
+/// over and not a span any assertion depends on.
+const CONVERGENCE_BUDGET: Duration = Duration::from_secs(30);
 
 /// How long a row waits while asserting that NOTHING happens — several passes' worth of
 /// time, so an action that was going to be taken would have been taken.
@@ -760,6 +768,9 @@ fn remediation(rule: &str, automatic: bool) -> Value {
                         "Values": [format!("arn:aws:iam::{ACCOUNT_ID}:role/config-remediation")],
                     },
                 },
+                // The runbook requires the bucket to act on, and what a remediation hands
+                // it is the resource the execution is about.
+                BUCKET_NAME: { "ResourceValue": { "Value": RESOURCE_ID } },
             },
         }],
     })
