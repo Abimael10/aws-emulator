@@ -24,7 +24,25 @@
 //! internet gateway, and whether the task is given the public address an internet gateway's
 //! route carries traffic for — the last row being the one that must NOT converge, so a row
 //! above it cannot pass by a path being assumed for every placement.
+//!
+//! The second suite below holds the three views of ONE address to each other, which is what
+//! makes that address something a client can reach. RULE: a task in the `awsvpc` network mode
+//! "is allocated an elastic network interface" (`RegisterTaskDefinition$networkMode`), and the
+//! attachment that stands for it reports, once the interface is in place, "the network
+//! interface ID, the MAC address, the subnet ID, and the private IPv4 address"
+//! (`Attachment$details`) — of an interface Amazon VPC really holds, in the subnet the
+//! placement named, at that very address; and every running task of a service whose
+//! `loadBalancers` bind a group of the `ip` target type is a target of that group AT that
+//! address. So the attachment, Amazon EC2's own `DescribeNetworkInterfaces` and Elastic Load
+//! Balancing v2's `DescribeTargetHealth` name one address, whichever of them is asked.
+//!
+//! Its rows differ along what that rule generalises over: how many tasks the service places
+//! (so no row passes on one interface being the only one there is), the block of the subnet it
+//! places them in, and whether the service binds a target group at all — the unbound row
+//! showing the interface is reported because the task holds it and not because something
+//! registered it.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -195,17 +213,25 @@ async fn default_network(router: &MultiServiceRouter, case: &str) -> (String, Ve
     (vpc, ids)
 }
 
-/// A VPC of the caller's own with two subnets in two zones, an internet gateway attached to
-/// it and a default route to that gateway in its main route table — every one created through
-/// the operations a caller calls.
-async fn own_network(router: &MultiServiceRouter, case: &str) -> (String, Vec<String>) {
+/// A VPC of the caller's own over `vpc_cidr` with one subnet per block of `subnet_cidrs`, each
+/// in its own zone, an internet gateway attached to it and a default route to that gateway in
+/// its main route table — every one created through the operations a caller calls.
+///
+/// Shared by every suite of this module that places into a network of its own, so the two
+/// cannot come to build different networks: what a row varies is the blocks it passes here.
+async fn gatewayed_vpc(
+    router: &MultiServiceRouter,
+    case: &str,
+    vpc_cidr: &str,
+    subnet_cidrs: [&str; 2],
+) -> (String, Vec<String>) {
     let vpc = ec2_element(
-        &ec2_form(router, "CreateVpc", &[("CidrBlock", OWN_VPC_CIDR)], case).await,
+        &ec2_form(router, "CreateVpc", &[("CidrBlock", vpc_cidr)], case).await,
         "vpcId",
         case,
     );
     let mut subnets = Vec::new();
-    for (index, cidr) in OWN_SUBNET_CIDRS.iter().enumerate() {
+    for (index, cidr) in subnet_cidrs.into_iter().enumerate() {
         let zone = format!("{}{}", crate::ecs_wire::SIGNED_REGION, ["a", "b"][index]);
         subnets.push(ec2_element(
             &ec2_form(
@@ -285,27 +311,30 @@ async fn security_group(
     )
 }
 
-/// The whole network one row runs in, with the inbound rule that lets the load balancer's
-/// health check reach the task: "a security group controls the traffic that is allowed to
-/// reach ... the resources that it is associated with" (Amazon VPC User Guide).
-async fn network_of(router: &MultiServiceRouter, row: &Row) -> Network {
-    let case = row.case;
-    let (vpc, subnets) = match row.placement {
-        Placement::DefaultSubnet => default_network(router, case).await,
-        Placement::OwnSubnetWithAGateway => own_network(router, case).await,
-    };
+/// The load balancer's OWN security group and the tasks', named after `label`, with the
+/// inbound rule that lets the load balancer's health check reach the task: "a security group
+/// controls the traffic that is allowed to reach ... the resources that it is associated with"
+/// (Amazon VPC User Guide).
+///
+/// Shared by the suites of this module for the reason [`gatewayed_vpc`] is.
+async fn paired_security_groups(
+    router: &MultiServiceRouter,
+    vpc: &str,
+    label: &str,
+    case: &str,
+) -> (String, String) {
     let load_balancer_group = security_group(
         router,
-        &vpc,
-        &format!("{}-alb", row.group_name),
+        vpc,
+        &format!("{label}-alb"),
         "the load balancers own group",
         case,
     )
     .await;
     let task_group = security_group(
         router,
-        &vpc,
-        &format!("{}-task", row.group_name),
+        vpc,
+        &format!("{label}-task"),
         "the tasks own group",
         case,
     )
@@ -323,6 +352,20 @@ async fn network_of(router: &MultiServiceRouter, row: &Row) -> Network {
         case,
     )
     .await;
+    (load_balancer_group, task_group)
+}
+
+/// The whole network one row runs in.
+async fn network_of(router: &MultiServiceRouter, row: &Row) -> Network {
+    let case = row.case;
+    let (vpc, subnets) = match row.placement {
+        Placement::DefaultSubnet => default_network(router, case).await,
+        Placement::OwnSubnetWithAGateway => {
+            gatewayed_vpc(router, case, OWN_VPC_CIDR, OWN_SUBNET_CIDRS).await
+        }
+    };
+    let (load_balancer_group, task_group) =
+        paired_security_groups(router, &vpc, row.group_name, case).await;
     Network {
         vpc,
         subnets,
@@ -331,19 +374,21 @@ async fn network_of(router: &MultiServiceRouter, row: &Row) -> Network {
     }
 }
 
-/// The `ip` target group one row binds, with a load balancer in its network forwarding to it
-/// — a group nothing forwards to is a group whose targets nothing checks.
+/// The `ip` target group a row binds under `name`, with a load balancer in its network
+/// forwarding to it from `listener_port` — a group nothing forwards to is a group whose
+/// targets nothing checks.
 async fn load_balanced_target_group(
     router: &MultiServiceRouter,
-    row: &Row,
+    name: &str,
+    listener_port: &str,
     network: &Network,
+    case: &str,
 ) -> String {
-    let case = row.case;
     let created = elb_ok(
         router,
         "CreateTargetGroup",
         &[
-            ("Name", row.group_name),
+            ("Name", name),
             ("Protocol", "HTTP"),
             ("Port", "80"),
             ("TargetType", "ip"),
@@ -361,7 +406,7 @@ async fn load_balanced_target_group(
             router,
             "CreateLoadBalancer",
             &[
-                ("Name", row.group_name),
+                ("Name", name),
                 ("Subnets.member.1", &network.subnets[0]),
                 ("Subnets.member.2", &network.subnets[1]),
                 ("SecurityGroups.member.1", &network.load_balancer_group),
@@ -378,7 +423,7 @@ async fn load_balanced_target_group(
         &[
             ("LoadBalancerArn", &load_balancer),
             ("Protocol", "HTTP"),
-            ("Port", row.listener_port),
+            ("Port", listener_port),
             ("DefaultActions.member.1.Type", "forward"),
             ("DefaultActions.member.1.TargetGroupArn", &group),
         ],
@@ -413,39 +458,53 @@ async fn register_revision(router: &MultiServiceRouter, family: &str, case: &str
     .await;
 }
 
-/// Create one row's service, bound to `group`.
-async fn create_service(
+/// What ONE `CreateService` of these suites places: which cluster and service, which
+/// revision, the public address its interface asks for, how many tasks it wants, and the `ip`
+/// target group it binds where it binds one.
+struct ServicePlacement<'a> {
+    case: &'a str,
+    cluster: &'a str,
+    service_name: &'a str,
+    family: &'a str,
+    /// `AwsVpcConfiguration$assignPublicIp` the placement declares.
+    assign_public_ip: &'a str,
+    /// `CreateService$desiredCount`.
+    desired: usize,
+    /// `ServiceLoadBalancer$targetGroupArn`, for a service that binds a group.
+    group: Option<&'a str>,
+}
+
+/// Create one service into `network`, as `placement` describes it.
+///
+/// Shared by the suites of this module for the reason [`gatewayed_vpc`] is: the only
+/// differences between their placements are the values above.
+async fn place_service(
     router: &MultiServiceRouter,
-    row: &Row,
+    placement: &ServicePlacement<'_>,
     network: &Network,
-    family: &str,
-    group: &str,
 ) {
-    ok(
-        router,
-        "CreateService",
-        json!({
-            "cluster": CLUSTER,
-            "serviceName": row.service_name,
-            "taskDefinition": family,
-            "desiredCount": 1,
-            "launchType": "FARGATE",
-            "networkConfiguration": {
-                "awsvpcConfiguration": {
-                    "subnets": [network.subnets[0]],
-                    "securityGroups": [network.task_group],
-                    "assignPublicIp": row.assign_public_ip,
-                }
-            },
-            "loadBalancers": [{
-                "targetGroupArn": group,
-                "containerName": CONTAINER,
-                "containerPort": CONTAINER_PORT,
-            }],
-        }),
-        row.case,
-    )
-    .await;
+    let mut request = json!({
+        "cluster": placement.cluster,
+        "serviceName": placement.service_name,
+        "taskDefinition": placement.family,
+        "desiredCount": placement.desired,
+        "launchType": "FARGATE",
+        "networkConfiguration": {
+            "awsvpcConfiguration": {
+                "subnets": [network.subnets[0]],
+                "securityGroups": [network.task_group],
+                "assignPublicIp": placement.assign_public_ip,
+            }
+        },
+    });
+    if let Some(group) = placement.group {
+        request["loadBalancers"] = json!([{
+            "targetGroupArn": group,
+            "containerName": CONTAINER,
+            "containerPort": CONTAINER_PORT,
+        }]);
+    }
+    ok(router, "CreateService", request, placement.case).await;
 }
 
 /// One row's service as `DescribeServices` reports it now.
@@ -463,15 +522,21 @@ async fn described_service(router: &MultiServiceRouter, row: &Row) -> Value {
         .unwrap_or_else(|| panic!("case {:?}: the service must read back", row.case))
 }
 
-/// `(target id, state)` for every registration one group reports.
-async fn health(router: &MultiServiceRouter, group: &str, case: &str) -> Vec<(String, String)> {
-    let body = elb_ok(
+/// The `DescribeTargetHealth` answer for one target group — the ONE read both suites of this
+/// module ask Elastic Load Balancing v2 for what a group holds through.
+async fn target_health(router: &MultiServiceRouter, group: &str, case: &str) -> String {
+    elb_ok(
         router,
         "DescribeTargetHealth",
         &[("TargetGroupArn", group)],
         case,
     )
-    .await;
+    .await
+}
+
+/// `(target id, state)` for every registration one group reports.
+async fn health(router: &MultiServiceRouter, group: &str, case: &str) -> Vec<(String, String)> {
+    let body = target_health(router, group, case).await;
     let ids = all_texts(&body, "Id");
     let states = all_texts(&body, "State");
     ids.into_iter().zip(states).collect()
@@ -517,8 +582,23 @@ async fn an_alb_fronted_service_in_the_default_network_converges_to_a_healthy_ta
         let network = network_of(&router, row).await;
         let family = format!("{}family", row.group_name);
         register_revision(&router, &family, row.case).await;
-        let group = load_balanced_target_group(&router, row, &network).await;
-        create_service(&router, row, &network, &family, &group).await;
+        let group =
+            load_balanced_target_group(&router, row.group_name, row.listener_port, &network, row.case)
+                .await;
+        place_service(
+            &router,
+            &ServicePlacement {
+                case: row.case,
+                cluster: CLUSTER,
+                service_name: row.service_name,
+                family: &family,
+                assign_public_ip: row.assign_public_ip,
+                desired: 1,
+                group: Some(&group),
+            },
+            &network,
+        )
+        .await;
         built.push((row, group));
     }
 
@@ -609,4 +689,391 @@ async fn an_alb_fronted_service_in_the_default_network_converges_to_a_healthy_ta
             ::tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
+}
+
+// The three views of ONE `awsvpc` task's address: the attachment Amazon ECS reports, the
+// interface Amazon VPC holds, and the target Elastic Load Balancing v2 registered.
+
+/// The cluster the services of the join below run in — its own, so what it reads back is what
+/// it placed.
+const JOIN_CLUSTER: &str = "joinedviews";
+
+/// The `Attachment$details` keys the attachment of an interface that is IN PLACE reports, from
+/// that member's own doc sentence: for an elastic network interface the details include "the
+/// network interface ID, the MAC address, the subnet ID, and the private IPv4 address".
+const INTERFACE_DETAILS: [&str; 4] = [
+    "networkInterfaceId",
+    "macAddress",
+    "subnetId",
+    "privateIPv4Address",
+];
+
+/// One row of the join: the network it builds, the service it places there, and whether that
+/// service binds an `ip` target group.
+struct JoinRow {
+    case: &'static str,
+    /// What every resource of the row is named after: its VPC's groups, its revision, its
+    /// service and its target group.
+    label: &'static str,
+    /// The CIDR block of the row's VPC, which holds both of its subnets'.
+    vpc_cidr: &'static str,
+    /// `Subnet$cidrBlock` of the subnet the service places its tasks in, and of the second
+    /// subnet of the row's VPC: a load balancer is created across subnets of two zones, so a
+    /// row that fronts its service needs one beside the one its tasks run in.
+    task_subnet_cidr: &'static str,
+    second_subnet_cidr: &'static str,
+    /// The port the row's listener forwards from, where the row has one.
+    listener_port: &'static str,
+    /// `CreateService$desiredCount`: how many tasks of its own the service places.
+    desired: usize,
+    /// Whether the service binds an `ip` target group that a load balancer forwards to.
+    binds_a_target_group: bool,
+}
+
+const JOIN_ROWS: [JoinRow; 3] = [
+    JoinRow {
+        case: "one task of a service behind an ip target group",
+        label: "joinone",
+        vpc_cidr: "10.80.0.0/16",
+        task_subnet_cidr: "10.80.1.0/24",
+        second_subnet_cidr: "10.80.2.0/24",
+        listener_port: "9080",
+        desired: 1,
+        binds_a_target_group: true,
+    },
+    JoinRow {
+        case: "two tasks of a service behind an ip target group, in a /28 subnet",
+        label: "jointwo",
+        vpc_cidr: "10.81.0.0/16",
+        task_subnet_cidr: "10.81.3.16/28",
+        second_subnet_cidr: "10.81.4.0/24",
+        listener_port: "9081",
+        desired: 2,
+        binds_a_target_group: true,
+    },
+    JoinRow {
+        case: "one task of a service bound to no load balancer",
+        label: "joinnone",
+        vpc_cidr: "10.82.0.0/16",
+        task_subnet_cidr: "10.82.5.0/26",
+        second_subnet_cidr: "10.82.6.0/24",
+        listener_port: "9082",
+        desired: 1,
+        binds_a_target_group: false,
+    },
+];
+
+/// The network one join row places into: the gatewayed VPC of its own blocks
+/// ([`gatewayed_vpc`]) with the two security groups every placement of this module runs under
+/// ([`paired_security_groups`]).
+async fn join_network(router: &MultiServiceRouter, row: &JoinRow) -> Network {
+    let (vpc, subnets) = gatewayed_vpc(
+        router,
+        row.case,
+        row.vpc_cidr,
+        [row.task_subnet_cidr, row.second_subnet_cidr],
+    )
+    .await;
+    let (load_balancer_group, task_group) =
+        paired_security_groups(router, &vpc, row.label, row.case).await;
+    Network {
+        vpc,
+        subnets,
+        load_balancer_group,
+        task_group,
+    }
+}
+
+/// One `Attachment$details` entry, by name.
+fn attachment_detail(attachment: &Value, name: &str, case: &str) -> Option<String> {
+    list(attachment, "details", case)
+        .into_iter()
+        .find(|entry| entry["name"].as_str() == Some(name))
+        .and_then(|entry| entry["value"].as_str().map(str::to_string))
+}
+
+/// Whether one attachment reports the interface it stands for as in place: `ATTACHED`,
+/// carrying every detail [`INTERFACE_DETAILS`] names.
+fn reports_its_interface(attachment: &Value, case: &str) -> bool {
+    attachment["status"].as_str() == Some("ATTACHED")
+        && INTERFACE_DETAILS.iter().all(|name| {
+            attachment_detail(attachment, name, case).is_some_and(|value| !value.is_empty())
+        })
+}
+
+/// The `ElasticNetworkInterface` attachment of every RUNNING task of one join row's service,
+/// read back through `ListTasks` and `DescribeTasks`.
+async fn running_interface_attachments(router: &MultiServiceRouter, row: &JoinRow) -> Vec<Value> {
+    let case = row.case;
+    let listed = ok(
+        router,
+        "ListTasks",
+        json!({
+            "cluster": JOIN_CLUSTER,
+            "serviceName": row.label,
+            "desiredStatus": "RUNNING",
+        }),
+        case,
+    )
+    .await;
+    let arns: Vec<Value> = list(&listed, "taskArns", case);
+    if arns.is_empty() {
+        return Vec::new();
+    }
+    let described = ok(
+        router,
+        "DescribeTasks",
+        json!({ "cluster": JOIN_CLUSTER, "tasks": arns }),
+        case,
+    )
+    .await;
+    list(&described, "tasks", case)
+        .into_iter()
+        .filter(|task| task["lastStatus"].as_str() == Some("RUNNING"))
+        .flat_map(|task| list(&task, "attachments", case))
+        .filter(|attachment| attachment["type"].as_str() == Some("ElasticNetworkInterface"))
+        .collect()
+}
+
+/// One interface as Amazon EC2 holds it, reduced to the three members the task's attachment
+/// reports for it.
+#[derive(Debug)]
+struct HeldInterface {
+    subnet_id: String,
+    mac_address: String,
+    private_ip_address: String,
+}
+
+/// What Amazon EC2's own `DescribeNetworkInterfaces` reports for ONE interface id — the read
+/// that says whether the interface a task's attachment names exists at all.
+async fn held_interface(
+    router: &MultiServiceRouter,
+    network_interface_id: &str,
+    case: &str,
+) -> HeldInterface {
+    let body = ec2_form(
+        router,
+        "DescribeNetworkInterfaces",
+        &[("NetworkInterfaceId.1", network_interface_id)],
+        case,
+    )
+    .await;
+    assert_eq!(
+        all_texts(&body, "networkInterfaceId"),
+        vec![network_interface_id.to_string()],
+        "case {case:?}: expected Amazon EC2 to hold exactly the interface the attachment \
+         names, got {body}"
+    );
+    // Each of the three is a member of the interface ITSELF, and an answer about ONE interface
+    // carries one value for each: the address is spelled both on the interface and in the set
+    // of addresses it holds, so every spelling of it has to be the same address. Read as a
+    // SET, so a reordered or repeated member fails loudly rather than being read as the first
+    // tag that matched.
+    let one = |name: &str| {
+        let found: BTreeSet<String> = all_texts(&body, name).into_iter().collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "case {case:?}: expected the interface {network_interface_id} to report one \
+             <{name}>, got {found:?} in {body}"
+        );
+        found.into_iter().next().unwrap_or_default()
+    };
+    HeldInterface {
+        subnet_id: one("subnetId"),
+        mac_address: one("macAddress"),
+        private_ip_address: one("privateIpAddress"),
+    }
+}
+
+/// Every `(address, port)` one target group reports a target at, read off the same answer
+/// [`health`] reads its states off.
+async fn registered_targets(
+    router: &MultiServiceRouter,
+    group: &str,
+    case: &str,
+) -> Vec<(String, String)> {
+    let body = target_health(router, group, case).await;
+    all_texts(&body, "Id")
+        .into_iter()
+        .zip(all_texts(&body, "Port"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_service_placed_tasks_address_is_the_interface_ec2_holds_and_the_target_registered() {
+    let router = emulator();
+    create_cluster(&router, JOIN_CLUSTER, "the cluster").await;
+
+    // Every row is placed first, so the rows' interfaces are created and attached at the same
+    // time rather than one row's wait running after another's.
+    let mut built: Vec<(&JoinRow, Network, Option<String>)> = Vec::new();
+    for row in &JOIN_ROWS {
+        let network = join_network(&router, row).await;
+        let family = format!("{}family", row.label);
+        register_revision(&router, &family, row.case).await;
+        let group = if row.binds_a_target_group {
+            Some(
+                load_balanced_target_group(
+                    &router,
+                    row.label,
+                    row.listener_port,
+                    &network,
+                    row.case,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        place_service(
+            &router,
+            &ServicePlacement {
+                case: row.case,
+                cluster: JOIN_CLUSTER,
+                service_name: row.label,
+                family: &family,
+                // The task's own public address, which is what makes the internet gateway its
+                // subnet routes through a path to the image's registry.
+                assign_public_ip: "ENABLED",
+                desired: row.desired,
+                group: group.as_deref(),
+            },
+            &network,
+        )
+        .await;
+        built.push((row, network, group));
+    }
+
+    // Nothing handed out by the ONE store every row shares may be handed out twice: an
+    // interface, an address and a MAC address belong to one task.
+    let mut addresses: BTreeSet<String> = BTreeSet::new();
+    let mut interface_ids: BTreeSet<String> = BTreeSet::new();
+    let mut mac_addresses: BTreeSet<String> = BTreeSet::new();
+    let mut joined = 0usize;
+
+    for (row, network, group) in &built {
+        let case = row.case;
+        let subnet = network.subnets[0].as_str();
+        let deadline = Instant::now() + POLL_BUDGET;
+        // The CONDITION is polled for, never a span waited out: every task the service was
+        // asked for runs and reports the interface it was allocated, and the group it binds
+        // holds one target per task.
+        let attachments = loop {
+            let attachments = running_interface_attachments(&router, row).await;
+            let targets = match group {
+                Some(group) => registered_targets(&router, group, case).await,
+                None => Vec::new(),
+            };
+            let wanted_targets = if group.is_some() { row.desired } else { 0 };
+            if attachments.len() == row.desired
+                && attachments
+                    .iter()
+                    .all(|attachment| reports_its_interface(attachment, case))
+                && targets.len() == wanted_targets
+            {
+                break attachments;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: expected {} running task(s) each reporting the interface it \
+                 was allocated and {wanted_targets} registered target(s), got the attachments \
+                 {attachments:?} and the targets {targets:?}",
+                row.desired
+            );
+            ::tokio::time::sleep(POLL_INTERVAL).await;
+        };
+
+        for attachment in &attachments {
+            let read = |name: &str| {
+                attachment_detail(attachment, name, case).unwrap_or_else(|| {
+                    panic!("case {case:?}: expected the attachment to report {name}, got {attachment}")
+                })
+            };
+            let interface_id = read("networkInterfaceId");
+            let address = read("privateIPv4Address");
+            let mac_address = read("macAddress");
+            assert_eq!(
+                read("subnetId"),
+                subnet,
+                "case {case:?}: the interface is created in the subnet the placement named, \
+                 got {attachment}"
+            );
+            // The interface the attachment NAMES is one Amazon VPC really holds, in that same
+            // subnet and at that same address: an id resolving to nothing is an address no
+            // client could reach.
+            let held = held_interface(&router, &interface_id, case).await;
+            assert_eq!(
+                (
+                    held.private_ip_address.as_str(),
+                    held.subnet_id.as_str(),
+                    held.mac_address.as_str()
+                ),
+                (address.as_str(), subnet, mac_address.as_str()),
+                "case {case:?}: expected Amazon EC2 to hold the interface the attachment \
+                 reports, got {held:?} against {attachment}"
+            );
+            assert!(
+                addresses.insert(address.clone()),
+                "case {case:?}: expected an address no other interface holds, got {address} \
+                 among {addresses:?}"
+            );
+            assert!(
+                interface_ids.insert(interface_id.clone()),
+                "case {case:?}: expected an interface id no other task reports, got \
+                 {interface_id} among {interface_ids:?}"
+            );
+            assert!(
+                mac_addresses.insert(mac_address.clone()),
+                "case {case:?}: expected a MAC address no other interface holds, got \
+                 {mac_address} among {mac_addresses:?}"
+            );
+            joined += 1;
+        }
+
+        // Every running task of a service that binds an `ip` group is a target of that group
+        // AT the address its own interface holds, on the port the binding named.
+        if let Some(group) = group {
+            let expected: BTreeSet<(String, String)> = attachments
+                .iter()
+                .map(|attachment| {
+                    (
+                        attachment_detail(attachment, "privateIPv4Address", case)
+                            .unwrap_or_default(),
+                        CONTAINER_PORT.to_string(),
+                    )
+                })
+                .collect();
+            let reported: BTreeSet<(String, String)> = registered_targets(&router, group, case)
+                .await
+                .into_iter()
+                .collect();
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected the group to hold one target per running task, at \
+                 the address and port each task's own interface listens on"
+            );
+        }
+
+        // Two reads report ONE interface per task: the values are stored, not minted per read.
+        let again: BTreeSet<String> = running_interface_attachments(&router, row)
+            .await
+            .iter()
+            .map(Value::to_string)
+            .collect();
+        let settled: BTreeSet<String> = attachments.iter().map(Value::to_string).collect();
+        assert_eq!(
+            again, settled,
+            "case {case:?}: expected a second read to report the same interface for every \
+             task"
+        );
+    }
+
+    let placed: usize = JOIN_ROWS.iter().map(|row| row.desired).sum();
+    assert_eq!(
+        joined, placed,
+        "case {:?}: expected every task placed to report an interface the three views agree \
+         on, got {joined} of {placed}",
+        "the whole join"
+    );
 }
