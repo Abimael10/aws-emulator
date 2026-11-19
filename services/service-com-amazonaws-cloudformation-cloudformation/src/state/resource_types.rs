@@ -88,6 +88,7 @@ use super::template::{
     APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME,
     APPLICATION_SIGNALS_GROUPING_CONFIGURATION, APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG,
     APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE, BACKUP_GATEWAY_HYPERVISOR,
+    BCM_DASHBOARD, BCM_SCHEDULED_REPORT,
     BRAKET_SPENDING_LIMIT,
     CLEANROOMSML_TRAINING_DATASET,
     CLOUDFRONT_CONNECTION_FUNCTION, CLOUDFRONT_CONNECTION_GROUP, CLOUDFRONT_FUNCTION,
@@ -302,6 +303,11 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Batch::QuotaShare",
     "AWS::Batch::SchedulingPolicy",
     "AWS::Batch::ServiceEnvironment",
+    // Billing and Cost Management Dashboards. The dashboard and the scheduled report on one
+    // are both created in the owning service (`super::provisioner`): `CreateDashboard` and
+    // `CreateScheduledReport`.
+    BCM_DASHBOARD,
+    BCM_SCHEDULED_REPORT,
     // Amazon Bedrock
     "AWS::Bedrock::Agent",
     "AWS::Bedrock::AgentAlias",

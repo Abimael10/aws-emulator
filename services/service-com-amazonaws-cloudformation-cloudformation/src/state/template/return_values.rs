@@ -290,6 +290,12 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // are that service's clock and reach the resource off its own report of the data
         // source, exactly as a knowledge base's status and instants do.
         BEDROCK_DATA_SOURCE => &[BEDROCK_DATA_SOURCE_ID_ATTRIBUTE],
+        // A Billing and Cost Management Dashboards dashboard, and a scheduled report on one,
+        // each publish the ARN that service minted — the one return value these naming rules
+        // compute a stand-in for before the resource exists — beside the instants of its
+        // clock, which reach the resource off its own report rather than from here.
+        BCM_DASHBOARD => BCM_DASHBOARD_ATTRIBUTES,
+        BCM_SCHEDULED_REPORT => BCM_SCHEDULED_REPORT_ATTRIBUTES,
         // A spending limit's ARN is the one return value these naming rules can compute; its
         // `CreatedAt` is Amazon Braket's clock, which reaches the resource off that
         // service's own report of the limit rather than from here, exactly as a knowledge
@@ -845,6 +851,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // That ARN is also what every call on a limit takes (`UpdateSpendingLimit` and
         // `DeleteSpendingLimit` each address one by it).
         || resource_type == BRAKET_SPENDING_LIMIT
+        // The two Billing and Cost Management Dashboards types are two more: neither
+        // `CreateDashboard` nor `CreateScheduledReport` takes an identifier — a template
+        // declares a dashboard's widgets and a report's schedule — and each answers the
+        // `arn` that service minted, whose resource segment carries a 32-character
+        // hexadecimal id of its own that no name CloudFormation decides is. That ARN is what
+        // either type's `Ref` returns and the handle every call on the resource takes, so the
+        // identity in force is the one that service answered.
+        || resource_type == BCM_DASHBOARD
+        || resource_type == BCM_SCHEDULED_REPORT
         // An Application Signals INSTRUMENTATION CONFIG is one more:
         // `CreateInstrumentationConfiguration` takes no identifier for the configuration — the
         // declaration states the service, the environment, the signal type and the code

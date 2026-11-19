@@ -465,7 +465,7 @@ pub(super) use super::{
 
 use super::provisioning::{
     call_json_rpc, call_query, call_rest_json, call_rest_json_named, call_rest_xml,
-    percent_encoded, xml_element, xml_elements,
+    percent_encoded, published_instant, xml_element, xml_elements,
     xml_entry_map, xml_entry_structures, xml_leaf, xml_member_structures, xml_scalar_children,
     Created, Readiness,
     Refusal, Removal,
@@ -483,7 +483,8 @@ use super::template::{
     APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG, APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE,
     BACKUP_GATEWAY_HYPERVISOR, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT,
     BATCH_COMPUTE_ENVIRONMENT,
-    BATCH_JOB_DEFINITION, BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BEDROCK_DATA_SOURCE,
+    BATCH_JOB_DEFINITION, BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BCM_DASHBOARD,
+    BCM_SCHEDULED_REPORT, BEDROCK_DATA_SOURCE,
     BEDROCK_FLOW,
     BEDROCK_GUARDRAIL,
     BEDROCK_KNOWLEDGE_BASE,
@@ -1143,6 +1144,15 @@ pub(super) enum Provisioner {
     /// the `spendingLimitArn` the type publishes — the handle every spending-limit API takes
     /// — so it is read off that create's own answer and is the identity a `Ref` resolves to.
     BraketSpendingLimit,
+    /// `AWS::BCM::Dashboard` and `AWS::BCM::ScheduledReport`: the Billing and Cost
+    /// Management Dashboards dashboard `CreateDashboard` makes under the name the template
+    /// states, and the scheduled report `CreateScheduledReport` makes ON one of those
+    /// dashboards; each `Update…` changes one and each `Delete…` removes it. That service
+    /// MINTS the `arn` either type publishes — the handle every call on the resource takes —
+    /// so it is read off that create's own answer and is the identity a `Ref` resolves to
+    /// ([`bcm_dashboards`]).
+    BcmDashboard,
+    BcmScheduledReport,
     /// `AWS::ApplicationSignals::ServiceLevelObjective`: the objective CloudWatch Application
     /// Signals' own `CreateServiceLevelObjective` makes under the name the template states,
     /// `UpdateServiceLevelObjective` changes and `DeleteServiceLevelObjective` removes. Its
@@ -1483,6 +1493,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
         BRAKET_SPENDING_LIMIT => Some(Provisioner::BraketSpendingLimit),
+        BCM_DASHBOARD => Some(Provisioner::BcmDashboard),
+        BCM_SCHEDULED_REPORT => Some(Provisioner::BcmScheduledReport),
         APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE => {
             Some(Provisioner::ApplicationSignalsServiceLevelObjective)
         }
@@ -2246,6 +2258,14 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 create_braket_spending_limit(ctx, region, resource, propagated).await
             }
+            // Both `AWS::BCM::*` types publish `Tags`, and each of their creates takes a
+            // `resourceTags` list of its own, so a dashboard and a scheduled report a stack
+            // creates each carry the tags CloudFormation gives them beside the ones their
+            // declaration asks for.
+            Self::BcmDashboard => create_bcm_dashboard(ctx, region, resource, propagated).await,
+            Self::BcmScheduledReport => {
+                create_bcm_scheduled_report(ctx, region, resource, propagated).await
+            }
             // `AWS::ApplicationSignals::ServiceLevelObjective` publishes `Tags`, and
             // `CreateServiceLevelObjective` takes the `TagList` of its own, so an objective a
             // stack creates carries the tags CloudFormation gives it beside the ones the
@@ -2521,6 +2541,13 @@ impl Provisioner {
                 // ("The key can't start with `aws:`") — so a hypervisor carries the stack's own
                 // tags without the three.
                 | Self::BackupGatewayHypervisor
+                // Billing and Cost Management Dashboards refuses a tag key in the reserved
+                // namespace on every call that takes tags — the `resourceTags` list of each
+                // create and `TagResource` alike, in the one check its own crate's tag
+                // validation makes — so a dashboard and a scheduled report each carry the
+                // stack's own tags without the three.
+                | Self::BcmDashboard
+                | Self::BcmScheduledReport
         );
         propagated
             .iter()
@@ -3535,6 +3562,18 @@ impl Provisioner {
             Self::BraketSpendingLimit => update_braket_spending_limit(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // Each `Update…` takes the resource's whole declared configuration by the ARN
+            // that service minted for it, the name included — so a changed declaration is
+            // applied to that dashboard or report rather than replacing it. Their tags travel
+            // separately ([`Self::retag`]).
+            Self::BcmDashboard => update_bcm_dashboard(ctx, region, resource, declared)
+                .await
+                .map(Some),
+            Self::BcmScheduledReport => {
+                update_bcm_scheduled_report(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
             // `UpdateEnvironment` reconfigures the environment the stack created, by the name
             // Amazon MWAA knows it by, taking every member of the create but the ones fixed
             // when an environment is made — which replace the resource instead — so a changed
@@ -3790,6 +3829,14 @@ impl Provisioner {
             // a hypervisor is to end up carrying is reconciled.
             Self::BackupGatewayHypervisor => {
                 retag_backup_gateway_hypervisor(ctx, region, resource, declared, propagated).await
+            }
+            // A dashboard's and a scheduled report's tags are that service's own
+            // `TagResource` and `UntagResource`: each create's `resourceTags` list applies to
+            // the resource it created, and neither update carries a tag at all, so this is
+            // where the set either resource is to end up carrying is reconciled. One arm for
+            // both, because `ResourceArn` names either kind.
+            Self::BcmDashboard | Self::BcmScheduledReport => {
+                retag_bcm_resource(ctx, region, resource, declared, propagated).await
             }
             // A graph's tags are Neptune Analytics' own `TagResource` and `UntagResource`:
             // `CreateGraph`'s `tags` map applies to the graph that call creates, and
@@ -4445,6 +4492,12 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 delete_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // Each delete addresses its resource by the ARN that service minted for it, which
+            // is this resource's physical id.
+            Self::BcmDashboard => delete_bcm_dashboard(ctx, region, physical_resource_id).await,
+            Self::BcmScheduledReport => {
+                delete_bcm_scheduled_report(ctx, region, physical_resource_id).await
+            }
             // The objective is deleted by the ARN it is addressed by, which is this resource's
             // physical id; the account's grouping configuration by the one call that takes it
             // away, which carries no identifier; and the instrumentation point by the identity
@@ -4594,6 +4647,11 @@ mod bedrock_flows;
 /// the return-value catalogue key their entries for those types by.
 pub(crate) mod sagemaker_resources;
 mod braket_spending_limits;
+/// The Billing and Cost Management Dashboards arms: the dashboard an `AWS::BCM::Dashboard`
+/// declares and the scheduled report an `AWS::BCM::ScheduledReport` declares, created in the
+/// service that owns them so a client's own reads — and an execution of the report — resolve
+/// the ARNs the stack publishes.
+mod bcm_dashboards;
 /// The CloudWatch Application Signals arms: the service level objective, the account's
 /// grouping configuration and the dynamic instrumentation point a template declares there,
 /// created in the service that owns them so a client's own reads — and the SDKs that fetch an
@@ -4780,6 +4838,7 @@ use bedrock_data_sources::*;
 use bedrock_flows::*;
 use sagemaker_resources::*;
 use braket_spending_limits::*;
+use bcm_dashboards::*;
 use application_signals::*;
 use cleanrooms_ml_training_datasets::*;
 use backup_gateway_hypervisors::*;

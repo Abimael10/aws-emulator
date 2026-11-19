@@ -2855,6 +2855,13 @@ pub fn name_is_create_only(resource_type: &str) -> bool {
             // the `HypervisorArn` that service minted together with a new `Name`, so renaming
             // one is a modification of it rather than a recreation.
             | BACKUP_GATEWAY_HYPERVISOR
+            // The two Billing and Cost Management Dashboards types are in that same position:
+            // `UpdateDashboard` takes the `arn` that service minted together with a new
+            // required `name`, and `UpdateScheduledReport` takes that `arn` with a new
+            // `name` of its own — each resource being identified by the ARN rather than by
+            // what it is called — so renaming one is a modification of it, not a recreation.
+            | BCM_DASHBOARD
+            | BCM_SCHEDULED_REPORT
     )
 }
 
@@ -2991,6 +2998,10 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE,
     BATCH_SERVICE_ENVIRONMENT,
+    // The two Billing and Cost Management Dashboards types, each publishing the ARN that
+    // service mints for it and the instants of its clock.
+    BCM_DASHBOARD,
+    BCM_SCHEDULED_REPORT,
     "AWS::BedrockAgentCore::Browser",
     "AWS::BedrockAgentCore::CodeInterpreter",
     "AWS::BedrockAgentCore::Gateway",

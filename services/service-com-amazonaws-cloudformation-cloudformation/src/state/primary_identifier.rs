@@ -91,6 +91,11 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // The Amazon S3 Vectors types, each identified by its own ARN.
         S3VECTORS_VECTOR_BUCKET => "VectorBucketArn",
         S3VECTORS_INDEX => "IndexArn",
+        // A Billing and Cost Management Dashboards dashboard, and a scheduled report on one,
+        // are each identified by the ARN that service minted for the resource ("Ref returns
+        // the Arn") — the handle every call on either takes; the type's own `Name` is only
+        // what the resource is called, and two accounts' reports may share one.
+        BCM_DASHBOARD | BCM_SCHEDULED_REPORT => "Arn",
         // An Amazon Braket spending limit, identified by the ARN that service minted for it
         // ("Ref returns the spending limit ARN"), which is the handle every spending-limit
         // API takes — the type declares no name a client could name one by.

@@ -132,6 +132,59 @@ pub(super) const BEDROCK_FLOW_DRAFT_VERSION: &str = "DRAFT";
 /// `FlowArn`'s own pattern (`arn:aws:bedrock:<region>:<account>:flow/<id>`).
 pub(super) const BEDROCK_FLOW_PATH: &str = "flow";
 
+/// The `AWS::BCM::<Resource>` types of the two Billing and Cost Management Dashboards
+/// resources a template declares: the DASHBOARD that service's own `CreateDashboard` makes
+/// under the name the declaration states, and the SCHEDULED REPORT its
+/// `CreateScheduledReport` makes on one of those dashboards.
+///
+/// "Ref returns the Arn" for either type, and `Fn::GetAtt` reads
+/// [`BCM_DASHBOARD_ATTRIBUTES`] / [`BCM_SCHEDULED_REPORT_ATTRIBUTES`]. That service MINTS
+/// the ARN each create answers — neither create takes an identifier at all, and the
+/// resource segment of the ARN carries an id of that service's own
+/// (`DashboardArn`: `^arn:aws[-a-z0-9]*:bcm-dashboards::[0-9]{12}:dashboard/(\*|[-a-z0-9]+)$`,
+/// and the same shape under `scheduled-report` for a report) — which is why
+/// [`identity_is_service_assigned`] names both types, and why the instants beside the ARN
+/// are that service's clock rather than anything a template states.
+pub const BCM_DASHBOARD: &str = "AWS::BCM::Dashboard";
+pub const BCM_SCHEDULED_REPORT: &str = "AWS::BCM::ScheduledReport";
+
+/// That service's ARN namespace, which is the namespace both ARNs carry, with no REGION
+/// segment at all: the ARN patterns above spell the region segment empty, so a dashboard
+/// and a report are named account-wide.
+pub const BCM_DASHBOARDS_ARN_NAMESPACE: &str = "bcm-dashboards";
+
+/// The resource path each ARN carries before the id that service minted, from those same
+/// patterns.
+pub(super) const BCM_DASHBOARD_PATH: &str = "dashboard";
+pub(super) const BCM_SCHEDULED_REPORT_PATH: &str = "scheduled-report";
+
+/// How many characters the id inside one of those ARNs carries: that service renders a
+/// resource id as 32 lowercase hexadecimal characters, which is inside the `[-a-z0-9]+`
+/// resource segment the patterns admit — so the STAND-IN computed before the create is of
+/// that same width.
+pub(super) const BCM_RESOURCE_ID_DIGITS: usize = 32;
+
+/// Every `Fn::GetAtt` attribute an [`BCM_DASHBOARD`] publishes, in the sorted order a
+/// resource's own attribute map holds them in: the ARN that service minted, the two
+/// instants it recorded for the dashboard and the kind of dashboard it records it as
+/// (`GetDashboard` reports `createdAt`, `updatedAt` and `type` beside the record's own
+/// members).
+///
+/// Only the ARN is computable here, and only as a stand-in of that service's own form;
+/// every other value is read off its own report of the dashboard
+/// ([`crate::state::provisioner`]).
+pub(super) const BCM_DASHBOARD_ATTRIBUTES: &[&str] = &["Arn", "CreatedAt", "Type", "UpdatedAt"];
+
+/// Every `Fn::GetAtt` attribute an [`BCM_SCHEDULED_REPORT`] publishes, in that same order:
+/// the ARN that service minted and the two instants it recorded for the report
+/// (`GetScheduledReport` reports `createdAt` and `updatedAt` beside the report's own
+/// members).
+pub(super) const BCM_SCHEDULED_REPORT_ATTRIBUTES: &[&str] = &["Arn", "CreatedAt", "UpdatedAt"];
+
+/// The one attribute of either list these naming rules compute rather than stand in for:
+/// the ARN, which is also the identity each type's `Ref` returns.
+pub(super) const BCM_ARN_ATTRIBUTE: &str = "Arn";
+
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Braket SPENDING LIMIT: the
 /// cost control that service's own `CreateSpendingLimit` makes for a quantum device. The
 /// middle segment is that model's own `awsService.sdkId` (`Braket`).

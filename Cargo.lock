@@ -11329,6 +11329,7 @@ dependencies = [
  "service-com-amazonaws-applicationsignals-applicationsignals",
  "service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice",
  "service-com-amazonaws-autoscaling-autoscaling-2011-01-01",
+ "service-com-amazonaws-bcmdashboards-awsbcmdashboardsservice",
  "service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda",
  "service-com-amazonaws-cloudfront-cloudfront2020-05-31",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",

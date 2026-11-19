@@ -590,6 +590,14 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 describe_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // That service's own reads of the dashboard and of the scheduled report, each by
+            // the ARN it minted for the resource.
+            Self::BcmDashboard => {
+                describe_bcm_dashboard(ctx, region, physical_resource_id).await
+            }
+            Self::BcmScheduledReport => {
+                describe_bcm_scheduled_report(ctx, region, physical_resource_id).await
+            }
             // Application Signals' own reads: the objective by the ARN it is addressed by, the
             // account's grouping configuration by the read that reports this account's
             // definitions, and the instrumentation point by the identity the stack holds for

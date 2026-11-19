@@ -306,6 +306,12 @@ service-com-amazonaws-servicediscovery-route53autonaming-v20170314 = { workspace
 # `HostedZoneId` such a namespace publishes is the id of a zone that service holds, so it is
 # mounted beside Cloud Map.
 service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
+# Billing and Cost Management Dashboards, for the `AWS::BCM::Dashboard` and the
+# `AWS::BCM::ScheduledReport` on one a stack really creates there
+# (`state::provisioner::bcm_dashboards`): a suite that deploys one must have its owning
+# service mounted beside CloudFormation, or the create is refused and the stack fails — and the
+# dashboard and the report the stack published are read back through that service's own wire.
+service-com-amazonaws-bcmdashboards-awsbcmdashboardsservice = { workspace = true }
 
 [lints]
 workspace = true

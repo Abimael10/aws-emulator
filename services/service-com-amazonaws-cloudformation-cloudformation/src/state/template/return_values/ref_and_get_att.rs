@@ -1762,6 +1762,45 @@ pub(crate) fn return_values(
                 attributes,
             )
         }
+        // The Billing and Cost Management Dashboards control plane: the dashboard an
+        // `AWS::BCM::Dashboard` declares and the scheduled report an
+        // `AWS::BCM::ScheduledReport` declares. "Ref returns the Arn" for either, and
+        // `Fn::GetAtt` reads the instants that service recorded beside it (and, for a
+        // dashboard, the kind it records it as). That service MINTS the ARN — neither create
+        // takes an identifier, and the resource segment carries a 32-hexadecimal-character
+        // id of its own, with no Region segment at all — so the value here is a STAND-IN of
+        // that form, which `super::provisioning` re-points at the ARN the create really
+        // answered ([`super::provisioner::Provisioner::BcmDashboard`]). The instants and the
+        // kind are that service's own, so each stands in until it has reported them.
+        BCM_DASHBOARD | BCM_SCHEDULED_REPORT => {
+            let (path, published) = if resource_type == BCM_DASHBOARD {
+                (BCM_DASHBOARD_PATH, BCM_DASHBOARD_ATTRIBUTES)
+            } else {
+                (BCM_SCHEDULED_REPORT_PATH, BCM_SCHEDULED_REPORT_ATTRIBUTES)
+            };
+            let arn = ::emulator_server::emulator_arn(
+                BCM_DASHBOARDS_ARN_NAMESPACE,
+                "",
+                &format!(
+                    "{path}/{}",
+                    crate::state::stable_identifier_digits(
+                        &format!("{resource_type}/{name}"),
+                        BCM_RESOURCE_ID_DIGITS
+                    )
+                ),
+            );
+            attributes.insert(BCM_ARN_ATTRIBUTE.to_string(), arn.clone());
+            for attribute in published
+                .iter()
+                .filter(|attribute| **attribute != BCM_ARN_ATTRIBUTE)
+            {
+                attributes.insert(
+                    (*attribute).to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (arn, attributes)
+        }
         // Amazon Braket's own control plane: the spending limit an
         // `AWS::Braket::SpendingLimit` declares. "Ref returns the spending limit ARN" (the
         // type's primary identifier); Fn::GetAtt reads `SpendingLimitArn` and `CreatedAt`.

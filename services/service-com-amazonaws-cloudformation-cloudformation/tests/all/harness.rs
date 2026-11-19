@@ -341,6 +341,15 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
     router.register_service(
         service_com_amazonaws_route53_awsdnsv20130401::EmulatedService::new(Arc::clone(&engine)),
     );
+    // Billing and Cost Management Dashboards, for the `AWS::BCM::Dashboard` a stack really
+    // creates there and the `AWS::BCM::ScheduledReport` it schedules ON that dashboard, so a
+    // suite that deploys one reads the dashboard and the report back through that service's
+    // own wire, by the ARNs the stack publishes.
+    router.register_service(
+        service_com_amazonaws_bcmdashboards_awsbcmdashboardsservice::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     (router, engine)
 }
 
