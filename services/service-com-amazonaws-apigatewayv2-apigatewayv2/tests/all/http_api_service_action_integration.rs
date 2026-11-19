@@ -23,6 +23,7 @@
 //! `http_api_servable_stage.rs` and its siblings and are not restated here.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -429,13 +430,7 @@ impl Emulator {
 
     /// A queue carrying the policy EventBridge's delivery needs; answers `(url, arn)`.
     async fn queue(&self, case: &str, name: &str) -> (String, String) {
-        let created = self
-            .sqs(case, "CreateQueue", &json!({ "QueueName": name }))
-            .await;
-        let url = created["QueueUrl"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {case:?}: no QueueUrl in {created}"))
-            .to_string();
+        let url = self.queue_with(case, name, json!({})).await;
         let attributes = self
             .sqs(
                 case,
@@ -528,21 +523,28 @@ impl Emulator {
         (matching_url, near_miss_url)
     }
 
-    /// A FIFO queue, which is the one kind whose send is answered a `SequenceNumber`
-    /// ("This parameter applies only to FIFO (first-in-first-out) queues",
-    /// `SendMessageResult$SequenceNumber`); answers its url.
-    async fn fifo_queue(&self, case: &str, name: &str) -> String {
+    /// A queue named `name` created with `attributes`: the ONE create every queue in this
+    /// suite is made with, so the kinds it needs differ in that map alone. Answers its url.
+    async fn queue_with(&self, case: &str, name: &str, attributes: Value) -> String {
         let created = self
             .sqs(
                 case,
                 "CreateQueue",
-                &json!({ "QueueName": name, "Attributes": { "FifoQueue": "true" } }),
+                &json!({ "QueueName": name, "Attributes": attributes }),
             )
             .await;
         created["QueueUrl"]
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: no QueueUrl in {created}"))
             .to_string()
+    }
+
+    /// A FIFO queue, which is the one kind whose send is answered a `SequenceNumber`
+    /// ("This parameter applies only to FIFO (first-in-first-out) queues",
+    /// `SendMessageResult$SequenceNumber`); answers its url.
+    async fn fifo_queue(&self, case: &str, name: &str) -> String {
+        self.queue_with(case, name, json!({ "FifoQueue": "true" }))
+            .await
     }
 
     /// Every message waiting on the queue at `url`, as its parsed body, taken off it.
@@ -928,9 +930,19 @@ async fn the_action_a_subtype_route_performs_is_the_one_its_subtype_names() {
             None,
         ),
         (
+            // A first-class subtype whose action belongs to a service this emulator performs
+            // no action of, configured with every parameter the control plane holds it to, so
+            // the route exists and only the ACTION is missing.
             "a subtype this emulator performs no action for",
-            "SQS-PurgeQueue",
-            |url| json!({ "QueueUrl": url }),
+            "AppConfig-GetConfiguration",
+            |_url| {
+                json!({
+                    "Application": "orders",
+                    "Environment": "live",
+                    "Configuration": "limits",
+                    "ClientId": "a-client",
+                })
+            },
             None,
         ),
     ];
@@ -1235,5 +1247,426 @@ async fn a_request_that_cannot_satisfy_a_required_mapping_is_refused() {
                 );
             }
         }
+    }
+}
+
+/// The IAM actions the three queue subtypes below need
+/// (`<arnNamespace>:<OperationName>`), and the attribute the backlog of a queue is reported
+/// under.
+const RECEIVE_MESSAGE_ACTION: &str = "sqs:ReceiveMessage";
+const DELETE_MESSAGE_ACTION: &str = "sqs:DeleteMessage";
+const PURGE_QUEUE_ACTION: &str = "sqs:PurgeQueue";
+const VISIBLE_COUNT: &str = "ApproximateNumberOfMessages";
+
+/// The status and error shape Amazon SQS answers a call the policies in force do not permit,
+/// which is what a relayed refusal of a queue action carries.
+const QUEUE_ACCESS_DENIED_STATUS: u16 = 403;
+const QUEUE_ACCESS_DENIED: &str = "AccessDenied";
+
+/// The member a relayed refusal names the error shape under.
+const SHAPE_MEMBER: &str = "__type";
+
+/// How long a poll waits for a condition to hold, and how long one turn of it waits before
+/// looking again.
+///
+/// Generous on purpose: what is waited for is the CONDITION — a message answered off the
+/// queue, a queue reporting an empty backlog — re-read until it holds, so a slow or loaded
+/// host only takes more turns of the loop.
+const QUEUE_POLL_DEADLINE: Duration = Duration::from_secs(60);
+const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+impl Emulator {
+    /// A queue whose received messages stay visible, so what a row asserts about the backlog
+    /// is about the action under test and not about a visibility window: "VisibilityTimeout —
+    /// the visibility timeout for the queue, in seconds" (`CreateQueue$Attributes`), zero
+    /// being that attribute's documented floor. Answers its url.
+    async fn queue_without_a_visibility_window(&self, case: &str, name: &str) -> String {
+        self.queue_with(case, name, json!({ "VisibilityTimeout": "0" }))
+            .await
+    }
+
+    /// One message onto the queue at `url`, sent with that service's own `SendMessage`;
+    /// answers the id it minted for it.
+    async fn sent(&self, case: &str, url: &str, body: &str) -> String {
+        let sent = self
+            .sqs(case, "SendMessage", &json!({ "QueueUrl": url, "MessageBody": body }))
+            .await;
+        sent["MessageId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no MessageId in {sent}"))
+            .to_string()
+    }
+
+    /// The receipt handle of one message waiting on the queue at `url`, taken with that
+    /// service's own `ReceiveMessage` — the handle a consumer would delete by.
+    async fn one_handle(&self, case: &str, url: &str) -> String {
+        let received = self.received(case, url).await;
+        received
+            .first()
+            .and_then(|message| message["ReceiptHandle"].as_str())
+            .unwrap_or_else(|| panic!("case {case:?}: no ReceiptHandle in {received:?}"))
+            .to_string()
+    }
+
+    /// How many messages the queue at `url` reports waiting, read through that service's own
+    /// `GetQueueAttributes`.
+    async fn waiting(&self, case: &str, url: &str) -> i64 {
+        let attributes = self
+            .sqs(
+                case,
+                "GetQueueAttributes",
+                &json!({ "QueueUrl": url, "AttributeNames": [VISIBLE_COUNT] }),
+            )
+            .await;
+        attributes["Attributes"][VISIBLE_COUNT]
+            .as_str()
+            .and_then(|count| count.parse::<i64>().ok())
+            .unwrap_or_else(|| panic!("case {case:?}: no {VISIBLE_COUNT} in {attributes}"))
+    }
+
+    /// The queue at `url` once it reports NO message waiting: the backlog is re-read until
+    /// that holds, or until a deadline far beyond any span this emulator owes has passed.
+    async fn until_empty(&self, case: &str, url: &str) {
+        let deadline = Instant::now() + QUEUE_POLL_DEADLINE;
+        loop {
+            let waiting = self.waiting(case, url).await;
+            if waiting == 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: expected the queue to hold no message, got {waiting}"
+            );
+            tokio::time::sleep(QUEUE_POLL_INTERVAL).await;
+        }
+    }
+
+    /// One invoke of a READING route, repeated until its answer carries a message or a
+    /// deadline far beyond any span this emulator owes has passed: a receive takes what is
+    /// waiting at the instant it is served, so the CONDITION is polled rather than a time
+    /// waited.
+    async fn invoke_until_a_message_is_answered(
+        &self,
+        case: &str,
+        endpoint: &str,
+        path: &str,
+    ) -> (u16, String, Value) {
+        let deadline = Instant::now() + QUEUE_POLL_DEADLINE;
+        loop {
+            let answered = self.answered(endpoint, path, &[], "").await;
+            if answered.0 != 200 || !envelope_elements(&answered.2, "Body").is_empty() {
+                return answered;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: expected the route to answer a message, got {:?}",
+                answered.2
+            );
+            tokio::time::sleep(QUEUE_POLL_INTERVAL).await;
+        }
+    }
+}
+
+/// Every element NAME the document the route answered carries, in document order.
+///
+/// Parsed with `quick-xml`, like [`envelope_elements`], rather than by slicing the body: which
+/// elements the envelope HAS is read the way a client's own XML reader reads it. A body that
+/// is not well-formed XML fails the case.
+fn envelope_element_names(case: &str, answered: &Value) -> Vec<String> {
+    let body = answered.as_str().unwrap_or_default().to_string();
+    let mut reader = Reader::from_str(&body);
+    let mut names: Vec<String> = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) => {
+                names.push(String::from_utf8_lossy(start.name().as_ref()).to_string());
+            }
+            Ok(Event::Empty(empty)) => {
+                names.push(String::from_utf8_lossy(empty.name().as_ref()).to_string());
+            }
+            Ok(Event::Eof) => return names,
+            Ok(_) => {}
+            Err(error) => panic!("case {case:?}: expected XML, got {error} in {body:?}"),
+        }
+    }
+}
+
+/// What a row asserts once its route was invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueOutcome {
+    /// The answer carries the message the queue held — its body, the id its send minted, and
+    /// a handle that still deletes it.
+    AnswersTheMessage,
+    /// The answer carries the result element and no message at all, the queue holding none.
+    AnswersNoMessage,
+    /// The queue holds no message afterwards.
+    EmptiesTheQueue,
+}
+
+/// RULE: a route whose integration names a first-class Amazon SQS QUEUE subtype performs that
+/// action — the read, the delete, the purge — with the parameters its `RequestParameters` map,
+/// under the role its `CredentialsArn` names, and answers `200` carrying the queue api's own
+/// query-interface `{Action}Response` envelope: the members that action's output declares, and
+/// no result element at all for an action whose output declares none. So what a client reads
+/// off the answer, and what the queue holds afterwards, are what the action did.
+#[tokio::test]
+async fn a_queue_subtype_route_performs_the_action_its_subtype_names() {
+    /// One case: the subtype, the permission its action needs, the route, the mapping, the
+    /// messages the queue holds first, and what the invoke must then have done.
+    struct Row {
+        case: &'static str,
+        subtype: &'static str,
+        permission: &'static str,
+        route_key: &'static str,
+        path: &'static str,
+        bodies: &'static [&'static str],
+        /// Whether the invoke carries the receipt handle of a message a consumer took off the
+        /// queue, which is the value a delete is mapped from.
+        carries_handle: bool,
+        parameters: fn(&str) -> Value,
+        /// Whether the envelope carries the `{Action}Result` element, which is whether the
+        /// action's own output declares any member at all.
+        result_element: bool,
+        outcome: QueueOutcome,
+    }
+    // Rows differ along the ACTION and along what the queue holds when it is performed: a read
+    // of a queue holding one message, a read of a queue holding none, a delete by the handle a
+    // consumer holds, and a purge of a queue holding several.
+    let rows: &[Row] = &[
+        Row {
+            case: "a read of a queue holding one message",
+            subtype: "SQS-ReceiveMessage",
+            permission: RECEIVE_MESSAGE_ACTION,
+            route_key: "POST /recv",
+            path: "/recv",
+            bodies: &["a marker"],
+            carries_handle: false,
+            parameters: |url| json!({ "QueueUrl": url, "MaxNumberOfMessages": "10" }),
+            result_element: true,
+            outcome: QueueOutcome::AnswersTheMessage,
+        },
+        Row {
+            case: "a read of a queue holding none",
+            subtype: "SQS-ReceiveMessage",
+            permission: RECEIVE_MESSAGE_ACTION,
+            route_key: "POST /recv",
+            path: "/recv",
+            bodies: &[],
+            carries_handle: false,
+            parameters: |url| json!({ "QueueUrl": url }),
+            result_element: true,
+            outcome: QueueOutcome::AnswersNoMessage,
+        },
+        Row {
+            case: "a delete by the handle a consumer holds",
+            subtype: "SQS-DeleteMessage",
+            permission: DELETE_MESSAGE_ACTION,
+            route_key: "POST /delete",
+            path: "/delete",
+            bodies: &["to be deleted"],
+            carries_handle: true,
+            parameters: |url| {
+                json!({ "QueueUrl": url, "ReceiptHandle": "$request.header.x-receipt-handle" })
+            },
+            result_element: false,
+            outcome: QueueOutcome::EmptiesTheQueue,
+        },
+        Row {
+            case: "a purge of a queue holding several",
+            subtype: "SQS-PurgeQueue",
+            permission: PURGE_QUEUE_ACTION,
+            route_key: "POST /purge",
+            path: "/purge",
+            bodies: &["one", "two", "three"],
+            carries_handle: false,
+            parameters: |url| json!({ "QueueUrl": url }),
+            result_element: false,
+            outcome: QueueOutcome::EmptiesTheQueue,
+        },
+    ];
+    for row in rows {
+        let case = row.case;
+        let emulator = Emulator::new();
+        let role = emulator.role(case, Some(grant(row.permission))).await;
+        let url = emulator
+            .queue_without_a_visibility_window(case, "subject")
+            .await;
+        let mut sent: Vec<String> = Vec::new();
+        for body in row.bodies {
+            sent.push(emulator.sent(case, &url, body).await);
+        }
+        let handle = if row.carries_handle {
+            emulator.one_handle(case, &url).await
+        } else {
+            String::new()
+        };
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if row.carries_handle {
+            headers.push(("x-receipt-handle", handle.as_str()));
+        }
+        let endpoint = emulator
+            .api(
+                case,
+                subtype_integration(row.subtype, Some(&role), (row.parameters)(&url)),
+                row.route_key,
+            )
+            .await
+            .1;
+
+        let (status, media_type, answered) = if row.outcome == QueueOutcome::AnswersTheMessage {
+            emulator
+                .invoke_until_a_message_is_answered(case, &endpoint, row.path)
+                .await
+        } else {
+            emulator.answered(&endpoint, row.path, &headers, "").await
+        };
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from the route, got {status} {answered}"
+        );
+        assert_eq!(
+            media_type, XML_MEDIA_TYPE,
+            "case {case:?}: expected the media type a query interface answers under, got \
+             {media_type:?}"
+        );
+        // The envelope is the ACTION's own: its response element around the result element
+        // the action's output declares members for, and the `ResponseMetadata` naming the
+        // request.
+        let action = row
+            .subtype
+            .split_once('-')
+            .map(|(_service, action)| action)
+            .unwrap_or_default();
+        let names = envelope_element_names(case, &answered);
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some(format!("{action}Response").as_str()),
+            "case {case:?}: expected the action's own response element, got {names:?}"
+        );
+        assert_eq!(
+            names.contains(&format!("{action}Result")),
+            row.result_element,
+            "case {case:?}: expected a result element={}, got {names:?}",
+            row.result_element
+        );
+        assert!(
+            envelope_elements(&answered, "RequestId")
+                .first()
+                .is_some_and(|named| !named.is_empty()),
+            "case {case:?}: expected the ResponseMetadata to name the request, got {answered}"
+        );
+
+        match row.outcome {
+            QueueOutcome::AnswersTheMessage => {
+                let expected: Vec<String> =
+                    row.bodies.iter().map(|body| (*body).to_string()).collect();
+                assert_eq!(
+                    envelope_elements(&answered, "Body"),
+                    expected,
+                    "case {case:?}: expected the queue's own message, got {answered}"
+                );
+                assert_eq!(
+                    envelope_elements(&answered, "MessageId"),
+                    sent,
+                    "case {case:?}: expected the id the send minted, got {answered}"
+                );
+                // The handle the answer carries still deletes the message, which is what
+                // makes the read usable.
+                let answered_handle = envelope_elements(&answered, "ReceiptHandle")
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| panic!("case {case:?}: no ReceiptHandle in {answered}"));
+                emulator
+                    .sqs(
+                        case,
+                        "DeleteMessage",
+                        &json!({ "QueueUrl": url, "ReceiptHandle": answered_handle }),
+                    )
+                    .await;
+                emulator.until_empty(case, &url).await;
+            }
+            QueueOutcome::AnswersNoMessage => {
+                assert!(
+                    !names.contains(&"Message".to_string()),
+                    "case {case:?}: expected no message in {answered}"
+                );
+                assert_eq!(
+                    emulator.waiting(case, &url).await,
+                    0,
+                    "case {case:?}: expected the queue to be left empty"
+                );
+            }
+            QueueOutcome::EmptiesTheQueue => emulator.until_empty(case, &url).await,
+        }
+    }
+}
+
+/// RULE: a queue action too is performed as a session of the role the integration's
+/// `CredentialsArn` names, so Amazon SQS decides on that role's own policies whether it
+/// happens — and a route whose role does not hold the action's permission is answered THAT
+/// service's own refusal, relayed, with the queue untouched.
+#[tokio::test]
+async fn a_queue_subtype_route_is_performed_as_the_role_its_credentials_arn_names() {
+    // Rows differ along the ACTION whose permission the role does not hold: each of the three
+    // queue subtypes performed above, with the mapping that action needs.
+    type Parameters = fn(&str) -> Value;
+    let rows: &[(&str, &str, &str, &str, Parameters)] = &[
+        (
+            "a read the role may not make",
+            "SQS-ReceiveMessage",
+            "POST /recv",
+            "/recv",
+            |url| json!({ "QueueUrl": url }),
+        ),
+        (
+            "a delete the role may not make",
+            "SQS-DeleteMessage",
+            "POST /delete",
+            "/delete",
+            // The handle is a static value: the action is refused on the role's policies
+            // before the queue resolves a handle at all, so no real one is needed to drive
+            // the refusal, and the message must still be waiting afterwards.
+            |url| json!({ "QueueUrl": url, "ReceiptHandle": "a-handle-no-receive-minted" }),
+        ),
+        (
+            "a purge the role may not make",
+            "SQS-PurgeQueue",
+            "POST /purge",
+            "/purge",
+            |url| json!({ "QueueUrl": url }),
+        ),
+    ];
+    for (case, subtype, route_key, path, parameters) in rows {
+        let emulator = Emulator::new();
+        // A grant of ANOTHER action of the same service, so the role exists and is assumable
+        // and only the permission under test is missing.
+        let role = emulator.role(case, Some(grant("sqs:SendMessage"))).await;
+        let url = emulator
+            .queue_without_a_visibility_window(case, "subject")
+            .await;
+        emulator.sent(case, &url, "stays on the queue").await;
+        let endpoint = emulator
+            .api(
+                case,
+                subtype_integration(subtype, Some(&role), parameters(&url)),
+                route_key,
+            )
+            .await
+            .1;
+        let (status, answered) = emulator.invoke(&endpoint, path, &[], "").await;
+        assert_eq!(
+            status, QUEUE_ACCESS_DENIED_STATUS,
+            "case {case:?}: expected the service's own refusal, got {status} {answered}"
+        );
+        assert_eq!(
+            answered[SHAPE_MEMBER].as_str().unwrap_or_default(),
+            QUEUE_ACCESS_DENIED,
+            "case {case:?}: expected the error shape that service named, got {answered}"
+        );
+        assert_eq!(
+            emulator.waiting(case, &url).await,
+            1,
+            "case {case:?}: expected the queue to be untouched"
+        );
     }
 }

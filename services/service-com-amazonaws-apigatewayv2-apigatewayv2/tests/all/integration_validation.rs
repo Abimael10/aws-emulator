@@ -586,10 +586,11 @@ async fn a_subtype_integration_is_created_only_with_the_parameters_its_action_re
         "the refusal must be worded as API Gateway words it"
     );
     assert_eq!(
-        unmapped_required_parameters_message("SQS-SendMessage", &["MessageBody", "QueueUrl"]),
+        unmapped_required_parameters_message("SQS-SendMessage", &["QueueUrl", "MessageBody"]),
         "Operation: SQS-SendMessage requires enabling passthrough, or defining all of the \
-         following parameters in the parameter mapping: [MessageBody, QueueUrl]",
-        "a required set of more than one must be listed comma-separated inside the brackets"
+         following parameters in the parameter mapping: [QueueUrl, MessageBody]",
+        "a required set of more than one must be listed comma-separated inside the brackets, \
+         in that subtype's own order"
     );
 
     for (index, subtype) in FIRST_CLASS_SUBTYPES.iter().enumerate() {
@@ -891,6 +892,108 @@ async fn an_integration_naming_no_first_class_subtype_is_created_as_it_came() {
             as_str(&created, "integrationSubtype"),
             *subtype,
             "case {subtype:?}: expected the subtype to be stored as it came, got {created}"
+        );
+    }
+}
+
+/// The required set of every first-class subtype, in the order AWS's own refusal lists it.
+///
+/// Written out here rather than read off the catalog under test, so the ORDER is asserted
+/// against AWS and not merely agreed between the handler and this suite. Source: the
+/// parameter order API Gateway publishes for each subtype in its AWS-service integration
+/// reference for HTTP APIs, which is the order its refusal reproduces — note `SQS-SendMessage`
+/// and `SQS-DeleteMessage`, two actions of one service whose two parameters are listed the
+/// opposite way round, and `Kinesis-PutRecord` and `AppConfig-GetConfiguration`, neither of
+/// which is alphabetical.
+const PUBLISHED_PARAMETER_ORDER: &[(&str, &[&str])] = &[
+    (
+        "AppConfig-GetConfiguration",
+        &["Application", "Environment", "Configuration", "ClientId"],
+    ),
+    ("EventBridge-PutEvents", &["Detail", "DetailType", "Source"]),
+    ("Kinesis-PutRecord", &["StreamName", "Data", "PartitionKey"]),
+    ("SQS-DeleteMessage", &["ReceiptHandle", "QueueUrl"]),
+    ("SQS-PurgeQueue", &["QueueUrl"]),
+    ("SQS-ReceiveMessage", &["QueueUrl"]),
+    ("SQS-SendMessage", &["QueueUrl", "MessageBody"]),
+    ("StepFunctions-StartExecution", &["StateMachineArn"]),
+    ("StepFunctions-StartSyncExecution", &["StateMachineArn"]),
+    ("StepFunctions-StopExecution", &["ExecutionArn"]),
+];
+
+/// RULE: the refusal of a subtype integration whose mapping does not define the parameters its
+/// action requires lists that subtype's WHOLE required set in the order AWS publishes for THAT
+/// subtype — a per-subtype order, never a sorted one.
+#[tokio::test]
+async fn the_refusal_lists_a_subtype_s_required_set_in_that_subtype_s_own_order() {
+    let emulator = emulator();
+    // Rows differ along the SUBTYPE, which is what the order is a fact about: every subtype
+    // the catalog states a required set for, from a one-parameter action to a four-parameter
+    // one, including two of one service that order their parameters oppositely.
+    for (index, (subtype, published)) in PUBLISHED_PARAMETER_ORDER.iter().enumerate() {
+        let case = format!("{subtype} with nothing mapped");
+        let api_id =
+            create_api(&emulator, &case, &http_api(&format!("subtype-order-{index}"))).await;
+        let (status, body) =
+            create_integration(&emulator, &api_id, &subtype_integration(subtype, json!({}))).await;
+        let expected = format!(
+            "Operation: {subtype} requires enabling passthrough, or defining all of the \
+             following parameters in the parameter mapping: [{}]",
+            published.join(", ")
+        );
+        assert_refused(&case, &expected, status, &body);
+        // The same list, as the catalog this service renders that sentence from states it.
+        let stated = first_class_subtype(subtype)
+            .unwrap_or_else(|| panic!("case {case:?}: expected a catalogued subtype"))
+            .required_parameters;
+        assert_eq!(
+            stated, *published,
+            "case {case:?}: expected the catalog to state {published:?}, got {stated:?}"
+        );
+    }
+}
+
+/// RULE: that order is the published one and NOT a sorted one, which is a difference a client
+/// sees for every subtype whose published order is not alphabetical — and every catalogued
+/// subtype has its order asserted, so one added to the catalog cannot arrive unchecked.
+#[test]
+fn the_listed_order_is_the_published_one_and_not_a_sorted_one() {
+    for subtype in FIRST_CLASS_SUBTYPES {
+        let published = PUBLISHED_PARAMETER_ORDER
+            .iter()
+            .find(|(name, _)| *name == subtype.name)
+            .map(|(_, order)| *order)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: every catalogued subtype must state its published order",
+                    subtype.name
+                )
+            });
+        assert_eq!(
+            subtype.required_parameters, published,
+            "case {:?}: expected {published:?}, got {:?}",
+            subtype.name, subtype.required_parameters
+        );
+    }
+    // The four subtypes whose published order differs from the alphabetical one: for each,
+    // the rendered sentence must differ from the one a sorted list would render.
+    let unsorted = [
+        "AppConfig-GetConfiguration",
+        "Kinesis-PutRecord",
+        "SQS-DeleteMessage",
+        "SQS-SendMessage",
+    ];
+    for subtype in unsorted {
+        let known = first_class_subtype(subtype)
+            .unwrap_or_else(|| panic!("case {subtype:?}: expected a catalogued subtype"));
+        let mut sorted: Vec<&str> = known.required_parameters.to_vec();
+        sorted.sort_unstable();
+        let rendered = unmapped_required_parameters_message(subtype, known.required_parameters);
+        let if_sorted = unmapped_required_parameters_message(subtype, &sorted);
+        assert_ne!(
+            rendered, if_sorted,
+            "case {subtype:?}: expected the published order rather than a sorted one, got \
+             {rendered:?}"
         );
     }
 }

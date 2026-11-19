@@ -23,7 +23,16 @@
 //! nearly every one of them exactly the members that action's own input marks REQUIRED, read
 //! off the serving service's model, which each entry below cites the query for — spelled as
 //! an integration's `RequestParameters` spell a parameter: the action's member name in upper
-//! camel case. Nothing in this model enables the PASSTHROUGH the refusal names as the
+//! camel case.
+//!
+//! That set is ORDERED, and the order is PER SUBTYPE: the refusal lists a subtype's required
+//! parameters in the order API Gateway states them for that subtype in its own service-action
+//! reference, which is neither alphabetical nor the order the serving model declares the
+//! members in — two subtypes of one service order the same two parameters differently. So
+//! each entry below holds its own order, and the renderer takes the list as it stands rather
+//! than sorting it ([`unmapped_required_parameters_message`]).
+//!
+//! Nothing in this model enables the PASSTHROUGH the refusal names as the
 //! alternative — `PassthroughBehavior` is "Supported only for WebSocket APIs"
 //! (`Integration$PassthroughBehavior`) — so an HTTP api's subtype integration is configured
 //! the one way, by defining those parameters.
@@ -41,14 +50,16 @@ use std::collections::BTreeMap;
 pub struct FirstClassSubtype {
     /// The subtype as a request spells it, `<Service>-<Action>`.
     pub name: &'static str,
-    /// The parameters the action requires, in the order the refusal lists them: the members
-    /// its own input marks required, upper camel case as a mapping spells them.
+    /// The parameters the action requires, IN THE ORDER THE REFUSAL LISTS THEM: the members
+    /// its own input marks required, upper camel case as a mapping spells them, kept in this
+    /// subtype's own published order (see the module docs) and never sorted.
     pub required_parameters: &'static [&'static str],
 }
 
 /// `EventBridge-PutEvents`. The parameters are the members of one `PutEventsRequestEntry`, of
-/// which an event names its origin (`Source`), its kind (`DetailType`) and its payload
-/// (`Detail`) — the three EventBridge itself refuses an entry without.
+/// which an event names its payload (`Detail`), its kind (`DetailType`) and its origin
+/// (`Source`) — the three EventBridge itself refuses an entry without, in the order the
+/// service-action reference lists this subtype's parameters.
 pub const EVENT_BRIDGE_PUT_EVENTS: FirstClassSubtype = FirstClassSubtype {
     name: "EventBridge-PutEvents",
     required_parameters: &["Detail", "DetailType", "Source"],
@@ -56,26 +67,30 @@ pub const EVENT_BRIDGE_PUT_EVENTS: FirstClassSubtype = FirstClassSubtype {
 
 /// `AppConfig-GetConfiguration`
 /// (`smithy_query(query="operation",operation="GetConfiguration")` on the AppConfig model:
-/// `Application`, `Environment`, `Configuration` and `ClientId` are its required members).
+/// `Application`, `Environment`, `Configuration` and `ClientId` are its required members),
+/// in the order the service-action reference lists this subtype's parameters.
 pub const APP_CONFIG_GET_CONFIGURATION: FirstClassSubtype = FirstClassSubtype {
     name: "AppConfig-GetConfiguration",
-    required_parameters: &["Application", "ClientId", "Configuration", "Environment"],
+    required_parameters: &["Application", "Environment", "Configuration", "ClientId"],
 };
 
 /// `Kinesis-PutRecord`: the stream the record is put on, the record itself and the key it is
 /// partitioned by (`smithy_query(query="operation",operation="PutRecord")` on the Kinesis
 /// model, whose `Data` is required; `StreamName` and `PartitionKey` are this subtype's only
-/// way to name the stream and the shard, so a mapping defining neither names no put).
+/// way to name the stream and the shard, so a mapping defining neither names no put), in the
+/// order the service-action reference lists this subtype's parameters.
 pub const KINESIS_PUT_RECORD: FirstClassSubtype = FirstClassSubtype {
     name: "Kinesis-PutRecord",
-    required_parameters: &["Data", "PartitionKey", "StreamName"],
+    required_parameters: &["StreamName", "Data", "PartitionKey"],
 };
 
 /// `SQS-SendMessage` (`smithy_query(query="operation",operation="SendMessage")` on the Amazon
-/// SQS model: `QueueUrl` and `MessageBody` are its required members).
+/// SQS model: `QueueUrl` and `MessageBody` are its required members), in the order the
+/// service-action reference lists this subtype's parameters — the queue first, which is the
+/// opposite of the order the sibling `SQS-DeleteMessage` states its own two in.
 pub const SQS_SEND_MESSAGE: FirstClassSubtype = FirstClassSubtype {
     name: "SQS-SendMessage",
-    required_parameters: &["MessageBody", "QueueUrl"],
+    required_parameters: &["QueueUrl", "MessageBody"],
 };
 
 /// `SQS-ReceiveMessage` (`ReceiveMessage` requires `QueueUrl`).
@@ -84,10 +99,11 @@ pub const SQS_RECEIVE_MESSAGE: FirstClassSubtype = FirstClassSubtype {
     required_parameters: &["QueueUrl"],
 };
 
-/// `SQS-DeleteMessage` (`DeleteMessage` requires `QueueUrl` and `ReceiptHandle`).
+/// `SQS-DeleteMessage` (`DeleteMessage` requires `QueueUrl` and `ReceiptHandle`), listed the
+/// way API Gateway states this subtype's own order: the handle first, then the queue.
 pub const SQS_DELETE_MESSAGE: FirstClassSubtype = FirstClassSubtype {
     name: "SQS-DeleteMessage",
-    required_parameters: &["QueueUrl", "ReceiptHandle"],
+    required_parameters: &["ReceiptHandle", "QueueUrl"],
 };
 
 /// `SQS-PurgeQueue` (`PurgeQueue` requires `QueueUrl`).
@@ -148,7 +164,9 @@ pub fn first_class_subtype(subtype: &str) -> Option<&'static FirstClassSubtype> 
 /// Every part of the sentence is fixed but the subtype, which is the one the request named,
 /// and the bracketed list, which is that subtype's own required set — all of it, because the
 /// sentence asks for all of the parameters to be defined rather than naming the ones left
-/// out.
+/// out, IN THE ORDER THE CATALOG STATES FOR THAT SUBTYPE. The list is rendered as it stands:
+/// the order is a per-subtype fact of the api being emulated (see the module docs), so
+/// nothing here sorts, re-groups or filters it.
 pub fn unmapped_required_parameters_message(subtype: &str, required: &[&str]) -> String {
     format!(
         "Operation: {subtype} requires enabling passthrough, or defining all of the \

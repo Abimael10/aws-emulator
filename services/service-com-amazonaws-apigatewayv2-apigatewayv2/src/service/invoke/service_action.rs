@@ -359,6 +359,12 @@ enum Action {
     EventBridgePutEvents,
     /// `SQS-SendMessage`: send the mapped message to the queue it names.
     SqsSendMessage,
+    /// `SQS-ReceiveMessage`: read the queue it names.
+    SqsReceiveMessage,
+    /// `SQS-DeleteMessage`: delete the message its handle names off that queue.
+    SqsDeleteMessage,
+    /// `SQS-PurgeQueue`: empty the queue it names.
+    SqsPurgeQueue,
     /// `StepFunctions-StartExecution`: start an execution of the state machine it names.
     StepFunctionsStartExecution,
     /// `StepFunctions-StartSyncExecution`: start one synchronously and answer what it came
@@ -377,6 +383,9 @@ impl Action {
         match subtype {
             eventbridge::PUT_EVENTS_SUBTYPE => Some(Self::EventBridgePutEvents),
             sqs::SEND_MESSAGE_SUBTYPE => Some(Self::SqsSendMessage),
+            sqs::RECEIVE_MESSAGE_SUBTYPE => Some(Self::SqsReceiveMessage),
+            sqs::DELETE_MESSAGE_SUBTYPE => Some(Self::SqsDeleteMessage),
+            sqs::PURGE_QUEUE_SUBTYPE => Some(Self::SqsPurgeQueue),
             stepfunctions::START_EXECUTION_SUBTYPE => Some(Self::StepFunctionsStartExecution),
             stepfunctions::START_SYNC_EXECUTION_SUBTYPE => {
                 Some(Self::StepFunctionsStartSyncExecution)
@@ -392,6 +401,9 @@ impl Action {
         match self {
             Self::EventBridgePutEvents => eventbridge::PUT_EVENTS_PARAMETERS,
             Self::SqsSendMessage => sqs::SEND_MESSAGE_PARAMETERS,
+            Self::SqsReceiveMessage => sqs::RECEIVE_MESSAGE_PARAMETERS,
+            Self::SqsDeleteMessage => sqs::DELETE_MESSAGE_PARAMETERS,
+            Self::SqsPurgeQueue => sqs::PURGE_QUEUE_PARAMETERS,
             Self::StepFunctionsStartExecution => stepfunctions::START_EXECUTION_PARAMETERS,
             Self::StepFunctionsStartSyncExecution => {
                 stepfunctions::START_SYNC_EXECUTION_PARAMETERS
@@ -406,6 +418,9 @@ impl Action {
         match self {
             Self::EventBridgePutEvents => eventbridge::PUT_EVENTS_REQUIRED_PARAMETERS,
             Self::SqsSendMessage => sqs::SEND_MESSAGE_REQUIRED_PARAMETERS,
+            Self::SqsReceiveMessage => sqs::RECEIVE_MESSAGE_REQUIRED_PARAMETERS,
+            Self::SqsDeleteMessage => sqs::DELETE_MESSAGE_REQUIRED_PARAMETERS,
+            Self::SqsPurgeQueue => sqs::PURGE_QUEUE_REQUIRED_PARAMETERS,
             Self::StepFunctionsStartExecution => {
                 stepfunctions::START_EXECUTION_REQUIRED_PARAMETERS
             }
@@ -432,6 +447,9 @@ impl Action {
                 eventbridge::put_events(ctx, region, identity, mapped).await
             }
             Self::SqsSendMessage => sqs::send_message(ctx, region, identity, mapped).await,
+            Self::SqsReceiveMessage => sqs::receive_message(ctx, region, identity, mapped).await,
+            Self::SqsDeleteMessage => sqs::delete_message(ctx, region, identity, mapped).await,
+            Self::SqsPurgeQueue => sqs::purge_queue(ctx, region, identity, mapped).await,
             Self::StepFunctionsStartExecution => {
                 stepfunctions::start_execution(ctx, region, identity, mapped).await
             }
@@ -510,6 +528,17 @@ mod tests {
             ),
             ("the SQS send", sqs::SEND_MESSAGE_SUBTYPE, Some("MessageBody")),
             (
+                "the SQS receive",
+                sqs::RECEIVE_MESSAGE_SUBTYPE,
+                Some("VisibilityTimeout"),
+            ),
+            (
+                "the SQS delete",
+                sqs::DELETE_MESSAGE_SUBTYPE,
+                Some("ReceiptHandle"),
+            ),
+            ("the SQS purge", sqs::PURGE_QUEUE_SUBTYPE, Some("QueueUrl")),
+            (
                 "the Step Functions start",
                 stepfunctions::START_EXECUTION_SUBTYPE,
                 Some("StateMachineArn"),
@@ -525,7 +554,11 @@ mod tests {
                 Some("ExecutionArn"),
             ),
             ("a case-folded spelling", "eventbridge-putevents", None),
-            ("an action this emulator does not perform", "SQS-PurgeQueue", None),
+            (
+                "an action this emulator does not perform",
+                "AppConfig-GetConfiguration",
+                None,
+            ),
             ("nothing at all", "", None),
         ];
         for (case, subtype, expected) in rows {
