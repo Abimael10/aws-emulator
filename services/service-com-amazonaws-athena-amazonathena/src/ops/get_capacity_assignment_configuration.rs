@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCapacityAssignmentConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCapacityAssignmentConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCapacityAssignmentConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers with the capacity assignment configuration the named capacity
+//! reservation holds — the assignments the last accepted `PutCapacityAssignmentConfiguration`
+//! stored, and none for a reservation no put has configured — and reports a reservation this
+//! account does not hold as not found. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -139,20 +134,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCapacityAssignmentConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCapacityAssignmentConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCapacityAssignmentConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetCapacityAssignmentConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("Athena state is not reachable on this engine".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        // A pure read: it projects the field a put wrote, so two reads at the same instant
+        // report the same configuration and a read leaves the reservation as it found it.
+        let store = state.lock();
+        let configuration = store
+            .capacity_assignment_configuration(&input.capacity_reservation_name, now)
+            .map_err(invalid_request)?;
+
+        Ok(GetCapacityAssignmentConfigurationOutput {
+            capacity_assignment_configuration: configuration,
+        })
     }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// A read of the configuration of a reservation this account does not hold is a bad request
+/// rather than an unwritten operation, and `InvalidRequestException` is the client error this
+/// operation models: "Indicates that something is wrong with the input to the request." Its
+/// cause is the request itself, which is the class [`crate::state::ERROR_CODE_INVALID_INPUT`]
+/// names.
+fn invalid_request(message: impl Into<String>) -> GetCapacityAssignmentConfigurationError {
+    GetCapacityAssignmentConfigurationError::invalid_request(
+        crate::state::ERROR_CODE_INVALID_INPUT,
+        message,
+    )
 }

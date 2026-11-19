@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutCapacityAssignmentConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutCapacityAssignmentConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutCapacityAssignmentConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: makes the assignments the request carried the capacity assignment
+//! configuration of the named capacity reservation, replacing the one it held, and refuses
+//! a reservation this account does not hold or an assignment naming a workgroup it does not
+//! hold without storing anything, as it does a configuration larger than this service stores.
+//! `GetCapacityAssignmentConfiguration` answers out of the same field.
 //!
 //! ## Shape of an operation
 //!
@@ -138,20 +134,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutCapacityAssignmentConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutCapacityAssignmentConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutCapacityAssignmentConfiguration"))
+        // Check the request on its own terms FIRST, before the store is reached at all: a put
+        // whose configuration is larger than this service stores never walks the registry,
+        // and no other Athena request waits behind the work of measuring it.
+        if let Some(message) = crate::state::capacity_assignments_error(&input.capacity_assignments)
+        {
+            return Err(invalid_request(message));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutCapacityAssignmentConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("Athena state is not reachable on this engine".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        // ONE visit to the store under ONE lock, so the whole put — resolving the
+        // reservation, measuring every workgroup it assigns, and replacing the
+        // configuration — is atomic: concurrent puts against the same reservation each
+        // either store their own configuration whole or store nothing, and the one that
+        // wrote last is the one a later read reports.
+        let mut store = state.lock();
+        store
+            .put_capacity_assignments(
+                &input.capacity_reservation_name,
+                input.capacity_assignments,
+                now,
+            )
+            .map_err(invalid_request)?;
+
+        // The put carries nothing back: the configuration it stored is read through
+        // `GetCapacityAssignmentConfiguration`, which projects the field just written.
+        Ok(PutCapacityAssignmentConfigurationOutput {})
     }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// Every refusal above is caused by the request itself — a configuration larger than this
+/// service stores, a `CapacityReservationName` naming no reservation this account holds, or an
+/// assignment naming a workgroup it does not hold — and `InvalidRequestException` is the
+/// client error this operation models: "Indicates that something is wrong with the input to
+/// the request." That is the class [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
+fn invalid_request(message: impl Into<String>) -> PutCapacityAssignmentConfigurationError {
+    PutCapacityAssignmentConfigurationError::invalid_request(
+        crate::state::ERROR_CODE_INVALID_INPUT,
+        message,
+    )
 }

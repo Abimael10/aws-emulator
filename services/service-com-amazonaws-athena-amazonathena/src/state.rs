@@ -87,7 +87,11 @@
 //! units are due to be allocated and every read derives the reservation's status and
 //! allocated amount from that instant ([`CapacityReservationRecord::status_at`]), so a
 //! caller reading one straight back still sees it PENDING and the reservation reaches
-//! ACTIVE whether or not anybody polls it.
+//! ACTIVE whether or not anybody polls it. Which workgroups consume a reservation's
+//! capacity is one field of that same record
+//! ([`CapacityReservationRecord::capacity_assignments`]) rather than a registry beside it,
+//! so a reservation has at most one capacity assignment configuration and loses it with the
+//! reservation.
 //!
 //! The ENGINE VERSIONS a request may select are the service's own catalog rather than
 //! anything a request wrote ([`SELECTABLE_ENGINE_VERSIONS`]): `ListEngineVersions`
@@ -131,6 +135,10 @@ pub use session_dashboards::*;
 /// The provisioned capacity this account reserved, and each reservation's lifecycle.
 mod capacity_reservations;
 pub use capacity_reservations::*;
+
+/// Which workgroups consume one capacity reservation's capacity.
+mod capacity_assignments;
+pub use capacity_assignments::*;
 
 /// Whether IAM lets a request perform the action it asks for on the workgroup it names.
 pub mod authorization;

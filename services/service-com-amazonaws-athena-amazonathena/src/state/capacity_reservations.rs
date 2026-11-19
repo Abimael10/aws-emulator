@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime};
 
 use super::*;
 
-use crate::ops::types::{CapacityAllocation, CapacityReservation};
+use crate::ops::types::{CapacityAllocation, CapacityAssignment, CapacityReservation};
 
 /// The `CapacityReservationStatus` of a reservation whose FIRST allocation has not
 /// completed yet — the status a create leaves it in, since a reservation "initially
@@ -163,6 +163,13 @@ pub struct CapacityReservationRecord {
     pub cancel_complete_at: Option<SystemTime>,
     /// The tags the create call carried; keys are unique within this list.
     pub tags: Vec<Tag>,
+    /// The assignments of the capacity assignment configuration this reservation holds —
+    /// which workgroups consume its capacity — as the last accepted
+    /// `PutCapacityAssignmentConfiguration` stored them, and empty until one did. Held on
+    /// the reservation rather than beside it, which is what makes the documented "only one
+    /// capacity assignment configuration" per reservation true by construction; see
+    /// [`Self::to_capacity_assignment_configuration`].
+    pub capacity_assignments: Vec<CapacityAssignment>,
 }
 
 impl CapacityReservationRecord {
@@ -180,6 +187,9 @@ impl CapacityReservationRecord {
             cancelled_at: None,
             cancel_complete_at: None,
             tags,
+            // A create configures no assignment: `PutCapacityAssignmentConfiguration` is
+            // what assigns workgroups to a reservation, and none has been called yet.
+            capacity_assignments: Vec::new(),
         }
     }
 
