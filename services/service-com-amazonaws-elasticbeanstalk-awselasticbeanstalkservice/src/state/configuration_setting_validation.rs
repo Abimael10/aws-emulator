@@ -7,6 +7,12 @@
 //! value the option does not take, a `warning` for information the caller should
 //! take into account about a configuration whose values are each acceptable.
 //!
+//! A specification is resolved before it is evaluated: a `(Namespace,
+//! OptionName)` pair whose namespace no platform version defines
+//! ([`super::configuration_option_namespaces`]) names no configuration option,
+//! so it is reported as an unknown configuration setting rather than having a
+//! value of it compared with a restriction that does not exist.
+//!
 //! The published description of an option states what values it takes — a
 //! numeric range, a length, a regular expression, a value set — and
 //! [`super::configuration_option_catalog`] is where this service holds those
@@ -74,6 +80,19 @@ fn invalid_value_message(
     format!(
         "Invalid option value: '{value}' (Namespace: '{namespace}', OptionName: \
          '{option_name}'): {requirement}"
+    )
+}
+
+/// The sentence an option specification the platform cannot resolve is reported
+/// with: the namespace and the option name the CALLER supplied, and the
+/// statement that they name no configuration setting. FIXED text apart from
+/// those two values, which are echoed as the request wrote them — a caller
+/// correcting a typo'd namespace has to be told which specification it sent was
+/// not resolved.
+fn unknown_specification_message(namespace: &str, option_name: &str) -> String {
+    format!(
+        "Invalid option specification (Namespace: '{namespace}', OptionName: \
+         '{option_name}'): Unknown configuration setting."
     )
 }
 
@@ -220,6 +239,11 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
 /// desired values over them) — which is what a restriction stated in terms of
 /// ANOTHER option is resolved against.
 ///
+/// Each setting is RESOLVED first and evaluated second: a specification naming a
+/// namespace no platform version defines names no configuration option, so it is
+/// reported as an unknown configuration setting instead of having a value of it
+/// evaluated (see [`super::configuration_option_namespaces`]).
+///
 /// One message per defective setting, in the order the request listed them, so a
 /// caller sending several settings is told about each of them rather than only
 /// the first; a setting whose value the option takes contributes none, which is
@@ -233,13 +257,30 @@ pub fn configuration_validation_messages(
     for setting in desired {
         let namespace = setting.namespace.as_deref().unwrap_or_default();
         let option_name = setting.option_name.as_deref().unwrap_or_default();
+        // A specification is RESOLVED before any value in it is evaluated: a
+        // namespace no platform version defines identifies no Amazon Web
+        // Services resource, so the specification names no configuration
+        // option at all and there is no restriction a value of it could be
+        // compared against. That is reported as the specification being
+        // unknown — the finding is about the option the caller named, not
+        // about the value it carries, so it is reported whatever that value
+        // is and instead of any per-value finding. See
+        // `super::configuration_option_namespaces`.
+        if !platform_defines_namespace(namespace) {
+            messages.push(invalid_setting(
+                namespace,
+                option_name,
+                unknown_specification_message(namespace, option_name),
+            ));
+            continue;
+        }
         // An option the catalog publishes no description for carries no
-        // restriction to evaluate: a configuration legitimately sets options
-        // that are not part of what a platform version DEFINES — the
-        // environment properties passed to the application, whose names the
-        // caller chooses, and a setting scoped to a resource of its own — so a
-        // setting with no published description contributes no message rather
-        // than being refused as unknown.
+        // restriction to evaluate: inside a namespace the platform DOES define,
+        // a configuration legitimately sets options whose description is not
+        // part of this catalog — the environment properties passed to the
+        // application, whose names the caller chooses, and a setting scoped to a
+        // resource of its own — so a setting with no published description
+        // contributes no message.
         let Some(option) = catalog
             .iter()
             .find(|option| option.namespace == namespace && option.name == option_name)
@@ -357,26 +398,6 @@ fn published_expression(pattern: &'static str) -> Option<&'static ::regex::Regex
         .map(|(_, compiled)| compiled)
 }
 
-/// Every option any platform version this service publishes can define: the
-/// general catalog, the Amazon SQS daemon's, each platform category's runtime
-/// options and the proxy option of a platform whose category names none. The one
-/// walk over all of the catalog's tables, which is what makes the compiled
-/// expressions above the whole published set rather than a sample of it.
-fn every_publishable_option() -> impl Iterator<Item = &'static ConfigurationOption> {
-    use super::configuration_option_catalog::{
-        LINUX_CONFIGURATION_OPTIONS, PLATFORM_CATEGORY_CONFIGURATION_OPTIONS,
-    };
-    GENERAL_CONFIGURATION_OPTIONS
-        .iter()
-        .chain(WORKER_TIER_CONFIGURATION_OPTIONS)
-        .chain(LINUX_CONFIGURATION_OPTIONS)
-        .chain(
-            PLATFORM_CATEGORY_CONFIGURATION_OPTIONS
-                .iter()
-                .flat_map(|(_, options)| options.iter()),
-        )
-}
-
 /// The range `option`'s value has to lie in, given the configuration `in_force`:
 /// the range its published description carries, narrowed by any bound that
 /// description states in terms of ANOTHER option's value.
@@ -474,6 +495,41 @@ mod tests {
             messages.is_empty(),
             "case \"inside the published range\": expected no message, got {messages:?}"
         );
+    }
+
+    /// RULE: a specification whose namespace no platform version defines names
+    /// no configuration option, so it earns one error-severity message saying
+    /// the setting is unknown — whatever value it carries, and instead of any
+    /// finding about that value.
+    #[test]
+    fn a_specification_in_a_namespace_no_platform_defines_is_reported_as_unknown() {
+        // The option NAME is one the catalog does publish, in another namespace,
+        // so what is reported is about the namespace rather than the name; the
+        // value is one that namespace's option would also refuse, so a second
+        // message would show the evaluation had gone on to the value.
+        let undefined = "aws:elasticbeanstalk:namespace-no-platform-defines";
+        for value in ["2", "not-a-number", ""] {
+            let desired = vec![setting(undefined, OPTION_MIN_SIZE, value)];
+            let messages = configuration_validation_messages(&catalog(), &desired, &desired);
+            assert_eq!(
+                reported(&messages),
+                vec![(
+                    OPTION_MIN_SIZE.to_string(),
+                    format!(
+                        "Invalid option specification (Namespace: '{undefined}', OptionName: \
+                         '{OPTION_MIN_SIZE}'): Unknown configuration setting."
+                    )
+                )],
+                "case {value:?}: expected one message about the unknown specification, got \
+                 {messages:?}"
+            );
+            assert_eq!(
+                messages[0].severity.as_deref(),
+                Some(VALIDATION_SEVERITY_ERROR),
+                "case {value:?}: expected the error severity, got {:?}",
+                messages[0]
+            );
+        }
     }
 
     /// RULE: a value outside the published range earns one message naming that

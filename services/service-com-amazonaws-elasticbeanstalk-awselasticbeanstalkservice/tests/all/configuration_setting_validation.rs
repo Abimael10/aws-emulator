@@ -6,6 +6,12 @@
 //!
 //! The rules under test:
 //!
+//! * every desired option setting is RESOLVED before it is evaluated: a
+//!   specification whose `Namespace` no platform version defines names no
+//!   configuration option, so it earns one error-severity `ValidationMessage`
+//!   saying the setting is unknown — echoing the namespace and option name the
+//!   caller sent, whatever value it carried — and an operation that WRITES it is
+//!   refused;
 //! * every desired option setting is evaluated against the restriction the
 //!   PUBLISHED description of its own option carries on the platform version the
 //!   named configuration set runs — the value set a selection draws from, the
@@ -1101,6 +1107,299 @@ async fn a_write_of_a_value_the_platform_version_does_not_accept_is_refused() {
         stored_maximum,
         vec!["9".to_string()],
         "case \"after the refusals\": expected the template's stored maximum unchanged, got {}",
+        settings.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Resolving the specification, before evaluating the value in it
+// ---------------------------------------------------------------------------
+
+/// The sentence a specification the platform cannot resolve is reported with,
+/// word for word, with the namespace and the option name the request sent in it.
+fn unknown_specification(namespace: &str, option_name: &str) -> String {
+    format!(
+        "Invalid option specification (Namespace: '{namespace}', OptionName: \
+         '{option_name}'): Unknown configuration setting."
+    )
+}
+
+/// One row of the specification table: the setting to validate, and whether the
+/// platform can resolve the namespace it names.
+struct SpecificationCase {
+    case: &'static str,
+    namespace: &'static str,
+    option_name: &'static str,
+    value: &'static str,
+    resolved: bool,
+}
+
+#[tokio::test]
+async fn a_specification_naming_a_namespace_no_platform_defines_is_reported_as_unknown() {
+    let emulator = emulator_with_configuration_sets().await;
+
+    // Rows differ along HOW the namespace misses — a name of the service's own
+    // shape that no platform defines, a near miss of one it does, a
+    // resource-scoped prefix with nothing after it, and a name of no such shape
+    // at all — and, for the ones the platform resolves, along WHY it resolves
+    // them: described by the published catalogue, named by the caller, scoped to
+    // a resource of its own, described by no option here, and a scoped prefix
+    // followed by the resource it is for.
+    let cases = [
+        SpecificationCase {
+            case: "a namespace no platform version defines",
+            namespace: "aws:elasticbeanstalk:namespace-no-platform-defines",
+            option_name: MIN_SIZE,
+            value: "2",
+            resolved: false,
+        },
+        SpecificationCase {
+            case: "a near miss of a defined namespace",
+            namespace: "aws:autoscaling:asgroup",
+            option_name: MAX_SIZE,
+            value: "4",
+            resolved: false,
+        },
+        SpecificationCase {
+            case: "a resource-scoped prefix with no resource after it",
+            namespace: "aws:elbv2:listener:",
+            option_name: "Protocol",
+            value: "HTTPS",
+            resolved: false,
+        },
+        SpecificationCase {
+            case: "a name of no namespace shape at all",
+            namespace: "my-own-settings",
+            option_name: "Setting",
+            value: "on",
+            resolved: false,
+        },
+        SpecificationCase {
+            case: "an unresolved specification whose value its option would also refuse",
+            namespace: "aws:autoscaling:asg-v2",
+            option_name: MIN_SIZE,
+            value: "not-a-number",
+            resolved: false,
+        },
+        SpecificationCase {
+            case: "a namespace the published catalogue describes",
+            namespace: ASG,
+            option_name: MIN_SIZE,
+            value: "2",
+            resolved: true,
+        },
+        SpecificationCase {
+            case: "a namespace whose option names the caller chooses",
+            namespace: APP_ENV,
+            option_name: "STAGE",
+            value: "qa",
+            resolved: true,
+        },
+        SpecificationCase {
+            case: "a namespace whose options are scoped to a resource of their own",
+            namespace: SCHEDULED,
+            option_name: MIN_SIZE,
+            value: "3",
+            resolved: true,
+        },
+        SpecificationCase {
+            case: "a namespace this service describes no option of",
+            namespace: "aws:rds:dbinstance",
+            option_name: "DBAllocatedStorage",
+            value: "10",
+            resolved: true,
+        },
+        SpecificationCase {
+            case: "a resource-scoped prefix followed by its resource",
+            namespace: "aws:elbv2:listener:443",
+            option_name: "Protocol",
+            value: "HTTPS",
+            resolved: true,
+        },
+        SpecificationCase {
+            case: "another resource-scoped prefix followed by its resource",
+            namespace: "aws:elasticbeanstalk:environment:process:api",
+            option_name: "HealthCheckPath",
+            value: "/health",
+            resolved: true,
+        },
+    ];
+
+    for case in &cases {
+        let answer = validated(
+            &emulator,
+            &[(case.namespace, case.option_name, case.value, "")],
+        )
+        .await;
+        let reported = reported_errors(&answer);
+        if case.resolved {
+            assert!(
+                reported.is_empty(),
+                "case {:?}: expected no error-severity validation message, got {reported:?}",
+                case.case
+            );
+            continue;
+        }
+        assert_eq!(
+            reported,
+            vec![ReportedMessage {
+                namespace: case.namespace.to_string(),
+                option_name: case.option_name.to_string(),
+                severity: "error".to_string(),
+                message: unknown_specification(case.namespace, case.option_name),
+            }],
+            "case {:?}: expected exactly one error-severity message attributed to the pair the \
+             request sent, got {reported:?}",
+            case.case
+        );
+        // The finding is reported in the 200 body ALONGSIDE the advisories the
+        // configuration carries, not instead of them.
+        assert!(
+            reported_messages(&answer).contains(&instance_profile_advisory()),
+            "case {:?}: expected the advisory to be reported beside the error, got {}",
+            case.case,
+            answer.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_write_of_a_specification_the_platform_cannot_resolve_is_refused() {
+    let emulator = emulator_with_configuration_sets().await;
+    let stack = published_stack(0).name();
+    // An environment can only be updated once the launch the clock owes has
+    // completed, so the row that writes through `UpdateEnvironment` waits for
+    // the environment to report itself ready first.
+    polled_until(&emulator, "a write to a running environment", "Ready").await;
+
+    const UNKNOWN: &str = "aws:elasticbeanstalk:namespace-no-platform-defines";
+    let expected = format!(
+        "Configuration validation exception: {}",
+        unknown_specification(UNKNOWN, MIN_SIZE)
+    );
+
+    // Rows are the four operations that WRITE option settings: the resolution is
+    // the evaluation's, not any one handler's.
+    let cases = vec![
+        WriteCase {
+            case: "CreateConfigurationTemplate",
+            action: "CreateConfigurationTemplate",
+            named: vec![
+                ("ApplicationName".to_string(), APPLICATION.to_string()),
+                ("TemplateName".to_string(), "unresolved-template".to_string()),
+                ("SolutionStackName".to_string(), stack.clone()),
+            ],
+        },
+        WriteCase {
+            case: "UpdateConfigurationTemplate",
+            action: "UpdateConfigurationTemplate",
+            named: vec![
+                ("ApplicationName".to_string(), APPLICATION.to_string()),
+                ("TemplateName".to_string(), TEMPLATE.to_string()),
+            ],
+        },
+        WriteCase {
+            case: "CreateEnvironment",
+            action: "CreateEnvironment",
+            named: vec![
+                ("ApplicationName".to_string(), APPLICATION.to_string()),
+                ("EnvironmentName".to_string(), "unresolved-env".to_string()),
+                ("SolutionStackName".to_string(), stack.clone()),
+            ],
+        },
+        WriteCase {
+            case: "UpdateEnvironment",
+            action: "UpdateEnvironment",
+            named: vec![
+                ("ApplicationName".to_string(), APPLICATION.to_string()),
+                ("EnvironmentName".to_string(), ENVIRONMENT.to_string()),
+            ],
+        },
+    ];
+
+    for case in &cases {
+        let mut params = case.named.clone();
+        params.extend(option_params(&[(UNKNOWN, MIN_SIZE, "2", "")]));
+        let refused = emulator.call(case.action, &as_params(&params)).await;
+        assert_eq!(
+            (refused.status, refused.error_code()),
+            (400, "ConfigurationValidationException"),
+            "case {:?}: expected HTTP 400 ConfigurationValidationException, got {} and body {}",
+            case.case,
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            refused.error_message(),
+            expected,
+            "case {:?}: expected the refusal to carry the validation message, got {}",
+            case.case,
+            refused.body
+        );
+    }
+
+    // Each refused write stored nothing: the template it would have created does
+    // not exist, and the one it would have updated carries neither the
+    // unresolved setting nor a changed value of its own.
+    let applications = created(
+        &emulator,
+        "DescribeApplications",
+        &[("ApplicationNames.member.1", APPLICATION)],
+    )
+    .await;
+    assert_eq!(
+        applications.values_at("ConfigurationTemplates/member"),
+        vec![TEMPLATE],
+        "case \"after the refusals\": expected the refused create to store nothing, got {}",
+        applications.body
+    );
+    let settings = created(
+        &emulator,
+        "DescribeConfigurationSettings",
+        &[("ApplicationName", APPLICATION), ("TemplateName", TEMPLATE)],
+    )
+    .await;
+    assert!(
+        !settings.values_at("OptionSettings/member/Namespace").contains(&UNKNOWN),
+        "case \"after the refusals\": expected the unresolved namespace absent from the stored \
+         configuration, got {}",
+        settings.body
+    );
+
+    // The template's own legal settings stayed writable: the refusal was about
+    // the specification the request sent, and left nothing behind.
+    let mut legal = vec![
+        ("ApplicationName".to_string(), APPLICATION.to_string()),
+        ("TemplateName".to_string(), TEMPLATE.to_string()),
+    ];
+    legal.extend(option_params(&[(ASG, MAX_SIZE, "7", "")]));
+    let written = emulator
+        .call("UpdateConfigurationTemplate", &as_params(&legal))
+        .await;
+    assert_eq!(
+        written.status, 200,
+        "case \"a legal write after the refusals\": expected it to be performed, got {} and body \
+         {}",
+        written.status, written.body
+    );
+    let settings = created(
+        &emulator,
+        "DescribeConfigurationSettings",
+        &[("ApplicationName", APPLICATION), ("TemplateName", TEMPLATE)],
+    )
+    .await;
+    let stored_maximum: Vec<String> = settings
+        .elements_at("OptionSettings/member")
+        .iter()
+        .filter(|member| {
+            member.value("Namespace") == Some(ASG) && member.value("OptionName") == Some(MAX_SIZE)
+        })
+        .filter_map(|member| member.value("Value").map(str::to_string))
+        .collect();
+    assert_eq!(
+        stored_maximum,
+        vec!["7".to_string()],
+        "case \"a legal write after the refusals\": expected the new maximum stored, got {}",
         settings.body
     );
 }
