@@ -41,8 +41,6 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice as cognito_idp;
 
-use cognito_idp::state::lambda_triggers::esdk;
-
 /// The Region every request below is signed for.
 const REGION: &str = "us-east-1";
 
@@ -436,9 +434,11 @@ async fn next_delivery(router: &MultiServiceRouter, case: &str, queue_url: &str)
 
 /// The code a delivery carried, decrypted under the pool's own key.
 ///
-/// Every step is the one a decrypting client performs: the member is base64, the bytes are
-/// an encryption-SDK message, the key it names is asked to unwrap the data key, and the
-/// message opens under the data key that comes back.
+/// The opening is the crate's one spelling of it
+/// (`crate::custom_email_sender_node_handler::opened_code`), where every step is the one a
+/// decrypting client performs: the member is base64, the bytes are an encryption-SDK message
+/// naming the key that wrapped the data key, that key is asked to unwrap it, and the message
+/// opens under the data key that comes back.
 async fn decrypted_code(
     router: &MultiServiceRouter,
     case: &str,
@@ -448,44 +448,7 @@ async fn decrypted_code(
     let carried = delivery["code"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: the delivery carries no code: {delivery}"));
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(carried)
-        .unwrap_or_else(|error| {
-            panic!("case {case:?}: the code is not base64 ({error}): {carried}")
-        });
-    let parsed = esdk::parse(&bytes)
-        .unwrap_or_else(|fault| panic!("case {case:?}: the code is not a message: {fault}"));
-    assert_eq!(
-        parsed.key_provider_id, esdk::KEY_PROVIDER_ID,
-        "case {case:?}: expected the key service as the key provider, got {:?}",
-        parsed.key_provider_id
-    );
-    assert_eq!(
-        parsed.key_provider_info, key_arn,
-        "case {case:?}: expected the pool's own key, got {:?}",
-        parsed.key_provider_info
-    );
-    let unwrapped = kms(
-        router,
-        "Decrypt",
-        &json!({
-            "CiphertextBlob": base64::engine::general_purpose::STANDARD
-                .encode(&parsed.encrypted_data_key),
-        }),
-    )
-    .await;
-    let data_key = base64::engine::general_purpose::STANDARD
-        .decode(
-            unwrapped["Plaintext"]
-                .as_str()
-                .unwrap_or_else(|| panic!("case {case:?}: Decrypt answered no plaintext")),
-        )
-        .expect("the key service answers base64");
-    let opened = parsed
-        .open(&data_key)
-        .unwrap_or_else(|fault| panic!("case {case:?}: the message does not open: {fault}"));
-    String::from_utf8(opened)
-        .unwrap_or_else(|error| panic!("case {case:?}: the code is not text: {error}"))
+    crate::custom_email_sender_node_handler::opened_code(router, case, carried, key_arn).await
 }
 
 /// The value of `attribute` `AdminGetUser` reports for `username`.

@@ -35,6 +35,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice as cognito_idp;
 
+use cognito_idp::state::lambda_triggers::esdk;
+
 /// The Region every request below is signed for.
 ///
 /// `pub(crate)` here and below: the harness this suite builds for the custom email sender
@@ -510,6 +512,61 @@ pub(crate) fn refusal(body: &Value) -> (String, String) {
             .unwrap_or_default()
             .to_string(),
     )
+}
+
+/// The code a custom sender was handed, opened the way a client of the key service opens the
+/// message it travels in: the member is base64, its bytes are an encryption-SDK message
+/// naming the key that wrapped its data key, that key is asked to unwrap the data key, and
+/// the message opens under the key that comes back.
+///
+/// `pub(crate)`: every suite of this crate that reads a code out of the message rather than
+/// out of what a handler reported opens it this way, so there is one spelling of it
+/// (`crate::custom_email_sender_trigger`,
+/// `crate::custom_email_sender_attribute_code_delivery`).
+pub(crate) async fn opened_code(
+    router: &MultiServiceRouter,
+    case: &str,
+    encrypted: &str,
+    key_arn: &str,
+) -> String {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encrypted)
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: the code is not base64 ({error}): {encrypted}")
+        });
+    let parsed = esdk::parse(&bytes)
+        .unwrap_or_else(|fault| panic!("case {case:?}: the code is not a message: {fault}"));
+    assert_eq!(
+        parsed.key_provider_id, esdk::KEY_PROVIDER_ID,
+        "case {case:?}: expected the key service as the key provider, got {:?}",
+        parsed.key_provider_id
+    );
+    assert_eq!(
+        parsed.key_provider_info, key_arn,
+        "case {case:?}: expected the pool's own key, got {:?}",
+        parsed.key_provider_info
+    );
+    let unwrapped = kms(
+        router,
+        "Decrypt",
+        &json!({
+            "CiphertextBlob": base64::engine::general_purpose::STANDARD
+                .encode(&parsed.encrypted_data_key),
+        }),
+    )
+    .await;
+    let data_key = base64::engine::general_purpose::STANDARD
+        .decode(
+            unwrapped["Plaintext"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: Decrypt answered no plaintext")),
+        )
+        .expect("the key service answers base64");
+    let opened = parsed
+        .open(&data_key)
+        .unwrap_or_else(|fault| panic!("case {case:?}: the message does not open: {fault}"));
+    String::from_utf8(opened)
+        .unwrap_or_else(|error| panic!("case {case:?}: the code is not text: {error}"))
 }
 
 /// RULE: the code a custom sender is handed is the code the consuming operation accepts, and
