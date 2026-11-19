@@ -171,9 +171,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // GetExportJob response... If you include this field in a CreateExportJob
         // request, the request fails with a BadRequestException."
         if input.export_destination.s3_url.is_some() {
-            return Err(bad_request(
-                crate::state::export_destination_s3_url_is_set_by_ses(),
-            ));
+            return Err(bad_request(crate::state::custom_s3_url_is_not_supported()));
+        }
+
+        // `StartDate` and `EndDate` describe ONE export interval, whichever data source
+        // the request names them on, so a request whose end precedes its start describes
+        // no interval at all: refused up front with the sentence every windowed
+        // operation of this service refuses it with, rather than accepted as a job whose
+        // run can only ever draw on nothing.
+        if let Some((start, end)) = crate::state::export_window(&input.export_data_source) {
+            if end.as_secs_f64() < start.as_secs_f64() {
+                return Err(bad_request(crate::state::window_runs_backwards()));
+            }
         }
 
         let now = ::std::time::SystemTime::now();

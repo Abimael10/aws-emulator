@@ -18,7 +18,9 @@
 //!   names up, so a value the records do not carry keeps no message and the query
 //!   reports no data for it.
 //! * The `VDM` namespace is served only while the account's VDM configuration is
-//!   enabled, and a query window whose end precedes its start is refused.
+//!   enabled — with it off the call is refused 404 `NotFoundException` naming the
+//!   feature to enable — and a query window whose end precedes its start is refused
+//!   400 `BadRequestException` with this service's one inverted-window sentence.
 //!
 //! The tables span what the rules generalise over: the recipient count and the
 //! header each recipient sits in, the day a message was accepted, where the window
@@ -34,6 +36,7 @@ use service_com_amazonaws_sesv2_simpleemailservice_v2::ops::types::{
     FEATURE_STATUS_VALUES, METRIC_DIMENSION_NAME_VALUES, METRIC_NAMESPACE_VALUES, METRIC_VALUES,
 };
 use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
+    enable_vdm_to_use_this_feature, window_runs_backwards,
     ComAmazonawsSesv2SimpleemailserviceV2State, SentMessage, FEATURE_ENABLED,
 };
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
@@ -924,14 +927,16 @@ async fn the_namespace_is_served_only_while_the_account_vdm_is_enabled() {
         } else {
             assert_eq!(
                 (reply.status, reply.error_code().as_str()),
-                (400, "BadRequestException"),
-                "case {case:?}: expected 400 BadRequestException, got {} {:?}",
+                (404, "NotFoundException"),
+                "case {case:?}: expected 404 NotFoundException, got {} {:?}",
                 reply.status,
                 reply.error_code()
             );
-            assert!(
-                !reply.message().is_empty(),
-                "case {case:?}: expected the refusal to say what is not enabled, got an empty message"
+            assert_eq!(
+                reply.message(),
+                enable_vdm_to_use_this_feature(),
+                "case {case:?}: expected the sentence naming the feature to enable, got {:?}",
+                reply.message()
             );
         }
     }
@@ -968,9 +973,10 @@ async fn a_window_whose_end_precedes_its_start_is_refused() {
                 reply.status,
                 reply.error_code()
             );
-            assert!(
-                reply.message().contains("must be before"),
-                "case {case:?}: expected the refusal to name both bounds, got {:?}",
+            assert_eq!(
+                reply.message(),
+                window_runs_backwards(),
+                "case {case:?}: expected this service's inverted-window sentence, got {:?}",
                 reply.message()
             );
         }

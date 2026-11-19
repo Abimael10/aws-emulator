@@ -8,11 +8,15 @@
 //! request: its syntax, the DNS records of its domain, whether the mailbox exists,
 //! whether it is a role address, whether its domain is a disposable mailbox service
 //! and whether the input reads as random text. The overall `IsValid` verdict is the
-//! weakest of them once the three evaluations whose HIGH value counts AGAINST an
-//! address are inverted. Every verdict is computed from the value itself and from
-//! what the account's own records already say about its domain and its mailbox (the
-//! identity table and the account-level suppression list); reporting only, so
-//! nothing is written beyond the transitions the clock already owed.
+//! weakest of the evaluations that OBSERVED something, once the three whose HIGH
+//! value counts AGAINST an address are inverted — the mailbox check is documented as
+//! made "without actually sending an email", so an account whose records say nothing
+//! about the mailbox has observed nothing either way and that does not lower the
+//! overall verdict. Every verdict is computed from the value itself, from what a
+//! domain name can resolve to at all, and from what the account's own records already
+//! say about its mailbox (the identity table and the account-level suppression list);
+//! reporting only, so nothing is written beyond the transitions the clock already
+//! owed.
 //!
 //! The call grades whatever text it is given rather than refusing it: an input that
 //! names no mailbox is what a LOW syntax verdict says, and `IsRandomInput` is
@@ -324,7 +328,7 @@ fn mailbox_validation(
     };
 
     let has_valid_syntax = syntax_confidence(value, mailbox);
-    let has_valid_dns_records = dns_records_confidence(store, value, mailbox);
+    let has_valid_dns_records = dns_records_confidence(mailbox);
     let mailbox_exists = mailbox_confidence(store, value, has_valid_dns_records);
     let is_role_address = match mailbox {
         Some((local, _)) => role_address_confidence(local),
@@ -344,22 +348,28 @@ fn mailbox_validation(
     };
 
     MailboxValidation {
-        // "The overall validation verdict": the weakest of the evaluations, with the
-        // three whose HIGH value counts AGAINST the address inverted first, so an
-        // address is valid with HIGH confidence only while every evaluation agrees,
-        // and doubtful as soon as one of them does not.
+        // "The overall validation verdict": the weakest of the evaluations that
+        // OBSERVED something about the address, with the three whose HIGH value counts
+        // AGAINST it inverted first — so an address is valid with HIGH confidence only
+        // while every evaluation that saw anything agrees, and doubtful as soon as one
+        // of them does not. The mailbox check is documented as made "without actually
+        // sending an email", so when nothing in the account's records says anything
+        // about the mailbox it has observed nothing either way (MEDIUM) and does not
+        // lower the overall verdict; every other evaluation reads the value itself or
+        // its domain, so each of those always observed something.
         is_valid: Some(
             [
-                has_valid_syntax,
-                has_valid_dns_records,
-                mailbox_exists,
-                is_role_address.inverted(),
-                is_disposable.inverted(),
-                is_random_input.inverted(),
+                Some(has_valid_syntax),
+                Some(has_valid_dns_records),
+                Some(mailbox_exists).filter(|verdict| *verdict != Confidence::Medium),
+                Some(is_role_address.inverted()),
+                Some(is_disposable.inverted()),
+                Some(is_random_input.inverted()),
             ]
             .into_iter()
+            .flatten()
             .min()
-            .unwrap_or(Confidence::Low)
+            .unwrap_or(Confidence::Medium)
             .verdict(),
         ),
         evaluations: Some(EmailAddressInsightsMailboxEvaluations {
@@ -399,34 +409,19 @@ fn syntax_confidence(value: &str, mailbox: Option<(&str, &str)>) -> Confidence {
 ///
 /// LOW when there is no domain to query — the value names no mailbox — or when no DNS
 /// zone can cover the domain at all, so the records can never be published there
-/// ([`crate::state::dns_zone_can_exist`]). HIGH when the account holds a verified
-/// domain identity covering the address: the records SES was told to look for in that
-/// zone were found, which is the evidence here that the zone exists and answers.
-/// MEDIUM otherwise — a zone that may well exist, with nothing in the account's
-/// records saying what it publishes.
-fn dns_records_confidence(
-    store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
-    value: &str,
-    mailbox: Option<(&str, &str)>,
-) -> Confidence {
+/// ([`crate::state::dns_zone_can_exist`]): the lookup of such a name can only ever come
+/// back empty. HIGH for every other domain: the records are looked up in the public DNS,
+/// which this emulator does not query, so what it has to go on is whether the name is one
+/// a zone can be published under — and a name that can be resolved is reported as
+/// resolving rather than as unknown.
+fn dns_records_confidence(mailbox: Option<(&str, &str)>) -> Confidence {
     let Some((_, domain)) = mailbox else {
         return Confidence::Low;
     };
-    if !crate::state::dns_zone_can_exist(domain) {
-        return Confidence::Low;
-    }
-    // The identity whose DNS zone SES searched for this address's records: the domain
-    // identity covering it, when the account holds one.
-    let zone_searched = store
-        .sending_identity(value)
-        .map(|record| store.dkim_authority(record))
-        .filter(|record| record.identity_kind == crate::state::IdentityKind::Domain);
-    if zone_searched
-        .is_some_and(|record| record.verification_status == crate::state::SesStatus::Success)
-    {
+    if crate::state::dns_zone_can_exist(domain) {
         Confidence::High
     } else {
-        Confidence::Medium
+        Confidence::Low
     }
 }
 

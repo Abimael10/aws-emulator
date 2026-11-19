@@ -102,6 +102,11 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # the account's own recipients is handed to that surface's receive path
 # (`ops::send_email`) rather than a second copy of either being kept here.
 service-com-amazonaws-ses-simpleemailservice = { workspace = true }
+# Certificate Manager, which HOLDS the S/MIME certificate an email identity's association
+# names: whether that certificate can be prepared for signing is a fact about the
+# certificate rather than about the association, so it is read from that service's own
+# store in the one shared engine (`state::identity_certificates`) instead of being assumed.
+service-com-amazonaws-acm-certificatemanager = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -149,6 +154,12 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # (`service_common::uuid_from_random_bytes`), so what counts as a well-formed UUID, with
 # its version and variant, is the crate's rule and not re-derived in a test.
 uuid = "1"
+# `rcgen`: builds the real X.509 certificates and key pairs the certificate-association
+# suite brings into Certificate Manager, so what that service reads — and what the
+# association's preparation then asks it about — is a genuine certificate body rather than
+# a record written into the test. TEST-ONLY; the same generator that service's own import
+# suites use.
+rcgen = "0.13"
 
 [lints]
 workspace = true

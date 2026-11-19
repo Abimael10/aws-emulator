@@ -53,8 +53,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sesv2_simpleemailservice_v2::ops::types::SUPPRESSION_LIST_REASON_VALUES;
 use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
     encode_tagged_page_token, identity_key, suppression_key, suppression_list_prefix,
-    ComAmazonawsSesv2SimpleemailserviceV2State, SuppressedDestinationRecord,
-    CONTACTS_PAGE_TOKEN_TAG, MAX_TENANT_NAME_CHARS,
+    window_runs_backwards, ComAmazonawsSesv2SimpleemailserviceV2State,
+    SuppressedDestinationRecord, CONTACTS_PAGE_TOKEN_TAG, MAX_TENANT_NAME_CHARS,
 };
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -1335,15 +1335,6 @@ async fn a_next_token_this_listing_never_minted_is_refused() {
     );
 }
 
-/// One bound of a listing window, as the refusal of an inverted window names it: the
-/// wire value the request carried, cut where the minutes end.
-fn to_the_minute(at: SystemTime) -> String {
-    date_time(at)
-        .chars()
-        .take("YYYY-MM-DDThh:mm".len())
-        .collect()
-}
-
 #[tokio::test]
 async fn a_listing_window_whose_end_precedes_its_start_is_refused() {
     let (ses, base) = seeded().await;
@@ -1390,16 +1381,12 @@ async fn a_listing_window_whose_end_precedes_its_start_is_refused() {
             reply.error_code(),
             reply.body
         );
-        // The refusal names both bounds as the request gave them.
-        let expected = format!(
-            "Start date {} must be before end date {}",
-            to_the_minute(start),
-            to_the_minute(end)
-        );
+        // The refusal states the requirement the two bounds broke, in the one wording
+        // every windowed operation of this service answers an inverted window with.
         assert_eq!(
             reply.message(),
-            expected,
-            "case {case:?}: expected the refusal to read {expected:?}, got {:?}",
+            window_runs_backwards(),
+            "case {case:?}: expected the inverted-window sentence, got {:?}",
             reply.message()
         );
     }

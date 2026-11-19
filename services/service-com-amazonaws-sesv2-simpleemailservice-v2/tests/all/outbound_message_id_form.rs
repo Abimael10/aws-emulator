@@ -126,6 +126,20 @@ impl Ses {
     /// span.
     async fn with_verified_domain() -> Self {
         let ses = Self::new();
+        // Message Insights is served under the account's Virtual Deliverability Manager
+        // configuration, so the switch goes on before a report is read.
+        let vdm = ses
+            .call(
+                "PUT",
+                "/v2/email/account/vdm",
+                Some(json!({"VdmAttributes": {"VdmEnabled": "ENABLED"}})),
+            )
+            .await;
+        assert_eq!(
+            vdm.status, 200,
+            "the VDM switch must be accepted first, got {} {:?}",
+            vdm.status, vdm.body
+        );
         let created = ses
             .call(
                 "POST",

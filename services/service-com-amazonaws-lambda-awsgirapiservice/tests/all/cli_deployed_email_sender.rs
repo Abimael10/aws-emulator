@@ -323,6 +323,22 @@ fn rows() -> Vec<Row> {
     ]
 }
 
+/// Switch the account's Virtual Deliverability Manager configuration on, which is what SES
+/// serves a message's insights report under: with it off the report does not exist for the
+/// account and the read is refused.
+pub(crate) async fn given_message_insights_enabled(router: &MultiServiceRouter) {
+    email(
+        router,
+        "the account's VDM configuration",
+        "PUT",
+        "/v2/email/account/vdm",
+        &serde_json::to_vec(&json!({ "VdmAttributes": { "VdmEnabled": "ENABLED" } }))
+            .expect("the VDM body serializes"),
+        200,
+    )
+    .await;
+}
+
 /// Create `identity` and read it back until the verification SES owes it is due.
 ///
 /// The transition is owed by the CLOCK, so this looks again until the condition holds instead
@@ -546,6 +562,7 @@ async fn a_cli_deployed_function_sends_through_its_own_sdk_and_every_invocation_
     );
     given_verified_identity(&router, ADDRESS_IDENTITY).await;
     given_verified_identity(&router, SENDING_DOMAIN).await;
+    given_message_insights_enabled(&router).await;
     given_active_function(&router, FUNCTION, HANDLER_SOURCE, &role_arn).await;
 
     let mut minted: Vec<String> = Vec::new();

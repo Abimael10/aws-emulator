@@ -87,12 +87,33 @@ pub fn invalid_export_data_source() -> String {
 ///
 /// "SES sets this value. It's returned only in the `GetExportJob` response... If you
 /// include this field in a `CreateExportJob` request, the request fails with a
-/// `BadRequestException`" — so the sentence names the member and says who sets it,
-/// and carries no part of the request.
-pub fn export_destination_s3_url_is_set_by_ses() -> String {
-    "ExportDestination.S3Url is set by SES and must not be included in a \
-     CreateExportJob request."
-        .to_string()
+/// `BadRequestException`". The model documents no sentence for that refusal, so the
+/// fixed text is the one a recording of this surface answers it with: the destination is
+/// SES's to choose, so a caller supplying one of its own is told that is not supported,
+/// and the sentence carries no part of the request.
+pub fn custom_s3_url_is_not_supported() -> String {
+    "Providing a custom S3 URL is not supported".to_string()
+}
+
+/// The window an `ExportDataSource` exports over, as the pair of bounds whichever of its
+/// two members the request carries declares, or `None` for a data source that selects
+/// neither or both.
+///
+/// `MetricsDataSource` and `MessageInsightsDataSource` each declare a required
+/// `StartDate` and `EndDate`, so the interval is a property of the data source rather
+/// than of one of the two: a caller's window is read \u2014 and so checked \u2014 the same way
+/// whichever export it asks for.
+pub fn export_window(
+    data_source: &crate::ops::types::ExportDataSource,
+) -> Option<(::aws_smithy_types::DateTime, ::aws_smithy_types::DateTime)> {
+    match (
+        data_source.metrics_data_source.as_ref(),
+        data_source.message_insights_data_source.as_ref(),
+    ) {
+        (Some(metrics), None) => Some((metrics.start_date, metrics.end_date)),
+        (None, Some(insights)) => Some((insights.start_date, insights.end_date)),
+        _ => None,
+    }
 }
 
 /// How this service words `NotFoundException` for a `JobId` the account holds no export

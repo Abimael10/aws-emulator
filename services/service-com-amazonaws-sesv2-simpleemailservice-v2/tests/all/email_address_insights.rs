@@ -9,18 +9,23 @@
 //! per documented mailbox evaluation of the address in the request — its syntax, the
 //! DNS records of its domain, whether the mailbox exists, whether it is a role
 //! address, whether its domain is a throwaway mailbox service and whether the input
-//! reads as random text — each computed from the value itself and from what the
-//! account's own records already say about that domain and that mailbox, with
-//! `IsValid` the weakest of them once the three evaluations whose HIGH value counts
-//! against an address are inverted; and the report is a read, so it moves nothing a
-//! later caller sees.
+//! reads as random text — each computed from the value itself, from what a domain name
+//! can resolve to at all, and from what the account's own records already say about that
+//! mailbox, with `IsValid` the weakest of the evaluations that OBSERVED something once
+//! the three whose HIGH value counts against an address are inverted; and the report is
+//! a read, so it moves nothing a later caller sees.
+//!
+//! The mailbox check is documented as made "without actually sending an email", so an
+//! account whose records say nothing about the mailbox has observed nothing either way
+//! (MEDIUM) and that does not lower the overall verdict.
 //!
 //! The table below spans what the rule generalises over: the ways a value falls
 //! outside the address form, the length bound and a value past it, a domain no DNS
 //! zone can cover, role mailboxes spelled three ways, a throwaway service addressed
 //! directly and under a subdomain, character mixes that read as generated and as
-//! typed, and the case the domain is spelled in. The second suite varies the account's
-//! records instead, which is the other half of what each verdict is computed from.
+//! typed, the case the domain is spelled in, and a mailbox of the SES mailbox
+//! simulator. The second suite varies the account's records instead, which is the other
+//! half of what each verdict is computed from.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -250,9 +255,9 @@ impl Ses {
 }
 
 /// One graded value and the verdicts the rule gives it, in an account holding no
-/// records at all: no identity says what any domain publishes and no suppression
-/// entry says anything about any mailbox, so the DNS and mailbox evaluations rest on
-/// the value alone.
+/// records at all: no suppression entry says anything about any mailbox and no identity
+/// says a mailbox was reached, so the mailbox evaluation observes nothing and the DNS
+/// evaluation rests on the domain name alone.
 struct Row {
     name: &'static str,
     address: String,
@@ -268,12 +273,12 @@ fn repeated_local_part(length: usize) -> String {
 fn rows() -> Vec<Row> {
     let domain = "@example.com";
     vec![
-        // A typed personal address: nothing is wrong with it, and nothing here can
-        // confirm its domain's records or its mailbox.
+        // A typed personal address: nothing is wrong with it, its domain is a name DNS
+        // can resolve, and the mailbox itself is what no check here observes.
         Row {
             name: "typed-personal-address",
             address: format!("john.doe{domain}"),
-            expected: Verdicts::expected("MEDIUM", "HIGH", "MEDIUM", "MEDIUM", "LOW", "LOW", "LOW"),
+            expected: Verdicts::expected("HIGH", "HIGH", "HIGH", "MEDIUM", "LOW", "LOW", "LOW"),
         },
         // Four ways a value falls outside the address form: no `@` at all, a second
         // `@`, an empty atom in the local part, and a single character.
@@ -311,7 +316,7 @@ fn rows() -> Vec<Row> {
                 "{}{domain}",
                 repeated_local_part(MAX_EMAIL_ADDRESS_CHARS - domain.len())
             ),
-            expected: Verdicts::expected("MEDIUM", "HIGH", "MEDIUM", "MEDIUM", "LOW", "LOW", "LOW"),
+            expected: Verdicts::expected("HIGH", "HIGH", "HIGH", "MEDIUM", "LOW", "LOW", "LOW"),
         },
         Row {
             name: "one-past-the-length-bound",
@@ -320,17 +325,18 @@ fn rows() -> Vec<Row> {
                 repeated_local_part(MAX_EMAIL_ADDRESS_CHARS - domain.len() + 1)
             ),
             expected: Verdicts::expected(
-                "MEDIUM", "MEDIUM", "MEDIUM", "MEDIUM", "LOW", "LOW", "LOW",
+                "MEDIUM", "MEDIUM", "HIGH", "MEDIUM", "LOW", "LOW", "LOW",
             ),
         },
         // A domain label outside DNS's preferred name syntax: an address a receiving
         // system may still turn down, which is weaker than well-spelled rather than
-        // no address at all.
+        // no address at all. Its top-level name is one the root delegates, so a zone
+        // covering it can exist.
         Row {
             name: "domain-label-opening-with-a-hyphen",
             address: "user@-example.com".to_string(),
             expected: Verdicts::expected(
-                "MEDIUM", "MEDIUM", "MEDIUM", "MEDIUM", "LOW", "LOW", "LOW",
+                "MEDIUM", "MEDIUM", "HIGH", "MEDIUM", "LOW", "LOW", "LOW",
             ),
         },
         // Role mailboxes: one named by RFC 2142 that the member's documentation does
@@ -339,18 +345,18 @@ fn rows() -> Vec<Row> {
         Row {
             name: "role-mailbox",
             address: format!("postmaster{domain}"),
-            expected: Verdicts::expected("LOW", "HIGH", "MEDIUM", "MEDIUM", "HIGH", "LOW", "LOW"),
+            expected: Verdicts::expected("LOW", "HIGH", "HIGH", "MEDIUM", "HIGH", "LOW", "LOW"),
         },
         Row {
             name: "role-mailbox-with-a-subaddress",
             address: format!("support+eu{domain}"),
-            expected: Verdicts::expected("LOW", "HIGH", "MEDIUM", "MEDIUM", "HIGH", "LOW", "LOW"),
+            expected: Verdicts::expected("LOW", "HIGH", "HIGH", "MEDIUM", "HIGH", "LOW", "LOW"),
         },
         Row {
             name: "role-name-as-one-segment",
             address: format!("sales.emea{domain}"),
             expected: Verdicts::expected(
-                "MEDIUM", "HIGH", "MEDIUM", "MEDIUM", "MEDIUM", "LOW", "LOW",
+                "MEDIUM", "HIGH", "HIGH", "MEDIUM", "MEDIUM", "LOW", "LOW",
             ),
         },
         // A throwaway mailbox service addressed directly, and under one of its
@@ -358,36 +364,44 @@ fn rows() -> Vec<Row> {
         Row {
             name: "throwaway-mailbox-service",
             address: "someone@mailinator.com".to_string(),
-            expected: Verdicts::expected("LOW", "HIGH", "MEDIUM", "MEDIUM", "LOW", "HIGH", "LOW"),
+            expected: Verdicts::expected("LOW", "HIGH", "HIGH", "MEDIUM", "LOW", "HIGH", "LOW"),
         },
         Row {
             name: "throwaway-mailbox-service-subdomain",
             address: "x@mail.mailinator.com".to_string(),
-            expected: Verdicts::expected("LOW", "HIGH", "MEDIUM", "MEDIUM", "LOW", "HIGH", "LOW"),
+            expected: Verdicts::expected("LOW", "HIGH", "HIGH", "MEDIUM", "LOW", "HIGH", "LOW"),
         },
         // Character mixes: letters with no vowels and no repeat, letters and digits
         // interleaved, and digits appended to a name, which is not a generated value.
         Row {
             name: "vowel-less-local-part",
             address: format!("xkqjvzwp{domain}"),
-            expected: Verdicts::expected("LOW", "HIGH", "MEDIUM", "MEDIUM", "LOW", "LOW", "HIGH"),
+            expected: Verdicts::expected("LOW", "HIGH", "HIGH", "MEDIUM", "LOW", "LOW", "HIGH"),
         },
         Row {
             name: "letters-and-digits-interleaved",
             address: format!("a7f3k9q2zp{domain}"),
-            expected: Verdicts::expected("LOW", "HIGH", "MEDIUM", "MEDIUM", "LOW", "LOW", "HIGH"),
+            expected: Verdicts::expected("LOW", "HIGH", "HIGH", "MEDIUM", "LOW", "LOW", "HIGH"),
         },
         Row {
             name: "digits-appended-to-a-name",
             address: format!("jdoe2024{domain}"),
-            expected: Verdicts::expected("MEDIUM", "HIGH", "MEDIUM", "MEDIUM", "LOW", "LOW", "LOW"),
+            expected: Verdicts::expected("HIGH", "HIGH", "HIGH", "MEDIUM", "LOW", "LOW", "LOW"),
         },
         // DNS compares a domain without regard to case, and a local part's case is
         // not what makes it a role or a mailbox at a throwaway service.
         Row {
             name: "mixed-case-address",
             address: "John.Doe@EXAMPLE.COM".to_string(),
-            expected: Verdicts::expected("MEDIUM", "HIGH", "MEDIUM", "MEDIUM", "LOW", "LOW", "LOW"),
+            expected: Verdicts::expected("HIGH", "HIGH", "HIGH", "MEDIUM", "LOW", "LOW", "LOW"),
+        },
+        // A mailbox of the SES mailbox simulator, the address a client validates
+        // against a domain AWS itself operates: an ordinary well-spelled address, whose
+        // mailbox is still what nothing here observes.
+        Row {
+            name: "mailbox-simulator-address",
+            address: "success@simulator.amazonses.com".to_string(),
+            expected: Verdicts::expected("HIGH", "HIGH", "HIGH", "MEDIUM", "LOW", "LOW", "LOW"),
         },
     ]
 }
@@ -422,16 +436,14 @@ async fn each_evaluation_is_computed_from_the_address_itself() {
 }
 
 #[tokio::test]
-async fn the_dns_and_mailbox_evaluations_are_computed_from_the_accounts_records() {
+async fn the_mailbox_evaluation_is_computed_from_the_accounts_records() {
     let ses = Ses::new();
     ses.grant_production_access();
 
-    // A verified domain identity: the records SES was told to look for in that zone
-    // were found, which is what the DNS evaluation rests on.
+    // A verified domain identity, a verified mailbox inside it, and one in a domain the
+    // account holds no identity for: a mailbox whose owner followed the verification
+    // link was reached, whichever domain it sits in.
     ses.verified_identity("insights.example.com").await;
-    // A verified mailbox inside it, and one in a domain the account holds no identity
-    // for: a mailbox whose owner followed the verification link exists whether or not
-    // anything is known about its domain's records.
     ses.verified_identity("person@insights.example.com").await;
     ses.verified_identity("solo@other.example.org").await;
     // Mail to one address came back, and the owner of another reported the message
@@ -454,7 +466,7 @@ async fn the_dns_and_mailbox_evaluations_are_computed_from_the_accounts_records(
         (
             "address-in-a-verified-domain",
             "someone@insights.example.com",
-            Verdicts::expected("MEDIUM", "HIGH", "HIGH", "MEDIUM", "LOW", "LOW", "LOW"),
+            Verdicts::expected("HIGH", "HIGH", "HIGH", "MEDIUM", "LOW", "LOW", "LOW"),
         ),
         (
             "verified-mailbox-in-a-verified-domain",
@@ -464,7 +476,7 @@ async fn the_dns_and_mailbox_evaluations_are_computed_from_the_accounts_records(
         (
             "verified-mailbox-in-an-unknown-domain",
             "solo@other.example.org",
-            Verdicts::expected("MEDIUM", "HIGH", "MEDIUM", "HIGH", "LOW", "LOW", "LOW"),
+            Verdicts::expected("HIGH", "HIGH", "HIGH", "HIGH", "LOW", "LOW", "LOW"),
         ),
         (
             "mailbox-suppressed-for-a-bounce",
@@ -479,7 +491,7 @@ async fn the_dns_and_mailbox_evaluations_are_computed_from_the_accounts_records(
         (
             "address-in-a-sibling-domain-the-account-knows-nothing-about",
             "someone@sibling.example.net",
-            Verdicts::expected("MEDIUM", "HIGH", "MEDIUM", "MEDIUM", "LOW", "LOW", "LOW"),
+            Verdicts::expected("HIGH", "HIGH", "HIGH", "MEDIUM", "LOW", "LOW", "LOW"),
         ),
     ];
 

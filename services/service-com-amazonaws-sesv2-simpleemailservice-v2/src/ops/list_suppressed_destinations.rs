@@ -191,18 +191,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The two bounds describe ONE window — `StartDate` keeps the addresses added
         // "after a specific date" and `EndDate` those added "before a specific date" —
         // so a request whose end precedes its start describes no window at all. That is
-        // invalid input, refused with the error the model binds for it and naming both
-        // bounds as the request gave them, rather than answered with the empty page the
-        // comparison would otherwise produce.
+        // invalid input, refused with the error the model binds for it and the sentence
+        // every windowed operation of this service refuses it with, rather than answered
+        // with the empty page the comparison would otherwise produce.
         if let (Some(start), Some(end)) = (input.start_date.as_ref(), input.end_date.as_ref()) {
             if end.as_secs_f64() < start.as_secs_f64() {
                 return Err(ListSuppressedDestinationsErrorModeled::BadRequestException(
                     BadRequestException {
-                        message: Some(format!(
-                            "Start date {} must be before end date {}",
-                            window_bound(start),
-                            window_bound(end)
-                        )),
+                        message: Some(crate::state::window_runs_backwards()),
                     },
                 )
                 .into());
@@ -310,18 +306,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
-}
-
-/// One bound of the listing window, as the refusal of an inverted window prints it:
-/// the instant to the minute, with no seconds and no zone suffix.
-///
-/// The value is the request's own bound; only its rendering is fixed here.
-fn window_bound(at: &::aws_smithy_types::DateTime) -> String {
-    // `Format::DateTime` renders `YYYY-MM-DDThh:mm:ssZ` (with a fraction when the
-    // instant carries one); the sentence names the minute, so the rendering stops
-    // where the minutes end.
-    const TO_THE_MINUTE: usize = "YYYY-MM-DDThh:mm".len();
-    at.fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .map(|rendered| rendered.chars().take(TO_THE_MINUTE).collect())
-        .unwrap_or_default()
 }

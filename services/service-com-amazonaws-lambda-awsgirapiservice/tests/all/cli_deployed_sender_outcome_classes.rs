@@ -44,7 +44,8 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::execution::FUNCTION_ER
 // upload, the wait for `Active` and the invocation that answers terminally — is the sibling
 // suite's, so this one drives those steps rather than a second copy of them.
 use crate::cli_deployed_email_sender::{
-    email, emulator, given_active_function, given_execution_role, given_verified_identity, invoke,
+    email, emulator, given_active_function, given_execution_role,
+    given_message_insights_enabled, given_verified_identity, invoke,
     RECIPIENT, SEND_EMAIL_SUCCESS_STATUS,
 };
 // The statement builders every role in this target is written with.
@@ -331,6 +332,7 @@ async fn every_invocation_of_a_deployed_sender_settles_on_one_outcome_class() {
     .await;
     let logs_only_role = given_execution_role(&router, LOGS_ONLY_ROLE, json!([logs_only()])).await;
     given_verified_identity(&router, SENDER).await;
+    given_message_insights_enabled(&router).await;
     given_configuration_set(&router, HELD_SET, true).await;
     given_configuration_set(&router, PAUSED_SET, false).await;
     given_active_function(&router, SENDING_FUNCTION, HANDLER_SOURCE, &sending_role).await;

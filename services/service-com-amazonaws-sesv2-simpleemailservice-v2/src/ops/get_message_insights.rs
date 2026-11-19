@@ -8,6 +8,12 @@
 //! from address, subject and tags as they were accepted, plus one `EmailInsights`
 //! entry per recipient. Reporting only — the log is read, never written.
 //!
+//! Message Insights is one of the account's Virtual Deliverability Manager
+//! facilities, so the report exists only while that feature is enabled: with it off
+//! the call is refused as a resource that does not exist, naming the feature to
+//! enable, before anything about the message the request names is resolved
+//! (`crate::state::enable_vdm_to_use_this_feature`).
+//!
 //! A `MessageId` names a message SES accepted, so it is refused the way every
 //! caller-supplied identifier in this service is: a value outside the form SES
 //! issues is a `BadRequestException`, and a well-formed id the account holds no
@@ -162,6 +168,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let message_id = input.message_id;
+
+        // Reporting only: nothing about an accepted message falls due with the
+        // clock, so this read leaves the log exactly as a later caller finds it.
+        // (The documented once-per-second limit on this operation is measured on
+        // the caller rather than on anything stored, and no per-second throttle is
+        // applied anywhere in this slice.)
+        let store = state.lock();
+
+        // Message Insights is a facility of the account's Virtual Deliverability
+        // Manager configuration, so while that is off this report does not exist for
+        // the account at all — whatever message the request names. Taken before the id
+        // is read, so the caller is told which feature to enable rather than something
+        // about an id that could not have been answered either way.
+        if !crate::state::vdm_is_enabled(&store.account) {
+            return Err(GetMessageInsightsErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::enable_vdm_to_use_this_feature()),
+                },
+            )
+            .into());
+        }
+
         // A value outside the form SES issues names no message it could ever have
         // accepted, so it is the caller's mistake rather than a message that has
         // gone.
@@ -174,12 +202,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Reporting only: nothing about an accepted message falls due with the
-        // clock, so this read leaves the log exactly as a later caller finds it.
-        // (The documented once-per-second limit on this operation is measured on
-        // the caller rather than on anything stored, and no per-second throttle is
-        // applied anywhere in this slice.)
-        let store = state.lock();
         let Some(message) = store
             .sent_messages
             .iter()

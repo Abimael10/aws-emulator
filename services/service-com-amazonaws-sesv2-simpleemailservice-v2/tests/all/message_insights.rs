@@ -9,20 +9,27 @@
 //! The rule these cases pin: the call reports the accepted message its `MessageId`
 //! names, computed from the outbound-message log — the from address, subject and
 //! tags exactly as they were accepted, and one insights entry per recipient in
-//! `To`, `Cc`, `Bcc` order carrying the acceptance event — while a `MessageId`
+//! `To`, `Cc`, `Bcc` order carrying the acceptance event — while the report exists
+//! only for an account whose Virtual Deliverability Manager configuration is enabled,
+//! so with it off the call is refused 404 `NotFoundException` naming the feature to
+//! enable whatever the `MessageId` says; a `MessageId`
 //! outside the form SES issues for a message is refused with a 400
 //! `BadRequestException` and a well-formed id the account holds no message for with
 //! a 404 `NotFoundException`; and the report is a read, so it moves nothing a later
 //! caller sees. The tables below span what the rule generalises over: the number of
 //! recipients and which fields they are addressed in, the number of tags, a message
-//! with and without tags, the ways a value can fall outside the id form, and the
-//! shapes a well-formed-but-unheld id takes.
+//! with and without tags, the ways a value can fall outside the id form, the
+//! shapes a well-formed-but-unheld id takes, and every feature status the account's
+//! VDM switch takes.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_sesv2_simpleemailservice_v2::state::ComAmazonawsSesv2SimpleemailserviceV2State;
+use service_com_amazonaws_sesv2_simpleemailservice_v2::ops::types::FEATURE_STATUS_VALUES;
+use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
+    enable_vdm_to_use_this_feature, ComAmazonawsSesv2SimpleemailserviceV2State, FEATURE_ENABLED,
+};
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -150,6 +157,36 @@ impl Ses {
             .await
     }
 
+    /// Set the account's Virtual Deliverability Manager switch, which is what the
+    /// insights report is served under.
+    async fn put_vdm(&self, status: &str) -> Reply {
+        self.call(
+            "PUT",
+            "/v2/email/account/vdm",
+            Some(json!({ "VdmAttributes": { "VdmEnabled": status } })),
+        )
+        .await
+    }
+
+    /// Switch Virtual Deliverability Manager on, requiring the write to be served: the
+    /// report of a message is only served while it is.
+    async fn enable_vdm(&self) {
+        let put = self.put_vdm(FEATURE_ENABLED).await;
+        assert_eq!(
+            put.status, 200,
+            "expected 200 from the VDM put, got {} {:?}",
+            put.status, put.body
+        );
+    }
+
+    /// A service with Virtual Deliverability Manager switched on and nothing else
+    /// configured.
+    async fn with_vdm() -> Self {
+        let ses = Self::new();
+        ses.enable_vdm().await;
+        ses
+    }
+
     /// The account report, so a case can show a read moved nothing about the
     /// account's sending either.
     async fn account(&self) -> Reply {
@@ -184,9 +221,11 @@ impl Ses {
         }
     }
 
-    /// A service with one verified sending domain, ready to send.
+    /// A service with one verified sending domain, ready to send, and Virtual
+    /// Deliverability Manager switched on so the insights report is served.
     async fn with_verified_domain(domain: &str) -> Self {
         let ses = Self::new();
+        ses.enable_vdm().await;
         assert_eq!(
             ses.create_identity(domain).await.status,
             200,
@@ -598,7 +637,7 @@ async fn a_well_formed_id_the_account_holds_no_message_for_is_not_found() {
 
     // An id this account's log holds is not held by another account's: a service
     // that never accepted it answers not-found for the very same value.
-    let elsewhere = Ses::new();
+    let elsewhere = Ses::with_vdm().await;
     let refused = elsewhere.insights(&held).await;
     assert_eq!(
         (refused.status, refused.error_code().as_str()),
@@ -661,4 +700,104 @@ async fn the_report_moves_nothing_a_later_caller_sees() {
         "expected the reads to leave the account report alone, got {:?}",
         ses.account().await.body
     );
+}
+
+/// RULE: Message Insights is one of the account's Virtual Deliverability Manager
+/// facilities, so while that feature is off the report does not exist for the account:
+/// the call is refused 404 `NotFoundException` with the one sentence naming the feature
+/// to enable, whatever the `MessageId` names — and it is served again as soon as the
+/// feature is switched back on.
+#[tokio::test]
+async fn the_report_is_served_only_while_the_account_vdm_is_enabled() {
+    let ses = Ses::with_verified_domain("gated.example.com").await;
+    let accepted = ses
+        .send(json!({
+            "FromEmailAddress": "sender@gated.example.com",
+            "Destination": { "ToAddresses": ["rcpt@example.org"] },
+            "Content": {"Simple": {"Subject": {"Data": "held"}, "Body": {"Text": {"Data": "b"}}}},
+        }))
+        .await;
+    assert_eq!(
+        accepted.status, 200,
+        "expected the send to be accepted, got {} {:?}",
+        accepted.status, accepted.body
+    );
+    let held = accepted.string("MessageId");
+
+    // The ids differ along what they would otherwise be answered with: a message the
+    // log holds (200), a well-formed id it does not (404 not-found) and a value outside
+    // the id form (400 bad request). The gate is ahead of all three.
+    let ids: Vec<(&str, String)> = vec![
+        ("an id the log holds", held.clone()),
+        (
+            "a well-formed id the log does not hold",
+            "0100000000000000-0000000000000000-000000".to_string(),
+        ),
+        ("a value outside the id form", "not-a-message-id".to_string()),
+    ];
+
+    // The legs cross both feature statuses the model publishes, in both directions,
+    // beginning with an account nothing has configured.
+    let legs: Vec<(&str, Option<&str>, bool)> = vec![
+        ("VDM switched on", Some("ENABLED"), true),
+        ("VDM switched off", Some("DISABLED"), false),
+        ("VDM switched back on", Some("ENABLED"), true),
+    ];
+    for status in FEATURE_STATUS_VALUES {
+        assert!(
+            legs.iter().any(|(_, set, _)| *set == Some(*status)),
+            "case {status:?}: the legs must cover every published feature status"
+        );
+    }
+
+    for (leg, status, served) in legs {
+        if let Some(status) = status {
+            let put = ses.put_vdm(status).await;
+            assert_eq!(
+                put.status, 200,
+                "case {leg:?}: expected 200 from the VDM put, got {} {:?}",
+                put.status, put.body
+            );
+        }
+        for (case, message_id) in &ids {
+            let reply = ses.insights(message_id).await;
+            if !served {
+                assert_eq!(
+                    (reply.status, reply.error_code().as_str()),
+                    (404, "NotFoundException"),
+                    "case {leg:?}/{case:?}: expected the feature refusal, got {} {:?}",
+                    reply.status,
+                    reply.body
+                );
+                assert_eq!(
+                    reply.message(),
+                    enable_vdm_to_use_this_feature(),
+                    "case {leg:?}/{case:?}: expected the sentence naming the feature to enable, \
+                     got {:?}",
+                    reply.message()
+                );
+                continue;
+            }
+            // With the feature on, each id is answered on its own merits again.
+            let expected = match *case {
+                "an id the log holds" => 200,
+                "a well-formed id the log does not hold" => 404,
+                _ => 400,
+            };
+            assert_eq!(
+                reply.status, expected,
+                "case {leg:?}/{case:?}: expected HTTP {expected}, got {} {:?}",
+                reply.status, reply.body
+            );
+            if expected != 200 {
+                assert_ne!(
+                    reply.message(),
+                    enable_vdm_to_use_this_feature(),
+                    "case {leg:?}/{case:?}: expected the id's own refusal once the feature is on, \
+                     got {:?}",
+                    reply.message()
+                );
+            }
+        }
+    }
 }

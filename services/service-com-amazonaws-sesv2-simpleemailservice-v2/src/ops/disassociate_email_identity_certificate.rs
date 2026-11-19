@@ -198,13 +198,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "This operation is idempotent. If the specified email identity exists but
         // there's no matching certificate association, the operation succeeds without
-        // making any changes." An association that already signs nothing is such a
-        // no-change case: it is already on its way out.
+        // making any changes." An association that is already on its way out is such a
+        // no-change case; every association the account still holds — one being
+        // prepared, one ready for signing, and one whose preparation ended in `FAILED` —
+        // is taken out of use here.
         if let Some(certificate) = record
             .certificates
             .get_mut(&crate::state::identity_key(&from_address))
         {
-            if certificate.signs() {
+            if certificate.in_force() {
                 certificate.deactivate(now);
             }
         }

@@ -29,7 +29,6 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
-use service_com_amazonaws_lambda_awsgirapiservice::state::ACTIVATION_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// Where `CreateFunction` is bound.
@@ -44,9 +43,16 @@ const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 /// The module and attribute the package below carries its handler as.
 const HANDLER: &str = "lambda_function.lambda_handler";
 
-/// How long past a due instant this suite waits before calling. Each transition is owed by
-/// the CLOCK, so nothing here sleeps on the emulator's behalf.
-const SLACK: Duration = Duration::from_millis(200);
+/// How long a wait on a transition the CLOCK owes may take before the case gives up.
+/// Generous: the condition is what is waited on, not this bound, and a loaded host may
+/// take far longer than the span itself to get round to the work.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(180);
+
+/// How often such a wait looks again.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// `State`'s value for a function an invocation may reach.
+const ACTIVE: &str = "Active";
 
 /// The identity the served send is made from: created by the first row, verified once the
 /// verification SES owes it is due.
@@ -352,7 +358,30 @@ async fn a_handler_calls_the_email_service_through_the_sdk_the_runtime_supplies(
         status, 201,
         "expected HTTP 201 from CreateFunction, got {status} ({created})"
     );
-    tokio::time::sleep(ACTIVATION_DELAY + SLACK).await;
+    // The activation is owed by the CLOCK, so this looks again until the function reports the
+    // state an invocation needs instead of sleeping for a fixed span.
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (status, _headers, configuration) = lambda(
+            &router,
+            "GET",
+            &format!("{FUNCTIONS_URI}/{function}/configuration"),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "expected HTTP 200 from GetFunctionConfiguration, got {status} ({configuration})"
+        );
+        if configuration["State"] == json!(ACTIVE) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected the activation the clock owes to fall due, last read {configuration}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 
     let mut sent_message_id = String::new();
     for row in rows() {
@@ -471,13 +500,28 @@ async fn a_handler_calls_the_email_service_through_the_sdk_the_runtime_supplies(
         }
 
         // The identity the first row created is verified once the verification SES owes it
-        // is due, which is what the served send below is made from.
+        // is due, which is what the served send below is made from. The transition is owed
+        // by the CLOCK, so this looks again until the identity reports it.
         if case == "a body-only create: CreateEmailIdentity" {
-            tokio::time::sleep(
-                service_com_amazonaws_sesv2_simpleemailservice_v2::state::VERIFICATION_SETTLE
-                    + SLACK,
-            )
-            .await;
+            let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+            loop {
+                let read = email(
+                    &router,
+                    case,
+                    "GET",
+                    &format!("/v2/email/identities/{SENDER}"),
+                )
+                .await;
+                if read["VerifiedForSendingStatus"] == json!(true) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "case {case:?}: expected the verification the clock owes to fall due, last \
+                     read {read}"
+                );
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
         }
     }
 
@@ -507,13 +551,30 @@ async fn a_handler_calls_the_email_service_through_the_sdk_the_runtime_supplies(
         json!(CONFIGURATION_SET),
         "case {case:?}: expected the configuration set the handler created, got {set}"
     );
-    let insights = email(
-        &router,
-        case,
-        "GET",
-        &format!("/v2/email/insights/{sent_message_id}"),
-    )
-    .await;
+    let insights = {
+        // Message Insights is served under the account's Virtual Deliverability Manager
+        // configuration, so the switch goes on before the report is read.
+        let (status, _headers, answered) = dispatch(
+            &router,
+            "ses",
+            &format!("email.{REGION}.amazonaws.com"),
+            "PUT",
+            "/v2/email/account/vdm",
+            br#"{"VdmAttributes":{"VdmEnabled":"ENABLED"}}"#,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the VDM switch to be accepted, got {status} ({answered})"
+        );
+        email(
+            &router,
+            case,
+            "GET",
+            &format!("/v2/email/insights/{sent_message_id}"),
+        )
+        .await
+    };
     assert_eq!(
         insights["MessageId"],
         json!(sent_message_id.clone()),

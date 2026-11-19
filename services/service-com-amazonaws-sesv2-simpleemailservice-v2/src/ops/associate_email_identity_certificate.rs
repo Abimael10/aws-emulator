@@ -263,13 +263,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The ARN names a certificate in Certificate Manager, whose records belong to
-        // that service's state rather than this one's: SES is documented to take the
-        // ARN as how the caller "identif[ies] it", and a certificate that is not ready
-        // for signing is reflected in the association's STATUS rather than refused
-        // here, so the ARN is stored as given and resolved against nothing.
+        // that service's state rather than this one's: SES is documented to take the ARN
+        // as how the caller "identif[ies] it" and to refuse only an identity it does not
+        // hold, so the ARN is stored as given and the association is accepted. Whether
+        // the certificate it names can actually be PREPARED for signing is read from the
+        // holder here, at the instant the preparation starts, and is what the
+        // `PROVISIONING` status settles into — `ACTIVE` for a certificate that can be
+        // signed with, `FAILED` ("the certificate couldn't be prepared for use, or the
+        // certificate has expired") for one that cannot.
+        let certificate_is_usable =
+            crate::state::certificate_can_sign(&*self.engine, &input.certificate_arn, now);
         record.certificates.insert(
             certificate_key,
-            IdentityCertificateRecord::new(&from_address, &input.certificate_arn, now),
+            IdentityCertificateRecord::new(
+                &from_address,
+                &input.certificate_arn,
+                certificate_is_usable,
+                now,
+            ),
         );
         Ok(AssociateEmailIdentityCertificateOutput {})
     }

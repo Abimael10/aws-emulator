@@ -14,7 +14,11 @@
 //!   address, the `FromAddress` within the domain when it is a domain — and a listing of
 //!   the identity reports every association it holds, each with the address it applies
 //!   to, the certificate it names and the status it currently carries;
-//! * a created association starts out being prepared for signing and becomes ready for it
+//! * where the preparation of an association ENDS is what the service that holds the
+//!   certificate says about it: `ACTIVE` for a certificate it holds that has been issued,
+//!   is still valid and may be used to protect email, and `FAILED` for one it does not
+//!   hold at all or holds in a state that cannot sign;
+//! * a created association starts out being prepared for signing and reaches that end
 //!   when the clock says so; a removed one stops signing at once and is cleaned up
 //!   afterwards;
 //! * a second association for an address that already has one is refused, and so is a
@@ -26,8 +30,17 @@
 //!
 //! The tables below span what those rules generalise over: the kind of identity (address,
 //! domain), the form of `FromAddress` (absent, the identity itself, a differently cased
-//! spelling of it, an address in the domain, an address in a subdomain), the status an
-//! association is in, the number of stored associations and the page size.
+//! spelling of it, an address in the domain, an address in a subdomain), what Certificate
+//! Manager holds for the ARN the request names (nothing, a certificate it issued for TLS,
+//! an imported certificate that may protect email, one that may not, one that asserts no
+//! key purpose at all, one whose validity has run out, one that is not issued yet), the
+//! status an association is in, the number of stored associations and the page size.
+//!
+//! Certificate Manager is mounted BESIDE this service on one engine, so every certificate
+//! a case names is one its holder really holds: the material is built by `rcgen` —
+//! something other than the code under test — and brought in through that service's own
+//! `ImportCertificate`/`RequestCertificate`, and the ARN asserted on is the one it
+//! answered rather than a value written into the test.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -41,6 +54,10 @@ use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
 };
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+/// The Region every request in this suite is signed for, which is the Region the
+/// certificate ARNs the holder mints carry too.
+const HOME: &str = "us-east-1";
 
 /// A well-formed ACM certificate ARN, as `CertificateArn`'s modelled pattern requires.
 /// The id part only has to be an identifier the pattern accepts; which certificate it
@@ -109,6 +126,44 @@ fn member(certificate: &Value, name: &str) -> String {
         .to_string()
 }
 
+/// A real self-signed certificate and the private key that matches it.
+struct Minted {
+    /// The PEM-encoded certificate.
+    certificate: String,
+    /// The PEM-encoded private key.
+    private_key: String,
+}
+
+/// Build a certificate asserting `purposes` as its Extended Key Usage extension and
+/// valid until the first of January of `valid_until`.
+///
+/// Built by `rcgen` — something other than the code under test — so the holder reads a
+/// genuine X.509 body. An empty `purposes` leaves the extension OFF the certificate,
+/// which is the "asserts no key purpose" case.
+fn mint(purposes: &[rcgen::ExtendedKeyUsagePurpose], valid_until: i32) -> Minted {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a key pair");
+    let mut params = rcgen::CertificateParams::new(vec!["signing.example.com".to_string()])
+        .expect("certificate parameters");
+    let mut subject = rcgen::DistinguishedName::new();
+    subject.push(rcgen::DnType::CommonName, "signing.example.com");
+    params.distinguished_name = subject;
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(valid_until, 1, 1);
+    params.extended_key_usages = purposes.to_vec();
+    Minted {
+        certificate: params
+            .self_signed(&key)
+            .expect("a self-signed certificate")
+            .pem(),
+        private_key: key.serialize_pem(),
+    }
+}
+
+/// A PEM body as the base64 a blob member carries on the wire.
+fn blob(pem: &str) -> Value {
+    json!(aws_smithy_types::base64::encode(pem.as_bytes()))
+}
+
 /// The emulated service behind its router, plus the shared engine so a test can read
 /// what a handler persisted and move the instant a clock-owed transition falls due.
 struct Ses {
@@ -123,6 +178,11 @@ impl Ses {
         // These cases exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // The HOLDER of the certificates an association names, on the same engine: what
+        // it answers about a certificate is what the association's preparation reads.
+        router.register_service(
+            service_com_amazonaws_acm_certificatemanager::EmulatedService::new(Arc::clone(&engine)),
+        );
         Self { engine, router }
     }
 
@@ -196,6 +256,165 @@ impl Ses {
     async fn list_certificates(&self, body: Value) -> Reply {
         self.call("POST", "/v2/email/identity/certificates/list", Some(body))
             .await
+    }
+
+    /// Call one Certificate Manager operation over the same router and return the parsed
+    /// body, requiring success.
+    ///
+    /// That service speaks `awsJson1_1` (`POST /`, `X-Amz-Target:
+    /// CertificateManager.<Op>`), signed for [`HOME`] so the ARNs it mints carry the same
+    /// Region this suite's own requests do.
+    async fn acm(&self, case: &str, operation: &str, body: Value) -> Value {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://acm.us-east-1.amazonaws.com/")
+            .header("host", "acm.us-east-1.amazonaws.com")
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("CertificateManager.{operation}"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIAEMULATOR0000000/20260101/{HOME}/acm/\
+                     aws4_request, SignedHeaders=host;x-amz-target, Signature=00"
+                ),
+            )
+            .body(bytes::Bytes::from(
+                serde_json::to_vec(&body).expect("serialize body"),
+            ))
+            .expect("build request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let bytes = response.into_body();
+        let parsed = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from {operation}, got {status} {parsed:?}"
+        );
+        parsed
+    }
+
+    /// Bring a certificate built from `purposes` and valid until `valid_until` into the
+    /// holder, and answer the ARN it stored it under.
+    async fn imported_certificate(
+        &self,
+        case: &str,
+        purposes: &[rcgen::ExtendedKeyUsagePurpose],
+        valid_until: i32,
+    ) -> String {
+        let minted = mint(purposes, valid_until);
+        let imported = self
+            .acm(
+                case,
+                "ImportCertificate",
+                json!({
+                    "Certificate": blob(&minted.certificate),
+                    "PrivateKey": blob(&minted.private_key),
+                }),
+            )
+            .await;
+        imported["CertificateArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no CertificateArn in {imported:?}"))
+            .to_string()
+    }
+
+    /// An imported certificate that may be used to sign a message: one asserting the
+    /// `emailProtection` key purpose, which is what an S/MIME signing certificate carries.
+    async fn signing_certificate(&self, case: &str) -> String {
+        self.imported_certificate(
+            case,
+            &[rcgen::ExtendedKeyUsagePurpose::EmailProtection],
+            2100,
+        )
+        .await
+    }
+
+    /// A certificate the HOLDER could not issue: a request whose validation outcome is
+    /// brought into the past, so the holder reports the state that outcome left it in.
+    async fn unissued_certificate(&self, case: &str) -> String {
+        let requested = self
+            .acm(
+                case,
+                "RequestCertificate",
+                json!({ "DomainName": "tls.example.com", "ValidationMethod": "DNS" }),
+            )
+            .await;
+        let arn = requested["CertificateArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no CertificateArn in {requested:?}"))
+            .to_string();
+        self.hold_acm_validation(&arn, SystemTime::now() - Duration::from_secs(1));
+        let described = self
+            .acm(case, "DescribeCertificate", json!({ "CertificateArn": arn }))
+            .await;
+        assert_eq!(
+            described["Certificate"]["Status"].as_str(),
+            Some("FAILED"),
+            "case {case:?}: expected the holder to report a certificate it could not issue, got \
+             {described:?}"
+        );
+        arn
+    }
+
+    /// A certificate the holder is still validating, so it has not been issued: the
+    /// outcome it owes is pushed well past this case's own lifetime rather than waited on.
+    async fn pending_certificate(&self, case: &str) -> String {
+        let requested = self
+            .acm(
+                case,
+                "RequestCertificate",
+                json!({ "DomainName": "pending.example.com", "ValidationMethod": "DNS" }),
+            )
+            .await;
+        let arn = requested["CertificateArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no CertificateArn in {requested:?}"))
+            .to_string();
+        self.hold_acm_validation(&arn, SystemTime::now() + Duration::from_secs(3600));
+        let described = self
+            .acm(case, "DescribeCertificate", json!({ "CertificateArn": arn }))
+            .await;
+        assert_eq!(
+            described["Certificate"]["Status"].as_str(),
+            Some("PENDING_VALIDATION"),
+            "case {case:?}: expected the holder to report the certificate still pending, got \
+             {described:?}"
+        );
+        arn
+    }
+
+    /// Move the instant at which the holder's validation outcome for `arn` falls due, so
+    /// a case drives that outcome instead of waiting on the wall clock.
+    fn hold_acm_validation(&self, arn: &str, due_at: SystemTime) {
+        let state = self
+            .engine
+            .state::<service_com_amazonaws_acm_certificatemanager::state::ComAmazonawsAcmCertificatemanagerState>();
+        let mut store = state.lock();
+        let certificate = store
+            .certificates
+            .get_mut(arn)
+            .unwrap_or_else(|| panic!("the holder must hold {arn:?}"));
+        if let Some(pending) = certificate.pending_validation.as_mut() {
+            pending.due_at = due_at;
+        }
+    }
+
+    /// End the validity of the certificate `arn` names, as time passing after an import
+    /// does: the holder still holds it, and it can no longer be used.
+    fn expire_acm_certificate(&self, arn: &str) {
+        let state = self
+            .engine
+            .state::<service_com_amazonaws_acm_certificatemanager::state::ComAmazonawsAcmCertificatemanagerState>();
+        let mut store = state.lock();
+        let certificate = store
+            .certificates
+            .get_mut(arn)
+            .unwrap_or_else(|| panic!("the holder must hold {arn:?}"));
+        certificate.not_after = Some(SystemTime::now() - Duration::from_secs(1));
     }
 
     /// Move the instant at which the association for `from_address` has its next
@@ -371,7 +590,7 @@ async fn an_association_round_trips_through_the_identity_listing() {
             empty.body
         );
 
-        let arn = certificate_arn("11111111-1111-1111-1111-111111111111");
+        let arn = ses.signing_certificate(case).await;
         let mut request = json!({ "EmailIdentity": identity, "CertificateArn": arn });
         if let Some(address) = from_address {
             request["FromAddress"] = json!(address);
@@ -628,12 +847,10 @@ async fn one_address_holds_one_certificate_at_a_time() {
         let ses = Ses::new();
         let identity = "example.com";
         let from_address = "sender@example.com";
-        ses.with_held_association(
-            identity,
-            from_address,
-            &certificate_arn("33333333-3333-3333-3333-333333333333"),
-        )
-        .await;
+        let held = ses.signing_certificate(status).await;
+        let replacement = ses.signing_certificate(status).await;
+        ses.with_held_association(identity, from_address, &held)
+            .await;
         // Walk the association into the status this row is about.
         match status {
             "PROVISIONING" => {}
@@ -676,7 +893,7 @@ async fn one_address_holds_one_certificate_at_a_time() {
             .associate(json!({
                 "EmailIdentity": identity,
                 "FromAddress": from_address,
-                "CertificateArn": certificate_arn("44444444-4444-4444-4444-444444444444"),
+                "CertificateArn": replacement,
             }))
             .await;
         if status == "DEPROVISIONING" {
@@ -693,7 +910,7 @@ async fn one_address_holds_one_certificate_at_a_time() {
                 .await;
             assert_eq!(
                 member(&replaced.certificates()[0], "CertificateArn"),
-                certificate_arn("44444444-4444-4444-4444-444444444444"),
+                replacement,
                 "case {status:?}: expected the new certificate to be the one reported, got {:?}",
                 replaced.body
             );
@@ -734,12 +951,9 @@ async fn an_identity_that_still_signs_with_a_certificate_cannot_be_deleted() {
     let ses = Ses::new();
     let identity = "example.com";
     let from_address = "sender@example.com";
-    ses.with_held_association(
-        identity,
-        from_address,
-        &certificate_arn("55555555-5555-5555-5555-555555555555"),
-    )
-    .await;
+    let arn = ses.signing_certificate("still signing").await;
+    ses.with_held_association(identity, from_address, &arn)
+        .await;
 
     // Both statuses an association signs with hold the identity: one being prepared for
     // signing and one ready for it.
@@ -844,6 +1058,7 @@ async fn an_identity_holds_at_most_the_bounded_number_of_associations() {
                 IdentityCertificateRecord::new(
                     &address,
                     &certificate_arn(&format!("7777777{index}")),
+                    true,
                     now,
                 ),
             );
@@ -1304,5 +1519,333 @@ async fn a_listing_refuses_a_token_it_did_not_issue() {
         "FromAddress is required when EmailIdentity is a domain.",
         "expected the missing-FromAddress sentence, got {:?}",
         no_address.message()
+    );
+}
+
+/// What the HOLDER of the certificate an association names holds for the ARN the request
+/// carries.
+enum Holding {
+    /// No certificate at all under that ARN.
+    Nothing,
+    /// A certificate whose request the holder could not issue.
+    CouldNotBeIssued,
+    /// A certificate the holder is still validating, so it is not issued.
+    NotIssuedYet,
+    /// A certificate brought in by its owner, asserting these key purposes; an empty
+    /// list asserts no key purpose at all.
+    Imported(&'static [rcgen::ExtendedKeyUsagePurpose]),
+    /// An imported certificate asserting `emailProtection` whose validity has since run
+    /// out.
+    ImportedThenExpired,
+}
+
+/// One row of the preparation table: what the holder holds, and the status the
+/// preparation of an association naming it must end in.
+struct Preparation {
+    case: &'static str,
+    holding: Holding,
+    /// The modelled `IdentityCertificateStatus` the association settles into.
+    settles_into: &'static str,
+}
+
+/// The rows span what the rule generalises over: an ARN the holder has nothing under, a
+/// certificate it could not issue, one it has not issued yet, imported certificates whose
+/// Extended Key Usage extension does and does not permit email protection (including the
+/// `anyExtendedKeyUsage` purpose and the absence of the extension altogether), and one
+/// whose validity has run out.
+///
+/// The key purposes are the ones the holder publishes as `ExtendedKeyUsageName`
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#ExtendedKeyUsageName")` lists
+/// `EMAIL_PROTECTION`, `TLS_WEB_SERVER_AUTHENTICATION`, `TLS_WEB_CLIENT_AUTHENTICATION`,
+/// `CODE_SIGNING`, `ANY` and `NONE` among them); `emailProtection` is the purpose RFC
+/// 5280 section 4.2.1.12 assigns to protecting email.
+fn preparation_cases() -> Vec<Preparation> {
+    vec![
+        Preparation {
+            case: "an ARN the holder has no certificate under",
+            holding: Holding::Nothing,
+            settles_into: "FAILED",
+        },
+        Preparation {
+            case: "a certificate the holder could not issue",
+            holding: Holding::CouldNotBeIssued,
+            settles_into: "FAILED",
+        },
+        Preparation {
+            case: "a certificate the holder has not issued yet",
+            holding: Holding::NotIssuedYet,
+            settles_into: "FAILED",
+        },
+        Preparation {
+            case: "an imported certificate asserting emailProtection",
+            holding: Holding::Imported(&[rcgen::ExtendedKeyUsagePurpose::EmailProtection]),
+            settles_into: "ACTIVE",
+        },
+        Preparation {
+            case: "an imported certificate asserting emailProtection among other purposes",
+            holding: Holding::Imported(&[
+                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+                rcgen::ExtendedKeyUsagePurpose::EmailProtection,
+                rcgen::ExtendedKeyUsagePurpose::CodeSigning,
+            ]),
+            settles_into: "ACTIVE",
+        },
+        Preparation {
+            case: "an imported certificate asserting anyExtendedKeyUsage",
+            holding: Holding::Imported(&[rcgen::ExtendedKeyUsagePurpose::Any]),
+            settles_into: "ACTIVE",
+        },
+        Preparation {
+            case: "an imported certificate asserting no key purpose at all",
+            holding: Holding::Imported(&[]),
+            settles_into: "ACTIVE",
+        },
+        Preparation {
+            case: "an imported certificate asserting only the TLS purposes",
+            holding: Holding::Imported(&[
+                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+            ]),
+            settles_into: "FAILED",
+        },
+        Preparation {
+            case: "an imported certificate whose validity has run out",
+            holding: Holding::ImportedThenExpired,
+            settles_into: "FAILED",
+        },
+    ]
+}
+
+/// RULE: an association is created being prepared for signing, and where that
+/// preparation ENDS is what the service holding the certificate says about it — `ACTIVE`
+/// for a certificate it holds that has been issued, is still valid and may be used to
+/// protect email, and `FAILED` for one it does not hold, has not issued, or holds in a
+/// state that cannot sign.
+#[tokio::test]
+async fn the_preparation_of_an_association_ends_where_the_certificate_allows() {
+    for Preparation {
+        case,
+        holding,
+        settles_into,
+    } in preparation_cases()
+    {
+        let ses = Ses::new();
+        let identity = "example.com";
+        let from_address = "sender@example.com";
+        let created = ses.create_identity(identity).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected the identity to be created, got {} {:?}",
+            created.status, created.body
+        );
+
+        let arn = match holding {
+            Holding::Nothing => certificate_arn("deadbeef-0000-4000-8000-000000000000"),
+            Holding::CouldNotBeIssued => ses.unissued_certificate(case).await,
+            Holding::NotIssuedYet => ses.pending_certificate(case).await,
+            Holding::Imported(purposes) => ses.imported_certificate(case, purposes, 2100).await,
+            Holding::ImportedThenExpired => {
+                let arn = ses
+                    .imported_certificate(
+                        case,
+                        &[rcgen::ExtendedKeyUsagePurpose::EmailProtection],
+                        2100,
+                    )
+                    .await;
+                ses.expire_acm_certificate(&arn);
+                arn
+            }
+        };
+
+        let associated = ses
+            .associate(json!({
+                "EmailIdentity": identity,
+                "FromAddress": from_address,
+                "CertificateArn": arn,
+            }))
+            .await;
+        assert_eq!(
+            associated.status, 200,
+            "case {case:?}: expected the association to be accepted, got {} {:?}",
+            associated.status, associated.body
+        );
+
+        // "When the association is created, the certificate begins provisioning and its
+        // status is PROVISIONING": the transition is owed at an instant the handler
+        // stored, so it is held off rather than waited on.
+        ses.hold_certificate(identity, from_address);
+        let provisioning = ses
+            .list_certificates(json!({ "EmailIdentity": identity }))
+            .await;
+        assert_eq!(
+            member(&provisioning.certificates()[0], "Status"),
+            "PROVISIONING",
+            "case {case:?}: expected a fresh association to be PROVISIONING, got {:?}",
+            provisioning.body
+        );
+
+        ses.due_certificate(identity, from_address);
+        let settled = ses
+            .list_certificates(json!({ "EmailIdentity": identity }))
+            .await;
+        let certificate = &settled.certificates()[0];
+        assert_eq!(
+            member(certificate, "Status"),
+            settles_into,
+            "case {case:?}: expected the preparation to end in {settles_into}, got {:?}",
+            settled.body
+        );
+        assert!(
+            IDENTITY_CERTIFICATE_STATUS_VALUES.contains(&member(certificate, "Status").as_str()),
+            "case {case:?}: expected a modelled IdentityCertificateStatus, got {certificate:?}"
+        );
+        assert_eq!(
+            member(certificate, "CertificateArn"),
+            arn,
+            "case {case:?}: expected the ARN the request named, got {certificate:?}"
+        );
+        // "The timestamp after which the certificate is no longer valid" belongs to the
+        // certificate, and a preparation that failed reports none.
+        if settles_into == "FAILED" {
+            assert!(
+                certificate.get("CertificateExpiryTime").is_none(),
+                "case {case:?}: expected no expiry on a failed preparation, got {certificate:?}"
+            );
+        }
+
+        // Whichever status it ended in, it is one the clock cannot move again: a further
+        // read reports the same status.
+        ses.due_certificate(identity, from_address);
+        let again = ses
+            .list_certificates(json!({ "EmailIdentity": identity }))
+            .await;
+        assert_eq!(
+            member(&again.certificates()[0], "Status"),
+            settles_into,
+            "case {case:?}: expected {settles_into} to be the status it stays in, got {:?}",
+            again.body
+        );
+    }
+}
+
+/// RULE: an association whose preparation failed signs nothing, so the identity holding
+/// it can be deleted — and it is still an association the account holds, so removing it
+/// takes it out of use and the address can take another certificate.
+#[tokio::test]
+async fn a_failed_association_signs_nothing_and_can_still_be_removed() {
+    let ses = Ses::new();
+    let identity = "example.com";
+    let from_address = "sender@example.com";
+    ses.create_identity(identity).await;
+    let unheld = certificate_arn("deadbeef-1111-4111-8111-111111111111");
+    let associated = ses
+        .associate(json!({
+            "EmailIdentity": identity,
+            "FromAddress": from_address,
+            "CertificateArn": unheld,
+        }))
+        .await;
+    assert_eq!(
+        associated.status, 200,
+        "expected the association to be accepted, got {} {:?}",
+        associated.status, associated.body
+    );
+    ses.due_certificate(identity, from_address);
+    let failed = ses
+        .list_certificates(json!({ "EmailIdentity": identity }))
+        .await;
+    assert_eq!(
+        member(&failed.certificates()[0], "Status"),
+        "FAILED",
+        "expected the preparation of a certificate nothing holds to fail, got {:?}",
+        failed.body
+    );
+
+    // A second association for the same address is still refused: the account holds one
+    // for it, failed or not.
+    let second = ses
+        .associate(json!({
+            "EmailIdentity": identity,
+            "FromAddress": from_address,
+            "CertificateArn": certificate_arn("deadbeef-2222-4222-8222-222222222222"),
+        }))
+        .await;
+    assert_eq!(
+        (second.status, second.error_code().as_str()),
+        (400, "AlreadyExistsException"),
+        "expected the duplicate to be refused, got {} {:?}",
+        second.status,
+        second.body
+    );
+
+    // Removing it takes it out of use, and the clean-up then frees the address.
+    let removed = ses
+        .disassociate(json!({ "EmailIdentity": identity, "FromAddress": from_address }))
+        .await;
+    assert_eq!(
+        removed.status, 200,
+        "expected the removal to be served, got {} {:?}",
+        removed.status, removed.body
+    );
+    ses.hold_certificate(identity, from_address);
+    let inactive = ses
+        .list_certificates(json!({ "EmailIdentity": identity }))
+        .await;
+    assert_eq!(
+        member(&inactive.certificates()[0], "Status"),
+        "INACTIVE",
+        "expected a removed association to be INACTIVE, got {:?}",
+        inactive.body
+    );
+    for _ in 0..2 {
+        ses.due_certificate(identity, from_address);
+        ses.list_certificates(json!({ "EmailIdentity": identity }))
+            .await;
+    }
+    let gone = ses
+        .list_certificates(json!({ "EmailIdentity": identity }))
+        .await;
+    assert!(
+        gone.certificates().is_empty(),
+        "expected the cleaned-up association to be gone, got {:?}",
+        gone.body
+    );
+
+    // Nothing signs for the identity, so it can be deleted — which a certificate being
+    // prepared or ready for signing would hold.
+    let deleted = ses.delete_identity(identity).await;
+    assert_eq!(
+        deleted.status, 200,
+        "expected the identity to be deletable once nothing signs for it, got {} {:?}",
+        deleted.status, deleted.body
+    );
+
+    // And a FAILED association holds nothing back either, because it signs nothing: a
+    // second account whose only association failed can delete its identity straight
+    // away.
+    let other = Ses::new();
+    other.create_identity(identity).await;
+    other
+        .associate(json!({
+            "EmailIdentity": identity,
+            "FromAddress": from_address,
+            "CertificateArn": certificate_arn("deadbeef-3333-4333-8333-333333333333"),
+        }))
+        .await;
+    other.due_certificate(identity, from_address);
+    let listed = other
+        .list_certificates(json!({ "EmailIdentity": identity }))
+        .await;
+    assert_eq!(
+        member(&listed.certificates()[0], "Status"),
+        "FAILED",
+        "expected the second account's association to have failed, got {:?}",
+        listed.body
+    );
+    let deleted_with_failed = other.delete_identity(identity).await;
+    assert_eq!(
+        deleted_with_failed.status, 200,
+        "expected an identity whose only association FAILED to be deletable, got {} {:?}",
+        deleted_with_failed.status, deleted_with_failed.body
     );
 }

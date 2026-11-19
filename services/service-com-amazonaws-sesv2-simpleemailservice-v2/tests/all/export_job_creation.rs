@@ -20,6 +20,9 @@
 //!   persists nothing;
 //! * `ExportDestination$S3Url` is SES's to set, so a create that carries one is refused
 //!   the same way and persists nothing;
+//! * the `StartDate` and `EndDate` of whichever data source the request names describe ONE
+//!   export interval, so a create whose end precedes its start is refused with the
+//!   service's one inverted-window sentence and persists nothing;
 //! * the created job is reported by a read of the account's export jobs, and the
 //!   `ExportSourceType` filter partitions the jobs a run of these cases created.
 //!
@@ -36,8 +39,8 @@ use service_com_amazonaws_sesv2_simpleemailservice_v2::ops::types::{
     DATA_FORMAT_VALUES, EXPORT_SOURCE_TYPE_VALUES,
 };
 use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
-    export_destination_s3_url_is_set_by_ses, invalid_export_data_source, ExportJobRecord,
-    ComAmazonawsSesv2SimpleemailserviceV2State, EXPORT_JOB_COMPLETION_SETTLE,
+    custom_s3_url_is_not_supported, invalid_export_data_source, window_runs_backwards,
+    ComAmazonawsSesv2SimpleemailserviceV2State, ExportJobRecord, EXPORT_JOB_COMPLETION_SETTLE,
     EXPORT_JOB_PROCESSING_SETTLE, MAX_EXPORT_JOBS,
 };
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
@@ -777,7 +780,7 @@ async fn a_create_that_carries_the_destination_url_is_refused_and_persists_nothi
             );
             assert_eq!(
                 reply.message(),
-                export_destination_s3_url_is_set_by_ses(),
+                custom_s3_url_is_not_supported(),
                 "case {case:?}: expected the modelled rule as the message, got {:?}",
                 reply.message()
             );
@@ -790,4 +793,139 @@ async fn a_create_that_carries_the_destination_url_is_refused_and_persists_nothi
         "a refused create stores nothing, got {} stored jobs",
         ses.stored_count()
     );
+}
+
+/// One window a create asks to export over, and whether the service serves it.
+struct Window {
+    case: &'static str,
+    /// `StartDate`, in whole epoch seconds.
+    start: i64,
+    /// `EndDate`, in the same units.
+    end: i64,
+    served: bool,
+}
+
+/// The windows the rule has to hold for, on BOTH data sources: an interval of several
+/// days, one of a single second, one of no time at all (both bounds are documented as
+/// inclusive, so a window that begins and ends at the same instant is still an interval),
+/// and ends that precede their start by a second and by a whole day.
+const WINDOWS: &[Window] = &[
+    Window {
+        case: "a window of three days",
+        start: RANGE_START_SECS,
+        end: RANGE_START_SECS + 3 * 24 * 60 * 60,
+        served: true,
+    },
+    Window {
+        case: "a window of one second",
+        start: RANGE_START_SECS,
+        end: RANGE_START_SECS + 1,
+        served: true,
+    },
+    Window {
+        case: "a window of no time at all",
+        start: RANGE_START_SECS,
+        end: RANGE_START_SECS,
+        served: true,
+    },
+    Window {
+        case: "an end one second before the start",
+        start: RANGE_START_SECS,
+        end: RANGE_START_SECS - 1,
+        served: false,
+    },
+    Window {
+        case: "an end a whole day before the start",
+        start: RANGE_END_SECS,
+        end: RANGE_START_SECS,
+        served: false,
+    },
+];
+
+/// The `ExportDataSource` document for `source_type` over the window `start`..`end`.
+fn data_source_over(source_type: &str, start: i64, end: i64) -> Value {
+    if source_type == METRICS_DATA {
+        json!({
+            "MetricsDataSource": {
+                "Dimensions": { "ISP": ["example-isp"] },
+                "Namespace": "VDM",
+                "Metrics": [{ "Name": "SEND", "Aggregation": "VOLUME" }],
+                "StartDate": start,
+                "EndDate": end,
+            }
+        })
+    } else {
+        json!({
+            "MessageInsightsDataSource": { "StartDate": start, "EndDate": end }
+        })
+    }
+}
+
+/// RULE: a request's `StartDate` and `EndDate` describe ONE interval, so a create whose
+/// end precedes its start is refused 400 `BadRequestException` with this service's one
+/// inverted-window sentence and stores nothing — whichever data source carries the two
+/// bounds.
+#[tokio::test]
+async fn a_create_whose_window_runs_backwards_is_refused_and_persists_nothing() {
+    for source_type in EXPORT_SOURCE_TYPE_VALUES {
+        for Window {
+            case,
+            start,
+            end,
+            served,
+        } in WINDOWS
+        {
+            let ses = Ses::new();
+            let reply = ses
+                .create(json!({
+                    "ExportDataSource": data_source_over(source_type, *start, *end),
+                    "ExportDestination": { "DataFormat": DATA_FORMAT_VALUES[0] },
+                }))
+                .await;
+            if *served {
+                assert_eq!(
+                    reply.status, 200,
+                    "case {case:?} ({source_type}): expected the window to be served, got {} {:?}",
+                    reply.status, reply.body
+                );
+                assert!(
+                    !reply.job_id().is_empty(),
+                    "case {case:?} ({source_type}): expected a JobId, got {:?}",
+                    reply.body
+                );
+                assert_eq!(
+                    ses.stored_count(),
+                    1,
+                    "case {case:?} ({source_type}): expected the served create to store its job, \
+                     got {} stored jobs",
+                    ses.stored_count()
+                );
+                continue;
+            }
+            assert_eq!(
+                reply.status, 400,
+                "case {case:?} ({source_type}): expected the input refusal, got {} {:?}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_code(),
+                "BadRequestException",
+                "case {case:?} ({source_type}): expected the operation's input error, got {:?}",
+                reply.body
+            );
+            assert_eq!(
+                reply.message(),
+                window_runs_backwards(),
+                "case {case:?} ({source_type}): expected the inverted-window sentence, got {:?}",
+                reply.message()
+            );
+            assert_eq!(
+                ses.stored_count(),
+                0,
+                "case {case:?} ({source_type}): a refused create stores nothing, got {} stored \
+                 jobs",
+                ses.stored_count()
+            );
+        }
+    }
 }

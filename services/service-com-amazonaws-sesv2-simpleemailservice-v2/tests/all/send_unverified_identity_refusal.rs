@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
-    ComAmazonawsSesv2SimpleemailserviceV2State, MAX_EMAIL_TEMPLATE_BYTES,
+    ComAmazonawsSesv2SimpleemailserviceV2State, FEATURE_ENABLED, MAX_EMAIL_TEMPLATE_BYTES,
 };
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -86,6 +86,15 @@ impl Ses {
         // These cases exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // One case below reads an accepted message back through Message Insights, which is
+        // served under the account's Virtual Deliverability Manager configuration. The
+        // switch is the one `PutAccountVdmAttributes` writes and `GetAccount` reports; it
+        // is set on the account record here because this constructor is not a request.
+        engine
+            .state::<ComAmazonawsSesv2SimpleemailserviceV2State>()
+            .lock()
+            .account
+            .vdm_enabled = FEATURE_ENABLED.to_string();
         Self { engine, router }
     }
 

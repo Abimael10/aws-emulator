@@ -13,8 +13,9 @@
 //! * The `VDM` namespace is the account's Virtual Deliverability Manager data, so it
 //!   is served only while the account's VDM configuration is enabled
 //!   (`VdmAttributes$VdmEnabled`, which `PutAccountVdmAttributes` writes and
-//!   `GetAccount` reports). While it is off there is no such data to read and a query
-//!   against the namespace is refused as invalid input.
+//!   `GetAccount` reports). While it is off there is no such data to read at all, so
+//!   the call is refused as a resource that does not exist, naming the feature to
+//!   enable (`crate::state::enable_vdm_to_use_this_feature`).
 //! * A dimension states which of the recorded activity the metric is wanted for, so
 //!   it filters the records rather than looking the resource it names up: a query
 //!   whose dimension names a configuration set, an identity, a tenant or a provider
@@ -193,11 +194,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // The namespace every query names is the account's VDM data, which exists
-        // only while the account's VDM configuration is enabled.
-        if store.account.vdm_enabled != crate::state::FEATURE_ENABLED {
-            return Err(bad_request(
-                "VDM is not enabled for your account.".to_string(),
-            ));
+        // only while the account's VDM configuration is enabled. That is a missing
+        // FEATURE rather than a bad request, so it is reported as the resource that
+        // does not exist, with the service's one sentence for it.
+        if !crate::state::vdm_is_enabled(&store.account) {
+            return Err(BatchGetMetricDataErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::enable_vdm_to_use_this_feature()),
+                },
+            )
+            .into());
         }
 
         let mut results = Vec::with_capacity(queries.len());
@@ -266,11 +272,7 @@ impl MetricQuery {
         let start = query.start_date.as_secs_f64();
         let end = query.end_date.as_secs_f64();
         if end < start {
-            return Err(bad_request(format!(
-                "Start date {} must be before end date {}",
-                window_bound(&query.start_date),
-                window_bound(&query.end_date)
-            )));
+            return Err(bad_request(crate::state::window_runs_backwards()));
         }
 
         Ok(Self {
@@ -294,18 +296,6 @@ impl MetricQuery {
     ) -> Vec<(i64, i64)> {
         crate::state::metric_day_counts(store, &self.metric, &self.dimensions, self.start, self.end)
     }
-}
-
-/// One bound of the query window, as the refusal of an inverted window prints it:
-/// the instant to the minute, with no seconds and no zone suffix — the rendering the
-/// other windowed operations of this service refuse with.
-///
-/// The value is the request's own bound; only its rendering is fixed here.
-fn window_bound(at: &::aws_smithy_types::DateTime) -> String {
-    const TO_THE_MINUTE: usize = "YYYY-MM-DDThh:mm".len();
-    at.fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .map(|rendered| rendered.chars().take(TO_THE_MINUTE).collect())
-        .unwrap_or_default()
 }
 
 /// `value` when it is one of `allowed`, and this operation's input error otherwise.

@@ -58,6 +58,9 @@ mod export_job;
 /// the sentences a policy write is refused with — shared by every operation that writes
 /// one.
 mod identity_policy_rules;
+/// The S/MIME certificate an identity's association names, resolved against the service
+/// that holds it.
+mod identity_certificates;
 /// The account's VDM metric series, which a metric query reports and a metrics export
 /// writes into its file.
 mod metric_series;
@@ -70,6 +73,10 @@ mod pricing;
 /// The suppression-list plane: one suppressed address and how a list's entries are
 /// keyed.
 mod suppression;
+/// The account's Virtual Deliverability Manager configuration as a gate: whether the
+/// feature is on, and how a call that can only be answered from its data is refused
+/// while it is off.
+mod vdm;
 /// The template language a template SAVED in the account is written in, and how one is
 /// evaluated against a set of rendering data — the full language, as against the inline
 /// substitution below.
@@ -88,11 +95,13 @@ pub use enum_value_sets::*;
 pub use export_file::*;
 pub use export_job::*;
 pub use identity_policy_rules::*;
+pub use identity_certificates::*;
 pub use metric_series::*;
 pub use minted_ids::*;
 pub use pricing::*;
 pub use suppression::*;
 pub use templates::*;
+pub use vdm::*;
 
 /// How long after `CreateEmailIdentity` an identity's `PENDING` -> `SUCCESS`
 /// verification transition becomes due.
@@ -188,7 +197,7 @@ pub fn dkim_lookup_error(domain: &str) -> &'static str {
 pub const MAIL_FROM_MX_SETTLE: Duration = Duration::from_secs(3);
 
 /// How long after a certificate association is created its `PROVISIONING` ->
-/// `ACTIVE` transition becomes due, and how long after it is removed its
+/// `ACTIVE` or `FAILED` transition becomes due, and how long after it is removed its
 /// `DEPROVISIONING` clean-up is due.
 ///
 /// Both spans are CHOSEN, not documented: real SES prepares the certificate for
@@ -196,7 +205,7 @@ pub const MAIL_FROM_MX_SETTLE: Duration = Duration::from_secs(3);
 /// here can observe. The span is long enough that a caller which reads straight back
 /// still sees the transient state and the state rules that go with it. The due
 /// instant is stored on the record; nothing ever sleeps for it.
-pub const CERTIFICATE_SETTLE: Duration = Duration::from_millis(500);
+pub const CERTIFICATE_SETTLE: Duration = Duration::from_secs(3);
 
 /// Certificate associations one email identity may hold.
 ///
@@ -2149,11 +2158,6 @@ impl MailFromState {
 }
 
 /// The status of one certificate association (`IdentityCertificateStatus`).
-///
-/// Only the states this emulator can reach are represented. `FAILED` is what SES
-/// reports for an association whose certificate "has passed its expiration time",
-/// which is read from the ACM certificate the association names: that certificate
-/// lives in another service's state, so nothing here produces that status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CertificateStatus {
     /// "The certificate association was created and the certificate is being
@@ -2166,6 +2170,10 @@ pub enum CertificateStatus {
     Inactive,
     /// "The certificate association is being cleaned up."
     Deprovisioning,
+    /// "The certificate couldn't be prepared for use, or the certificate has
+    /// expired" — where the preparation of an association whose certificate cannot be
+    /// signed with ends.
+    Failed,
 }
 
 impl CertificateStatus {
@@ -2176,6 +2184,7 @@ impl CertificateStatus {
             Self::Active => "ACTIVE",
             Self::Inactive => "INACTIVE",
             Self::Deprovisioning => "DEPROVISIONING",
+            Self::Failed => "FAILED",
         }
     }
 }
@@ -2189,10 +2198,15 @@ pub struct IdentityCertificateRecord {
     pub from_address: String,
     /// `CertificateArn`: the ACM certificate the association names.
     pub certificate_arn: String,
+    /// Whether the certificate the association names can be prepared for use at all, as
+    /// the service that HOLDS that certificate answered when the association was created
+    /// (see [`Self::new`]). It is what the preparation settles into: `ACTIVE` for a
+    /// certificate that can be signed with, `FAILED` for one that cannot.
+    pub certificate_is_usable: bool,
     /// Where the association is in its lifecycle.
     pub status: CertificateStatus,
-    /// When this status's clock-owed transition falls due: `PROVISIONING` ->
-    /// `ACTIVE`, `INACTIVE` -> `DEPROVISIONING`, and the clean-up that removes a
+    /// When this status's clock-owed transition falls due: `PROVISIONING` -> `ACTIVE`
+    /// or `FAILED`, `INACTIVE` -> `DEPROVISIONING`, and the clean-up that removes a
     /// `DEPROVISIONING` association.
     pub status_due_at: SystemTime,
 }
@@ -2200,11 +2214,24 @@ pub struct IdentityCertificateRecord {
 impl IdentityCertificateRecord {
     /// A fresh association, as `AssociateEmailIdentityCertificate` stores it: "when
     /// the association is created, the certificate begins provisioning and its status
-    /// is PROVISIONING".
-    pub fn new(from_address: &str, certificate_arn: &str, now: SystemTime) -> Self {
+    /// is PROVISIONING", and the preparation ends the span [`CERTIFICATE_SETTLE`] later.
+    ///
+    /// `certificate_is_usable` is the answer of the service that HOLDS the certificate
+    /// the ARN names, taken here because creating the association is when SES starts
+    /// preparing that certificate: an ARN that resolves to a certificate which can be
+    /// signed with can be prepared, and one that resolves to no certificate at all — or
+    /// to one that cannot sign — cannot, which is where the preparation ends
+    /// ([`Self::settle`]).
+    pub fn new(
+        from_address: &str,
+        certificate_arn: &str,
+        certificate_is_usable: bool,
+        now: SystemTime,
+    ) -> Self {
         Self {
             from_address: from_address.to_string(),
             certificate_arn: certificate_arn.to_string(),
+            certificate_is_usable,
             status: CertificateStatus::Provisioning,
             status_due_at: now.checked_add(CERTIFICATE_SETTLE).unwrap_or(now),
         }
@@ -2221,11 +2248,25 @@ impl IdentityCertificateRecord {
 
     /// Whether this association is one the identity signs with: a `PROVISIONING` one
     /// is being prepared for signing and an `ACTIVE` one is ready for it, while a
-    /// disassociated one is on its way out and signs nothing.
+    /// `FAILED` one never became usable and a disassociated one is on its way out, so
+    /// neither signs anything.
     pub fn signs(&self) -> bool {
         matches!(
             self.status,
             CertificateStatus::Provisioning | CertificateStatus::Active
+        )
+    }
+
+    /// Whether this association is still in force — one the account holds rather than
+    /// one already on its way out.
+    ///
+    /// A `FAILED` association is in force in this sense even though it signs nothing:
+    /// the account still holds the record, so removing it is a change rather than the
+    /// no-change case a disassociation of an association already leaving is.
+    pub fn in_force(&self) -> bool {
+        !matches!(
+            self.status,
+            CertificateStatus::Inactive | CertificateStatus::Deprovisioning
         )
     }
 
@@ -2238,13 +2279,21 @@ impl IdentityCertificateRecord {
                 return true;
             }
             match self.status {
-                // Both are states the association stays in until a request moves it,
-                // so neither owes the clock anything further.
+                // Where the preparation ends is what the certificate the association
+                // names allows: "the status changes to ACTIVE when the certificate is
+                // ready to use for signing", and `FAILED` — "the certificate couldn't be
+                // prepared for use" — when it is not one that can be signed with.
                 CertificateStatus::Provisioning => {
-                    self.status = CertificateStatus::Active;
+                    self.status = if self.certificate_is_usable {
+                        CertificateStatus::Active
+                    } else {
+                        CertificateStatus::Failed
+                    };
                     return true;
                 }
-                CertificateStatus::Active => return true,
+                // Each is a state the association stays in until a request moves it, so
+                // neither owes the clock anything further.
+                CertificateStatus::Active | CertificateStatus::Failed => return true,
                 CertificateStatus::Inactive => {
                     self.status = CertificateStatus::Deprovisioning;
                     // Measured from the instant the clean-up was owed, not from this
@@ -3712,6 +3761,19 @@ fn boundary_clause(violation: &Violation) -> String {
 /// would be exactly the drift this function exists to prevent.
 pub fn invalid_next_token() -> String {
     "Invalid next token.".to_string()
+}
+
+/// How this service words the refusal of a request whose window runs backwards — an end
+/// bound that precedes the start bound, which describes no interval at all.
+///
+/// AWS's own sentence for that class, which is wholly FIXED text: the two bounds are the
+/// caller's own and the sentence states the requirement they broke rather than echoing
+/// them back. ONE wording for every windowed operation of this service — the metric
+/// queries, the export job's data source and the suppression-list listing — because it is
+/// one condition, and a second sentence for it would be exactly the drift this function
+/// exists to prevent.
+pub fn window_runs_backwards() -> String {
+    "Expected start date to be before the end date.".to_string()
 }
 
 /// The version prefix an outbound message id carries: SES spells the id of a
