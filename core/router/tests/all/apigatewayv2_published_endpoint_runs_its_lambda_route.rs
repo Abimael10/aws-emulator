@@ -416,7 +416,12 @@ fn rows() -> Vec<Row> {
 
 /// The announced endpoint split into the authority a client dials and the path it carries ahead
 /// of the stage — empty for an endpoint that is a bare host.
-fn announced_parts(announced: &str) -> (String, String) {
+///
+/// `pub(crate)` because every suite that DIALS an announced address has to split it exactly this
+/// way, and a second copy of the split is a second reading of what was announced: the sibling
+/// that holds a CloudFormation-deployed api's published address to the same rule
+/// ([`super::cloudformation_published_http_api_endpoint`]) reads it from here.
+pub(crate) fn announced_parts(announced: &str) -> (String, String) {
     let without_scheme = announced
         .split_once("://")
         .map_or(announced, |(_scheme, rest)| rest);

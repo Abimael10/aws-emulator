@@ -86,10 +86,17 @@ const ESSENTIAL_CONTAINER_EXITED: &str = "EssentialContainerExited";
 /// part of such a reason.
 const CANNOT_PULL: &str = "CannotPullContainerError";
 
-/// The clause a refusal carries when the REPOSITORY's own policy denies the call the pull makes
-/// (`service_common::iam_authorization`'s one wording of an explicit deny in a resource-based
-/// policy).
-const RESOURCE_DENY: &str = "with an explicit deny in a resource-based policy";
+/// The clause a refusal carries when the REPOSITORY's own policy denies the call the pull makes:
+/// the HTTP status the registry answered the manifest request with.
+///
+/// What the task reports for such a pull is the container agent's own account of it — the ECS
+/// crate's `state::image_pull::pull_access_denied_message`, whose reading is that "the
+/// authorization decision itself is the registry's own and is not on this wire: a `docker pull`
+/// is answered with an HTTP status, not with an IAM sentence". So the clause held to here is that
+/// status, which is what a client reads off `stoppedReason`; the IAM wording of an explicit deny
+/// in a resource-based policy belongs to the registry's own API answer, which the row about the
+/// registry AUTHENTICATION step covers.
+const FORBIDDEN_STATUS: &str = "403 Forbidden";
 
 /// The clause a refusal carries when the registry resolved the reference to nothing: the
 /// container runtime's words for a reference no content answers for.
@@ -487,7 +494,7 @@ async fn a_task_is_launched_only_when_the_policy_in_force_serves_its_pull() {
         case,
         image: held.clone(),
         task_arn: place(&router, family, case).await,
-        expected: Outcome::FailedToStart(vec![CANNOT_PULL, RESOURCE_DENY]),
+        expected: Outcome::FailedToStart(vec![CANNOT_PULL, FORBIDDEN_STATUS]),
     });
 
     // The ACCOUNT the role belongs to is another spelling of a principal that covers it, so a
@@ -503,7 +510,7 @@ async fn a_task_is_launched_only_when_the_policy_in_force_serves_its_pull() {
         case,
         image: held.clone(),
         task_arn: place(&router, family, case).await,
-        expected: Outcome::FailedToStart(vec![CANNOT_PULL, RESOURCE_DENY]),
+        expected: Outcome::FailedToStart(vec![CANNOT_PULL, FORBIDDEN_STATUS]),
     });
 
     // A deny that names ANOTHER role withholds nothing from this one: what decides the pull is

@@ -25,6 +25,12 @@
 //! was created from, and the one it was updated to) and both directions of the transition. The
 //! disabled api's answer is also compared, status and body alike, against the same endpoint
 //! addressed for an api id nothing ever created.
+//!
+//! This suite OWNS the reading of that answer, and the wire it drives the two services over:
+//! the sibling that holds a stack's PUBLISHED `ApiEndpoint` to the address this emulator serves
+//! ([`super::cloudformation_published_http_api_endpoint`]) reads the mounting, the two
+//! control-plane callers, the invoke and both assertions from here rather than wording a second
+//! copy of any of them.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -38,10 +44,10 @@ use crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status;
 use crate::query_wire::{form_encode, outputs_of};
 
 /// The Region every request below is signed for, and the one every endpoint host names.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The terminal statuses the two stack operations are waited for.
-const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+pub(crate) const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
 
 /// The refusal an HTTP api's `execute-api` endpoint gives a request it serves nothing for,
@@ -62,7 +68,7 @@ const LOCATION_HEADER: &str = "location";
 const LOCAL_ENDPOINT: &str = "localhost:9297";
 
 /// The marker that rewriting carries the endpoint behind.
-const LOCAL_ENDPOINT_PREFIX: &str = "/_aws/execute-api";
+pub(crate) const LOCAL_ENDPOINT_PREFIX: &str = "/_aws/execute-api";
 
 /// An api id of the shape API Gateway mints that nothing in this suite ever creates, so its
 /// `execute-api` endpoint serves nothing — the answer a disabled default endpoint has to be
@@ -74,18 +80,18 @@ const POLL: Duration = Duration::from_millis(25);
 const POLLS: usize = 400;
 
 /// One answered request: its status, its headers and its body verbatim.
-struct Answered {
-    status: u16,
+pub(crate) struct Answered {
+    pub(crate) status: u16,
     headers: BTreeMap<String, String>,
     body: Bytes,
 }
 
 impl Answered {
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 
@@ -96,7 +102,7 @@ impl Answered {
 
 /// The emulator as it is ASSEMBLED, on one engine: the stack's apis are held by the same
 /// router the requests below reach.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = aws_emulator_router::build_router(engine);
     // The suite exercises the services, not SigV4: a control-plane call carries a credential
@@ -108,7 +114,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// A SigV4 `Authorization` whose credential scope names `signing_name`, which is what routes
 /// the request. The signature itself is never checked here.
-fn authorization(signing_name: &str) -> String {
+pub(crate) fn authorization(signing_name: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260101/{REGION}/{signing_name}/\
          aws4_request, SignedHeaders=host, Signature=0000"
@@ -116,7 +122,7 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// Dispatch one request as it arrives on the wire.
-async fn dispatch(
+pub(crate) async fn dispatch(
     router: &MultiServiceRouter,
     method: &str,
     host: &str,
@@ -152,7 +158,7 @@ async fn dispatch(
 }
 
 /// Call one CloudFormation operation over its awsQuery wire.
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     action: &str,
     members: &[(&str, &str)],
@@ -178,12 +184,31 @@ async fn cloudformation(
     .await
 }
 
-/// One API Gateway v2 control-plane call over its `restJson1` wire.
-async fn apigatewayv2(router: &MultiServiceRouter, method: &str, path: &str) -> Answered {
+/// One API Gateway v2 control-plane call over its `restJson1` wire, at that service's own
+/// endpoint host.
+pub(crate) async fn apigatewayv2(router: &MultiServiceRouter, method: &str, path: &str) -> Answered {
+    apigatewayv2_at(
+        router,
+        &format!("apigateway.{REGION}.amazonaws.com"),
+        method,
+        path,
+    )
+    .await
+}
+
+/// The same call addressed at `host`, for a reader that reaches the control plane at an
+/// endpoint OTHER than that service's own — the emulator's own endpoint, say. One spelling of
+/// the wire for both, so a suite that varies the endpoint varies nothing else.
+pub(crate) async fn apigatewayv2_at(
+    router: &MultiServiceRouter,
+    host: &str,
+    method: &str,
+    path: &str,
+) -> Answered {
     dispatch(
         router,
         method,
-        &format!("apigateway.{REGION}.amazonaws.com"),
+        host,
         path,
         &[
             ("content-type", "application/json"),
@@ -349,14 +374,14 @@ fn addressings(api_id: &str, invoke_path: &str) -> Vec<(&'static str, String, St
 
 /// Request one address of an api's default endpoint, as a client of a published endpoint does:
 /// no credential, no body.
-async fn request(router: &MultiServiceRouter, host: &str, path: &str) -> Answered {
+pub(crate) async fn request(router: &MultiServiceRouter, host: &str, path: &str) -> Answered {
     dispatch(router, "GET", host, path, &[], Bytes::new()).await
 }
 
 /// Assert this answer is the one an endpoint that serves NOTHING gives: `404` with the
 /// gateway's own `{"message": "Not Found"}` body, and nothing of the route it would otherwise
 /// have resolved — no redirect to any upstream.
-fn assert_serves_nothing(case: &str, answered: &Answered) {
+pub(crate) fn assert_serves_nothing(case: &str, answered: &Answered) {
     assert_eq!(
         answered.status, NOT_FOUND,
         "case {case:?}: expected HTTP {NOT_FOUND} on a disabled default endpoint, got {} with \
@@ -382,7 +407,7 @@ fn assert_serves_nothing(case: &str, answered: &Answered) {
 
 /// Assert this answer is the route's own: the redirect to the upstream that api's integration
 /// names, which is also what tells one api's answer from another's.
-fn assert_serves_its_route(case: &str, upstream: &str, answered: &Answered) {
+pub(crate) fn assert_serves_its_route(case: &str, upstream: &str, answered: &Answered) {
     assert_eq!(
         answered.status, TEMPORARY_REDIRECT,
         "case {case:?}: expected HTTP {TEMPORARY_REDIRECT} from the route's upstream, got {} \
