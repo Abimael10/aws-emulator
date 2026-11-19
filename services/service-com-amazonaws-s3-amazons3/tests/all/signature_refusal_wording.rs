@@ -153,11 +153,23 @@ impl Emulator {
 /// another: the Regional one, which carries no bucket, so the request is PATH-STYLE.
 pub(crate) const REGIONAL_ENDPOINT_HOST: &str = "s3.us-east-1.amazonaws.com";
 
-/// `YYYYMMDDTHHMMSSZ` for this instant, as SigV4 writes a signing date — rendered by the
+/// `YYYYMMDDTHHMMSSZ` for this instant, as SigV4 writes a signing date.
+pub(crate) fn amz_date_now() -> String {
+    amz_date_at(SystemTime::now())
+}
+
+/// `YYYYMMDDTHHMMSSZ` for `instant`, as SigV4 writes a signing date — rendered by the
 /// library's own calendar (`DateTime::fmt`, RFC 3339 in UTC) with the separators SigV4
 /// omits removed, rather than by any date arithmetic written here.
-pub(crate) fn amz_date_now() -> String {
-    let seconds = SystemTime::now()
+///
+/// The stamp spells WHOLE seconds, which is the precision a signing instant travels in, so
+/// a sub-second part is dropped here the way a signer drops it.
+///
+/// Takes the instant rather than reading the clock, so a suite whose case is WHERE the
+/// instant sits relative to a validity window ([`super::presigned_query_authentication`])
+/// states that placement instead of inheriting whatever the clock said when it started.
+pub(crate) fn amz_date_at(instant: SystemTime) -> String {
+    let seconds = instant
         .duration_since(UNIX_EPOCH)
         .expect("the clock must be after the epoch")
         .as_secs();

@@ -32,14 +32,20 @@
 //! than a 64-bit count holds), the operation addressed (a read of an object, a write of
 //! one, a read of a bucket subresource, a listing of the account's buckets), whether the
 //! bucket named exists, and whether the credential was issued or the signing date has
-//! passed. For the second, how the credential travelled (a presigned query and an
+//! passed — and, at the boundary of that range, where the signing instant sits relative to
+//! the window the URL asks for, which is what decides whether a URL inside the range is
+//! answered for its signature or for its expiry. Every such instant is STATED by the row
+//! rather than taken from the clock as the request is sent, so no row's answer depends on
+//! how long the host took to send it. For the second, how the credential travelled (a presigned query and an
 //! `Authorization` header), the method, the FORM of the key, the shape of the query (a bare
 //! subresource flag beside the signed parameters), the window the URL states, the signature
 //! value presented, and whether the request carried a payload at all or declared the hash of
 //! one.
 
+use std::time::{Duration, SystemTime};
+
 use super::signature_refusal_wording::{
-    amz_date_now, authorization, credential_scope, presigned_query, Emulator,
+    amz_date_at, amz_date_now, authorization, credential_scope, presigned_query, Emulator,
     SIGNATURE_MISMATCH_MESSAGE, SIGV4_ALGORITHM, WRONG_SIGNATURE,
 };
 
@@ -49,6 +55,19 @@ const QUERY_PARAMETERS_CODE: &str = "AuthorizationQueryParametersError";
 
 /// The code a request whose signature did not verify is refused with.
 const SIGNATURE_MISMATCH_CODE: &str = "SignatureDoesNotMatch";
+
+/// The code a presigned request whose validity window has PASSED is refused with — the one
+/// condition that answers a window inside the accepted range before the signature does.
+const EXPIRED_CODE: &str = "AccessDenied";
+
+/// How far from this clock the instant a row's window runs to is placed.
+///
+/// Not a published value and not a budget anything waits out: it is the slack between the
+/// instant a row's window closes and the instant the request is judged, so a row whose
+/// window must still be open stays open — and one whose window has closed stays closed —
+/// however long this suite's own requests take on a loaded host. An hour is far more than a
+/// test run, and far less than the one-week ceiling the range itself states.
+const WINDOW_MARGIN: Duration = Duration::from_secs(60 * 60);
 
 /// The sentence AWS answers a window longer than the one-week ceiling. Fixed text in full,
 /// the ceiling included: nothing in it comes from the request.
@@ -228,28 +247,80 @@ async fn a_window_outside_the_accepted_range_is_refused_for_the_query_string() {
 
 /// RULE 1, its BOUNDARY: a window INSIDE the accepted range is not a query-string refusal
 /// at all — the published ceiling itself is accepted, and what answers such a URL is the
-/// condition that really refused it.
+/// condition that really refused it: the signature while the window is still open, and the
+/// expiry once it has closed.
+///
+/// Every row STATES where its signing instant sits, so which of the two answers it is
+/// follows from the window the row describes rather than from how long the host took to get
+/// here: the instant is placed so the row's window closes [`WINDOW_MARGIN`] after this
+/// clock for a window that must still be open, and that far before it for one that has
+/// closed. A presigned URL is judged on its window rather than on its stamp, so placing the
+/// instant is what fixes the outcome.
 #[tokio::test]
 async fn a_window_inside_the_accepted_range_is_judged_on_its_own_terms() {
     let emulator = Emulator::new();
-    let now = amz_date_now();
+    let now = SystemTime::now();
     let key_id = emulator.access_key_id.clone();
 
-    // (case, the window asked for, the code the refusal carries)
-    let rows: [(&str, &str, &str); 5] = [
-        ("one second of validity", "1", SIGNATURE_MISMATCH_CODE),
-        ("the quarter hour a signer defaults to", "900", SIGNATURE_MISMATCH_CODE),
-        ("one second under the ceiling", "604799", SIGNATURE_MISMATCH_CODE),
-        ("the published ceiling itself", "604800", SIGNATURE_MISMATCH_CODE),
+    // (case, the window asked for, whether it is still open when judged, the code the
+    // refusal carries)
+    let rows: [(&str, &str, bool, &str); 7] = [
+        ("one second of validity", "1", true, SIGNATURE_MISMATCH_CODE),
+        (
+            "the quarter hour a signer defaults to",
+            "900",
+            true,
+            SIGNATURE_MISMATCH_CODE,
+        ),
+        (
+            "one second under the ceiling",
+            "604799",
+            true,
+            SIGNATURE_MISMATCH_CODE,
+        ),
+        (
+            "the published ceiling itself",
+            "604800",
+            true,
+            SIGNATURE_MISMATCH_CODE,
+        ),
         // Zero is inside the range, so it is not a query-string refusal — it is a window
         // that has already closed, which AWS states as the expiry it is.
-        ("no validity at all", "0", "AccessDenied"),
+        ("no validity at all", "0", false, EXPIRED_CODE),
+        // The same length of window, on the other side of its own close: which refusal
+        // answers a URL inside the range turns on the WINDOW's state, not on how many
+        // seconds it asked for.
+        (
+            "the quarter hour a signer defaults to, already closed",
+            "900",
+            false,
+            EXPIRED_CODE,
+        ),
+        (
+            "the published ceiling itself, already closed",
+            "604800",
+            false,
+            EXPIRED_CODE,
+        ),
     ];
 
-    for (case, expires, expected_code) in rows {
+    for (case, expires, open, expected_code) in rows {
+        let window = Duration::from_secs(
+            expires
+                .parse::<u64>()
+                .expect("every window of this table is a count of seconds"),
+        );
+        // The instant the window runs to, placed a generous margin either side of this
+        // clock, and the signing instant that states it.
+        let closes_at = match open {
+            true => now + WINDOW_MARGIN,
+            false => now - WINDOW_MARGIN,
+        };
+        let signed_at = closes_at - window;
+        let amz_date = amz_date_at(signed_at);
         let uri = with_query(
             "/range-bucket/object.txt",
-            &presigned_query(&key_id, &now, expires, WRONG_SIGNATURE),
+            &presigned_query(&key_id, &amz_date, expires, WRONG_SIGNATURE),
         );
         let refused = emulator.send("GET", &uri, &[]).await;
         assert_ne!(
