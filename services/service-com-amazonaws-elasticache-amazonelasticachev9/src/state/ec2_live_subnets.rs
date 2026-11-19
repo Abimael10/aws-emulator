@@ -90,6 +90,31 @@ pub fn group_subnets(held: Vec<AccountSubnet>) -> Vec<SubnetRecord> {
         .collect()
 }
 
+/// `group` as the modelled `CacheSubnetGroup`, over the subnets the OWNER of subnets holds
+/// for it NOW.
+///
+/// The one place a reader of a SINGLE group performs the resolution ([`held_subnets`]) and
+/// the derivation ([`group_subnets_of`]) together, so every answer that carries one group
+/// reports the membership and the network types a describe of the same group reports. A
+/// deployment stood up without the owner of subnets has no inventory to resolve against, and
+/// the group then reports what it stored.
+///
+/// LOCKING: as [`held_subnets`] — the caller must hold no guard of this service's own store.
+pub fn reported_live<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
+    group: &super::CacheSubnetGroupRecord,
+) -> crate::ops::types::CacheSubnetGroup {
+    let named: Vec<String> = group
+        .subnets
+        .iter()
+        .map(|subnet| subnet.subnet_identifier.clone())
+        .collect();
+    match held_subnets(engine, &named) {
+        Some(held) => group.reported_over(&group_subnets_of(group, &held)),
+        None => group.to_modeled(),
+    }
+}
+
 /// The membership of ONE group out of the subnets `held` reports, in the order the group
 /// names them.
 ///

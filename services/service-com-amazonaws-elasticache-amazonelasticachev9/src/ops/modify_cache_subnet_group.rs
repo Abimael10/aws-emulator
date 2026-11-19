@@ -332,6 +332,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             group.subnets = crate::state::ec2_live_subnets::group_subnets(resolved);
             group.vpc_id = placement.vpc_id;
         }
+        // The group as the store now holds it, so the response is the persisted
+        // group rather than the request echoed — taken under the lock that wrote
+        // it, which is then DROPPED before the membership is resolved, because
+        // resolving it takes the lock of the service that owns subnets and no two
+        // store locks are ever held at once (see `crate::state::ec2_live_subnets`).
+        let stored = group.clone();
         // Modifying a cache subnet group is one of the events this service records,
         // under the source type its create and its delete record it under; see
         // `crate::state::EventRecord`.
@@ -341,14 +347,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "Cache subnet group modified",
             now,
         );
+        drop(store);
 
-        // Read back out of the store, so the response is the persisted group rather
-        // than the request echoed.
+        // A group's `Subnets` and `SupportedNetworkTypes` are DERIVED from the
+        // subnets it names as the service that OWNS subnets holds them NOW — the
+        // same derivation `DescribeCacheSubnetGroups` reports a group by, performed
+        // by the one reader of it for a single group — so a modify that changed only
+        // the description still reports the addressing and the membership that hold
+        // at this instant rather than the ones that held when the group was last
+        // written.
         Ok(ModifyCacheSubnetGroupOutput {
-            cache_subnet_group: store
-                .cache_subnet_groups
-                .get(&name)
-                .map(crate::state::CacheSubnetGroupRecord::to_modeled),
+            cache_subnet_group: Some(crate::state::ec2_live_subnets::reported_live(
+                &*self.engine,
+                &stored,
+            )),
         })
     }
 }

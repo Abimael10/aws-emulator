@@ -38,18 +38,22 @@ use crate::harness::{params, Emulator, Reply, REGION};
 const ZONES: [&str; 3] = ["us-east-1a", "us-east-1b", "us-east-1c"];
 
 /// One subnet of a group as the wire reports it, in document order.
+///
+/// Shared with the sibling suite that reads the same members out of a dual-stack group's
+/// answers ([`crate::cache_subnet_group_dual_stack_network_types`]), so one scanner reads
+/// them for every suite of this crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WireSubnet {
-    identifier: String,
-    zone: String,
-    network_types: Vec<String>,
+pub(crate) struct WireSubnet {
+    pub(crate) identifier: String,
+    pub(crate) zone: String,
+    pub(crate) network_types: Vec<String>,
 }
 
 /// Every `Subnet` of the one `CacheSubnetGroup` a reply reports.
 ///
 /// The members of a `Subnet` arrive in the order the shape declares them, so each
 /// `SubnetIdentifier` opens the subnet the following members belong to.
-fn wire_subnets(case: &str, reply: &Reply) -> Vec<WireSubnet> {
+pub(crate) fn wire_subnets(case: &str, reply: &Reply) -> Vec<WireSubnet> {
     let mut reported: Vec<WireSubnet> = Vec::new();
     for (path, text) in &reply.nodes {
         if path.ends_with("/Subnets/Subnet/SubnetIdentifier") {
@@ -78,7 +82,7 @@ fn wire_subnets(case: &str, reply: &Reply) -> Vec<WireSubnet> {
 }
 
 /// The network types the one `CacheSubnetGroup` of a reply publishes for ITSELF.
-fn wire_group_network_types(reply: &Reply) -> Vec<String> {
+pub(crate) fn wire_group_network_types(reply: &Reply) -> Vec<String> {
     reply
         .nodes
         .iter()
@@ -92,7 +96,7 @@ fn wire_group_network_types(reply: &Reply) -> Vec<String> {
 ///
 /// ASKED of the owner, never assumed — and derived here rather than read from the service
 /// under test, so a group that published something else would fail.
-async fn expected_network_types(emulator: &Emulator, subnet_id: &str) -> Vec<String> {
+pub(crate) async fn expected_network_types(emulator: &Emulator, subnet_id: &str) -> Vec<String> {
     let described = emulator
         .ec2(REGION)
         .describe_subnets()
