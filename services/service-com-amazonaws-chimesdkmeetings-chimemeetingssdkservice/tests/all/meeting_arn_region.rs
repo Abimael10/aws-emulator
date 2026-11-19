@@ -10,10 +10,11 @@
 //! Region segment is the Region of the endpoint the call was signed for, with the caller's
 //! account id and the minted `MeetingId` after it — a string a client can rebuild from its
 //! own Region and account. `MediaRegion`, documented as "The Region in which you create the
-//! meeting", is an independent media-placement parameter: it scopes the meeting's media
-//! endpoints (`MediaPlacement`) and appears nowhere in the ARN. The ARN is also the key the
-//! generic tagging routes address the meeting by, so the string a client builds addresses
-//! the meeting it created.
+//! meeting", is an independent request parameter: it is reported as supplied and is part of
+//! no value this service derives — the meeting's media endpoints (`MediaPlacement`) name
+//! the address the caller reached this emulator at, not a Region's host. The ARN is also
+//! the key the generic tagging routes address the meeting by, so the string a client builds
+//! addresses the meeting it created.
 //!
 //! The table spans what the rule generalises over: the endpoint Region the request is
 //! signed for, the `MediaRegion` the request asks for (equal to the endpoint Region,
@@ -29,8 +30,8 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The account id every emulated ARN carries (`engine::emulator_account_id`).
 const ACCOUNT_ID: &str = "000000000000";
 
-/// Every member of the modelled `MediaPlacement` shape that carries a host name scoped to
-/// the meeting's media Region (`smithy_query(query="shape",shape="MediaPlacement")`).
+/// Every member of the modelled `MediaPlacement` shape that carries an address
+/// (`smithy_query(query="shape",shape="MediaPlacement")`).
 const MEDIA_PLACEMENT_MEMBERS: &[&str] = &[
     "AudioHostUrl",
     "AudioFallbackUrl",
@@ -158,11 +159,11 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// RULE: the ARN's Region segment is the endpoint Region; `MediaRegion` scopes the media
-/// endpoints only. Pinned for both creates, read back through `GetMeeting`, and used as the
-/// key of a tagging round trip.
+/// RULE: the ARN's Region segment is the endpoint Region; `MediaRegion` is reported as
+/// supplied and scopes nothing else. Pinned for both creates, read back through
+/// `GetMeeting`, and used as the key of a tagging round trip.
 #[tokio::test]
-async fn a_meetings_arn_names_the_endpoint_region_and_its_media_placement_the_media_region() {
+async fn a_meetings_arn_names_the_endpoint_region_and_its_media_region_scopes_nothing() {
     let emulator = Emulator::new();
 
     for (index, row) in cases().into_iter().enumerate() {
@@ -216,8 +217,9 @@ async fn a_meetings_arn_names_the_endpoint_region_and_its_media_placement_the_me
                  got {:?}",
                 meeting["MeetingArn"]
             );
-            // `MediaRegion` is reported as supplied and is what every media endpoint is
-            // scoped to, so the two Regions are kept apart rather than confused.
+            // `MediaRegion` is reported as supplied, and neither Region reaches a media
+            // endpoint: every one of them names the address this caller reached the
+            // emulator at, which `meeting_projection.rs` pins in full.
             assert_eq!(
                 string_member(&meeting, "MediaRegion"),
                 media_region,
@@ -228,9 +230,9 @@ async fn a_meetings_arn_names_the_endpoint_region_and_its_media_placement_the_me
             for member in MEDIA_PLACEMENT_MEMBERS {
                 let url = string_member(&placement, member);
                 assert!(
-                    url.contains(media_region),
+                    !url.contains(media_region) && !url.contains(endpoint_region),
                     "case {case:?} ({operation}): expected MediaPlacement.{member} to name \
-                     the media Region {media_region}, got {url:?}"
+                     no Region's host, got {url:?}"
                 );
             }
 

@@ -146,12 +146,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetMeetingErrorModeled::ServiceFailureException(crate::state::store_unavailable())
         })?;
         // A pure read: it returns the stored record and changes nothing, so a later
-        // caller sees exactly what this one did.
+        // caller sees exactly what this one did. The `MediaPlacement` it reports is
+        // composed for THIS request, on the address this caller reached the emulator at,
+        // which is the same set the create announced to a caller reached there.
         let store = state.lock();
         let Some(stored) = store.meetings.get(&input.meeting_id) else {
             return Err(GetMeetingErrorModeled::NotFoundException(
@@ -160,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         Ok(GetMeetingOutput {
-            meeting: Some(stored.meeting.clone()),
+            meeting: Some(stored.announced_meeting(ctx)),
         })
     }
 }

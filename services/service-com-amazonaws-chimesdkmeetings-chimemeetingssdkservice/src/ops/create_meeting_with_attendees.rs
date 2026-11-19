@@ -239,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|meeting_id| store.meetings.get(meeting_id))
             .map(|stored| {
                 (
-                    stored.meeting.clone(),
+                    stored.announced_meeting(ctx),
                     stored.attendees.values().cloned().collect::<Vec<Attendee>>(),
                 )
             });
@@ -272,12 +272,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // meeting carries — nor be dropped for want of one.
         let meeting_arn = crate::state::meeting_arn(&meeting_id, &endpoint_region);
         let meeting = Meeting {
-            // Server-owned: the media endpoints and the ARN are DERIVED from the minted
-            // id, never taken from the request.
-            media_placement: Some(crate::state::media_placement(
-                &meeting_id,
-                &input.media_region,
-            )),
+            // Server-owned: the ARN is DERIVED from the minted id, never taken from the
+            // request. `MediaPlacement` is NOT stored: every one of its members is an
+            // address a client dials, so it is composed for the request that reads the
+            // meeting (`StoredMeeting::announced_meeting`) and names the address that
+            // request reached this emulator at.
+            media_placement: None,
             meeting_arn: Some(meeting_arn.clone()),
             meeting_id: Some(meeting_id.clone()),
             // Caller-owned: stored as supplied, so a reader reports what was asked for.
@@ -416,7 +416,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let meeting = stored.meeting.clone();
+        let meeting = stored.announced_meeting(ctx);
         drop(store);
 
         // The pairs go to the family's shared directory, which is the one place any

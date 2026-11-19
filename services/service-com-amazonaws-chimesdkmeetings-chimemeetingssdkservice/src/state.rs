@@ -9,10 +9,11 @@
 //! `DeleteMeeting` remove them transitively and makes it impossible for
 //! `ListAttendees`/`GetAttendee` to reach another meeting's attendees.
 //!
-//! The derivations beside the map — the GUID minting, the `MediaPlacement` endpoints, the
-//! ARN, the documented capability defaults and the documented attendee ceiling — live
-//! here rather than in a handler because several operation files share them, and a second
-//! copy of any of them would let two operations disagree about one meeting.
+//! The derivations beside the map — the GUID minting, the `MediaPlacement` endpoints (in
+//! [`media_endpoints`]), the ARN, the documented capability defaults and the documented
+//! attendee ceiling — live here rather than in a handler because several operation files
+//! share them, and a second copy of any of them would let two operations disagree about one
+//! meeting.
 //!
 //! # Every store here is bounded
 //!
@@ -42,6 +43,11 @@ use crate::ops::types::{
     NotFoundException, NotificationsConfiguration, ResourceNotFoundException,
     ServiceFailureException, TooManyTagsException, TranscriptionConfiguration,
 };
+
+/// The addresses a meeting's `MediaPlacement` announces, which every projection of a
+/// meeting composes for the request that reads it.
+mod media_endpoints;
+pub use media_endpoints::*;
 
 /// The `arnNamespace` this service's ARNs carry (`OPERATIONS.md`, `## Wire protocol`).
 pub const ARN_NAMESPACE: &str = "chime";
@@ -340,7 +346,10 @@ pub fn too_many_tags(resource_arn: &str, requested: usize) -> TooManyTagsExcepti
 /// call resumes there.
 #[derive(Debug, Clone)]
 pub struct StoredMeeting {
-    /// The meeting record, exactly as every reader returns it.
+    /// The meeting record as stored, which every reader returns with its
+    /// `MediaPlacement` composed for the reading request ([`Self::announced_meeting`]):
+    /// the stored record carries no endpoints, because an address is only an address for
+    /// the caller it is announced to.
     pub meeting: Meeting,
     /// The attendees of this meeting, keyed by `AttendeeId`.
     pub attendees: BTreeMap<String, Attendee>,
@@ -388,8 +397,8 @@ impl StoredMeeting {
 
 /// Per-service state for com-amazonaws-chimesdkmeetings-chimemeetingssdkservice. A handler reaches it through [`service_state`].
 ///
-/// The meetings map is NOT partitioned by region: a meeting's media endpoints record the
-/// `MediaRegion` it was created in and its ARN the Region of the endpoint that created it,
+/// The meetings map is NOT partitioned by region: a meeting records the `MediaRegion` it
+/// was created in and its ARN the Region of the endpoint that created it,
 /// but any later call reaches every meeting in the store whatever region it is signed for.
 /// Partitioning the control plane by region is a separate change; nothing here claims it.
 #[derive(Debug, Default)]
@@ -754,8 +763,8 @@ fn content_needs_video_problem() -> String {
 /// not the meeting's `MediaRegion`: the ARN names the control-plane resource, so a client
 /// that builds a meeting's ARN from its own Region and account — to tag it, to write an
 /// IAM resource condition, or to compare it against a stored ARN — builds the same string
-/// this service hands back. `MediaRegion` is an independent request parameter that scopes
-/// the meeting's MEDIA endpoints ([`media_placement`]) and nothing else.
+/// this service hands back. `MediaRegion` is an independent request parameter, reported as
+/// supplied and part of no other value this service derives.
 pub fn meeting_arn(meeting_id: &str, region: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("meeting/{meeting_id}"))
 }
@@ -772,49 +781,6 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// The Region an unsigned request is attributed to; the emulator's default.
 const DEFAULT_REGION: &str = "us-east-1";
 
-/// The media endpoints reported for a meeting.
-///
-/// Every URL is a pure function of the `MeetingId` and the meeting's `MediaRegion`, so
-/// every read of one meeting reports the same `MediaPlacement` — which is what makes
-/// `GetMeeting` equal to what `CreateMeeting` returned. The shapes of the host names
-/// mirror the ones the real service hands out, because a client parses these strings;
-/// this emulator runs no Chime SDK media service, so nothing answers behind them.
-pub fn media_placement(meeting_id: &str, media_region: &str) -> MediaPlacement {
-    MediaPlacement {
-        audio_host_url: Some(format!(
-            "{}.k.m3.{media_region}.app.chime.aws:3478",
-            audio_host_token(meeting_id)
-        )),
-        audio_fallback_url: Some(format!(
-            "wss://haxrp.m3.{media_region}.app.chime.aws:443/calls/{meeting_id}"
-        )),
-        signaling_url: Some(format!(
-            "wss://signal.m3.{media_region}.app.chime.aws/control/{meeting_id}"
-        )),
-        turn_control_url: Some(format!(
-            "https://ccp.cp.{media_region}.app.chime.aws/v2/turn_sessions"
-        )),
-        screen_data_url: Some(format!(
-            "wss://bitpw.m3.{media_region}.app.chime.aws:443/v2/screen/{meeting_id}"
-        )),
-        screen_sharing_url: Some(format!(
-            "wss://bitpw.m3.{media_region}.app.chime.aws:443/v2/screen/{meeting_id}"
-        )),
-        // The bit-hub connect URL a screen viewer is pointed at. Its query string is the
-        // whole viewer connect string the service hands out: a `passcode` and a
-        // `viewer_uuid` that no caller supplies — so both read `null` — ahead of the
-        // meeting's own call id. A client parses this string, so none of its parameters
-        // may be dropped.
-        screen_viewing_url: Some(format!(
-            "wss://bitpw.m3.{media_region}.app.chime.aws:443/ws/connect\
-             ?passcode=null&viewer_uuid=null&X-BitHub-Call-Id={meeting_id}"
-        )),
-        event_ingestion_url: Some(format!(
-            "https://data.svc.{media_region}.ingest.chime.aws/v1/client-events"
-        )),
-    }
-}
-
 /// The tenant ids a stored meeting carries, given what the create asked for.
 ///
 /// The member belongs to the `Meeting` projection itself, so a meeting created without
@@ -824,12 +790,6 @@ pub fn media_placement(meeting_id: &str, media_region: &str) -> MediaPlacement {
 /// about whether the projection carries the member.
 pub fn tenant_ids(requested: Option<Vec<String>>) -> Vec<String> {
     requested.unwrap_or_default()
-}
-
-/// The 8-hex-character per-meeting label the audio host name carries.
-fn audio_host_token(meeting_id: &str) -> String {
-    let digest = Sha256::digest(format!("chime-sdk-meetings/audio-host/{meeting_id}").as_bytes());
-    hex::encode(&digest[..4])
 }
 
 /// One id in the `GuidString` form this service's ids take:

@@ -349,8 +349,9 @@ async fn create_meeting_persists_a_meeting_derived_from_its_minted_id() {
             meeting["MeetingArn"]
         );
 
-        // Every modelled MediaPlacement member is filled in, and each endpoint is scoped
-        // to the meeting's media Region.
+        // Every modelled MediaPlacement member is filled in, and none of them names a
+        // Region's host: each is an address this emulator answers on, which
+        // `meeting_projection.rs` pins in full.
         let placement = meeting
             .get("MediaPlacement")
             .cloned()
@@ -358,9 +359,9 @@ async fn create_meeting_persists_a_meeting_derived_from_its_minted_id() {
         for member in MEDIA_PLACEMENT_MEMBERS {
             let url = string_member(&placement, member);
             assert!(
-                url.contains(&region),
-                "case {case:?}: expected MediaPlacement.{member} to name the media Region \
-                 {region}, got {url:?}"
+                !url.is_empty() && !url.contains(&region),
+                "case {case:?}: expected MediaPlacement.{member} to be an address naming no \
+                 Region, got {url:?}"
             );
         }
         // The per-meeting endpoints carry the meeting's own id, which is what makes two
