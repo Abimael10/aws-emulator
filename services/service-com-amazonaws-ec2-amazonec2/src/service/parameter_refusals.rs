@@ -324,6 +324,26 @@ pub(super) fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation)
                 ),
             })
         }
+        ViolationKind::EnumValue(allowed)
+            if crate::state::is_instance_bandwidth_weighting_catalog(allowed) =>
+        {
+            // A weighting outside the `InstanceBandwidthWeighting` catalog is EC2's own
+            // `InvalidParameterValue` rather than a validation clause, in the sentence this
+            // crate words an unpublished catalog value with
+            // ([`crate::state::instance_bandwidth_weighting_refusal_message`]) — which is the
+            // sentence the handlers that resolve the member answer, so a caller reads one
+            // wording whichever side of dispatch refused the value. Keyed on the catalog, so
+            // a launch's own network performance options and the modify of one instance's are
+            // refused identically. The value it names is already elided to the framework's
+            // `MAX_ECHOED_VALUE`, so echoing it cannot amplify a request into an arbitrarily
+            // long response.
+            Some(Refused {
+                code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
+                message: crate::state::instance_bandwidth_weighting_refusal_message(
+                    violation.value.as_deref().unwrap_or_default(),
+                ),
+            })
+        }
         ViolationKind::MinValue(minimum)
             if violation.path == crate::state::MAX_RESULTS_MEMBER_PATH =>
         {

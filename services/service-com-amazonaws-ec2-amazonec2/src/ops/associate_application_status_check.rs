@@ -156,7 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             deduplicate_ids, holds_instance_association, holds_tag_association,
             initializing_application_status_detail, instance_association_failure_reason,
-            invalid_parameter_combination, missing_parameter,
+            missing_parameter, one_application_status_check_target,
             require_known_application_status_check, require_service_state,
             system_time_to_date_time, tag_association_bytes, tag_association_limit_exceeded,
             tag_association_value, validate_tag_size, ASSOCIATION_TYPE_EC2_TAG,
@@ -217,9 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let asked_tags = input.target_tag_associations.as_deref().unwrap_or_default();
         let asked_instances = input.instance_ids.as_deref().unwrap_or_default();
         if input.target_tag_associations.is_some() && input.instance_ids.is_some() {
-            return Err(invalid_parameter_combination(
-                "You must specify either TargetTagAssociations or InstanceIds, but not both",
-            ));
+            // The sentence lives in `crate::state` beside the rule, so this operation and the
+            // disassociation that publishes the same rule answer it identically.
+            return Err(one_application_status_check_target());
         }
         if asked_tags.is_empty() && asked_instances.is_empty() {
             return Err(missing_parameter(

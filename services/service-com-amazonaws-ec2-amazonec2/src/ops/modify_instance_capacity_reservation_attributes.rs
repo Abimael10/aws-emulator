@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyInstanceCapacityReservationAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyInstanceCapacityReservationAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes the Capacity Reservation targeting the request asks for onto the
+//! stored instance — the preference it runs under and the reservation it runs IN, the two
+//! members `Instance$CapacityReservationSpecification` reports — and moves the reserved
+//! capacity with it, so the reservation's own report of what is available and used follows
+//! the change. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyInstanceCapacityReservationAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Modifies the Capacity Reservation settings for a STOPPED instance": where an instance
+//! runs is chosen when it starts, so an instance in any other state is refused
+//! `IncorrectInstanceState` naming the state the call requires and nothing is written. A
+//! request that targets a particular reservation is held to the rules a launch into one is
+//! held to — the preference that may accompany a target, the reservation's own attributes and
+//! its remaining capacity — through the same readers, so the two cannot disagree about which
+//! instance a reservation can hold.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +143,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyInstanceCapacityReservationAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyInstanceCapacityReservationAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyInstanceCapacityReservationAttributes"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{self, CAPACITY_RESERVATION_PREFERENCE_ONLY, InstanceStateName};
+
+        // Which instance is reconfigured and which reservation it is pointed at are facts of
+        // the ids the request names: nothing here depends on the request's metadata.
+        let _ = ctx;
+
+        let specification = &input.capacity_reservation_specification;
+        // "Indicates the instance's Capacity Reservation preferences"
+        // (`CapacityReservationSpecification$CapacityReservationPreference`), resolved against
+        // the catalog of its own modelled enum, so what reaches the store is a catalog member
+        // rather than the request's text.
+        let preference = state::requested_word(
+            "CapacityReservationPreference",
+            specification
+                .capacity_reservation_preference
+                .as_deref()
+                .filter(|preference| !preference.is_empty()),
+            CAPACITY_RESERVATION_PREFERENCE_VALUES,
+        )?;
+        // "Information about the target Capacity Reservation or Capacity Reservation group"
+        // (`$CapacityReservationTarget`): the reservation this call points the instance AT.
+        let targeted = specification
+            .capacity_reservation_target
+            .as_ref()
+            .and_then(|target| target.capacity_reservation_id.as_deref())
+            .filter(|id| !id.is_empty());
+
+        // "You can only specify `CapacityReservationPreference` and
+        // `CapacityReservationTarget` if the `CapacityReservationPreference` is
+        // `capacity-reservations-only`" (`CapacityReservationSpecification`) — the same rule a
+        // launch that names both is held to, so the two paths refuse the pair identically.
+        if targeted.is_some()
+            && preference.is_some_and(|preference| preference != CAPACITY_RESERVATION_PREFERENCE_ONLY)
+        {
+            return Err(state::parameters_cannot_be_combined(
+                "capacityReservationPreference",
+                "capacityReservationTarget",
+            ));
+        }
+        // The specification is what this call is about, so one that names neither member asks
+        // for no change at all rather than for some default.
+        if preference.is_none() && targeted.is_none() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter capacityReservationPreference or the \
+                 parameter capacityReservationTarget",
+            ));
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Which state an instance is in is a fact of where the clock stands, so every move it
+        // already owed is materialised before one is read.
+        store.materialize_due_transitions();
+
+        // "The ID of the instance to be modified" (`$InstanceId`), resolved through the one
+        // reading of those two refusals this crate has: malformed before not-found.
+        let instance = state::require_instance_record(&store, &input.instance_id)?;
+        let instance_state = instance.state;
+        let instance_id = instance.instance_id.clone();
+        let instance_type = instance.instance_type.clone();
+        let availability_zone = instance.placement_az.clone();
+        let held_reservation = instance.detail.capacity_reservation_id.clone();
+
+        // "Modifies the Capacity Reservation settings for a stopped instance": which capacity
+        // an instance runs in is decided when it is placed, so an instance that is not stopped
+        // has nothing for this call to change.
+        if instance_state != InstanceStateName::Stopped {
+            return Err(Scaffolded::incorrect_instance_state_requires(
+                &instance_id,
+                InstanceStateName::Stopped.as_str(),
+            ));
+        }
+
+        // A reservation the request TARGETS is resolved against the reservation store and
+        // held to the attributes it reserves capacity for — "has matching attributes (instance
+        // type, platform, Availability Zone, and tenancy)"
+        // (`CapacityReservationPreference`) — and to the capacity it has left, so an instance
+        // never points at a reservation that could not hold it. The instance already IN this
+        // reservation takes none of its capacity a second time.
+        if let Some(capacity_reservation_id) = targeted {
+            // The reservation is resolved by the SHAPE an EC2 resource id takes, which is the
+            // reading this operation is recorded taking: a value of that shape the account
+            // holds no reservation under — the all-zero placeholder included — is reported not
+            // found, and only a value outside the shape is malformed.
+            let reservation =
+                state::require_capacity_reservation_by_id_shape(&store, capacity_reservation_id)?;
+            let reserved_instance_type = reservation.view.instance_type.clone();
+            let reserved_zone = reservation.view.availability_zone.clone();
+            let available = reservation.available_instance_count();
+            if reserved_instance_type
+                .as_deref()
+                .is_some_and(|reserved| reserved != instance_type)
+            {
+                return Err(state::capacity_reservation_attributes_do_not_match(
+                    capacity_reservation_id,
+                    "instance type",
+                    reserved_instance_type.as_deref().unwrap_or_default(),
+                    &instance_type,
+                ));
+            }
+            let already_in = held_reservation.as_deref() == Some(capacity_reservation_id);
+            if reserved_zone
+                .as_deref()
+                .is_some_and(|zone| zone != availability_zone)
+                || (!already_in && available < 1)
+            {
+                return Err(state::reservation_capacity_exceeded(capacity_reservation_id));
+            }
+        }
+
+        // DryRun sits after every refusal above and before the first write: "if you have the
+        // required permissions, the error response is DryRunOperation" (`$DryRun`).
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The reservation the instance ends up in: the one this call targets, or none at all
+        // for a preference that says the instance does not run in a particular reservation —
+        // `open` lets it run in any matching reservation and `none` keeps it out of every one,
+        // so neither leaves it pointing at one.
+        let resulting_reservation = match (targeted, preference) {
+            (Some(capacity_reservation_id), _) => Some(capacity_reservation_id.to_string()),
+            (None, Some(_)) => None,
+            (None, None) => held_reservation.clone(),
+        };
+
+        let Some(instance) = store.instances.get_mut(&instance_id) else {
+            return Err(Scaffolded::invalid_instance_id_not_found(&instance_id));
+        };
+        if let Some(preference) = preference {
+            instance.detail.capacity_reservation_preference = preference;
+        } else if targeted.is_some() {
+            // A call that names only a target has said the instance runs in THAT reservation,
+            // which is what `capacity-reservations-only` means — the one preference the
+            // specification admits beside a target.
+            instance.detail.capacity_reservation_preference =
+                CAPACITY_RESERVATION_PREFERENCE_ONLY;
+        }
+        instance.detail.capacity_reservation_id = resulting_reservation.clone();
+
+        // The capacity moves with the instance: the reservation it leaves can be launched
+        // into again, and the one it joins has that much less available — written through the
+        // one pair of writers of that count, so the reservation's own report and this change
+        // cannot disagree.
+        if held_reservation != resulting_reservation {
+            if let Some(left) = held_reservation.as_deref() {
+                store.release_capacity_reservation_capacity(left);
+            }
+            if let Some(joined) = resulting_reservation.as_deref() {
+                store.take_capacity_reservation_capacity(joined);
+            }
+        }
+
+        Ok(ModifyInstanceCapacityReservationAttributesOutput {
+            // "Returns true if the request succeeds; otherwise, it returns an error"
+            // (`$Return`).
+            r#return: Some(true),
+        })
     }
 }

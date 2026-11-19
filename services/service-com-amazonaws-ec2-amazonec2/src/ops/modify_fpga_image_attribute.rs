@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyFpgaImageAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyFpgaImageAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes the ONE attribute of a stored Amazon FPGA Image (AFI) the request
+//! names — its name, its description, the load permissions that say which accounts and
+//! groups may load it onto an FPGA, or the product codes it carries — and answers with that
+//! attribute as it now stands, read back off the store through the one projection
+//! `DescribeFpgaImageAttribute` reports it with. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyFpgaImageAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The AFI is resolved the way every FPGA-image operation of this crate resolves one: a value
+//! EC2 could not have issued as an AFI id is `InvalidFpgaImageID.Malformed` before any
+//! lookup, and an id inside that form the account holds no AFI under is
+//! `InvalidFpgaImageID.NotFound`. A request that does not describe exactly one attribute to
+//! modify is refused rather than answered with an attribute nothing changed.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +82,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::scaffolded::Scaffolded;
+use crate::state::{
+    FpgaImageRecord, aws_account_id_is_well_formed, invalid_user_id_malformed,
+    unknown_attribute_parameter_value,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -146,18 +155,466 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyFpgaImageAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyFpgaImageAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyFpgaImageAttribute"))
+        use crate::state::{
+            FPGA_IMAGE_ID_PREFIX, MAX_STORED_BYTES, dry_run_operation,
+            fpga_image_attribute_id_not_found, internal_error, invalid_fpga_image_id_malformed,
+            prefixed_id_is_well_formed, require_fpga_image_by_id_shape, require_service_state,
+        };
+
+        // An AFI carries no Region member of its own, so nothing here depends on the Region
+        // the request was signed for.
+        let _ = ctx;
+
+        // A value that is not SHAPED like an AFI id is refused BEFORE anything else: there is
+        // nothing to look up, whatever else the request carries. The lookup below asks the
+        // same question again under the lock, where the id meets the store.
+        if !prefixed_id_is_well_formed(FPGA_IMAGE_ID_PREFIX, &input.fpga_image_id) {
+            return Err(invalid_fpga_image_id_malformed(&input.fpga_image_id));
+        }
+
+        // "The name of the attribute" (`$Attribute`) and the value that goes with it. The
+        // modelled enum constraint already refuses a word outside the catalog before this
+        // handler runs; this is the same belt-and-braces check the describe of an AFI
+        // attribute keeps.
+        if let Some(attribute) = input.attribute.as_deref() {
+            if !FPGA_IMAGE_ATTRIBUTE_NAME_VALUES.contains(&attribute) {
+                return Err(unknown_attribute_parameter_value(attribute));
+            }
+        }
+        let change = AttributeChange::read(&input)?;
+
+        // The permission question, answered once the request's own members are read and
+        // before the resource one — the order every FPGA-image operation of this crate keeps.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The AFI is resolved by the SHAPE an EC2 resource id takes, which is the reading
+        // this operation is recorded taking: a value of that shape the account holds no AFI
+        // under — the all-zero placeholder included — is reported not found, and only a value
+        // outside the shape is malformed.
+        let record = require_fpga_image_by_id_shape(
+            &store,
+            &input.fpga_image_id,
+            fpga_image_attribute_id_not_found,
+        )?;
+
+        // The caller-chosen bytes this call would retain, and the ones it gives back: a text
+        // attribute REPLACES the one the AFI carries, and a load permission or a product code
+        // is added to or removed from a list. Charged before the first write, so a call that
+        // cannot be stored changes nothing.
+        let charge = change.charge();
+        let refund = change.refund(record);
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {charge} more",
+                store.stored_bytes()
+            )));
+        }
+
+        let Some(record) = store.fpga_images.get_mut(&input.fpga_image_id) else {
+            return Err(fpga_image_attribute_id_not_found(&input.fpga_image_id));
+        };
+        let attribute = change.apply(record);
+        // The record's own charge moves with what it now holds, so the removal path still
+        // gives back exactly what the store is holding for this AFI.
+        record.payload_bytes = record
+            .payload_bytes
+            .saturating_add(charge)
+            .saturating_sub(refund);
+        let reported = record.attribute_view(attribute).ok_or_else(|| {
+            // Unreachable: every attribute `AttributeChange` resolves is one the projection
+            // answers.
+            internal_error(format!(
+                "'{attribute}' is an AFI attribute this emulator holds no value for"
+            ))
+        })?;
+        store.add_stored_bytes(charge);
+        store.release_stored_bytes(refund);
+
+        // "Information about the attribute" (`$FpgaImageAttribute`), read back off the record
+        // just written through the one projection `DescribeFpgaImageAttribute` reports an AFI
+        // attribute with, so the two cannot disagree about one AFI.
+        Ok(ModifyFpgaImageAttributeOutput {
+            fpga_image_attribute: Some(reported),
+        })
     }
+}
+
+/// The `FpgaImageAttributeName` member naming an AFI's description.
+const FPGA_IMAGE_ATTRIBUTE_DESCRIPTION: &str = "description";
+
+/// The `FpgaImageAttributeName` member naming an AFI's name.
+const FPGA_IMAGE_ATTRIBUTE_NAME: &str = "name";
+
+/// The `FpgaImageAttributeName` member naming the load permissions of an AFI: "which accounts
+/// and groups may load it onto an FPGA" (`FpgaImageAttribute$LoadPermissions`).
+const FPGA_IMAGE_ATTRIBUTE_LOAD_PERMISSION: &str = "loadPermission";
+
+/// The `FpgaImageAttributeName` member naming the product codes an AFI carries.
+const FPGA_IMAGE_ATTRIBUTE_PRODUCT_CODES: &str = "productCodes";
+
+/// "The type of product code" (`ProductCode$ProductCodeType`) a product code a caller adds
+/// through this operation carries: the `marketplace` member of the modelled
+/// `ProductCodeValues` catalog ([`PRODUCT_CODE_VALUES_VALUES`]), the one a code bought
+/// through AWS Marketplace has — its other member, `devpay`, belongs to a retired
+/// billing system no caller can mint a code under any more.
+const PRODUCT_CODE_TYPE_MARKETPLACE: &str = "marketplace";
+
+/// "The type of operation to perform to the attribute" (`$OperationType`) that ADDS what the
+/// request names: the `OperationType` enum's `add` member, the whole catalog being the
+/// generated [`OPERATION_TYPE_VALUES`].
+const OPERATION_TYPE_ADD: &str = "add";
+
+/// The `OperationType` member that REMOVES them.
+const OPERATION_TYPE_REMOVE: &str = "remove";
+
+/// The most modifications one call may make to a list-valued attribute of an AFI: the
+/// grantees it adds and removes, or the product codes it adds.
+///
+/// AWS publishes no ceiling for this operation's own lists, so this is the one the comparable
+/// attribute modify of this model publishes — "you can make up to 500 modifications to a
+/// snapshot in a single operation" (`ModifySnapshotAttribute`), which
+/// `crate::ops::modify_snapshot_attribute` charges its grantees against. The model declares
+/// no `@length` on `LoadPermissionListRequest`, `UserIdStringList`, `UserGroupStringList` or
+/// `ProductCodeStringList`, so the handler is the only place a bound on them can exist, and
+/// it is charged before any per-entry work so the cost of serving one call is bounded
+/// whatever the caller sent.
+pub const MAX_ATTRIBUTE_MODIFICATIONS: usize = 500;
+
+/// The ONE attribute change a call asks for.
+///
+/// "Modifies the specified attribute of the specified Amazon FPGA Image (AFI)": one call
+/// modifies ONE attribute, so a request that describes none has asked for nothing and one
+/// that describes two has asked for a change this operation does not make in a single call.
+/// Which attribute is meant comes from `Attribute` when the request names it, and otherwise
+/// from the single value member it carries — `LoadPermission` alone says the load permissions
+/// are meant, the way a modify of a snapshot's attribute may carry its modification alone.
+#[derive(Debug)]
+enum AttributeChange {
+    /// "A description for the AFI" (`$Description`).
+    Description(String),
+    /// "A name for the AFI" (`$Name`).
+    Name(String),
+    /// "The load permission for the AFI" (`$LoadPermission`): the permissions to add and the
+    /// ones to remove, each already held to the form a grantee takes.
+    LoadPermission {
+        add: Vec<LoadPermission>,
+        remove: Vec<LoadPermission>,
+    },
+    /// "The product codes" (`$ProductCodes`): "after you add a product code to an AFI, it
+    /// can't be removed", so this change only ever adds.
+    ProductCodes(Vec<String>),
+}
+
+impl AttributeChange {
+    /// The change `input` asks for, refused when it does not describe exactly one.
+    fn read<E>(input: &ModifyFpgaImageAttributeInput) -> Result<Self, Scaffolded<E>> {
+        // Every LIST the request carries is bounded by its own COUNT before any per-entry
+        // work is done, so the cost of serving one call is bounded whatever the caller sent:
+        // the model declares no `@length` on any of them, so the handler is the only place
+        // the bound can exist ([`MAX_ATTRIBUTE_MODIFICATIONS`]).
+        let asked_permissions = input
+            .load_permission
+            .as_ref()
+            .map_or(0, |modifications| {
+                modifications.add.as_ref().map_or(0, Vec::len)
+                    + modifications.remove.as_ref().map_or(0, Vec::len)
+            })
+            + input.user_ids.as_ref().map_or(0, Vec::len)
+            + input.user_groups.as_ref().map_or(0, Vec::len);
+        let asked_codes = input.product_codes.as_ref().map_or(0, Vec::len);
+        for (asked, parameter) in [
+            (asked_permissions, "loadPermission"),
+            (asked_codes, "productCode"),
+        ] {
+            if asked > MAX_ATTRIBUTE_MODIFICATIONS {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "This request makes {asked} modifications to {parameter}, above the \
+                     {MAX_ATTRIBUTE_MODIFICATIONS} a single operation may make"
+                )));
+            }
+        }
+
+        let modifications = input.load_permission.clone().unwrap_or_default();
+        let mut add = permissions(modifications.add.as_deref())?;
+        let mut remove = permissions(modifications.remove.as_deref())?;
+        // "The user groups" and "the Amazon Web Services account IDs. This parameter is valid
+        // only when modifying the loadPermission attribute" (`$UserGroups`, `$UserIds`): the
+        // flat form of the same grantees, which takes its direction from `OperationType`.
+        let flat: Vec<LoadPermission> = input
+            .user_ids
+            .iter()
+            .flatten()
+            .map(|user_id| LoadPermission {
+                user_id: Some(user_id.clone()),
+                group: None,
+            })
+            .chain(
+                input
+                    .user_groups
+                    .iter()
+                    .flatten()
+                    .map(|group| LoadPermission {
+                        user_id: None,
+                        group: Some(group.clone()),
+                    }),
+            )
+            .collect();
+        if !flat.is_empty() {
+            match input.operation_type.as_deref() {
+                Some(OPERATION_TYPE_ADD) => add.extend(flat),
+                Some(OPERATION_TYPE_REMOVE) => remove.extend(flat),
+                // The modelled enum constraint is refused by the request walk before this
+                // handler runs, so an operation type that is neither word is an ABSENT one
+                // here: the parameter the request has to contain for those lists to mean
+                // anything.
+                _ => {
+                    return Err(Scaffolded::missing_parameter(
+                        "The request must contain the parameter operationType",
+                    ));
+                }
+            }
+        }
+        // Every grantee is held to the form it takes wherever this service records one: an
+        // account id that is no account id names no account in any partition, and the only
+        // group a permission can name is the one the modelled `PermissionGroup` catalog has.
+        for permission in add.iter().chain(remove.iter()) {
+            if let Some(user_id) = permission.user_id.as_deref() {
+                if !aws_account_id_is_well_formed(user_id) {
+                    return Err(invalid_user_id_malformed(user_id));
+                }
+            }
+            if let Some(group) = permission.group.as_deref() {
+                if !PERMISSION_GROUP_VALUES.contains(&group) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Value ({}) for parameter group is invalid. Valid values are {}",
+                        crate::state::echoed_resource_id(group),
+                        PERMISSION_GROUP_VALUES.join(", ")
+                    )));
+                }
+            }
+        }
+
+        let product_codes: Vec<String> = input
+            .product_codes
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|code| !code.is_empty())
+            .collect();
+        // Which attributes the request carries a VALUE for — the question "exactly one
+        // attribute" is asked of, whether or not `Attribute` names one.
+        let carried: Vec<&'static str> = [
+            (input.description.is_some(), FPGA_IMAGE_ATTRIBUTE_DESCRIPTION),
+            (input.name.is_some(), FPGA_IMAGE_ATTRIBUTE_NAME),
+            (
+                !add.is_empty() || !remove.is_empty(),
+                FPGA_IMAGE_ATTRIBUTE_LOAD_PERMISSION,
+            ),
+            (
+                !product_codes.is_empty(),
+                FPGA_IMAGE_ATTRIBUTE_PRODUCT_CODES,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(carried, attribute)| carried.then_some(attribute))
+        .collect();
+
+        // The attribute this call modifies: the one the request named, or the one it carried a
+        // value for.
+        let attribute = match (input.attribute.as_deref(), carried.as_slice()) {
+            (Some(named), [carried]) if *carried != named => {
+                return Err(Scaffolded::invalid_parameter_combination(format!(
+                    "The request names the attribute '{named}' and carries a value for \
+                     '{carried}', so it does not describe one modification"
+                )));
+            }
+            (Some(named), [_] | []) => named,
+            (None, [carried]) => *carried,
+            (_, []) => {
+                return Err(Scaffolded::missing_parameter(
+                    "The request must contain a value for the attribute it modifies",
+                ));
+            }
+            (_, _) => {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "One call modifies one attribute of an AFI, so values for more than one \
+                     may not be given together",
+                ));
+            }
+        };
+
+        match attribute {
+            FPGA_IMAGE_ATTRIBUTE_DESCRIPTION => Ok(Self::Description(
+                input.description.clone().unwrap_or_default(),
+            )),
+            FPGA_IMAGE_ATTRIBUTE_NAME => Ok(Self::Name(input.name.clone().unwrap_or_default())),
+            FPGA_IMAGE_ATTRIBUTE_LOAD_PERMISSION => {
+                if add.is_empty() && remove.is_empty() {
+                    return Err(Scaffolded::missing_parameter(
+                        "The request must contain the parameter loadPermission",
+                    ));
+                }
+                Ok(Self::LoadPermission { add, remove })
+            }
+            FPGA_IMAGE_ATTRIBUTE_PRODUCT_CODES => {
+                if product_codes.is_empty() {
+                    return Err(Scaffolded::missing_parameter(
+                        "The request must contain the parameter productCode",
+                    ));
+                }
+                Ok(Self::ProductCodes(product_codes))
+            }
+            // Unreachable: the catalog check in the handler admits only the four members
+            // above.
+            other => Err(unknown_attribute_parameter_value(other)),
+        }
+    }
+
+    /// The caller-chosen bytes this change would retain.
+    fn charge(&self) -> usize {
+        match self {
+            Self::Description(text) | Self::Name(text) => text.len(),
+            Self::LoadPermission { add, .. } => add.iter().map(permission_bytes).sum(),
+            Self::ProductCodes(codes) => codes.iter().map(String::len).sum(),
+        }
+    }
+
+    /// The caller-chosen bytes this change gives back: the text it replaces, or the
+    /// permissions it removes from the AFI — counted off the STORED record, so only what the
+    /// store is actually holding is ever refunded.
+    ///
+    /// The removals are read through a SET, so the cost is one lookup per held permission
+    /// rather than a scan of the removals for each of them.
+    fn refund(&self, record: &FpgaImageRecord) -> usize {
+        match self {
+            Self::Description(_) => record.view.description.as_ref().map_or(0, String::len),
+            Self::Name(_) => record.view.name.as_ref().map_or(0, String::len),
+            Self::LoadPermission { remove, .. } => {
+                let removed = grantee_set(remove);
+                record
+                    .load_permissions
+                    .iter()
+                    .filter(|held| removed.contains(&grantee(held)))
+                    .map(permission_bytes)
+                    .sum()
+            }
+            // "After you add a product code to an AFI, it can't be removed", so nothing is
+            // ever given back on this path.
+            Self::ProductCodes(_) => 0,
+        }
+    }
+
+    /// Write this change onto `record` and answer the attribute it modified.
+    fn apply(&self, record: &mut FpgaImageRecord) -> &'static str {
+        match self {
+            // The EMPTY text is what a request that names no value for a text attribute
+            // carries, and it is a value: it leaves the AFI with no name or description, which
+            // is what an AFI created without one holds.
+            Self::Description(text) => {
+                record.view.description = Some(text.clone()).filter(|text| !text.is_empty());
+                FPGA_IMAGE_ATTRIBUTE_DESCRIPTION
+            }
+            Self::Name(text) => {
+                record.view.name = Some(text.clone()).filter(|text| !text.is_empty());
+                FPGA_IMAGE_ATTRIBUTE_NAME
+            }
+            // The removals are applied before the additions, so one call that names the same
+            // grantee both ways leaves it holding the permission: the request asked for it.
+            // A grantee the AFI already has is not recorded twice — a permission is held or
+            // it is not — and which grantees are held is read through a SET, so each decision
+            // is one lookup rather than a scan of the permissions beside it.
+            Self::LoadPermission { add, remove } => {
+                let removed = grantee_set(remove);
+                record
+                    .load_permissions
+                    .retain(|held| !removed.contains(&grantee(held)));
+                let mut held_grantees = grantee_set(&record.load_permissions);
+                for granted in add {
+                    if held_grantees.insert(grantee(granted)) {
+                        record.load_permissions.push(granted.clone());
+                    }
+                }
+                FPGA_IMAGE_ATTRIBUTE_LOAD_PERMISSION
+            }
+            Self::ProductCodes(codes) => {
+                let held = record.view.product_codes.get_or_insert_with(Vec::new);
+                let mut held_ids: ::std::collections::BTreeSet<Option<String>> =
+                    held.iter().map(|code| code.product_code_id.clone()).collect();
+                for code in codes {
+                    if held_ids.insert(Some(code.clone())) {
+                        held.push(ProductCode {
+                            product_code_id: Some(code.clone()),
+                            product_code_type: Some(PRODUCT_CODE_TYPE_MARKETPLACE.to_string()),
+                        });
+                    }
+                }
+                FPGA_IMAGE_ATTRIBUTE_PRODUCT_CODES
+            }
+        }
+    }
+}
+
+/// The load permissions one `LoadPermissionListRequest` names.
+///
+/// Each entry names "the Amazon Web Services account ID" (`LoadPermissionRequest$UserId`),
+/// "the name of the group" (`$Group`), or both; one that names NEITHER describes no
+/// permission at all, which is a modification the service cannot make.
+fn permissions<E>(
+    requested: Option<&[LoadPermissionRequest]>,
+) -> Result<Vec<LoadPermission>, Scaffolded<E>> {
+    let mut read = Vec::new();
+    for permission in requested.unwrap_or_default() {
+        // An EMPTY value names nothing: `UserId=` is a member the request carried without
+        // saying which account, so it is read as absent rather than as the account whose id
+        // is the empty string.
+        let user_id = permission
+            .user_id
+            .as_deref()
+            .filter(|user_id| !user_id.is_empty());
+        let group = permission
+            .group
+            .as_deref()
+            .filter(|group| !group.is_empty());
+        match (user_id, group) {
+            (None, None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "Each load permission must name a user ID or a group",
+                ));
+            }
+            (user_id, group) => read.push(LoadPermission {
+                user_id: user_id.map(str::to_string),
+                group: group.map(str::to_string),
+            }),
+        }
+    }
+    Ok(read)
+}
+
+/// The GRANTEE one load permission names: the account id and the group it carries, as a key
+/// two permissions are the same permission when they share.
+///
+/// The ONE reading of that identity, so a removal, a repeated addition and the refund all
+/// decide "is this the permission the AFI holds?" the same way — and through a set rather
+/// than a scan.
+fn grantee(permission: &LoadPermission) -> (Option<String>, Option<String>) {
+    (permission.user_id.clone(), permission.group.clone())
+}
+
+/// The grantees `permissions` name, as a set.
+fn grantee_set(
+    permissions: &[LoadPermission],
+) -> ::std::collections::BTreeSet<(Option<String>, Option<String>)> {
+    permissions.iter().map(grantee).collect()
+}
+
+/// The caller-chosen bytes one stored load permission holds: the account id and the group it
+/// names.
+fn permission_bytes(permission: &LoadPermission) -> usize {
+    permission.user_id.as_ref().map_or(0, String::len)
+        + permission.group.as_ref().map_or(0, String::len)
 }

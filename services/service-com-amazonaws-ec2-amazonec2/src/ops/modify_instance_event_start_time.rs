@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyInstanceEventStartTime
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyInstanceEventStartTime`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: resolves the instance and the scheduled event the request names against the
+//! store and moves that event's start time to the instant the request asks for, answering
+//! with the event as it then stands. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyInstanceEventStartTime::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A SCHEDULED EVENT is one Amazon EC2 itself planned against the host an instance runs on
+//! — no API of this service creates one, which is why this operation only MOVES the start
+//! time of an event that already exists. The events an instance has are read through the one
+//! reading of them this crate has ([`crate::state::scheduled_instance_events`]), the reading
+//! `DescribeInstanceStatus` reports from, so this operation and that describe cannot disagree
+//! about which events an instance has: nothing in this emulator plans maintenance, so an
+//! event id names no event of the instance it was asked about and the request is refused
+//! `InvalidInstanceEventId.NotFound` rather than answered with an event nothing scheduled.
+//!
+//! The instance id is resolved first and on its own terms: a value outside the form EC2
+//! issues is `InvalidInstanceID.Malformed` before any lookup, and an id inside that form the
+//! account holds no instance under is `InvalidInstanceID.NotFound`.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +145,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyInstanceEventStartTime` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyInstanceEventStartTimeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyInstanceEventStartTime"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            self, invalid_instance_event_id_not_found, scheduled_instance_event,
+        };
+
+        // A scheduled event belongs to the instance, reached by the ids the request names:
+        // nothing here depends on the request's headers or URI.
+        let _ = ctx;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Which state an instance is in, and so what it reports, is a fact of where the clock
+        // stands: every move it already owed is materialised before it is read.
+        store.materialize_due_transitions();
+
+        // "The ID of the instance with the scheduled event" (`$InstanceId`), resolved through
+        // the one reading of those two refusals this crate has: malformed before not-found.
+        let instance = state::require_instance_record(&store, &input.instance_id)?;
+
+        // "The ID of the event whose date and time you are modifying" (`$InstanceEventId`),
+        // resolved against the events THAT instance has. An id that names none of them names
+        // no event this call could move.
+        let Some(event) = scheduled_instance_event(instance, &input.instance_event_id) else {
+            return Err(invalid_instance_event_id_not_found());
+        };
+
+        // DryRun sits after every refusal above and before the move: "if you have the
+        // required permissions, the error response is DryRunOperation" (`$DryRun`), so a
+        // request that would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // Unreachable while nothing in this emulator schedules an instance event: the lookup
+        // above resolves against the events an instance HAS, and no instance of this store
+        // has one, so no request reaches here. The move of an event's start time is written
+        // here, beside the reading it would be written through, when maintenance events
+        // become part of this store.
+        let _ = event;
+        Err(state::internal_error(format!(
+            "the scheduled event '{}' of instance '{}' holds no start time this emulator \
+             can move",
+            state::echoed_resource_id(&input.instance_event_id),
+            input.instance_id
+        )))
     }
 }

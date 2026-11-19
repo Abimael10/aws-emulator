@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateApplicationStatusCheck
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateApplicationStatusCheck`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the association between one application status check and the
+//! instances the request names, or the tags it names, from the two stores
+//! `AssociateApplicationStatusCheck` wrote them to — the check's own `TargetTagAssociations`
+//! member, which `DescribeApplicationStatusChecks` reports, and the per-check result the
+//! instance holds, which `DescribeApplicationStatus` reports — so "after disassociation,
+//! health monitoring stops for the affected instances". This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateApplicationStatusCheck::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The mirror of `crate::ops::associate_application_status_check`, holding a request to the
+//! same published rules through the same readers: exactly one of the two target members ("you
+//! must specify either TargetTagAssociations or InstanceIds, but not both. Specifying both
+//! results in an InvalidParameterCombination error"), a check of the account ("the
+//! application status check must already exist and belong to your account") and no blank tag
+//! key. An item that was not associated in the first place is reported on its own
+//! unsuccessful row rather than refusing the items beside it.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +156,229 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateApplicationStatusCheck` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateApplicationStatusCheckErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateApplicationStatusCheck"))
+        use ::std::time::SystemTime;
+
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            ASSOCIATION_TYPE_EC2_TAG, ASSOCIATION_TYPE_INSTANCE_ID,
+            MAX_APPLICATION_STATUS_CHECK_TAG_ASSOCIATIONS, MAX_CLIENT_TOKEN_CHARS,
+            MAX_RESOURCE_IDS, deduplicate_ids, holds_instance_association, holds_tag_association,
+            instance_association_failure_reason, missing_parameter,
+            one_application_status_check_target, require_known_application_status_check,
+            require_service_state, system_time_to_date_time, tag_association_bytes,
+            tag_association_value, validate_tag_size,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — what a check
+        // is associated with is a fact of the check and of the instances, not of the Region
+        // the request was signed for. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The ID of the application status check to disassociate": the SUBJECT of the call is
+        // resolved first, through the one reader both halves of that refusal come from — a
+        // value that is not an id of this kind before a well-formed id the account holds no
+        // check under.
+        let application_status_check_id = input.application_status_check_id.clone();
+
+        // "A unique, case-sensitive identifier that you provide to ensure that the operation
+        // completes no more than one time" (`$ClientToken`): a disassociation that already
+        // holds answers the same way whoever repeats it, so there is no token to record — but
+        // the value a caller sends is still held to the length every other token of this
+        // crate is.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // "You must specify either TargetTagAssociations or InstanceIds, but not both.
+        // Specifying both results in an InvalidParameterCombination error" — a rule about
+        // which members the request SPECIFIES, so it is read off their presence rather than
+        // off their contents, and a request that specifies neither has named no target at
+        // all, which is a member it left out.
+        let asked_tags = input.target_tag_associations.as_deref().unwrap_or_default();
+        let asked_instances = input.instance_ids.as_deref().unwrap_or_default();
+        if input.target_tag_associations.is_some() && input.instance_ids.is_some() {
+            return Err(one_application_status_check_target());
+        }
+        if asked_tags.is_empty() && asked_instances.is_empty() {
+            return Err(missing_parameter(
+                "You must specify either TargetTagAssociations or InstanceIds",
+            ));
+        }
+
+        // Both LISTS are bounded before any work proportional to them is done — the pairs by
+        // the ceiling one check holds ("you can create a maximum of 50 tag associations for
+        // each application status check", so a request naming more pairs than that can never
+        // name associations a check has), the ids the way every id list of this crate is — and
+        // this is all asked BEFORE the store is locked, so no request's own parameter work is
+        // charged to the callers waiting on it.
+        if asked_tags.len() > MAX_APPLICATION_STATUS_CHECK_TAG_ASSOCIATIONS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "TargetTagAssociations carries {} pairs, above the \
+                 {MAX_APPLICATION_STATUS_CHECK_TAG_ASSOCIATIONS} tag associations a check \
+                 holds",
+                asked_tags.len()
+            )));
+        }
+        if asked_instances.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                asked_instances.len()
+            )));
+        }
+
+        // "Specify the same key-value pairs that were used during association"
+        // (`$TargetTagAssociations`): "tag keys must not be blank", a value is as long as any
+        // other tag value, and the same pair named twice names one association — which a SET
+        // of the pairs already seen decides in one lookup each rather than in a scan of the
+        // pairs before it.
+        let mut seen: ::std::collections::BTreeSet<(String, String)> =
+            ::std::collections::BTreeSet::new();
+        let mut asked_pairs: Vec<(String, String)> = Vec::with_capacity(asked_tags.len());
+        for pair in asked_tags {
+            let key = pair.key.clone().unwrap_or_default();
+            if key.is_empty() {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "A tag key cannot be empty",
+                ));
+            }
+            let value = pair.value.clone().unwrap_or_default();
+            validate_tag_size(&key, &value)?;
+            if seen.insert((key.clone(), value.clone())) {
+                asked_pairs.push((key, value));
+            }
+        }
+
+        let asked_instance_ids = deduplicate_ids(asked_instances);
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        require_known_application_status_check(&store, &application_status_check_id)?;
+
+        // What this call would do to each item it was given, decided before anything is
+        // removed: an instance this check monitors stops being monitored, one the account does
+        // not hold fails on its own row with the reason this service refuses that id with, and
+        // one the check does not monitor fails on its own row too — there is no association of
+        // it to remove.
+        let mut successful: Vec<SuccessfulAssociationResponseObject> = Vec::new();
+        let mut unsuccessful: Vec<UnsuccessfulAssociationResponseObject> = Vec::new();
+        let mut instances_to_disassociate: Vec<String> = Vec::new();
+        for instance_id in &asked_instance_ids {
+            let reason = instance_association_failure_reason(&store, instance_id).or_else(|| {
+                (!holds_instance_association(
+                    &store,
+                    &application_status_check_id,
+                    instance_id,
+                ))
+                .then(|| NOT_ASSOCIATED_REASON.to_string())
+            });
+            match reason {
+                Some(reason) => unsuccessful.push(UnsuccessfulAssociationResponseObject {
+                    application_status_check_id: Some(application_status_check_id.clone()),
+                    association_type: Some(ASSOCIATION_TYPE_INSTANCE_ID.to_string()),
+                    association_value: Some(instance_id.clone()),
+                    reason: Some(reason),
+                }),
+                None => {
+                    instances_to_disassociate.push(instance_id.clone());
+                    successful.push(SuccessfulAssociationResponseObject {
+                        application_status_check_id: Some(application_status_check_id.clone()),
+                        association_type: Some(ASSOCIATION_TYPE_INSTANCE_ID.to_string()),
+                        association_value: Some(instance_id.clone()),
+                    });
+                }
+            }
+        }
+
+        // The tag pairs this call would remove: the ones the check actually monitors by.
+        let mut pairs_to_remove: Vec<CustomTagKeyValueResponsePair> = Vec::new();
+        for (key, value) in &asked_pairs {
+            let held = store
+                .application_status_checks
+                .get(&application_status_check_id)
+                .is_some_and(|check| holds_tag_association(check, key, value));
+            if held {
+                pairs_to_remove.push(CustomTagKeyValueResponsePair {
+                    key: Some(key.clone()),
+                    value: Some(value.clone()),
+                });
+                successful.push(SuccessfulAssociationResponseObject {
+                    application_status_check_id: Some(application_status_check_id.clone()),
+                    association_type: Some(ASSOCIATION_TYPE_EC2_TAG.to_string()),
+                    association_value: Some(tag_association_value(key, value)),
+                });
+            } else {
+                unsuccessful.push(UnsuccessfulAssociationResponseObject {
+                    application_status_check_id: Some(application_status_check_id.clone()),
+                    association_type: Some(ASSOCIATION_TYPE_EC2_TAG.to_string()),
+                    association_value: Some(tag_association_value(key, value)),
+                    reason: Some(NOT_ASSOCIATED_REASON.to_string()),
+                });
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves both stores untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let now = SystemTime::now();
+
+        // The tag half: the pairs come off the check itself, the member
+        // `DescribeApplicationStatusChecks` reports, and the bytes they were charged are given
+        // back — the mirror of what the association charged for them.
+        if !pairs_to_remove.is_empty() || !instances_to_disassociate.is_empty() {
+            let freed = tag_association_bytes(&pairs_to_remove);
+            let Some(check) = store
+                .application_status_checks
+                .get_mut(&application_status_check_id)
+            else {
+                return Err(Scaffolded::internal_error(format!(
+                    "the application status check '{application_status_check_id}' was \
+                     resolved and then could not be written"
+                )));
+            };
+            if let Some(held) = check.target_tag_associations.as_mut() {
+                held.retain(|pair| {
+                    !pairs_to_remove.iter().any(|removed| {
+                        removed.key == pair.key && removed.value == pair.value
+                    })
+                });
+            }
+            // "The date and time when the application status check was last updated"
+            // (`$LastUpdatedAt`): a disassociation of either half is such an update of the
+            // check, so a call that made one is dated here whichever half it named.
+            check.last_updated_at = Some(system_time_to_date_time(now));
+            store.release_stored_bytes(freed);
+        }
+
+        // The instance half: "after disassociation, health monitoring stops for the affected
+        // instances", so the per-check result each disassociated instance held is gone and
+        // `DescribeApplicationStatus` reports this check for it no longer.
+        for instance_id in instances_to_disassociate {
+            if let Some(record) = store.application_status.get_mut(&instance_id) {
+                record.details.remove(&application_status_check_id);
+            }
+        }
+
+        Ok(DisassociateApplicationStatusCheckOutput {
+            successful_results: Some(successful),
+            unsuccessful_results: Some(unsuccessful),
+        })
     }
 }
+
+/// "The reason the association failed to be removed"
+/// (`UnsuccessfulAssociationResponseObject$Reason`) for the one cause this operation has
+/// beside an instance the account does not hold: the check was not associated with that
+/// instance or that tag, so there was no association of it to remove.
+const NOT_ASSOCIATED_REASON: &str =
+    "The application status check is not associated with this target";

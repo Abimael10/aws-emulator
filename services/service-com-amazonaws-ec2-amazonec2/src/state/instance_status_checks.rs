@@ -30,7 +30,9 @@ use super::{
     zone_id_for_zone_name, ComAmazonawsEc2Amazonec2State, InstanceRecord, InstanceStateName,
     TRANSITION_DELAY,
 };
-use crate::ops::types::{InstanceStatus, InstanceStatusDetails, InstanceStatusSummary};
+use crate::ops::types::{
+    InstanceStatus, InstanceStatusDetails, InstanceStatusEvent, InstanceStatusSummary,
+};
 
 /// How long after its guest came up an instance's status checks PASS.
 ///
@@ -171,7 +173,11 @@ impl ComAmazonawsEc2Amazonec2State {
             // reported on one.
             outpost_arn: None,
             operator: Some(super::unmanaged_operator()),
-            events: None,
+            // The scheduled events of this instance, through the one reading of them
+            // ([`scheduled_instance_events`]): absent for an instance with none, which the
+            // shape's own optionality is for.
+            events: Some(scheduled_instance_events(instance))
+                .filter(|events| !events.is_empty()),
             instance_id: Some(instance.instance_id.clone()),
             instance_state: Some(instance.state.view()),
             instance_status: Some(instance_status),
@@ -181,6 +187,61 @@ impl ComAmazonawsEc2Amazonec2State {
             performance_status: None,
         }
     }
+}
+
+/// The SCHEDULED EVENTS one instance reports: "any scheduled events associated with the
+/// instance" (`InstanceStatus$Events`).
+///
+/// Amazon EC2 schedules these itself, for maintenance it has planned on the host an instance
+/// runs on — "scheduled events for your instances" are created by EC2, and no API of this
+/// service creates one: `ModifyInstanceEventStartTime` moves the start time of one EC2 has
+/// already scheduled, and `DescribeInstanceStatus` reports it. Nothing in this emulator plans
+/// maintenance, so no instance of this store has an event scheduled against it, and an event
+/// is never invented for one: an instance reports the events it HAS, which is none.
+///
+/// The ONE reading of them, so the describe that reports an instance's events and the modify
+/// that moves one cannot disagree about which events an instance has.
+pub fn scheduled_instance_events(instance: &InstanceRecord) -> Vec<InstanceStatusEvent> {
+    let _ = instance;
+    Vec::new()
+}
+
+/// The scheduled event of `instance` that `instance_event_id` names, if it has one.
+///
+/// Read off [`scheduled_instance_events`], so an operation that acts on ONE event resolves it
+/// against exactly the events the describe reports for that instance.
+pub fn scheduled_instance_event(
+    instance: &InstanceRecord,
+    instance_event_id: &str,
+) -> Option<InstanceStatusEvent> {
+    scheduled_instance_events(instance)
+        .into_iter()
+        .find(|event| event.instance_event_id.as_deref() == Some(instance_event_id))
+}
+
+/// The code EC2 answers for an instance event id the instance it was asked about has no
+/// scheduled event under.
+///
+/// The not-found half of the resource-id pair this service answers for every other kind of
+/// id: the id resolved to no event of that instance, so retrying it unchanged can only fail
+/// again. Spelt WITHOUT the dot every other not-found code of this service carries —
+/// `ModifyInstanceEventStartTime` is recorded answering exactly this word — so it is named
+/// here once rather than assembled from the pattern the other id kinds follow.
+pub const INVALID_INSTANCE_EVENT_ID_NOT_FOUND: &str = "InvalidInstanceEventIDNotFound";
+
+/// Refuse a request naming an instance event the instance has no scheduled event for: HTTP
+/// 400 [`INVALID_INSTANCE_EVENT_ID_NOT_FOUND`].
+///
+/// AWS's sentence for this class is FIXED text end to end — `Cannot find event`, naming
+/// neither the event nor the instance — which is what `ModifyInstanceEventStartTime` is
+/// recorded answering, so every operation that cannot find a scheduled event answers exactly
+/// this one.
+pub fn invalid_instance_event_id_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_INSTANCE_EVENT_ID_NOT_FOUND,
+        400,
+        "Cannot find event",
+    )
 }
 
 /// The values one instance holds for the `DescribeInstanceStatus` filter `name`, or `None`

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyInstancePlacement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyInstancePlacement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes WHERE one stopped instance is placed — its Dedicated Host and the
+//! affinity it has for one, its tenancy, the placement group and partition it sits in, and
+//! the host resource group it draws hosts from — onto the stored instance, so the
+//! `Instance$Placement` `DescribeInstances` reports is the one this call left. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyInstancePlacement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every attribute this call writes is chosen for an instance when it is PLACED on hardware,
+//! which happens when it starts: "to modify the host ID, tenancy, placement group, or
+//! partition for an instance, the instance must be in the stopped state", so an instance in
+//! any other state is refused `InvalidInstanceState` naming the state the call requires and
+//! nothing is written. Each resource the request names is resolved against the store it
+//! lives in before anything is written — the placement group store by name or by id, the
+//! Dedicated Host store — so an instance never reports a group or a host the account does
+//! not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +163,276 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyInstancePlacement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyInstancePlacementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyInstancePlacement"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            self, InstanceStateName, MAX_PLACEMENT_GROUP_PARTITION_COUNT,
+            MIN_PLACEMENT_GROUP_PARTITION_COUNT, PLACEMENT_STRATEGY_PARTITION, TENANCY_HOST,
+        };
+
+        // Where an instance is placed is a fact of the instance and of the resources the
+        // request names by id: nothing here depends on the request's headers or URI.
+        let _ = ctx;
+
+        // "At least one attribute for affinity, host ID, tenancy, or placement group name
+        // must be specified in the request": a request naming none asks for no change at
+        // all, so it is refused rather than answered with a 200 that wrote nothing. A
+        // partition, a group id and a host resource group are placements too, so naming one
+        // of those is naming an attribute.
+        let group_name = input.group_name.as_deref();
+        let names_something = input.affinity.is_some()
+            || input.host_id.is_some()
+            || input.tenancy.is_some()
+            || group_name.is_some()
+            || input.group_id.is_some()
+            || input.partition_number.is_some()
+            || input.host_resource_group_arn.is_some();
+        if !names_something {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain at least one of the parameters affinity, hostId, \
+                 tenancy or groupName",
+            ));
+        }
+
+        // A placement group is named ONCE: "you must specify the Placement Group Group Id to
+        // launch an instance in a shared placement group" (`$GroupId`) is the other way of
+        // naming the same group as `$GroupName`, so a request carrying both has named it
+        // twice and is refused rather than one of the two being preferred silently.
+        if input.group_id.is_some() && group_name.is_some() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "A placement group is named once, so groupId and groupName may not be given \
+                 together",
+            ));
+        }
+
+        // Each word the request asks for, resolved against the catalog of that member's own
+        // modelled enum, so what reaches the store is a catalog member rather than the
+        // request's text. `None` is "the request left this member out", which asks for no
+        // change to that attribute.
+        let affinity = state::requested_word("Affinity", input.affinity.as_deref(), AFFINITY_VALUES)?;
+        let tenancy = state::requested_word("Tenancy", input.tenancy.as_deref(), HOST_TENANCY_VALUES)?;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Which state an instance is in is a fact of where the clock stands, so every move it
+        // already owed is materialised before one is read: the refusal below is answered from
+        // the state the same instant's `DescribeInstances` reports.
+        store.materialize_due_transitions();
+
+        // "The ID of the instance that you are modifying" (`$InstanceId`), resolved through
+        // the one reading of those two refusals this crate has: malformed before not-found.
+        let instance = state::require_instance_record(&store, &input.instance_id)?;
+        let instance_state = instance.state;
+        let instance_id = instance.instance_id.clone();
+        let held_tenancy = instance.detail.tenancy;
+        let held_group_name = instance.detail.placement_group_name.clone();
+        let held_host_id = instance.detail.host_id.clone();
+        let held_host_resource_group_arn = instance.detail.host_resource_group_arn.clone();
+
+        // "To modify the host ID, tenancy, placement group, or partition for an instance, the
+        // instance must be in the stopped state": every attribute of a placement is chosen
+        // when the instance is placed on hardware, which happens when it starts, so an
+        // instance that is not stopped has no placement this call can change. The refusal
+        // names WHAT cannot be changed — the attribute the request asked to change, taken in
+        // the order the operation documents them — which is the sentence this operation words
+        // that class with.
+        if instance_state != InstanceStateName::Stopped {
+            return Err(Scaffolded::attribute_requires_instance_state(
+                changed_subject(&input),
+                InstanceStateName::Stopped.as_str(),
+            ));
+        }
+
+        // "You can't change the tenancy from host to dedicated or default. Attempting to make
+        // one of these unsupported tenancy changes results in an InvalidRequest error code"
+        // (`$Tenancy`).
+        if held_tenancy == TENANCY_HOST && tenancy.is_some_and(|asked| asked != TENANCY_HOST) {
+            return Err(state::invalid_request(format!(
+                "The tenancy of instance '{instance_id}' cannot be changed from \
+                 '{TENANCY_HOST}'"
+            )));
+        }
+        // The tenancy the instance will have once this call is served, which is what the
+        // members that require one are judged against.
+        let resulting_tenancy = tenancy.unwrap_or(held_tenancy);
+
+        // "The instance must have a tenancy of host to specify this parameter"
+        // (`$HostResourceGroupArn`), and a host resource group is where a host is drawn FROM,
+        // so naming it beside one particular host names two placements for one instance.
+        if input.host_resource_group_arn.is_some() {
+            if input.host_id.is_some() {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "An instance is placed on one host, so hostId and hostResourceGroupArn \
+                     may not be given together",
+                ));
+            }
+            if resulting_tenancy != TENANCY_HOST {
+                return Err(Scaffolded::invalid_parameter_combination(format!(
+                    "hostResourceGroupArn requires the instance to have a tenancy of \
+                     '{TENANCY_HOST}'"
+                )));
+            }
+        }
+
+        // The placement group this call puts the instance in, resolved against the placement
+        // group store: by NAME, or by the id that names the same group. "To remove an
+        // instance from a placement group, specify an empty string" (`$GroupName`), so the
+        // empty name is the one value that resolves to no group at all. `None` leaves the
+        // instance in the group it is already in.
+        let group: Option<Option<String>> = match (group_name, input.group_id.as_deref()) {
+            (Some(""), _) => Some(None),
+            (Some(group_name), _) => {
+                if store.placement_group_id_for_name(group_name).is_none() {
+                    return Err(state::invalid_placement_group_unknown(group_name));
+                }
+                Some(Some(group_name.to_string()))
+            }
+            (None, Some(group_id)) => {
+                let named = store
+                    .placement_groups
+                    .get(group_id)
+                    .and_then(|group| group.group_name.clone())
+                    .ok_or_else(|| state::invalid_placement_group_unknown(group_id))?;
+                Some(Some(named))
+            }
+            (None, None) => None,
+        };
+
+        // The group the instance is in once this call is served — the one it moves into, or
+        // the one it is already in — which is the group a partition has to be a partition OF.
+        let resulting_group_name = match group.clone() {
+            Some(group_name) => group_name,
+            None => held_group_name.clone(),
+        };
+        // "The number of the partition in which to place the instance. Valid only if the
+        // placement group strategy is set to partition" (`$PartitionNumber`), and a group has
+        // exactly as many partitions as it was created with, so a number outside them names a
+        // partition the group does not have.
+        if let Some(partition_number) = input.partition_number {
+            let group = resulting_group_name
+                .as_deref()
+                .and_then(|group_name| store.placement_group_id_for_name(group_name))
+                .and_then(|group_id| store.placement_groups.get(&group_id));
+            let partitions = group
+                .filter(|group| group.strategy.as_deref() == Some(PLACEMENT_STRATEGY_PARTITION))
+                .and_then(|group| group.partition_count)
+                .ok_or_else(|| {
+                    Scaffolded::invalid_parameter_value(format!(
+                        "partitionNumber is valid only for an instance in a placement group \
+                         whose strategy is '{PLACEMENT_STRATEGY_PARTITION}'"
+                    ))
+                })?;
+            // The ceiling the resource itself publishes, applied to the group's own count so
+            // the admitted range can never be wider than any partition group could have.
+            let partitions = partitions.min(MAX_PLACEMENT_GROUP_PARTITION_COUNT);
+            if !(MIN_PLACEMENT_GROUP_PARTITION_COUNT..=partitions).contains(&partition_number) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Value ({partition_number}) for parameter partitionNumber is invalid. \
+                     Expecting {MIN_PLACEMENT_GROUP_PARTITION_COUNT}-{partitions}."
+                )));
+            }
+        }
+
+        // "The ID of the Dedicated Host with which to associate the instance" (`$HostId`),
+        // resolved against the Dedicated Host store the way a launch onto a host resolves it:
+        // a host the account does not hold, or one it has given back, is refused rather than
+        // stored, which would leave the instance reporting a host nothing holds.
+        if let Some(host_id) = input.host_id.as_deref().filter(|host_id| !host_id.is_empty()) {
+            if store
+                .dedicated_hosts
+                .get(host_id)
+                .is_none_or(state::host_is_released)
+            {
+                return Err(state::invalid_host_id_not_found(host_id));
+            }
+        }
+
+        // The caller-chosen bytes this call would retain: the host resource group's ARN,
+        // which REPLACES the one the instance holds — so the charge and the refund are both
+        // facts of the one member that writes it. A call that names any other attribute
+        // leaves the held ARN resident, so it gives nothing back: a refund for bytes nothing
+        // released would let the store's own ceiling drift below what it actually holds.
+        let (charge, refund) = match input.host_resource_group_arn.as_deref() {
+            Some(arn) => (
+                arn.len(),
+                held_host_resource_group_arn.as_ref().map_or(0, String::len),
+            ),
+            None => (0, 0),
+        };
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {} of at most {} bytes of caller-supplied data, so it \
+                 cannot store {charge} more",
+                store.stored_bytes(),
+                state::MAX_STORED_BYTES
+            )));
+        }
+
+        // Every parameter is validated and every named resource resolved, and nothing has
+        // been written: a refusal above leaves the instance's placement exactly where it
+        // was. This operation models no `DryRun` member, so there is no probe to answer.
+
+        let Some(instance) = store.instances.get_mut(&instance_id) else {
+            return Err(Scaffolded::invalid_instance_id_not_found(&instance_id));
+        };
+        let detail = &mut instance.detail;
+        // Exactly the attributes the request named are written; every other one is left as it
+        // stands. An empty `HostId` takes the instance off the host it was on, the way an
+        // empty `GroupName` takes it out of its group.
+        if let Some(affinity) = affinity {
+            detail.affinity = Some(affinity);
+        }
+        if let Some(tenancy) = tenancy {
+            detail.tenancy = tenancy;
+        }
+        if let Some(group_name) = group {
+            detail.placement_group_name = group_name;
+            // A partition is a partition OF a group: an instance leaving one is in no
+            // partition, and one moving to another group is not in the partition of the group
+            // it left unless this same call named one.
+            detail.partition_number = None;
+        }
+        if let Some(partition_number) = input.partition_number {
+            detail.partition_number = Some(partition_number);
+        }
+        if let Some(host_id) = input.host_id.as_deref() {
+            detail.host_id = Some(host_id.to_string()).filter(|host_id| !host_id.is_empty());
+        }
+        if let Some(arn) = input.host_resource_group_arn.clone() {
+            detail.host_resource_group_arn = Some(arn).filter(|arn| !arn.is_empty());
+        }
+        store.add_stored_bytes(charge);
+        store.release_stored_bytes(refund);
+        // The host an instance runs on is what makes that host's own `Instances` report it,
+        // so the two sides are brought back into step through the one place that does it.
+        if input.host_id.is_some() || held_host_id.is_some() {
+            store.resync_dedicated_host_instances();
+        }
+
+        Ok(ModifyInstancePlacementOutput {
+            // "Is true if the request succeeds, and an error otherwise" (`$Return`).
+            r#return: Some(true),
+        })
+    }
+}
+
+/// What a request asks to change, as the state refusal names it.
+///
+/// EC2 words that refusal about the ATTRIBUTE rather than the instance — "<subject> can only
+/// be changed for instances in the 'stopped' state." — so the subject is read off the members
+/// the request carries, in the order the operation documents them ("at least one attribute
+/// for affinity, host ID, tenancy, or placement group name must be specified"), with the
+/// partition and the host resource group counted with the attribute they belong to: a
+/// partition is a partition of a placement group, and a host resource group is where the
+/// Dedicated Host an instance is placed on comes from. A request naming several is reported
+/// for the first of them, so one sentence names one attribute.
+fn changed_subject(input: &ModifyInstancePlacementInput) -> &'static str {
+    if input.affinity.is_some() {
+        "Affinity"
+    } else if input.host_id.is_some() || input.host_resource_group_arn.is_some() {
+        "Host IDs"
+    } else if input.tenancy.is_some() {
+        "Tenancy"
+    } else {
+        "Placement groups"
     }
 }

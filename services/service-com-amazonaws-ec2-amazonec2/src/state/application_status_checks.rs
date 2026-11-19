@@ -688,6 +688,20 @@ fn same_health_check_paths(
 /// asks about, counted over the pairs the check would hold afterwards.
 pub const MAX_APPLICATION_STATUS_CHECK_TAG_ASSOCIATIONS: usize = 50;
 
+/// Refuse an association call that names BOTH of the two target members: HTTP 400
+/// `InvalidParameterCombination`.
+///
+/// "You must specify either TargetTagAssociations or InstanceIds, but not both. Specifying
+/// both results in an InvalidParameterCombination error" — the rule
+/// `AssociateApplicationStatusCheck` and `DisassociateApplicationStatusCheck` publish
+/// identically, so the SENTENCE lives here once and both answer it: the one
+/// `DisassociateApplicationStatusCheck` is recorded answering.
+pub fn one_application_status_check_target<E>() -> Scaffolded<E> {
+    super::invalid_parameter_combination(
+        "Only one of TargetTagAssociations or InstanceIds may be specified, not both",
+    )
+}
+
 /// The `AssociationType` of a TAG association, as the association response objects spell it:
 /// "The type of association. Valid values: EC2TAG and INSTANCE_ID"
 /// (`SuccessfulAssociationResponseObject$AssociationType`).
@@ -699,6 +713,19 @@ pub const ASSOCIATION_TYPE_EC2_TAG: &str = "EC2TAG";
 
 /// The `AssociationType` of an INSTANCE association — see [`ASSOCIATION_TYPE_EC2_TAG`].
 pub const ASSOCIATION_TYPE_INSTANCE_ID: &str = "INSTANCE_ID";
+
+/// The `AssociationTypeEnum` member a TAG association is reported under by the association
+/// DESCRIBE: "`tag` – The check applies to current and future instances with a matching tag
+/// key-value pair" (`ApplicationStatusCheckAssociationObject$AssociationType`).
+///
+/// The other spelling of the kind [`ASSOCIATION_TYPE_EC2_TAG`] names: one association kind,
+/// two spellings, each a fact of the shape that carries it. The whole catalog is the
+/// generated `crate::ops::types::ASSOCIATION_TYPE_ENUM_VALUES`.
+pub const ASSOCIATION_TYPE_ENUM_TAG: &str = "tag";
+
+/// The `AssociationTypeEnum` member an INSTANCE association is reported under: "`instance-id`
+/// – The check applies to a specific instance" — see [`ASSOCIATION_TYPE_ENUM_TAG`].
+pub const ASSOCIATION_TYPE_ENUM_INSTANCE_ID: &str = "instance-id";
 
 /// What separates the two halves of a tag association's reported value: "the value is
 /// formatted as `key=value`" (`SuccessfulAssociationResponseObject$AssociationValue`).

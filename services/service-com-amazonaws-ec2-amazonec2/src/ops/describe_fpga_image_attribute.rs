@@ -10,7 +10,7 @@
 //! FPGA-image operation of this crate: a malformed id (`InvalidFpgaImageID.Malformed`), then
 //! `DryRun` (`DryRunOperation`), then an id the account holds no AFI for
 //! (`InvalidFpgaImageID.NotFound`, worded with the sentence THIS operation is recorded
-//! answering — `crate::state::describe_fpga_image_attribute_id_not_found`).
+//! answering — `crate::state::fpga_image_attribute_id_not_found`).
 //!
 //! ## Shape of an operation
 //!
@@ -68,7 +68,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::FpgaImageRecord;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -138,7 +137,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            describe_fpga_image_attribute_id_not_found, dry_run_operation,
+            dry_run_operation, fpga_image_attribute_id_not_found,
             fpga_image_id_is_well_formed, internal_error, invalid_fpga_image_id_malformed,
             require_service_state, unknown_attribute_parameter_value,
         };
@@ -176,17 +175,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.fpga_images.get(&input.fpga_image_id) else {
             // An id inside the issued form that names no AFI of this account: worded with
             // the sentence THIS operation is recorded answering
-            // ([`crate::state::describe_fpga_image_attribute_id_not_found`]), which is EC2's
+            // ([`crate::state::fpga_image_attribute_id_not_found`]), which is EC2's
             // common missing-id sentence naming the `fpga-image` resource type rather than
             // the `Image ID '<id>' not found.` the delete and the reset answer.
-            return Err(describe_fpga_image_attribute_id_not_found(
+            return Err(fpga_image_attribute_id_not_found(
                 &input.fpga_image_id,
             ));
         };
 
-        let reported = reported_attribute(attribute, record).ok_or_else(|| {
+        let reported = record.attribute_view(attribute).ok_or_else(|| {
             // Unreachable: the catalog check above admits only the attributes
-            // `reported_attribute` answers.
+            // `FpgaImageRecord::attribute_view` answers.
             internal_error(format!(
                 "'{attribute}' is an AFI attribute this emulator holds no value for"
             ))
@@ -197,38 +196,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// `record` as the answer to asking for its `attribute`: the ONE member that attribute
-/// names, read off the stored AFI, beside the AFI's own id. `None` for an attribute no
-/// member of `FpgaImageAttribute` corresponds to, which the handler has already refused.
-///
-/// Each arm names the `FpgaImageAttributeName` value the model publishes
-/// ([`FPGA_IMAGE_ATTRIBUTE_NAME_VALUES`]) and reads the `FpgaImageAttribute` member AWS
-/// documents that attribute as, so the mapping from attribute to value lives in one place:
-///
-/// ```text
-/// smithy_query(query="shape",shape="FpgaImageAttributeName,FpgaImageAttribute",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
-/// ```
-///
-/// A text member is reported as the AFI carries it, absent when the AFI holds none — an AFI
-/// created with no description has no description to report, which is a different answer
-/// from a description this emulator invented. A LIST member is reported as the list the AFI
-/// carries, empty or not, the way `DescribeImageAttribute` reports an AMI's product codes.
-fn reported_attribute(attribute: &str, record: &FpgaImageRecord) -> Option<FpgaImageAttribute> {
-    let mut reported = FpgaImageAttribute {
-        fpga_image_id: record.view.fpga_image_id.clone(),
-        ..FpgaImageAttribute::default()
-    };
-    match attribute {
-        "description" => reported.description = record.view.description.clone(),
-        "name" => reported.name = record.view.name.clone(),
-        // "The load permissions" (`FpgaImageAttribute$LoadPermissions`): which accounts and
-        // groups may load the AFI, as `ModifyFpgaImageAttribute` left them and
-        // `ResetFpgaImageAttribute` clears them.
-        "loadPermission" => reported.load_permissions = Some(record.load_permissions.clone()),
-        "productCodes" => {
-            reported.product_codes = Some(record.view.product_codes.clone().unwrap_or_default());
-        }
-        _ => return None,
-    }
-    Some(reported)
-}

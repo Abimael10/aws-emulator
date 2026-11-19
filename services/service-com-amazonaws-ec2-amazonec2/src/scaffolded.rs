@@ -443,6 +443,75 @@ impl<E> Scaffolded<E> {
         )
     }
 
+    /// The refusal of an operation that acts on an instance ONLY from one lifecycle state,
+    /// asked of an instance in another: "The instance '<id>' is not in the '<state>' state."
+    ///
+    /// EC2 words this class as one sentence naming the instance the REQUEST named and the
+    /// state the operation requires — not the state the instance is actually in, which a
+    /// caller reads back through a describe — and ends it in a full stop. It is a DIFFERENT
+    /// sentence from [`Self::incorrect_instance_state`], which names the ACTION a state does
+    /// not admit: that one is the wording of the lifecycle operations (start, stop, reboot,
+    /// monitor), while the operations that modify a setting an instance can only be
+    /// RECONFIGURED in one state answer this one, naming that state.
+    ///
+    /// Which CODE carries it is a fact of the operation, recorded by its caller, so the code
+    /// is the caller's to choose through the three named constructors below — the sentence
+    /// itself is built once here.
+    fn instance_is_not_in_state(code: &'static str, instance_id: &str, required: &str) -> Self {
+        Self::service_error(
+            code,
+            400,
+            format!(
+                "The instance '{}' is not in the '{required}' state.",
+                crate::state::echoed_resource_id(instance_id)
+            ),
+        )
+    }
+
+    /// `IncorrectInstanceState` (HTTP 400) in the "not in the '<state>' state" wording of
+    /// [`Self::instance_is_not_in_state`]: the code `ModifyInstanceAttribute` answers for an
+    /// attribute it can only write while the instance is in `required`.
+    pub fn incorrect_instance_state_requires(instance_id: &str, required: &str) -> Self {
+        Self::instance_is_not_in_state("IncorrectInstanceState", instance_id, required)
+    }
+
+    /// `InvalidInstanceState` (HTTP 400): the attribute `subject` names can only be changed
+    /// while the instance is in the `required` state, and it is in another.
+    ///
+    /// A THIRD sentence for the instance-state class, and a named constructor rather than a
+    /// literal at the call site for the same reason the others are: this one is about WHAT
+    /// cannot be changed rather than about the instance — it names the attribute and the
+    /// state that attribute can be changed from, and no instance id at all — which is the
+    /// sentence `ModifyInstancePlacement` is recorded answering for a placement it cannot
+    /// change from the state the instance is in.
+    pub fn attribute_requires_instance_state(subject: &str, required: &str) -> Self {
+        Self::service_error(
+            "InvalidInstanceState",
+            400,
+            format!(
+                "{subject} can only be changed for instances in the '{required}' state."
+            ),
+        )
+    }
+
+    /// `InvalidState` (HTTP 400): the operation acts on an instance only from the states
+    /// `allowed` lists, and the instance is in another.
+    ///
+    /// The fourth sentence of the instance-state class, naming the instance the REQUEST named
+    /// and the states the operation does admit, with no full stop — the sentence
+    /// `ModifyInstanceNetworkPerformanceOptions` is recorded answering. `allowed` is the
+    /// state, or the comma-separated states, the operation admits.
+    pub fn instance_state_not_allowed(instance_id: &str, allowed: &str) -> Self {
+        Self::service_error(
+            "InvalidState",
+            400,
+            format!(
+                "The instance '{}' is not in an allowed state: {allowed}",
+                crate::state::echoed_resource_id(instance_id)
+            ),
+        )
+    }
+
     /// `OperationNotPermitted` (HTTP 400): the request is well formed and the
     /// resource exists, but an attribute on it forbids the action.
     pub fn operation_not_permitted(message: impl Into<String>) -> Self {

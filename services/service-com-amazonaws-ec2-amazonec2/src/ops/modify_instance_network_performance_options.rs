@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyInstanceNetworkPerformanceOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyInstanceNetworkPerformanceOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes the bandwidth weighting the request names onto the stored instance —
+//! the one `Instance$NetworkPerformanceOptions` member `DescribeInstances` reports — and
+//! answers with the instance and the weighting it now carries, read back off the store. This
+//! is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyInstanceNetworkPerformanceOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The weighting decides how an instance's baseline bandwidth is split between its network
+//! and its EBS traffic, which is a property of the hardware the instance is placed on: it is
+//! chosen when the instance is started, so the instance has to be STOPPED for this call to
+//! change it. An instance in any other state is refused `InvalidState` naming the state this
+//! call requires, and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +142,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyInstanceNetworkPerformanceOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyInstanceNetworkPerformanceOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyInstanceNetworkPerformanceOptions"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{self, InstanceStateName};
+
+        // Which instance is reconfigured is a fact of the id the request names, and the
+        // weighting comes off the request: nothing here depends on the request's metadata.
+        let _ = ctx;
+
+        // "Specify the bandwidth weighting option to boost the associated type of baseline
+        // bandwidth" (`$BandwidthWeighting`), resolved against the catalog of its own modelled
+        // enum — so what reaches the store is a catalog member rather than the request's own
+        // text, and a word the catalog does not hold is refused in the sentence EC2 words for
+        // that parameter type, the one the request boundary answers for the same value
+        // (`crate::state::instance_bandwidth_weighting_refusal_message`). The modelled enum
+        // constraint already refuses any other spelling before this handler runs; this is the
+        // same belt-and-braces reading the modify of the other launch-chosen option sets
+        // keeps.
+        let weighting = state::requested_bandwidth_weighting(Some(
+            input.bandwidth_weighting.as_str(),
+        ))?
+        .ok_or_else(|| {
+            Scaffolded::missing_parameter(
+                "The request must contain the parameter bandwidthWeighting",
+            )
+        })?;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Which state an instance is in is a fact of where the clock stands, so every move it
+        // already owed is materialised before one is read: the refusal below is answered from
+        // the state the same instant's `DescribeInstances` reports.
+        store.materialize_due_transitions();
+
+        // "The ID of the instance to update" (`$InstanceId`), resolved through the one reading
+        // of those two refusals this crate has: malformed before not-found.
+        let instance = state::require_instance_record(&store, &input.instance_id)?;
+        let instance_state = instance.state;
+        // The id is read back off the record the lookup resolved, so the answer reports the
+        // stored instance rather than the request's text.
+        let instance_id = instance.instance_id.clone();
+
+        // The bandwidth split is chosen for the instance when it is placed on hardware, so an
+        // instance that is not stopped has no reconfiguration this call can make: it is
+        // refused with the states this operation does admit, in the sentence it words that
+        // class with.
+        if instance_state != InstanceStateName::Stopped {
+            return Err(Scaffolded::instance_state_not_allowed(
+                &instance_id,
+                InstanceStateName::Stopped.as_str(),
+            ));
+        }
+
+        // DryRun sits after every refusal above and before the one write: "if you have the
+        // required permissions, the error response is DryRunOperation" (`$DryRun`), so a
+        // request that would have been refused is refused with that reason instead, and one
+        // that would have succeeded leaves the instance's options exactly where they were.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let Some(instance) = store.instances.get_mut(&instance_id) else {
+            return Err(Scaffolded::invalid_instance_id_not_found(&instance_id));
+        };
+        instance.detail.bandwidth_weighting = weighting;
+
+        // "Contains the updated configuration for bandwidth weighting on the specified
+        // instance" (`$BandwidthWeighting`): read back off the record just written, through
+        // the member `DescribeInstances` reports it as, so the two cannot disagree about one
+        // instance.
+        Ok(ModifyInstanceNetworkPerformanceOptionsOutput {
+            instance_id: Some(instance_id),
+            bandwidth_weighting: Some(instance.detail.bandwidth_weighting.to_string()),
+        })
     }
 }

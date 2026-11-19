@@ -919,12 +919,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // way to (or already at) `terminated` has no attributes left to modify at all.
         // `pending` and `stopping` are transient states on their way to exactly `running`
         // and `stopped`, so a policy attribute is modifiable in them.
-        let admitted = if STOPPED_ONLY_INSTANCE_ATTRIBUTES.contains(&attribute) {
-            instance_state == InstanceStateName::Stopped
-        } else {
-            !instance_state.is_terminating()
-        };
-        if !admitted {
+        //
+        // The two halves are refused in the two sentences EC2 words them with: an attribute
+        // that can only be written in ONE state names that state
+        // ([`crate::scaffolded::Scaffolded::incorrect_instance_state_requires`], "is not in
+        // the 'stopped' state."), while an instance on its way out admits no modification at
+        // all, which is the action wording.
+        if STOPPED_ONLY_INSTANCE_ATTRIBUTES.contains(&attribute) {
+            if instance_state != InstanceStateName::Stopped {
+                return Err(
+                    crate::scaffolded::Scaffolded::incorrect_instance_state_requires(
+                        &input.instance_id,
+                        InstanceStateName::Stopped.as_str(),
+                    ),
+                );
+            }
+        } else if instance_state.is_terminating() {
             return Err(crate::scaffolded::Scaffolded::incorrect_instance_state(
                 &input.instance_id,
                 &format!("modified for the {attribute} attribute"),

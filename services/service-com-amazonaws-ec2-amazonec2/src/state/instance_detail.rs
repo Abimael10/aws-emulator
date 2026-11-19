@@ -104,6 +104,12 @@ pub const DEFAULT_METADATA_HOP_LIMIT: i32 = MIN_METADATA_HOP_LIMIT;
 /// runs on single-tenant hardware" (`Placement$Tenancy`).
 pub const TENANCY_DEFAULT: &str = "default";
 
+/// `HostTenancy`'s `host`: an instance that runs on a Dedicated Host of the account — the one
+/// tenancy a host resource group or an affinity for a host makes sense under, and the one a
+/// tenancy change cannot leave ("you can't change the tenancy from `host` to `dedicated` or
+/// `default`", `ModifyInstancePlacementRequest$Tenancy`).
+pub const TENANCY_HOST: &str = "host";
+
 /// `CapacityReservationPreference`'s `open`: "the instance can run in any `open` Capacity
 /// Reservation that has matching attributes" — and the preference of a launch that named
 /// none, "the instance's Capacity Reservation preference defaults to open"
@@ -206,6 +212,21 @@ pub struct InstanceDetail {
     pub bandwidth_weighting: &'static str,
     /// `Placement$Tenancy`.
     pub tenancy: &'static str,
+    /// "The affinity setting for the instance on the Dedicated Host" (`Placement$Affinity`),
+    /// or `None` for an instance nothing has set one for — which is every instance a launch
+    /// mints, the member being one `ModifyInstancePlacement` writes rather than one a launch
+    /// carries. A catalog member of the modelled `Affinity` enum, never the request's text.
+    pub affinity: Option<&'static str>,
+    /// "The number of the partition that the instance is in"
+    /// (`Placement$PartitionNumber`), or `None` for an instance in no partition — already
+    /// checked against the partition count of the group it is in by the writer, so the
+    /// instance never reports a partition its group does not have.
+    pub partition_number: Option<i32>,
+    /// "The ARN of the host resource group in which to launch the instances"
+    /// (`Placement$HostResourceGroupArn`), or `None` for an instance in none. Caller-chosen
+    /// text, so it is charged against the store's byte budget by
+    /// [`super::instance_payload_bytes`] like every other such string of the record.
+    pub host_resource_group_arn: Option<String>,
     /// The NAME of the placement group the launch put the instance in
     /// (`Placement$GroupName`), or `None` for an instance in none. Stored as the caller's
     /// own text because that is what the member is — a name the account chose — and charged
@@ -251,6 +272,9 @@ impl Default for InstanceDetail {
             reboot_migration: REBOOT_MIGRATION_DEFAULT,
             bandwidth_weighting: BANDWIDTH_WEIGHTING_DEFAULT,
             tenancy: TENANCY_DEFAULT,
+            affinity: None,
+            partition_number: None,
+            host_resource_group_arn: None,
             placement_group_name: None,
             host_id: None,
             private_dns_hostname_type: None,
@@ -378,15 +402,19 @@ impl InstanceDetail {
             // (`InstanceMaintenanceOptionsRequest`) — so an instance starts on the
             // `default` behaviour and only a modify of its maintenance options changes it.
             reboot_migration: REBOOT_MIGRATION_DEFAULT,
-            bandwidth_weighting: requested_word(
-                "BandwidthWeighting",
+            bandwidth_weighting: requested_bandwidth_weighting(
                 spec.network_performance_options
                     .and_then(|options| options.bandwidth_weighting.as_deref()),
-                INSTANCE_BANDWIDTH_WEIGHTING_VALUES,
             )?
             .unwrap_or(BANDWIDTH_WEIGHTING_DEFAULT),
             tenancy: requested_word("Tenancy", spec.tenancy, TENANCY_VALUES)?
                 .unwrap_or(TENANCY_DEFAULT),
+            // Neither an affinity, a partition nor a host resource group is something a
+            // launch carries: each is a setting `ModifyInstancePlacement` writes, so a fresh
+            // instance holds none of them.
+            affinity: None,
+            partition_number: None,
+            host_resource_group_arn: None,
             placement_group_name: spec.placement_group_name.map(str::to_string),
             host_id: spec.host_id.map(str::to_string),
             private_dns_hostname_type: requested_word(
@@ -558,13 +586,90 @@ pub fn requested_word<E>(
     };
     match catalog_member(catalog, requested) {
         Some(word) => Ok(Some(word)),
-        None => Err(invalid_parameter_value(format!(
-            "Value ({}) for parameter {member} is invalid. Valid values are {}",
-            echoed_resource_id(requested),
-            catalog.join(", ")
+        None => Err(invalid_parameter_value(unpublished_word_message(
+            member, requested, catalog,
         ))),
     }
 }
+
+/// How EC2 states a value `member` does not publish: the submitted value, the parameter that
+/// refused it and the words that parameter accepts — "Value (`<value>`) for parameter
+/// `<member>` is invalid. Valid values are …".
+///
+/// The ONE place that sentence is built, so a value outside a catalog is worded the same way
+/// whichever side of dispatch refused it: [`requested_word`], which is where a handler
+/// resolves one, and the service's own wording of a MODELLED catalog violation
+/// (`crate::service::parameter_refusals`), which is where the request boundary refuses one
+/// before a handler runs. The value is bounded by the one echo every refusal of this crate
+/// quotes a request value through ([`echoed_resource_id`]).
+pub fn unpublished_word_message(
+    member: &str,
+    requested: &str,
+    catalog: &'static [&'static str],
+) -> String {
+    format!(
+        "Value ({}) for parameter {member} is invalid. Valid values are {}",
+        echoed_resource_id(requested),
+        catalog.join(", ")
+    )
+}
+
+/// Is `allowed` the `InstanceBandwidthWeighting` catalog — the value set the model declares
+/// for how an instance's baseline bandwidth is split between its network and its EBS traffic
+/// ([`INSTANCE_BANDWIDTH_WEIGHTING_VALUES`])?
+///
+/// Keyed to the TYPE's value set, the way every catalog-keyed refusal of this crate is
+/// ([`super::is_modelled_catalog`] records that rule), so every member of this model that
+/// names a bandwidth weighting — a launch's own network performance options and the modify of
+/// one instance's — is refused an unpublished one in the same words.
+pub fn is_instance_bandwidth_weighting_catalog(allowed: &[String]) -> bool {
+    super::is_modelled_catalog(allowed, INSTANCE_BANDWIDTH_WEIGHTING_VALUES)
+}
+
+/// How EC2 states a `BandwidthWeighting` the catalog does not hold: `"<value>" is not a
+/// valid value for bandwidth weighting. Specify a valid value and try again.`
+///
+/// RECORDED: EC2 does not state this refusal as the generic "Value (…) for parameter …"
+/// clause [`unpublished_word_message`] words — it names the SETTING in words, quotes the
+/// value the request sent and says what to do next — so the sentence lives with the TYPE it
+/// belongs to, where both sides of dispatch read it: the service's wording of a modelled
+/// catalog violation (`crate::service::parameter_refusals`) and the handlers that resolve the
+/// member themselves ([`requested_bandwidth_weighting`]). The value is bounded by the one
+/// echo every refusal of this crate quotes a request value through
+/// ([`echoed_resource_id`]).
+pub fn instance_bandwidth_weighting_refusal_message(value: &str) -> String {
+    format!(
+        "\"{}\" is not a valid value for bandwidth weighting. Specify a valid value and try \
+         again.",
+        echoed_resource_id(value)
+    )
+}
+
+/// The `InstanceBandwidthWeighting` member `requested` names, or `None` when the request
+/// named none — and the refusal EC2 words for that parameter type
+/// ([`instance_bandwidth_weighting_refusal_message`]) for a word the catalog does not hold.
+///
+/// [`requested_word`] for the one member whose refusal EC2 does not word as that generic
+/// clause: shared by the launch that chooses a weighting and the modify that changes one, so
+/// the two cannot refuse the same value differently.
+pub fn requested_bandwidth_weighting<E>(
+    requested: Option<&str>,
+) -> Result<Option<&'static str>, Scaffolded<E>> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    match catalog_member(INSTANCE_BANDWIDTH_WEIGHTING_VALUES, requested) {
+        Some(word) => Ok(Some(word)),
+        None => Err(invalid_parameter_value(
+            instance_bandwidth_weighting_refusal_message(requested),
+        )),
+    }
+}
+
+/// The name the `InstanceBandwidthWeighting` member carries in a refusal that names the
+/// parameter: `BandwidthWeighting`, the member's own name on both the launch's options and
+/// the modify's request.
+pub const BANDWIDTH_WEIGHTING_MEMBER: &str = "BandwidthWeighting";
 
 impl ComAmazonawsEc2Amazonec2State {
     /// The detail an instance launched FROM a launch template version carries: every option
@@ -924,13 +1029,13 @@ impl ComAmazonawsEc2Amazonec2State {
             tenancy: Some(detail.tenancy.to_string()),
             // The Dedicated Host the launch placed this instance on, where it placed it on
             // one — resolved against the host store by the launch, so this reports a host the
-            // account holds. A partition and a host resource group are things a launch asks
-            // for; this one asked for neither, and affinity is a setting `ModifyInstancePlacement`
-            // writes rather than one a launch onto a named host carries.
-            affinity: None,
+            // account holds. The affinity, the partition and the host resource group are the
+            // settings `ModifyInstancePlacement` writes: each is reported for an instance a
+            // call set it for and absent for one nothing did.
+            affinity: detail.affinity.map(str::to_string),
             host_id: detail.host_id.clone(),
-            host_resource_group_arn: None,
-            partition_number: None,
+            host_resource_group_arn: detail.host_resource_group_arn.clone(),
+            partition_number: detail.partition_number,
             spread_domain: None,
         });
 

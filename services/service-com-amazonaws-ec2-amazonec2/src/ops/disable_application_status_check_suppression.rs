@@ -197,8 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The whole batch is resolved before the first suppression is lifted, so a request
         // naming one id this service cannot resolve lifts nothing at all — which is also
-        // what makes this loop the last thing that can refuse the call. Malformed before
-        // unknown, the order this service asks the two questions in; the malformed half is
+        // what makes this loop the last thing that can refuse the call. The FORM of every id
+        // is read before ANY of them is looked up, so a batch carrying both an id that is no
+        // instance id and one that merely names no instance of the account is refused as
+        // malformed whichever order it names them in: the form of a value is a fact of the
+        // value alone, while a lookup is a fact of the account's state. The malformed half is
         // worded the way THIS operation's validator words it — "The instance ID '<id>' is
         // malformed", which is what its recorded refusal carries, and the sentence
         // `require_known_instance` answers for the same half.
@@ -206,6 +209,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !instance_id_is_well_formed(instance_id) {
                 return Err(Scaffolded::instance_id_is_malformed(instance_id));
             }
+        }
+        for instance_id in &instance_ids {
             if !store.instances.contains_key(instance_id) {
                 return Err(Scaffolded::invalid_instance_id_not_found(instance_id));
             }

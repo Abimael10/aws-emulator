@@ -3087,6 +3087,11 @@ pub fn instance_payload_bytes(record: &InstanceRecord) -> usize {
             .placement_group_name
             .as_ref()
             .map_or(0, String::len)
+        + record
+            .detail
+            .host_resource_group_arn
+            .as_ref()
+            .map_or(0, String::len)
         + tag_bytes(&record.tags)
         + root_block_device_bytes(record.root_block_device.as_ref())
         + record

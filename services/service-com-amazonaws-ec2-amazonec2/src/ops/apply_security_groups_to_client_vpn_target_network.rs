@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ApplySecurityGroupsToClientVpnTargetNetwork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ApplySecurityGroupsToClientVpnTargetNetwork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replaces the security groups applied to a Client VPN endpoint's target
+//! network association in the VPC the request names — "this action REPLACES the existing
+//! security groups with the specified security groups" — writing them onto both records that
+//! report them: the endpoint's own `SecurityGroupIds`, which `DescribeClientVpnEndpoints`
+//! reports, and every association in that VPC, whose `SecurityGroups`
+//! `DescribeClientVpnTargetNetworks` reports. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ApplySecurityGroupsToClientVpnTargetNetwork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Each resource the request names is resolved against the store it lives in before anything
+//! is written: the endpoint (`InvalidClientVpnEndpointId.NotFound`), the VPC the association
+//! is in (`InvalidVpcID.NotFound`, and the endpoint has to HAVE an association in it), and
+//! each security group, which has to be a group of that VPC (`InvalidGroup.NotFound`) — so an
+//! association never reports a group the account does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +146,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ApplySecurityGroupsToClientVpnTargetNetwork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ApplySecurityGroupsToClientVpnTargetNetworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // Which endpoint, which VPC and which groups are all facts of the ids the request
+        // names: nothing here depends on the request's headers or URI.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation" (`$DryRun`): the question is
+        // about the CALLER's permission for this action, which nothing the request names can
+        // change, so this operation answers it before it reads what the request names at all
+        // — and nothing is read or written for a request that gets this answer.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ApplySecurityGroupsToClientVpnTargetNetwork"))
+        // WHERE a dry run sits relative to an operation's own validation is a fact of that
+        // operation, recorded by its caller: this one's recorded dry run answers
+        // `DryRunOperation` for a request whose Client VPN endpoint id it refuses without the
+        // flag, the way `crate::ops::disable_application_status_check_suppression`'s does.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "The IDs of the security groups to apply to the associated target network. Up to 5
+        // security groups can be applied to an associated target network"
+        // (`$SecurityGroupIds`): the model bounds the list nowhere, so the documented ceiling
+        // is charged here, before any lookup proportional to it. One group named twice is one
+        // group applied.
+        let requested_groups = state::deduplicate_ids(&input.security_group_ids);
+        if requested_groups.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter securityGroupId",
+            ));
+        }
+        if requested_groups.len() > MAX_APPLIED_SECURITY_GROUPS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "securityGroupId carries {} ids, above the maximum of \
+                 {MAX_APPLIED_SECURITY_GROUPS}",
+                requested_groups.len()
+            )));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // An association's clock-owed move fell due at its own instant whether or not anybody
+        // called, so it is applied before the associations are read.
+        store.materialize_due_transitions();
+
+        // "The ID of the Client VPN endpoint", resolved by lookup through the one refusal this
+        // surface documents for an endpoint id.
+        let endpoint_id = input.client_vpn_endpoint_id.clone();
+        state::require_client_vpn_endpoint(&store, &endpoint_id)?;
+
+        // "The ID of the VPC in which the associated target network is located" (`$VpcId`):
+        // the VPC has to be one the account holds, and the endpoint has to have an
+        // association in it — there is no association for the groups to apply to otherwise.
+        let vpc_id = input.vpc_id.clone();
+        if !store.vpcs.contains_key(&vpc_id) {
+            return Err(state::invalid_vpc_id_not_found(&vpc_id));
+        }
+        let associations: Vec<String> = store
+            .client_vpn_target_networks
+            .iter()
+            .filter(|(_, record)| {
+                record.view.client_vpn_endpoint_id.as_deref() == Some(endpoint_id.as_str())
+                    && record.view.vpc_id.as_deref() == Some(vpc_id.as_str())
+            })
+            .map(|(association_id, _)| association_id.clone())
+            .collect();
+        if associations.is_empty() {
+            return Err(state::client_vpn_active_vpc_association_not_found(
+                &vpc_id,
+                &endpoint_id,
+            ));
+        }
+
+        // Each group has to be a group of THAT VPC: a security group is a VPC-scoped resource,
+        // so one of another VPC could never govern this association's traffic.
+        for group_id in &requested_groups {
+            let holds = store
+                .security_groups
+                .get(group_id)
+                .is_some_and(|group| group.vpc_id.as_deref() == Some(vpc_id.as_str()));
+            if !holds {
+                return Err(state::invalid_group_not_found(group_id));
+            }
+        }
+
+        // The caller-chosen bytes this call retains: the ids it applies, in place of the ones
+        // the endpoint and each association hold now.
+        let group_bytes =
+            |groups: &[String]| groups.iter().map(String::len).fold(0usize, usize::saturating_add);
+        let charge = group_bytes(&requested_groups).saturating_mul(associations.len() + 1);
+        let held_on_endpoint = store
+            .client_vpn_endpoints
+            .get(&endpoint_id)
+            .and_then(|endpoint| endpoint.security_group_ids.clone())
+            .unwrap_or_default();
+        let mut refund = group_bytes(&held_on_endpoint);
+        for association_id in &associations {
+            if let Some(record) = store.client_vpn_target_networks.get(association_id) {
+                refund = refund.saturating_add(group_bytes(
+                    record.view.security_groups.as_deref().unwrap_or_default(),
+                ));
+            }
+        }
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {} of at most {} bytes of caller-supplied data, so it \
+                 cannot store {charge} more",
+                store.stored_bytes(),
+                state::MAX_STORED_BYTES
+            )));
+        }
+
+        // Every parameter is validated and every named resource resolved, and nothing has
+        // been written: a refusal above leaves every record exactly as it stands. The dry run
+        // was answered at the top, where this operation's recorded contract answers it.
+
+        // "This action replaces the existing security groups with the specified security
+        // groups": the groups go onto the endpoint, which is what every later association
+        // inherits, AND onto each association in the VPC, which is where a reader of one
+        // looks — so the two cannot disagree about which groups govern that network.
+        if let Some(endpoint) = store.client_vpn_endpoints.get_mut(&endpoint_id) {
+            endpoint.security_group_ids = Some(requested_groups.clone());
+        }
+        for association_id in &associations {
+            if let Some(record) = store.client_vpn_target_networks.get_mut(association_id) {
+                record.view.security_groups = Some(requested_groups.clone());
+            }
+        }
+        store.add_stored_bytes(charge);
+        store.release_stored_bytes(refund);
+
+        // "The IDs of the applied security groups" (`$SecurityGroupIds`), read back off the
+        // endpoint just written rather than off the request.
+        let applied = store
+            .client_vpn_endpoints
+            .get(&endpoint_id)
+            .and_then(|endpoint| endpoint.security_group_ids.clone())
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the Client VPN endpoint '{endpoint_id}' was resolved and then could not \
+                     be read back"
+                ))
+            })?;
+        Ok(ApplySecurityGroupsToClientVpnTargetNetworkOutput {
+            security_group_ids: Some(applied),
+        })
     }
 }
+
+/// The most security groups one target network association may carry: "up to 5 security
+/// groups can be applied to an associated target network"
+/// (`ApplySecurityGroupsToClientVpnTargetNetworkRequest$SecurityGroupIds`). A DOCUMENTED
+/// ceiling rather than one this emulator chose; the model declares no `@length` on the list,
+/// so the handler is the only place it can exist.
+const MAX_APPLIED_SECURITY_GROUPS: usize = 5;

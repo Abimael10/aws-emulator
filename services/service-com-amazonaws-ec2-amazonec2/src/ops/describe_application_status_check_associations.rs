@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeApplicationStatusCheckAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeApplicationStatusCheckAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the associations the account's application status checks hold — the
+//! tag pairs `AssociateApplicationStatusCheck` wrote onto the check itself and the instances
+//! it monitors, which are the per-check results those instances hold — one row per
+//! association, paged in a stable order. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeApplicationStatusCheckAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The two halves are read out of the two stores the association pair writes, so this
+//! describe, `DescribeApplicationStatusChecks` and `DescribeApplicationStatus` cannot
+//! disagree about what one check is associated with: a disassociation stops a row being
+//! reported because it removed the association itself, not because this operation was told
+//! about it.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +150,222 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeApplicationStatusCheckAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeApplicationStatusCheckAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeApplicationStatusCheckAssociations"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            ASSOCIATION_TYPE_ENUM_INSTANCE_ID, ASSOCIATION_TYPE_ENUM_TAG, MAX_FILTERS,
+            MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS, decode_page_token,
+            encode_page_token, invalid_pagination_token_for,
+            require_known_application_status_check, require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — what a check
+        // is associated with is a fact of the check and of the instances. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The IDs of the application status checks for which to describe associations"
+        // (`$ApplicationStatusCheckIds`). The model bounds the list nowhere, so it is bounded
+        // here before any work proportional to it is done.
+        let requested_ids: &[String] = input
+            .application_status_check_ids
+            .as_deref()
+            .unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "ApplicationStatusCheckIds carries {} ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // The request-controlled factors of the matching cost are capped before any matching
+        // runs, the way every filtered describe of this crate caps them.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // "The filters to use to limit the results. association-type – The type of
+        // association. Valid values: tag and instance-id" (`$Filters`): the one filter this
+        // operation documents, so any other name is refused rather than read as "no results".
+        let mut wanted_types: Vec<Vec<String>> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if name != ASSOCIATION_TYPE_FILTER {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            wanted_types.push(values.to_vec());
+        }
+
+        // "The token returned from a previous paginated request" (`$NextToken`) — anything
+        // else is refused rather than read as a position, before any other member is looked
+        // at.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        // A read, and only a read: an association is written by the association pair, so two
+        // calls here answer the same rows and reading them changes nothing a later caller
+        // sees.
+        let store = state.lock();
+
+        // An id that names no application status check of the account is an error, not an
+        // absent row — the same answer every other EC2 describe of this crate gives for one.
+        for application_status_check_id in requested_ids {
+            require_known_application_status_check(&store, application_status_check_id)?;
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named check
+        // resolved: the flag asks whether the request WOULD have succeeded.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "If you do not specify any application status check IDs", every check of the
+        // account is reported on, the way the sibling describe reads the same member.
+        let narrowed_to: ::std::collections::HashSet<&str> =
+            requested_ids.iter().map(String::as_str).collect();
+        let selected = |application_status_check_id: &str| {
+            narrowed_to.is_empty() || narrowed_to.contains(application_status_check_id)
+        };
+
+        // The TAG half: the pairs the check itself holds, which
+        // `DescribeApplicationStatusChecks` reports as its `TargetTagAssociations` — "the key
+        // for the association ... contains the tag key" and "for tag-based associations, this
+        // is the tag value" (`$Key`, `$Value`).
+        let mut rows: Vec<ApplicationStatusCheckAssociationObject> = Vec::new();
+        let mut tags: Vec<Tag> = Vec::new();
+        for (application_status_check_id, check) in &store.application_status_checks {
+            if !selected(application_status_check_id) {
+                continue;
+            }
+            // "The tags associated with the application status checks" (`$Tags`): the tags
+            // the selected checks carry, which is what a caller reading this report needs
+            // beside the associations.
+            tags.extend(check.tags.clone().unwrap_or_default());
+            for pair in check.target_tag_associations.iter().flatten() {
+                rows.push(ApplicationStatusCheckAssociationObject {
+                    application_status_check_id: Some(application_status_check_id.clone()),
+                    association_type: Some(ASSOCIATION_TYPE_ENUM_TAG.to_string()),
+                    key: pair.key.clone(),
+                    value: pair.value.clone(),
+                });
+            }
+        }
+
+        // The INSTANCE half: an instance association IS the per-check result the instance
+        // holds, so the rows are read off that one store — "for instance-based associations,
+        // this value is absent" (`$Key`) and "this is the instance ID" (`$Value`).
+        for (instance_id, record) in &store.application_status {
+            for application_status_check_id in record.details.keys() {
+                if !selected(application_status_check_id) {
+                    continue;
+                }
+                rows.push(ApplicationStatusCheckAssociationObject {
+                    application_status_check_id: Some(application_status_check_id.clone()),
+                    association_type: Some(ASSOCIATION_TYPE_ENUM_INSTANCE_ID.to_string()),
+                    key: None,
+                    value: Some(instance_id.clone()),
+                });
+            }
+        }
+
+        // Every row the filter admits: "if you specify multiple filters, the filters are
+        // joined with an AND" (`Filter`), and a filter's own values are joined with an OR.
+        rows.retain(|row| {
+            wanted_types.iter().all(|values| {
+                values
+                    .iter()
+                    .any(|value| row.association_type.as_deref() == Some(value.as_str()))
+            })
+        });
+
+        // Paged in one stable order, which the cursor below names a position in: the check
+        // the association belongs to, then the kind of association, then what it names. "The
+        // order of the elements in the response ... might vary", so nothing a caller reads
+        // depends on this order — it exists so that paging the same set twice cannot skip or
+        // repeat a row.
+        rows.sort_by_key(row_cursor);
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => rows.partition_point(|row| row_cursor(row).as_str() < cursor),
+        };
+        let page = rows.get(from..).unwrap_or_default();
+
+        // "The maximum number of items to return for this request" (`$MaxResults`), whose
+        // modelled `@range` of 5..1000 the boundary validator has already enforced — so the
+        // only value that cannot convert is one it would have refused. A request naming no
+        // page size gets the largest page the model publishes.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_ASSOCIATIONS_PER_PAGE)
+            .clamp(1, MAX_ASSOCIATIONS_PER_PAGE);
+
+        // "This value is null when there are no more items to return" (`$NextToken`): a
+        // token only when a row follows this page, naming the position that page starts at.
+        let next_token = page.get(limit).map(|row| encode_page_token(&row_cursor(row)));
+
+        Ok(DescribeApplicationStatusCheckAssociationsOutput {
+            associations: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+            tags: Some(tags),
+        })
     }
+}
+
+/// The most associations this operation reports in one page: the top of the modelled
+/// `@range` on `DescribeApplicationStatusCheckAssociationsMaxResults` (5..1000,
+/// `smithy_query(query="operation",operation="DescribeApplicationStatusCheckAssociations")`),
+/// which is therefore also the page a request naming no `MaxResults` gets.
+const MAX_ASSOCIATIONS_PER_PAGE: usize = 1_000;
+
+/// The one filter name this operation documents, from `$Filters`: "association-type – The
+/// type of association. Valid values: tag and instance-id".
+const ASSOCIATION_TYPE_FILTER: &str = "association-type";
+
+/// What separates the parts of one association's page cursor: a control character no
+/// resource id, association type or tag of this service carries, so the parts can never run
+/// together into a position that names a different row.
+const CURSOR_SEPARATOR: char = '\u{1f}';
+
+/// The position one association row holds in the paging order: the check it belongs to, the
+/// kind of association, and what it names.
+///
+/// The ONE definition of that position, so the sort, the resume point and the token a page
+/// hands back cannot read it three ways.
+fn row_cursor(row: &ApplicationStatusCheckAssociationObject) -> String {
+    format!(
+        "{}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{}",
+        row.application_status_check_id.as_deref().unwrap_or_default(),
+        row.association_type.as_deref().unwrap_or_default(),
+        row.key.as_deref().unwrap_or_default(),
+        row.value.as_deref().unwrap_or_default()
+    )
 }

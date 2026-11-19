@@ -8,6 +8,7 @@
 //! other primitive there.
 
 use super::*;
+use crate::ops::types::FpgaImageAttribute;
 
 /// `CallerRole`'s `odcr-owner` member: the caller is asking as the Capacity Reservation
 /// owner — "If you are the Capacity Reservation owner, specify this value to view requests
@@ -558,7 +559,7 @@ pub fn fpga_image_id_is_well_formed(id: &str) -> bool {
 /// way an unreadable id is [`invalid_fpga_image_id_malformed`]'s `Image ID '<id>' is
 /// invalid.`, each closing with a full stop. The attribute DESCRIBE is recorded wording the
 /// same cause with EC2's common missing-id sentence instead
-/// ([`describe_fpga_image_attribute_id_not_found`]), so a reader of this refusal keeps the
+/// ([`fpga_image_attribute_id_not_found`]), so a reader of this refusal keeps the
 /// sentence of the operation that answers it. Only the id is variable, and it is the one the
 /// REQUEST carried, bounded by [`echoed_resource_id`] the way every refusal that echoes a
 /// caller-chosen id is.
@@ -570,22 +571,54 @@ pub fn invalid_fpga_image_id_not_found<E>(fpga_image_id: &str) -> Scaffolded<E> 
     )
 }
 
-/// Refuse a `DescribeFpgaImageAttribute` whose AFI id the account holds no FPGA image for:
-/// HTTP 400 `InvalidFpgaImageID.NotFound`.
+/// The AFI `fpga_image_id` names, read by the SHAPE an EC2 resource id takes
+/// ([`prefixed_id_is_well_formed`]) rather than by the stricter issued-id reading
+/// [`fpga_image_id_is_well_formed`] applies: a value of that shape the account holds no AFI
+/// under — the all-zero placeholder included — is reported
+/// [`INVALID_FPGA_IMAGE_ID_NOT_FOUND`], and only a value outside the shape is refused
+/// [`INVALID_FPGA_IMAGE_ID_MALFORMED`], before any lookup.
 ///
-/// The attribute DESCRIBE words this cause with EC2's common missing-id sentence
+/// Which of the two readings an operation applies is a fact of that OPERATION, recorded by
+/// its caller, the way it is for a Capacity Reservation id
+/// ([`require_capacity_reservation_by_id_shape`]): `ModifyFpgaImageAttribute` is recorded
+/// answering NOT FOUND for an all-zero `afi-` id, where the operations that read ids through
+/// [`fpga_image_id_is_well_formed`] are recorded refusing the same value as malformed. The
+/// not-found sentence is the one the operations that CHANGE the AFI an id names answer
+/// ([`invalid_fpga_image_id_not_found`]).
+/// Which not-found sentence an operation answers is a fact of that operation, so the SHAPE
+/// reader takes it as a parameter: the attribute operations answer
+/// [`fpga_image_attribute_id_not_found`].
+pub fn require_fpga_image_by_id_shape<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    fpga_image_id: &str,
+    not_found: impl Fn(&str) -> Scaffolded<E>,
+) -> Result<&'store FpgaImageRecord, Scaffolded<E>> {
+    if !prefixed_id_is_well_formed(FPGA_IMAGE_ID_PREFIX, fpga_image_id) {
+        return Err(invalid_fpga_image_id_malformed(fpga_image_id));
+    }
+    store
+        .fpga_images
+        .get(fpga_image_id)
+        .ok_or_else(|| not_found(fpga_image_id))
+}
+
+/// Refuse an AFI id the account holds no FPGA image for, in EC2's COMMON missing-id
+/// sentence: HTTP 400 `InvalidFpgaImageID.NotFound`.
+///
+/// The ATTRIBUTE operations word this cause with that sentence
 /// ([`id_not_found_message`] — the fixed `The `, ` '` and `' does not exist` around the
 /// resource type and the id), naming the `fpga-image` resource type
 /// ([`FPGA_IMAGE_TAGGABLE_RESOURCE`], the one spelling of that type in this crate): that is
-/// the sentence its own recorded refusal carries. The operations that CHANGE the AFI an id
-/// names — the delete and the attribute reset — word the same cause their own way
+/// what the recorded refusals of both `DescribeFpgaImageAttribute` and
+/// `ModifyFpgaImageAttribute` carry. The operations that act on the AFI as a WHOLE — the
+/// delete and the attribute reset — word the same cause their own way
 /// ([`invalid_fpga_image_id_not_found`]'s `Image ID '<id>' not found.`), which is what their
 /// recordings carry, so the sentence belongs to the operation that answers it rather than to
 /// the id kind, and neither reader is worded from the other's recording.
 ///
 /// Only the id is variable, and it is the one the REQUEST carried, bounded by
 /// [`echoed_resource_id`] the way every refusal that echoes a caller-chosen id is.
-pub fn describe_fpga_image_attribute_id_not_found<E>(fpga_image_id: &str) -> Scaffolded<E> {
+pub fn fpga_image_attribute_id_not_found<E>(fpga_image_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_FPGA_IMAGE_ID_NOT_FOUND,
         400,
@@ -676,6 +709,44 @@ impl FpgaImageRecord {
                 message: Some(self.failure_message.clone()),
             }
         }
+    }
+
+    /// This AFI as the answer to asking for its `attribute`: the ONE member that attribute
+    /// names, read off the stored record, beside the AFI's own id. `None` for an attribute no
+    /// member of `FpgaImageAttribute` corresponds to.
+    ///
+    /// Each arm names the `FpgaImageAttributeName` value the model publishes
+    /// (`crate::ops::types::FPGA_IMAGE_ATTRIBUTE_NAME_VALUES`) and reads the
+    /// `FpgaImageAttribute` member AWS documents that attribute as:
+    ///
+    /// ```text
+    /// smithy_query(query="shape",shape="FpgaImageAttributeName,FpgaImageAttribute",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+    /// ```
+    ///
+    /// The ONE projection of an AFI attribute, so `DescribeFpgaImageAttribute` and the answer
+    /// `ModifyFpgaImageAttribute` gives cannot disagree about one AFI. A text member is
+    /// reported as the AFI carries it, absent when the AFI holds none — an AFI created with no
+    /// description has no description to report, which is a different answer from a
+    /// description this emulator invented. A LIST member is reported as the list the AFI
+    /// carries, empty or not, the way `DescribeImageAttribute` reports an AMI's product codes.
+    pub fn attribute_view(&self, attribute: &str) -> Option<FpgaImageAttribute> {
+        let mut reported = FpgaImageAttribute {
+            fpga_image_id: self.view.fpga_image_id.clone(),
+            ..FpgaImageAttribute::default()
+        };
+        match attribute {
+            "description" => reported.description = self.view.description.clone(),
+            "name" => reported.name = self.view.name.clone(),
+            // "The load permissions" (`FpgaImageAttribute$LoadPermissions`): which accounts
+            // and groups may load the AFI, as `ModifyFpgaImageAttribute` left them and
+            // `ResetFpgaImageAttribute` clears them.
+            "loadPermission" => reported.load_permissions = Some(self.load_permissions.clone()),
+            "productCodes" => {
+                reported.product_codes = Some(self.view.product_codes.clone().unwrap_or_default());
+            }
+            _ => return None,
+        }
+        Some(reported)
     }
 }
 

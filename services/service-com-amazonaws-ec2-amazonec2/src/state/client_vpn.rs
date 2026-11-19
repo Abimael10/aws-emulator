@@ -787,6 +787,28 @@ pub fn client_vpn_active_association_not_found<E>(
     )
 }
 
+/// Refuse a request that acts on a Client VPN endpoint's association in a VPC the endpoint
+/// has no association in: HTTP 400 [`INVALID_CLIENT_VPN_ACTIVE_ASSOCIATION_NOT_FOUND`].
+///
+/// The same code and the same sentence shape as
+/// [`client_vpn_active_association_not_found`], naming the network the request named it by —
+/// the VPC an association is IN, where that one names the subnet an association IS. Both are
+/// "there is no active association for <network> in Client VPN endpoint <endpoint>", so the
+/// two readers cannot word one cause two ways.
+pub fn client_vpn_active_vpc_association_not_found<E>(
+    vpc_id: &str,
+    endpoint_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CLIENT_VPN_ACTIVE_ASSOCIATION_NOT_FOUND,
+        400,
+        format!(
+            "There is no active association for vpc {vpc_id} in Client VPN endpoint \
+             {endpoint_id}"
+        ),
+    )
+}
+
 /// What names ONE route of a Client VPN endpoint's route table: the endpoint it belongs to,
 /// the destination it routes, and the target that traffic leaves through.
 ///
