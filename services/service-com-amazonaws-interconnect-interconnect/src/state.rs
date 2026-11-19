@@ -331,7 +331,7 @@ pub struct ComAmazonawsInterconnectInterconnectState {
     /// [`Self::connections_in`], so one Region's endpoint never answers for
     /// another's connections. A deleted connection is kept in the
     /// `deleted` state rather than dropped straight away, so a later
-    /// `GetConnection` reports the terminal state instead of a 404 — and is
+    /// `GetConnection` reports the terminal state instead of refusing the read — and is
     /// evicted once [`DELETED_RECORD_RETENTION`] has elapsed. At most
     /// [`MAX_CONNECTIONS`] entries.
     pub connections: BTreeMap<String, StoredConnection>,
@@ -1132,8 +1132,8 @@ pub const REFUSAL_ENVELOPE: &str = "Unable to process request: ";
 /// no Environment.
 ///
 /// An unresolvable environment is a CLIENT fault for this service — the caller named
-/// a model that does not exist — so it is reported as `InterconnectClientException`
-/// (HTTP 400), not as the connection-scoped `ResourceNotFoundException` (404), and the
+/// a model that does not exist — so it is reported as `InterconnectClientException`,
+/// not as the connection-scoped `ResourceNotFoundException`, and the
 /// message is built from the id the request carried.
 pub fn environment_not_found_message(environment_id: &str) -> String {
     format!("{REFUSAL_ENVELOPE}This environment model with id {environment_id} could not be found")

@@ -9,7 +9,8 @@
 //! member, the `ConnectionState` the model documents as "available: The connection has
 //! been fully provisioned between AWS and the Partner". A connection that does not
 //! provide that connectivity yet, and one that no longer provides it, are alike refused
-//! with the operation's modelled 404, worded exactly as an ARN this scope never allocated
+//! with the operation's modelled absent-resource error, worded exactly as an ARN this
+//! scope never allocated
 //! is, having provisioned and associated nothing — the same rule the union's gateway
 //! member is held to, where only a gateway ready for use is a valid attach point.
 //!
@@ -314,7 +315,8 @@ async fn stored_ids(emulator: &Emulator, region: &str) -> BTreeSet<String> {
     }
 }
 
-/// Assert `(status, body)` is the modelled 404 this service answers an attach point that
+/// Assert `(status, body)` is the modelled absent-resource refusal this service answers
+/// an attach point that
 /// resolves to nothing with, worded for `arn` on `environment_id`.
 fn assert_not_an_attach_point(
     case: &str,
@@ -324,8 +326,8 @@ fn assert_not_an_attach_point(
     body: &Value,
 ) {
     assert_eq!(
-        status, 404,
-        "case {case:?}: expected the modelled 404 for an attach point whose connection provides no connectivity, got {status} with {body:?}"
+        status, 400,
+        "case {case:?}: expected HTTP 400 for an attach point whose connection provides no connectivity, got {status} with {body:?}"
     );
     assert!(
         code(body).contains("ResourceNotFoundException"),
@@ -371,7 +373,8 @@ fn assert_every_state_was_judged(proved: &BTreeSet<&'static str>) {
 
 /// RULE: a `CreateConnection` whose `attachPoint.arn` names a connection that is not
 /// fully provisioned — still awaiting the partner portal, still being provisioned, being
-/// re-provisioned, being torn down or torn down — is refused with the modelled 404 and
+/// re-provisioned, being torn down or torn down — is refused with the modelled
+/// absent-resource error and
 /// provisions nothing, while the ARN of a fully provisioned connection is accepted and
 /// read back.
 #[tokio::test]

@@ -225,9 +225,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A key that resolves to no stored proposal — one never issued, one issued
         // through another Region's endpoint, or one naming a connection a
-        // `DeleteConnection` has been made on — is the modelled 404: "the request
-        // specifies a resource that does not exist on the server". `ActivationKey` is
-        // `@sensitive`, so the refusal names the member, never the key's value.
+        // `DeleteConnection` has been made on — names "a resource that does not exist
+        // on the server": the modelled absent-resource shape, under the status this
+        // service answers a fault in the REQUEST with
+        // (`crate::scaffolded::wire_status`), which is the status the
+        // identifier-addressed reads of the same record answer too — one absent record
+        // cannot have two statuses. `ActivationKey` is `@sensitive`, so the refusal
+        // names the member, never the key's value.
         let Some(output) = proposal else {
             return Err(
                 DescribeConnectionProposalErrorModeled::ResourceNotFoundException(

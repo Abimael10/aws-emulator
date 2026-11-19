@@ -6,7 +6,8 @@
 //! RULE under test: an attach point is a handle whose whole subject is the connectivity
 //! a Connection is provisioned onto, so from the moment a `DeleteConnection` is made on
 //! the connection behind such a handle the handle names nothing — the ARN is refused
-//! with the operation's modelled 404, worded exactly as an ARN this scope never
+//! with the operation's modelled absent-resource error, worded exactly as an ARN this
+//! scope never
 //! allocated is, for the whole teardown as well as after it, while the record itself
 //! stays readable by its own identifier so a caller polling the delete sees the
 //! teardown. The readiness rule is the union's, not one member's: the gateway member is
@@ -170,7 +171,8 @@ async fn state_now(emulator: &Emulator, region: &str, identifier: &str) -> Strin
     text(&read["connection"], "state")
 }
 
-/// Assert `(status, body)` is the modelled 404 this service answers an attach point that
+/// Assert `(status, body)` is the modelled absent-resource refusal this service answers
+/// an attach point that
 /// resolves to nothing with, worded for `arn` on `environment_id`.
 fn assert_not_an_attach_point(
     case: &str,
@@ -180,8 +182,8 @@ fn assert_not_an_attach_point(
     body: &Value,
 ) {
     assert_eq!(
-        status, 404,
-        "case {case:?}: expected the modelled 404 for an attach point whose delete has been called, got {status} with {body:?}"
+        status, 400,
+        "case {case:?}: expected HTTP 400 for an attach point whose delete has been called, got {status} with {body:?}"
     );
     assert!(
         code(body).contains("ResourceNotFoundException"),
@@ -201,7 +203,8 @@ fn assert_not_an_attach_point(
 // ---------------------------------------------------------------------------
 
 /// RULE: a `CreateConnection` whose `attachPoint.arn` names a connection a
-/// `DeleteConnection` has been made on is refused with the modelled 404 and provisions
+/// `DeleteConnection` has been made on is refused with the modelled absent-resource error
+/// and provisions
 /// nothing — in the call right after the delete as well as once the teardown has
 /// settled — while the ARN of a connection with no delete against it is accepted.
 #[tokio::test]

@@ -7,7 +7,8 @@
 //! the REQUEST addressed holds — a connection belongs to the Region it was created in —
 //! so the ARN of a live connection is an attach point only through that connection's own
 //! regional endpoint, and through every other Region's endpoint it resolves to nothing
-//! and is refused with the operation's modelled 404, worded exactly as an ARN this scope
+//! and is refused with the operation's modelled absent-resource error, worded exactly as
+//! an ARN this scope
 //! never allocated is, having provisioned and associated nothing.
 //!
 //! The rows differ in the Region the connection the ARN names lives in, the Region the
@@ -137,7 +138,8 @@ async fn stored_ids(emulator: &Emulator, region: &str) -> BTreeSet<String> {
     }
 }
 
-/// Assert `(status, body)` is the modelled 404 this service answers an attach point that
+/// Assert `(status, body)` is the modelled absent-resource refusal this service answers
+/// an attach point that
 /// resolves to nothing with, worded for `arn` on `environment_id`.
 fn assert_not_an_attach_point(
     case: &str,
@@ -147,8 +149,8 @@ fn assert_not_an_attach_point(
     body: &Value,
 ) {
     assert_eq!(
-        status, 404,
-        "case {case:?}: expected the modelled 404 for an attach point that resolves to nothing, got {status} with {body:?}"
+        status, 400,
+        "case {case:?}: expected HTTP 400 for an attach point that resolves to nothing, got {status} with {body:?}"
     );
     assert!(
         code(body).contains("ResourceNotFoundException"),

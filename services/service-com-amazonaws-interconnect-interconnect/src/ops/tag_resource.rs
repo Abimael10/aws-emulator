@@ -209,7 +209,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a tag key or value outside the modelled lengths, a key inside the namespace
         // AWS reserves for its own system tags, or more tags in one
         // request than a resource can hold, is a fault in the INPUT whatever the
-        // `arn` names, and judging it first keeps a 404 from masking it. (The
+        // `arn` names, and judging it first keeps a resource verdict from masking it.
+        // (The
         // boundary validator holds a LIST's members to their target's constraints
         // but not a MAP's keys, so a tag map is checked here.) The merged set is
         // judged again once the resource is resolved, below.
@@ -231,9 +232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::connection_for_arn_mut`): the connection the ARN's id names
         // among those the Region the request addressed holds, and a connection in the
         // terminal deleted state no longer has a tag set. An ARN that resolves to no
-        // connection this account holds is this service's own CLIENT fault, the modelled
-        // 400, not a 404 — worded with the fixed sentence every ARN-addressed refusal of
-        // a missing resource carries.
+        // connection this account holds is this service's own CLIENT fault,
+        // `InterconnectClientException` and not the connection-scoped not-found shape —
+        // worded with the fixed sentence every ARN-addressed refusal of a missing
+        // resource carries.
         let stored = crate::state::connection_for_arn_mut::<TagResourceError>(
             &mut guard,
             &region,

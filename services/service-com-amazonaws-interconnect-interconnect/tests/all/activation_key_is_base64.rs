@@ -9,7 +9,8 @@
 //! text that is not base64 is refused as invalid input (the modelled
 //! `InterconnectValidationException`, HTTP 400, in one fixed sentence that reproduces
 //! nothing of the `@sensitive` value), while base64 text that simply names no proposal
-//! keeps the resource verdict (the modelled `ResourceNotFoundException`, HTTP 404). The
+//! keeps the resource verdict (the modelled `ResourceNotFoundException`, under the same
+//! HTTP 400 this service answers every fault in a request with). The
 //! two operations that carry the member — the probe a client runs first
 //! (`DescribeConnectionProposal`) and the acceptance that follows it
 //! (`AcceptConnectionProposal`) — answer one and the same text identically, and neither
@@ -38,7 +39,8 @@ use crate::emulator::{code, message, placements, text, Emulator, DEFAULT_SIGNING
 /// The error this service models for a fault in the request's own input (HTTP 400).
 const VALIDATION_CODE: &str = "InterconnectValidationException";
 
-/// The error a well-formed handle that names no resource is answered with (HTTP 404).
+/// The error a well-formed handle that names no resource is answered with; like every
+/// fault in a request, it carries this service's HTTP 400.
 const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 
 /// The published bounds of `ActivationKey`
@@ -137,8 +139,8 @@ async fn assert_resolves_to_nothing(
     for (operation, status, body) in both(emulator, activation_key, gateway).await {
         let case = format!("{case} / {operation}");
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404 for base64 text that names no proposal, got {status} with {body:?}"
+            status, 400,
+            "case {case:?}: expected HTTP 400 for base64 text that names no proposal, got {status} with {body:?}"
         );
         assert!(
             code(&body).contains(NOT_FOUND_CODE),
@@ -278,8 +280,9 @@ fn well_formed_keys(minted: &str) -> Vec<(String, String)> {
 
 /// RULE: both operations that take an `activationKey` judge the member's own base64
 /// encoding before they resolve it, so text that is not base64 is the modelled input
-/// refusal (400) in one fixed sentence and base64 text that names no proposal is the
-/// modelled resource verdict (404) — and a key a `CreateConnection` minted is read
+/// refusal in one fixed sentence and base64 text that names no proposal is the
+/// modelled resource verdict — the two classes carry one status and are told apart by
+/// their error code — and a key a `CreateConnection` minted is read
 /// rather than refused.
 #[tokio::test]
 async fn an_activation_keys_encoding_is_judged_before_the_proposal_is_resolved() {
@@ -342,7 +345,7 @@ async fn an_activation_keys_encoding_is_judged_before_the_proposal_is_resolved()
     }
 
     // A key one character PAST the published maximum is refused at the boundary, before
-    // any handler judges its encoding — a 400, and never a 404 or a 501.
+    // any handler judges its encoding — a 400, and never a 501.
     for (name, key) in [
         ("one past the maximum, base64", "A".repeat(maximum + 1)),
         (

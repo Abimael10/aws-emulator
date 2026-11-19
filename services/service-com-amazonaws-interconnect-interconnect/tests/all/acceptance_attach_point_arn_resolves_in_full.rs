@@ -8,7 +8,8 @@
 //! the REQUEST addressed holds, so an ARN differing from a stored connection's own ARN in
 //! any one of those fields, or naming a connection of another Region, is an ARN this
 //! endpoint holds no attach point for: the acceptance is refused with the operation's
-//! modelled 404, worded exactly as an id this scope never allocated is, and the proposal
+//! modelled absent-resource error, worded exactly as an id this scope never allocated
+//! is, and the proposal
 //! is left as it was.
 //!
 //! The rows differ along what the rule generalises over: WHICH field of the ARN differs
@@ -124,7 +125,8 @@ async fn accept_with_arn(
         .await
 }
 
-/// Assert `(status, body)` is the modelled 404 this service answers an attach point that
+/// Assert `(status, body)` is the modelled absent-resource refusal this service answers
+/// an attach point that
 /// resolves to nothing with, worded for `arn` on `environment_id`.
 fn assert_not_an_attach_point(
     case: &str,
@@ -134,8 +136,8 @@ fn assert_not_an_attach_point(
     body: &Value,
 ) {
     assert_eq!(
-        status, 404,
-        "case {case:?}: expected the modelled 404 for an attach point that resolves to nothing, got {status} with {body:?}"
+        status, 400,
+        "case {case:?}: expected HTTP 400 for an attach point that resolves to nothing, got {status} with {body:?}"
     );
     assert!(
         code(body).contains("ResourceNotFoundException"),
@@ -153,7 +155,7 @@ fn assert_not_an_attach_point(
 /// RULE: an acceptance's `attachPoint.arn` resolves only to a connection the Region the
 /// request addressed holds, matched field for field — so an ARN whose partition, Region,
 /// account or resource id is not that connection's resolves to nothing, the acceptance is
-/// refused with the same 404 and the same wording whichever field differs, and the
+/// refused with the same refusal and the same wording whichever field differs, and the
 /// proposal keeps the attach point it was created on. The same ARN, with every field the
 /// stored one's, is accepted and read back.
 #[tokio::test]

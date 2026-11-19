@@ -155,10 +155,10 @@ fn assert_absent(case: &str, status: u16, body: &Value, expected: &str) {
 }
 
 /// [`assert_absent`] for a lookup addressed by an `activationKey` rather than by a
-/// `ConnectionId`: the same modelled error and the same wording, under the status the
-/// proposal read answers it with.
+/// `ConnectionId`: one absent record cannot have two statuses, so the same modelled
+/// error, the same wording and the same status the identifier-addressed read answers.
 fn assert_proposal_absent(case: &str, status: u16, body: &Value, expected: &str) {
-    assert_absent_with(case, 404, status, body, expected)
+    assert_absent_with(case, 400, status, body, expected)
 }
 
 /// The shared assertion both of the above make: the modelled

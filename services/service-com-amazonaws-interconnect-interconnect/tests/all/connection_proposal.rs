@@ -9,7 +9,8 @@
 //! connection record holds, and the describe reports that record's bandwidth and
 //! environmentId together with the named Environment's provider and location — a
 //! key that resolves to no stored proposal is refused with the operation's modelled
-//! 404. Every assertion here is checked over a TABLE built from the live seeded
+//! absent-resource error, under the HTTP 400 this service answers every fault in a
+//! request with. Every assertion here is checked over a TABLE built from the live seeded
 //! catalog, whose rows differ in the environment, the provider kind, the bandwidth,
 //! the attach point the connection is created on and the region the request is signed
 //! for; the refusal table's rows differ in the SHAPE of the unresolvable key, including
@@ -18,7 +19,7 @@
 //! The second half of the rule: a key resolves to a proposal only while the connection
 //! it names is one a `DeleteConnection` has NOT been made on — the connectivity the
 //! proposal offered ceases to exist from the moment the delete is called, so the handle
-//! is void and describing it is the same 404 an unissued key gets, while the record
+//! is void and describing it is the same refusal an unissued key gets, while the record
 //! itself stays readable by its identifier.
 
 use std::collections::BTreeMap;
@@ -382,15 +383,16 @@ async fn describe(emulator: &Emulator, region: &str, activation_key: &str) -> (u
         .await
 }
 
-/// The key names no describable proposal: the operation's modelled 404, worded the way
+/// The key names no describable proposal: the operation's modelled absent-resource
+/// error under this service's client-fault status, worded the way
 /// this service words a key that resolves to nothing, and never echoing the
 /// `@sensitive` key itself.
 fn assert_void_handle(case: &str, status: u16, body: &Value, activation_key: &str) {
     use service_com_amazonaws_interconnect_interconnect::state::proposal_not_retrievable_message;
 
     assert_eq!(
-        status, 404,
-        "case {case:?}: expected the modelled 404 for a key that names no proposal, got {status} with {body:?}"
+        status, 400,
+        "case {case:?}: expected HTTP 400 for a key that names no proposal, got {status} with {body:?}"
     );
     assert!(
         code(body).contains("ResourceNotFoundException"),
@@ -411,7 +413,8 @@ fn assert_void_handle(case: &str, status: u16, body: &Value, activation_key: &st
 }
 
 /// A connection a `DeleteConnection` has been made on has no proposal left: its
-/// activation key is refused with the operation's modelled 404 from the instant the
+/// activation key is refused with the operation's modelled absent-resource error from the
+/// instant the
 /// delete is called — while the record is still `deleting`, and once the clock has
 /// settled it into the terminal `deleted` — while the record stays readable by its
 /// identifier and every other key still names its own proposal.
@@ -536,7 +539,8 @@ async fn a_deleted_connections_activation_key_names_no_proposal() {
 }
 
 /// An `activationKey` that is base64 text but resolves to no stored proposal is the
-/// operation's modelled 404, whatever shape the key has — and the refusal never echoes
+/// operation's modelled absent-resource error, whatever shape the key has — and the
+/// refusal never echoes
 /// the key, which `ActivationKey` marks `@sensitive`. (Text that is not base64 at all is
 /// a fault in the REQUEST, which [`crate::activation_key_is_base64`] covers.)
 #[tokio::test]
@@ -588,8 +592,8 @@ async fn describe_connection_proposal_refuses_a_key_that_names_no_proposal() {
             .await;
         let label = format!("absent key of {} characters", key.len());
         assert_eq!(
-            status, 404,
-            "case {label:?}: expected the modelled 404 for a key that names no proposal, got {status} with {body:?}"
+            status, 400,
+            "case {label:?}: expected HTTP 400 for a key that names no proposal, got {status} with {body:?}"
         );
         assert!(
             text(&body, "__type").contains("ResourceNotFoundException"),
@@ -609,8 +613,9 @@ async fn describe_connection_proposal_refuses_a_key_that_names_no_proposal() {
     }
 
     // One character PAST the upper bound, and one short of the lower one, are refused
-    // at the boundary as malformed requests — a 400, never the 404 above and never a
-    // 501.
+    // at the boundary as malformed REQUESTS: the same 400 every fault in a request
+    // carries, but naming the boundary's own error class rather than the
+    // absent-resource one above, and never a 501.
     for (label, key) in [
         ("one past the 2048-character maximum", "A".repeat(2049)),
         ("one short of the 1-character minimum", String::new()),
@@ -625,9 +630,14 @@ async fn describe_connection_proposal_refuses_a_key_that_names_no_proposal() {
             status, 400,
             "case {label:?}: expected HTTP 400 for a key outside the modelled length, got {status} with {body:?}"
         );
+        assert!(
+            !text(&body, "__type").contains("ResourceNotFoundException"),
+            "case {label:?}: expected the boundary's own refusal class, not the absent-resource one, got {:?}",
+            body["__type"]
+        );
     }
 
-    // A missing required member is likewise a 400, not a 404.
+    // A missing required member is likewise a 400.
     let (status, body) = emulator.ic("DescribeConnectionProposal", json!({})).await;
     assert_eq!(
         status, 400,

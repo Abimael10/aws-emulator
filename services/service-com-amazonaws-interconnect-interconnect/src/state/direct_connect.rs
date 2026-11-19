@@ -207,7 +207,8 @@ pub trait AttachPointRefusal: Sized {
     fn invalid_attach_point(message: String) -> Self;
 
     /// The account's attach points were read and the identifier is not one of them: the
-    /// modelled `ResourceNotFoundException` (HTTP 404).
+    /// modelled `ResourceNotFoundException`, under the status this service answers a
+    /// fault in the request with (`crate::scaffolded::wire_status`).
     fn not_an_attach_point(message: String) -> Self;
 
     /// The account's attach points could not be read, so the identifier could not be

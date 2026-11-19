@@ -7,7 +7,7 @@
 //! points of the account by one rule, whichever operation writes it — `CreateConnection`
 //! allocating the first one or `AcceptConnectionProposal` associating one: a gateway the
 //! account holds ready is accepted, a gateway the account's attach points do not include
-//! is the modelled `ResourceNotFoundException` (404) naming the identifier and the
+//! is the modelled `ResourceNotFoundException` naming the identifier and the
 //! Environment, and an account whose attach points cannot be read at all is the modelled
 //! `InterconnectServerException` (500) saying so without naming the identifier, because
 //! then nothing is known about it either way.
@@ -150,7 +150,8 @@ fn identifier_of(attach_point: &Value) -> String {
 /// RULE: both writers of a connection's attach point reach the SAME verdict on the same
 /// gateway identifier and answer it with the same status, the same modelled error and
 /// the same wording — a gateway the account holds ready is accepted by both, and one the
-/// account's attach points do not include is the modelled 404 naming the identifier and
+/// account's attach points do not include is the modelled absent-resource refusal naming
+/// the identifier and
 /// the Environment from both.
 #[tokio::test]
 async fn both_attach_point_writers_answer_one_gateway_verdict_the_same_way() {
@@ -206,8 +207,8 @@ async fn both_attach_point_writers_answer_one_gateway_verdict_the_same_way() {
                 ("AcceptConnectionProposal", accepted_status, &accepted_body),
             ] {
                 assert_eq!(
-                    status, 404,
-                    "case {case:?} / {operation}: expected the modelled 404 for an identifier that is not an attach point, got {status} with {body:?}"
+                    status, 400,
+                    "case {case:?} / {operation}: expected HTTP 400 for an identifier that is not an attach point, got {status} with {body:?}"
                 );
                 assert!(
                     code(body).contains("ResourceNotFoundException"),
@@ -263,8 +264,8 @@ async fn both_attach_point_writers_answer_one_gateway_verdict_the_same_way() {
 
 /// RULE: when the account's attach points cannot be read at all, both writers answer the
 /// modelled `InterconnectServerException` (500) with one wording that names no
-/// identifier — a different answer from the 404 above, because nothing is known about the
-/// identifier either way — and neither writes anything.
+/// identifier — a different answer from the client fault above, because nothing is known
+/// about the identifier either way — and neither writes anything.
 #[tokio::test]
 async fn both_attach_point_writers_report_an_unreadable_account_the_same_way() {
     // Two front doors over ONE store: the fully mounted emulator, which owns the

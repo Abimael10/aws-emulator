@@ -159,7 +159,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Environment here to list anything for. An unresolvable environment is this
         // service's own client fault — the caller named an environment model that does
         // not exist — so it is the 400 `InterconnectClientException` every
-        // environment-resolving operation gives, never the connection-scoped 404 and
+        // environment-resolving operation gives, never the connection-scoped not-found
+        // shape and
         // never an empty page, which a caller could not tell from "this environment
         // offers none".
         let Some(environment) = crate::state::environment_in_region(&region, &input.environment_id)

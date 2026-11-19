@@ -43,7 +43,8 @@ use crate::emulator::{
 /// The error this service models for a fault in the request's own input (HTTP 400).
 const VALIDATION_CODE: &str = "InterconnectValidationException";
 
-/// The error a handle that resolves to no resource is answered with (HTTP 404).
+/// The error a handle that resolves to no resource is answered with; like every fault
+/// in a request, it carries this service's HTTP 400.
 const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 
 /// The error this service models for its own client faults (HTTP 400).
@@ -444,7 +445,7 @@ async fn an_acceptances_own_faults_are_reported_before_its_proposal_is_resolved(
             // row to reach the resource verdict.
             activation_key: "bm9Qb3J0YWxFdmVySXNzdWVkVGhpcw".to_string(),
             attach_point: json!({ "directConnectGateway": first }),
-            status: 404,
+            status: 400,
             code: NOT_FOUND_CODE,
             message: proposal_not_retrievable_message(),
         },

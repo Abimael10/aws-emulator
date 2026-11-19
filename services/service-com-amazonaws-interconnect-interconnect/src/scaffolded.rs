@@ -184,23 +184,47 @@ impl SerializableStruct for ValidationException {
 /// answered with whatever shape names the fault.
 pub const CLIENT_FAULT_STATUS: u16 = 400;
 
+/// The status the model puts on the shape that says a request named a resource this
+/// endpoint does not hold (`ResourceNotFoundException`), which is the only shape in
+/// this service's model carrying it.
+const ABSENT_RESOURCE_MODELED_STATUS: u16 = 404;
+
+/// The HTTP status THIS service answers a modeled fault with, given the status
+/// `modeled` that the fault's shape declares.
+///
+/// A request naming a resource the endpoint does not hold is a fault in the REQUEST,
+/// and this service is RECORDED answering it with [`CLIENT_FAULT_STATUS`] — naming the
+/// absent-resource shape in the body (`__type`, on both of this service's protocols)
+/// rather than in the status line — so the status the model records for that shape is
+/// not what the endpoint emits. Taking it verbatim makes the answer say "this endpoint
+/// resolved nothing" — which is how SDK classifiers, proxies and caches read it — for a
+/// request that reached the operation and was judged by it.
+///
+/// Every other status the model records is kept as it is: a quota refusal, a
+/// throttling refusal and a 5xx server fault each carry retry semantics of their own
+/// that nothing here may flatten into a plain client fault.
+///
+/// It is one function for the whole service on purpose: a per-site override is what
+/// lets two handles on one record disagree about the status its absence is answered
+/// with.
+pub fn wire_status(modeled: u16) -> u16 {
+    if modeled == ABSENT_RESOURCE_MODELED_STATUS {
+        CLIENT_FAULT_STATUS
+    } else {
+        modeled
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status this service's
+    /// wire answers that fault with — see [`wire_status`], the one place that decides
+    /// it for every operation.
     Modeled(E),
-    /// A modeled error this service answers with the HTTP 400 it gives a client
-    /// fault, rather than with the status the model's `@httpError` gives that shape.
-    ///
-    /// The error SHAPE, its members and its wire code are the modeled ones and are
-    /// rendered exactly as [`Self::Modeled`] renders them; only the status line
-    /// differs. Reach for this where the service answers a client's fault with its own
-    /// 400 even though the shape it names is modeled with another status — a request
-    /// naming a resource the account does not hold, say.
-    ClientFault(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -218,12 +242,6 @@ impl<E> Scaffolded<E> {
     /// The scaffold signal for `operation`.
     pub fn not_implemented(operation: &str) -> Self {
         Self::NotImplemented(NotImplemented::new(operation))
-    }
-
-    /// Answer `modeled` with the 400 this service gives a client fault, keeping the
-    /// modeled shape, members and wire code. See [`Self::ClientFault`].
-    pub fn client_fault(modeled: E) -> Self {
-        Self::ClientFault(modeled)
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
@@ -249,7 +267,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
-            Self::Modeled(e) | Self::ClientFault(e) => write!(f, "{e}"),
+            Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -261,7 +279,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::NotImplemented(e) => e.source(),
-            Self::Modeled(e) | Self::ClientFault(e) => e.source(),
+            Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -275,7 +293,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn as_serializable(&self) -> &dyn SerializableStruct {
         match self {
             Self::NotImplemented(e) => e,
-            Self::Modeled(e) | Self::ClientFault(e) => e.as_serializable(),
+            Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
         }
     }
@@ -283,7 +301,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn variant_schema(&self) -> &'static Schema {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
-            Self::Modeled(e) | Self::ClientFault(e) => e.variant_schema(),
+            Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -295,7 +313,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn shape_name(&self) -> &'static str {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
-            Self::Modeled(e) | Self::ClientFault(e) => e.shape_name(),
+            Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -307,8 +325,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
-            Self::ClientFault(_) | Self::ValidationException(_) => CLIENT_FAULT_STATUS,
+            Self::Modeled(e) => wire_status(e.http_status()),
+            Self::ValidationException(_) => CLIENT_FAULT_STATUS,
         }
     }
 
@@ -318,9 +336,38 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // no `awsQueryError` trait to honour. The 501 + `<Code>NotImplemented`
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
-            Self::Modeled(e) | Self::ClientFault(e) => e.query_error_code(),
+            Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{wire_status, CLIENT_FAULT_STATUS};
+
+    /// The status every modelled fault of this service is served at, from the status
+    /// the model records for it: the shape that names an absent resource is answered
+    /// with this service's own client-fault status, and every other class keeps the
+    /// status the model gives it.
+    #[test]
+    fn an_absent_resource_is_served_at_the_client_fault_status() {
+        // The statuses this service's model records on its errors
+        // (`smithy_query(query="digest")` -> the service's common errors).
+        for modeled in [400, 402, 403, 429, 500] {
+            assert_eq!(
+                wire_status(modeled),
+                modeled,
+                "case \"a modelled {modeled}\": expected the modelled status to be kept, got {}",
+                wire_status(modeled)
+            );
+        }
+        assert_eq!(
+            wire_status(404),
+            CLIENT_FAULT_STATUS,
+            "case \"the absent-resource shape\": expected {CLIENT_FAULT_STATUS}, got {}",
+            wire_status(404)
+        );
     }
 }

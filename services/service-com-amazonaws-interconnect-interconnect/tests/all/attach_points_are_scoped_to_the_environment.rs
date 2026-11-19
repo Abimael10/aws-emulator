@@ -123,7 +123,7 @@ async fn the_listing_is_scoped_to_the_environment_it_is_asked_for() {
 
 /// RULE: the listing and the attach-point refusal are the same judgement — an identifier
 /// the listing reports for an Environment creates a Connection on it, and one it does
-/// not report is refused with the modelled `ResourceNotFoundException` (404) naming the
+/// not report is refused with the modelled `ResourceNotFoundException` naming the
 /// identifier and the Environment it was offered for.
 #[tokio::test]
 async fn a_create_accepts_exactly_what_the_environments_listing_offers() {
@@ -199,7 +199,7 @@ async fn a_create_accepts_exactly_what_the_environments_listing_offers() {
 
 /// RULE: an attach point an Environment's listing does not offer is never accepted for
 /// it — an identifier the account does not hold is the modelled `ResourceNotFoundException`
-/// (404), worded from the identifier the request carried and the Environment it was
+/// worded from the identifier the request carried and the Environment it was
 /// offered for, and an Environment that carries no Connection refuses the request by its
 /// own state (`InterconnectClientException`, 400) before an attach point is judged at all.
 #[tokio::test]
@@ -227,7 +227,8 @@ async fn an_attach_point_outside_the_environments_listing_is_never_accepted() {
     // Rows differ in WHY the attach point is not valid, and each row names the refusal
     // it expects: an identifier the account does not hold at all, offered for an
     // environment that carries connections, is the attach-point refusal itself (the
-    // modelled `ResourceNotFoundException`, 404, in the shared wording); a gateway the
+    // modelled `ResourceNotFoundException`, in the shared wording, under the 400 this
+    // service answers every fault in a request with); a gateway the
     // account DOES hold, offered for an environment that carries none, is refused by that
     // environment's own state first (`InterconnectClientException`, 400), which is where
     // the request stops before an attach point is judged at all.
@@ -238,7 +239,7 @@ async fn an_attach_point_outside_the_environments_listing_is_never_accepted() {
             (
                 environment.clone(),
                 unowned.clone(),
-                404,
+                400,
                 "ResourceNotFoundException",
             )
         })

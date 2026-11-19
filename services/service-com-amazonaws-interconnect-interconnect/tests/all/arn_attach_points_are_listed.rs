@@ -156,7 +156,8 @@ async fn provisioned_arns(emulator: &Emulator, region: &str) -> BTreeSet<String>
     }
 }
 
-/// Assert `(status, body)` is the modelled 404 this service answers an attach point that
+/// Assert `(status, body)` is the modelled absent-resource refusal this service answers
+/// an attach point that
 /// resolves to nothing with, worded for `identifier` on `environment_id`.
 fn assert_not_an_attach_point(
     case: &str,
@@ -166,8 +167,8 @@ fn assert_not_an_attach_point(
     body: &Value,
 ) {
     assert_eq!(
-        status, 404,
-        "case {case:?}: expected the modelled 404 for an attach point the listing does not offer, got {status} with {body:?}"
+        status, 400,
+        "case {case:?}: expected HTTP 400 for an attach point the listing does not offer, got {status} with {body:?}"
     );
     assert!(
         code(body).contains("ResourceNotFoundException"),
@@ -376,7 +377,7 @@ async fn a_connection_is_an_arn_attach_point_exactly_while_it_provides_connectiv
 /// RULE: the attach points `ListAttachPoints` offers an Environment are exactly the ones
 /// a create onto it accepts — every descriptor on the page is accepted in the member its
 /// `type` names, and a well-formed identifier of either form that the page does not offer
-/// is refused with the modelled `ResourceNotFoundException` (404).
+/// is refused with the modelled `ResourceNotFoundException`.
 #[tokio::test]
 async fn the_listing_offers_exactly_the_attach_points_a_create_accepts() {
     let emulator = Emulator::new();

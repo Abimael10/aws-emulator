@@ -208,7 +208,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the request itself names is judged before any resource is looked up,
         // and nothing is written when it is refused: a key AWS reserves for its own
         // system tags is not the caller's to remove, whatever the `arn` names, so the
-        // refusal is the modelled 400 on the input rather than a 404 masking it. The
+        // refusal is the modelled input fault rather than a resource verdict masking
+        // it. The
         // same rule judges the writers of a tag set, so a key a caller can never
         // create is also one it can never delete.
         if let Some(message) =
@@ -231,8 +232,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::connection_for_arn_mut`): the connection the ARN's id names
         // among those the Region the request addressed holds, and a connection in the
         // terminal deleted state no longer has a tag set. An ARN that resolves to no
-        // connection this account holds is this service's own CLIENT fault, the modelled
-        // 400, not a 404 — worded with the same fixed sentence the sibling tag write
+        // connection this account holds is this service's own CLIENT fault,
+        // `InterconnectClientException` and not the connection-scoped not-found shape —
+        // worded with the same fixed sentence the sibling tag write
         // answers, so the two writers report a missing resource identically.
         let stored = crate::state::connection_for_arn_mut::<UntagResourceError>(
             &mut guard,

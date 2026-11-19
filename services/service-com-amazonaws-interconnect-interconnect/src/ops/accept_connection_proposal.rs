@@ -260,7 +260,9 @@ fn judge_against_store(
     // `activationKey` -> connection-id index resolves it, and the connection it names
     // is then resolved in the Region the request was signed for, so a key minted
     // through another Region's endpoint resolves to nothing here. A key that resolves
-    // to no proposal is the modelled 404, worded without the key itself, which
+    // to no proposal is the modelled absent-resource shape, under the status this
+    // service answers a fault in the REQUEST with (`crate::scaffolded::wire_status`)
+    // and worded without the key itself, which
     // `ActivationKey` marks `@sensitive`. Unlike the proposal READ
     // (`crate::state::proposal_in`), which serves nothing once a `DeleteConnection`
     // has been made on the connection, the record is resolved here whatever state it

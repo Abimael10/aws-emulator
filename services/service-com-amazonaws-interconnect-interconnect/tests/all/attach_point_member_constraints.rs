@@ -8,8 +8,9 @@
 //! them is a fault in the REQUEST — the modelled `InterconnectValidationException`
 //! (400), worded the way this service words every value that is not an identifier of its
 //! kind — rather than an identifier resolved against state and then answered as a
-//! resource the account does not hold (404) or as an empty page. A value INSIDE those
-//! constraints is resolved as before: one that names nothing is still the modelled 404.
+//! resource the account does not hold or as an empty page. A value INSIDE those
+//! constraints is resolved as before: one that names nothing is still the modelled
+//! absent-resource refusal.
 //!
 //! The constraints are the model's, read from
 //! `smithy_query(query="shape",shape="AttachPoint")`: `arn` carries `@length(59, 150)`
@@ -463,7 +464,8 @@ async fn a_value_outside_an_attach_point_members_constraints_is_invalid_input() 
 // ---------------------------------------------------------------------------
 
 /// RULE: a value every one of its member's constraints admits is still RESOLVED — one
-/// that names no attach point valid for the Environment is the modelled 404, naming the
+/// that names no attach point valid for the Environment is the modelled absent-resource
+/// refusal, naming the
 /// value and the Environment — so the 400s above are about the value's own spelling and
 /// not a blanket refusal, and a gateway the account holds is accepted by both writers.
 #[tokio::test]
@@ -488,8 +490,8 @@ async fn a_well_formed_value_that_names_nothing_is_still_the_not_found() {
                 ("AcceptConnectionProposal", accepted_status, &accepted_body),
             ] {
                 assert_eq!(
-                    status, 404,
-                    "case {case:?} / {operation}: expected the modelled 404 for a well-formed value naming nothing, got {status} with {body:?}"
+                    status, 400,
+                    "case {case:?} / {operation}: expected HTTP 400 for a well-formed value naming nothing, got {status} with {body:?}"
                 );
                 assert!(
                     code(body).contains(NOT_FOUND_CODE),

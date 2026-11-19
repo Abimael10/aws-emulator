@@ -160,11 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = &mut *guard;
 
         // An identifier that names no stored connection is a fault in the REQUEST: an
-        // update never brings a connection into existence, so it is answered with the
-        // status this service gives a client fault
-        // (`crate::scaffolded::CLIENT_FAULT_STATUS`) under the modeled connection-scoped
-        // error shape. The message is built from the request's own identifier, in this
-        // operation's own construction.
+        // update never brings a connection into existence, so it is answered under the
+        // modeled connection-scoped error shape with the status this service answers
+        // such a fault with (`crate::scaffolded::wire_status`, which decides it for
+        // every operation). The message is built from the request's own identifier, in
+        // this operation's own construction.
         //
         // The same Region scope every connection lookup applies, spelled with the
         // store's own predicate so this field borrow keeps one rule: a
@@ -175,13 +175,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.identifier)
             .filter(|stored| crate::state::visible_in(stored, &region))
         else {
-            return Err(crate::scaffolded::Scaffolded::client_fault(
+            return Err(
                 UpdateConnectionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(crate::state::connection_absent_message(&input.identifier)),
                     },
-                ),
-            ));
+                )
+                .into(),
+            );
         };
 
         // An update that asks for a CHANGE is permitted only FROM the states the

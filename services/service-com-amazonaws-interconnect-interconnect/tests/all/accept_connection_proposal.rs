@@ -11,7 +11,8 @@
 //! request selects, leaving the Environment and the bandwidth chosen on the partner's
 //! portal untouched, and reports the connection in the state the model documents an
 //! accepted proposal's connection in. A key that names no proposal, and an Attach
-//! Point that resolves to nothing, are both refused with the operation's modelled 404
+//! Point that resolves to nothing, are both refused with the operation's modelled
+//! absent-resource error
 //! and change nothing; a proposal that has already been accepted is reported again
 //! only for the same acceptance.
 //!
@@ -468,7 +469,7 @@ async fn an_acceptance_may_select_an_attach_point_by_arn() {
 
 /// RULE: an `activationKey` that is base64 text but resolves to no proposal of the
 /// Region the request addresses is refused with the operation's modelled
-/// `ResourceNotFoundException` (404), in the service's own wording, which never echoes
+/// `ResourceNotFoundException`, in the service's own wording, which never echoes
 /// the `@sensitive` key — and the refusal makes nothing. (Text that is not base64 at all
 /// is a fault in the REQUEST, which [`crate::activation_key_is_base64`] covers.)
 #[tokio::test]
@@ -521,8 +522,8 @@ async fn accepting_a_key_that_names_no_proposal_is_refused_and_makes_nothing() {
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {label:?}: expected the modelled 404 for a key that names no proposal, got {status} with {body:?}"
+            status, 400,
+            "case {label:?}: expected HTTP 400 for a key that names no proposal, got {status} with {body:?}"
         );
         assert!(
             code(&body).contains("ResourceNotFoundException"),
@@ -559,7 +560,7 @@ async fn accepting_a_key_that_names_no_proposal_is_refused_and_makes_nothing() {
             )
             .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {label:?}: expected a key of another Region to name no proposal, got {status} with {body:?}"
         );
         assert_eq!(
@@ -582,8 +583,8 @@ async fn accepting_a_key_that_names_no_proposal_is_refused_and_makes_nothing() {
     );
 
     // A key outside the modelled length, and a request missing a required member, are
-    // refused at the boundary as malformed requests — a 400, never the 404 above and
-    // never a 501.
+    // refused at the boundary as malformed requests — the same 400 every fault in a
+    // request carries, and never a 501.
     for (label, body) in [
         (
             "one past the 2048-character maximum",
@@ -619,7 +620,8 @@ async fn accepting_a_key_that_names_no_proposal_is_refused_and_makes_nothing() {
 /// EXISTS and is valid for the Environment the proposal is placed upon — the set
 /// `ListAttachPoints` reports for it for the `directConnectGateway` member, a
 /// Connection of the account for the `arn` one — and one that resolves to nothing is
-/// refused with the modelled 404, leaving the proposal's own attach point in place.
+/// refused with the modelled absent-resource error, leaving the proposal's own attach
+/// point in place.
 #[tokio::test]
 async fn an_attach_point_that_resolves_to_nothing_is_refused_and_accepts_nothing() {
     let emulator = Emulator::new();
@@ -683,8 +685,8 @@ async fn an_attach_point_that_resolves_to_nothing_is_refused_and_accepts_nothing
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {label:?}: expected the modelled 404 for an attach point that resolves to nothing, got {status} with {body:?}"
+            status, 400,
+            "case {label:?}: expected HTTP 400 for an attach point that resolves to nothing, got {status} with {body:?}"
         );
         assert!(
             code(&body).contains("ResourceNotFoundException"),

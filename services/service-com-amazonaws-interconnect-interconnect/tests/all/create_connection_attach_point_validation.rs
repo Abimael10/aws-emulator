@@ -6,7 +6,8 @@
 //! RULE: `CreateConnection$attachPoint` has to identify an attach point that EXISTS and
 //! is valid for the named Environment — the set `ListAttachPoints` reports for it for
 //! the `directConnectGateway` member, a Connection of the account for the `arn` one —
-//! and one that resolves to nothing is refused with the operation's modelled 404,
+//! and one that resolves to nothing is refused with the operation's modelled
+//! absent-resource error,
 //! having provisioned nothing.
 //!
 //! The rows differ along what the rule generalises over (the attach-point member, the
@@ -113,8 +114,8 @@ async fn listed_identifiers(emulator: &Emulator, region: &str, environment_id: &
 // ---------------------------------------------------------------------------
 
 /// RULE: an `attachPoint` that resolves to no attach point valid for the named
-/// Environment is refused with the operation's modelled `ResourceNotFoundException`
-/// (404), worded from the request, and nothing is provisioned for it.
+/// Environment is refused with the operation's modelled `ResourceNotFoundException`,
+/// worded from the request, and nothing is provisioned for it.
 #[tokio::test]
 async fn an_attach_point_that_resolves_to_nothing_is_refused_and_provisions_nothing() {
     let emulator = Emulator::new();
@@ -193,8 +194,8 @@ async fn an_attach_point_that_resolves_to_nothing_is_refused_and_provisions_noth
             let (status, body) =
                 create_on(&emulator, region, environment, &bandwidth, attach_point).await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected the modelled 404 for an attach point that resolves to nothing, got {status} with {body:?}"
+                status, 400,
+                "case {case:?}: expected HTTP 400 for an attach point that resolves to nothing, got {status} with {body:?}"
             );
             assert!(
                 code(&body).contains("ResourceNotFoundException"),
@@ -373,7 +374,7 @@ async fn a_connection_of_the_account_is_an_attach_point_by_arn() {
         let (status, body) =
             create_on(&emulator, region, environment, &bandwidth, &attach_point).await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: expected the ARN of a gone connection to resolve to nothing, got {status} with {body:?}"
         );
     }
