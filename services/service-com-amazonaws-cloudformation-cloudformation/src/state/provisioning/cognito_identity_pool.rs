@@ -98,6 +98,11 @@ const NOT_IMPLEMENTED: &str = "NotImplemented";
 /// The code a refusal carries for a declaration that states none of a required property.
 const MISSING_PROPERTY: &str = "InvalidRequest";
 
+/// The code a refusal carries for a declared change the owning API does not make to the
+/// resource that EXISTS: a declaration this deployment cannot apply, which is the same class
+/// of bad declaration as one missing a required property.
+const UNAPPLIED_CHANGE: &str = "InvalidRequest";
+
 /// Which of the two types one resource is.
 ///
 /// Visible to the whole of this service's state module, because it travels with
@@ -129,6 +134,11 @@ const IDENTITY_POOL_NAME: &str = "IdentityPoolName";
 /// The property carrying the pool's own tag map.
 const IDENTITY_POOL_TAGS: &str = "IdentityPoolTags";
 
+/// The property carrying the pool's developer-provider domain — "the 'domain' by which Cognito
+/// will refer to your users; you provided this domain while creating/updating the identity
+/// pool" — which the owning API settles when the pool first takes one.
+const DEVELOPER_PROVIDER_NAME: &str = "DeveloperProviderName";
+
 /// The property naming the pool a role attachment configures, and the member every call on a
 /// pool is addressed by.
 const IDENTITY_POOL_ID: &str = "IdentityPoolId";
@@ -151,7 +161,7 @@ const POOL_MEMBERS: &[&str] = &[
     "AllowClassicFlow",
     "AllowUnauthenticatedIdentities",
     "CognitoIdentityProviders",
-    "DeveloperProviderName",
+    DEVELOPER_PROVIDER_NAME,
     "OpenIdConnectProviderARNs",
     "SamlProviderARNs",
     "SupportedLoginProviders",
@@ -164,7 +174,7 @@ const POOL_PROPERTIES: &[&str] = &[
     "AllowClassicFlow",
     "AllowUnauthenticatedIdentities",
     "CognitoIdentityProviders",
-    "DeveloperProviderName",
+    DEVELOPER_PROVIDER_NAME,
     "IdentityPoolName",
     "IdentityPoolTags",
     "OpenIdConnectProviderARNs",
@@ -437,6 +447,9 @@ pub(super) fn ready() -> super::Readiness {
 /// is a different attachment, and the pool it was on would keep the roles this resource put
 /// there, so the deployment reports the change as not applied rather than as a success that
 /// left the old pool configured.
+///
+/// A declared value the owning API will not put in force is a FAILURE of the resource rather
+/// than a change reported as made ([`refuse_unapplied_change`]), so the deployment rolls back.
 pub(super) async fn update(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -473,6 +486,14 @@ pub(super) async fn update(
                 &Value::Object(request),
             )
             .await?;
+            // A resource is reported UPDATED only where the owning API really applied what the
+            // declaration asked for. `UpdateIdentityPool` answers the pool's stored record, so
+            // a member the answer reports with another value is one the call did NOT apply —
+            // the developer-provider domain is settled when the pool first takes one, and the
+            // update keeps the one it holds — and a declared change this deployment cannot
+            // make FAILS the resource, which is what rolls the deployment back instead of
+            // reporting a success that left the old value in force.
+            refuse_unapplied_change(declared, &answered, &resource.resource_type)?;
             let mut attributes = BTreeMap::new();
             if let Some(name) = answered.get(IDENTITY_POOL_NAME).and_then(Value::as_str) {
                 attributes.insert(NAME_ATTRIBUTE.to_string(), name.to_string());
@@ -817,6 +838,42 @@ fn refuse_unapplied_properties(
         });
     }
     Ok(())
+}
+
+/// The refusal for a declared value the owning API did NOT apply to the pool that exists,
+/// read off what the update ANSWERED — the pool's own stored record, so the question asked is
+/// whether the call made the change rather than which member it was about.
+///
+/// The pool's developer-provider domain is the one member whose value that API settles when
+/// the pool first takes one, and an update carrying another one is answered with the domain
+/// the pool keeps. CloudFormation reports a resource updated only where the declared state is
+/// the state in force, so such a declaration fails the resource — and the deployment rolls
+/// back — rather than being reported as a success that changed nothing. A declaration stating
+/// no domain asks for no change to it, and a pool that holds none TAKES the declared one, so
+/// neither is this refusal.
+fn refuse_unapplied_change(
+    declared: &Value,
+    answered: &Value,
+    resource_type: &str,
+) -> Result<(), Refusal> {
+    let settled = answered
+        .get(DEVELOPER_PROVIDER_NAME)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let asked = declared
+        .get(DEVELOPER_PROVIDER_NAME)
+        .and_then(Value::as_str)
+        .filter(|domain| !domain.is_empty());
+    match asked {
+        Some(asked) if asked != settled => Err(Refusal {
+            code: UNAPPLIED_CHANGE.to_string(),
+            message: format!(
+                "the {resource_type} declares {DEVELOPER_PROVIDER_NAME} '{asked}', which the \
+                 identity pool does not take: it keeps the '{settled}' it already has"
+            ),
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Call one Amazon Cognito Identity operation on the awsJson1_1 wire its model declares.

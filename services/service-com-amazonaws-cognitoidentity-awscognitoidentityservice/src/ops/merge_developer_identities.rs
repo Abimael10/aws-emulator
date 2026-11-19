@@ -9,6 +9,11 @@
 //! identity, since a merge takes an identity's logins away and only `DeleteIdentities`
 //! removes the record.
 //!
+//! The two users are the pool's own developer provider's, so a request naming any other
+//! provider names one the pool does not support: a bad input parameter decided against the
+//! pool's configuration alone, before either user identifier is resolved — the same refusal
+//! every operation of this service that resolves a developer provider answers it with.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -267,25 +272,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> MergeDeveloperIde
         // A developer identity is a login of the pool keyed by the pool's own
         // `DeveloperProviderName` — "the 'domain' by which Cognito will refer to your
         // users" — whose value is the developer user identifier. A request naming any other
-        // provider therefore names mappings this pool cannot hold at all, which is not a
-        // statement about either user it names: it is answered as access this caller does
-        // not have, exactly as the lookup of a mapping under such a provider is.
-        let developer_provider = pool
-            .developer_provider_name
-            .clone()
-            .filter(|provider| *provider == input.developer_provider_name);
-        let Some(developer_provider) = developer_provider else {
+        // provider therefore names a provider this pool does not support at all, which is a
+        // bad INPUT PARAMETER the caller has to correct (a stale or mistyped provider name,
+        // or a pool that names no developer provider), not an access decision about either
+        // user it names: it is decided against the pool's configuration alone, before either
+        // developer user identifier is resolved, and answered with the one fixed sentence
+        // every operation of this service that resolves a developer provider states for it
+        // ([`crate::state::UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE`], which names neither the
+        // provider the request carried nor the pool's own).
+        if !pool.names_developer_provider(&input.developer_provider_name) {
             return Err(
-                MergeDeveloperIdentitiesErrorModeled::NotAuthorizedException(
-                    NotAuthorizedException {
+                MergeDeveloperIdentitiesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
                         message: Some(
-                            crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE.to_string(),
+                            crate::state::UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE.to_string(),
                         ),
                     },
                 )
                 .into(),
             );
-        };
+        }
+        let developer_provider = input.developer_provider_name.clone();
 
         // "Only developer-authenticated users can be merged": each side of the merge is a
         // developer user identifier this pool has REGISTERED, and one it has registered

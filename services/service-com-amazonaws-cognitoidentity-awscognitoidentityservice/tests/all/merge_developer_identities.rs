@@ -20,7 +20,7 @@
 //!   `ResourceNotFoundException`, a developer user
 //!   identifier the pool has not registered is the same error naming that USER, a developer
 //!   provider that is not the pool's own
-//!   is a `NotAuthorizedException`, two users reached through one public provider are a
+//!   is an `InvalidParameterException`, two users reached through one public provider are a
 //!   `ResourceConflictException`, a pair whose linked
 //!   logins together pass the service's documented limit is an `InvalidParameterException`,
 //!   and a value outside a constraint the MODEL states is refused ahead of the operation with
@@ -37,11 +37,13 @@ use crate::identity_pool_flow::{error_code, Emulator, ABSENT_POOL_ID, DEFAULT_RE
 /// The operation under test, spelled once.
 const OPERATION: &str = "MergeDeveloperIdentities";
 
-/// The message Amazon Cognito Identity answers a request naming a developer provider that is
-/// not its identity pool's own with (`crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE`)
-/// — asserted here against the literal so the wire-visible wording is pinned by the test,
-/// not by the code under test.
-const NO_ACCESS_MESSAGE: &str = "You do not have access to this identity";
+/// The message Amazon Cognito Identity answers a request naming a developer provider its
+/// identity pool does not support with
+/// (`crate::state::UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE`) — asserted here against the
+/// literal so the wire-visible wording is pinned by the test, not by the code under test.
+/// Fixed text: it names neither the provider the request carried nor the pool's own.
+const UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE: &str =
+    "This identity pool does not support the specified developer provider.";
 
 /// The message Amazon Cognito Identity answers a pair of users that cannot become one user
 /// with (`crate::state::CANNOT_MERGE_IDENTITIES_MESSAGE`) — one fixed sentence, naming
@@ -580,7 +582,7 @@ async fn a_merge_the_pool_cannot_act_on_is_refused_and_writes_nothing() {
             "a developer provider name that is not this pool's",
             Broken::OtherDeveloperProvider,
             400,
-            "NotAuthorizedException",
+            "InvalidParameterException",
         ),
         (
             "a source identifier that was never registered",
@@ -765,11 +767,12 @@ async fn a_merge_the_pool_cannot_act_on_is_refused_and_writes_nothing() {
             error_code(&body).contains(expected_code),
             "case {case:?}: expected {expected_code}, got {body}"
         );
-        if *expected_code == "NotAuthorizedException" {
+        if matches!(broken, Broken::OtherDeveloperProvider) {
             assert_eq!(
                 error_message(case, &body),
-                NO_ACCESS_MESSAGE,
-                "case {case:?}: expected the fixed no-access message, got {body}"
+                UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE,
+                "case {case:?}: expected the fixed unsupported-developer-provider message, got \
+                 {body}"
             );
         }
         // A developer user identifier the pool has registered against no identity names a
@@ -815,6 +818,131 @@ async fn a_merge_the_pool_cannot_act_on_is_refused_and_writes_nothing() {
         assert_eq!(
             both, expected,
             "case {case:?}: a refused merge removes no identity"
+        );
+    }
+}
+
+/// RULE: the two users a merge names are the users of the POOL's own developer provider, so a
+/// request naming any other provider names one the pool does not support — a bad input
+/// parameter (400 `InvalidParameterException`) carrying the one fixed sentence this service
+/// states for it, decided against the pool's configuration alone and so BEFORE either
+/// identifier is resolved, which is what a pool holding both of the named users shows.
+#[tokio::test]
+async fn a_developer_provider_the_pool_does_not_support_is_an_invalid_parameter() {
+    let emulator = Emulator::new();
+
+    // The rows differ along what makes the named provider not the pool's own: another pool's
+    // domain, the same domain in another letter case or truncated (the stored value is exact),
+    // a domain the pool's own is a prefix of, and a pool that names NO developer provider at
+    // all. Every name sits inside the modelled `DeveloperProviderName` `pattern ^[\w._-]+$`,
+    // so each row reaches the handler rather than the validating walk ahead of it.
+    // (case, the pool's own developer provider, the provider the request names)
+    let cases: Vec<(&str, Option<&str>, &str)> = vec![
+        (
+            "another domain entirely",
+            Some("login.example.app"),
+            "another.example.app",
+        ),
+        (
+            "the pool's own domain in another letter case",
+            Some("login.example.app"),
+            "Login.Example.App",
+        ),
+        (
+            "the pool's own domain truncated",
+            Some("login.example.app"),
+            "login.example",
+        ),
+        (
+            "a domain the pool's own is a prefix of",
+            Some("login.example.app"),
+            "login.example.app.v2",
+        ),
+        (
+            "a domain spelled with the other characters the pattern admits",
+            Some("login_example-app.v2"),
+            "login_example-app.v3",
+        ),
+        (
+            "a pool that names no developer provider at all",
+            None,
+            "login.example.app",
+        ),
+    ];
+
+    for (index, (case, own_provider, named_provider)) in cases.iter().enumerate() {
+        let pool_id = pool_with_developer_provider(
+            &emulator,
+            &format!("merge-unsupported-provider-{index}"),
+            *own_provider,
+        )
+        .await;
+        // A pool with a developer provider holds BOTH users the request names, so the
+        // refusal cannot be the missing-user one: it is decided before either is resolved.
+        let registered = match own_provider {
+            Some(own_provider) => Some((
+                user(&emulator, &pool_id, own_provider, &["source-user"], &[]).await,
+                user(
+                    &emulator,
+                    &pool_id,
+                    own_provider,
+                    &["destination-user"],
+                    &[],
+                )
+                .await,
+            )),
+            None => None,
+        };
+
+        let (status, body) = emulator
+            .call(
+                OPERATION,
+                &merge_request(
+                    Some(&pool_id),
+                    Some(named_provider),
+                    Some("source-user"),
+                    Some("destination-user"),
+                ),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).contains("InvalidParameterException"),
+            "case {case:?}: expected InvalidParameterException, got {body}"
+        );
+        assert_eq!(
+            error_message(case, &body),
+            UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE,
+            "case {case:?}: expected the fixed unsupported-developer-provider message, got \
+             {body}"
+        );
+
+        // The refusal wrote nothing: each user still answers its own identifier, and the pool
+        // holds exactly the identities it held.
+        if let Some((source, destination)) = &registered {
+            assert_eq!(
+                identifiers_of(&emulator, &pool_id, source).await,
+                vec!["source-user".to_string()],
+                "case {case:?}: a refused merge moves no mapping off {source}"
+            );
+            assert_eq!(
+                identifiers_of(&emulator, &pool_id, destination).await,
+                vec!["destination-user".to_string()],
+                "case {case:?}: a refused merge moves no mapping off {destination}"
+            );
+        }
+        let mut both = listed_identities(&emulator, &pool_id).await;
+        both.sort();
+        let mut expected: Vec<String> = registered
+            .map(|(source, destination)| vec![source, destination])
+            .unwrap_or_default();
+        expected.sort();
+        assert_eq!(
+            both, expected,
+            "case {case:?}: a refused merge changes no identity of the pool"
         );
     }
 }

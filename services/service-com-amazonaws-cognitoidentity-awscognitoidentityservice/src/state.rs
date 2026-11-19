@@ -1115,6 +1115,21 @@ pub fn classic_flow_refusal(
     None
 }
 
+/// How AWS words the refusal of a DEVELOPER-authenticated token mint
+/// (`GetOpenIdTokenForDeveloperIdentity`) on a pool whose stored roles configuration holds a
+/// ROLE MAPPING.
+///
+/// A role mapping picks the session's role from the CLAIMS of the token an exchange presents
+/// ([`IdentityPoolRoles::has_role_mappings`]), and a token this service mints for a user the
+/// caller's own backend authenticated carries no provider claims for a mapping to read — so a
+/// pool whose roles are mapped does not serve that mint at all, and the configuration the
+/// call met is what the sentence names. Fixed text: no part of it is taken from the request
+/// or from stored state, since what is wrong is the pool's configuration for this operation
+/// rather than any value the call carried.
+pub const ROLE_MAPPINGS_FORBID_DEVELOPER_TOKEN_MESSAGE: &str =
+    "Invalid identity pool configuration. When a pool is configured for RoleMappings, \
+     GetOpenIdTokenForDeveloperIdentity may not be used.";
+
 /// Whether the issuer a presented token CLAIMS and the `Logins` provider name it was
 /// presented under name the same issuer.
 ///

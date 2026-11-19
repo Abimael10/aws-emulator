@@ -43,6 +43,12 @@
 //! recorded in `open_id_tokens`, so the service can later say which identity a token it
 //! issued names and until when.
 //!
+//! A pool whose stored roles configuration holds a ROLE MAPPING does not serve this mint at
+//! all. A mapping has the service pick a session's role from the CLAIMS of the token the
+//! exchange presents, and a token minted for a user the caller's own backend authenticated
+//! carries no such claims, so the operation is refused on the pool's configuration before any
+//! identity is resolved or any token minted.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -339,6 +345,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                 GetOpenIdTokenForDeveloperIdentityErrorModeled::InvalidParameterException(
                     InvalidParameterException {
                         message: Some(crate::state::NO_LOGIN_PROVIDER_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A ROLE MAPPING has the SERVICE pick the role a session gets from the CLAIMS of the
+        // token the exchange presents, and a token minted here stands for a user the
+        // CALLER's own backend authenticated, so it carries no provider claims for a mapping
+        // to resolve a role from. A pool whose stored roles configuration holds a role
+        // mapping therefore does not serve this mint at all: the whole operation is closed
+        // on such a pool, whichever logins the request presents and whichever identity it
+        // names, so the pool's configuration is the bad input parameter the call is answered
+        // with ([`crate::state::ROLE_MAPPINGS_FORBID_DEVELOPER_TOKEN_MESSAGE`]). Decided
+        // here, before any identity is resolved, linked or minted and before any token is
+        // issued, so the refusal leaves the pool and its identities exactly as they were.
+        if store
+            .identity_pool_roles
+            .get(&input.identity_pool_id)
+            .is_some_and(crate::state::IdentityPoolRoles::has_role_mappings)
+        {
+            return Err(
+                GetOpenIdTokenForDeveloperIdentityErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::ROLE_MAPPINGS_FORBID_DEVELOPER_TOKEN_MESSAGE
+                                .to_string(),
+                        ),
                     },
                 )
                 .into(),

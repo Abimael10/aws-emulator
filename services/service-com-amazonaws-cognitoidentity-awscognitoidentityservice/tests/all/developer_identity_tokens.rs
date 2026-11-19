@@ -19,6 +19,10 @@
 //!   nothing;
 //! * `Logins` that names no developer provider of the pool is a bad input parameter (400
 //!   `InvalidParameterException`) and changes nothing;
+//! * a pool whose stored roles configuration holds a ROLE MAPPING does not serve this mint at
+//!   all — a mapping resolves the role from the CLAIMS of the token an exchange presents, and
+//!   a token minted for a backend-authenticated user carries none — so the whole operation is
+//!   refused (400 `InvalidParameterException`) while the pool holds one;
 //! * a pool or an identity this service does not hold is the modelled
 //!   `ResourceNotFoundException`.
 //!
@@ -826,4 +830,372 @@ async fn naming_an_existing_identity_links_the_developer_login_to_it() {
             "case {case:?}: linking a login to an existing identity mints none"
         );
     }
+}
+
+/// The fixed sentence a pool configured for role MAPPINGS refuses this mint with, spelled
+/// out here so the wire-visible text is pinned by the test rather than read back out of the
+/// crate. No part of it is taken from the request or from stored state.
+const ROLE_MAPPINGS_REFUSAL: &str = "Invalid identity pool configuration. When a pool is \
+                                     configured for RoleMappings, \
+                                     GetOpenIdTokenForDeveloperIdentity may not be used.";
+
+/// Configure `pool_id`'s roles: the pool's `authenticated` role always, and the
+/// `RoleMappings` member only when the row carries one (so a row with `None` exercises its
+/// ABSENCE). `SetIdentityPoolRoles` replaces the whole configuration, so one call puts the
+/// pool in either state.
+async fn set_pool_roles(emulator: &Emulator, pool_id: &str, name: &str, mappings: Option<Value>) {
+    let mut request = json!({
+        "IdentityPoolId": pool_id,
+        "Roles": {"authenticated": seeded_role_arn(name, "auth")},
+    });
+    if let Some(mappings) = mappings {
+        request["RoleMappings"] = mappings;
+    }
+    emulator.ok("SetIdentityPoolRoles", &request).await;
+}
+
+/// A `Token`-type mapping keyed by `provider`, as an identity-pool role attachment writes
+/// one: the type that resolves the role from the token's claims, with the
+/// `AmbiguousRoleResolution` the model requires for it.
+fn token_mapping(provider: &str) -> Value {
+    json!({provider: {"Type": "Token", "AmbiguousRoleResolution": "AuthenticatedRole"}})
+}
+
+/// A `Rules`-type mapping keyed by `provider`, with the `RulesConfiguration` the model
+/// requires for that type, resolving to `name`'s role.
+fn rules_mapping(provider: &str, name: &str) -> Value {
+    let role_arn = seeded_role_arn(name, "auth");
+    json!({provider: {
+        "Type": "Rules",
+        "AmbiguousRoleResolution": "Deny",
+        "RulesConfiguration": {"Rules": [{
+            "Claim": "email",
+            "MatchType": "Equals",
+            "Value": "someone@example.com",
+            "RoleARN": role_arn,
+        }]},
+    }})
+}
+
+/// The `RoleMappings` keys `GetIdentityPoolRoles` reports for a pool, so what a refusal is
+/// asserted against is the pool's LIVE configuration.
+async fn mapped_providers(emulator: &Emulator, pool_id: &str) -> Vec<String> {
+    let reported = emulator
+        .ok("GetIdentityPoolRoles", &json!({"IdentityPoolId": pool_id}))
+        .await;
+    reported["RoleMappings"]
+        .as_object()
+        .map(|mappings| mappings.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// RULE: a role MAPPING resolves the role a session gets from the CLAIMS of the token an
+/// exchange presents, and a token minted for a backend-authenticated user carries no such
+/// claims — so a pool whose stored roles configuration holds at least one `RoleMappings`
+/// entry does not serve `GetOpenIdTokenForDeveloperIdentity` at all: the call is refused with
+/// the modelled `InvalidParameterException` (HTTP 400) and its one fixed sentence, and mints
+/// neither an identity nor a token. A configuration holding no mapping entry serves it.
+#[tokio::test]
+async fn a_pool_configured_for_role_mappings_does_not_mint_developer_tokens() {
+    let emulator = Emulator::new();
+    let developer_provider = "login.example.app";
+
+    // The rows differ along what the rule generalises over — whether the pool's stored
+    // configuration holds a mapping ENTRY, how many, the mapping's `Type` and ambiguous
+    // resolution, the provider the entry is keyed by (a user-pool provider with a client id,
+    // as a role attachment writes one, and a public provider), and HOW the pool reached that
+    // state (the first `SetIdentityPoolRoles` call, a later one that adds a mapping, a later
+    // one that drops it): (case, the mappings of the first call, the mappings of a later
+    // call when the row makes one, whether the mint is refused).
+    type Row<'a> = (&'a str, Option<Value>, Option<Option<Value>>, bool);
+    let rows: Vec<Row<'_>> = vec![
+        ("no roles configured at all", None, None, false),
+        ("roles configured, RoleMappings absent", None, None, false),
+        (
+            // `RoleMappingMap` is modelled `len 0..10`, so an EMPTY map is a configuration a
+            // pool can store: it holds no mapping entry, so no claim decides a role.
+            "roles configured with an EMPTY RoleMappings map",
+            Some(json!({})),
+            None,
+            false,
+        ),
+        (
+            "one Token mapping keyed by a user-pool provider and client id",
+            Some(token_mapping(
+                "cognito-idp.us-east-1.amazonaws.com/us-east-1_AbCdEfGhI:1h57kf5cpq17m0eml12eu9m8ll",
+            )),
+            None,
+            true,
+        ),
+        (
+            "one Rules mapping keyed by a public provider",
+            Some(rules_mapping("graph.facebook.com", "mapped-rules")),
+            None,
+            true,
+        ),
+        (
+            "two mapping entries at once",
+            Some(json!({
+                "graph.facebook.com": {"Type": "Token", "AmbiguousRoleResolution": "Deny"},
+                "accounts.google.com": {
+                    "Type": "Token",
+                    "AmbiguousRoleResolution": "AuthenticatedRole",
+                },
+            })),
+            None,
+            true,
+        ),
+        (
+            "a mapping added by a later call to a pool that had none",
+            None,
+            Some(Some(token_mapping("accounts.google.com"))),
+            true,
+        ),
+        (
+            "a mapping dropped by a later call",
+            Some(token_mapping("graph.facebook.com")),
+            Some(None),
+            false,
+        ),
+        (
+            "a mapping replaced by an EMPTY map",
+            Some(rules_mapping("accounts.google.com", "replaced-rules")),
+            Some(Some(json!({}))),
+            false,
+        ),
+    ];
+
+    for (index, (case, first, later, refused)) in rows.iter().enumerate() {
+        let name = format!("developer-mint-mapping-{index}");
+        let pool_id =
+            pool_with_developer_provider(&emulator, &name, Some(developer_provider)).await;
+        // The first row configures NO roles at all; every other row configures them, with the
+        // mappings it carries.
+        if index > 0 {
+            set_pool_roles(&emulator, &pool_id, &name, first.clone()).await;
+        }
+        if let Some(later) = later {
+            set_pool_roles(&emulator, &pool_id, &name, later.clone()).await;
+        }
+        let configured = mapped_providers(&emulator, &pool_id).await;
+        assert_eq!(
+            !configured.is_empty(),
+            *refused,
+            "case {case:?}: expected the pool's live RoleMappings to decide the mint, got \
+             {configured:?}"
+        );
+
+        let identifier = format!("backend-user-{index}");
+        let (status, body) = emulator
+            .call(
+                OPERATION,
+                &token_request(&pool_id, &[(developer_provider, &identifier)], None, None),
+            )
+            .await;
+
+        if *refused {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a pool configured for RoleMappings mints nothing, got {status} \
+                 with {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidParameterException",
+                "case {case:?}: expected InvalidParameterException, got {body}"
+            );
+            assert_eq!(
+                body["message"].as_str(),
+                Some(ROLE_MAPPINGS_REFUSAL),
+                "case {case:?}: expected the refusal to be worded {ROLE_MAPPINGS_REFUSAL:?}, \
+                 got {body}"
+            );
+            assert_eq!(
+                identity_count(&emulator, &pool_id).await,
+                0,
+                "case {case:?}: a refused mint leaves the pool with no identity"
+            );
+            // A gate is a decision, not a change: the pool still reports exactly the mapping
+            // keys it held.
+            let after = mapped_providers(&emulator, &pool_id).await;
+            assert_eq!(
+                after, configured,
+                "case {case:?}: expected the pool's RoleMappings to be unchanged, got {after:?}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a pool holding no mapping entry serves the mint, got {status} with \
+             {body}"
+        );
+        assert!(
+            body["IdentityId"]
+                .as_str()
+                .is_some_and(|identity_id| !identity_id.is_empty()),
+            "case {case:?}: a served mint answers an IdentityId, got {body}"
+        );
+        assert!(
+            body["Token"].as_str().is_some_and(|token| !token.is_empty()),
+            "case {case:?}: a served mint answers a Token, got {body}"
+        );
+        assert_eq!(
+            identity_count(&emulator, &pool_id).await,
+            1,
+            "case {case:?}: a served mint persists the identity it answered"
+        );
+    }
+}
+
+/// RULE, the same gate from the request's side: the pool's configuration closes the whole
+/// operation, so no shape of request gets past it — not one naming an identity, not one
+/// presenting a public login beside the developer one, not one asking for a token duration,
+/// and not one whose developer user identifier the pool had already registered. Dropping the
+/// mapping serves the very calls that were refused, which is what shows the refusal damaged
+/// neither the pool nor its identities.
+#[tokio::test]
+async fn a_mapped_pool_refuses_every_developer_mint_until_the_mapping_is_dropped() {
+    let emulator = Emulator::new();
+    let developer_provider = "login.example.app";
+    let name = "developer-mint-mapped-requests";
+    let pool_id = pool_with_developer_provider(&emulator, name, Some(developer_provider)).await;
+
+    // An identifier the pool registers BEFORE the mapping is configured, so the rows below
+    // cover the idempotent-resolution path as well as a fresh mint.
+    let registered = emulator
+        .ok(
+            OPERATION,
+            &token_request(&pool_id, &[(developer_provider, "known-user")], None, None),
+        )
+        .await;
+    let known_identity = registered["IdentityId"]
+        .as_str()
+        .expect("a served mint answers an IdentityId")
+        .to_string();
+    let logins_before = listed_logins(&emulator, &pool_id, &known_identity).await;
+
+    set_pool_roles(
+        &emulator,
+        &pool_id,
+        name,
+        Some(token_mapping("graph.facebook.com")),
+    )
+    .await;
+
+    // (case, the logins presented, the identity named, the token duration)
+    type RequestRow<'a> = (&'a str, Vec<Login<'a>>, Option<&'a str>, Option<i64>);
+    let rows: Vec<RequestRow<'_>> = vec![
+        (
+            "a fresh developer user identifier",
+            vec![(developer_provider, "fresh-user")],
+            None,
+            None,
+        ),
+        (
+            "an identifier the pool had already registered",
+            vec![(developer_provider, "known-user")],
+            None,
+            None,
+        ),
+        (
+            "naming the identity the identifier is registered under",
+            vec![(developer_provider, "known-user")],
+            Some(known_identity.as_str()),
+            None,
+        ),
+        (
+            "a public login presented beside the developer one",
+            vec![
+                (developer_provider, "fresh-user"),
+                ("graph.facebook.com", "a-facebook-token"),
+            ],
+            None,
+            None,
+        ),
+        (
+            "a TokenDuration at the modelled maximum",
+            vec![(developer_provider, "fresh-user")],
+            None,
+            Some(86_400),
+        ),
+        (
+            "a TokenDuration at the modelled minimum",
+            vec![(developer_provider, "fresh-user")],
+            None,
+            Some(1),
+        ),
+    ];
+
+    for (case, logins, identity_id, token_duration) in &rows {
+        let (status, body) = emulator
+            .call(
+                OPERATION,
+                &token_request(&pool_id, logins, *identity_id, *token_duration),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: the pool's RoleMappings close the operation, got {status} with \
+             {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterException",
+            "case {case:?}: expected InvalidParameterException, got {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(ROLE_MAPPINGS_REFUSAL),
+            "case {case:?}: expected the refusal to be worded {ROLE_MAPPINGS_REFUSAL:?}, got \
+             {body}"
+        );
+        assert!(
+            body["Token"].is_null(),
+            "case {case:?}: a refused mint answers no Token, got {body}"
+        );
+    }
+
+    // Nothing the refusals met was written: the pool still holds exactly the one identity it
+    // had, with the logins it had.
+    assert_eq!(
+        identity_count(&emulator, &pool_id).await,
+        1,
+        "refused mints leave the pool with the one identity it already held"
+    );
+    let logins_after = listed_logins(&emulator, &pool_id, &known_identity).await;
+    assert_eq!(
+        logins_after, logins_before,
+        "refused mints leave the identity's logins {logins_before:?}, got {logins_after:?}"
+    );
+
+    // Dropping the mapping serves the very calls that were refused, and the registered
+    // identifier still resolves to the identity it was registered under.
+    set_pool_roles(&emulator, &pool_id, name, None).await;
+    for (case, logins, identity_id, token_duration) in &rows {
+        let served = emulator
+            .ok(
+                OPERATION,
+                &token_request(&pool_id, logins, *identity_id, *token_duration),
+            )
+            .await;
+        assert!(
+            served["Token"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty()),
+            "case {case:?}: with the mapping dropped the same call must mint a token, got \
+             {served}"
+        );
+    }
+    let resolved = emulator
+        .ok(
+            OPERATION,
+            &token_request(&pool_id, &[(developer_provider, "known-user")], None, None),
+        )
+        .await;
+    assert_eq!(
+        resolved["IdentityId"],
+        json!(known_identity),
+        "the registered identifier still resolves to {known_identity:?}, got {resolved}"
+    );
 }
