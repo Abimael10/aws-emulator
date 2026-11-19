@@ -103,7 +103,7 @@ const ONE_ATTEMPT_CEILING: Duration = PERMIT_WAIT
 /// retained — six hours by default — and how many such attempts a loaded host costs one event
 /// is not a row's to bound. What a row CAN bound is the emulator going QUIET about the event:
 /// one attempt is bounded by [`ONE_ATTEMPT_CEILING`], the waits the retry policy puts between
-/// two attempts of one event reach the longer of the two AWS publishes for an errored handler
+/// two attempts of one event reach the longer of the two it has for an errored handler
 /// ([`SECOND_ASYNC_RETRY_DELAY`]) and [`THROTTLED_MAX_RETRY`] for one that found no capacity
 /// and no further, and the first attempt falls due [`ASYNC_DELIVERY_DELAY`] after the
 /// accepting call. So an event that neither settles nor has another attempt made for it

@@ -126,7 +126,7 @@ const THROTTLE_ERROR: &str = "TooManyRequestsException";
 /// delay ([`ASYNC_DELIVERY_DELAY`]), then an attempt waits for a share of this process's run
 /// capacity ([`PERMIT_WAIT`]), initializes an execution environment ([`INIT_PHASE_LIMIT`]) and
 /// runs the handler ([`HOST_WAIT_CEILING`]) — with room for every attempt the retry policy has
-/// for one event ([`MAX_ASYNC_DELIVERY_ATTEMPTS`], separated by the waits AWS publishes
+/// for one event ([`MAX_ASYNC_DELIVERY_ATTEMPTS`], separated by the waits the service puts
 /// between them, [`FIRST_ASYNC_RETRY_DELAY`] and [`SECOND_ASYNC_RETRY_DELAY`]). Each
 /// of those spans is shared with every other suite of a whole-workspace run, so only a
 /// delivery that never arrives at all fails the wait below; how fast the host runs decides

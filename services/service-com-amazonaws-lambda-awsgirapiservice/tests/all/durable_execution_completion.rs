@@ -62,7 +62,7 @@ const KMS_KEY: &str = "arn:aws:kms:us-east-1:000000000000:key/durable-executions
 /// The bound is what the EMULATOR itself allows one invocation, rather than a span picked
 /// here: the wait for a share of the run capacity ([`PERMIT_WAIT`]) and the wait for the
 /// run's own answer ([`HOST_WAIT_CEILING`]), with room for every attempt the retry policy has
-/// for an event whose handler raised — separated by the waits AWS publishes between them
+/// for an event whose handler raised — separated by the waits the service puts between them
 /// ([`FIRST_ASYNC_RETRY_DELAY`], [`SECOND_ASYNC_RETRY_DELAY`]) — and a margin for the queueing
 /// either side of them. It is patience and not a weakened expectation — the assertions below
 /// are unchanged — and a whole-workspace test run shares its cores with every other suite, so

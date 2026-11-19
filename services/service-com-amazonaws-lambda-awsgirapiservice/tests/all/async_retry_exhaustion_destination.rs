@@ -80,7 +80,7 @@ const CONDITION_RETRIES_EXHAUSTED: &str = "RetriesExhausted";
 const FUNCTION_ERROR_UNHANDLED: &str = "Unhandled";
 
 /// How long a row waits for work the CLOCK owes: the ladder of attempts an event has — the
-/// wait AWS publishes before the first retry included ([`FIRST_ASYNC_RETRY_DELAY`]) — and the
+/// wait before the first retry included ([`FIRST_ASYNC_RETRY_DELAY`]) — and the
 /// record that follows the last of them.
 ///
 /// A ceiling on PATIENCE, never a span anything here counts on: every wait below looks again

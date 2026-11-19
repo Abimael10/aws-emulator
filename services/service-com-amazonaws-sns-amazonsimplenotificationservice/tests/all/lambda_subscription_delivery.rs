@@ -83,11 +83,11 @@ const ONE_ATTEMPT_CEILING: Duration = PERMIT_WAIT
 /// ALLOWED, never picked as a round number: an accepted event waits its queueing delay
 /// ([`ASYNC_DELIVERY_DELAY`]) and is then delivered by an attempt bounded by
 /// [`ONE_ATTEMPT_CEILING`], and an attempt whose run was cut off is followed by another after
-/// the wait AWS publishes between them ([`FIRST_ASYNC_RETRY_DELAY`]) — so this holds two whole
-/// attempts and that wait. A wait shorter than what it waits on is answered by how loaded the
-/// host is rather than by what the emulator did, and every one of these spans is shared with
-/// every other suite of a whole-workspace run. A row that expects NOTHING to arrive does not
-/// pay it: those wait out [`QUIET_BUDGET`] instead.
+/// the wait the service puts between them ([`FIRST_ASYNC_RETRY_DELAY`]) — so this holds two
+/// whole attempts and that wait. A wait shorter than what it waits on is answered by how
+/// loaded the host is rather than by what the emulator did, and every one of these spans is
+/// shared with every other suite of a whole-workspace run. A row that expects NOTHING to
+/// arrive does not pay it: those wait out [`QUIET_BUDGET`] instead.
 pub(crate) const DELIVERY_BUDGET: Duration = ASYNC_DELIVERY_DELAY
     .saturating_add(FIRST_ASYNC_RETRY_DELAY)
     .saturating_add(ONE_ATTEMPT_CEILING.saturating_mul(2));
@@ -388,7 +388,7 @@ pub(crate) async fn quiet(emulator: &Emulator, function: &str) -> Vec<Value> {
 /// A subscribed function's run happens off the publishing request's response path, and the
 /// service that makes it bounds every leg of that chain: the queueing delay, the wait for a
 /// share of this process's run capacity, the initialization of the execution environment, the
-/// handler's own run and the grace after its deadline, plus the published wait before a retried
+/// handler's own run and the grace after its deadline, plus the wait before a retried
 /// attempt. A wait shorter than the sum of the legs it covers expires while the work it waits
 /// for is still inside its own allowance — which makes its outcome a measurement of the host,
 /// and is why [`DELIVERY_BUDGET`] is derived from those spans instead of being picked.
@@ -408,7 +408,7 @@ fn every_wait_a_delivery_is_given_outlasts_the_spans_it_is_allowed() {
             ASYNC_DELIVERY_DELAY.saturating_add(ONE_ATTEMPT_CEILING),
         ),
         (
-            "a second attempt, after the wait published between them",
+            "a second attempt, after the wait put between them",
             ASYNC_DELIVERY_DELAY
                 .saturating_add(FIRST_ASYNC_RETRY_DELAY)
                 .saturating_add(ONE_ATTEMPT_CEILING.saturating_mul(2)),

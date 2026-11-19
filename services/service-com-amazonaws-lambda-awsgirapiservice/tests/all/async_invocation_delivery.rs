@@ -65,7 +65,7 @@ const ONE_RETRY: i64 = 1;
 const NO_RETRIES: i64 = 0;
 
 /// How long this suite waits for every accepted event to settle: well past the attempts an
-/// errored handler's event takes under [`ONE_RETRY`] — the wait AWS publishes before that
+/// errored handler's event takes under [`ONE_RETRY`] — the wait before that
 /// retry included ([`FIRST_ASYNC_RETRY_DELAY`]) — and still a bound on the test.
 const SETTLE_BUDGET: Duration = FIRST_ASYNC_RETRY_DELAY.saturating_add(Duration::from_secs(120));
 

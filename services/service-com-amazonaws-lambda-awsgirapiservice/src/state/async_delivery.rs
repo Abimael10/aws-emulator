@@ -68,19 +68,28 @@ pub fn attempts_allowed(maximum_retry_attempts: Option<i32>) -> u32 {
 
 /// How long after the FIRST delivery attempt of an event the second one is made.
 ///
-/// AWS publishes this wait: "between the first and second attempt, Lambda waits one minute"
-/// for an asynchronous invocation whose function returned an error. It is the service's own
-/// documented span, so it keeps its value: the delay between attempts is what a client
-/// observing its own event — the age of the event each attempt meters
-/// ([`super::metrics::ASYNC_EVENT_AGE_METRIC`]), and when a record reaches a destination —
-/// reads the retry policy through.
-pub const FIRST_ASYNC_RETRY_DELAY: Duration = Duration::from_secs(60);
+/// An EMULATOR-CHOSEN span, like [`crate::state::ACTIVATION_DELAY`]: the wait before a
+/// retried attempt is work the CLOCK owes off every response path, and no operation takes it
+/// as a parameter or reports it back — what a client reads the retry policy through is how
+/// many attempts its event gets, the age each attempt meters
+/// ([`super::metrics::ASYNC_EVENT_AGE_METRIC`]) and the record the last of them earns at the
+/// configured destination, none of which is the length of the idle between two attempts.
+///
+/// Compressed from the pacing AWS states for it — "between the first and second attempt,
+/// Lambda waits one minute", and two minutes before the third — because those spans put the
+/// LAST attempt of a fully retried event three minutes past the accepting call, outside the
+/// window a client waits for its own attempts and its invocation record in, which is the
+/// part of the policy that IS the contract. It stays non-zero, so a client that looks
+/// between two attempts still sees the event being delivered rather than done.
+pub const FIRST_ASYNC_RETRY_DELAY: Duration = Duration::from_secs(3);
 
-/// How long after the SECOND delivery attempt the third one is made: "between the second and
-/// third attempt, Lambda waits two minutes", the other wait AWS publishes for the same
-/// policy. It is the wait after every later attempt too, because the policy allows no attempt
-/// past the third ([`MAX_ASYNC_DELIVERY_ATTEMPTS`]).
-pub const SECOND_ASYNC_RETRY_DELAY: Duration = Duration::from_secs(120);
+/// How long after the SECOND delivery attempt the third one is made: twice the span above,
+/// keeping the doubling AWS's own pacing has (one minute, then two), so a client watching
+/// the age of its event
+/// ([`super::metrics::ASYNC_EVENT_AGE_METRIC`]) sees the wait GROW with the attempts spent.
+/// It is the wait after every later attempt too, because the policy allows no attempt past
+/// the third ([`MAX_ASYNC_DELIVERY_ATTEMPTS`]).
+pub const SECOND_ASYNC_RETRY_DELAY: Duration = Duration::from_secs(6);
 
 /// The wait before the attempt that FOLLOWS the one numbered `attempts_made`; see the two
 /// spans above.
