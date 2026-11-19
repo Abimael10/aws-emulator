@@ -422,9 +422,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // 12 characters, within the `[a-zA-Z0-9]{10,12}` the `BillingGroupArn`
-        // pattern allows.
-        let id = state.mint_resource_id(12);
+        // The id spelling every modelled member that carries a billing group id admits
+        // (`crate::state::TaggableResourceKind::id_alphabet`): 12 DIGITS, which is both
+        // inside the `[a-zA-Z0-9]{10,12}` of `BillingGroupArn` and the
+        // `billinggroup/?[0-9]{12}` the tagging surface's `Arn` spells, so the group
+        // this call creates is addressable by every operation that takes its ARN — the
+        // tagging surface, which the `Tags` below are stored for, included.
+        let id = state.mint_resource_id(crate::state::TaggableResourceKind::BillingGroup);
         let arn = crate::state::billing_group_arn(&id);
         let now = crate::state::now_millis();
         let record = crate::state::BillingGroupRecord {

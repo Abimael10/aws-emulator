@@ -3,6 +3,12 @@
 //! The tagging plane's shared vocabulary: how a tagging `ResourceArn` is read into the
 //! resource it names, the bounds a resource's tag map is held to, and the not-found this
 //! service's tagging surface answers.
+//!
+//! The kinds this surface addresses are also the kinds this service MINTS ids for, and the
+//! tagging `Arn` is the narrowest modelled spelling any of those ids has to satisfy, so
+//! the per-kind id spelling the creates mint through
+//! ([`TaggableResourceKind::id_alphabet`], [`TaggableResourceKind::id_width`] and
+//! [`render_resource_id`]) lives here beside the pattern that decides it.
 
 use super::*;
 
@@ -197,6 +203,68 @@ impl TaggableResourceKind {
             Self::CustomLineItem => "customlineitem",
         }
     }
+
+    /// The characters an id this service MINTS for this kind is rendered from: the ones
+    /// EVERY modelled member that spells this kind's id admits.
+    ///
+    /// One resource id travels through more than one modelled string — the create's own
+    /// `...Arn` output, the readers' `Arn` inputs, and the tagging surface's `Arn` among
+    /// them — and the boundary refuses a request whose value breaks the pattern of the
+    /// member it travels in, so an id has to satisfy the INTERSECTION of those patterns
+    /// or some operation can never address the resource it names. The tagging `Arn`
+    /// (`smithy_query(query="shape",shape="Arn")`) spells a billing group
+    /// `billinggroup/?[0-9]{12}` — digits only — where `BillingGroupArn` admits
+    /// `[a-zA-Z0-9]{10,12}`, so a billing group id is rendered from DIGITS; the other
+    /// three kinds are spelled `[a-zA-Z0-9]{10}` by both, so they keep the wider
+    /// alphabet.
+    pub fn id_alphabet(self) -> &'static [u8] {
+        match self {
+            Self::BillingGroup => NUMERIC_ID_ALPHABET,
+            Self::PricingPlan | Self::PricingRule | Self::CustomLineItem => {
+                ALPHANUMERIC_ID_ALPHABET
+            }
+        }
+    }
+
+    /// How many characters an id this service mints for this kind carries: a width every
+    /// modelled member that spells this kind's id admits, by the same intersection
+    /// [`Self::id_alphabet`] follows — the tagging `Arn` fixes a billing group at 12
+    /// (inside the `{10,12}` of `BillingGroupArn`) and the other three kinds at 10.
+    pub fn id_width(self) -> usize {
+        match self {
+            Self::BillingGroup => 12,
+            Self::PricingPlan | Self::PricingRule | Self::CustomLineItem => 10,
+        }
+    }
+}
+
+/// The digits a `[0-9]`-spelled resource id is rendered from.
+const NUMERIC_ID_ALPHABET: &[u8] = b"0123456789";
+
+/// The characters a `[a-zA-Z0-9]`-spelled resource id is rendered from. Upper case
+/// alone: a pattern that admits both cases admits this subset too, and one case keeps
+/// a minted id readable.
+const ALPHANUMERIC_ID_ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// Render `sequence` as a resource id of `kind`: its [`TaggableResourceKind::id_width`]
+/// characters, least significant last, drawn from its
+/// [`TaggableResourceKind::id_alphabet`].
+///
+/// Separate from [`ComAmazonawsBillingconductorAwsbillingconductorState::mint_resource_id`]
+/// (which supplies the sequence) so the spelling of an id lives beside the patterns that
+/// decide it.
+pub fn render_resource_id(kind: TaggableResourceKind, sequence: u64) -> String {
+    let alphabet = kind.id_alphabet();
+    let radix = u64::try_from(alphabet.len()).unwrap_or(10).max(2);
+    let width = kind.id_width();
+    let mut id = vec![b'0'; width];
+    let mut value = sequence;
+    for slot in id.iter_mut().rev() {
+        // `value % radix` is below `radix`, which is the alphabet's own length.
+        *slot = alphabet[usize::try_from(value % radix).unwrap_or(0)];
+        value /= radix;
+    }
+    String::from_utf8(id).unwrap_or_else(|_| "0".repeat(width))
 }
 
 /// A resource a tagging operation addressed: which kind its ARN names, that ARN in the

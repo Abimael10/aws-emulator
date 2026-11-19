@@ -314,9 +314,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Exactly 10 characters: the `PricingRuleArn` pattern's resource id is
-        // `[a-zA-Z0-9]{10}`.
-        let id = state.mint_resource_id(10);
+        // Exactly 10 characters of `[a-zA-Z0-9]`: the id spelling every modelled member
+        // that carries a pricing rule id admits, the `PricingRuleArn` pattern's resource
+        // id and the tagging surface's `Arn` alike
+        // (`crate::state::TaggableResourceKind::id_alphabet`).
+        let id = state.mint_resource_id(crate::state::TaggableResourceKind::PricingRule);
         let arn = crate::state::pricing_rule_arn(&id);
         let now = crate::state::now_millis();
         let record = crate::state::PricingRuleRecord {

@@ -682,9 +682,8 @@ async fn every_state_changing_operation_leaves_one_audit_record() {
 #[tokio::test]
 async fn the_tagging_writes_record_the_resource_they_addressed() {
     let em = Emulator::new(TAGGING_AKID);
-    // The billing group is created FIRST so its minted id is all digits, the form the
-    // modelled tagging `Arn` spells a billing group in (`billinggroup/?[0-9]{12}`). It
-    // names a pricing plan Amazon Web Services owns, so nothing has to exist before it.
+    // The billing group names a pricing plan Amazon Web Services owns, so nothing has to
+    // exist before it.
     let group = em
         .create(
             "a billing group to tag",

@@ -60,8 +60,6 @@ async fn untag_resource_removes_the_tags_a_create_persisted() {
             ])),
         )
         .await;
-    // Created after the plan so the group's minted id is still all digits: the tagging
-    // `Arn` pattern spells a billing group `billinggroup/?[0-9]{12}`.
     let group = em
         .create_group(
             "CreatedTagsGroup",

@@ -434,8 +434,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // list is moved into the record it is stored in.
         let associated_count = associated_resources.len();
 
-        // 10 characters, the width the `CustomLineItemArn` pattern allows.
-        let id = state.mint_resource_id(10);
+        // Exactly 10 characters of `[a-zA-Z0-9]`: the id spelling every modelled member
+        // that carries a custom line item id admits, the `CustomLineItemArn` pattern and
+        // the tagging surface's `Arn` alike
+        // (`crate::state::TaggableResourceKind::id_alphabet`).
+        let id = state.mint_resource_id(crate::state::TaggableResourceKind::CustomLineItem);
         let arn = crate::state::custom_line_item_arn(&id);
         let now = crate::state::now_millis();
         let record = crate::state::CustomLineItemRecord {

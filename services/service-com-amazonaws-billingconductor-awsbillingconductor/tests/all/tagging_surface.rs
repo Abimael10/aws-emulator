@@ -381,8 +381,6 @@ pub(crate) fn filler(length: usize) -> String {
 #[tokio::test]
 async fn tag_resource_merges_its_pairs_into_the_named_resource() {
     let em = Emulator::new();
-    // Created before the billing group so the group's minted id is still all digits:
-    // the tagging `Arn` pattern spells a billing group `billinggroup/?[0-9]{12}`.
     let plan_with_tags = em
         .create_plan("PlanWithTags", Some(tag_map(&[("team", "finance")])))
         .await;

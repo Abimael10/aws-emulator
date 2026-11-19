@@ -35,9 +35,6 @@ const ARN_REGION: &str = "";
 /// group may name one without the caller ever having created it.
 pub const AWS_MANAGED_PRICING_PLAN_IDS: &[&str] = &["BasicPricingPlan", "Passthrough"];
 
-/// The alphabet the modeled resource-id patterns allow (`[a-zA-Z0-9]`).
-const ID_ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-
 /// Wall-clock millis since the epoch — the unit the modeled `Instant` long carries
 /// (`CreationTime` / `LastModifiedTime`).
 pub fn now_millis() -> i64 {
@@ -3084,18 +3081,13 @@ macro_rules! resource_tags_of {
 }
 
 impl ComAmazonawsBillingconductorAwsbillingconductorState {
-    /// Mint the next `width`-character `[a-zA-Z0-9]` resource id. Monotonic, so no
-    /// two resources of this service ever share an id.
-    pub fn mint_resource_id(&mut self, width: usize) -> String {
+    /// Mint the next resource id for `kind`: [`TaggableResourceKind::id_width`]
+    /// characters drawn from [`TaggableResourceKind::id_alphabet`], rendered from one
+    /// counter shared by every kind. Monotonic, so no two resources of this service
+    /// ever share an id.
+    pub fn mint_resource_id(&mut self, kind: TaggableResourceKind) -> String {
         self.id_counter += 1;
-        let mut value = self.id_counter;
-        let mut id = vec![b'0'; width];
-        for slot in id.iter_mut().rev() {
-            let alphabet_len = u64::try_from(ID_ALPHABET.len()).unwrap_or(36);
-            *slot = ID_ALPHABET[usize::try_from(value % alphabet_len).unwrap_or(0)];
-            value /= alphabet_len;
-        }
-        String::from_utf8(id).unwrap_or_else(|_| "0".repeat(width))
+        render_resource_id(kind, self.id_counter)
     }
 
     /// The ARN a previous call with this `ClientToken` minted, if any.

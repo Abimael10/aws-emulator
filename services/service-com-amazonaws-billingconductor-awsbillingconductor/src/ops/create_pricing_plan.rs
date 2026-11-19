@@ -258,9 +258,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err((reason, field, message)) => return Err(validation(reason, field, message)),
         };
 
-        // Exactly 10 characters: the customer-minted form of the `PricingPlanArn`
-        // pattern is `[a-zA-Z0-9]{10}`.
-        let id = state.mint_resource_id(10);
+        // Exactly 10 characters of `[a-zA-Z0-9]`: the id spelling every modelled member
+        // that carries a pricing plan id admits, the customer-minted form of the
+        // `PricingPlanArn` pattern and of the tagging surface's `Arn`
+        // (`crate::state::TaggableResourceKind::id_alphabet`).
+        let id = state.mint_resource_id(crate::state::TaggableResourceKind::PricingPlan);
         let arn = crate::state::pricing_plan_arn(&id);
         let now = crate::state::now_millis();
         let record = crate::state::PricingPlanRecord {
