@@ -47,10 +47,13 @@ const RELEASE_LABEL: &str = "emr-7.9.0";
 
 /// How long a wait for a clock-owed move looks for it before giving up. Generous: it bounds
 /// a condition that is already due in well under a second, so a loaded host cannot fail it.
-const WAIT_DEADLINE: Duration = Duration::from_secs(90);
+///
+/// `pub(crate)` so a sibling suite driving this same harness waits through one deadline
+/// rather than its own copy.
+pub(crate) const WAIT_DEADLINE: Duration = Duration::from_secs(90);
 
 /// One look inside that deadline.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The service-managed tag naming the cluster an Amazon EC2 resource was created for, and
 /// the one naming the role an instance fills (Amazon EMR Management Guide, "Tagging Amazon
@@ -60,12 +63,15 @@ const INSTANCE_ROLE_TAG: &str = "aws:elasticmapreduce:instance-group-role";
 
 /// Amazon EMR and Amazon EC2 on one engine, plus an EC2 client over the router's own
 /// in-process callback — the seam this suite resolves what EMR launched through.
-struct Emulator {
-    router: MultiServiceRouter,
-    ec2: ::aws_sdk_ec2::Client,
+///
+/// `pub(crate)` so a sibling suite that has to resolve a cluster's capacity in the service
+/// that OWNS it mounts the two services through this one harness rather than its own copy.
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
+    pub(crate) ec2: ::aws_sdk_ec2::Client,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -94,7 +100,7 @@ fn emulator() -> Emulator {
 }
 
 /// One `awsJson1_1` Amazon EMR call, which must be served.
-async fn emr(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+pub(crate) async fn emr(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let (status, payload) = emr_call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -104,7 +110,11 @@ async fn emr(router: &MultiServiceRouter, operation: &str, body: Value) -> Value
 }
 
 /// One Amazon EMR call, answering the status and the payload whatever they are.
-async fn emr_call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn emr_call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = ::http::Request::builder()
         .method("POST")
         .uri("/")
@@ -134,7 +144,7 @@ async fn emr_call(router: &MultiServiceRouter, operation: &str, body: Value) -> 
 
 /// The subnet of one VPC Amazon EC2 itself minted, so every cluster here is placed in a
 /// subnet the owning service holds.
-async fn subnet(emulator: &Emulator) -> String {
+pub(crate) async fn subnet(emulator: &Emulator) -> String {
     let vpc = emulator
         .ec2
         .create_vpc()
@@ -164,7 +174,12 @@ async fn subnet(emulator: &Emulator) -> String {
 }
 
 /// A cluster launched with `instances` in `subnet_id`, answering its id.
-async fn launch(emulator: &Emulator, name: &str, subnet_id: &str, instances: Value) -> String {
+pub(crate) async fn launch(
+    emulator: &Emulator,
+    name: &str,
+    subnet_id: &str,
+    instances: Value,
+) -> String {
     let mut instances = instances;
     instances["Ec2SubnetId"] = json!(subnet_id);
     instances["KeepJobFlowAliveWhenNoSteps"] = json!(true);
@@ -183,7 +198,7 @@ async fn launch(emulator: &Emulator, name: &str, subnet_id: &str, instances: Val
 
 /// Every instance `ListInstances` reports for `cluster_id` under `filters`, following the
 /// `Marker` to its end — which is what collects the whole listing.
-async fn list_instances(
+pub(crate) async fn list_instances(
     emulator: &Emulator,
     case: &str,
     cluster_id: &str,
@@ -214,7 +229,7 @@ async fn list_instances(
 
 /// The instances of `cluster_id` once every one of them has reached `state`, looked for
 /// until the deadline passes rather than waited out.
-async fn instances_in_state(
+pub(crate) async fn instances_in_state(
     emulator: &Emulator,
     case: &str,
     cluster_id: &str,
@@ -272,19 +287,26 @@ async fn groups(emulator: &Emulator, cluster_id: &str) -> BTreeMap<String, Strin
         .collect()
 }
 
-/// What Amazon EC2 reports for the instance `ec2_instance_id`: its state name, the subnet it
-/// is in, its type, its placement group and its tags.
-struct Ec2Instance {
-    subnet_id: Option<String>,
-    instance_type: Option<String>,
-    placement_group: Option<String>,
-    tags: BTreeMap<String, String>,
+/// What Amazon EC2 reports for the instance `ec2_instance_id`: the lifecycle state it is in,
+/// the subnet it is in, its type, its placement group and its tags.
+///
+/// `pub(crate)` with its members, so a sibling suite that has to resolve a cluster's capacity
+/// in the service that OWNS it reads these facts through one cross-service read rather than
+/// its own copy.
+pub(crate) struct Ec2Instance {
+    /// The `InstanceStateName` Amazon EC2 reports, or the empty string for an instance it
+    /// reports none for.
+    pub(crate) state: String,
+    pub(crate) subnet_id: Option<String>,
+    pub(crate) instance_type: Option<String>,
+    pub(crate) placement_group: Option<String>,
+    pub(crate) tags: BTreeMap<String, String>,
 }
 
 /// The instances Amazon EC2 holds under `ec2_instance_ids`, keyed by id — so an id EC2 does
 /// not hold is simply absent, which is what makes a missing entry a failed assertion rather
 /// than a panic.
-async fn described_in_ec2(
+pub(crate) async fn described_in_ec2(
     emulator: &Emulator,
     ec2_instance_ids: &[String],
 ) -> BTreeMap<String, Ec2Instance> {
@@ -304,6 +326,11 @@ async fn described_in_ec2(
             held.insert(
                 id.to_string(),
                 Ec2Instance {
+                    state: instance
+                        .state()
+                        .and_then(::aws_sdk_ec2::types::InstanceState::name)
+                        .map(|name| name.as_str().to_string())
+                        .unwrap_or_default(),
                     subnet_id: instance.subnet_id().map(str::to_string),
                     instance_type: instance.instance_type().map(|kind| kind.as_str().to_string()),
                     placement_group: instance
@@ -324,7 +351,7 @@ async fn described_in_ec2(
 }
 
 /// The `Ec2InstanceId` of every reported instance.
-fn ec2_ids(instances: &[Value]) -> Vec<String> {
+pub(crate) fn ec2_ids(instances: &[Value]) -> Vec<String> {
     instances
         .iter()
         .map(|instance| {

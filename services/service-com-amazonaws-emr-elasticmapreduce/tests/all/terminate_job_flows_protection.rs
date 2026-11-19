@@ -71,20 +71,27 @@ fn assert_protected_refusal(case: &str, status: u16, payload: &Value) -> String 
 /// neither a state-change reason nor an end.
 async fn assert_not_shutting_down(emr: &Emr, case: &str, cluster_id: &str) {
     let cluster = emr.describe_cluster(cluster_id).await;
-    let state = at(&cluster, &["Status", "State"])
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    assert_not_shut_down(case, cluster_id, &cluster);
+}
+
+/// What "nothing shut this cluster down" IS, of a cluster already read: it is in neither
+/// shutdown state and carries neither a state-change reason nor an end.
+///
+/// `pub(crate)` and taking the cluster rather than a harness, so the sibling suite that
+/// reads a cluster through the cross-service harness asserts the same definition rather
+/// than its own copy.
+pub(crate) fn assert_not_shut_down(case: &str, cluster_id: &str, cluster: &Value) {
+    let state = at(cluster, &["Status", "State"]).as_str().unwrap_or_default();
     assert!(
         state != "TERMINATING" && state != "TERMINATED",
         "case {case:?}: {cluster_id} must not be shut down, got state {state:?} in {cluster}"
     );
     assert!(
-        at(&cluster, &["Status", "StateChangeReason"]).is_null(),
+        at(cluster, &["Status", "StateChangeReason"]).is_null(),
         "case {case:?}: nothing changed {cluster_id}'s state, got {cluster}"
     );
     assert!(
-        at(&cluster, &["Status", "Timeline", "EndDateTime"]).is_null(),
+        at(cluster, &["Status", "Timeline", "EndDateTime"]).is_null(),
         "case {case:?}: {cluster_id} has not ended, got {cluster}"
     );
 }
