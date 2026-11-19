@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSessions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSessions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the sessions STORED under one workflow run, each summary read off the stored
+//! session, ordered by the instant it was created with its id as the tie-break, in pages
+//! of at most `maxResults` that resume strictly after the session the previous page ended
+//! on ([`crate::state::paging`], shared by every listing of this service).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSessions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Both parents are resolved first, so a definition or a run this account's store does not
+//! hold is refused with `ResourceNotFoundException` (404) rather than answered with an
+//! empty page, and a session created under one run is never reported under another.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +87,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::paging;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -162,18 +162,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSessions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSessionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSessions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSessionsErrorModeled::InternalServerException(InternalServerException {
+                message: "the com-amazonaws-novaact-amazonnovaagentsdataplane store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+                reason: None,
+            })
+        })?;
+        // The region is read for the identifier a refusal reports: the missing resource's
+        // ARN in the requesting credential scope's region.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let not_found = |missing: crate::state::MissingResource| -> Self::Error {
+            ListSessionsErrorModeled::ResourceNotFoundException(missing.not_found(&region)).into()
+        };
+
+        let order = paging::PageOrder::from_input(input.sort_order.as_deref()).map_err(refused)?;
+        let page_size = paging::page_size(input.max_results);
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                paging::decode_next_token(token, order, Self::NAME, paging::is_uuid_string)
+                    .map_err(refused)?,
+            ),
+        };
+
+        let mut state = state.lock();
+        // A deletion the clock has already made due is completed first, exactly as every
+        // other read of this service does: it materialises a change that was owed at this
+        // instant whether or not anybody called, so this listing cannot report a session
+        // under a definition a `GetWorkflowDefinition` at the same instant would refuse.
+        state.complete_due_deletions(now);
+
+        // The run the path names, under the definition the path names: both parents are
+        // resolved before anything is listed, so this listing reports that one run's
+        // sessions and never another run's.
+        let run = state
+            .definition(&input.workflow_definition_name)
+            .and_then(|definition| definition.run(&input.workflow_run_id))
+            .map_err(not_found)?;
+
+        // The walk is bounded by `crate::state::MAX_SESSIONS_PER_RUN`, so neither it nor
+        // the sort grows with request volume. A session is placed by the instant it was
+        // created and its own id, which is the key a resumption token can name it by.
+        let listed: Vec<&crate::state::Session> = run.sessions.values().collect();
+        let (page, next_token) =
+            paging::page(listed, order, page_size, cursor.as_ref(), |session| {
+                paging::Position::new(session.created_at, session.session_id.clone())
+            });
+
+        Ok(ListSessionsOutput {
+            session_summaries: page
+                .into_iter()
+                .map(|session| SessionSummary {
+                    session_id: session.session_id.clone(),
+                })
+                .collect(),
+            next_token,
+        })
     }
+}
+
+/// A member this operation cannot use, on its own modelled error channel: HTTP 400
+/// `ValidationException`, filled in by [`paging`] so every listing of this service refuses
+/// a bad `sortOrder` or `nextToken` the same way.
+fn refused(invalid: ValidationException) -> ListSessionsError {
+    ListSessionsErrorModeled::ValidationException(invalid).into()
 }
