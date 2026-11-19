@@ -48,7 +48,8 @@
 //!
 //! That registry is what the plane's FIRST-PARTY calls check a presented
 //! `workloadIdentityToken` against ([`workload_identity_tokens`]): a token the registry does
-//! not resolve at this instant is refused, so the only tokens accepted are the ones this
+//! not resolve at this instant is refused as an authorization verdict on the request, so the
+//! only tokens accepted are the ones this
 //! service issued and has not seen expire. A call that gets past it resolves the credential
 //! provider it named against the plane that owns the account's token vault, and reads the
 //! credential out of the service holding it ([`resource_api_keys`]).

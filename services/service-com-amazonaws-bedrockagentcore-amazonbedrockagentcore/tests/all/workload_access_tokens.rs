@@ -19,7 +19,7 @@
 //! is immediately usable against a FIRST-PARTY call of the same plane
 //! (`GetResourceApiKey`) — which gets past the token and is refused only on the credential
 //! provider it named, with the sentence AWS words that miss with — while a presented value no
-//! live issuance stands behind is refused `UnauthorizedException` before anything the request
+//! live issuance stands behind is refused `AccessDeniedException` before anything the request
 //! named is resolved.
 //!
 //! Every case drives real HTTP through the same `MultiServiceRouter` the emulator serves
@@ -770,9 +770,9 @@ const API_KEY_ROUTE: &str = "/identities/api-key";
 /// emulator, so the assertion states the expectation instead of restating the code.
 const PROVIDER_NOT_FOUND_MESSAGE: &str = "Resource Credential Provider not found";
 
-/// The two sentences the plane refuses a presented bearer token with.
-const TOKEN_EXPIRED_MESSAGE: &str = "Token has expired";
-const TOKEN_INVALID_MESSAGE: &str = "Invalid JWT token";
+/// The one sentence the plane refuses a presented WORKLOAD IDENTITY token with, whichever way
+/// no live issuance stands behind it.
+const WORKLOAD_TOKEN_REFUSED_MESSAGE: &str = "Invalid workload access token";
 
 /// `GetResourceApiKey` with `token` presented for the provider `provider`.
 async fn get_resource_api_key(
@@ -948,61 +948,57 @@ async fn a_minted_token_is_accepted_by_the_first_party_api_key_call() {
 }
 
 /// A presented value no LIVE issuance of this service stands behind is refused
-/// `UnauthorizedException` (HTTP 401) — decided before the provider the request named is
-/// looked up, so the refusal says nothing about what the account holds.
+/// `AccessDeniedException` (HTTP 403) with the fixed sentence of that gate — decided before
+/// the provider the request named is looked up, so the refusal says nothing about what the
+/// account holds. The workload identity token is a credential the request CARRIES; the
+/// modelled `UnauthorizedException` (401) belongs to the caller's own OAuth bearer
+/// credential, which this call presents none of.
 ///
 /// The rows span why no live issuance backs the value: one whose window the clock has closed,
-/// one well-formed token of the plane's own form that was never issued here, and values that
-/// are no token at all.
+/// one well-formed token of the plane's own form that was never issued here, the same token
+/// under the bearer scheme, and values that are no token at all.
 #[tokio::test]
 async fn the_api_key_call_refuses_a_token_no_live_issuance_backs() {
     let (router, engine) = emulator();
     let expired = aged_issuance(&engine, "exchange.agent", "user-1");
     let unissued = unissued_token("exchange.agent", "user-1");
 
-    let cases: Vec<(&str, String, &str)> = vec![
-        (
-            "an-issuance-whose-window-has-closed",
-            expired,
-            TOKEN_EXPIRED_MESSAGE,
-        ),
+    let cases: Vec<(&str, String)> = vec![
+        ("an-issuance-whose-window-has-closed", expired),
         (
             "a-well-formed-token-this-service-never-issued",
-            unissued,
-            TOKEN_INVALID_MESSAGE,
+            unissued.clone(),
+        ),
+        (
+            "the-same-token-under-the-bearer-scheme",
+            format!("Bearer {unissued}"),
         ),
         (
             "three-segments-that-are-not-base64url-json",
             "abc.def.ghi".to_string(),
-            TOKEN_INVALID_MESSAGE,
         ),
-        (
-            "a-value-that-is-no-token-at-all",
-            "not-a-token".to_string(),
-            TOKEN_INVALID_MESSAGE,
-        ),
+        ("a-value-that-is-no-token-at-all", "not-a-token".to_string()),
         (
             "two-segments-rather-than-three",
             "header.claims".to_string(),
-            TOKEN_INVALID_MESSAGE,
         ),
     ];
 
-    for (case, token, expected) in cases {
+    for (case, token) in cases {
         let (status, body) = get_resource_api_key(&router, &token, "nonexistent-provider").await;
         assert_eq!(
-            status, 401,
-            "case {case:?}: expected HTTP 401, got {status} with {body:?}"
+            status, 403,
+            "case {case:?}: expected HTTP 403, got {status} with {body:?}"
         );
         assert_eq!(
             error_code(&body),
-            "UnauthorizedException",
-            "case {case:?}: expected UnauthorizedException, got {body:?}"
+            "AccessDeniedException",
+            "case {case:?}: expected AccessDeniedException, got {body:?}"
         );
         assert_eq!(
             text(&body, "message"),
-            expected,
-            "case {case:?}: expected {expected:?}, got {body:?}"
+            WORKLOAD_TOKEN_REFUSED_MESSAGE,
+            "case {case:?}: expected {WORKLOAD_TOKEN_REFUSED_MESSAGE:?}, got {body:?}"
         );
         assert!(
             !text(&body, "message").contains(&token),

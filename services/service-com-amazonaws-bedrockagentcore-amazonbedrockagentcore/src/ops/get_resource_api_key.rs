@@ -8,9 +8,12 @@
 //! Three steps, in this order, so a refusal says only what the caller is entitled to know:
 //!
 //! 1. the presented `workloadIdentityToken` is CHECKED against the issuances this service
-//!    recorded ([`crate::state::workload_of_identity_token`]) — a token this service did not
-//!    issue, or one the clock has run out on, is `UnauthorizedException` (401) and nothing is
-//!    resolved;
+//!    recorded ([`crate::state::workload_of_identity_token`]) — that token is a credential
+//!    carried in the request BODY, so a token this service did not issue, or one the clock
+//!    has run out on, is the authorization verdict `AccessDeniedException` (403) with the
+//!    fixed sentence of that gate ([`crate::state::INVALID_WORKLOAD_ACCESS_TOKEN_MESSAGE`])
+//!    and nothing is resolved. The modelled `UnauthorizedException` (401) belongs to the
+//!    caller's own inbound OAuth bearer credential, which this operation is handed none of;
 //! 2. the `resourceCredentialProviderName` is resolved against the plane that owns the
 //!    account's token vault ([`crate::state::api_key_secret_of_provider`]) — a name it holds
 //!    no provider under is `ResourceNotFoundException` (404). Reaching this refusal is how a
@@ -196,11 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.workload_identity_token,
                 ::std::time::SystemTime::now(),
             )
-            .map_err(|refusal| {
-                GetResourceApiKeyErrorModeled::UnauthorizedException(UnauthorizedException {
-                    message: Some(refusal.message().to_string()),
-                })
-            })?;
+            .ok_or_else(invalid_workload_access_token)?;
         }
 
         // Then the provider, against the plane that owns the account's token vault. The
@@ -249,6 +248,17 @@ fn provider_problem(problem: crate::state::ResourceApiKeyProblem) -> GetResource
             .into()
         }
     }
+}
+
+/// How this operation answers a `workloadIdentityToken` no live issuance of this service
+/// stands behind: the modelled authorization verdict on the credential the request carried,
+/// with the fixed sentence of that gate. Nothing of the presented value is quoted back — it
+/// is a credential, and the member is `@sensitive`.
+fn invalid_workload_access_token() -> GetResourceApiKeyError {
+    GetResourceApiKeyErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(crate::state::INVALID_WORKLOAD_ACCESS_TOKEN_MESSAGE.to_string()),
+    })
+    .into()
 }
 
 /// The modelled server failure for an engine that carries no store this operation needs.

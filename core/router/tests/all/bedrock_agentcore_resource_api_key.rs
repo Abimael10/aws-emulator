@@ -4,8 +4,10 @@
 //! resource's API key.
 //!
 //! RULE: the data plane's first-party resource-credential call CHECKS the presented
-//! `workloadIdentityToken` against the issuances the identity plane recorded — a token no
-//! live issuance stands behind is `UnauthorizedException` (HTTP 401) and nothing the request
+//! `workloadIdentityToken` against the issuances the identity plane recorded — that token is a
+//! credential the request CARRIES, so a value no live issuance stands behind is
+//! `AccessDeniedException` (HTTP 403) with the fixed sentence `Invalid workload access token`
+//! and nothing the request
 //! named is resolved — then resolves `resourceCredentialProviderName` against the plane that
 //! OWNS the account's token vault, refusing a name that plane holds no provider under with
 //! `ResourceNotFoundException` (HTTP 404) and the fixed sentence `Resource Credential
@@ -34,16 +36,17 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore as data_plane;
 
-/// The Region every request is signed for unless a row says otherwise.
-const REGION: &str = "us-east-1";
+/// The Region every request is signed for unless a row says otherwise. Shared with the
+/// sibling suite that drives the same exchange's token gate.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// A second Region, for the external secret a provider of this account references from
 /// elsewhere.
 const OTHER_REGION: &str = "eu-west-1";
 
 /// The workload identity the tokens under test are minted from, and the user they act for.
-const WORKLOAD: &str = "simreal.resource-api-key";
-const USER: &str = "user-1";
+pub(crate) const WORKLOAD: &str = "simreal.resource-api-key";
+pub(crate) const USER: &str = "user-1";
 
 /// `GetResourceApiKey`: `POST /identities/api-key` (source: smithy_query query="operation"
 /// operation="GetResourceApiKey": `http`).
@@ -65,15 +68,14 @@ const DELETE_PROVIDER_ROUTE: &str = "/identities/DeleteApiKeyCredentialProvider"
 /// emulator, so the assertion states the expectation instead of restating the code.
 const PROVIDER_NOT_FOUND: &str = "Resource Credential Provider not found";
 
-/// The two sentences the identity plane refuses a presented bearer token with.
-const TOKEN_EXPIRED: &str = "Token has expired";
-const TOKEN_INVALID: &str = "Invalid JWT token";
+/// The one sentence the identity plane refuses a presented WORKLOAD IDENTITY token with.
+const WORKLOAD_TOKEN_REFUSED: &str = "Invalid workload access token";
 
 /// One answer from the emulator: its status and its JSON body.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Answer {
@@ -88,7 +90,7 @@ impl Answer {
     }
 
     /// The modelled error code this answer carries, with the shape namespace stripped.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.body
             .get("__type")
             .and_then(Value::as_str)
@@ -99,7 +101,7 @@ impl Answer {
             .to_string()
     }
 
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.body
             .get("message")
             .and_then(Value::as_str)
@@ -107,7 +109,7 @@ impl Answer {
             .to_string()
     }
 
-    fn text(&self, member: &str) -> String {
+    pub(crate) fn text(&self, member: &str) -> String {
         self.body
             .get(member)
             .and_then(Value::as_str)
@@ -118,13 +120,13 @@ impl Answer {
 
 /// The AgentCore control plane, the AgentCore data plane and Secrets Manager over ONE shared
 /// engine, exactly as `router/src/lib.rs` mounts them.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -140,6 +142,12 @@ impl Emulator {
             )),
         );
         Self { router, engine }
+    }
+
+    /// The engine the three services share, so a suite can read the stores the handlers
+    /// wrote rather than infer them from a response.
+    pub(crate) fn engine(&self) -> &engine::InMemoryEngine {
+        &self.engine
     }
 
     /// One `restJson1` call to the AgentCore signing name, signed for `region`. The ROUTE is
@@ -189,7 +197,7 @@ impl Emulator {
     }
 
     /// Mint a workload access token for a USER, as a workload acting on behalf of one does.
-    async fn token_for_user(&self, case: &str) -> String {
+    pub(crate) async fn token_for_user(&self, case: &str) -> String {
         let answer = self
             .agentcore(
                 REGION,
@@ -226,7 +234,7 @@ impl Emulator {
     }
 
     /// `GetResourceApiKey` — the call under test.
-    async fn resource_api_key(&self, token: &str, provider: &str) -> Answer {
+    pub(crate) async fn resource_api_key(&self, token: &str, provider: &str) -> Answer {
         self.agentcore(
             REGION,
             API_KEY_ROUTE,
@@ -239,7 +247,7 @@ impl Emulator {
     }
 
     /// Create an API key credential provider whose key the SERVICE stores for it.
-    async fn create_managed_provider(&self, case: &str, name: &str, api_key: &str) {
+    pub(crate) async fn create_managed_provider(&self, case: &str, name: &str, api_key: &str) {
         let answer = self
             .agentcore(
                 REGION,
@@ -322,7 +330,7 @@ impl Emulator {
     /// Record an issuance whose window has already closed, the way a mint records one: a
     /// token minted an hour ago for a fifteen-minute window. The test reaches into the store
     /// the handlers share instead of waiting for a clock, which is not an emulator behaviour.
-    fn aged_issuance(&self) -> String {
+    pub(crate) fn aged_issuance(&self) -> String {
         let issued_at = SystemTime::now() - Duration::from_secs(3_600);
         let expires_at = issued_at + Duration::from_secs(900);
         let token = data_plane::state::mint_workload_access_token(
@@ -347,6 +355,31 @@ impl Emulator {
         );
         token
     }
+}
+
+/// How many issuances the identity plane holds — what a test checks to show a refused
+/// exchange recorded nothing of its own.
+#[must_use]
+pub(crate) fn issuance_count(engine: &engine::InMemoryEngine) -> usize {
+    let state = data_plane::state::service_state(engine).expect("the data plane's own store");
+    let store = state.lock();
+    store.workload_access_tokens.len()
+}
+
+/// A token of this plane's own FORM that this emulator never issued, minted for `region` and
+/// for `user` (`None` for the workload itself) with the mint sequence `seq`, and recorded
+/// nowhere.
+#[must_use]
+pub(crate) fn token_minted_nowhere(region: &str, user: Option<&str>, seq: u64) -> String {
+    let issued_at = SystemTime::now();
+    data_plane::state::mint_workload_access_token(
+        region,
+        WORKLOAD,
+        user,
+        issued_at,
+        issued_at + Duration::from_secs(900),
+        seq,
+    )
 }
 
 /// A token of the right FORM that this emulator never issued: the identity plane's own mint
@@ -575,10 +608,13 @@ async fn a_name_no_provider_exists_under_is_refused_with_the_fixed_sentence() {
     );
 }
 
-/// A presented value no live issuance of this service stands behind is the modelled 401 —
-/// decided before the provider the request named is looked up at all.
+/// A presented value no live issuance of this service stands behind is the modelled 403 —
+/// decided before the provider the request named is looked up at all. The workload identity
+/// token is a credential carried in the request body, so refusing it is an authorization
+/// verdict; the modelled `UnauthorizedException` (401) belongs to the caller's own OAuth
+/// bearer credential, which this call presents none of.
 #[tokio::test]
-async fn a_token_no_live_issuance_stands_behind_is_refused_unauthorized() {
+async fn a_token_no_live_issuance_stands_behind_is_refused_access_denied() {
     let emulator = Emulator::new();
     emulator
         .create_managed_provider("the provider that exists", "partner-api", "sk-live-0001")
@@ -587,60 +623,59 @@ async fn a_token_no_live_issuance_stands_behind_is_refused_unauthorized() {
     let unissued = unissued_token();
 
     // Rows: why no live issuance stands behind the value × whether the provider named exists.
-    let rows: Vec<(&str, String, &str, &str)> = vec![
+    let rows: Vec<(&str, String, &str)> = vec![
         (
             "an issuance whose window has closed",
             aged.clone(),
             "partner-api",
-            TOKEN_EXPIRED,
         ),
         (
             "an issuance whose window has closed, naming no provider that exists",
             aged,
             "sim2real-nonexistent-provider",
-            TOKEN_EXPIRED,
         ),
         (
             "a well-formed token this service never issued",
             unissued.clone(),
             "partner-api",
-            TOKEN_INVALID,
         ),
         (
             "the same token naming no provider that exists",
-            unissued,
+            unissued.clone(),
             "sim2real-nonexistent-provider",
-            TOKEN_INVALID,
+        ),
+        (
+            "the same token presented under the bearer scheme",
+            format!("Bearer {unissued}"),
+            "partner-api",
         ),
         (
             "three segments that are not base64url JSON",
             "abc.def.ghi".to_string(),
             "partner-api",
-            TOKEN_INVALID,
         ),
         (
             "a value that is no token at all",
             "not-a-token".to_string(),
             "partner-api",
-            TOKEN_INVALID,
         ),
     ];
 
-    for (case, token, provider, expected) in rows {
+    for (case, token, provider) in rows {
         let answer = emulator.resource_api_key(&token, provider).await;
         assert_eq!(
-            answer.status, 401,
-            "case {case:?}: expected HTTP 401, got {answer:?}"
+            answer.status, 403,
+            "case {case:?}: expected HTTP 403, got {answer:?}"
         );
         assert_eq!(
             answer.error_code(),
-            "UnauthorizedException",
-            "case {case:?}: expected UnauthorizedException, got {answer:?}"
+            "AccessDeniedException",
+            "case {case:?}: expected AccessDeniedException, got {answer:?}"
         );
         assert_eq!(
             answer.message(),
-            expected,
-            "case {case:?}: expected {expected:?}, got {:?}",
+            WORKLOAD_TOKEN_REFUSED,
+            "case {case:?}: expected {WORKLOAD_TOKEN_REFUSED:?}, got {:?}",
             answer.message()
         );
         // The refusal never echoes the bearer value back.
