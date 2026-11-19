@@ -381,7 +381,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
         // against the same answer.
         let addressed_tags = store
             .bucket(&input.bucket)
-            .map(crate::service::request_authorization::AddressedBucketTags::of)
+            .map(crate::service::request_authorization::AddressedTags::of)
             .unwrap_or_default();
         // Whether this request asks to bypass governance-mode restrictions, and the one
         // instant every Object Lock judgement in the batch is made at — so two identifiers
@@ -397,18 +397,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
             // ([`crate::service::request_authorization::delete_object_action`]). A refused
             // identifier is THIS key's failure, reported beside the keys that did delete the
             // way every other per-key refusal here is, and nothing of it is removed.
-            if let Some(message) = crate::service::request_authorization::denial(
-                &caller,
-                store
-                    .bucket(&input.bucket)
-                    .and_then(|bucket| bucket.policy.as_deref()),
-                &addressed_tags,
-                crate::service::request_authorization::delete_object_action(
-                    identifier.version_id.as_deref(),
-                ),
-                &crate::state::object_arn(&input.bucket, key),
-                &crate::service::authorization::read_conditions(),
-            ) {
+            if let Some(message) = {
+                let bucket = store.bucket(&input.bucket);
+                // The stored version THIS identifier addresses, whose own tag set answers the
+                // existing-object-tag family for its decision, through the store's one reading
+                // of an address ([`crate::state::Bucket::addressed_object`]).
+                let addressed = bucket.and_then(|bucket| {
+                    bucket.addressed_object(key, identifier.version_id.as_deref())
+                });
+                crate::service::request_authorization::denial(
+                    &caller,
+                    bucket.and_then(|bucket| bucket.policy.as_deref()),
+                    &addressed_tags.clone().with_object(addressed),
+                    crate::service::request_authorization::delete_object_action(
+                        identifier.version_id.as_deref(),
+                    ),
+                    &crate::state::object_arn(&input.bucket, key),
+                    &crate::service::authorization::read_conditions(),
+                )
+            } {
                 errors.push(Error {
                     key: Some(key.to_string()),
                     version_id: identifier.version_id.clone(),

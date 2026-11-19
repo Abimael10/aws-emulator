@@ -804,7 +804,7 @@ impl Bucket {
     /// "If ABAC is enabled on your bucket, you can use tags on the bucket for access control"
     /// (`GetBucketAbac`'s own documentation), so this is what decides whether a request
     /// addressed to the bucket answers the condition keys naming those tags
-    /// ([`crate::service::request_authorization::AddressedBucketTags`]). ABAC is a property of
+    /// ([`crate::service::request_authorization::AddressedTags`]). ABAC is a property of
     /// a general purpose bucket — "sets the attribute-based access control (ABAC) property of
     /// the general purpose bucket" (`PutBucketAbac`'s own documentation) — so a DIRECTORY
     /// bucket's tags are not in force as access control whatever status a put recorded on it,
@@ -820,7 +820,7 @@ impl Bucket {
     /// where a clause over one of those keys stays undecided and so grants nothing.
     ///
     /// ONE reading, so the full authorization gate
-    /// ([`crate::service::request_authorization::AddressedBucketTags`]) and the bucket-policy
+    /// ([`crate::service::request_authorization::AddressedTags`]) and the bucket-policy
     /// deny this module decides ([`Bucket::caller_is_denied`]) answer the family alike. A
     /// bucket under ABAC that holds NO tag answers the family with no pair at all, which is
     /// not the same as not answering it: a clause over a tag key it does not carry is then

@@ -77,7 +77,7 @@
 //! from the credential rather than decided here, and a long-term access key carries a value
 //! for neither. Two more come from the TAGS in play: the session tags the credential carries
 //! (`aws:PrincipalTag/<key>`) and the tags of the bucket the request addressed while ABAC is
-//! enabled on it (`aws:ResourceTag/<key>`, [`AddressedBucketTags`]) — the pair an
+//! enabled on it (`aws:ResourceTag/<key>`, [`AddressedTags`]) — the pair an
 //! attribute-based grant is written over, where the policy states the principal's tag as a
 //! VARIABLE and the evaluator substitutes it from this same context.
 //!
@@ -624,17 +624,18 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
 /// reached it from outside that VPC is refused for the NETWORK it came over, in the sentence
 /// an explicit resource-policy deny is worded in — and no grant in any document lifts it.
 ///
-/// ## The ADDRESSED bucket's own tags
+/// ## The ADDRESSED resources' own tags
 ///
-/// `addressed_tags` is what the bucket the request addressed answers the
-/// `aws:ResourceTag/<key>` family with ([`AddressedBucketTags`]), which is how a statement
-/// conditioned on the resource's own tags — the ABAC shape, where the grant holds only for a
-/// principal whose session tag matches the bucket's — is decided at all.
+/// `addressed_tags` is what the resources the request addressed answer the
+/// `aws:ResourceTag/<key>` and `s3:ExistingObjectTag/<key>` families with
+/// ([`AddressedTags`]), which is how a statement conditioned on the resource's own tags — the
+/// ABAC shape, where the grant holds only for a principal whose session tag matches the
+/// bucket's or the object's — is decided at all.
 #[must_use]
 pub fn denial(
     caller: &Caller,
     policy: Option<&str>,
-    addressed_tags: &AddressedBucketTags,
+    addressed_tags: &AddressedTags,
     action: &str,
     resource: &str,
     conditions: &[(String, String)],
@@ -698,9 +699,19 @@ pub fn denial(
     // `aws:ResourceTag/<key>` is decided against. The family is published only where the
     // bucket answers it, so a clause over a tag key such a bucket does not carry is decided
     // as absent while the same clause about a bucket outside ABAC stays undecided.
-    if let Some(tags) = addressed_tags.answered() {
+    if let Some(tags) = addressed_tags.bucket_answered() {
         context.extend(tags.iter().cloned());
         also_published.push(state::RESOURCE_TAG_CONDITION_KEY_FAMILY);
+    }
+    // The tag set of the OBJECT the request addressed, which is what a statement conditioned
+    // on `s3:ExistingObjectTag/<key>` is decided against — the key an attribute-based grant
+    // comparing the object's tag with the caller's own session tag is written over. Published
+    // only where a decision was taken over an object this emulator holds, so a clause over a
+    // tag key that object does not carry is decided as absent there and stays undecided for a
+    // decision taken over the bucket alone.
+    if let Some(tags) = addressed_tags.object_answered() {
+        context.extend(tags.iter().cloned());
+        also_published.push(state::EXISTING_OBJECT_TAG_CONDITION_KEY_FAMILY);
     }
     // Borrowed rather than copied where nothing is added, since that is the common case.
     let published: ::std::borrow::Cow<'_, [&str]> = if also_published.is_empty() {
@@ -951,9 +962,10 @@ const IDENTITY_POLICY_DENY_REASON: &str = "with an explicit deny in an identity-
 /// tag `tenant`.
 const PRINCIPAL_TAG_CONDITION_KEY_FAMILY: &str = "aws:PrincipalTag/";
 
-/// What the bucket a request addressed answers the condition-key family naming a bucket's
-/// tags ([`state::RESOURCE_TAG_CONDITION_KEY_FAMILY`]) with, for the decision taken on that
-/// request.
+/// What the RESOURCES a request addressed answer the tag condition-key families with, for the
+/// decision taken on that request: the BUCKET's own tags
+/// ([`state::RESOURCE_TAG_CONDITION_KEY_FAMILY`]) and, for a decision taken over an existing
+/// object, that object's tag set ([`state::EXISTING_OBJECT_TAG_CONDITION_KEY_FAMILY`]).
 ///
 /// S3 decides access by a bucket's own tags only while ABAC is ENABLED on it — "if ABAC is
 /// enabled on your bucket, you can use tags on the bucket for access control"
@@ -963,24 +975,60 @@ const PRINCIPAL_TAG_CONDITION_KEY_FAMILY: &str = "aws:PrincipalTag/";
 /// family not at all: a clause over one of its members stays undecided there, which grants
 /// nothing while a `Deny` carrying it still refuses.
 ///
-/// The tags are the BUCKET's for an object resource too: ABAC on a general purpose bucket is
-/// the bucket's property, and the objects it holds are reached under it.
+/// The bucket's tags are in force on an object resource too: ABAC on a general purpose bucket
+/// is the bucket's property, and the objects it holds are reached under it.
+///
+/// An OBJECT's own tag set is in force whenever the decision is taken over the object itself —
+/// "`s3:ExistingObjectTag/<key>` … enables you to verify that an existing object tag has the
+/// specific tag key and value" (Amazon S3 User Guide, *Actions, resources, and condition keys
+/// for Amazon S3*) — which is what an attribute-based grant comparing the object's tag with
+/// the caller's own (`${aws:PrincipalTag/<key>}`) is written over. It is answered by the
+/// decision that resolved the stored version the request addressed ([`Self::with_object`]),
+/// so a decision over a bucket, or over an address holding nothing, answers it not at all and
+/// leaves such a clause undecided.
 #[derive(Debug, Clone, Default)]
-pub struct AddressedBucketTags(Option<Vec<(String, String)>>);
+pub struct AddressedTags {
+    bucket: Option<Vec<(String, String)>>,
+    object: Option<Vec<(String, String)>>,
+}
 
-impl AddressedBucketTags {
-    /// What `bucket` answers the family with, through the store's one reading of that
-    /// ([`Bucket::resource_tag_conditions`]).
+impl AddressedTags {
+    /// What `bucket` answers the bucket-tag family with, through the store's one reading of
+    /// that ([`Bucket::resource_tag_conditions`]), and no object tags: the value a decision
+    /// taken over the bucket itself is judged in.
     #[must_use]
     pub fn of(bucket: &Bucket) -> Self {
-        Self(bucket.resource_tag_conditions())
+        Self {
+            bucket: bucket.resource_tag_conditions(),
+            object: None,
+        }
     }
 
-    /// The pairs the family is answered with, or `None` for a decision that does not answer
-    /// it — a request addressed to a bucket outside ABAC, or to no bucket this emulator holds
-    /// (which is what [`AddressedBucketTags::default`] states).
-    fn answered(&self) -> Option<&[(String, String)]> {
-        self.0.as_deref()
+    /// The same, carrying what the stored version the request ADDRESSED answers the
+    /// existing-object-tag family with ([`Object::existing_object_tag_conditions`]).
+    ///
+    /// `addressed` is the version the address resolved to, so an address holding nothing
+    /// leaves the family unanswered — there is no object whose tags could decide a clause —
+    /// exactly as a decision taken over the bucket does.
+    #[must_use]
+    pub fn with_object(self, addressed: Option<&Object>) -> Self {
+        Self {
+            object: addressed.map(Object::existing_object_tag_conditions),
+            ..self
+        }
+    }
+
+    /// The pairs the BUCKET-tag family is answered with, or `None` for a decision that does
+    /// not answer it — a request addressed to a bucket outside ABAC, or to no bucket this
+    /// emulator holds (which is what [`AddressedTags::default`] states).
+    fn bucket_answered(&self) -> Option<&[(String, String)]> {
+        self.bucket.as_deref()
+    }
+
+    /// The pairs the EXISTING-OBJECT-tag family is answered with, or `None` for a decision
+    /// that was not taken over an object this emulator holds.
+    fn object_answered(&self) -> Option<&[(String, String)]> {
+        self.object.as_deref()
     }
 }
 
@@ -1085,7 +1133,7 @@ fn request_over<'a>(
 pub fn policy_operation_denial(
     caller: &Caller,
     policy: Option<&str>,
-    addressed_tags: &AddressedBucketTags,
+    addressed_tags: &AddressedTags,
     action: &str,
     resource: &str,
     conditions: &[(String, String)],
@@ -1127,8 +1175,10 @@ pub fn object_read_denial(
     let conditions = authorization::read_conditions();
     let policy = bucket.policy.as_deref();
     // The bucket's own tags are in force on a read of it and on a read of anything it holds
-    // alike, while ABAC is enabled on it ([`AddressedBucketTags`]).
-    let addressed_tags = AddressedBucketTags::of(bucket);
+    // alike, while ABAC is enabled on it ([`AddressedTags`]). The ADDRESSED version's own tag
+    // set answers the existing-object-tag family beside it, which is what an attribute-based
+    // grant comparing the object's tag with the caller's session tag is decided against.
+    let addressed_tags = AddressedTags::of(bucket).with_object(addressed);
     if addressed.is_some() {
         return denial(
             caller,
@@ -1270,7 +1320,7 @@ mod tests {
             let answer = denial(
                 &caller,
                 policy,
-                &AddressedBucketTags::default(),
+                &AddressedTags::default(),
                 action,
                 object,
                 &[],
@@ -1332,7 +1382,7 @@ mod tests {
             let answer = denial(
                 &caller,
                 policy,
-                &AddressedBucketTags::default(),
+                &AddressedTags::default(),
                 "s3:GetObject",
                 object,
                 &[],
@@ -1382,7 +1432,7 @@ mod tests {
             let admitted = denial(
                 &caller,
                 None,
-                &AddressedBucketTags::default(),
+                &AddressedTags::default(),
                 "s3:GetObject",
                 object,
                 &[],
@@ -1395,7 +1445,7 @@ mod tests {
             let refused = denial(
                 &caller,
                 Some(&deny),
-                &AddressedBucketTags::default(),
+                &AddressedTags::default(),
                 "s3:GetObject",
                 object,
                 &[],

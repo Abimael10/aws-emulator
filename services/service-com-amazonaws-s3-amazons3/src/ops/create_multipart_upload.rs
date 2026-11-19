@@ -714,7 +714,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (
                 bucket.and_then(|bucket| bucket.policy.clone()),
                 bucket
-                    .map(crate::service::request_authorization::AddressedBucketTags::of)
+                    .map(crate::service::request_authorization::AddressedTags::of)
                     .unwrap_or_default(),
             )
         };

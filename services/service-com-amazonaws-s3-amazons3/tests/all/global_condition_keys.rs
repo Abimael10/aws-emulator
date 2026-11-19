@@ -28,8 +28,8 @@
 //! the conditioned statement is the `Allow` or a `Deny` over a broad `Allow`, and which
 //! operation the call is — a bucket listing, an object read and an object write, so the rule
 //! is pinned on bucket-scoped and object-scoped resources alike. The last row is the
-//! boundary: a grant conditioned on a key this service does NOT answer stays undecided and
-//! authorizes nothing.
+//! boundary: a grant conditioned on an object tag the read's object does not carry holds for
+//! nothing and authorizes nothing.
 
 use std::sync::Arc;
 
@@ -466,9 +466,9 @@ const ROWS: &[Row] = &[
         call: Call::ListBucket,
         allowed: false,
     },
-    // --- the boundary: a key this service does NOT answer stays undecided ---
+    // --- the boundary: a clause the request does not satisfy grants nothing ---
     Row {
-        case: "a grant conditioned on a key this service does not answer",
+        case: "a grant conditioned on an object tag the read's object does not carry",
         effect: "Allow",
         condition: |_user| {
             "{\"StringEquals\":{\"s3:ExistingObjectTag/stage\":\"production\"}}".to_string()
@@ -500,8 +500,8 @@ fn document(row: &Row, user: &str, action: &str) -> String {
 }
 
 /// RULE: a clause over a global condition key this service answers decides its statement —
-/// the grant holds or it does not, and the deny refuses or it does not — while a clause over
-/// a key it does not answer leaves the statement undecided, granting and refusing nothing.
+/// the grant holds or it does not, and the deny refuses or it does not — and a grant whose
+/// clause the request does not satisfy authorizes nothing.
 #[tokio::test]
 async fn a_clause_over_an_answered_global_key_decides_its_statement() {
     for (index, row) in ROWS.iter().enumerate() {

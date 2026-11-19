@@ -1120,6 +1120,27 @@ impl Object {
         (!self.tags.is_empty()).then(|| i32::try_from(self.tags.len()).unwrap_or(i32::MAX))
     }
 
+    /// The condition keys naming this stored version's own TAG SET, which a statement
+    /// conditioned on [`EXISTING_OBJECT_TAG_CONDITION_KEY_FAMILY`] is decided against: one
+    /// pair per tag the object carries, in the order the write that set them carried them.
+    ///
+    /// ONE reading, so every decision taken over an existing object — a read of it, a delete
+    /// of it, a copy that reads it as a source — answers the family alike. An object holding
+    /// NO tag answers the family with no pair at all, which is not the same as not answering
+    /// it: the family is published for a decision over the object, so a clause over a tag key
+    /// that object does not carry is decided as absent there.
+    pub fn existing_object_tag_conditions(&self) -> Vec<(String, String)> {
+        self.tags
+            .iter()
+            .map(|tag| {
+                (
+                    format!("{EXISTING_OBJECT_TAG_CONDITION_KEY_FAMILY}{}", tag.key),
+                    tag.value.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// How large this object's user-defined metadata is, in UTF-8 bytes summed over every
     /// key and value — what [`MAX_OBJECT_METADATA_BYTES`] bounds.
     pub fn metadata_bytes(&self) -> usize {

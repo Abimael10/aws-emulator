@@ -125,8 +125,14 @@ impl<Eng: Send + Sync + 'static> SelectObjectContent<Eng> {
                 let held = store.bucket(&bucket);
                 (
                     held.and_then(|held| held.policy.clone()),
-                    held.map(super::request_authorization::AddressedBucketTags::of)
-                        .unwrap_or_default(),
+                    held.map(|held| {
+                        // The stored version this Select READS, whose own tag set answers the
+                        // existing-object-tag family for the decision — the same reading a
+                        // plain read of that object takes.
+                        super::request_authorization::AddressedTags::of(held)
+                            .with_object(held.object(&key))
+                    })
+                    .unwrap_or_default(),
                 )
             })
             .unwrap_or_default();

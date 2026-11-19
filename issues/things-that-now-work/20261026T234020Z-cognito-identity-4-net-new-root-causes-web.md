@@ -13,6 +13,16 @@ Issue-Commit: da7bc09c8c1c199d36cb9fc39c5c5796d768dc3a
 
 > _Note: this issue was identified against the code base at commit `da7bc09c8c1c199d36cb9fc39c5c5796d768dc3a`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Resolution: causes 2, 3 and 4 are FIXED, and their replay keys pass. Cause 1 (the `ASIA`
+> access-key class) is NOT fixed: it cannot be served from a service crate — every credential
+> this emulator vends is minted by the read-only core credential store, whose kinds are sealed
+> (`vendor/server/src/credential_store.rs:17`) and mint `EMULATOR`-prefixed ids deliberately
+> (`vendor/server/src/aws_credentials.rs:12-16,47,57`) — so it was split out with its own replay
+> key into
+> `issues/things-that-do-not-work/20261026T234020Z-cognito-identity-a-web-identity-session-still-vends-an-emul-class-accesskeyid.md`,
+> which carries the analysis and the core change it needs. Cause 1 below is kept for context;
+> the split report, not this one, is its filing._
+
 ## Operation
 GetCredentialsForIdentity (also sts:AssumeRoleWithWebIdentity, GetId, cloudtrail:LookupEvents)
 

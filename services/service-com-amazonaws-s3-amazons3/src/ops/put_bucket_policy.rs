@@ -333,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) = crate::service::request_authorization::policy_operation_denial(
             &caller,
             bucket.policy.as_deref(),
-            &crate::service::request_authorization::AddressedBucketTags::of(bucket),
+            &crate::service::request_authorization::AddressedTags::of(bucket),
             PUT_BUCKET_POLICY_ACTION,
             &crate::state::bucket_arn(&input.bucket),
             &crate::service::authorization::read_conditions(),

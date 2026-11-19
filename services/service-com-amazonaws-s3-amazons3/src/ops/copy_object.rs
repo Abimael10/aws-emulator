@@ -700,7 +700,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         if let Some(message) = crate::service::request_authorization::denial(
             &caller,
             destination.policy.as_deref(),
-            &crate::service::request_authorization::AddressedBucketTags::of(destination),
+            &crate::service::request_authorization::AddressedTags::of(destination),
             PUT_OBJECT_ACTION,
             &crate::state::object_arn(&input.bucket, &input.key),
             &write_context.conditions(),
@@ -750,7 +750,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         if let Some(message) = crate::service::request_authorization::denial(
             &caller,
             source_bucket.policy.as_deref(),
-            &crate::service::request_authorization::AddressedBucketTags::of(source_bucket),
+            // The stored version the copy READS, whose own tag set answers the
+            // existing-object-tag family for this decision, through the store's one reading of
+            // an address ([`crate::state::Bucket::addressed_object`]) — nothing at all for a
+            // reference holding nothing, which the read below is what reports.
+            &crate::service::request_authorization::AddressedTags::of(source_bucket).with_object(
+                source_bucket.addressed_object(&source.key, source.version_id.as_deref()),
+            ),
             crate::service::request_authorization::get_object_action(source.version_id.as_deref()),
             &crate::state::object_arn(&source.bucket, &source.key),
             &crate::service::authorization::read_conditions(),

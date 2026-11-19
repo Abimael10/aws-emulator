@@ -309,10 +309,11 @@ fn rows() -> Vec<Row> {
             },
         },
         Row {
-            // A Deny this service cannot JUDGE: the clause is over a condition key nothing
-            // here answers, so whether it holds is unknown — and an unknown refusal does
-            // not stand in the way of the bucket owner's own read.
-            case: "a Deny conditioned on a key this service does not answer",
+            // A Deny over an object tag the object does NOT carry: the family a decision
+            // taken over an existing object answers is `s3:ExistingObjectTag/<key>`, and
+            // this object carries no tag at all, so the clause does not hold and the Deny
+            // carrying it refuses nothing.
+            case: "a Deny conditioned on an object tag this object does not carry",
             bucket: "read-authz-undecidable-deny",
             policy: Some(policy_document(&conditional_statement(
                 "Deny",

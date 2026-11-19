@@ -461,7 +461,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) = crate::service::request_authorization::denial(
             &caller,
             source_bucket.policy.as_deref(),
-            &crate::service::request_authorization::AddressedBucketTags::of(source_bucket),
+            // The stored version this part copy READS, whose own tag set answers the
+            // existing-object-tag family for this decision — the same reading `CopyObject`
+            // takes for the same reference ([`crate::state::Bucket::addressed_object`]).
+            &crate::service::request_authorization::AddressedTags::of(source_bucket).with_object(
+                source_bucket.addressed_object(&source.key, source.version_id.as_deref()),
+            ),
             crate::service::request_authorization::get_object_action(source.version_id.as_deref()),
             &crate::state::object_arn(&source.bucket, &source.key),
             &crate::service::authorization::read_conditions(),

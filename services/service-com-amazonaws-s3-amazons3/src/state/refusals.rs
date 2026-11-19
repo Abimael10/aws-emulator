@@ -859,7 +859,7 @@ pub const DEFAULT_BUCKET_ABAC_STATUS: &str = "Disabled";
 /// buckets" (`PutBucketAbac`'s own documentation).
 ///
 /// Which is what makes a request addressed to such a bucket answer the condition keys naming
-/// its tags ([`crate::service::request_authorization::AddressedBucketTags`]).
+/// its tags ([`crate::service::request_authorization::AddressedTags`]).
 pub const ENABLED_BUCKET_ABAC_STATUS: &str = "Enabled";
 
 /// How many ownership control rules this emulator records for one bucket.
@@ -2595,6 +2595,19 @@ pub(super) const REQUEST_CONDITION_KEYS: &[&str] = &[SECURE_TRANSPORT_KEY];
 /// ABAC is enabled on your bucket, you can use tags on the bucket for access control"
 /// (`GetBucketAbac`'s own documentation).
 pub const RESOURCE_TAG_CONDITION_KEY_FAMILY: &str = "aws:ResourceTag/";
+
+/// The condition-key FAMILY the TAGS of the OBJECT a request addressed are named in, each
+/// member after the tag key it carries: `s3:ExistingObjectTag/department` holds the value of
+/// the object tag `department` (Amazon S3 User Guide, *Actions, resources, and condition keys
+/// for Amazon S3*, `s3:ExistingObjectTag/<key>` — "enables you to verify that an existing
+/// object tag has the specific tag key and value").
+///
+/// An object answers it whenever a decision is taken over the object ITSELF — the tag set
+/// stored on the version the request resolved to ([`Object::existing_object_tag_conditions`]
+/// is the one reading of that) — so an action over an existing object decides a clause
+/// written in this family, while a decision over a bucket, or over an object nothing holds,
+/// answers the family not at all.
+pub const EXISTING_OBJECT_TAG_CONDITION_KEY_FAMILY: &str = "s3:ExistingObjectTag/";
 
 /// The `Payer` value under which the REQUESTER, rather than the bucket owner, pays for a
 /// download — one of the two values `Payer` takes (`PAYER_VALUES`), the other being

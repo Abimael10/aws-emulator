@@ -409,10 +409,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
         // the bucket's own policy ([`crate::service::request_authorization`] carries IAM's
         // order), before anything is taken away or laid down.
         let delete_denial = store.bucket(&input.bucket).and_then(|bucket| {
+            // The stored version this delete ADDRESSES, whose own tag set answers the
+            // existing-object-tag family for the decision, resolved through the store's one
+            // reading of an address ([`crate::state::Bucket::addressed_object`]): the version a
+            // `versionId` names, else the key's current one, and nothing at all for an address
+            // holding nothing.
+            let addressed = bucket.addressed_object(&input.key, input.version_id.as_deref());
             crate::service::request_authorization::denial(
                 &caller,
                 bucket.policy.as_deref(),
-                &crate::service::request_authorization::AddressedBucketTags::of(bucket),
+                &crate::service::request_authorization::AddressedTags::of(bucket)
+                    .with_object(addressed),
                 crate::service::request_authorization::delete_object_action(
                     input.version_id.as_deref(),
                 ),

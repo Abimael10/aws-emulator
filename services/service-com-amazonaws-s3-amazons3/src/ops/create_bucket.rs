@@ -532,7 +532,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None,
                 // A create addresses a bucket that does not exist yet, so nothing carries
                 // tags for the ABAC condition keys to be answered from.
-                &crate::service::request_authorization::AddressedBucketTags::default(),
+                &crate::service::request_authorization::AddressedTags::default(),
                 action,
                 &resource,
                 &conditions,
