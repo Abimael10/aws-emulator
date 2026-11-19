@@ -1584,4 +1584,82 @@ mod tests {
             );
         }
     }
+
+    /// RULE: the archive a run produced and the terminal status that follows the stage which
+    /// uploads it are owed at ONE instant, so at every instant the archive is handed over
+    /// exactly when a status settled at that same instant is the terminal one.
+    ///
+    /// This is what lets a reader take the clock ONCE and answer one instant's state with it
+    /// (`crate::ops::describe_training_job` claims the due archive and settles the status under
+    /// a single instant): no caller can be answered a job whose status says its upload stage is
+    /// over while the archive that stage publishes is still held, which is a state nobody could
+    /// reach by waiting. A reader that took an instant per materialisation would answer exactly
+    /// that whenever the pair fell due between the two.
+    ///
+    /// The rows differ along where the instant falls relative to that pair: a whole span
+    /// before it, a moment before it, exactly on it, a moment past it and long past it.
+    #[test]
+    fn the_archive_and_the_terminal_status_are_owed_at_one_instant() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let reported_at = created + Duration::from_millis(1);
+        let reached = vec![
+            TRAINING_SECONDARY_STATUS_DOWNLOADING.to_string(),
+            TRAINING_SECONDARY_STATUS_TRAINING.to_string(),
+            TRAINING_SECONDARY_STATUS_UPLOADING.to_string(),
+        ];
+        // (case, where the instant falls relative to the instant the pair is owed, in millis)
+        let rows: [(&str, i64); 5] = [
+            ("a whole span before the pair is owed", -2_000),
+            ("a moment before the pair is owed", -1),
+            ("the instant the pair is owed", 0),
+            ("a moment past it", 1),
+            ("long past it", 60_000),
+        ];
+
+        for (case, offset_millis) in rows {
+            let mut job = stored_job(created);
+            job.record_run(
+                crate::state::TrainingRunOutcome::Completed {
+                    model_artifacts: "s3://bucket/clock-probe/output/model.tar.gz".to_string(),
+                    final_metrics: Vec::new(),
+                    phases: reached.clone(),
+                    artifact: Some(crate::state::PendingArtifact {
+                        location: crate::state::S3Location {
+                            bucket: "bucket".to_string(),
+                            key: "clock-probe/output/model.tar.gz".to_string(),
+                        },
+                        archive: vec![1, 2, 3],
+                    }),
+                    checkpoints: Vec::new(),
+                },
+                reported_at,
+            );
+            let due = job
+                .artifact_due_at()
+                .expect("a run that produced an artifact has a stage that uploads it");
+            assert_eq!(
+                due, job.ends_at,
+                "case {case:?}: expected the archive and the terminal status owed at one \
+                 instant, got {due:?} and {:?}",
+                job.ends_at
+            );
+            let at = if offset_millis < 0 {
+                due - Duration::from_millis(offset_millis.unsigned_abs())
+            } else {
+                due + Duration::from_millis(offset_millis.unsigned_abs())
+            };
+            // In the order one read makes them: the publication the clock owes, then the
+            // status it owes, both as of `at`.
+            let handed_over = job.claim_due_artifact(at).is_some();
+            job.settle_status(at);
+            assert_eq!(
+                handed_over,
+                job.is_terminal(),
+                "case {case:?}: expected the archive to be handed over exactly when the status \
+                 settled at the same instant is terminal, got handed over: {handed_over} \
+                 beside {:?}",
+                job.status
+            );
+        }
+    }
 }

@@ -80,7 +80,8 @@ struct Row {
     name: &'static str,
     /// `OutputDataConfig.S3OutputPath`, as the request writes it.
     output: String,
-    /// The channels the job declares; the first is the `train` channel the fit reads.
+    /// The channels the job declares; the first is the `train` channel the fit reads, and
+    /// none at all for a job that declares no `InputDataConfig`.
     channels: &'static [&'static str],
     /// How many records each channel's data carries.
     records: usize,
@@ -92,8 +93,9 @@ struct Row {
 }
 
 /// The publication table: the rows differ in the form of the output location the artifact
-/// lands under, how a channel's location is addressed, how many channels the job declares and
-/// how much data they carry — what the rule generalises over.
+/// lands under, how a channel's location is addressed, how many channels the job declares —
+/// down to none at all, where the work has one stage fewer because there is nothing to bring
+/// down — and how much data they carry: what the rule generalises over.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -121,6 +123,19 @@ fn rows() -> Vec<Row> {
             channels: &["train"],
             records: 8,
             features: 2,
+            prefix_addressed: false,
+        },
+        Row {
+            // Nothing to bring down, so the run has no `Downloading` stage
+            // (`DescribeTrainingJob$SecondaryStatus` calls it "an optional stage") — and the
+            // rule is the same: the stage that UPLOADS the artifact still owes the object at
+            // the instant the terminal status is owed.
+            case: "no channel at all, so the work has one stage fewer",
+            name: "publish-no-channel",
+            output: format!("s3://{BUCKET}/published/no-channel/"),
+            channels: &[],
+            records: 0,
+            features: 0,
             prefix_addressed: false,
         },
     ]
@@ -171,12 +186,16 @@ async fn given_role(emulator: &Emulator) -> String {
 /// Stage `job`'s channel data and accept it as a training job of the row's shape.
 async fn given_accepted_job(emulator: &Emulator, row: &Row, role_arn: &str, job: &str) {
     let channels = given_channels(emulator, row, job).await;
-    emulator
-        .sagemaker_ok(
-            "CreateTrainingJob",
-            &training_body(job, role_arn, channels, &row.output),
-        )
-        .await;
+    let mut body = training_body(job, role_arn, channels, &row.output);
+    // A row that declares no channel sends NO `InputDataConfig`: the member is optional and
+    // its list is modelled with a minimum length, so a job with nothing to bring down omits
+    // it rather than sending an empty one.
+    if row.channels.is_empty() {
+        body.as_object_mut()
+            .expect("the request body is an object")
+            .remove("InputDataConfig");
+    }
+    emulator.sagemaker_ok("CreateTrainingJob", &body).await;
 }
 
 /// One client watching the job: polls `DescribeTrainingJob` every `interval` until the job
