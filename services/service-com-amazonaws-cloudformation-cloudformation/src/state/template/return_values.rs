@@ -632,6 +632,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == WAFV2_REGEX_PATTERN_SET
         || resource_type == GRAFANA_WORKSPACE
         || resource_type == EMR_CLUSTER
+        // An Amazon EMR STUDIO is one more: `CreateStudio` takes no identifier — a template
+        // declares the Studio's `Name`, the network it runs in and the roles it assumes —
+        // and answers the `es-…` `StudioId` that service minted, which is what "Ref returns
+        // the Studio ID" publishes and what `DescribeStudio`, `UpdateStudio`,
+        // `DeleteStudio` and every session mapping on the Studio each take.
+        || resource_type == crate::state::provisioner::emr_resources::EMR_STUDIO
         || resource_type == GUARDDUTY_DETECTOR
         // The two CloudFront types this emulator provisions are the same case: neither
         // `CreateDistribution` nor `CreateOriginAccessControl` takes an identifier — a
@@ -1081,6 +1087,13 @@ pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static 
         GLUE_TABLE_OPTIMIZER => &["CatalogId", "DatabaseName", "TableName", "Type"],
         CODEPIPELINE_CUSTOM_ACTION_TYPE => CODEPIPELINE_ACTION_TYPE_IDENTITY,
         S3TABLES_NAMESPACE => S3TABLES_NAMESPACE_IDENTITY,
+        // An `AWS::EMR::StudioSessionMapping` is `<StudioId>|<IdentityType>|<IdentityName>`,
+        // the triple `CreateStudioSessionMapping`, `GetStudioSessionMapping` and
+        // `DeleteStudioSessionMapping` each address one mapping by — Amazon EMR mints no
+        // identifier for one, and the type declares no name of its own.
+        crate::state::provisioner::emr_resources::EMR_STUDIO_SESSION_MAPPING => {
+            crate::state::provisioner::emr_resources::EMR_STUDIO_SESSION_MAPPING_IDENTITY
+        }
         AMPLIFYUIBUILDER_COMPONENT | AMPLIFYUIBUILDER_FORM | AMPLIFYUIBUILDER_THEME => {
             AMPLIFYUIBUILDER_ATTRIBUTES
         }
@@ -1229,9 +1242,12 @@ pub(super) fn resolved_members(
 ///
 /// A composite identity is a function of the resource's RESOLVED properties — the other
 /// resources the binding names resolve to their own identifiers first — so this is applied
-/// where those are filled in ([`resolve_properties`]) rather than where the naming rules run.
+/// where those are filled in ([`resolve_properties`]) rather than where the naming rules run,
+/// and AGAIN once a part naming a resource whose identity its owning service mints has been
+/// re-pointed at the identifier that service really assigned
+/// ([`crate::state::provisioning::repointing`]).
 /// A type with no composite identifier is left exactly as it is.
-pub(super) fn adopt_composite_identity(resource: &mut StoredResource) {
+pub(in crate::state) fn adopt_composite_identity(resource: &mut StoredResource) {
     let Some(identity) = composite_identity(&resource.resource_type, &resource.properties) else {
         return;
     };

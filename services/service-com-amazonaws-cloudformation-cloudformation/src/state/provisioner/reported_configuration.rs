@@ -93,6 +93,17 @@ impl Provisioner {
             }
             Self::S3VectorsIndex => describe_index(ctx, region, physical_resource_id).await,
             Self::EmrCluster => describe_job_flow(ctx, region, physical_resource_id).await,
+            // Amazon EMR's own reads of the three resources a stack declares beside a
+            // cluster: the configuration by the name it was stored under, the Studio by the
+            // id that service minted, and the mapping by the triple it keys one by, which
+            // only the resource's own declaration carries.
+            Self::EmrSecurityConfiguration => {
+                describe_emr_security_configuration(ctx, region, physical_resource_id).await
+            }
+            Self::EmrStudio => describe_emr_studio(ctx, region, physical_resource_id).await,
+            Self::EmrStudioSessionMapping => {
+                describe_emr_studio_session_mapping(ctx, region, resource).await
+            }
             Self::IamRole => describe_role(ctx, region, physical_resource_id).await,
             Self::IamInstanceProfile => {
                 describe_instance_profile(ctx, region, physical_resource_id).await

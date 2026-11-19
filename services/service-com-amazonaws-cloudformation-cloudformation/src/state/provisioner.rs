@@ -717,6 +717,22 @@ pub(super) enum Provisioner {
     S3VectorsVectorBucket,
     S3VectorsIndex,
     EmrCluster,
+    /// `AWS::EMR::SecurityConfiguration`: the security configuration Amazon EMR's own
+    /// `CreateSecurityConfiguration` stores under the name the template states — "Ref returns
+    /// the Name of the security configuration", which is the handle every call on one takes
+    /// and what a cluster names it by — and `DeleteSecurityConfiguration` removes
+    /// ([`emr_resources`]).
+    EmrSecurityConfiguration,
+    /// `AWS::EMR::Studio`: the Studio `CreateStudio` creates in Amazon EMR, whose `es-…`
+    /// identifier that service mints — "Ref returns the Studio ID" — and `DeleteStudio`
+    /// removes by it.
+    EmrStudio,
+    /// `AWS::EMR::StudioSessionMapping`: the mapping of ONE identity onto such a Studio,
+    /// which `CreateStudioSessionMapping` creates and `DeleteStudioSessionMapping` removes.
+    /// Amazon EMR mints no identifier for one, addressing it by the Studio, the identity type
+    /// and the identity name together, which is this type's composite physical id and what
+    /// the arms read the three parts off.
+    EmrStudioSessionMapping,
     IamRole,
     /// `AWS::IAM::InstanceProfile`: the container that lets an Amazon EC2 instance assume
     /// the role it holds. `CreateInstanceProfile` creates it and
@@ -1278,6 +1294,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         S3VECTORS_VECTOR_BUCKET => Some(Provisioner::S3VectorsVectorBucket),
         S3VECTORS_INDEX => Some(Provisioner::S3VectorsIndex),
         EMR_CLUSTER => Some(Provisioner::EmrCluster),
+        emr_resources::EMR_SECURITY_CONFIGURATION => Some(Provisioner::EmrSecurityConfiguration),
+        emr_resources::EMR_STUDIO => Some(Provisioner::EmrStudio),
+        emr_resources::EMR_STUDIO_SESSION_MAPPING => Some(Provisioner::EmrStudioSessionMapping),
         IAM_ROLE => Some(Provisioner::IamRole),
         IAM_INSTANCE_PROFILE => Some(Provisioner::IamInstanceProfile),
         IAM_USER => Some(Provisioner::IamUser),
@@ -1509,6 +1528,21 @@ impl Provisioner {
                 put_composite_alarm(ctx, region, resource, propagated).await
             }
             Self::EmrCluster => run_job_flow(ctx, region, resource, propagated).await,
+            // `AWS::EMR::SecurityConfiguration` publishes no `Tags` property and
+            // `CreateSecurityConfiguration` takes none, so no tags are propagated to one.
+            Self::EmrSecurityConfiguration => {
+                create_emr_security_configuration(ctx, region, resource).await
+            }
+            // `AWS::EMR::Studio` publishes `Tags`, and `CreateStudio` takes a `TagList` of
+            // its own, so a Studio a stack creates carries the tags CloudFormation gives it
+            // beside the ones the declaration asks for.
+            Self::EmrStudio => create_emr_studio(ctx, region, resource, propagated).await,
+            // `AWS::EMR::StudioSessionMapping` publishes no `Tags` property and
+            // `CreateStudioSessionMapping` takes none: a mapping is no taggable resource, so
+            // no tags are propagated to one.
+            Self::EmrStudioSessionMapping => {
+                create_emr_studio_session_mapping(ctx, region, resource).await
+            }
             Self::EcrPublicRepository => {
                 create_public_repository(ctx, region, resource, propagated).await
             }
@@ -3734,6 +3768,16 @@ impl Provisioner {
             }
             Self::S3VectorsIndex => delete_index(ctx, region, physical_resource_id).await,
             Self::EmrCluster => terminate_job_flow(ctx, region, physical_resource_id).await,
+            // The configuration and the Studio are each removed by the identity they were
+            // created under, which is this resource's physical id; a session mapping is
+            // addressed by the triple only its own declaration carries.
+            Self::EmrSecurityConfiguration => {
+                delete_emr_security_configuration(ctx, region, physical_resource_id).await
+            }
+            Self::EmrStudio => delete_emr_studio(ctx, region, physical_resource_id).await,
+            Self::EmrStudioSessionMapping => {
+                delete_emr_studio_session_mapping(ctx, region, resource).await
+            }
             // The role's policies have to go first, and only the resource's own record
             // says which ones there are.
             Self::IamRole => delete_role(ctx, region, resource).await,
@@ -4480,6 +4524,12 @@ mod codepipeline_webhooks;
 /// a stack's expected configuration against. One `impl Provisioner` of its own, so this
 /// file holds the dispatch enum and the write arms.
 mod reported_configuration;
+/// The Amazon EMR arms of the types a stack declares BESIDE a cluster — the security
+/// configuration, the Studio and a Studio's session mapping — whose own arms are
+/// [`data_and_storage`]'s. Visible to the rest of this service's state because those three
+/// types' own NAMES live here, beside the arms that provision them, and the naming rules and
+/// the return-value catalogue key their entries for them by those names.
+pub(in crate::state) mod emr_resources;
 use codepipeline_webhooks::*;
 use memorydb_groups::*;
 use elasticache_caches::*;
@@ -4530,6 +4580,7 @@ use glue_table_optimizers::*;
 use mediaconvert_certificates::*;
 use iam_identities::*;
 use data_and_storage::*;
+use emr_resources::*;
 
 /// Amazon CloudWatch's wire identity, for the ROLLBACK TRIGGER monitoring beside this
 /// catalogue ([`super::rollback_triggers`]): that module reads a trigger alarm's state out of

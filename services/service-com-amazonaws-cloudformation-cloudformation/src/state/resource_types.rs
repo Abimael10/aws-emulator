@@ -561,6 +561,8 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::EMR::InstanceGroupConfig",
     "AWS::EMR::SecurityConfiguration",
     "AWS::EMR::Step",
+    "AWS::EMR::Studio",
+    "AWS::EMR::StudioSessionMapping",
     // Amazon EMR Serverless
     "AWS::EMRServerless::Application",
     // Amazon ElastiCache

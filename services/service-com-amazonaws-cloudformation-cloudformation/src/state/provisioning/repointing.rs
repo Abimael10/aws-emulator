@@ -119,6 +119,13 @@ pub(super) fn repoint_references(properties: &mut Value, minted: &[Minted]) {
 ///
 /// A name no minted identifier is part of is left exactly as it is, which is every resource
 /// whose declaration names it outright.
+///
+/// A type whose primary identifier is COMPOSITE is brought along the same way, from the
+/// declaration this has just re-pointed: every part of such an identifier is a value the
+/// declaration states ([`crate::state::template::composite_identity`]), so a part naming a
+/// resource whose identity its owning service mints was composed out of that resource's
+/// stand-in. Recomposing it is what makes the binding's `Ref` — and the record the stack's own
+/// delete addresses the binding by — carry the identifiers its parts really have.
 pub(super) fn repoint_identity(resource: &mut StoredResource, minted: &[Minted]) {
     if minted.is_empty() {
         return;
@@ -133,6 +140,10 @@ pub(super) fn repoint_identity(resource: &mut StoredResource, minted: &[Minted])
         // attributes and the id a `Ref` resolves to cannot drift apart.
         crate::state::template::adopt_identity(resource, repointed);
     }
+    // The same step for a composite identifier, recomposed out of the re-pointed document by
+    // the one function that computes one ([`crate::state::template::resolve_properties`] runs
+    // it before any create has answered).
+    crate::state::template::adopt_composite_identity(resource);
 }
 
 /// One TEXT value re-pointed the way a property document's values are
@@ -299,4 +310,141 @@ pub(super) fn retokenised(text: &str, stand_in: &str, assigned: &str) -> Option<
     }
     repointed.push_str(&text[cursor..]);
     Some(repointed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One resource as a deployment holds it just before its create: the identity the naming
+    /// rules computed, and the declaration as it was resolved.
+    fn deployed(resource_type: &str, physical_resource_id: &str, properties: Value) -> StoredResource {
+        StoredResource {
+            logical_id: "ARes".to_string(),
+            resource_type: resource_type.to_string(),
+            physical_resource_id: physical_resource_id.to_string(),
+            attributes: BTreeMap::new(),
+            metadata: None,
+            properties,
+            materialised: false,
+            deletion_policy: None,
+            update_replace_policy: None,
+        }
+    }
+
+    /// One minted pair, as the walk collects it for a resource whose identity its owning
+    /// service assigned: the stand-in that resource's `Ref` had resolved to, and what that
+    /// service answered. `composed` is false here, which is a stand-in that IS the name the
+    /// declaration asked for — the case a whole-token match does not cover.
+    fn minted(of: &str, stand_in: &str, assigned: &str) -> Minted {
+        Minted {
+            of: of.to_string(),
+            stand_in: stand_in.to_string(),
+            assigned: assigned.to_string(),
+            composed: false,
+        }
+    }
+
+    /// A type whose primary identifier is COMPOSITE is identified by the parts its declaration
+    /// states, so the identity has to be the one those parts really carry: a part naming a
+    /// resource whose identity its owning service minted is re-pointed, and the identity is
+    /// recomposed around it — while a binding every part of which was already final keeps
+    /// exactly the identity it had.
+    ///
+    /// The rows span the two directions of that rule and the types whose identity is a pair, a
+    /// triple and a quadruple, so the recomposition is asserted over the forms
+    /// [`crate::state::template::composite_identity_properties`] publishes rather than over one
+    /// of them.
+    #[test]
+    fn a_composite_identity_is_recomposed_out_of_the_identifiers_its_parts_really_carry() {
+        struct Row {
+            case: &'static str,
+            resource_type: &'static str,
+            properties: Value,
+            /// The identity the naming rules had computed before any create answered.
+            computed: &'static str,
+            /// The pair the walk minted for the resource this binding names, if any.
+            minted: Vec<Minted>,
+            expected: &'static str,
+        }
+        let rows = vec![
+            // A session mapping one part of which names a Studio whose `es-…` id Amazon EMR
+            // minted: the id the stack publishes has to carry that id, not the Studio's name.
+            Row {
+                case: "a triple whose first part is a minted identifier",
+                resource_type:
+                    crate::state::provisioner::emr_resources::EMR_STUDIO_SESSION_MAPPING,
+                properties: serde_json::json!({
+                    "StudioId": "es-0000000000001",
+                    "IdentityType": "USER",
+                    "IdentityName": "analyst",
+                }),
+                computed: "a-studio|USER|analyst",
+                minted: vec![minted("Studio", "a-studio", "es-0000000000001")],
+                expected: "es-0000000000001|USER|analyst",
+            },
+            // The same type with nothing minted for it at all: the parts the declaration
+            // states are the identity.
+            Row {
+                case: "a triple with no minted part",
+                resource_type:
+                    crate::state::provisioner::emr_resources::EMR_STUDIO_SESSION_MAPPING,
+                properties: serde_json::json!({
+                    "StudioId": "es-0000000000002",
+                    "IdentityType": "GROUP",
+                    "IdentityName": "analysts",
+                }),
+                computed: "es-0000000000002|GROUP|analysts",
+                minted: vec![minted("Other", "a-name", "another-name")],
+                expected: "es-0000000000002|GROUP|analysts",
+            },
+            // A PAIR whose two parts are values the declaration itself states: the identity
+            // stands exactly as it was computed.
+            Row {
+                case: "a pair every part of which was already final",
+                resource_type: "AWS::EKS::AccessEntry",
+                properties: serde_json::json!({
+                    "ClusterName": "a-cluster",
+                    "PrincipalArn": "arn:aws:iam::000000000000:role/a-role",
+                }),
+                computed: "a-cluster|arn:aws:iam::000000000000:role/a-role",
+                minted: vec![minted("Other", "a-name", "another-name")],
+                expected: "a-cluster|arn:aws:iam::000000000000:role/a-role",
+            },
+            // A QUADRUPLE, the longest form the catalogue publishes, likewise final.
+            Row {
+                case: "a quadruple every part of which was already final",
+                resource_type: "AWS::Glue::TableOptimizer",
+                properties: serde_json::json!({
+                    "CatalogId": "000000000000",
+                    "DatabaseName": "a-database",
+                    "TableName": "a-table",
+                    "Type": "compaction",
+                }),
+                computed: "000000000000|a-database|a-table|compaction",
+                minted: vec![minted("Other", "a-name", "another-name")],
+                expected: "000000000000|a-database|a-table|compaction",
+            },
+            // And a type with NO composite identifier keeps the name it was given, which is
+            // the re-pointing this function did before composite identities took part in it.
+            Row {
+                case: "a type whose identity is its own name, re-pointed",
+                resource_type: "AWS::Logs::LogGroup",
+                properties: serde_json::json!({ "LogGroupName": "/aws/vendedlogs/es-0000000000001" }),
+                computed: "a-studio",
+                minted: vec![minted("Studio", "a-studio", "es-0000000000001")],
+                expected: "es-0000000000001",
+            },
+        ];
+        for row in rows {
+            let case = row.case;
+            let mut resource = deployed(row.resource_type, row.computed, row.properties.clone());
+            repoint_identity(&mut resource, &row.minted);
+            assert_eq!(
+                resource.physical_resource_id, row.expected,
+                "case {case:?}: expected the identity {:?}, got {:?}",
+                row.expected, resource.physical_resource_id
+            );
+        }
+    }
 }

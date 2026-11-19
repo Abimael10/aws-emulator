@@ -123,6 +123,19 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
         "ElasticLoadBalancingV2",
         SdkDiagnostic::Envelope,
     ),
+    // Amazon EMR's SDK names it `Emr` — that model's own `sdkId` (`EMR`,
+    // `smithy_query(query="service_info")` on that service's model) with only the initial
+    // capitalised, exactly as Amazon RDS's and Amazon EC2's below and above are — and words the
+    // ATTEMPT-counting shape, as the recorded `ResourceStatusReason` of an
+    // `AWS::EMR::SecurityConfiguration` whose declared document that service will not store
+    // carries it (in the behavioral corpus `simparity-behavioral-aws-v1`, check
+    // `cloudformation__emr.deploy-emr-security-configuration-malformed-json-rejected`, whose
+    // reason reads `Resource handler returned message: "<the service's sentence> (Service: Emr,
+    // Status Code: 400, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …,
+    // HandlerErrorCode: InvalidRequest)`). Every type this emulator provisions over this
+    // signing name is that service's (the cluster, the security configuration, the Studio and a
+    // Studio's session mapping).
+    ("elasticmapreduce", "Emr", SdkDiagnostic::Attempts),
     ("es", "OpenSearch", SdkDiagnostic::Attempts),
     ("iam", "Iam", SdkDiagnostic::Attempts),
     ("lambda", "Lambda", SdkDiagnostic::Attempts),
