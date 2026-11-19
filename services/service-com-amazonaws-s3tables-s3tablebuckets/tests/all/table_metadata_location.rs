@@ -11,13 +11,17 @@
 //! and `warehouseLocation` required, `metadataLocation` optional, `@readonly`).
 //!
 //! RULE 2 — `UpdateTableMetadataLocation` POINTS the table at the metadata file the
-//! request names, under the precondition the caller's `versionToken` states, and advances
-//! that token: the token guards the table's open-table metadata and this call is what
-//! moves it, so every later read reports the new location and the new token, and the token
-//! the caller presented is spent
+//! request names, under the precondition the caller's `versionToken` states, and leaves
+//! that token where it is: the file the location names was written by the CALLER, so this
+//! service writes no metadata document for the table and mints no token for one, and the
+//! token the caller presented is still the table's afterwards — every later read reports
+//! the new location under the same token, and presenting it again is honoured rather than
+//! refused
 //! (`smithy_query(query="operation", operation="UpdateTableMetadataLocation")`: PUT on the
 //! same path, 200, required `versionToken` + `metadataLocation` in, and `name`/`tableARN`/
 //! `namespace`/`versionToken`/`metadataLocation` out).
+//! The token's whole lifecycle across this service's writes is asserted in
+//! `table_version_token_lifecycle`.
 //!
 //! RULE 3 — a write the store rules out changes nothing and is refused as its class: a
 //! `metadataLocation` that is not an S3 URI under the table's warehouse location naming a
@@ -221,8 +225,8 @@ const ACCEPTED: &[Accepted] = &[
     },
 ];
 
-/// RULE 2: the write points the table at the file it names, advances the token, and every
-/// read afterwards agrees.
+/// RULE 2: the write points the table at the file it names, leaves the table's token
+/// where it was, and every read afterwards agrees.
 #[tokio::test]
 async fn an_update_points_the_table_at_the_metadata_file_it_names() {
     for (index, case) in ACCEPTED.iter().enumerate() {
@@ -271,13 +275,14 @@ async fn an_update_points_the_table_at_the_metadata_file_it_names() {
             fixture.describe().await.text("tableARN"),
             "case {label:?}: the write reports a different tableARN from the describe"
         );
-        let advanced = updated.text("versionToken");
-        assert!(
-            advanced != token,
-            "case {label:?}: the write left the version token at {token:?}, so a caller \
-             cannot tell the metadata moved"
+        let settled = updated.text("versionToken");
+        assert_eq!(
+            settled, token,
+            "case {label:?}: the write answered with {settled:?} instead of the token \
+             {token:?} the caller presented, so the view the caller holds is spent by a \
+             write of its own"
         );
-        assert_table_version_token(&advanced, "the versionToken an update settles", label);
+        assert_table_version_token(&settled, "the versionToken an update settles", label);
         assert!(
             held.as_deref() != Some(location.as_str()),
             "case {label:?}: the case does not move the location at all (it was already \
@@ -293,7 +298,7 @@ async fn an_update_points_the_table_at_the_metadata_file_it_names() {
         );
         assert_eq!(
             read.text("versionToken"),
-            advanced,
+            settled,
             "case {label:?}: GetTableMetadataLocation reports a different token: {read:?}"
         );
         assert_eq!(
@@ -309,28 +314,28 @@ async fn an_update_points_the_table_at_the_metadata_file_it_names() {
         );
         assert_eq!(
             described.text("versionToken"),
-            advanced,
+            settled,
             "case {label:?}: GetTable reports a different token: {described:?}"
         );
 
-        // The presented token is spent: the same write again is the stale-token conflict,
+        // The presented token is NOT spent: the same write again is honoured under it,
         // and the location stays where this write put it.
         let replayed = fixture
             .update(&json!({ "metadataLocation": location, "versionToken": token }))
             .await;
         assert_eq!(
-            replayed.status, 409,
-            "case {label:?}: re-presenting the spent token: expected 409, got {replayed:?}"
+            replayed.status, 200,
+            "case {label:?}: re-presenting the token: expected 200, got {replayed:?}"
         );
         assert_eq!(
-            replayed.message(),
-            TABLE_VERSION_TOKEN_MISMATCH_MESSAGE,
-            "case {label:?}: unexpected message on the stale-token refusal: {replayed:?}"
+            replayed.text("versionToken"),
+            token,
+            "case {label:?}: the second write answered with another token: {replayed:?}"
         );
         assert_eq!(
             fixture.read().await.optional_text("metadataLocation"),
             Some(location),
-            "case {label:?}: the refused write moved the metadata location"
+            "case {label:?}: the second write moved the metadata location"
         );
     }
 }

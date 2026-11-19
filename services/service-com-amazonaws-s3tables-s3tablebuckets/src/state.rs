@@ -1092,15 +1092,17 @@ pub struct TableLocation {
     pub name: String,
 }
 
-/// How many bytes of entropy a table's `versionToken` carries: eight, read as one
-/// unsigned 64-bit stamp and rendered in decimal.
+/// How many bytes of entropy a table's `versionToken` carries: ten, written two
+/// lowercase hexadecimal characters per byte, so every token is twenty
+/// characters wide.
 ///
 /// The model constrains a `VersionToken` only by length (`@length(1, 2048)`), so
-/// the FORM is recorded behaviour: the token a table hands back is a decimal
-/// integer of 64-bit width rather than an identifier's hexadecimal or
-/// hyphenated-UUID spelling. Stated once here, so every operation that mints a
-/// table's token mints one class of value.
-const TOKEN_STAMP_BYTES: usize = 8;
+/// the FORM is recorded behaviour: the token this service hands back is a single
+/// unbroken run of lowercase hexadecimal characters of exactly that width —
+/// neither an identifier's hyphenated-UUID spelling nor a decimal number, whose
+/// spelling would be as wide as the value it happened to draw. Stated once here,
+/// so every operation that mints a table's token mints one class of value.
+const TOKEN_STAMP_BYTES: usize = 10;
 
 /// Per-service state for com-amazonaws-s3tables-s3tablebuckets. A handler reaches it through [`service_state`].
 ///
@@ -1166,19 +1168,22 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
 
     /// A fresh opaque TOKEN, laid out in the form this service's version tokens
     /// take: the first [`TOKEN_STAMP_BYTES`] bytes [`Self::mint_entropy`] hands
-    /// over, read as one unsigned 64-bit stamp and rendered as a DECIMAL integer,
-    /// so the token carries no structure a CLIENT could read anything out of (it
-    /// is derived the deterministic way [`Self::mint_entropy`] describes, so it
-    /// is not an unguessable value and nothing is authorized by holding one).
+    /// over, written as lowercase hexadecimal characters, so the token carries no
+    /// structure a CLIENT could read anything out of (it is derived the
+    /// deterministic way [`Self::mint_entropy`] describes, so it is not an
+    /// unguessable value and nothing is authorized by holding one).
+    ///
+    /// Every token is the SAME width, because the width is part of the form a
+    /// client sees: the bytes are rendered two characters each, including a
+    /// leading zero, rather than as a number whose spelling shrinks with its
+    /// value.
     ///
     /// A token is NOT an identifier: nothing addresses a resource by one, a
     /// caller only hands back the value it was given, and the service mints it in
     /// a form of its own — which is why this is not [`Self::mint_id`].
     fn mint_opaque_token(&mut self, domain: &str) -> String {
         let entropy = self.mint_entropy(domain);
-        let mut stamp = [0u8; TOKEN_STAMP_BYTES];
-        stamp.copy_from_slice(&entropy[..TOKEN_STAMP_BYTES]);
-        u64::from_be_bytes(stamp).to_string()
+        ::hex::encode(&entropy[..TOKEN_STAMP_BYTES])
     }
 
     /// A fresh `tableBucketId`, retried against the store so an id is never
@@ -1220,7 +1225,9 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
         }
     }
 
-    /// A fresh `versionToken` for a table that is being created or changed.
+    /// A fresh `versionToken` for a table whose metadata document this service
+    /// is writing: the table's create, and a catalog commit of a new metadata
+    /// file for it.
     ///
     /// A table's version token is the precondition handle `CreateTable` hands
     /// back and `GetTable` echoes, which `DeleteTable`, `RenameTable` and
@@ -1228,6 +1235,11 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
     /// token, not an identifier of the table, so it is minted in this service's
     /// token form ([`Self::mint_opaque_token`]) rather than in the id form
     /// [`Self::mint_id`] lays out.
+    ///
+    /// It is NOT minted by a write that only records a pointer or a coordinate
+    /// the caller supplies (a rename, a metadata-location update): such a write
+    /// takes the caller's token as its precondition and leaves it in place, so
+    /// the view a caller holds stays current.
     pub fn mint_version_token(&mut self) -> String {
         self.mint_opaque_token("table-version")
     }

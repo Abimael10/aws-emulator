@@ -21,8 +21,8 @@
 //! RULE 3 — a table's `versionToken` is NOT one of those identifiers. Nothing addresses a
 //! table by it: it is the opaque optimistic-concurrency handle a write hands back, a caller
 //! stores and hands straight back as a precondition, and the service mints it in its own
-//! TOKEN form — a decimal integer of 64-bit width (at most
-//! [`VERSION_TOKEN_MAX_CHARACTERS`] characters), which the model
+//! TOKEN form — one unbroken run of exactly [`VERSION_TOKEN_CHARACTERS`] lowercase
+//! hexadecimal characters, which the model
 //! (`smithy_query(query="shape", shape="VersionToken")`: a string with `@length(1, 2048)`
 //! and no pattern) leaves to recorded behaviour. Every operation that mints one emits that
 //! form, every read echoes the minted value unchanged, and a precondition compares the
@@ -136,25 +136,26 @@ pub(crate) fn assert_canonical_uuid(value: &str, what: &str, case: &str) {
     );
 }
 
-/// What a table's `versionToken` is made of: the service's token form is a DECIMAL integer
-/// of 64-bit width, so the widest token is this many characters. Spelled out here rather
-/// than read from the crate under test, so this suite pins the form itself.
-pub(crate) const VERSION_TOKEN_MAX_CHARACTERS: usize = 20;
+/// What a table's `versionToken` is made of: the service's token form is a single run of
+/// lowercase hexadecimal characters of exactly this width. Spelled out here rather than
+/// read from the crate under test, so this suite pins the form itself.
+pub(crate) const VERSION_TOKEN_CHARACTERS: usize = 20;
 
-/// Assert `value` is a token in the form this service mints a table's `versionToken` in: a
-/// decimal integer that fits in 64 bits, written as digits only — no sign, no leading zero
-/// and no separator — and so neither a hyphenated UUID nor a hex digest nor any other value
-/// carrying structure a client could read something out of.
+/// Assert `value` is a token in the form this service mints a table's `versionToken` in:
+/// exactly [`VERSION_TOKEN_CHARACTERS`] lowercase hexadecimal characters, unbroken — no
+/// hyphen or other separator, no uppercase character, and the same width whatever the
+/// token's value — and so neither a hyphenated UUID nor a decimal number nor any other
+/// value carrying structure a client could read something out of.
 pub(crate) fn assert_table_version_token(value: &str, what: &str, case: &str) {
     let characters = value.chars().count();
-    let digits_only = !value.is_empty() && value.chars().all(|digit| digit.is_ascii_digit());
+    let lowercase_hex = !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase());
     assert!(
-        digits_only
-            && value.parse::<u64>().is_ok()
-            && characters <= VERSION_TOKEN_MAX_CHARACTERS
-            && (characters == 1 || !value.starts_with('0')),
-        "case {case:?}: expected {what} to be a decimal 64-bit stamp of at most \
-         {VERSION_TOKEN_MAX_CHARACTERS} characters, got {value:?} ({characters} characters)"
+        lowercase_hex && characters == VERSION_TOKEN_CHARACTERS,
+        "case {case:?}: expected {what} to be {VERSION_TOKEN_CHARACTERS} lowercase \
+         hexadecimal characters, got {value:?} ({characters} characters)"
     );
 }
 
@@ -448,8 +449,8 @@ async fn every_minted_identifier_is_a_canonical_uuid() {
 /// RULE 3: a table's `versionToken` is an opaque token in the service's token form, never
 /// an identifier — the create mints one, both reads echo exactly that value, no two tables
 /// share one, it is nothing a value in the table's own identity is spelled as, and the
-/// write that advances it both accepts it as a precondition and settles another token of
-/// the same form, after which the spent one is refused.
+/// write that moves the table's metadata pointer both accepts it as a precondition and
+/// answers with it, after which it is still the token the delete's precondition takes.
 #[tokio::test]
 async fn a_table_version_token_is_an_opaque_token_that_guards_the_table() {
     let mut minted: BTreeSet<String> = BTreeSet::new();
@@ -536,8 +537,8 @@ async fn a_table_version_token_is_an_opaque_token_that_guards_the_table() {
         }
 
         // The precondition: the write that moves the table's metadata file accepts the
-        // token the reads reported, settles another token of the same form, and refuses the
-        // spent one.
+        // token the reads reported and answers with that same token, which a second write
+        // under it is still honoured by.
         let table = fixture.tables[0];
         let before = emulator
             .get_table(fixture.region, &bucket_arn, fixture.namespace, table)
@@ -561,16 +562,12 @@ async fn a_table_version_token_is_an_opaque_token_that_guards_the_table() {
             updated.status, 200,
             "case {case:?}: the write under the token the read reported: {updated:?}"
         );
-        let advanced = updated.text("versionToken");
-        assert_table_version_token(&advanced, "the versionToken a write advances to", case);
-        assert_ne!(
-            advanced, held,
-            "case {case:?}: the write left the table's token at {held:?}, so a caller cannot \
-             tell the metadata moved"
-        );
-        assert!(
-            minted.insert(advanced.clone()),
-            "case {case:?}: the advanced token {advanced:?} was already minted elsewhere"
+        let settled = updated.text("versionToken");
+        assert_table_version_token(&settled, "the versionToken a write answers with", case);
+        assert_eq!(
+            settled, held,
+            "case {case:?}: the write answered with {settled:?} instead of the token \
+             {held:?} the read reported, so a caller's view is spent by a write of its own"
         );
         let replayed = emulator
             .update_table_metadata_location(
@@ -582,19 +579,18 @@ async fn a_table_version_token_is_an_opaque_token_that_guards_the_table() {
             )
             .await;
         assert_eq!(
-            replayed.status, 409,
-            "case {case:?}: the spent token {held:?} must be refused as a conflict: \
-             {replayed:?}"
+            replayed.status, 200,
+            "case {case:?}: the token {held:?} must still be the table's: {replayed:?}"
         );
 
-        // And the advanced token is the one the delete's precondition takes.
+        // And it is still the one the delete's precondition takes.
         let deleted = emulator
             .delete_table(
                 fixture.region,
                 &bucket_arn,
                 fixture.namespace,
                 table,
-                &[("versionToken", advanced.clone())],
+                &[("versionToken", held.clone())],
             )
             .await;
         assert_eq!(
