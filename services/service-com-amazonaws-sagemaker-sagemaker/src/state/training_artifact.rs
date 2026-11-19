@@ -24,9 +24,12 @@
 //!   same materialisation [`super::TrainingJob::settle_status`] makes of the stages themselves.
 //!
 //! Both claim the one held object ([`super::TrainingJob::claim_due_artifact`],
-//! [`super::TrainingJob::claim_due_checkpoints`]), so whichever gets there first writes it
-//! exactly once, and a run whose job was asked to stop before the stage fell due publishes
-//! nothing at all: the stop abandons the run, so what it produced is never revealed.
+//! [`super::TrainingJob::claim_due_checkpoints`]) under the store's publication gate
+//! ([`super::ComAmazonawsSagemakerSagemakerState::artifact_publications`]), so whichever gets
+//! there first writes it exactly once and a reader arriving while a publication is in flight
+//! waits for it rather than reporting the stage with the object still missing; and a run whose
+//! job was asked to stop before the stage fell due publishes nothing at all: the stop abandons
+//! the run, so what it produced is never revealed.
 
 use super::*;
 
@@ -88,6 +91,15 @@ pub fn publish_when_due<Eng: Send + Sync + 'static>(
 ///
 /// The store's guard is given up before Amazon S3 is called, so this service's state is never
 /// held across a call into another service's.
+///
+/// A publication is the CLAIM of the held object together with the write that puts it in
+/// Amazon S3: the object is what the stage that uploads it leaves behind, so a caller must
+/// never observe the gap between the two — a read arriving inside it would find nothing left
+/// to publish and report the stage with the object still missing. So the whole publication is
+/// made under the store's publication gate
+/// ([`crate::state::ComAmazonawsSagemakerSagemakerState::artifact_publications`]), and a
+/// caller that arrives while another publication is in flight waits for it to finish before
+/// it claims anything of its own.
 pub async fn publish_due_artifact<Eng: Send + Sync + 'static>(
     engine: &Eng,
     callback: &smithy_server_runtime::EmbeddedEmulator,
@@ -98,6 +110,11 @@ pub async fn publish_due_artifact<Eng: Send + Sync + 'static>(
     let Some(state) = service_state(engine) else {
         return;
     };
+    // Taken before anything is claimed and held until every write is over. The store's own
+    // guard is given up on this line, so the gate is the only thing held across the calls
+    // into Amazon S3.
+    let gate = ::std::sync::Arc::clone(&state.lock().artifact_publications);
+    let _publishing = gate.lock().await;
     let (claimed, checkpoints) = {
         let mut store = state.lock();
         match store.training_jobs.get_mut(job_name) {

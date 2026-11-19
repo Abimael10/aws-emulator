@@ -312,6 +312,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
+        // ONE reading of the clock for this whole read: the publication the stage that
+        // uploads the artifact owes and the move out of `InProgress` the clock owes fall due
+        // at the same instant, so deciding them against two readings would let a read that
+        // straddles that instant settle the terminal status while leaving the object
+        // unpublished — a job reported `Completed` with nothing yet in Amazon S3 under the
+        // location it reports.
+        let now = ::std::time::SystemTime::now();
+
         // Before the job is read: the appearance of the artifact its run produced, when the
         // stage of the work that uploads it is already due. The object was owed at this
         // instant whether or not anybody described the job, so writing it changes nothing a
@@ -322,7 +330,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &*self.engine,
             ctx.callback(),
             &crate::state::request_region(ctx),
-            ::std::time::SystemTime::now(),
+            now,
             &input.training_job_name,
         )
         .await;
@@ -340,8 +348,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The one write this reporting operation makes: the move out of `InProgress` the
         // clock already owed. It was due at the stored instant whether or not anybody
         // described the job, so a waiter terminates and no read changes what a later
-        // caller sees.
-        let settled = job.settle_status(::std::time::SystemTime::now());
+        // caller sees. Settled at the same instant the publication above was decided
+        // against, so the stage that uploads the artifact and the object it leaves behind
+        // are reported together.
+        let settled = job.settle_status(now);
 
         let request = job.request.clone();
         let output = DescribeTrainingJobOutput {

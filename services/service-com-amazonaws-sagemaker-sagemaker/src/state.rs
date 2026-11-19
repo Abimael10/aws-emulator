@@ -2729,6 +2729,13 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub models: BTreeMap<String, Model>,
     /// Keyed by `TrainingJobName`.
     pub training_jobs: BTreeMap<String, TrainingJob>,
+    /// Serialises the PUBLICATION of what this store's training runs produced
+    /// ([`publish_due_artifact`]): the object a run built is CLAIMED off the job record and
+    /// then written to Amazon S3, and the two together are what the stage that uploads it
+    /// leaves behind. Whoever makes a publication holds this gate across both, so a reader
+    /// that arrives while one is in flight waits for it instead of reporting the stage with
+    /// the object still missing. It is a lock, not data: nothing is stored under it.
+    pub artifact_publications: ::std::sync::Arc<::tokio::sync::Mutex<()>>,
     /// Keyed by `TrainingSessionName`, which every operation of the training-session
     /// family addresses a session by. See [`TrainingSession`], whose slice lives in
     /// [`training_session`].
