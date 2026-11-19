@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePublicDnsNamespace
+//! Implemented: mints a `DNS_PUBLIC` namespace record, creates the Route 53 PUBLIC hosted
+//! zone of the same name the namespace is backed by, and files the `CREATE_NAMESPACE`
+//! operation whose id is this call's only output. A namespace is its hosted zone, so a
+//! creation Route 53 itself refuses leaves no zone to be: the operation lands `FAIL` with
+//! `CANNOT_CREATE_HOSTED_ZONE` carrying Route 53's own reason, and the staged namespace is
+//! rolled back with it.
 //!
 //! ## Shape of an operation
 //!
@@ -255,11 +261,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let id = state.next_id("ns", crate::state::RESOURCE_ID_DIGITS);
             let arn = crate::state::service_arn(&region, &format!("namespace/{id}"));
             // The operation is filed first because the namespace record carries its id:
-            // that is what a later create of the same name is refused with.
-            let operation_id = state.record_operation(
+            // that is what a later create of the same name is refused with. It carries the
+            // ROLL-BACK of the namespace below with it, so a create whose hosted zone
+            // Route 53 will not hold leaves nothing behind once it lands `FAIL`.
+            let operation_id = state.record_operation_with_effect(
                 "CREATE_NAMESPACE",
                 now,
                 [("NAMESPACE".to_string(), id.clone())],
+                Some(crate::state::OperationEffect::RemoveUncreatedNamespace(
+                    id.clone(),
+                )),
             );
             let namespace = crate::state::NamespaceRecord {
                 arn: arn.clone(),
@@ -312,8 +323,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name — instances in it "can be discovered using public DNS queries" — so no VPC
         // is associated with it. The zone's id is what `GetNamespace` reports as
         // `Properties.DnsProperties.HostedZoneId`, so it is read off the created zone
-        // rather than minted here.
-        if let Some(hosted_zone_id) = crate::state::route53_zone::create_namespace_zone(
+        // rather than minted here — and a creation Route 53 REFUSES is a namespace that
+        // cannot exist, so the operation lands `FAIL` carrying Route 53's own reason and
+        // the staged namespace is rolled back with it.
+        match crate::state::route53_zone::create_namespace_zone(
             &*self.engine,
             ctx,
             crate::state::route53_zone::NamespaceZone {
@@ -326,9 +339,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await
         {
-            if let Some(stored) = store.lock().namespaces.get_mut(&id) {
-                stored.hosted_zone_id = Some(hosted_zone_id);
+            crate::state::route53_zone::ZoneCreation::Created(hosted_zone_id) => {
+                if let Some(stored) = store.lock().namespaces.get_mut(&id) {
+                    stored.hosted_zone_id = Some(hosted_zone_id);
+                }
             }
+            crate::state::route53_zone::ZoneCreation::Refused(reason) => {
+                store.lock().fail_when_due(
+                    &operation_id,
+                    crate::state::ERROR_CODE_CANNOT_CREATE_HOSTED_ZONE,
+                    reason,
+                );
+            }
+            // Nothing resolved the zone either way, so nothing here decides the
+            // namespace: it keeps no hosted zone id and the create goes on.
+            crate::state::route53_zone::ZoneCreation::Unanswered => {}
         }
 
         Ok(CreatePublicDnsNamespaceOutput {

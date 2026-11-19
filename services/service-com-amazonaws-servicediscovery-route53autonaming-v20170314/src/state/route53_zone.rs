@@ -24,12 +24,14 @@
 //! ([`smithy_server_runtime::OperationContext::callback`]), so no socket is opened, no name
 //! is resolved and nothing outside this process is reachable from it.
 //!
-//! Every hop here FAILS OPEN, for the reason the other cross-service pre-flights in this
-//! workspace fail open: an emulator that mounts no Route 53 at all, or a namespace name
-//! Route 53 will not hold a zone for (Cloud Map's own `Name` pattern admits names that are
-//! not domain names), must not make a Cloud Map call fail that the real service serves. What
-//! is never done is reporting a zone that was not created: a namespace whose zone Route 53
-//! declined holds NO hosted zone id, so every id a read reports resolves in Route 53.
+//! A hop that resolves NOTHING fails open, for the reason the other cross-service
+//! pre-flights in this workspace fail open: an emulator that mounts no Route 53 at all must
+//! not make a Cloud Map call fail that the real service serves. A hop Route 53 REFUSES is a
+//! different answer: the namespace IS the zone, so a creation Route 53 refuses is a
+//! namespace that cannot exist, and [`ZoneCreation::Refused`] is what the create reports it
+//! with. What is never done is reporting a zone that was not created: a namespace whose
+//! zone Route 53 declined holds NO hosted zone id, so every id a read reports resolves in
+//! Route 53.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -351,20 +353,51 @@ fn bare_zone_id(id: &str) -> String {
     id.rsplit('/').next().unwrap_or(id).to_string()
 }
 
-/// Create the hosted zone a DNS namespace is backed by, and answer its id.
+/// What came of the hosted zone a DNS namespace IS.
+///
+/// The three answers a creation can get are kept apart because a create does something
+/// different with each: a zone Route 53 holds is the namespace's `HostedZoneId`, a creation
+/// Route 53 REFUSED is a namespace that cannot exist, and an unanswered one leaves the
+/// create to go on with no zone id (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZoneCreation {
+    /// Route 53 holds the zone, under this id.
+    Created(String),
+    /// Route 53 refused to create it, and this is the reason it answered with.
+    Refused(String),
+    /// Nothing resolved it either way: there is no Route 53 in this process to ask, or what
+    /// it answered is not one of the refusals it models for this creation.
+    Unanswered,
+}
+
+/// The error codes `CreateHostedZone` models — the answers that resolve a zone as one
+/// Route 53 will not create. Taken from that operation's own modelled error list
+/// (`service-com-amazonaws-route53-awsdnsv20130401`'s `OPERATIONS.md`, `CreateHostedZone`).
+/// Any OTHER answer — no Route 53 to ask, a transport that carried nothing, an error class
+/// this operation does not model — resolves nothing, so the create goes on.
+const ZONE_REFUSAL_CODES: [&str; 9] = [
+    "ConflictingDomainExists",
+    "DelegationSetNotAvailable",
+    "DelegationSetNotReusable",
+    "HostedZoneAlreadyExists",
+    "InvalidDomainName",
+    "InvalidInput",
+    "InvalidVPCId",
+    "NoSuchDelegationSet",
+    "TooManyHostedZones",
+];
+
+/// Create the hosted zone a DNS namespace is backed by, and answer what came of it.
 ///
 /// `vpc` is the VPC a PRIVATE namespace is created with — naming one is what makes the
 /// zone private and associates it, which is the whole of a private namespace's visibility
 /// ("visible only inside a specified Amazon VPC") — and `vpc_region` the Region that VPC was
 /// created in. A public namespace names none and gets a public zone.
-///
-/// `None` when Route 53 did not create a zone, for any reason at all; the caller then
-/// reports no hosted zone id rather than one that resolves to nothing.
 pub async fn create_namespace_zone<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     zone: NamespaceZone<'_>,
-) -> Option<String> {
+) -> ZoneCreation {
     let client = route53_client(ctx.callback());
     let mut request = client
         .create_hosted_zone()
@@ -388,14 +421,27 @@ pub async fn create_namespace_zone<Eng: Send + Sync + 'static>(
     let created = match request.send().await {
         Ok(created) => created.hosted_zone().map(|zone| bare_zone_id(zone.id())),
         Err(error) => {
+            use ::aws_sdk_route53::error::ProvideErrorMetadata;
             tracing::debug!(
                 namespace = zone.namespace_id,
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "Route 53 created no hosted zone for this namespace"
             );
-            None
+            // The reason is Route 53's own: the refusal it answered with, which is what a
+            // caller is told the zone could not be created for.
+            let refused = error
+                .code()
+                .filter(|code| ZONE_REFUSAL_CODES.contains(code))
+                .map(|code| error.message().unwrap_or(code).to_string());
+            return match refused {
+                Some(reason) => ZoneCreation::Refused(reason),
+                None => ZoneCreation::Unanswered,
+            };
         }
-    }?;
+    };
+    let Some(created) = created else {
+        return ZoneCreation::Unanswered;
+    };
     // The zone was created BY this service, for the namespace it belongs to, and this
     // service manages it from here on — which is what Route 53 reports as the zone's
     // `LinkedService`. Recorded on the zone whose id Route 53 just minted, so nothing a
@@ -406,7 +452,7 @@ pub async fn create_namespace_zone<Eng: Send + Sync + 'static>(
         SERVICE_PRINCIPAL,
         zone.namespace_arn,
     );
-    Some(created)
+    ZoneCreation::Created(created)
 }
 
 /// The hosted zone ONE namespace asks Route 53 for: the namespace it belongs to, and the

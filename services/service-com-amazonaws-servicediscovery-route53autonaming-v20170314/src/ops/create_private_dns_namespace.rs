@@ -5,9 +5,11 @@
 //! Route 53 private hosted zone the namespace is backed by — associated with the requested
 //! `Vpc` — mints a `DNS_PRIVATE` namespace record carrying THAT zone's id, and files the
 //! `CREATE_NAMESPACE` operation whose id is this call's only output — the namespace id
-//! reaches the caller through that operation's `Targets` map. A `Vpc` Amazon EC2 holds no
-//! VPC for leaves that association impossible, so the operation lands `FAIL` and the
-//! staged namespace is rolled back with it.
+//! reaches the caller through that operation's `Targets` map. A namespace is its hosted
+//! zone, so a zone that cannot be created is a namespace that cannot exist: a `Vpc`
+//! Amazon EC2 holds no VPC for leaves the association impossible, and a creation Route 53
+//! itself refuses leaves no zone to be, so in either case the operation lands `FAIL` with
+//! `CANNOT_CREATE_HOSTED_ZONE` and the staged namespace is rolled back with it.
 //!
 //! ## Shape of an operation
 //!
@@ -355,8 +357,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // — private, and associated with the VPC this request named, which is what makes
         // the namespace "visible only inside a specified Amazon VPC". The zone's id is
         // what `GetNamespace` reports as `Properties.DnsProperties.HostedZoneId`, so it is
-        // read off the created zone rather than minted here.
-        if let Some(hosted_zone_id) = crate::state::route53_zone::create_namespace_zone(
+        // read off the created zone rather than minted here — and a creation Route 53
+        // REFUSES is a namespace that cannot exist, so the operation lands `FAIL` carrying
+        // Route 53's own reason and the staged namespace is rolled back with it.
+        match crate::state::route53_zone::create_namespace_zone(
             &*self.engine,
             ctx,
             crate::state::route53_zone::NamespaceZone {
@@ -369,9 +373,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await
         {
-            if let Some(stored) = store.lock().namespaces.get_mut(&id) {
-                stored.hosted_zone_id = Some(hosted_zone_id);
+            crate::state::route53_zone::ZoneCreation::Created(hosted_zone_id) => {
+                if let Some(stored) = store.lock().namespaces.get_mut(&id) {
+                    stored.hosted_zone_id = Some(hosted_zone_id);
+                }
             }
+            crate::state::route53_zone::ZoneCreation::Refused(reason) => {
+                store.lock().fail_when_due(
+                    &operation_id,
+                    crate::state::ERROR_CODE_CANNOT_CREATE_HOSTED_ZONE,
+                    reason,
+                );
+            }
+            // Nothing resolved the zone either way, so nothing here decides the
+            // namespace: it keeps no hosted zone id and the create goes on.
+            crate::state::route53_zone::ZoneCreation::Unanswered => {}
         }
 
         Ok(CreatePrivateDnsNamespaceOutput {
