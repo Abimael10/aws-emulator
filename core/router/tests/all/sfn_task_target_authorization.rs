@@ -72,23 +72,43 @@ const FORBIDDEN: u16 = 403;
 /// what a suite holds is everything around it.
 pub(crate) const REQUEST_ID: &str = "<id>";
 
+/// The text a relayed exception names the id of the refused request after.
+const NAMES_THE_REQUEST: &str = "Request ID: ";
+
+/// The id a relayed exception names the refused request by, or `None` for a text that names
+/// no request at all.
+///
+/// The ONE scan of that field: the id runs up to whichever delimiter closes it — the
+/// separator for a client that writes a field after it, the closing parenthesis for one that
+/// writes it last — so [`masked`] and every suite that needs the id ITSELF (to hold it to a
+/// form, or to hold two calls to two ids) read it here rather than scanning the text again.
+///
+/// `pub(crate)` for the same reason the rest of this harness is: `tests/all/main.rs` is one
+/// crate root.
+pub(crate) fn named_request(cause: &str) -> Option<String> {
+    let (_, named) = cause.split_once(NAMES_THE_REQUEST)?;
+    Some(
+        named
+            .chars()
+            .take_while(|character| !";)".contains(*character))
+            .collect(),
+    )
+}
+
 /// `cause` with the id of the refused request replaced by [`REQUEST_ID`].
 ///
 /// `pub(crate)` for the same reason the harness is: every suite here that holds a failed
 /// `Task` state's cause to the text its client wrote reads it this way, and
 /// `tests/all.rs` is one crate root.
 pub(crate) fn masked(cause: &str) -> String {
-    const NAMES: &str = "Request ID: ";
-    let Some((sentence, named)) = cause.split_once(NAMES) else {
+    let Some((sentence, named)) = cause.split_once(NAMES_THE_REQUEST) else {
         return cause.to_string();
     };
-    // The id runs up to whichever delimiter closes its field: the separator for a client
-    // that writes a field after it, the closing parenthesis for one that writes it last.
-    let id: String = named
-        .chars()
-        .take_while(|character| !";)".contains(*character))
-        .collect();
-    format!("{sentence}{NAMES}{REQUEST_ID}{}", &named[id.len()..])
+    let id = named_request(cause).unwrap_or_default();
+    format!(
+        "{sentence}{NAMES_THE_REQUEST}{REQUEST_ID}{}",
+        &named[id.len()..]
+    )
 }
 
 /// The metadata the client a `Task`'s integration family is served by closes a refused
