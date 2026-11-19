@@ -189,11 +189,25 @@ async fn given_lambda_group(emulator: &Emulator, application: &str, members: Val
     group
 }
 
+/// The AppSpec of a Lambda deployment shifting the alias from version 1, which is
+/// where [`given_versions_and_alias`] leaves it; see [`app_spec_from`].
+fn app_spec(function: &str, target: &str, hooks: &[(&str, &str)]) -> String {
+    app_spec_from(function, "1", target, hooks)
+}
+
 /// The AppSpec of a Lambda deployment, as the AWS CodeDeploy User Guide writes
 /// one: the `Resources` entry naming the function, the alias and the two versions
 /// traffic moves between, plus one `Hooks` entry per lifecycle event the caller
 /// declares a validation function for.
-fn app_spec(function: &str, target: &str, hooks: &[(&str, &str)]) -> String {
+///
+/// `current` is the version the deployment shifts FROM, which the SECOND
+/// deployment of one alias states as the version the first one left it at.
+fn app_spec_from(
+    function: &str,
+    current: &str,
+    target: &str,
+    hooks: &[(&str, &str)],
+) -> String {
     let mut document = format!(
         "version: 0.0\n\
          Resources:\n\
@@ -202,7 +216,7 @@ fn app_spec(function: &str, target: &str, hooks: &[(&str, &str)]) -> String {
          \x20     Properties:\n\
          \x20       Name: {function}\n\
          \x20       Alias: {ALIAS}\n\
-         \x20       CurrentVersion: \"1\"\n\
+         \x20       CurrentVersion: \"{current}\"\n\
          \x20       TargetVersion: \"{target}\"\n"
     );
     if !hooks.is_empty() {
@@ -698,5 +712,207 @@ async fn a_failed_deployment_is_rolled_back_when_its_configuration_asks_for_it()
             "case {case:?}: expected the rollback to be the group's last successful deployment, \
              got {read:?}"
         );
+    }
+}
+
+/// How often a case samples the alias of a deployment nothing is calling
+/// CodeDeploy about: fine enough to catch the window a post-traffic hook holds
+/// open, and the only thing any of these waits is for is a CONDITION.
+const ALIAS_SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
+
+/// One row of the handover table: what the SECOND deployment's post-traffic hook
+/// reports, and what that deployment then ends as.
+struct Handover {
+    /// What the row is about.
+    case: &'static str,
+    /// The result its `AfterAllowTraffic` validation function reports, or `None`
+    /// for a deployment that declares no hook at all.
+    reports: Option<&'static str>,
+    /// The terminal status that deployment must reach.
+    status: &'static str,
+}
+
+/// RULE: a deployment's traffic shift happens at its `AllowTraffic` lifecycle
+/// event — before the hook that runs after the traffic is dispatched — so it does
+/// not depend on the verdict that hook decides, and the traffic it moved STAYS
+/// where it put it: what puts it back is the ROLLBACK deployment, whose own
+/// traffic shift falls due like every other deployment's. So a client watching
+/// only the alias sees it reach the version the revision targets whatever the
+/// deployment goes on to end as, and still reads it there once that deployment has
+/// failed, until its rollback runs.
+#[tokio::test]
+async fn a_failed_deployments_shift_stands_until_its_rollback_puts_the_alias_back() {
+    // Rows differ along what the second deployment's post-traffic hook reports —
+    // and whether it declares one at all — which is what decides the verdict the
+    // shift must be independent of.
+    let cases: &[Handover] = &[
+        Handover {
+            case: "a second deployment whose post-traffic hook approves",
+            reports: Some("Succeeded"),
+            status: "Succeeded",
+        },
+        Handover {
+            case: "a second deployment whose post-traffic hook fails",
+            reports: Some("Failed"),
+            status: "Failed",
+        },
+        Handover {
+            case: "a second deployment that declares no hook at all",
+            reports: None,
+            status: "Succeeded",
+        },
+    ];
+
+    for (index, case) in cases.iter().enumerate() {
+        let emulator = Emulator::with_lambda();
+        let application = format!("handover-{index:02}");
+        let function = format!("handover{index:02}");
+        let group = given_lambda_group(
+            &emulator,
+            &application,
+            json!({
+                "autoRollbackConfiguration": {
+                    "enabled": true,
+                    "events": ["DEPLOYMENT_FAILURE"],
+                },
+            }),
+        )
+        .await;
+        given_function(
+            &emulator,
+            case.case,
+            &function,
+            "def lambda_handler(e, c):\n    return e\n",
+        )
+        .await;
+        given_versions_and_alias(&emulator, case.case, &function, 3).await;
+        // The first revision's hook approves, but takes a while over it. That
+        // matters twice: the first deployment waits for it, and so does the
+        // ROLLBACK of the second one, which redeploys this same revision and runs
+        // its lifecycle events — which is the window in which the alias still
+        // reads what the failed deployment left.
+        given_function(
+            &emulator,
+            case.case,
+            "approve",
+            &validation_function_source("Succeeded", 2.0),
+        )
+        .await;
+        if let Some(reported) = case.reports {
+            // The second deployment's hook takes a while to report, so the alias
+            // that deployment has ALREADY moved is readable for the whole of the
+            // window its validation holds open.
+            given_function(
+                &emulator,
+                case.case,
+                "second",
+                &validation_function_source(reported, 1.0),
+            )
+            .await;
+        }
+
+        // The first leg, polled to its terminal status through CodeDeploy: the
+        // call that observes it ending is the one the next deployment is handed
+        // over by.
+        let first = deploy(
+            &emulator,
+            &application,
+            &group,
+            &app_spec_from(&function, "1", "2", &[("BeforeAllowTraffic", "approve")]),
+        )
+        .await;
+        let info = terminal_deployment_within(&emulator, &first, case.case, HOOKED_DEADLINE).await;
+        assert_eq!(
+            info["status"].as_str(),
+            Some("Succeeded"),
+            "case {:?}: the first leg must succeed, got {info:?}",
+            case.case
+        );
+        let moved = alias_version(&emulator, case.case, &function).await;
+        assert_eq!(
+            moved, "2",
+            "case {:?}: the first leg must leave the alias on version 2, got {moved}",
+            case.case
+        );
+
+        // The leg under test. From its creation until the alias has moved NOTHING
+        // calls CodeDeploy: the shift is the clock's to carry out.
+        let hooks: Vec<(&str, &str)> = case
+            .reports
+            .map(|_| vec![("AfterAllowTraffic", "second")])
+            .unwrap_or_default();
+        let second = deploy(
+            &emulator,
+            &application,
+            &group,
+            &app_spec_from(&function, "2", "3", &hooks),
+        )
+        .await;
+        let deadline_at = Instant::now() + HOOKED_DEADLINE;
+        loop {
+            let reading = alias_version(&emulator, case.case, &function).await;
+            if reading == "3" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline_at,
+                "case {:?}: expected the alias on version 3 with nothing but the clock running, \
+                 got {reading}",
+                case.case
+            );
+            tokio::time::sleep(ALIAS_SAMPLE_INTERVAL).await;
+        }
+
+        let info = terminal_deployment_within(&emulator, &second, case.case, HOOKED_DEADLINE).await;
+        assert_eq!(
+            info["status"].as_str(),
+            Some(case.status),
+            "case {:?}: expected the second leg to end {}, got {info:?}",
+            case.case,
+            case.status
+        );
+        if case.status != "Failed" {
+            continue;
+        }
+        assert_eq!(
+            info["errorInformation"]["code"].as_str(),
+            Some("HOOK_EXECUTION_FAILURE"),
+            "case {:?}: expected the hook-execution-failure error code, got {info:?}",
+            case.case
+        );
+        let rollback_id = info["rollbackInfo"]["rollbackDeploymentId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !rollback_id.is_empty(),
+            "case {:?}: expected the failure to name its rollback deployment, got {info:?}",
+            case.case
+        );
+        // The deployment has FAILED and the traffic it shifted is still where it
+        // put it: what puts it back is the rollback deployment, which is holding
+        // at the lifecycle event hook of the revision it redeploys.
+        let left = alias_version(&emulator, case.case, &function).await;
+        assert_eq!(
+            left, "3",
+            "case {:?}: expected the failed deployment's shift to stand until its rollback runs, \
+             got {left}",
+            case.case
+        );
+        // The rollback is a deployment of its own, driven by the same clock: it
+        // puts the alias back on the version the failed deployment found it at.
+        let deadline_at = Instant::now() + HOOKED_DEADLINE;
+        loop {
+            let back = alias_version(&emulator, case.case, &function).await;
+            if back == "2" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline_at,
+                "case {:?}: expected the rollback to put the alias back on version 2, got {back}",
+                case.case
+            );
+            tokio::time::sleep(ALIAS_SAMPLE_INTERVAL).await;
+        }
     }
 }

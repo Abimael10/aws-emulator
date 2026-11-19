@@ -28,6 +28,16 @@
 //! that deployment was walking. A rollback is CodeDeploy's own remediation for a
 //! deployment that was stopped, so it puts the alias back rather than walking a
 //! window again (which is also why [`super::alarm_gate`] leaves it ungated).
+//!
+//! That shift belongs to the ROLLBACK DEPLOYMENT and falls due like every other
+//! deployment's, so the traffic the deployment being rolled back had already moved
+//! stays where that deployment put it until the rollback runs: a client reading
+//! the alias of a deployment that has just failed sees what that deployment did,
+//! which is what tells a shift that was rolled back apart from a shift that never
+//! happened. Only a deployment group with no revision to roll back TO — which gets
+//! no rollback deployment — has the alias put back by [`record_rollback`] itself,
+//! since nothing else ever would ([`super::lambda_traffic_shift`] carries both
+//! out).
 
 use crate::ops::types::RollbackInfo;
 
@@ -178,13 +188,22 @@ pub fn record_rollback(
     if let Some(deployment) = state.deployments.get_mut(deployment_id) {
         deployment.rollback_info = Some(rollback_info.clone());
         // A rollback of a deployment that had already moved some of the traffic
-        // puts the alias back the way that deployment found it. That is owed by
-        // the ROLLBACK itself, so it is owed whether or not this group also had a
-        // revision to create a rollback deployment of: "if you stop a deployment,
-        // the traffic is restored to the original version" is what a rollback of
-        // a traffic shift means, and the version it is restored to is the one the
-        // stopped deployment's own AppSpec was shifting from.
-        deployment.awaits_alias_restore = deployment.lambda_traffic_shift.is_some()
+        // puts the alias back the way that deployment found it — "if you stop a
+        // deployment, the traffic is restored to the original version" — and the
+        // thing that puts it back is the ROLLBACK DEPLOYMENT, whose own traffic
+        // shift falls due like every other deployment's (it is recorded below, of
+        // the revision this group was on).
+        //
+        // So the alias is put back from HERE only where this group had no revision
+        // to create that rollback deployment of, which is the one case nothing
+        // else would ever put it back in. Where there IS one, re-pointing the alias
+        // in the same pass that ended this deployment would erase what this
+        // deployment had already done before any caller could read it: the traffic
+        // a deployment shifted stays where that deployment put it until its
+        // rollback runs, which is what lets a client tell a shift that was rolled
+        // back from a shift that never happened.
+        deployment.awaits_alias_restore = rollback_deployment_id.is_none()
+            && deployment.lambda_traffic_shift.is_some()
             && deployment.traffic_increments_applied > 0;
     }
 
