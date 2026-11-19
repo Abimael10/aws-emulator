@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOtaTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOtaTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOtaTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts the over-the-air task into `crate::state`'s `ota_tasks` store under a freshly
+//! generated `OtaTaskId`, after resolving the managed things its `Target` names and the
+//! OTA task configuration its `TaskConfigurationId` names, and answers with that id, its
+//! ARN and the description it stored. A replayed `ClientToken` (`@idempotencyToken`)
+//! answers with the record the first call created instead of creating a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -152,6 +149,22 @@ pub struct CreateOtaTask<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the task was created in, the task the
+/// call ended up with, and how it ended. No `S3Url`, no target and no `ClientToken`: a log
+/// sink needs none of them to attribute the change.
+fn audit(akid: &str, region: &str, task_id: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "CreateOtaTask",
+        akid = %akid,
+        region = %region,
+        task_id = %task_id,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
 impl<Eng> CreateOtaTask<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -178,18 +191,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOtaTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOtaTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOtaTask"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateOtaTaskErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the OTA task store is unavailable".to_string()),
+            })
+        })?;
+
+        // `OtaType`, `OtaProtocol` and `OtaMechanism` are modelled enums, so a value
+        // outside the enum is a client error rather than a stored record. The model's own
+        // constraint walk refuses one before this handler runs; this second line states it
+        // through the SAME formatter, so the two cannot word one refusal two ways
+        // (`crate::service::enum_value_set_refusal`).
+        let enum_members: [(&str, &[&str], Option<&str>); 3] = [
+            (
+                "otaType",
+                crate::ops::types::OTA_TYPE_VALUES,
+                Some(input.ota_type.as_str()),
+            ),
+            (
+                "protocol",
+                crate::ops::types::OTA_PROTOCOL_VALUES,
+                input.protocol.as_deref(),
+            ),
+            (
+                "otaMechanism",
+                crate::ops::types::OTA_MECHANISM_VALUES,
+                input.ota_mechanism.as_deref(),
+            ),
+        ];
+        for (member_path, allowed, sent) in enum_members {
+            if let Some(value) = sent.filter(|value| !allowed.contains(value)) {
+                return Err(CreateOtaTaskErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::service::enum_value_set_refusal(
+                        member_path,
+                        allowed,
+                        value,
+                    )),
+                })
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region this task is created in.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let mut store = state.lock();
+        let created_at = ::std::time::SystemTime::now();
+
+        // Retire the idempotency records the clock already made due, before anything reads
+        // them: a token past its TTL neither replays nor occupies the map.
+        store.retire_expired_idempotency_tokens(created_at);
+
+        // A retry with the same `ClientToken` answers with what the first call created,
+        // performing no further action. The token is scoped to the region that minted the
+        // record, as the record itself is.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.replayed_resource_id(crate::state::OTA_TASK_RESOURCE_TYPE, token));
+        if let Some(created) = replayed.and_then(|id| store.ota_task_in(&region, &id)) {
+            let replay = CreateOtaTaskOutput {
+                task_id: Some(created.id.clone()),
+                task_arn: Some(created.arn.clone()),
+                description: created.description.clone(),
+            };
+            let created_id = created.id.clone();
+            drop(store);
+            audit(&akid, &region, &created_id, "replayed");
+            return Ok(replay);
+        }
+
+        // The store is bounded: past its maximum a create is refused rather than grown
+        // into. The operation models no quota error, so the refusal is the modelled error
+        // closest to "this service will not take another one now".
+        if store.ota_tasks.len() >= crate::state::MAX_OTA_TASKS {
+            return Err(CreateOtaTaskErrorModeled::ThrottlingException(ThrottlingException {
+                message: Some(format!(
+                    "this service holds the maximum of {} OTA tasks; delete one before \
+                     creating another",
+                    crate::state::MAX_OTA_TASKS
+                )),
+            })
+            .into());
+        }
+
+        // `Target` carries no modelled `@length`, and every entry is stored and reported
+        // back, so one request's targets are bounded here rather than grown into.
+        let target = input.target.unwrap_or_default();
+        if target.len() > crate::state::MAX_OTA_TASK_TARGETS {
+            return Err(CreateOtaTaskErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "an over-the-air task targets at most {} devices",
+                    crate::state::MAX_OTA_TASK_TARGETS
+                )),
+            })
+            .into());
+        }
+
+        // Every `Target` entry names a DEVICE this API itself mints — a managed thing, by
+        // its `ManagedThingId` or by its ARN — so the reference is RESOLVED: an entry this
+        // region holds no managed thing under names nothing to deploy to, and the task is
+        // not created. The refusal is the modelled `ResourceNotFoundException` the
+        // operation declares for a resource the request named and this service does not
+        // hold, worded the way this service states an absent REFERENCE
+        // (`crate::state::record_does_not_exist_message`).
+        for entry in &target {
+            let identifier = crate::state::parse_resource_arn(entry)
+                .filter(|parts| {
+                    parts.region == region
+                        && parts.resource_type_segment == crate::state::MANAGED_THING_ARN_SEGMENT
+                })
+                .map_or(entry.as_str(), |parts| parts.id);
+            if store.managed_thing_in(&region, identifier).is_none() {
+                return Err(CreateOtaTaskErrorModeled::ResourceNotFoundException(
+                    crate::state::managed_thing_reference_not_found(entry),
+                )
+                .into());
+            }
+        }
+
+        // The `TaskConfigurationId` is a resource of this service too
+        // (`CreateOtaTaskConfiguration`), and is resolved on the same terms: a task rolls
+        // out under a configuration this region really holds.
+        if let Some(configuration_id) = input.task_configuration_id.as_deref() {
+            if store
+                .ota_task_configuration_in(&region, configuration_id)
+                .is_none()
+            {
+                return Err(CreateOtaTaskErrorModeled::ResourceNotFoundException(
+                    crate::state::ota_task_configuration_not_found_on_read(configuration_id),
+                )
+                .into());
+            }
+        }
+
+        let sequence = store.take_sequence();
+        // `OtaTaskId` is `^[A-Za-z0-9]+$`, len 1..200, which the lowercase-hex opaque id
+        // satisfies.
+        let id = crate::state::opaque_id();
+        let arn = crate::state::ota_task_arn(&region, &id);
+        // A schedule's start instant is read once, at create time: the status every later
+        // read reports is derived from it and the clock, so nothing is written when the
+        // schedule falls due.
+        let scheduled_start = input
+            .ota_scheduling_config
+            .as_ref()
+            .and_then(|config| config.start_time.as_deref())
+            .and_then(crate::state::schedule_instant);
+
+        let task = crate::state::OtaTask {
+            id: id.clone(),
+            arn: arn.clone(),
+            region: region.clone(),
+            description: input.description.clone(),
+            s3_url: input.s3_url,
+            protocol: input.protocol,
+            ota_type: input.ota_type,
+            ota_target_query_string: input.ota_target_query_string,
+            ota_mechanism: input.ota_mechanism,
+            target,
+            task_configuration_id: input.task_configuration_id,
+            scheduling_config: input.ota_scheduling_config,
+            execution_retry_config: input.ota_task_execution_retry_config,
+            tags: input.tags.unwrap_or_default(),
+            created_at,
+            updated_at: created_at,
+            scheduled_start,
+            sequence,
+        };
+
+        if let Some(token) = input.client_token {
+            store.record_idempotency_token(
+                crate::state::OTA_TASK_RESOURCE_TYPE,
+                &token,
+                &id,
+                created_at,
+            );
+        }
+        store.insert_ota_task(task);
+        drop(store);
+        audit(&akid, &region, &id, "created");
+
+        Ok(CreateOtaTaskOutput {
+            task_id: Some(id),
+            task_arn: Some(arn),
+            description: input.description,
+        })
     }
 }

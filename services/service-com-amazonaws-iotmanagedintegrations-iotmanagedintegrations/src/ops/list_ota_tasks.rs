@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOtaTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOtaTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOtaTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the `crate::state` `ota_tasks` records this region's endpoint holds, in the
+//! order they were created, projecting each onto an `OtaTaskSummary`. `MaxResults` bounds
+//! the page and the `NextToken` resumes at the record after the last one reported.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOtaTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOtaTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOtaTasks"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListOtaTasksErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the OTA task store is unavailable".to_string()),
+            })
+        })?;
+
+        let store = state.lock();
+        // An OTA task is regional, as every resource of this service is: a list reports
+        // only the records this region's endpoint holds.
+        let region = crate::state::request_region(ctx.parts());
+
+        // A `NextToken` is this service's own encoded cursor, so one it cannot have issued
+        // is a client error rather than an empty page.
+        let resume_at = match input.next_token.as_deref() {
+            None => 0u64,
+            Some(token) => crate::state::decode_page_token(token, store.next_sequence).ok_or_else(
+                || {
+                    ListOtaTasksErrorModeled::ValidationException(ValidationException {
+                        message: Some("NextToken is not a token this service issued".to_string()),
+                    })
+                },
+            )?,
+        };
+
+        // `MaxResults` is the caller's maximum, never a minimum, so the page size is
+        // clamped to what one response may carry: an absent or oversized `MaxResults`
+        // yields a bounded page plus a `NextToken` rather than the whole store. A value
+        // outside the modelled range (1..1000) never reaches here — the boundary validator
+        // refuses it with the modelled 400 `ValidationException`.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::OTA_TASK_PAGE_LIMIT, |max| {
+                usize::try_from(max)
+                    .unwrap_or(1)
+                    .clamp(1, crate::state::OTA_TASK_PAGE_LIMIT)
+            });
+
+        // One record past the page is all the cursor needs, so the response this request
+        // builds is proportional to the PAGE rather than to the store.
+        let selected: Vec<&crate::state::OtaTask> = store
+            .ota_tasks_in(&region)
+            .filter(|task| task.sequence >= resume_at)
+            .take(page_size.saturating_add(1))
+            .collect();
+
+        // One instant for the whole page, so two tasks of one response cannot report their
+        // status against two different clock readings.
+        let now = ::std::time::SystemTime::now();
+        let tasks: Vec<OtaTaskSummary> = selected
+            .iter()
+            .take(page_size)
+            .map(|task| crate::state::ota_task_summary(task, now))
+            .collect();
+
+        // The token resumes at the record after the last one this page emitted, so a record
+        // created or deleted in between cannot shift the resume point. No further record
+        // means the page is the last one and carries no token.
+        let next_token = selected
+            .get(page_size)
+            .map(|task| crate::state::encode_page_token(task.sequence));
+
+        Ok(ListOtaTasksOutput {
+            tasks: Some(tasks),
+            next_token,
+        })
     }
 }

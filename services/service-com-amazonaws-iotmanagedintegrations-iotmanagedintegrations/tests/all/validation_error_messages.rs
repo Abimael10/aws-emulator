@@ -532,13 +532,13 @@ async fn a_request_the_model_accepts_still_reaches_its_handler() {
     }
 
     // A scaffolded operation whose input the model accepts still answers the scaffold's
-    // 501: the wrapper refuses what the model refuses and nothing else. `ListOtaTasks` (GET
-    // `/ota-tasks`) takes no required member, so the model accepts the bare request and the
-    // answer is the scaffold's own.
-    let scaffolded = call(&router, "GET", "/ota-tasks", None).await;
+    // 501: the wrapper refuses what the model refuses and nothing else.
+    // `ListOtaTaskConfigurations` (GET `/ota-task-configurations`) takes no required member,
+    // so the model accepts the bare request and the answer is the scaffold's own.
+    let scaffolded = call(&router, "GET", "/ota-task-configurations", None).await;
     assert_eq!(
         scaffolded.status, 501,
-        "case \"ListOtaTasks/valid\": a valid request must reach the operation, \
+        "case \"ListOtaTaskConfigurations/valid\": a valid request must reach the operation, \
          which is still scaffolded, got {} with body {:?}",
         scaffolded.status, scaffolded.body
     );

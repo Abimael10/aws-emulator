@@ -15,6 +15,11 @@ pub use custom_endpoint_addressing::*;
 pub mod provisioning_profiles;
 pub use provisioning_profiles::*;
 
+/// The over-the-air (OTA) TASK records of this store, and the status derivation a task's
+/// schedule gives them. Re-exported on the same terms as [`provisioning_profiles`].
+pub mod ota_tasks;
+pub use ota_tasks::*;
+
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1104,6 +1109,13 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// The authoritative OTA-task-configuration store, keyed by the generated
     /// `OtaTaskConfigurationId`.
     pub ota_task_configurations: HashMap<String, OtaTaskConfiguration>,
+    /// The authoritative OTA-task store, keyed by the generated `OtaTaskId`.
+    /// `CreateOtaTask` inserts a record, `GetOtaTask` projects it onto its output shape and
+    /// `ListOtaTasks` pages over it. See [`OtaTask`].
+    pub ota_tasks: HashMap<String, OtaTask>,
+    /// Insertion order of OTA-task ids, so `ListOtaTasks` pages deterministically. An id is
+    /// appended on create.
+    pub ota_task_order: Vec<String>,
     /// The authoritative cloud-connector store, keyed by the generated
     /// `CloudConnectorId`. `CreateCloudConnector` inserts a record and
     /// `GetCloudConnector` projects it onto its output shape.
@@ -1611,6 +1623,10 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
                 .provisioning_profile_in(region, parts.id)
                 .filter(|profile| profile.arn == arn)
                 .map(|profile| &profile.tags),
+            OTA_TASK_ARN_SEGMENT => self
+                .ota_task_in(region, parts.id)
+                .filter(|task| task.arn == arn)
+                .map(|task| &task.tags),
             _ => None,
         }
     }
@@ -1641,6 +1657,10 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
                 .provisioning_profile_in_mut(region, parts.id)
                 .filter(|profile| profile.arn == arn)
                 .map(|profile| &mut profile.tags),
+            OTA_TASK_ARN_SEGMENT => self
+                .ota_task_in_mut(region, parts.id)
+                .filter(|task| task.arn == arn)
+                .map(|task| &mut task.tags),
             _ => None,
         }
     }
@@ -2256,6 +2276,32 @@ pub const OTA_TASK_CONFIGURATION_DELETE_SUBJECT: &str = "Ota task configuration"
 /// carries states its 404 through here, so one phrasing serves them all.
 pub fn identifier_not_found_message(resource_type: &str, identifier: &str) -> String {
     format!("{resource_type} for identifier '{identifier}' not found")
+}
+
+/// How a request that NAMES another resource of this service states that the named record
+/// is not there: the resource's type, and that no record of it exists. No identifier is
+/// quoted, so one sentence serves every request that names an absent one.
+///
+/// A reference a request carries is resolved where the backend consumes it, not where the
+/// request's own identifier is resolved, and that path words its own refusal: the recorded
+/// refusal of a `CreateOtaTask` whose `Target` names a managed thing this account does not
+/// hold reads `ManagedThing record does not exist`, rather than the sentence a mutation of
+/// the managed thing ITSELF answers ([`identifier_not_found_message`]).
+pub fn record_does_not_exist_message(resource_type: &str) -> String {
+    format!("{resource_type} record does not exist")
+}
+
+/// The modelled `ResourceNotFoundException` an operation that RESOLVES a managed-thing
+/// reference its request carried answers when this region holds no such record: the
+/// reference path's reason ([`record_does_not_exist_message`]), plus the `ResourceId` and
+/// `ResourceType` members every managed-thing 404 of this service reports
+/// ([`managed_thing_not_found_on_read`]), carrying the reference exactly as the request
+/// spelled it.
+pub fn managed_thing_reference_not_found(reference: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(record_does_not_exist_message(MANAGED_THING_RESOURCE_TYPE)),
+        ..resource_not_found(MANAGED_THING_RESOURCE_TYPE, reference)
+    }
 }
 
 /// How a DELETE states that it found nothing to delete: that the delete failed, the

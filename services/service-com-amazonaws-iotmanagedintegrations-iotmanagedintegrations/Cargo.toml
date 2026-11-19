@@ -46,6 +46,9 @@ time = { version = "0.3.55", default-features = false, features = ["std"] }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` file, so a new suite is picked up by
+# adding the file.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # `tokio::time::sleep` in tests/all/managed_thing_lifecycle.rs separates a create
