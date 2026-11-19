@@ -28,6 +28,13 @@
 //!    a detection at, with the residual well under a percent — while a span the
 //!    evidence only partly accounts for, or one nothing places at all, stays
 //!    materially below that gate.
+//! 6. A closed lexical form's confidence follows the characters that form fixes and
+//!    how tightly it fixes one, so two forms of one category are told apart.
+//! 7. It is a reading of the mention IN ITS DOCUMENT: one surface form, one type and
+//!    one rule class come back with two confidences in two documents that frame the
+//!    mention differently — the cue words the document writes beside it, the mentions
+//!    it coordinates with it, and the place it puts it in (the head of a sentence,
+//!    where orthography accounts for a capital, against inside one).
 //!
 //! Every row rides in one batch, so each is answered as its own `ResultList` entry
 //! beside the others, exactly as the recorded three-document request's were.
@@ -192,18 +199,24 @@ async fn two_mentions_of_one_type_are_scored_from_their_own_evidence() {
 // ---------------------------------------------------------------------------
 
 /// `(case, the document writing the mention once, the document writing it again,
-/// Type, the mention)`.
+/// Type, the mention, whether the second document FRAMES both writings alike)`.
 ///
 /// The rows differ along the kind of evidence that found the mention — a lexicon
 /// entry, a closed form, a designator inside the name — so the corroboration is not a
-/// property of one rule class.
-const REPEATED: &[(&str, &str, &str, &str, &str)] = &[
+/// property of one rule class. The last field says whether the document puts both
+/// writings in the same kind of place: the corroboration itself belongs to the
+/// document, so where it does, both writings carry one confidence, and where it does
+/// not (one writing opening a sentence, where orthography accounts for its capital,
+/// the other standing inside one) the writing the document frames more weakly is
+/// reported below the other.
+const REPEATED: &[(&str, &str, &str, &str, &str, bool)] = &[
     (
         "a name the place lexicon spells out",
         "They expanded into Portugal.",
         "They expanded into Portugal and later left Portugal.",
         "LOCATION",
         "Portugal",
+        true,
     ),
     (
         "a closed calendar form",
@@ -211,6 +224,7 @@ const REPEATED: &[(&str, &str, &str, &str, &str)] = &[
         "The outage began on 2024-01-15 and the report is dated 2024-01-15.",
         "DATE",
         "2024-01-15",
+        true,
     ),
     (
         "a name a legal-form designator types",
@@ -218,6 +232,7 @@ const REPEATED: &[(&str, &str, &str, &str, &str)] = &[
         "Acme Widgets LLC filed the papers, and Acme Widgets LLC paid the fee.",
         "ORGANIZATION",
         "Acme Widgets LLC",
+        false,
     ),
 ];
 
@@ -226,14 +241,14 @@ async fn a_mention_the_document_writes_again_is_scored_above_one_written_once() 
     let comprehend = Comprehend::new();
     let documents: Vec<&str> = REPEATED
         .iter()
-        .flat_map(|(_, once, again, _, _)| [*once, *again])
+        .flat_map(|(_, once, again, ..)| [*once, *again])
         .collect();
     let answers = batched_entities(&comprehend, &documents).await;
 
-    for (position, (case, _, _, entity_type, mention)) in REPEATED.iter().enumerate() {
+    for (position, (case, _, _, entity_type, mention, framed_alike)) in REPEATED.iter().enumerate() {
         let written_once = score_of(case, &answers[position * 2], mention, entity_type);
         // The repeated mention is reported twice, and the corroboration belongs to the
-        // document, so both writings carry it.
+        // document, so every writing carries it.
         let repeated = &answers[position * 2 + 1];
         let writings: Vec<f64> = repeated
             .iter()
@@ -246,24 +261,38 @@ async fn a_mention_the_document_writes_again_is_scored_above_one_written_once() 
             "case {case:?}: expected {mention:?} to be reported at both of its writings, got \
              {repeated:?}"
         );
-        assert_eq!(
-            distinct(writings.iter().copied()),
-            1,
-            "case {case:?}: the corroboration belongs to the document, so expected both \
-             writings of {mention:?} to carry one confidence, got {writings:?}"
-        );
-        assert!(
-            writings[0] > written_once,
-            "case {case:?}: expected {mention:?} written twice to be scored above the same \
-             mention written once, got {} against {written_once}",
-            writings[0]
-        );
-        assert!(
-            writings[0] < 1.0,
-            "case {case:?}: a corroborated reading is still a confidence, so expected a Score \
-             below 1, got {}",
-            writings[0]
-        );
+        for (which, writing) in writings.iter().enumerate() {
+            assert!(
+                *writing > written_once,
+                "case {case:?}: expected writing {which} of {mention:?} in a document that \
+                 writes it twice to be scored above the same mention written once, got \
+                 {writing} against {written_once}"
+            );
+            assert!(
+                *writing < 1.0,
+                "case {case:?}: a corroborated reading is still a confidence, so expected \
+                 writing {which} to be scored below 1, got {writing}"
+            );
+        }
+        if *framed_alike {
+            assert_eq!(
+                distinct(writings.iter().copied()),
+                1,
+                "case {case:?}: the corroboration belongs to the document and this document \
+                 frames both writings of {mention:?} alike, so expected one confidence, got \
+                 {writings:?}"
+            );
+        } else {
+            // The first writing opens a sentence, where English's orthography accounts
+            // for the capital it is written with, so its reading rests on less than the
+            // reading of the writing standing inside a sentence.
+            assert!(
+                writings[1] > writings[0],
+                "case {case:?}: expected the writing of {mention:?} standing inside a \
+                 sentence to be scored above the one opening it, got {:?}",
+                writings
+            );
+        }
     }
 }
 
@@ -277,7 +306,7 @@ async fn a_batched_document_is_scored_exactly_as_the_single_document_operation_s
     let documents: Vec<&str> = PAIRS
         .iter()
         .map(|(_, document, ..)| *document)
-        .chain(REPEATED.iter().map(|(_, _, again, _, _)| *again))
+        .chain(REPEATED.iter().map(|(_, _, again, ..)| *again))
         .collect();
     let batched = batched_entities(&comprehend, &documents).await;
     // Repeating the batch returns the same answer: nothing about a detection depends
@@ -571,6 +600,142 @@ async fn a_closed_forms_confidence_follows_the_characters_it_fixes_and_how_tight
             spelled_out > *score,
             "case {case:?}: expected {lexicon_mention:?}, which the lexicon spells out, to be \
              scored above a loosely fixed form, got {spelled_out} against {score}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. The confidence is a reading of the mention IN ITS DOCUMENT
+// ---------------------------------------------------------------------------
+
+/// `(case, the document that frames the mention with nothing, the document that frames
+/// it, Type, the mention, what the framing document writes around it)`.
+///
+/// ONE surface form, ONE type, ONE rule class, TWO documents: the characters of the
+/// mention carry the same evidence in both, so a confidence that is a function of the
+/// span — of its length, of the rule that fired on it, of its category — answers both
+/// documents the same. It is not: what the document writes around the mention bears on
+/// the reading, so the framed writing is reported above the bare one.
+///
+/// The rows differ along the KIND of framing, which is what the rule generalises over —
+/// an honorific and a verb that takes a human argument standing beside a personal
+/// name, a legal-form designator beside a company's name, a geographic head noun
+/// beside a place name, and a place name the document coordinates another with — and
+/// so along the Type as well, so no single lexicon or category is what the rule rests
+/// on.
+const FRAMED: &[(&str, &str, &str, &str, &str, &str)] = &[
+    (
+        "a personal name an honorific and a verb of saying frame",
+        "The claim lists Jane Doe as the buyer.",
+        "The claim was filed by Dr. Jane Doe, who told the court the same.",
+        "PERSON",
+        "Jane Doe",
+        "an honorific, the agent preposition of a passive and a verb English fills the \
+         human argument of",
+    ),
+    (
+        "a company's name a second designator frames",
+        "The fee was paid by Acme Widgets LLC.",
+        "The fee was paid by Acme Widgets LLC, a subsidiary of the Globex holdings group.",
+        "ORGANIZATION",
+        "Acme Widgets LLC",
+        "two further institution words standing outside the name",
+    ),
+    (
+        "a place name a geographic head noun frames",
+        "The shipment cleared customs in Chile.",
+        "The shipment cleared customs in Chile, a republic on the coast.",
+        "LOCATION",
+        "Chile",
+        "two generic geographic feature terms standing outside the name",
+    ),
+    (
+        "a place name the document coordinates another place with",
+        "They expanded into Chile last year.",
+        "They expanded into Portugal and Chile last year.",
+        "LOCATION",
+        "Chile",
+        "a coordinated place name, whose own characters bear on the reading of its \
+         conjunct",
+    ),
+];
+
+#[tokio::test]
+async fn one_mention_is_scored_from_the_framing_its_own_document_gives_it() {
+    let comprehend = Comprehend::new();
+    let documents: Vec<&str> = FRAMED
+        .iter()
+        .flat_map(|(_, bare, framed, ..)| [*bare, *framed])
+        .collect();
+    let answers = batched_entities(&comprehend, &documents).await;
+
+    for (position, (case, _, _, entity_type, mention, framing)) in FRAMED.iter().enumerate() {
+        let bare = score_of(case, &answers[position * 2], mention, entity_type);
+        let framed = score_of(case, &answers[position * 2 + 1], mention, entity_type);
+        assert!(
+            (framed - bare).abs() > 1e-6,
+            "case {case:?}: expected {mention:?} to be scored from the evidence its own \
+             document leaves it, got the same value {framed} in both documents"
+        );
+        assert!(
+            framed > bare,
+            "case {case:?}: expected {mention:?} to be scored above the unframed writing \
+             ({framing}), got {framed} against {bare}"
+        );
+    }
+}
+
+/// `(case, the document opening a sentence with the mention, the document writing it
+/// inside one, Type, the mention)`.
+///
+/// English's orthography puts a capital on a sentence's first word whatever the word
+/// is, so that capital is no evidence that the characters name anything: the same
+/// mention therefore rests on less at the head of a sentence than inside one. The rows
+/// differ along the rule class that typed the span — a lexicon entry naming every
+/// token, a legal-form designator naming one token of three, and the fallback that
+/// places a capitalized phrase in no category at all — so the reading of a capital is
+/// not a property of one rule.
+const SENTENCE_POSITION: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "a name the place lexicon spells out",
+        "Portugal raised the quota again.",
+        "The quota Portugal raised was published.",
+        "LOCATION",
+        "Portugal",
+    ),
+    (
+        "a name a legal-form designator types",
+        "Acme Widgets LLC paid the fee.",
+        "The fee was paid by Acme Widgets LLC.",
+        "ORGANIZATION",
+        "Acme Widgets LLC",
+    ),
+    (
+        "a capitalized phrase no rule places",
+        "Zorblax Initiative published its findings.",
+        "The findings came from Zorblax Initiative.",
+        "OTHER",
+        "Zorblax Initiative",
+    ),
+];
+
+#[tokio::test]
+async fn a_capital_a_sentence_boundary_explains_is_not_evidence_of_a_name() {
+    let comprehend = Comprehend::new();
+    let documents: Vec<&str> = SENTENCE_POSITION
+        .iter()
+        .flat_map(|(_, opening, inside, ..)| [*opening, *inside])
+        .collect();
+    let answers = batched_entities(&comprehend, &documents).await;
+
+    for (position, (case, _, _, entity_type, mention)) in SENTENCE_POSITION.iter().enumerate() {
+        let opening = score_of(case, &answers[position * 2], mention, entity_type);
+        let inside = score_of(case, &answers[position * 2 + 1], mention, entity_type);
+        assert!(
+            inside > opening,
+            "case {case:?}: the capital of a sentence's first word is orthography rather than \
+             evidence, so expected {mention:?} written inside a sentence to be scored above \
+             the same mention opening one, got {inside} against {opening}"
         );
     }
 }

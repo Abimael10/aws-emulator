@@ -17,10 +17,15 @@
 //! of them, which is what a client highlighting or redacting the mention needs. Its
 //! `Score` is computed from THAT detection's own evidence ([`Evidence`]) — how much
 //! the rule that fired constrains the characters, how many of the mention's own
-//! characters it accounts for, whether the document writes the mention again, and
-//! what else those characters could be — so it is a per-detection confidence rather
-//! than a constant of the rule class or of the type: two mentions of one type in one
-//! document are reported with the confidence each one's characters leave.
+//! characters it accounts for, whether the capital it is written with is evidence or
+//! the orthography of a sentence's first word, how the document frames the mention
+//! (the cue words beside it, the mentions it is coordinated with,
+//! [`framing_chars`]), whether the document writes the mention again, and what else
+//! those characters could be — so it is a per-detection confidence rather than a
+//! constant of the rule class, of the type, or of the mention's length: two mentions
+//! of one type in one document are reported with the confidence each one's own
+//! characters and surroundings leave, and one mention is read with the confidence the
+//! document it stands in leaves it rather than with a value belonging to the span.
 //!
 //! That tally is reported on the scale a confidence is read on, not on the scale it
 //! was tallied in: the one reading no evidence closes off weighs a few hundredths of
@@ -295,6 +300,35 @@ const EVIDENCE_PER_NAME_SHAPE_CHAR: f64 = 0.6;
 /// corroborates every rule above, and says less about a short token — an
 /// abbreviation, a sentence's first word — than about a long one.
 const EVIDENCE_PER_CAPITALIZED_CHAR: f64 = 0.25;
+
+/// Evidence one character of the document's own FRAMING of the mention holds: a
+/// character the document writes AROUND the span that bears on the reading reported
+/// — a cue word for that reading standing beside the mention, or a mention the
+/// document coordinates this one with ([`framing_chars`]).
+///
+/// Framing says what the document expects to stand in that place, and it names none
+/// of the mention's own characters, so it is the weakest reader this recogniser has:
+/// below even the orthography of a capital INSIDE the span
+/// ([`EVIDENCE_PER_CAPITALIZED_CHAR`]), which is at least a property of the
+/// characters reported. It is what makes a confidence a reading of the mention IN ITS
+/// DOCUMENT rather than of the mention alone: the same span, framed differently by
+/// two documents, is read with the confidence each document's own words leave it.
+const EVIDENCE_PER_FRAMING_CHAR: f64 = 0.1;
+
+/// How far either side of a mention [`framing_chars`] reads the document's framing of
+/// it.
+///
+/// A clause either side, which is as far as what the document writes bears on one
+/// mention, and a constant per detection — so a document carrying thousands of
+/// mentions costs a constant each rather than a scan of all of them. The window never
+/// crosses a sentence boundary, whatever its width: another sentence's words frame
+/// their own mentions.
+const FRAMING_WINDOW_BYTES: usize = 120;
+
+/// The most characters that may stand between two mentions the document coordinates
+/// ([`coordinating_gap`]): room for the conjunction English joins two names with and
+/// the spaces and comma around it, and no room for a clause.
+const COORDINATION_GAP_BYTES: usize = 8;
 
 /// Evidence one FURTHER writing of the same mention, read the same way, holds: a
 /// document that writes a name again corroborates the reading, so a mention the
@@ -1253,9 +1287,10 @@ fn complete_date_mention(text: &str, start: usize, end: usize) -> (usize, usize)
     // Each side is searched over a WINDOW of the document rather than over all of it
     // in front of (or behind) every date, so a document carrying thousands of dates
     // costs a constant per date instead of a scan of the whole text.
-    let start = match prefix.find(&text[window_start(text, start)..start]) {
+    let lookbehind = window_start(text, start, MENTION_COMPLETION_WINDOW_BYTES);
+    let start = match prefix.find(&text[lookbehind..start]) {
         Some(modifier) => {
-            let candidate = window_start(text, start) + modifier.start();
+            let candidate = lookbehind + modifier.start();
             // The window may cut a longer word down to a modifier (`unnext`), which
             // the slice's own start reads as a word boundary; the document's
             // character in front of it is what decides.
@@ -1271,7 +1306,7 @@ fn complete_date_mention(text: &str, start: usize, end: usize) -> (usize, usize)
         }
         None => start,
     };
-    let end = match suffix.find(&text[end..window_end(text, end)]) {
+    let end = match suffix.find(&text[end..window_end(text, end, MENTION_COMPLETION_WINDOW_BYTES)]) {
         Some(day_part) => {
             let candidate = end + day_part.end();
             // Likewise behind: a day part the window cut short (`mornings`) is not
@@ -1291,25 +1326,26 @@ fn complete_date_mention(text: &str, start: usize, end: usize) -> (usize, usize)
     (start, end)
 }
 
-/// Where the lookbehind of [`complete_date_mention`] starts: at most
-/// [`MENTION_COMPLETION_WINDOW_BYTES`] before `start`, on a character boundary.
+/// Where a lookbehind of `width` bytes in front of `start` begins, on a character
+/// boundary.
 ///
-/// A modifier run is a handful of short words, so the window is a constant and no
-/// mention is completed out of text far away from it.
-fn window_start(text: &str, start: usize) -> usize {
-    let mut floor = start.saturating_sub(MENTION_COMPLETION_WINDOW_BYTES);
+/// What every backward look at the text around a mention is bounded by — the modifier
+/// run [`complete_date_mention`] completes a date out of, the framing
+/// [`framing_chars`] reads beside a detection — so each one costs a CONSTANT per
+/// mention rather than a scan of everything in front of it, and nothing is read out
+/// of text far away from the mention.
+fn window_start(text: &str, start: usize, width: usize) -> usize {
+    let mut floor = start.saturating_sub(width);
     while floor < start && !text.is_char_boundary(floor) {
         floor += 1;
     }
     floor
 }
 
-/// Where the lookahead of [`complete_date_mention`] ends: the counterpart of
+/// Where a lookahead of `width` bytes behind `end` stops: the counterpart of
 /// [`window_start`].
-fn window_end(text: &str, end: usize) -> usize {
-    let mut ceiling = end
-        .saturating_add(MENTION_COMPLETION_WINDOW_BYTES)
-        .min(text.len());
+fn window_end(text: &str, end: usize, width: usize) -> usize {
+    let mut ceiling = end.saturating_add(width).min(text.len());
     while ceiling > end && !text.is_char_boundary(ceiling) {
         ceiling -= 1;
     }
@@ -1679,6 +1715,31 @@ fn capitalized_chars(text: &str, tokens: &[Token], phrase: Range<usize>) -> usiz
         .max(1)
 }
 
+/// How many characters of the phrase carry a capital that is EVIDENCE of a name.
+///
+/// The capitalized characters of the span, less those of its first word where that
+/// word opens a sentence: English's orthography puts a capital on a sentence's first
+/// word whatever the word is, so that capital says nothing about whether the
+/// characters name anything — the same reading of a capital the candidate pass itself
+/// applies ([`phrase_entities`]). A mention therefore carries less orthographic
+/// evidence at the head of a sentence than the same mention written inside one, which
+/// is a property of the place the document puts it in.
+///
+/// At least one, for the reason [`capitalized_chars`] gives: a candidate span is
+/// anchored on a capitalized token, so its orthographic evidence is never reported as
+/// nil.
+fn evidential_capitalized_chars(text: &str, tokens: &[Token], phrase: Range<usize>) -> usize {
+    let head = &tokens[phrase.start];
+    let explained_by_orthography = if head.sentence_initial && head.capitalized {
+        text[head.start..head.end].chars().count()
+    } else {
+        0
+    };
+    capitalized_chars(text, tokens, phrase)
+        .saturating_sub(explained_by_orthography)
+        .max(1)
+}
+
 /// Whether the span is written the way English writes a personal name: two or more
 /// tokens, the first and the last capitalized, every token either capitalized
 /// (a given name, a middle initial, a surname) or one of the particles a name
@@ -1776,11 +1837,12 @@ fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option
                 end: written_end,
                 entity_type,
                 // The lexicon spells out every character of the span, so nothing in
-                // it is unaccounted for; the orthography of the name corroborates it.
+                // it is unaccounted for; the orthography of the name corroborates it,
+                // except where the sentence boundary is what explains the capital.
                 evidence: Evidence {
                     support: EVIDENCE_PER_LEXICON_CHAR * written_chars as f64
                         + EVIDENCE_PER_CAPITALIZED_CHAR
-                            * capitalized_chars(text, tokens, phrase.clone()) as f64,
+                            * evidential_capitalized_chars(text, tokens, phrase.clone()) as f64,
                     competing: 0.0,
                 },
                 priority: 1,
@@ -1827,12 +1889,12 @@ fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option
         .map(|token| token.lower.clone())
         .collect();
     // What every rule below weighs its evidence over: the characters of each token
-    // of the span, the characters of the span as a whole, and the characters the
-    // document capitalized.
+    // of the span, the characters of the span as a whole, and the characters whose
+    // capital the document's own writing makes evidence of a name.
     let chars_of = token_chars(text, tokens, phrase.clone());
     let span_chars: usize = chars_of.iter().sum();
     let head_chars = chars_of.first().copied().unwrap_or_default();
-    let capitalized = capitalized_chars(text, tokens, phrase.clone());
+    let capitalized = evidential_capitalized_chars(text, tokens, phrase.clone());
     // One typed reading of the span, weighed from the evidence that typed it: the
     // rule's own strength over the characters it names, corroborated by the span's
     // orthography, against the reading in which the characters that evidence does NOT
@@ -1961,10 +2023,12 @@ fn resolve_overlaps(mut found: Vec<Recognised>) -> Vec<Recognised> {
 /// Weigh in what the REST of the document says about each mention: a name the
 /// document writes again, read the same way, corroborates that reading.
 ///
-/// The evidence is a property of the document rather than of one occurrence — every
-/// writing of the mention carries it — so a caller reads the same confidence whichever
-/// occurrence it looks at, and a mention written once is left exactly as its own span
-/// weighed.
+/// This piece of the evidence is a property of the document rather than of one
+/// occurrence — every writing of the mention carries the same count of further
+/// writings — so it never depends on which occurrence a caller looks at. What the
+/// occurrence itself stands in is weighed separately ([`framing_chars`]), so two
+/// writings of one name are reported with one confidence only where the document
+/// frames them alike.
 fn corroborate_repeated_mentions(text: &str, found: &mut [Recognised]) {
     // One pass to count each reading, so the weighing stays linear in the number of
     // detections however many mentions a document carries.
@@ -1984,6 +2048,165 @@ fn corroborate_repeated_mentions(text: &str, found: &mut [Recognised]) {
     }
 }
 
+/// Whether one of this recogniser's own cue lexicons reads `word`, standing BESIDE a
+/// span, as announcing the reading `entity_type`.
+///
+/// The same words that type a span from inside it or from the position in front of it
+/// — an honorific, a verb English fills the human argument of, a legal-form
+/// designator, a geographic or event head noun — read as framing when the document
+/// writes them beside the mention instead: `… reviewed by Jane Doe` says a person
+/// stands there as surely as `Dr. Jane Doe` does. One list per reading, so a word that
+/// announces a person is no evidence about a place.
+///
+/// A reading the recogniser has no cue lexicon for (a closed calendar or measurement
+/// form, a title, the untyped fallback) is framed by nothing: such a form is read off
+/// the characters it fixes, and no list of words beside it bears on that.
+fn is_framing_cue(entity_type: &str, word: &str) -> bool {
+    match entity_type {
+        TYPE_PERSON => {
+            person_titles().contains(word)
+                || person_predicates().contains(word)
+                || person_role_markers().contains(word)
+        }
+        TYPE_ORGANIZATION => organization_designators().contains(word),
+        TYPE_LOCATION => geographic_designators().contains(word),
+        TYPE_EVENT => event_designators().contains(word),
+        _ => false,
+    }
+}
+
+/// Whether the characters between two mentions are English COORDINATING them into one
+/// list: whitespace and commas, and the conjunctions that join two names (`Portugal
+/// and Chile`, `on Monday or Tuesday`), and nothing else.
+///
+/// A line break ends a mention's surroundings as it ends a mention itself
+/// ([`continues_span`]), and a clause between two names is not a coordination — it is
+/// the document saying two separate things — so the gap is bounded by
+/// [`COORDINATION_GAP_BYTES`].
+fn coordinating_gap(gap: &str) -> bool {
+    if gap.is_empty() || gap.len() > COORDINATION_GAP_BYTES || gap.contains('\n') {
+        return false;
+    }
+    gap.split(|character: char| character.is_whitespace() || character == ',')
+        .all(|word| word.is_empty() || word.eq_ignore_ascii_case("and") || word.eq_ignore_ascii_case("or"))
+}
+
+/// How many characters of FRAMING the document writes around one detection: the
+/// evidence for the reading that stands outside the mention's own characters.
+///
+/// Two things frame a reading, and both are the document's own words rather than the
+/// rule's:
+///
+/// * a cue word for that reading standing beside the mention, inside the same
+///   sentence and within [`FRAMING_WINDOW_BYTES`] of it ([`is_framing_cue`]) — what
+///   the document says it expects to stand there;
+/// * a mention the document COORDINATES this one with ([`coordinating_gap`]) — a
+///   conjunct of a place is a place, so the characters of the name beside it bear on
+///   this reading too.
+///
+/// `neighbours` are the detections the document writes immediately before and after
+/// this one; a coordination admits nothing between the two mentions but a conjunction,
+/// so no further detection can be in one with this.
+///
+/// `head` is the index of the first token at or after the span, which the caller
+/// advances across the document, so reading one mention's framing costs a constant
+/// rather than a scan of the token list.
+fn framing_chars(
+    text: &str,
+    tokens: &[Token],
+    head: usize,
+    entity: &Recognised,
+    neighbours: [Option<&Recognised>; 2],
+) -> usize {
+    let mut chars = 0;
+    let floor = window_start(text, entity.start, FRAMING_WINDOW_BYTES);
+    let ceiling = window_end(text, entity.end, FRAMING_WINDOW_BYTES);
+
+    // In front of the mention, back to the first word of its sentence or to the edge
+    // of the window, whichever comes first.
+    for index in (0..head).rev() {
+        let token = &tokens[index];
+        if token.start < floor {
+            break;
+        }
+        if is_framing_cue(entity.entity_type, &token.lower) {
+            chars += text[token.start..token.end].chars().count();
+        }
+        if token.sentence_initial {
+            break;
+        }
+    }
+    // And behind it, up to the word that opens the next sentence or the edge of the
+    // window. The span's own tokens are skipped: what they hold is the evidence the
+    // rule that fired already weighed.
+    for token in tokens.iter().skip(head) {
+        if token.end > ceiling || token.sentence_initial && token.start >= entity.end {
+            break;
+        }
+        if token.start >= entity.end && is_framing_cue(entity.entity_type, &token.lower) {
+            chars += text[token.start..token.end].chars().count();
+        }
+    }
+
+    for neighbour in neighbours.into_iter().flatten() {
+        if neighbour.entity_type != entity.entity_type {
+            continue;
+        }
+        let gap = if neighbour.end <= entity.start {
+            &text[neighbour.end..entity.start]
+        } else if entity.end <= neighbour.start {
+            &text[entity.end..neighbour.start]
+        } else {
+            continue;
+        };
+        if coordinating_gap(gap) {
+            chars += text[neighbour.start..neighbour.end]
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .count();
+        }
+    }
+    chars
+}
+
+/// Weigh in how the document FRAMES each mention, so the confidence reported is the
+/// one the mention's own surroundings leave it.
+///
+/// The rules that fired on a span weigh its own characters, and nothing else about
+/// the place the document puts it in: two mentions whose characters carry the same
+/// evidence would otherwise be reported with one value however differently their
+/// documents introduce them. What the document writes around a mention is evidence
+/// about that mention ([`framing_chars`]), so it is weighed here — once, over every
+/// detection, whichever rule class found it, since framing is a property of the
+/// document and not of the rule.
+///
+/// `found` is in document order, as [`resolve_overlaps`] leaves it, which is what lets
+/// the pass walk the tokens and the detections together and stay linear in the size of
+/// the document.
+fn weigh_document_framing(text: &str, found: &mut [Recognised]) {
+    let tokens = tokenize(text);
+    let mut framing: Vec<usize> = Vec::with_capacity(found.len());
+    let mut head = 0;
+    for (position, entity) in found.iter().enumerate() {
+        while head < tokens.len() && tokens[head].end <= entity.start {
+            head += 1;
+        }
+        framing.push(framing_chars(
+            text,
+            &tokens,
+            head,
+            entity,
+            [
+                position.checked_sub(1).and_then(|before| found.get(before)),
+                found.get(position + 1),
+            ],
+        ));
+    }
+    for (entity, chars) in found.iter_mut().zip(framing) {
+        entity.evidence.support += EVIDENCE_PER_FRAMING_CHAR * chars as f64;
+    }
+}
+
 /// Every entity the recogniser finds in `text`, as the modelled `Entity` list:
 /// ordered by position, each carrying the characters it covers, the modelled type,
 /// the zero-based CHARACTER offsets of that stretch and the confidence its own
@@ -2000,6 +2223,7 @@ pub fn detect_entities(text: &str) -> Vec<Entity> {
     let mut found = pattern_entities(text);
     found.extend(phrase_entities(text));
     let mut recognised = resolve_overlaps(found);
+    weigh_document_framing(text, &mut recognised);
     corroborate_repeated_mentions(text, &mut recognised);
     recognised
         .into_iter()
