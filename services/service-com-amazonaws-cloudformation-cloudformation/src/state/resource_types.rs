@@ -679,6 +679,7 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // AWS Lake Formation
     "AWS::LakeFormation::DataLakeSettings",
     "AWS::LakeFormation::Permissions",
+    "AWS::LakeFormation::PrincipalPermissions",
     "AWS::LakeFormation::Resource",
     // AWS Lambda
     "AWS::Lambda::Alias",

@@ -1265,6 +1265,15 @@ pub(super) enum Provisioner {
     /// the association is read back through the resources Certificate Manager reports as using
     /// the certificate ([`mediaconvert_certificates`]).
     MediaConvertCertificateAssociation,
+    /// `AWS::LakeFormation::Permissions` and `AWS::LakeFormation::PrincipalPermissions`: ONE
+    /// grant of Lake Formation permissions, which that service's own `GrantPermissions`
+    /// records for the principal and the Data Catalog resource the declaration names and
+    /// `RevokePermissions` takes away again. A grant declares no name of its own: what
+    /// identifies it is the pair it binds, which is what each type's `Ref` returns
+    /// ([`lake_formation_permissions`]). Which of the two types the declaration is travels
+    /// with the variant, the spelling of the declaration being all that differs between them
+    /// ([`lake_formation_permissions::Grant`]).
+    LakeFormationPermissions(lake_formation_permissions::Grant),
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -1485,6 +1494,14 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         MEDIACONVERT_CERTIFICATE_ASSOCIATION => {
             Some(Provisioner::MediaConvertCertificateAssociation)
         }
+        // Each Lake Formation grant names which of the two types it is, so the one set of
+        // arms serves both; the catalogue still lists every provisioned type here.
+        LAKEFORMATION_PERMISSIONS => Some(Provisioner::LakeFormationPermissions(
+            lake_formation_permissions::Grant::Legacy,
+        )),
+        LAKEFORMATION_PRINCIPAL_PERMISSIONS => Some(Provisioner::LakeFormationPermissions(
+            lake_formation_permissions::Grant::Principal,
+        )),
         _ => None,
     }
 }
@@ -1709,6 +1726,14 @@ impl Provisioner {
             // propagated to one.
             Self::MediaConvertCertificateAssociation => {
                 associate_mediaconvert_certificate(ctx, region, resource).await
+            }
+            // Neither Lake Formation permission type publishes a `Tags` property and neither
+            // `GrantPermissions` nor `RevokePermissions` takes one: a grant is not a taggable
+            // resource — that service holds tags on the LF-tags its own tagging calls name —
+            // so no tags are propagated to one, and the declared document IS the grant
+            // ([`lake_formation_permissions`]).
+            Self::LakeFormationPermissions(grant) => {
+                grant_lake_formation_permissions(ctx, region, grant, resource).await
             }
             // An `AWS::Glue::Job`'s properties ARE `CreateJob`'s own members, so the
             // declared document is the request, with the one member CloudFormation decides
@@ -3235,6 +3260,13 @@ impl Provisioner {
             Self::GlueTable => update_glue_table(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // Lake Formation publishes no call that SETS the permissions a grant carries, so
+            // a changed declaration reaches it as the revoke of what the grant no longer
+            // carries and the grant of what it adds — the two calls a client makes
+            // ([`update_lake_formation_permissions`]).
+            Self::LakeFormationPermissions(grant) => {
+                update_lake_formation_permissions(ctx, region, grant, resource, declared).await
+            }
             Self::GlueCrawler => update_glue_crawler(ctx, region, resource, declared)
                 .await
                 .map(Some),
@@ -3919,6 +3951,12 @@ impl Provisioner {
             // deletes take the whole record rather than the id.
             Self::GlueDatabase => delete_glue_database(ctx, region, resource).await,
             Self::GlueTable => delete_glue_table(ctx, region, resource).await,
+            // A grant is revoked by the very request that made it — the principal, the
+            // resource and the permissions it carries — so the revoke takes the whole record
+            // rather than the id, and it takes away exactly what the stack granted.
+            Self::LakeFormationPermissions(grant) => {
+                revoke_lake_formation_permissions(ctx, region, grant, resource).await
+            }
             Self::GlueCrawler => delete_glue_crawler(ctx, region, physical_resource_id).await,
             // An optimizer is addressed by the four values that service keys one by, which
             // the resource's own declaration carries — so the delete takes the whole record
@@ -4493,6 +4531,13 @@ mod glue_table_optimizers;
 /// that service really accepts the certificate and Certificate Manager's own report names it
 /// as using one.
 mod mediaconvert_certificates;
+/// The two LAKE FORMATION PERMISSION types' arms: the one grant an
+/// `AWS::LakeFormation::Permissions` or an `AWS::LakeFormation::PrincipalPermissions`
+/// declares, made in the service that owns it so a client's own `ListPermissions` reads back
+/// what the stack granted. Visible to the rest of this service's state because both types'
+/// own NAMES live here, beside the arms that provision them, and the return-value catalogue
+/// computes each type's published identity from the same rules.
+pub(in crate::state) mod lake_formation_permissions;
 mod data_and_storage;
 /// The in-place CHANGE of an `AWS::KinesisFirehose::DeliveryStream`, beside the create and
 /// delete arms [`data_and_storage`] holds for the same owning service: applying a changed
@@ -4641,6 +4686,7 @@ use rbin_rules::*;
 use neptune_graphs::*;
 use glue_table_optimizers::*;
 use mediaconvert_certificates::*;
+use lake_formation_permissions::*;
 use iam_identities::*;
 use data_and_storage::*;
 use firehose_delivery_streams::*;

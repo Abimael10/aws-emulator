@@ -28,6 +28,15 @@ pub use edge_and_api_identities::*;
 pub use type_names::*;
 pub use outputs::*;
 
+// The two Lake Formation permission types: their own NAMES and the projections of what each
+// publishes live beside the arms that provision the grant
+// ([`crate::state::provisioner::lake_formation_permissions`]), so this catalogue and the
+// provisioner cannot disagree about what identifies one.
+pub(super) use crate::state::provisioner::lake_formation_permissions;
+pub(super) use crate::state::provisioner::lake_formation_permissions::{
+    LAKEFORMATION_PERMISSIONS, LAKEFORMATION_PRINCIPAL_PERMISSIONS,
+};
+
 /// A DNS name with its terminal dot dropped, which is how CloudFormation reports the name of
 /// a resource whose return value IS a DNS record name.
 ///
@@ -113,6 +122,13 @@ pub(super) fn service_assigned_document(name: &str, attribute: &str) -> String {
 /// a document built from them is byte-for-byte the same on every read.
 pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str] {
     match resource_type {
+        // The newer Lake Formation permission type publishes the two halves of its composite
+        // primary identifier, and nothing else: the principal the grant was made to and the
+        // Data Catalog resource it is on.
+        LAKEFORMATION_PRINCIPAL_PERMISSIONS => &[
+            lake_formation_permissions::PRINCIPAL_IDENTIFIER_PROPERTY,
+            lake_formation_permissions::RESOURCE_IDENTIFIER_PROPERTY,
+        ],
         ACMPCA_CERTIFICATE_AUTHORITY => &["Arn", "CertificateSigningRequest"],
         ACMPCA_CERTIFICATE => &["Arn", "Certificate"],
         ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION => &["CompleteCertificateChain"],

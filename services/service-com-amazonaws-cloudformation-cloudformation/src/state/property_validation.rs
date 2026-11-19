@@ -41,6 +41,11 @@
 //!   {<type>}]` the stage reports ([`typed_properties::type_failure_reason`]);
 //! * a property whose contract publishes the values it admits, carrying a value that is not
 //!   one of them, over the rows this emulator holds ([`CONSTRAINED_PROPERTIES`]);
+//! * a property whose type's REGISTRY SCHEMA states the values it admits as an `enum`,
+//!   carrying one it does not state — in a list-valued property, in any element of it — over
+//!   the rows this emulator holds ([`enum_properties::ENUM_PROPERTIES`]), which is the
+//!   schema validator's own `<value> is not a valid enum value. …`
+//!   ([`enum_properties::enum_failure_reason`]);
 //! * a property whose contract publishes the PATTERN its values match, carrying a value
 //!   outside it, over the rows this emulator holds
 //!   ([`patterned_properties::PATTERNED_PROPERTIES`]), which is the
@@ -115,6 +120,11 @@ pub mod patterned_properties;
 /// Which TYPE a property's value has to have, which is the first question its schema makes
 /// decidable about that value.
 pub mod typed_properties;
+
+/// The values a type's REGISTRY SCHEMA states for a property, and the sentence that schema's
+/// own validator reports a value outside them with — including a LIST-valued property, whose
+/// every element is held to the set.
+pub mod enum_properties;
 
 /// One property whose admitted values its type's contract publishes.
 #[derive(Debug, Clone, Copy)]
@@ -418,7 +428,9 @@ const PROPERTIES_SECTION: &str = "Properties";
 /// set), then that every member it does carry is one the type HAS
 /// ([`declared_properties`]), then the `oneOf` over those members, and last each value
 /// against what its property states about a value — the TYPE it states
-/// ([`typed_properties`]), then the set it publishes, and then the pattern it admits
+/// ([`typed_properties`]), then the set it publishes (the one this emulator knows from the
+/// type's property reference, [`CONSTRAINED_PROPERTIES`], and the one its registry schema
+/// states as an `enum`, [`enum_properties`]), and then the pattern it admits
 /// ([`patterned_properties`]), since a value of another type is no value of a published set
 /// and a value outside such a set is not one of its values whatever it is spelled like.
 pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
@@ -428,6 +440,7 @@ pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
             .or_else(|| matched_several_subschemas(resource))
             .or_else(|| typed_properties::value_of_another_type(resource))
             .or_else(|| inadmissible_value(resource))
+            .or_else(|| enum_properties::value_outside_its_enum(resource))
             .or_else(|| patterned_properties::value_outside_its_pattern(resource))
     })
 }

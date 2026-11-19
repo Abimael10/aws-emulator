@@ -2654,6 +2654,41 @@ pub(crate) fn return_values(
                 ec2_gateway_attachment_identity(&resolved).unwrap_or_else(|| name.to_string());
             (identity, attributes)
         }
+        // The two LAKE FORMATION PERMISSION types, each of which declares ONE grant and no
+        // name: what identifies a grant is the pair it binds, so that pair is the physical id
+        // the type's `Ref` returns ([`crate::state::provisioner::lake_formation_permissions`]
+        // holds both projections, beside the arms that make the grant).
+        //
+        // The newer type's primary identifier is COMPOSITE, and its two halves are the two
+        // read-only properties it publishes: `Fn::GetAtt PrincipalIdentifier` is the
+        // `DataLakePrincipal` the grant was made to and `Fn::GetAtt ResourceIdentifier` the
+        // `Resource` it is on, each as the structure that shape is — so the id is those two
+        // joined with the separator a composite identifier is joined with.
+        LAKEFORMATION_PRINCIPAL_PERMISSIONS => {
+            let declared = resolve(properties, scope, budget).unwrap_or(Value::Null);
+            let principal = lake_formation_permissions::principal_identifier(&declared);
+            let resource = lake_formation_permissions::resource_identifier(&declared);
+            let identity = format!("{principal}{COMPOSITE_IDENTITY_SEPARATOR}{resource}");
+            attributes.insert(
+                lake_formation_permissions::PRINCIPAL_IDENTIFIER_PROPERTY.to_string(),
+                principal,
+            );
+            attributes.insert(
+                lake_formation_permissions::RESOURCE_IDENTIFIER_PROPERTY.to_string(),
+                resource,
+            );
+            (identity, attributes)
+        }
+        // The legacy type publishes no `Fn::GetAtt` attribute at all, and its id is the
+        // principal together with the ARN of the Data Catalog resource the grant is on. A
+        // declaration that names neither describes no grant, and such a resource keeps the
+        // identifier the naming rules computed.
+        LAKEFORMATION_PERMISSIONS => {
+            let declared = resolve(properties, scope, budget).unwrap_or(Value::Null);
+            let identity = lake_formation_permissions::legacy_identity(&declared, region)
+                .unwrap_or_else(|| name.to_string());
+            (identity, attributes)
+        }
         _ => (name.to_string(), attributes),
     }
 }

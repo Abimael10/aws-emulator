@@ -2126,6 +2126,13 @@ fn identity_depends_on_another_resource(resource_type: &str) -> bool {
             // `MergedApiIdentifier` names.
             | APPSYNC_CHANNEL_NAMESPACE
             | APPSYNC_SOURCE_API_ASSOCIATION
+            // The two Lake Formation permission types are two more: a grant is identified by
+            // the PRINCIPAL it was made to and the Data Catalog resource it is on, and a
+            // declaration states the principal as an `Fn::GetAtt` of the role of the same
+            // template — so neither type's identity, nor the halves of it the newer one
+            // publishes, can be computed before that role has one.
+            | crate::state::provisioner::lake_formation_permissions::LAKEFORMATION_PERMISSIONS
+            | crate::state::provisioner::lake_formation_permissions::LAKEFORMATION_PRINCIPAL_PERMISSIONS
     )
 }
 
@@ -2931,7 +2938,16 @@ enum Characters {
 /// [`crate::state::registry::aws_published`]): the registry reports an extension for a
 /// resource type this emulator carries the return values of, and nothing for a name it
 /// knows nothing about. Keep it in step with the `match` in [`return_values`] — one entry
-/// per arm.
+/// per arm that publishes an `Fn::GetAtt` ATTRIBUTE.
+///
+/// An arm that publishes none has no entry: what the registry reports for an entry is that
+/// type's schema, built from the attribute NAMES
+/// ([`published_attribute_names`](crate::state::template::published_attribute_names)), and
+/// `every_implemented_resource_type_has_known_return_values` holds every entry to at least
+/// one of them. Several arms are in that position — `AWS::Route53::RecordSet`, whose `Ref` is
+/// the record name without its terminal dot, `AWS::EC2::Route` and
+/// `AWS::LakeFormation::Permissions`, whose `Ref` is the pair that identifies the binding —
+/// each computing a physical id of its own and publishing no attribute to report.
 ///
 /// It is NOT the set [`crate::state::provisioning`] creates in the owning service: the two
 /// questions are independent — a type can have published return values this module knows
@@ -3051,6 +3067,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     IAM_ACCESS_KEY,
     "AWS::IAM::Role",
     KMS_KEY,
+    // The newer Lake Formation permission type, publishing the two halves of the composite
+    // identifier of the grant it declares.
+    crate::state::provisioner::lake_formation_permissions::LAKEFORMATION_PRINCIPAL_PERMISSIONS,
     FIREHOSE_DELIVERY_STREAM,
     KINESIS_STREAM,
     "AWS::Lambda::Function",

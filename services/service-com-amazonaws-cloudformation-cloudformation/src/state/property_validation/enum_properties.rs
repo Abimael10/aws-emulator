@@ -1,0 +1,323 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The set of values a resource type's REGISTRY SCHEMA states for a property, and the
+//! sentence the schema validator reports a value outside it with.
+//!
+//! A resource type whose schema the registry holds is validated AGAINST that schema before
+//! its handler is invoked, and a property the schema declares an `enum` for admits those
+//! values and no other — so a declaration carrying one the schema does not state is one no
+//! handler of the type could ever be given. The pre-deployment stage reports it, quoting the
+//! rejected value and the values the property admits at that property's own path, and the
+//! operation deploys nothing.
+//!
+//! That sentence is the SCHEMA VALIDATOR's ([`enum_failure_reason`]), which is what a client
+//! reads for a type validated that way — not the `Property validation failure: […]` form
+//! [`super::failure_reason`] words for a property whose admitted set this emulator knows from
+//! the type's published property reference alone. That is why this is a module of its own
+//! rather than another column on [`super::CONSTRAINED_PROPERTIES`]: the two catalogues answer
+//! the same QUESTION from different sources — a type's registry schema here, its published
+//! property reference there — and a source decides both the set and the sentence a value
+//! outside it is refused with, which is the same split the sibling questions of that stage
+//! are already in ([`super::declared_properties`], [`super::patterned_properties`]).
+//!
+//! A LIST-valued property is judged ELEMENT BY ELEMENT, because what the schema states the
+//! `enum` on is the list's items: every element is held to the set, the first element outside
+//! it is what the stage reports, and the path it reports names THAT element — the element's
+//! INDEX under the property it sits in, which is the form a recorded refusal of a list-valued
+//! property carries ([`element_path`]).
+//!
+//! The catalogue is the same kind as the rest of that stage's: one row per (resource type,
+//! property) whose schema-stated value set this emulator knows, so a property no row covers
+//! is left to the service that owns the resource rather than guessed at — and a value that is
+//! not text (an expression this service left unevaluated, a structure the author wrote where
+//! the schema states a string) is admitted here, because it is no value of the set either way.
+
+use ::serde_json::Value;
+
+use super::{declared_properties::property_path, PropertyFailure, StoredResource};
+
+/// One property whose admitted values its type's registry schema states as an `enum`.
+#[derive(Debug, Clone, Copy)]
+pub struct EnumProperty {
+    /// The resource type the property belongs to, as a template declares it.
+    pub resource_type: &'static str,
+    /// The property's name, as a template spells it.
+    pub property: &'static str,
+    /// The values the schema states, in the order it declares them — which is also the order
+    /// a refusal lists them in, since what the author has to act on is the set as the schema
+    /// publishes it.
+    pub values: &'static [&'static str],
+}
+
+/// The `enum` the registry schema of `AWS::LakeFormation::PrincipalPermissions` states for
+/// the items of its two permission lists, in the order that schema states them.
+///
+/// These are the values of Lake Formation's own `Permission`
+/// (`smithy_query(query="shape", shape="Permission")` of the `lakeformation` model: "Lake
+/// Formation defines privileges to grant and revoke access to metadata in the Data Catalog
+/// and data organized in underlying data storage"), in that enum's declaration order, AS THE
+/// TYPE'S SCHEMA CARRIES THEM. The model has since added three more —
+/// `CREATE_LF_TAG_EXPRESSION`, `CREATE_CATALOG` and `SUPER_USER` — which this type's schema
+/// does not state, so a declaration naming one of those is refused by the schema exactly as
+/// any other value outside it is, and the set a refusal lists back is this one. What a
+/// client may grant through Lake Formation's own `GrantPermissions` is the API's whole enum;
+/// what a TEMPLATE of this type may declare is what its schema states.
+pub const LAKEFORMATION_PERMISSIONS_VALUES: &[&str] = &[
+    "ALL",
+    "SELECT",
+    "ALTER",
+    "DROP",
+    "DELETE",
+    "INSERT",
+    "DESCRIBE",
+    "CREATE_DATABASE",
+    "CREATE_TABLE",
+    "DATA_LOCATION_ACCESS",
+    "CREATE_LF_TAG",
+    "ASSOCIATE",
+    "GRANT_WITH_LF_TAG_EXPRESSION",
+];
+
+/// The properties this stage knows a schema-stated value set of.
+///
+/// Source for each row: the `enum` the resource type's REGISTRY SCHEMA states for the
+/// property. That is the set the schema validation holds a declaration to — a value outside
+/// it never reaches the owning service at all — and it is not always the whole of the enum
+/// that service's own API publishes today ([`LAKEFORMATION_PERMISSIONS_VALUES`] says where
+/// the two differ for the row below).
+///
+/// The rows are the two permission lists an
+/// `AWS::LakeFormation::PrincipalPermissions` grants with: `Permissions`, "the permissions
+/// granted … on the resource", and `PermissionsWithGrantOption`, "indicates a list of the
+/// granted permissions that the principal may pass to other users" — each a `PermissionList`
+/// of Lake Formation's own `Permission` enum
+/// ([`LAKEFORMATION_PERMISSIONS_VALUES`]).
+pub const ENUM_PROPERTIES: &[EnumProperty] = &[
+    EnumProperty {
+        resource_type:
+            crate::state::provisioner::lake_formation_permissions::LAKEFORMATION_PRINCIPAL_PERMISSIONS,
+        property: "Permissions",
+        values: LAKEFORMATION_PERMISSIONS_VALUES,
+    },
+    EnumProperty {
+        resource_type:
+            crate::state::provisioner::lake_formation_permissions::LAKEFORMATION_PRINCIPAL_PERMISSIONS,
+        property: "PermissionsWithGrantOption",
+        values: LAKEFORMATION_PERMISSIONS_VALUES,
+    },
+];
+
+/// `Some(failure)` for a resource carrying a value outside the set its type's schema states
+/// for a property ([`ENUM_PROPERTIES`]) — the first such property in the order the catalogue
+/// states them, and within a list-valued one the first element outside the set; `None` for a
+/// type with no row, for a property the declaration does not carry, and for every value the
+/// schema admits.
+pub(super) fn value_outside_its_enum(resource: &StoredResource) -> Option<PropertyFailure> {
+    ENUM_PROPERTIES
+        .iter()
+        .filter(|row| row.resource_type == resource.resource_type)
+        .find_map(|row| {
+            let (at, rejected) = judged_values(resource.properties.get(row.property))
+                .into_iter()
+                .find(|(_, value)| !row.values.contains(value))?;
+            Some(PropertyFailure {
+                logical_id: resource.logical_id.clone(),
+                resource_type: resource.resource_type.clone(),
+                reason: enum_failure_reason(rejected, row.values),
+                path: element_path(&resource.logical_id, row.property, at),
+            })
+        })
+}
+
+/// The path the judged value sits at: the property itself where the declaration states a
+/// single value, and the ELEMENT of it where the declaration states a list.
+///
+/// `OperationEvent$ValidationPath` is "the path within the resource where the validation was
+/// applied", and for a list-valued property what was judged is one element of it: the index
+/// is part of the path a refusal of such a property carries
+/// (`/Resources/<LogicalId>/Properties/<Property>/<index>`), since what the author has to act
+/// on is the element they wrote and not the list.
+fn element_path(logical_id: &str, property: &str, at: Option<usize>) -> String {
+    let path = property_path(logical_id, property);
+    match at {
+        Some(at) => format!("{path}/{at}"),
+        None => path,
+    }
+}
+
+/// The values of one declared property this stage judges, each with its place in the list
+/// where the declaration states one: the value itself where the declaration states a single
+/// value, and every element where it states a LIST of them.
+///
+/// Only TEXT is judged, for the reason the module docs give — a value that is not text is no
+/// value of the set either way — so an element that is not text is passed over while every
+/// element keeps its own place, and the index a failure reports is the element's own.
+fn judged_values(declared: Option<&Value>) -> Vec<(Option<usize>, &str)> {
+    match declared {
+        Some(Value::String(value)) => vec![(None, value.as_str())],
+        Some(Value::Array(values)) => values
+            .iter()
+            .enumerate()
+            .filter_map(|(at, value)| value.as_str().map(|value| (Some(at), value)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// How the schema validator reports a value outside the set its property's schema states:
+/// fixed text around the VALUE the declaration carried and the values the property admits.
+///
+/// Both variable parts are what was judged — the value is the declaration's own, the set the
+/// one its property is held to ([`ENUM_PROPERTIES`]) — and the value is quoted back, as it is
+/// for a value outside its pattern, because a rejected value is only actionable beside the
+/// set it had to be in.
+pub fn enum_failure_reason(value: &str, values: &[&str]) -> String {
+    format!(
+        "{value} is not a valid enum value. Supported values: [{}]",
+        values.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::serde_json::json;
+    use ::std::collections::BTreeMap;
+
+    /// One declared resource of `resource_type` carrying `properties`.
+    fn declared(logical_id: &str, resource_type: &str, properties: Value) -> StoredResource {
+        StoredResource {
+            logical_id: logical_id.to_string(),
+            resource_type: resource_type.to_string(),
+            physical_resource_id: format!("{logical_id}-physical"),
+            attributes: BTreeMap::new(),
+            metadata: None,
+            properties,
+            materialised: false,
+            deletion_policy: None,
+            update_replace_policy: None,
+        }
+    }
+
+    /// The type whose rows the table below is about.
+    const PRINCIPAL_PERMISSIONS: &str =
+        crate::state::provisioner::lake_formation_permissions::LAKEFORMATION_PRINCIPAL_PERMISSIONS;
+
+    /// One row of the table: the case, the type declared, its property document, and the
+    /// `(property, index, value)` the stage must report — `None` where every judged value is
+    /// one the schema admits.
+    type EnumRow<'a> = (&'a str, &'a str, Value, Option<(&'a str, usize, &'a str)>);
+
+    /// RULE: a value outside the set its type's schema states for the property fails the
+    /// validation, quoting that value and that set at the path of the ELEMENT that carries it,
+    /// and a value the set admits does not — in a list-valued property, element by element.
+    ///
+    /// The rows span what the rule generalises over: which property carries the value, where
+    /// in the list it sits, how many values the list carries, values the set admits
+    /// (including ones the report that led here did not cite), the forms a value can take,
+    /// and a type the catalogue holds no row for.
+    #[test]
+    fn a_value_outside_its_schemas_enum_fails_the_validation() {
+        let rows: &[EnumRow] = &[
+            (
+                "the only permission granted is not one of them",
+                PRINCIPAL_PERMISSIONS,
+                json!({"Permissions": ["NOT_A_PERMISSION"]}),
+                Some(("Permissions", 0, "NOT_A_PERMISSION")),
+            ),
+            (
+                "the second of three is not one of them",
+                PRINCIPAL_PERMISSIONS,
+                json!({"Permissions": ["SELECT", "WRITE", "DESCRIBE"]}),
+                Some(("Permissions", 1, "WRITE")),
+            ),
+            (
+                "a permission that differs from one of them only in case",
+                PRINCIPAL_PERMISSIONS,
+                json!({"Permissions": ["describe"]}),
+                Some(("Permissions", 0, "describe")),
+            ),
+            (
+                "the grant-option list carries one that is not",
+                PRINCIPAL_PERMISSIONS,
+                json!({"Permissions": ["SELECT"],
+                       "PermissionsWithGrantOption": ["SELECT", "GRANT"]}),
+                Some(("PermissionsWithGrantOption", 1, "GRANT")),
+            ),
+            (
+                "every value the set admits, in both lists",
+                PRINCIPAL_PERMISSIONS,
+                json!({"Permissions": LAKEFORMATION_PERMISSIONS_VALUES,
+                       "PermissionsWithGrantOption": LAKEFORMATION_PERMISSIONS_VALUES}),
+                None,
+            ),
+            (
+                "a value the set admits that the report leading here did not cite",
+                PRINCIPAL_PERMISSIONS,
+                json!({"Permissions": ["DATA_LOCATION_ACCESS", "GRANT_WITH_LF_TAG_EXPRESSION"]}),
+                None,
+            ),
+            (
+                // A value the OWNING API's enum carries and this type's schema does not: the
+                // schema is what a declaration is held to, so it is refused like any other
+                // value outside the set.
+                "a permission the API has added since the type's schema was published",
+                PRINCIPAL_PERMISSIONS,
+                json!({"Permissions": ["SELECT", "SUPER_USER"]}),
+                Some(("Permissions", 1, "SUPER_USER")),
+            ),
+            (
+                "an empty list, which carries no value to judge",
+                PRINCIPAL_PERMISSIONS,
+                json!({"Permissions": []}),
+                None,
+            ),
+            (
+                "a list carrying an element that is not text",
+                PRINCIPAL_PERMISSIONS,
+                json!({"Permissions": [{"Fn::ImportValue": "Granted"}]}),
+                None,
+            ),
+            (
+                "a list whose first element is not text and whose second is rejected",
+                PRINCIPAL_PERMISSIONS,
+                json!({"Permissions": [{"Fn::ImportValue": "Granted"}, "NOT_A_PERMISSION"]}),
+                Some(("Permissions", 1, "NOT_A_PERMISSION")),
+            ),
+            (
+                "a property reading a value that has not landed yet",
+                PRINCIPAL_PERMISSIONS,
+                json!({"Permissions": Value::Null}),
+                None,
+            ),
+            (
+                "a type this stage knows no value set of",
+                crate::state::provisioner::lake_formation_permissions::LAKEFORMATION_PERMISSIONS,
+                json!({"Permissions": ["NOT_A_PERMISSION"]}),
+                None,
+            ),
+        ];
+        for (case, resource_type, properties, reported) in rows {
+            let resources = vec![declared("R", resource_type, properties.clone())];
+            let failed = super::super::failure(&resources);
+            let expected = reported.map(|(property, at, value)| {
+                let values = ENUM_PROPERTIES
+                    .iter()
+                    .find(|row| row.resource_type == *resource_type && row.property == property)
+                    .map(|row| row.values)
+                    .unwrap_or_default();
+                (
+                    enum_failure_reason(value, values),
+                    format!("/Resources/R/Properties/{property}/{at}"),
+                )
+            });
+            assert_eq!(
+                failed
+                    .as_ref()
+                    .map(|failure| (failure.reason.clone(), failure.path.clone())),
+                expected,
+                "case {case:?}: expected the failure {expected:?}, got {failed:?}"
+            );
+        }
+    }
+}

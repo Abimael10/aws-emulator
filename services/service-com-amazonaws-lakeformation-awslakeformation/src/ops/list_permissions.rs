@@ -331,9 +331,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every grant the filters select, keyed by the identity it is REPORTED under, so
         // the page below walks one entry per (principal, resource, condition) triple in a
-        // stable order a continuation token can resume from. The explicit records go in
-        // first, so an entry that carries both reports what was granted ahead of what the
-        // database was created holding.
+        // stable order a continuation token can resume from. An entry that several records
+        // report into carries their union, in the order the `Permission` enum declares its
+        // values ([`crate::state::merge_reported_grant`]), so what it reports does not
+        // depend on which of them this walk read first.
         //
         // What this holds is bounded by the three stores it reads, none of which a
         // request can grow past its ceiling: `crate::state::MAX_PERMISSION_GRANTS` explicit

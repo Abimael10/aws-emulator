@@ -154,7 +154,9 @@ pub struct LfTag {
 /// `GrantPermissions` idempotent and `ListPermissions` answer exactly one entry for a
 /// repeated grant. Both permission lists are kept as sets in first-granted order, and a
 /// record whose two sets are both empty is dropped rather than kept as an entry with no
-/// permissions at all.
+/// permissions at all. An entry that reports SEVERAL of these records carries their union in
+/// the order the `Permission` enum declares its values ([`reported_permissions`]), there
+/// being no grant order across records.
 #[derive(Debug, Clone, Default)]
 pub struct PermissionGrant {
     /// The Data Catalog the grant was made in ([`resolve_catalog_id`]).
@@ -200,6 +202,61 @@ impl PermissionGrant {
             last_updated_by: None,
         }
     }
+}
+
+/// The values of `Permission` in the order that enum DECLARES them
+/// (`smithy_query(query="shape", shape="Permission")`, whose `values` are in declaration
+/// order), which is the order a MERGED entry's permissions are reported in
+/// ([`reported_permissions`]).
+///
+/// Spelled out here because the generated [`crate::ops::types::PERMISSION_VALUES`] carries
+/// the same values SORTED, and what this order is about is the enum's own succession; one
+/// test asserts the two name exactly the same set.
+pub const PERMISSION_DECLARATION_ORDER: &[&str] = &[
+    "ALL",
+    "SELECT",
+    "ALTER",
+    "DROP",
+    "DELETE",
+    "INSERT",
+    "DESCRIBE",
+    "CREATE_DATABASE",
+    "CREATE_TABLE",
+    "DATA_LOCATION_ACCESS",
+    "CREATE_LF_TAG",
+    "ASSOCIATE",
+    "GRANT_WITH_LF_TAG_EXPRESSION",
+    "CREATE_LF_TAG_EXPRESSION",
+    "CREATE_CATALOG",
+    "SUPER_USER",
+];
+
+/// The UNION of the permissions several records hold, as the entry reporting them all
+/// carries it: the values held, in the order the `Permission` enum declares them
+/// ([`PERMISSION_DECLARATION_ORDER`]).
+///
+/// One record's own two lists are held in the order that record was granted them in, which is
+/// the order they are reported in. An entry that reports SEVERAL records has no such order —
+/// a principal's own grant and a group's grant resolved onto it were made independently of
+/// each other — so what it reports is the union as a SET, in the enum's own succession: a
+/// principal holding `DESCRIBE` in its own name and `ALL` through a group is reported holding
+/// `ALL` then `DESCRIBE`, whichever record the listing read first.
+///
+/// A value the enum does not carry cannot be in a record — neither write path records one
+/// ([`unmodelled_permissions`]) — and one that somehow were is reported after the modelled
+/// values in the order it is held, so nothing a record holds is dropped from the answer.
+pub fn reported_permissions(held: &[String]) -> Vec<String> {
+    let mut reported: Vec<String> = PERMISSION_DECLARATION_ORDER
+        .iter()
+        .filter(|declared| held.iter().any(|permission| permission == *declared))
+        .map(|declared| (*declared).to_string())
+        .collect();
+    reported.extend(
+        held.iter()
+            .filter(|permission| !PERMISSION_DECLARATION_ORDER.contains(&permission.as_str()))
+            .cloned(),
+    );
+    reported
 }
 
 /// Per-service state for com-amazonaws-lakeformation-awslakeformation. A handler reaches it through [`service_state`].
@@ -1097,7 +1154,10 @@ pub fn effective_principal_holds(queried: &str, grant_principal: &str) -> bool {
 /// Two grants reported under one identity — a principal's own record and a group grant
 /// resolved onto it — are ONE entry carrying the union of both, because a listing reports
 /// one entry per (principal, resource, condition) triple and re-attributing a group grant
-/// must not open a second entry for a triple that already has one.
+/// must not open a second entry for a triple that already has one. That union is reported in
+/// the order the `Permission` enum declares its values ([`reported_permissions`]): the
+/// records were granted independently of each other, so the order either of them was granted
+/// in says nothing about the set they together hold.
 pub fn merge_reported_grant(
     reported: &mut BTreeMap<String, PermissionGrant>,
     grant: &PermissionGrant,
@@ -1120,6 +1180,9 @@ pub fn merge_reported_grant(
                 &mut held.permissions_with_grant_option,
                 &grant.permissions_with_grant_option,
             );
+            held.permissions = reported_permissions(&held.permissions);
+            held.permissions_with_grant_option =
+                reported_permissions(&held.permissions_with_grant_option);
         }
         None => {
             reported.insert(key, grant);

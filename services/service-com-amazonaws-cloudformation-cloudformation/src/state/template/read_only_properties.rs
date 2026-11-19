@@ -48,6 +48,17 @@ pub const READ_ONLY_PROPERTIES: &[ReadOnlyProperties] = &[
         resource_type: super::APIGATEWAYV2_API,
         read_only: &["ApiEndpoint", "ApiId", "ExecuteApiArn"],
     },
+    // `AWS::LakeFormation::PrincipalPermissions`: the two halves of the grant's composite
+    // primary identifier, which the type's handler computes from the principal and the
+    // resource the declaration names and no create or update accepts.
+    ReadOnlyProperties {
+        resource_type:
+            crate::state::provisioner::lake_formation_permissions::LAKEFORMATION_PRINCIPAL_PERMISSIONS,
+        read_only: &[
+            crate::state::provisioner::lake_formation_permissions::PRINCIPAL_IDENTIFIER_PROPERTY,
+            crate::state::provisioner::lake_formation_permissions::RESOURCE_IDENTIFIER_PROPERTY,
+        ],
+    },
 ];
 
 /// The properties of `resource_type` its schema marks read-only ([`READ_ONLY_PROPERTIES`]),

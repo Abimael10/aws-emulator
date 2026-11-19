@@ -670,6 +670,11 @@ impl Provisioner {
                 describe_mediaconvert_certificate_association(ctx, region, physical_resource_id)
                     .await
             }
+            // Lake Formation's own read of what the principal the grant names holds on the
+            // resource it is on, out of the listing of that resource's own grants.
+            Self::LakeFormationPermissions(grant) => {
+                describe_lake_formation_permissions(ctx, region, grant, resource).await
+            }
         }
     }
 }
