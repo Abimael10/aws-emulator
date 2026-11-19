@@ -14,7 +14,7 @@
 //! has been through, how a document fails to be JSON, which operation carries the
 //! stale revision id), and the single-statement document is only one row.
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::web_function_lifecycle::{build_config, percent_encoded, role_arn, Emulator, Reply};
 
@@ -1154,5 +1154,177 @@ async fn every_resource_policy_refusal_carries_only_a_message() {
                 refused.body
             );
         }
+    }
+}
+
+/// A policy document the language accepts, carrying `sid` so a reader can tell
+/// WHICH generation it is reading back: that is what makes a refused mutation
+/// observably a no-op rather than merely "a policy is still there".
+fn policy_with_sid(sid: &str, resource_arn: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": sid,
+            "Effect": "Allow",
+            "Principal": { "AWS": "111122223333" },
+            "Action": "lambda:InvokeFunction",
+            "Resource": resource_arn,
+        }],
+    })
+    .to_string()
+}
+
+/// The `Sid` of the first statement of the document `reply` reports, for a
+/// reader's answer about a policy written by [`policy_with_sid`].
+fn reported_sid(case: &str, reply: &Reply) -> String {
+    let document = reply
+        .string("Policy")
+        .unwrap_or_else(|| panic!("case {case}: expected a Policy member, got {:?}", reply.body));
+    let parsed: Value = serde_json::from_str(&document)
+        .unwrap_or_else(|_| panic!("case {case}: the reported document is JSON: {document:?}"));
+    parsed
+        .pointer("/Statement/0/Sid")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case}: the reported document keeps its Sid: {document:?}"))
+        .to_string()
+}
+
+#[tokio::test]
+async fn the_two_mutating_resource_policy_operations_do_not_share_one_conflict_sentence() {
+    // RULE: a stale `revisionId` is refused by each mutating resource-policy
+    // operation in that OPERATION's own fixed sentence, so the two refusals of one
+    // and the same conflict — same stored generation, same supplied id, same 409
+    // and `ConflictException` — are distinguishable by their text alone, and the
+    // refusal changes nothing: the stored generation still reads back, and the
+    // current id still deletes it, after which the readers report no policy.
+    //
+    // The rows differ along what the rule generalises over: how many generations
+    // the policy has been through, and how the supplied id came to be stale (a
+    // superseded generation's id, one generation back or three, and a well-formed
+    // id this service never minted at all).
+    type StaleId = fn(&[String]) -> String;
+    let rows: [(&str, usize, StaleId); 4] = [
+        ("one generation, an id this service never minted", 1, |_| {
+            "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string()
+        }),
+        ("two generations, the id one generation back", 2, |chain| {
+            chain[chain.len() - 2].clone()
+        }),
+        (
+            "four generations, the id three generations back",
+            4,
+            |chain| chain[0].clone(),
+        ),
+        (
+            "three generations, the all-zero id, well-formed but never minted",
+            3,
+            |_| "00000000-0000-0000-0000-000000000000".to_string(),
+        ),
+    ];
+
+    for (row, (case, generations, stale_id)) in rows.into_iter().enumerate() {
+        let emulator = Emulator::new();
+        let name = format!("policy-conflict-wording-{row}");
+        let arn = create_function(&emulator, &name).await;
+
+        // Successive generations of the policy, each one a document a reader can
+        // name: the last `Sid` written is the one that has to survive a refusal.
+        let mut chain: Vec<String> = Vec::new();
+        let mut written = String::new();
+        for generation in 0..generations {
+            let sid = format!("gen{generation}");
+            let document = policy_with_sid(&sid, &arn);
+            let put = put_policy(&emulator, &arn, &document, None).await;
+            assert_eq!(
+                put.status, 200,
+                "case {case:?} (generation {generation}): PutResourcePolicy expected 200, got {} \
+                 with {:?}",
+                put.status, put.body
+            );
+            let (_, revision_id) = reported(case, &put);
+            chain.push(revision_id);
+            written = sid;
+        }
+        let current = chain
+            .last()
+            .expect("every row writes at least one generation")
+            .clone();
+
+        let stale = stale_id(&chain);
+        assert!(
+            is_modelled_revision_id(&stale) && stale != current,
+            "case {case:?}: the supplied id is a well-formed id that is not the current one, \
+             got {stale:?} against {current:?}"
+        );
+
+        // ONE conflict, reported by both mutating operations: same status, same
+        // code, and each operation's OWN sentence — so neither may report the
+        // other's.
+        let refused_delete = delete_policy(&emulator, &arn, Some(&stale)).await;
+        assert_conflict(
+            case,
+            "DeleteResourcePolicy",
+            &refused_delete,
+            &[&stale, &current, &arn, &name],
+        );
+        let refused_put =
+            put_policy(&emulator, &arn, &policy_with_sid("rejected", &arn), Some(&stale)).await;
+        assert_conflict(
+            case,
+            "PutResourcePolicy",
+            &refused_put,
+            &[&stale, &current, &arn, &name],
+        );
+
+        let delete_message = refused_delete.string("message").unwrap_or_default();
+        let put_message = refused_put.string("message").unwrap_or_default();
+        assert_ne!(
+            delete_message, put_message,
+            "case {case:?}: the delete's and the put's stale-revision sentences are each their \
+             own, got {delete_message:?} for both"
+        );
+
+        // The refusals changed nothing: the generation that was stored still reads
+        // back, at the id that was current all along.
+        let held = get_policy(&emulator, &arn).await;
+        assert_eq!(
+            held.status, 200,
+            "case {case:?}: GetResourcePolicy after the refusals expected 200, got {} with {:?}",
+            held.status, held.body
+        );
+        assert_eq!(
+            reported_sid(case, &held),
+            written,
+            "case {case:?}: a refused mutation leaves the stored generation as it was, got {:?}",
+            held.body
+        );
+        assert_eq!(
+            held.string("RevisionId").as_deref(),
+            Some(current.as_str()),
+            "case {case:?}: a refused mutation leaves the revision id as it was, got {:?}",
+            held.body
+        );
+
+        // And the id that IS current still deletes, after which the reader reports
+        // the no-policy sentence.
+        let deleted = delete_policy(&emulator, &arn, Some(&current)).await;
+        assert_eq!(
+            deleted.status, 204,
+            "case {case:?}: DeleteResourcePolicy with the current id expected 204, got {} \
+             with {:?}",
+            deleted.status, deleted.body
+        );
+        let gone = get_policy(&emulator, &arn).await;
+        assert_eq!(
+            gone.status, 404,
+            "case {case:?}: GetResourcePolicy after the delete expected 404, got {} with {:?}",
+            gone.status, gone.body
+        );
+        assert_eq!(
+            gone.string("message").as_deref(),
+            Some(POLICY_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the no-policy sentence, got {:?}",
+            gone.body
+        );
     }
 }
