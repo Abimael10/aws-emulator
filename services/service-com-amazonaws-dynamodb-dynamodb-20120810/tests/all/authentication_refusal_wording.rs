@@ -9,7 +9,9 @@
 //! refused with this service's unknown-credential code (`UnrecognizedClientException`)
 //! carrying AWS's fixed sentence; a request whose key id DOES resolve, whose signature does
 //! not verify under that credential's secret, failed the SIGNATURE and is refused
-//! `InvalidSignatureException` with the SigV4 layer's own sentence. Neither is
+//! `InvalidSignatureException` with the SigV4 layer's own sentence — at the status a fault in
+//! the request's own signature material carries rather than the one an identity failure does
+//! (`tests/all/signature_presentation_refusals.rs` owns that half of the rule). Neither is
 //! `AccessDenied`: that is what a KNOWN principal is answered for an action its policies do
 //! not permit, and an SDK branches on exactly this difference — it re-resolves its credential
 //! chain on an authentication failure and reports a policy problem on an authorization one.
@@ -27,25 +29,23 @@
 //! are read from the module that owns them (`service_common::authentication_refusal`) and
 //! only the CODES — which are this service's own — are stated here.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService;
 use service_common::authentication_refusal::{
     SIGNATURE_MISMATCH_MESSAGE, UNRESOLVED_CREDENTIAL_MESSAGE,
 };
-use smithy_server_runtime::MultiServiceRouter;
 
-use crate::emulator::{call, REGION};
+use crate::emulator::{call, error_type, message, signed_at, verifying_emulator, REGION};
 
 /// The code AWS answers a request whose signing credential resolves to nothing with, on an
 /// `awsJson` endpoint. An authentication outcome, so it is NOT `AccessDenied`.
 const UNRESOLVED_CREDENTIAL_CODE: &str = "UnrecognizedClientException";
 
 /// The code AWS answers a request whose credential DID resolve and whose signature did not
-/// verify with, on an `awsJson` endpoint.
-const SIGNATURE_MISMATCH_CODE: &str = "InvalidSignatureException";
+/// verify with, on an `awsJson` endpoint — named, as that layer's own refusals are, in the
+/// namespace this endpoint's SigV4 layer declares its classes in
+/// (`tests/all/signature_presentation_refusals.rs` pins the rest of that layer).
+const SIGNATURE_MISMATCH_CODE: &str = "com.amazon.coral.service#InvalidSignatureException";
 
 /// The authorization denial, which no row below may be answered: it is what a resolved
 /// principal gets for an action its policies do not permit.
@@ -56,30 +56,9 @@ const AUTHORIZATION_DENIAL: &str = "AccessDenied";
 /// the parse.
 const WRONG_SIGNATURE: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-/// The instant every request below signs at, in SigV4's own `YYYYMMDDTHHMMSSZ` form, and the
-/// scope date it falls on — read from the CLOCK rather than written down, because a request
-/// signed at a fixed instant is refused for the difference between that instant and the
-/// current time once the clock has moved past the window SigV4 admits, and what these rows
-/// are about is the CREDENTIAL. Both halves come from one reading, so the scope date and the
-/// signing instant can never name different days.
-fn signed_at() -> (String, String) {
-    let rendered = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .expect("the current instant renders in RFC 3339");
-    let (date, time) = rendered
-        .split_once('T')
-        .expect("an RFC 3339 instant separates its date and time with 'T'");
-    let date: String = date.chars().filter(|held| held.is_ascii_digit()).collect();
-    let time: String = time
-        .chars()
-        .filter(|held| held.is_ascii_digit())
-        .take(6)
-        .collect();
-    (format!("{date}T{time}Z"), date)
-}
-
 /// The table a MUTATION row names, so the store can be read afterwards to show the refused
-/// write never happened.
+/// write never happened. The instant each request signs at, and the scope date it falls on,
+/// are the harness's ([`signed_at`]).
 const REFUSED_TABLE: &str = "AuthenticationRefusalWording";
 
 /// Which credential a row presents.
@@ -117,24 +96,6 @@ fn calls() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// A router serving only this service with request authentication ON, plus the access key id
-/// the emulator published for this run — the one credential a refusal has RESOLVED.
-fn authenticating_emulator() -> (MultiServiceRouter, String) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(true);
-    let access_key_id = match router.vended_credentials().into_iter().next() {
-        Some(emulator_server::VendedCredentials::AwsAccessKey { access_key_id, .. }) => {
-            access_key_id
-        }
-        other => panic!(
-            "with authentication on the emulator must vend a SigV4 key pair, got {other:?}"
-        ),
-    };
-    router.register_service(EmulatedService::new(engine));
-    (router, access_key_id)
-}
-
 /// The published key id with its last character replaced, which is a key id of the issued
 /// form that the emulator holds no credential for.
 fn one_character_off(access_key_id: &str) -> String {
@@ -149,7 +110,7 @@ fn one_character_off(access_key_id: &str) -> String {
 /// Dispatch one `awsJson1_0` call signed with `access_key_id` and a signature that is not
 /// the one the emulator computes, answering the HTTP status and the parsed body.
 async fn signed_call(
-    router: &MultiServiceRouter,
+    router: &smithy_server_runtime::MultiServiceRouter,
     access_key_id: &str,
     operation: &str,
     body: &Value,
@@ -177,62 +138,71 @@ async fn signed_call(
     (status, parsed)
 }
 
-/// The error code and message of an `awsJson` failure document.
+/// The error code and message of an `awsJson` failure document, read through the harness's
+/// own readers ([`error_type`] for the whole `__type` a client reads, [`message`] for the
+/// sentence).
 fn reported(answer: &Value) -> (String, String) {
-    let field = |name: &str| {
-        answer
-            .get(name)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    };
-    (field("__type"), field("message"))
+    (error_type(answer), message(answer))
 }
 
-/// One row: the credential the request presented, and the code and sentence AWS answers for
-/// that credential's failure.
+/// One row: the credential the request presented, and the status, code and sentence AWS
+/// answers for that credential's failure.
 struct Row {
     case: &'static str,
     presented: Presented,
+    status: u16,
     code: &'static str,
     message: &'static str,
 }
+
+/// The status an identity failure is refused with: no principal was found for the request,
+/// so nothing could be authorized.
+const IDENTITY_FAILURE_STATUS: u16 = 403;
+
+/// The status a failure of the request's own SIGNATURE is refused with: what is at fault is
+/// the material the request carried, which is the client's to fix.
+const SIGNATURE_FAILURE_STATUS: u16 = 400;
 
 /// Every credential failure is answered with the code AWS names for THAT failure on this
 /// protocol, with AWS's fixed sentence — and never with the authorization denial.
 #[tokio::test]
 async fn a_credential_failure_is_answered_with_the_code_aws_names_for_it() {
-    let (mut router, published) = authenticating_emulator();
+    let (mut router, published) = verifying_emulator();
     let off_by_one = one_character_off(&published);
 
     let rows = vec![
         Row {
             case: "a never-issued long-term key id",
             presented: Presented::NeverIssued("AKIAIOSFODNN7EXAMPLE"),
+            status: IDENTITY_FAILURE_STATUS,
             code: UNRESOLVED_CREDENTIAL_CODE,
             message: UNRESOLVED_CREDENTIAL_MESSAGE,
         },
         Row {
             case: "a never-issued temporary key id",
             presented: Presented::NeverIssued("ASIAIOSFODNN7EXAMPLE"),
+            status: IDENTITY_FAILURE_STATUS,
             code: UNRESOLVED_CREDENTIAL_CODE,
             message: UNRESOLVED_CREDENTIAL_MESSAGE,
         },
         Row {
             case: "a never-issued key id of the emulator's own form",
             presented: Presented::NeverIssued("EMULATORDEADBEEF0123"),
+            status: IDENTITY_FAILURE_STATUS,
             code: UNRESOLVED_CREDENTIAL_CODE,
             message: UNRESOLVED_CREDENTIAL_MESSAGE,
         },
         Row {
             case: "a key id one character off one the emulator holds",
             presented: Presented::OneCharacterOffThePublishedKey,
+            status: IDENTITY_FAILURE_STATUS,
             code: UNRESOLVED_CREDENTIAL_CODE,
             message: UNRESOLVED_CREDENTIAL_MESSAGE,
         },
         Row {
             case: "a key id the emulator holds, with a signature that does not verify",
             presented: Presented::PublishedKey,
+            status: SIGNATURE_FAILURE_STATUS,
             code: SIGNATURE_MISMATCH_CODE,
             message: SIGNATURE_MISMATCH_MESSAGE,
         },
@@ -241,6 +211,7 @@ async fn a_credential_failure_is_answered_with_the_code_aws_names_for_it() {
     for Row {
         case,
         presented,
+        status: expected_status,
         code: expected_code,
         message: expected_message,
     } in rows
@@ -255,9 +226,9 @@ async fn a_credential_failure_is_answered_with_the_code_aws_names_for_it() {
             let (code, message) = reported(&answer);
             assert_eq!(
                 (status, code.as_str(), message.as_str()),
-                (403, expected_code, expected_message),
-                "case {case:?} on {operation}: expected 403 {expected_code} with AWS's own \
-                 wording, got {status} {answer}"
+                (expected_status, expected_code, expected_message),
+                "case {case:?} on {operation}: expected {expected_status} {expected_code} \
+                 with AWS's own wording, got {status} {answer}"
             );
             assert_ne!(
                 code.as_str(), AUTHORIZATION_DENIAL,

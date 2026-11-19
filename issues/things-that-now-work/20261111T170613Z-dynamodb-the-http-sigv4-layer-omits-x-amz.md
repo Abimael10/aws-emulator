@@ -48,3 +48,26 @@ Expected vs actual, verbatim from the replay:
 3. POST the same body with Authorization: 'AWS4-' only — expect a 400-class refusal naming the missing SigV4 components.
 4. Presign a ListTables GET, alter one character of X-Amz-Signature, send it — expect 400 InvalidSignatureException.
 5. Send a DescribeTable request carrying both a valid Authorization header and an X-Amz-Algorithm query parameter — expect InvalidSignatureException, not the operation's result.
+
+## Resolution
+
+Causes 1 and 2 were already fixed before this change (`src/service/body_checksum.rs` stamps
+`x-amz-crc32`; `src/service/request_id.rs` mints the 52-character uppercase id), and their
+checks pass. Causes 3, 4 and 5 are fixed by `src/service/request_signature.rs`: the request's
+SigV4 PRESENTATION is read ahead of any credential lookup, and a fault in it — no
+presentation, a presentation missing components, a presentation in both forms at once, or a
+complete presentation whose signature does not verify — is refused HTTP 400 with the class
+AWS names for that fault. `tests/all/signature_presentation_refusals.rs` pins the rule over
+the class of inputs.
+
+### Remaining divergence, tracked rather than left silent
+
+One assertion of `dynamodb.incomplete-sigv4-signature-lists-missing-components` still differs,
+and nothing in this change can close it: the clause list the emulator states for an incomplete
+`Authorization` header matches the recorded message character for character up to the end of
+the date clause, and the recorded message then continues with a tail the replay harness
+withholds (it renders it as a hashed placeholder, `… 'Date' header. (Hashed w…`). It is not
+derivable from the request — a tail echoing the offending `Authorization` value was tried and
+is not what the recording holds — so it is not written. Everything else about that refusal (the
+400, the class, and every clause) now matches.
+

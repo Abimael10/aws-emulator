@@ -43,6 +43,60 @@ pub fn emulator_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>
     (router, engine)
 }
 
+/// One emulator holding only this service, with signature VERIFICATION ON — the
+/// configuration the emulator serves traffic in (`--auth on`) — together with the access key
+/// id it published for this run, which is the one credential a request can have RESOLVE.
+///
+/// For the suites whose rule is about the SigV4 layer rather than about an operation
+/// (`authentication_refusal_wording`, `signature_presentation_refusals`): everything else
+/// drives unsigned requests, so it takes [`emulator`] instead.
+pub fn verifying_emulator() -> (MultiServiceRouter, String) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(true);
+    let access_key_id = match router.vended_credentials().into_iter().next() {
+        Some(emulator_server::VendedCredentials::AwsAccessKey { access_key_id, .. }) => {
+            access_key_id
+        }
+        other => panic!("with verification on the emulator must vend a key pair, got {other:?}"),
+    };
+    router.register_service(EmulatedService::new(engine));
+    (router, access_key_id)
+}
+
+/// The instant a suite signs a request at, in SigV4's own `YYYYMMDDTHHMMSSZ` form, and the
+/// scope date it falls on.
+///
+/// Read from the CLOCK rather than written down, because a request signed at a fixed instant
+/// is refused for the difference between that instant and the current time once the clock has
+/// moved past the window SigV4 admits — and what the suites that sign one are about is the
+/// CREDENTIAL and the PRESENTATION. Both halves come from one reading, so the scope date and
+/// the signing instant can never name different days.
+pub fn signed_at() -> (String, String) {
+    let rendered = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .expect("the current instant renders in RFC 3339");
+    let (date, time) = rendered
+        .split_once('T')
+        .expect("an RFC 3339 instant separates its date and time with 'T'");
+    let date: String = date.chars().filter(|held| held.is_ascii_digit()).collect();
+    let time: String = time
+        .chars()
+        .filter(|held| held.is_ascii_digit())
+        .take(6)
+        .collect();
+    (format!("{date}T{time}Z"), date)
+}
+
+/// The WHOLE `__type` of a refusal document, namespace included — what a client reads off the
+/// wire, where [`error_code`] answers the shape name alone.
+pub fn error_type(body: &Value) -> String {
+    body.get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or("<no __type>")
+        .to_string()
+}
+
 /// Make sure the Kinesis data stream `name` exists in [`REGION`], creating it over the
 /// wire if it does not, and answer the ARN THAT SERVICE reports for it — the ARN a table's
 /// destination then names.

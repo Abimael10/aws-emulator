@@ -124,6 +124,15 @@
 //! handed WHICH failure it was is the definition's `refusal_response`; the refusal hook sees
 //! the structural refusal alone, which is why this service uses it for input constraints.
 //!
+//! What was at fault in such a request is not always the CREDENTIAL, though: a request that
+//! presented no signature at all, one whose presentation is missing components, one that
+//! presented it in both forms at once, and one whose signature does not verify are faults in
+//! the REQUEST, and AWS's SigV4 front door answers each of them in its own class with the
+//! status a request fault carries. That layer lives in [`request_signature`] and is wired at
+//! the same definition seam, outside the one above (so the identity failures it declines fall
+//! through to it), and — for the one fault a verifier that reads a single form cannot see —
+//! ahead of every operation ([`OperationScopedClauseForm`]).
+//!
 //! ## The audit leg: what every served call is recorded as
 //!
 //! The definition this file hands back is also where this front door's AUDIT leg hangs: the
@@ -158,6 +167,11 @@ mod body_checksum;
 /// The endpoint's own HTTP surface: the root's method surface, the media types the API is
 /// served under, and what a target naming no bound operation is refused with.
 mod front_door;
+
+/// How a request whose SigV4 signature PRESENTATION is at fault is answered — unsigned,
+/// incomplete, presented twice, or carrying a signature that does not verify — which is a
+/// fault in the request rather than in the identity it named.
+mod request_signature;
 
 /// The `AWS/DynamoDB` `SuccessfulRequestLatency` series this service publishes for each
 /// table request it serves, under the `{TableName, Operation}` dimension pair that family is
@@ -781,6 +795,16 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
         Box::pin(async move {
+            // The SIGNATURE gate, ahead of everything: a request that presented its
+            // signature in BOTH of SigV4's forms names two auth mechanisms where exactly one
+            // may be used, and AWS's front door refuses it before the request is served.
+            // It is read here because it is the one such fault a verifier cannot raise: the
+            // verifier reads ONE form, and a request whose header verifies is served with
+            // its query-string presentation never looked at ([`request_signature`], which
+            // words every other signature fault at the refusal seam instead).
+            if let Some(refusal) = request_signature::two_forms_refusal(req) {
+                return front_door::announced(req, reported(refusal));
+            }
             // The REGION gate, ahead of every operation: DynamoDB is reached through a
             // REGIONAL endpoint, and a Region the account has not turned on serves it
             // nothing at all — every request to that endpoint is refused rather than
@@ -1373,8 +1397,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// ([`AUTHENTICATION_REFUSAL`]), and INSIDE both the AUDITED routing table every
     /// request this service serves is resolved through ([`management_events`]).
     entry: RequestIdEnvelopeDefinition<
-        AuthenticationRefusalDefinition<
-            management_events::AuditedDefinition<crate::ServiceDefinition<Eng>>,
+        request_signature::FaultStatedDefinition<
+            AuthenticationRefusalDefinition<
+                management_events::AuditedDefinition<crate::ServiceDefinition<Eng>>,
+            >,
         >,
     >,
     /// The dispatch `override_operation` hands back, which carries the served
@@ -1399,7 +1425,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         let audited = management_events::audited_table(&engine);
         Self {
             entry: RequestIdEnvelopeDefinition::reporting(
-                AuthenticationRefusalDefinition::new(
+                // The SIGNATURE-fault layer is outside the credential one, because it
+                // answers the refusals that are about the REQUEST's signature material and
+                // leaves the identity failures — a key id that resolves to no credential —
+                // to the layer below it.
+                request_signature::FaultStatedDefinition::new(AuthenticationRefusalDefinition::new(
                     // The audited table is the INNERMOST wrapper, so every layer that
                     // resolves an operation for a request — the router, this service's own
                     // dispatch, the envelope wrappers around it — reaches the audited
@@ -1410,7 +1440,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                         audited,
                     ),
                     AUTHENTICATION_REFUSAL,
-                ),
+                )),
                 reported,
             ),
             clause_form_scope: OperationScopedClauseForm { engine },

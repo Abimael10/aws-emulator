@@ -68,7 +68,7 @@ const CONTENT_TYPE: &str = "content-type";
 /// the tree's one statement of it. Every media type of the versioned `awsJson` family begins
 /// `application/x-amz-json-`, and this endpoint serves exactly ONE version of it: a request
 /// announcing another version announces a protocol this endpoint does not speak.
-const PROTOCOL_MEDIA_TYPE: &str = ::service_common::response_media_type::AWS_JSON_1_0;
+pub(super) const PROTOCOL_MEDIA_TYPE: &str = ::service_common::response_media_type::AWS_JSON_1_0;
 
 /// The other: the plain JSON media type, under which the same endpoint serves the same
 /// protocol.
