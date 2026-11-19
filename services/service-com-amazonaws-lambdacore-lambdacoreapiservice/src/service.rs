@@ -66,6 +66,11 @@
 //! are not here: they are built by the shared helpers in [`crate::state`], so every
 //! operation states them one way.
 
+/// The AUDIT leg of this front door: every control-plane call it serves is a management
+/// event of the account, recorded in the event history CloudTrail's `LookupEvents` reads;
+/// see the module's own header.
+pub mod management_events;
+
 mod validation;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
@@ -83,26 +88,38 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The same modelled operations the generated table holds, each wrapped in
-    /// [`StatedPerOperation`] so a refused request is worded the way this service words it.
-    /// Keyed by the routing key the protocol resolves — the key the generated table uses —
-    /// and built from the SAME shared engine, so a wrapped operation reads and writes the
-    /// one store.
+    /// The same modelled operations the generated table holds, each served AUDITED — so the
+    /// call is recorded in the account's event history (see [`management_events`]) — and
+    /// wrapped in [`StatedPerOperation`] so a refused request is worded the way this service
+    /// words it. Keyed by the routing key the protocol resolves — the key the generated
+    /// table uses — and built from the SAME shared engine, so a wrapped operation reads and
+    /// writes the one store.
     stated: OperationRoutingTable,
 }
 
-/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
-/// [`StatedPerOperation`] and keyed by its operation shape name — the routing key
-/// `ServerProtocol::routing_key` resolves and the generated table is keyed by.
+/// Serve one `crate::ops::<module>::<Operation>` per line through `table`: AUDITED, as a
+/// call of the read/write class the management-event catalog states for it
+/// ([`management_events::recorded_class`]), and still wrapped in [`StatedPerOperation`] —
+/// inside the recorder, so a record reports the operation's own typed input and outcome
+/// while the refusal wording stays this service's. Each row is keyed by its operation shape
+/// name — the routing key `ServerProtocol::routing_key` resolves and the generated table is
+/// keyed by.
+///
+/// A row the catalog holds no class for is skipped rather than guessed at, so the list below
+/// and that catalog cannot disagree about which calls are management events; `tests` below
+/// fails when the model declares an operation neither of them holds.
 macro_rules! wrap_operations {
     ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
         $(
-            $table.add_operation(
-                stringify!($operation),
-                ::std::boxed::Box::new(StatedPerOperation::new(
+            if let Some(kind) = management_events::recorded_class(
+                <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+            ) {
+                $table.serve_behind(
                     crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
-                )) as ::std::boxed::Box<dyn ErasedOperation>,
-            );
+                    kind,
+                    |audited, _envelope| StatedPerOperation::new(audited),
+                );
+            }
         )+
     };
 }
@@ -112,13 +129,19 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
-        let mut stated = OperationRoutingTable::new();
+        // The table every modelled operation of this service is served through: the AUDIT
+        // table, so each control-plane call it serves is recorded in the account's event
+        // history where CloudTrail's `LookupEvents` reads it (see [`management_events`]) —
+        // one code path for all of them, rather than a recorder per handler.
+        let mut stated = management_events::recording_table(&engine);
         // EVERY modelled operation (the six this model binds, one per file in `src/ops/`),
-        // because the rule is the service's and not one operation's: an operation whose
+        // because both rules are the service's and not one operation's: an operation whose
         // input declares no constraint simply never has a violation to state, which the
-        // wrapper reads off that operation's own input schema. An operation added later is
-        // added here as well, or it answers a refusal in the framework's wording rather
-        // than this service's; `tests` below fails when one is missing.
+        // wrapper reads off that operation's own input schema, and every control-plane call
+        // of an account is a management event. An operation added later is added here as
+        // well, or it answers a refusal in the framework's wording rather than this
+        // service's and its calls are served unrecorded; `tests` below fails when one is
+        // missing.
         wrap_operations!(
             stated,
             engine,
@@ -131,7 +154,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         );
         Self {
             entry: crate::ServiceDefinition::new(engine),
-            stated,
+            stated: stated.finish(),
         }
     }
 }
@@ -331,14 +354,15 @@ mod tests {
     );
 
     /// RULE applied to the whole surface: every operation the model declares is served
-    /// behind [`StatedPerOperation`], under the same key the generated routing table is
-    /// keyed by.
+    /// AUDITED and behind [`StatedPerOperation`], under the same key the generated routing
+    /// table is keyed by.
     ///
     /// The names come from the MODEL rather than from a second hand list, so an operation
-    /// added to the model and not to `wrap_operations!` fails here instead of silently
-    /// answering a refusal in the framework's wording — and a key spelled differently from
-    /// the generated table's fails here instead of silently never being reached by
-    /// `override_operation`.
+    /// added to the model and not to `wrap_operations!` (or to the management-event catalog
+    /// that macro reads its class from) fails here instead of silently answering a refusal
+    /// in the framework's wording or serving its calls unrecorded — and a key spelled
+    /// differently from the generated table's fails here instead of silently never being
+    /// reached by `override_operation`.
     #[test]
     fn every_modelled_operation_is_served_with_this_services_refusal_wording() {
         let model = std::fs::read_to_string(MODEL_PATH)
@@ -368,10 +392,18 @@ mod tests {
                  name; this one resolved to nothing, so the wrapper's key spelling is wrong"
             );
             assert!(
+                management_events::recorded_class(operation).is_some(),
+                "case {operation}: every call of this service is a management event, so \
+                 every modelled operation carries a recorded class; this one is missing \
+                 from the catalog, so `wrap_operations!` skips it and its calls are served \
+                 unrecorded"
+            );
+            assert!(
                 service.stated.get(operation).is_some(),
-                "case {operation}: every modelled operation is served behind \
+                "case {operation}: every modelled operation is served audited and behind \
                  StatedPerOperation; this one is missing from wrap_operations!, so it \
-                 answers a refusal in the framework's wording instead of this service's"
+                 answers a refusal in the framework's wording instead of this service's \
+                 and its calls reach event history nowhere"
             );
         }
     }
