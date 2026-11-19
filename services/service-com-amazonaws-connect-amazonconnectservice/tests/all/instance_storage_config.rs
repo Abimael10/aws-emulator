@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Instance storage configurations — `AssociateInstanceStorageConfig` and the
-//! `DescribeInstanceStorageConfig` read that proves it — end to end over HTTP through
-//! the router the emulator serves with.
+//! `DescribeInstanceStorageConfig` and `ListInstanceStorageConfigs` reads that prove
+//! it — end to end over HTTP through the router the emulator serves with.
 //!
 //! The rules under test, each asserted over a SET of inputs rather than one request:
 //!
@@ -19,7 +19,13 @@
 //! * a configuration that does not carry the member its `StorageType` names is
 //!   refused with the modelled `InvalidParameterException` (HTTP 400);
 //! * an instance, or an association, that does not exist is refused with the modelled
-//!   `ResourceNotFoundException` (HTTP 404) — never a 501.
+//!   `ResourceNotFoundException` (HTTP 404) — never a 501;
+//! * a list of one resource type reports the configurations that instance stores for
+//!   THAT resource type, each carrying its association id, and the empty list for a
+//!   resource type it stores nothing for — for every resource type the model names;
+//! * a page is bounded by `MaxResults` where the caller sends one, and carries a
+//!   `NextToken` only while entries remain beyond it; a `NextToken` this service never
+//!   issued is refused, and listing changes nothing a later read sees.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connect_amazonconnectservice::ops::types::{
@@ -119,6 +125,49 @@ async fn describe(
             None,
         )
         .await
+}
+
+/// `ListInstanceStorageConfigs`:
+/// `GET /instance/{InstanceId}/storage-configs?resourceType=…[&maxResults=…][&nextToken=…]`.
+async fn list(
+    connect: &Connect,
+    instance_id: &str,
+    resource_type: &str,
+    max_results: Option<i32>,
+    token: Option<&str>,
+) -> Answer {
+    let mut params = vec![format!("resourceType={resource_type}")];
+    if let Some(max) = max_results {
+        params.push(format!("maxResults={max}"));
+    }
+    if let Some(token) = token {
+        params.push(format!("nextToken={token}"));
+    }
+    connect
+        .send_answer(
+            "GET",
+            &format!(
+                "/instance/{instance_id}/storage-configs?{}",
+                params.join("&")
+            ),
+            None,
+        )
+        .await
+}
+
+/// The `StorageConfigs` member of an answered list, which this operation always
+/// serializes — so a resource type storing nothing is the empty list, not an absent
+/// member.
+fn configs_of(answer: &Answer, case: &str) -> Vec<Value> {
+    answer.body["StorageConfigs"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected a StorageConfigs list, got {}",
+                answer.body
+            )
+        })
+        .clone()
 }
 
 /// The `InstanceStorageConfig` of one row: its `StorageType` and the one member that
@@ -503,6 +552,263 @@ async fn an_unknown_instance_or_association_is_not_found() {
             "case {label:?}: expected ResourceNotFoundException, got {:?} {}",
             answer.error_code,
             answer.body
+        );
+    }
+}
+
+/// `ListInstanceStorageConfigs` reports what the instance stores for the resource type
+/// the request names, and nothing else: every row of the table is listed back under its
+/// own resource type carrying its association id, and every resource type the model
+/// names that the instance stores nothing for is the empty list.
+#[tokio::test]
+async fn listing_a_resource_type_reports_only_what_it_stores() {
+    let connect = Connect::new();
+    let (instance_id, _) = connect
+        .create_instance(connect_managed("storage-list"))
+        .await;
+
+    // Before anything is associated, every resource type the model names lists empty.
+    for resource_type in INSTANCE_STORAGE_RESOURCE_TYPE_VALUES {
+        let answer = list(&connect, &instance_id, resource_type, None, None).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {resource_type:?} before any association: expected HTTP 200, got {} {}",
+            answer.status, answer.body
+        );
+        let configs = configs_of(&answer, resource_type);
+        assert!(
+            configs.is_empty(),
+            "case {resource_type:?} before any association: expected no configs, got {configs:?}"
+        );
+        assert_eq!(
+            answer.body["NextToken"],
+            Value::Null,
+            "case {resource_type:?} before any association: expected no NextToken, got {}",
+            answer.body["NextToken"]
+        );
+    }
+
+    let mut associated: Vec<(Case, String)> = Vec::new();
+    for case in CASES {
+        let answer = associate(&connect, &instance_id, request(*case, "listed", None)).await;
+        let association_id = answer.body["AssociationId"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected an AssociationId, got {}",
+                    answer.body
+                )
+            })
+            .to_string();
+        associated.push((*case, association_id));
+    }
+
+    for (case, association_id) in &associated {
+        let answer = list(&connect, &instance_id, case.resource_type, None, None).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected HTTP 200, got {} {}",
+            answer.status, answer.body
+        );
+        let configs = configs_of(&answer, case.resource_type);
+        let mut expected = storage_config(*case, "listed");
+        expected["AssociationId"] = json!(association_id);
+        assert_eq!(
+            configs,
+            vec![expected.clone()],
+            "case {case:?}: expected exactly [{expected}], got {configs:?}"
+        );
+        assert_eq!(
+            answer.body["NextToken"],
+            Value::Null,
+            "case {case:?}: expected no NextToken on a complete page, got {}",
+            answer.body["NextToken"]
+        );
+    }
+
+    // The resource types the table leaves unassociated — every remaining value of
+    // `com.amazonaws.connect#InstanceStorageResourceType` — still store nothing, so the
+    // associations above are reported under their own resource type only.
+    for resource_type in INSTANCE_STORAGE_RESOURCE_TYPE_VALUES {
+        if CASES.iter().any(|case| case.resource_type == *resource_type) {
+            continue;
+        }
+        let answer = list(&connect, &instance_id, resource_type, None, None).await;
+        let configs = configs_of(&answer, resource_type);
+        assert!(
+            configs.is_empty(),
+            "case {resource_type:?}: expected an unassociated resource type to list \
+             nothing, got {configs:?}"
+        );
+    }
+}
+
+/// A page is bounded by the page size the caller asks for, and `MaxResults` is held to
+/// the `@range` its member's shape declares (`com.amazonaws.connect#MaxResult10` ->
+/// min 1, max 10): both published ends are served, and one past either end is refused
+/// at the request boundary rather than answered with a page.
+#[tokio::test]
+async fn a_page_is_bounded_by_max_results_within_its_modelled_range() {
+    let connect = Connect::new();
+    let (instance_id, _) = connect
+        .create_instance(connect_managed("storage-list-paging"))
+        .await;
+    let case = CASES[0];
+    let answer = associate(&connect, &instance_id, request(case, "paged", None)).await;
+    let association_id = answer.body["AssociationId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an AssociationId, got {}", answer.body))
+        .to_string();
+
+    // Both ends of the modelled range, and the sizes between them, are served; the one
+    // stored configuration fits on every one of those pages, so none of them is
+    // truncated and none carries a token.
+    for max_results in [1, 2, 5, 10] {
+        let answer = list(
+            &connect,
+            &instance_id,
+            case.resource_type,
+            Some(max_results),
+            None,
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case maxResults={max_results}: expected HTTP 200, got {} {}",
+            answer.status, answer.body
+        );
+        let configs = configs_of(&answer, &format!("maxResults={max_results}"));
+        assert_eq!(
+            configs.len(),
+            1,
+            "case maxResults={max_results}: expected the one stored config, got {configs:?}"
+        );
+        assert_eq!(
+            configs[0]["AssociationId"],
+            json!(association_id),
+            "case maxResults={max_results}: expected the stored association {association_id}, \
+             got {}",
+            configs[0]
+        );
+        assert_eq!(
+            answer.body["NextToken"],
+            Value::Null,
+            "case maxResults={max_results}: expected no NextToken on the last page, got {}",
+            answer.body["NextToken"]
+        );
+    }
+
+    // One past each published end.
+    for max_results in [0, 11] {
+        let answer = list(
+            &connect,
+            &instance_id,
+            case.resource_type,
+            Some(max_results),
+            None,
+        )
+        .await;
+        assert_eq!(
+            answer.status, 400,
+            "case maxResults={max_results}: expected HTTP 400 outside the modelled range, \
+             got {} {}",
+            answer.status, answer.body
+        );
+    }
+}
+
+/// The refusals of the list: an instance nobody created holds no storage plane to
+/// report, and a `NextToken` this service never issued names no position in the scan.
+#[tokio::test]
+async fn an_unknown_instance_or_an_unissued_token_is_refused() {
+    let connect = Connect::new();
+    let (instance_id, _) = connect
+        .create_instance(connect_managed("storage-list-refusals"))
+        .await;
+    let case = CASES[0];
+    associate(&connect, &instance_id, request(case, "refused", None)).await;
+
+    let unknown = "11111111-2222-3333-4444-555555555555";
+    let missing = list(&connect, unknown, case.resource_type, None, None).await;
+    assert_eq!(
+        missing.status, 404,
+        "case \"an unknown instance\": expected HTTP 404, got {} {}",
+        missing.status, missing.body
+    );
+    assert!(
+        missing.error_code.contains("ResourceNotFoundException"),
+        "case \"an unknown instance\": expected ResourceNotFoundException, got {:?} {}",
+        missing.error_code,
+        missing.body
+    );
+
+    for token in ["not-a-token", "deadbeef", "AAAAAAAA"] {
+        let answer = list(
+            &connect,
+            &instance_id,
+            case.resource_type,
+            None,
+            Some(token),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 400,
+            "case {token:?}: expected HTTP 400 for a token this service never issued, got {} {}",
+            answer.status, answer.body
+        );
+        assert!(
+            answer.error_code.contains("InvalidRequestException"),
+            "case {token:?}: expected InvalidRequestException, got {:?} {}",
+            answer.error_code,
+            answer.body
+        );
+    }
+}
+
+/// Listing is a read: repeating it reports the same configurations, and leaves the
+/// association readable through `DescribeInstanceStorageConfig` exactly as it was
+/// stored.
+#[tokio::test]
+async fn listing_changes_nothing_a_later_read_sees() {
+    let connect = Connect::new();
+    let (instance_id, _) = connect
+        .create_instance(connect_managed("storage-list-is-a-read"))
+        .await;
+
+    for case in CASES {
+        let answer = associate(&connect, &instance_id, request(*case, "reread", None)).await;
+        let association_id = answer.body["AssociationId"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected an AssociationId, got {}",
+                    answer.body
+                )
+            })
+            .to_string();
+
+        let first = list(&connect, &instance_id, case.resource_type, None, None).await;
+        let repeated = list(&connect, &instance_id, case.resource_type, None, None).await;
+        assert_eq!(
+            configs_of(&first, case.resource_type),
+            configs_of(&repeated, case.resource_type),
+            "case {case:?}: expected a repeated list to report {}, got {}",
+            first.body["StorageConfigs"],
+            repeated.body["StorageConfigs"]
+        );
+
+        let read = describe(&connect, &instance_id, &association_id, case.resource_type).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected the listed association to stay readable, got {} {}",
+            read.status, read.body
+        );
+        let mut expected = storage_config(*case, "reread");
+        expected["AssociationId"] = json!(association_id);
+        assert_eq!(
+            read.body["StorageConfig"], expected,
+            "case {case:?}: expected the stored config {expected}, got {}",
+            read.body["StorageConfig"]
         );
     }
 }

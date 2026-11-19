@@ -126,6 +126,14 @@ pub const LIST_CONTACT_FLOWS_DEFAULT_PAGE_SIZE: usize = 100;
 /// return per page. The default MaxResult size is 100."
 pub const LIST_HOURS_OF_OPERATIONS_DEFAULT_PAGE_SIZE: usize = 100;
 
+/// The page size `ListInstanceStorageConfigs` uses when the caller sends no
+/// `MaxResults`: its page-size member documents no default
+/// (`smithy_query(query="doc",shape="ListInstanceStorageConfigsRequest",member="MaxResults")`
+/// -> "The maximum number of results to return per page."), so the modelled maximum of
+/// the shape it targets stands in, as [`LIST_INSTANCES_DEFAULT_PAGE_SIZE`] explains
+/// (`MaxResult10` -> range 1..10).
+pub const LIST_INSTANCE_STORAGE_CONFIGS_DEFAULT_PAGE_SIZE: usize = 10;
+
 /// How many instances the registry holds before `CreateInstance` refuses with the
 /// modelled `ServiceQuotaExceededException`.
 ///

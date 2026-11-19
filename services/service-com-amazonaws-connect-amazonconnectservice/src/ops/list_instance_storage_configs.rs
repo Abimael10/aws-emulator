@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInstanceStorageConfigs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInstanceStorageConfigs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInstanceStorageConfigs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +146,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInstanceStorageConfigs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInstanceStorageConfigsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInstanceStorageConfigs"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListInstanceStorageConfigsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Amazon Connect store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A cursor this service never issued names no position in the scan, so it is
+        // refused as the malformed request it is rather than read as a restart from the
+        // beginning.
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListInstanceStorageConfigsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some("NextToken is not a token this service issued".to_string()),
+                        reason: None,
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        let store = state.lock();
+
+        // The instance is resolved first, so a request naming an instance this account
+        // does not hold is refused rather than reported as an instance that stores
+        // nothing. Connect states ONE not-found sentence for every resource
+        // (`crate::state::resource_not_found`), quoting nothing the request carried.
+        let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
+            ListInstanceStorageConfigsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+        })?;
+
+        // Reporting only: each configuration is projected as it was associated, in
+        // association-id order — the key this page's cursor is cut on — so reading them
+        // changes nothing a later caller sees. A page covers ONE resource type, since
+        // the operation lists the storage configurations of the identified instance AND
+        // resource type: a configuration this instance stores for another resource type
+        // is not on it.
+        let entries: Vec<(String, InstanceStorageConfig)> = instance
+            .storage_configs
+            .iter()
+            .filter(|(_, record)| record.resource_type == input.resource_type)
+            .map(|(association_id, record)| (association_id.clone(), record.to_storage_config()))
+            .collect();
+        drop(store);
+
+        let (storage_configs, next_token) = crate::state::paginate(
+            entries,
+            cursor.as_deref(),
+            input.max_results,
+            crate::state::LIST_INSTANCE_STORAGE_CONFIGS_DEFAULT_PAGE_SIZE,
+        );
+
+        Ok(ListInstanceStorageConfigsOutput {
+            // Always serialized, so an instance storing nothing for this resource type
+            // is reported as the empty list rather than as an absent member.
+            storage_configs: Some(storage_configs),
+            next_token,
+        })
     }
 }
