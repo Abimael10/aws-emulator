@@ -11,11 +11,13 @@
 //! "temporary security credentials are scoped to the bucket and expire after 5 minutes"
 //! (`CreateSession`'s own documentation) — so a presented token authorizes the Zonal endpoint
 //! calls on the bucket ITS OWN session was created for, for as long as that session lives,
-//! and nothing else. A token no session carries is `InvalidToken`, one whose session the
-//! clock has expired is `ExpiredToken`, and one whose live session was created for another
-//! bucket is `AccessDenied` — the three codes Amazon S3 publishes for these conditions.
+//! and nothing else. A token no session carries is `InvalidToken` (400): nothing can be said
+//! about a session that was never vended. A session the clock has expired and a live session
+//! created for another bucket are both `AccessDenied` (403) — the token says WHICH session the
+//! caller acts under rather than being the credential the request is signed with, so either
+//! way the session authorizes nothing on the bucket the request addressed.
 
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use service_com_amazonaws_s3_amazons3::service::express_session::SESSION_TOKEN_HEADER;
 use service_com_amazonaws_s3_amazons3::state::ComAmazonawsS3Amazons3State;
@@ -134,7 +136,9 @@ async fn a_session_token_authorizes_only_its_own_bucket() {
     let (_, other_token) = session_credentials(&router, other).await;
 
     // A session the CLOCK has already expired, recorded directly in the store: no sequence of
-    // requests can reach that state, because the documented lifetime is five minutes.
+    // requests can reach that state, because the documented lifetime is five minutes. Its
+    // expiry is the epoch — an instant in the past on every host, so nothing here depends on
+    // how fast this one runs or on reading its clock.
     let expired_token = "an-expired-sessions-token";
     let expired_key_id = "EMULATORAKEXPIREDSESSION";
     {
@@ -143,7 +147,7 @@ async fn a_session_token_authorizes_only_its_own_bucket() {
         assert!(
             store.record_vended_session_on(
                 expired_key_id,
-                SystemTime::now() - Duration::from_secs(60),
+                SystemTime::UNIX_EPOCH,
                 own,
                 expired_token,
             ),
@@ -163,7 +167,7 @@ async fn a_session_token_authorizes_only_its_own_bucket() {
         (
             "a session the clock has expired",
             expired_token,
-            Some((400, "ExpiredToken")),
+            Some((403, "AccessDenied")),
         ),
         (
             "a token no session carries",
@@ -240,8 +244,8 @@ async fn a_session_token_authorizes_only_its_own_bucket() {
             expired_key_id,
             own,
             "session-renamed.txt",
-            400,
-            "ExpiredToken",
+            403,
+            "AccessDenied",
         ),
     ] {
         let answered = signed_with_session_key(&router, addressed, key, key_id).await;

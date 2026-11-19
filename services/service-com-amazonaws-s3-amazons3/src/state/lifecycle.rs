@@ -198,14 +198,10 @@ pub enum LifecycleConfigurationRejection {
     },
     /// An object-size range no object can be in, because the minimum is not below the
     /// maximum.
-    ObjectSizeRangeEmpty {
-        /// Which rule carries it.
-        rule: usize,
-        /// The `ObjectSizeGreaterThan` it named.
-        greater_than: i64,
-        /// The `ObjectSizeLessThan` it named.
-        less_than: i64,
-    },
+    ///
+    /// The refusal states the rule and no value of the request
+    /// ([`INVERTED_OBJECT_SIZE_RANGE_MESSAGE`]), so the two bounds are not carried here.
+    ObjectSizeRangeEmpty,
     /// A rule naming no action at all: a lifecycle rule carries "one or more lifecycle
     /// transition and expiration actions that you want Amazon S3 to perform on the objects
     /// identified by the filter" (`PutBucketLifecycleConfiguration`'s own documentation).
@@ -405,7 +401,7 @@ impl LifecycleConfigurationRejection {
             | Self::ExpirationNotAfterTransition { .. }
             | Self::TooManyNewerNoncurrentVersions { .. } => INVALID_ARGUMENT_CODE,
             Self::MixedPrefixAndFilterRules { .. }
-            | Self::ObjectSizeRangeEmpty { .. }
+            | Self::ObjectSizeRangeEmpty
             | Self::NoAction { .. }
             | Self::DuplicateTagKey { .. }
             | Self::TagFilteredAction { .. }
@@ -472,6 +468,17 @@ pub const DATE_ARGUMENT: &str = "Date";
 /// (`NoncurrentVersionExpiration$NewerNoncurrentVersions`).
 pub const NEWER_NONCURRENT_VERSIONS_ARGUMENT: &str = "NewerNoncurrentVersions";
 
+/// The `<Message>` S3 refuses an object-size range whose minimum is not below its maximum
+/// with.
+///
+/// FIXED text, naming the two MEMBERS the caller has to reconcile and nothing of the request:
+/// the sizes the rule named are not in it, so two filters that invert the range the same way
+/// are refused with one sentence. The members are spelled as the API publishes them
+/// (`LifecycleRuleFilter$ObjectSizeGreaterThan` and `$ObjectSizeLessThan`), each in the single
+/// quotes S3's own sentence puts a member name in.
+pub const INVERTED_OBJECT_SIZE_RANGE_MESSAGE: &str =
+    "'ObjectSizeLessThan' has to be a value greater than 'ObjectSizeGreaterThan'.";
+
 impl std::fmt::Display for LifecycleConfigurationRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -531,15 +538,7 @@ impl std::fmt::Display for LifecycleConfigurationRejection {
                 "Rule {rule}: {member} is an object size in bytes and cannot be negative, \
                  got {bytes}"
             ),
-            Self::ObjectSizeRangeEmpty {
-                rule,
-                greater_than,
-                less_than,
-            } => write!(
-                f,
-                "Rule {rule}: ObjectSizeGreaterThan {greater_than} is not below \
-                 ObjectSizeLessThan {less_than}, so no object size matches the filter"
-            ),
+            Self::ObjectSizeRangeEmpty => f.write_str(INVERTED_OBJECT_SIZE_RANGE_MESSAGE),
             Self::NoAction { .. } => write!(
                 f,
                 "At least one action needs to be specified in a rule"
@@ -830,11 +829,7 @@ pub(super) fn validate_lifecycle_object_sizes(
     }
     if let (Some(greater_than), Some(less_than)) = (greater_than, less_than) {
         if greater_than >= less_than {
-            return Err(Rejection::ObjectSizeRangeEmpty {
-                rule: position,
-                greater_than,
-                less_than,
-            });
+            return Err(Rejection::ObjectSizeRangeEmpty);
         }
     }
 

@@ -2333,6 +2333,53 @@ impl NotificationDestination {
     }
 }
 
+/// The suffix the name of a FIFO queue or a FIFO topic ends with: "the name of a FIFO queue
+/// must end with the `.fifo` suffix" (`CreateQueue`, Amazon SQS API reference) and "the name of
+/// a FIFO topic must end with the `.fifo` suffix" (`CreateTopic`, Amazon SNS API reference),
+/// which is what makes the KIND of either readable out of the ARN that addresses it.
+pub const FIFO_QUEUE_SUFFIX: &str = ".fifo";
+
+/// Whether `arn` addresses a FIFO queue or a FIFO topic — the resource NAME is the last
+/// segment of an SQS queue's or an SNS topic's ARN
+/// (`arn:<partition>:sqs:<region>:<account>:<name>`), so the suffix is read off that segment
+/// rather than off the whole string: a queue named `orders.fifo.q` is not a FIFO queue, and
+/// neither is a standard queue in an account whose other resources are.
+pub fn names_a_fifo_resource(arn: &str) -> bool {
+    arn.rsplit(':')
+        .next()
+        .is_some_and(|resource| resource.ends_with(FIFO_QUEUE_SUFFIX))
+}
+
+/// The member a FIFO destination of `destination`'s kind arrives on, or `None` for a kind that
+/// has no FIFO form at all — a Lambda function, whose name the `.fifo` suffix says nothing
+/// about.
+fn fifo_capable_member(destination: NotificationDestination) -> Option<&'static str> {
+    match destination {
+        NotificationDestination::Queue | NotificationDestination::Topic => {
+            Some(destination.arn_member())
+        }
+        NotificationDestination::LambdaFunction => None,
+    }
+}
+
+/// The `<Message>` S3 refuses a notification configuration naming a FIFO destination of
+/// `destination`'s kind with ([`NotificationConfigurationRejection::FifoDestination`]).
+///
+/// FIXED text per destination kind, with nothing of the request in it — the ARN travels in the
+/// `<ArgumentValue>` beside the member, the way every other refusal of one destination
+/// reference carries it. It states the restriction itself rather than that validation failed,
+/// which is what makes the fix (use a standard queue or topic) readable from the refusal.
+pub fn fifo_destination_unsupported_message(destination: NotificationDestination) -> &'static str {
+    match destination {
+        NotificationDestination::Topic => "FIFO SNS topics are not supported.",
+        NotificationDestination::Queue => "FIFO SQS queues are not supported.",
+        // A Lambda function has no FIFO form at all, so nothing reaches this arm
+        // ([`fifo_capable_member`] answers `None` for one) — stated per variant rather than
+        // through a catch-all, so a destination kind added later has to be worded deliberately.
+        NotificationDestination::LambdaFunction => "FIFO destinations are not supported.",
+    }
+}
+
 /// The per-destination detail S3 carries for a destination that EXISTS and whose resource
 /// policy does not let Amazon S3 publish this bucket's notifications to it.
 ///
@@ -2648,6 +2695,21 @@ pub enum NotificationConfigurationRejection {
         /// The value that does not satisfy it, as the request spelled it.
         arn: String,
     },
+    /// A destination reference naming a FIFO resource: a queue or a topic whose name ends in
+    /// [`FIFO_QUEUE_SUFFIX`] is a first-in-first-out one, and Amazon S3 publishes event
+    /// notifications to neither — so the destination names a resource of a KIND S3 cannot
+    /// publish to, which S3 says in a sentence of its own
+    /// ([`fifo_destination_unsupported_message`]) rather than in the generic
+    /// destination-validation text: the fix is to use a standard queue or topic, which no
+    /// "validation failed" sentence tells the caller.
+    FifoDestination {
+        /// The member the ARN arrived on (`Queue` or `Topic`).
+        member: &'static str,
+        /// Which destination kind it names, which is what the sentence states.
+        destination: NotificationDestination,
+        /// The FIFO resource's ARN, as the request spelled it.
+        arn: String,
+    },
     /// More configurations than [`MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`].
     TooManyConfigurations {
         /// How many the request carried.
@@ -2679,6 +2741,9 @@ impl std::fmt::Display for NotificationConfigurationRejection {
             Self::InvalidDestinationArn { .. } => f.write_str(UNPARSEABLE_DESTINATION_MESSAGE),
             Self::DestinationArnPattern { pattern, .. } => {
                 write!(f, "{UNSATISFIED_ARN_CONSTRAINT_MESSAGE}{pattern}")
+            }
+            Self::FifoDestination { destination, .. } => {
+                f.write_str(fifo_destination_unsupported_message(*destination))
             }
             Self::TooManyConfigurations { count } => write!(
                 f,
@@ -2728,6 +2793,7 @@ impl NotificationConfigurationRejection {
             Self::DestinationArnPattern { member, arn, .. } => {
                 Some((member, Some(arn.as_str())))
             }
+            Self::FifoDestination { member, arn, .. } => Some((member, Some(arn.as_str()))),
             Self::DuplicateFilterRuleKind { .. } => Some((FILTER_RULE_ARGUMENT, None)),
             Self::DuplicateConfigurationId { id } => {
                 Some((CONFIGURATION_ID_ARGUMENT, Some(id.as_str())))
@@ -3034,6 +3100,22 @@ pub fn validate_notification_configuration(
                 return Err(NotificationConfigurationRejection::DestinationArnPattern {
                     member,
                     pattern,
+                    arn: target.arn.clone(),
+                });
+            }
+        }
+
+        // And a destination that is a FIFO queue or a FIFO topic, which S3 publishes to at
+        // all: the ARN is one of the right service and of the right form, and the KIND of
+        // resource it names is one no notification can be delivered to, which is a different
+        // thing from a destination that could not be validated — so it is reported here, with
+        // its own sentence, before the destinations are resolved against the services that own
+        // them.
+        if names_a_fifo_resource(&target.arn) {
+            if let Some(member) = fifo_capable_member(destination) {
+                return Err(NotificationConfigurationRejection::FifoDestination {
+                    member,
+                    destination,
                     arn: target.arn.clone(),
                 });
             }

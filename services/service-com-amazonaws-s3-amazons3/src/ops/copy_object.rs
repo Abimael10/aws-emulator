@@ -638,6 +638,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         let Some(destination) = store.bucket(&input.bucket) else {
             return Err(CopyObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
+        // WHAT KIND of bucket the copy writes into, read here and carried past the guard: the
+        // tag set a copy into a DIRECTORY bucket may write is judged below, once the directive
+        // and the source have settled what that set is.
+        let into_a_directory_bucket = destination.is_directory();
         let mut encryption = if requested.names_no_member() {
             destination.default_object_encryption()
         } else {
@@ -1053,6 +1057,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         } else {
             source_object.tags.clone()
         };
+
+        // A copy into a DIRECTORY bucket may write no tags at all: "for directory buckets in a
+        // `CopyObject` operation, only the empty tag-set is supported. Any requests that
+        // attempt to write non-empty tags into directory buckets will receive a `501 Not
+        // Implemented` status code" (`CopyObjectRequest$TaggingDirective`), which that member
+        // then lists the three forms of — a `COPY` of a source object that has non-empty tags,
+        // a `REPLACE` setting a non-empty `x-amz-tagging`, and a request that states no
+        // directive at all over a tagged source, the directive's default being `COPY`.
+        //
+        // So the rule is about the tag set the copy WOULD WRITE, whichever of the three asked
+        // for it: `tags` above is that set, resolved from the directive and the source, so one
+        // test covers all three forms and the empty cases that same member lists as allowed
+        // are served. The refusal is the 501 that member names, carrying the sentence this
+        // service answers every call asking a directory bucket for the object tag-set plane
+        // with (`crate::service::directory_bucket`), and it is answered before anything is
+        // written.
+        if into_a_directory_bucket && !tags.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NOT_IMPLEMENTED_CODE,
+                crate::state::NOT_IMPLEMENTED_STATUS,
+                crate::service::directory_bucket::unsupported_message(
+                    crate::service::directory_bucket::OBJECT_TAGS,
+                ),
+            ));
+        }
 
         // The DESTINATION's conditional members, judged against what the destination key
         // holds NOW — the copy's write is what they make conditional, so they are judged

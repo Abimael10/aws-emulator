@@ -374,13 +374,16 @@ async fn an_enabled_rule_replicates_the_versions_it_covers_and_nothing_else() {
 
 #[tokio::test]
 async fn the_source_version_settles_on_what_the_replication_did() {
-    // (case, the destination the rule names, whether that destination is created, the
-    // status the source version settles on).
+    // (case, the destination the rule names, whether that destination still exists when the
+    // write is made, the status the source version settles on).
     //
-    // The rows differ along what the rule's destination IS: a bucket this emulator holds
-    // with versioning enabled, and one it does not hold at all — the destination a
-    // replication role cannot write, which is the case AWS reports as a failed replication
-    // rather than as a refused configuration.
+    // The rows differ along what the rule's destination IS when the object is written: a
+    // bucket this emulator holds with versioning enabled, and one that was there when the
+    // configuration was accepted and is gone by the time the write is made — the destination
+    // a replication role cannot write, which is the case AWS reports as a failed replication
+    // rather than as a refused configuration. (A configuration whose destination is absent
+    // when the PUT is made is refused outright instead, which
+    // [`crate::s3_replication_destination_validation`] pins.)
     let rows: [(&str, &str, bool, &str); 2] = [
         (
             "a destination that can be written",
@@ -389,20 +392,21 @@ async fn the_source_version_settles_on_what_the_replication_did() {
             "COMPLETED",
         ),
         (
-            "a destination no bucket answers to",
+            "a destination that is gone when the write is made",
             "crr-absent-dest",
             false,
             "FAILED",
         ),
     ];
 
-    for (case, destination, create_destination, expected) in rows {
+    for (case, destination, destination_stands, expected) in rows {
         let router = router();
         let source = "crr-settled-source";
         versioned_bucket(&router, source).await;
-        if create_destination && destination != source {
-            versioned_bucket(&router, destination).await;
-        }
+        // The destination is stood up for every row: a rule may name only a bucket that
+        // exists and keeps object versions, so that is what the configuration is accepted
+        // against.
+        versioned_bucket(&router, destination).await;
         let configured =
             put_replication(&router, source, &rule(destination, "Enabled", "", "")).await;
         assert_eq!(
@@ -411,6 +415,17 @@ async fn the_source_version_settles_on_what_the_replication_did() {
             configured.status,
             text(&configured)
         );
+        if !destination_stands {
+            // Taken away AFTER the configuration was accepted, which is what leaves the rule
+            // naming a destination nothing answers to when the write is replicated.
+            let removed = send(&router, "DELETE", &format!("/{destination}"), &[], "").await;
+            assert_eq!(
+                removed.status, 204,
+                "case {case:?}: the destination must be deleted, got {} with {:?}",
+                removed.status,
+                text(&removed)
+            );
+        }
 
         let key = "settling/object.bin";
         let written = put_object(&router, source, key, b"settling bytes", &[]).await;

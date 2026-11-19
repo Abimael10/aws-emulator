@@ -42,6 +42,17 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/s3-replication-role";
 /// The destination bucket, as `Destination$Bucket` takes it: an S3 bucket ARN.
 const DESTINATION_ARN: &str = "arn:aws:s3:::replication-destination";
 
+/// A SECOND destination, for the row where two rules replicate into different buckets.
+const ANOTHER_DESTINATION_ARN: &str = "arn:aws:s3:::another-destination";
+
+/// Stand up the DESTINATION buckets the rules below replicate into, each versioning-enabled —
+/// through the one place this crate's replication suites stand them up
+/// ([`super::bucket_replication::replication_destinations`]), so the two suites cannot disagree
+/// about which buckets a rule needs. The ARNs above are the ones that helper creates.
+async fn replication_destinations(router: &MultiServiceRouter) {
+    super::bucket_replication::replication_destinations(router).await;
+}
+
 /// One `ReplicationRule` as XML, carrying only the two members the shape REQUIRES
 /// (`Status` and `Destination`), plus whatever `extra` elements the row names.
 ///
@@ -228,7 +239,7 @@ fn removal_rows() -> Vec<(&'static str, Vec<String>)> {
                 rule_xml(
                     "<ID>second</ID><Priority>2</Priority><Filter><Prefix>b/</Prefix></Filter>",
                     "Enabled",
-                    "arn:aws:s3:::another-destination",
+                    ANOTHER_DESTINATION_ARN,
                 ),
                 rule_xml(
                     "<ID>first</ID><Priority>1</Priority><Filter><Prefix>a/</Prefix></Filter>",
@@ -245,6 +256,7 @@ fn removal_rows() -> Vec<(&'static str, Vec<String>)> {
 #[tokio::test]
 async fn a_delete_withdraws_the_whole_replication_configuration() {
     let router = router();
+    replication_destinations(&router).await;
 
     for (index, (case, rules)) in removal_rows().into_iter().enumerate() {
         let bucket = format!("replication-delete-{index}");
@@ -359,6 +371,7 @@ async fn a_delete_against_a_missing_bucket_is_refused() {
 #[tokio::test]
 async fn a_delete_for_an_unexpected_bucket_owner_is_refused() {
     let router = router();
+    replication_destinations(&router).await;
     let bucket = "replication-delete-owner-gate";
     furnished_bucket(&router, bucket).await;
 

@@ -760,21 +760,35 @@ fn event_bridge_detail(
     detail
 }
 
-/// `at` as an event states a time: the RFC 3339 instant the modelled timestamp format
-/// renders, which is what a consumer parses `eventTime` as.
+/// `at` as an event states a time: an ISO-8601 UTC instant with exactly three
+/// fractional-second digits, which is what a consumer parses `eventTime` and the test
+/// notification's `Time` as.
 ///
-/// The fallback is for an instant that form cannot state (a year outside the four-digit
-/// range), which this process's own clock does not produce; it is logged rather than
-/// silently published, because a member with an empty value would be indistinguishable
-/// from one a record does not carry.
+/// S3 publishes the instant to the MILLISECOND — the *Event message structure*'s own records
+/// state `eventTime` as `1970-01-01T00:00:00.000Z` — so the fraction is a fixed three digits
+/// whatever resolution this process's clock has: a consumer that parses the envelope with a
+/// strict millisecond format (the Java and Go SDK event models, a log pipeline) reads every
+/// event this emulator publishes, and one that compares two timestamps as text orders them.
+///
+/// The fallback is for an instant no calendar date can state (a year outside the four-digit
+/// range), which this process's own clock does not produce; it is logged rather than silently
+/// published, because a member with an empty value would be indistinguishable from one a
+/// record does not carry.
 fn event_instant(at: SystemTime) -> String {
-    ::aws_smithy_types::DateTime::from(at)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_else(|_| {
-            ::tracing::warn!("an object event instant could not be stated as RFC 3339");
+    let stamp = ::aws_smithy_types::DateTime::from(at);
+    match ::chrono::DateTime::from_timestamp(stamp.secs(), stamp.subsec_nanos()) {
+        Some(instant) => instant.format(EVENT_TIME_FORMAT).to_string(),
+        None => {
+            ::tracing::warn!("an object event instant could not be stated as ISO-8601");
             String::new()
-        })
+        }
+    }
 }
+
+/// The format [`event_instant`] renders an event's time in: the ISO-8601 UTC instant S3's own
+/// event records carry, whose fraction is exactly three digits (`%.3f` writes the millisecond
+/// part, truncated rather than rounded) and whose zone is the `Z` of UTC.
+const EVENT_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 
 /// How many delivery tasks this process may have in flight at once.
 ///

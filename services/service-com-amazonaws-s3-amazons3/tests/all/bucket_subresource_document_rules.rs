@@ -1118,8 +1118,15 @@ async fn a_replication_filter_names_at_most_one_predicate() {
     let name = "replication-filter-choice";
     bucket(&router, name).await;
     // Replication copies object VERSIONS, so the configuration applies only to a bucket whose
-    // versioning is enabled — put in force through this file's one versioning helper.
+    // versioning is enabled — put in force through this file's one versioning helper. Both
+    // ENDS of a replication have to satisfy that, so the destination bucket the rules below
+    // name is stood up the same way.
     enable_versioning(&router, name).await;
+    // Through the one place this crate reads the bucket out of a destination ARN
+    // ([`super::bucket_replication::destination_bucket`]), so no suite repeats that step.
+    let destination = super::bucket_replication::destination_bucket(REPLICATION_DESTINATION_ARN);
+    bucket(&router, destination).await;
+    enable_versioning(&router, destination).await;
 
     for (index, row) in filter_cases().into_iter().enumerate() {
         let case = row.case;

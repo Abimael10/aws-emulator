@@ -362,8 +362,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lowercase character class, the first and last character, adjacent periods, a
         // name formatted as an IP address, and the reserved prefixes and suffixes. No bucket
         // can come into being under a name outside them, so the create is refused BEFORE any
-        // state is written, with the code and sentence S3's published error list states for
-        // it and the `<BucketName>` member that envelope names the rejected name by.
+        // state is written.
+        //
+        // WHICH refusal depends on which kind of sentence the name broke, because the two
+        // say different things about what the caller can do next:
+        //
+        // * a name in the namespace AWS keeps for its OWN buckets
+        //   ([`AWS_RESERVED_BUCKET_NAME_PREFIXES`]) is spelled the way a bucket name is
+        //   spelled; what the caller may not do is HOLD it — so the refusal is the
+        //   authorization one, 403 `AccessDenied` with the sentence that code publishes, and no
+        //   amount of respelling the rest of the name makes the create servable;
+        // * every other sentence is about how the name is SPELLED, which is `InvalidBucketName`
+        //   (400) with the sentence S3's published error list states for that code and the
+        //   `<BucketName>` member that envelope names the rejected name by — a caller that
+        //   fixes the spelling gets its bucket.
+        //
+        // The namespace is judged FIRST: it is a statement about who may hold the name at all,
+        // which stands whatever else is wrong with the text after the reserved prefix.
         //
         // This create is the one call that applies those rules, and the reason it is: every
         // other request ADDRESSES a bucket that already exists, which is judged by the wider
@@ -374,8 +389,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A DIRECTORY bucket is judged by its own rule instead, in `directory_placement`
         // above: its name carries the zone the bucket is placed in and ends in the
         // `--x-s3` suffix these general purpose rules reserve.
-        if placement.is_none() && !::service_common::s3_bucket_name::is_well_formed(&input.bucket) {
-            return Err(invalid_bucket_name(&input.bucket));
+        if placement.is_none() {
+            if reserved_namespace(&input.bucket).is_some() {
+                return Err(reserved_bucket_name());
+            }
+            if !::service_common::s3_bucket_name::is_well_formed(&input.bucket) {
+                return Err(invalid_bucket_name(&input.bucket));
+            }
         }
 
         // Where the bucket lives, from the request's own location constraint. Note this
@@ -790,6 +810,52 @@ fn invalid_bucket_name(bucket: &str) -> CreateBucketError {
         crate::state::INVALID_BUCKET_NAME_MESSAGE,
     )
     .naming_bucket(bucket)
+}
+
+/// The prefix AWS keeps for its OWN buckets, and so the one namespace a bucket name can be
+/// refused the AUTHORIZATION refusal for.
+///
+/// "Bucket names must not start with the prefix `sthree-`" (Amazon S3 User Guide, *General
+/// purpose bucket naming rules*): that namespace is Amazon S3's own internal one, so a name in
+/// it is a name the caller may not HOLD rather than one S3 could hold no bucket under at all.
+/// Every OTHER reserved prefix and suffix the same rules publish belongs to a different S3
+/// resource KIND or spelling — the `xn--` punycode prefix, the access point alias suffix, and
+/// the Object Lambda, Multi-Region Access Point, directory bucket and table bucket suffixes —
+/// so no general purpose bucket exists under one at all, which is the malformed-name refusal
+/// `service_common::s3_bucket_name::is_well_formed` already rejects such a name by
+/// ([`invalid_bucket_name`]).
+const AWS_RESERVED_BUCKET_NAME_PREFIXES: [&str; 1] = ["sthree-"];
+
+/// The reserved prefix `bucket` is named in, or `None` for a name outside AWS's own namespace.
+///
+/// A prefix is reserved at the START of a name, so the same text anywhere else in one is just
+/// text.
+fn reserved_namespace(bucket: &str) -> Option<&'static str> {
+    AWS_RESERVED_BUCKET_NAME_PREFIXES
+        .into_iter()
+        .find(|prefix| bucket.starts_with(prefix))
+}
+
+/// The refusal S3 answers a create whose bucket name is in the namespace AWS keeps for itself
+/// ([`reserved_namespace`]): 403 `AccessDenied` with the sentence that code publishes.
+///
+/// The name is spelled the way a bucket name is spelled — nothing about it is malformed — and
+/// what the caller may not do is hold it, which is what the authorization refusal says and
+/// what [`crate::state::INVALID_BUCKET_NAME_CODE`] would not: a client branching on "the name
+/// is malformed, fix it" against "the name is not yours to have" reads the two apart here, and
+/// retry logic keyed on one does not fire for the other.
+///
+/// Fixed text, with nothing of the request interpolated into it
+/// ([`crate::state::ACCESS_DENIED_MESSAGE`]) — the same sentence every other refusal of this
+/// service for an action the caller may not perform carries. Answered through the unmodelled
+/// channel because `CreateBucket` declares only the two name-in-use errors
+/// (`smithy_query(query="operation",operation="CreateBucket")`).
+fn reserved_bucket_name() -> CreateBucketError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        crate::state::ACCESS_DENIED_CODE,
+        crate::state::ACCESS_DENIED_STATUS,
+        crate::state::ACCESS_DENIED_MESSAGE,
+    )
 }
 
 /// The ACL this create names, or `None` when it names none at all.

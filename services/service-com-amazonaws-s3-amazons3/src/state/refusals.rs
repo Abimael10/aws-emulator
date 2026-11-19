@@ -2626,10 +2626,11 @@ pub const INVALID_TOKEN_MESSAGE: &str = "The provided token is malformed or othe
 /// the status and the message that code carries (same published list: "ExpiredToken — The
 /// provided token has expired", HTTP 400).
 ///
-/// What an S3 EXPRESS session the CLOCK has expired earns — "after the expiration time, any
-/// calls that you make with those credentials will fail" (`CreateSession`'s own
-/// documentation) — which is what tells a caller to take a new session rather than to fix its
-/// request.
+/// What a SECURITY TOKEN presented as the request's own credential earns once its lifetime has
+/// passed. It is NOT what an expired S3 EXPRESS SESSION earns: that token says which session a
+/// Zonal request acts under rather than being the credential the request is signed with, so a
+/// session past its expiry authorizes nothing and is refused 403 `AccessDenied` — see
+/// `crate::service::express_session`.
 pub const EXPIRED_TOKEN_CODE: &str = "ExpiredToken";
 /// See [`EXPIRED_TOKEN_CODE`].
 pub const EXPIRED_TOKEN_STATUS: u16 = 400;

@@ -10,7 +10,10 @@
 //! (`MalformedXML` / `InvalidRequest`), a rule written in the V2 schema (one carrying a
 //! `Filter`) that leaves out an element that schema requires (`InvalidRequest`), a `Role`
 //! that is not an IAM role ARN or a rule
-//! `Destination.Bucket` that is not an S3 bucket ARN (`InvalidArgument`).
+//! `Destination.Bucket` that is not an S3 bucket ARN (`InvalidArgument`), or a destination
+//! objects could never be replicated into — one that does not exist, keeps no object versions,
+//! is the source bucket itself, or whose members do not describe a destination S3 can write
+//! (`InvalidRequest`).
 //!
 //! The read side is `GetBucketReplication`, implemented in the same change so a put can be
 //! read back; `DeleteBucketReplication` is still the scaffold's 501 and is its own stub
@@ -394,6 +397,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 ));
             }
+
+            // And the bucket that ARN names has to be one objects can actually be replicated
+            // INTO: it has to exist, to keep object versions, and not to be the source bucket
+            // itself ([`destination_refusal`] holds the three published requirements and the
+            // sentence for each). A rule breaking one could never copy an object, which is a
+            // configuration S3 cannot apply rather than a payload it cannot parse — the same
+            // judgement the SOURCE bucket's versioning is made by above, so one rule is not
+            // applied to one end of a replication and not the other.
+            if let Some(refusal) = destination_refusal(&store, &input.bucket, &rule.destination) {
+                return Err(refusal);
+            }
+
+            // And the destination's own MEMBERS have to describe a destination S3 can write:
+            // three of them are documented as going together, and a container naming one half
+            // of a pair asks for a replication S3 cannot carry out
+            // ([`destination_members_refusal`] holds each published sentence).
+            if let Some(refusal) = destination_members_refusal(rule) {
+                return Err(refusal);
+            }
         }
 
         // "Creates a replication configuration or replaces an existing one": the payload
@@ -414,6 +436,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(PutBucketReplicationOutput)
     }
 }
+
+/// The refusal the destination `destination` of a rule on `source` earns, or `None` for a
+/// destination objects can be replicated into.
+///
+/// Three published requirements, each of which a rule breaking could never replicate anything:
+///
+/// * the destination bucket EXISTS. This emulator serves one account, so a bucket ARN names a
+///   bucket of this store whatever `Destination$Account` says beside it — "the account ID of
+///   the destination bucket" qualifies the ownership of the bucket, not which store holds it.
+/// * its versioning is ENABLED, the same state the SOURCE bucket is required to be in: the
+///   Amazon S3 User Guide's replication requirements state both ends keep object versions, and
+///   "for information about enabling versioning on a bucket, see Using Versioning" is this
+///   operation's own sentence pointing at it.
+/// * it is not the SOURCE bucket. A rule replicating a bucket into itself would copy every
+///   object it wrote back over the object that triggered it; replication copies objects
+///   "between buckets", so the two are different buckets.
+///
+/// Read-only in the store: the destination bucket's record is read for whether it is there and
+/// for its versioning state, and nothing is written, so a refused put leaves the bucket's
+/// current configuration and every other bucket exactly as they were.
+fn destination_refusal(
+    store: &crate::state::ComAmazonawsS3Amazons3State,
+    source: &str,
+    destination: &Destination,
+) -> Option<PutBucketReplicationError> {
+    // The bucket an S3 bucket ARN names is its resource part, read through the one ARN parse
+    // every service in this workspace reads an ARN with.
+    let named = ::service_common::arn::resource(&destination.bucket)?;
+    if named == source {
+        return Some(crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::INVALID_REQUEST_CODE,
+            crate::state::INVALID_REQUEST_STATUS,
+            DESTINATION_IS_THE_SOURCE_MESSAGE,
+        ));
+    }
+    let Some(bucket) = store.bucket(named) else {
+        return Some(crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::INVALID_REQUEST_CODE,
+            crate::state::INVALID_REQUEST_STATUS,
+            DESTINATION_MUST_EXIST_MESSAGE,
+        ));
+    };
+    (!bucket.versioning_enabled()).then(|| {
+        crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::INVALID_REQUEST_CODE,
+            crate::state::INVALID_REQUEST_STATUS,
+            DESTINATION_MUST_BE_VERSIONED_MESSAGE,
+        )
+    })
+}
+
+/// The `<Message>` S3 refuses a rule whose destination bucket is not there with: the
+/// replication requirement itself, as fixed text — the ARN the rule named is not interpolated
+/// into it, the way the sentence for the source bucket's own versioning state names no bucket
+/// either.
+const DESTINATION_MUST_EXIST_MESSAGE: &str = "Destination bucket must exist.";
+
+/// The same for a destination bucket that is there and is not versioned — the other half of
+/// the published requirement that both ends of a replication have versioning enabled.
+const DESTINATION_MUST_BE_VERSIONED_MESSAGE: &str =
+    "Destination bucket must have versioning enabled.";
+
+/// And for a rule whose destination is the bucket the configuration is being applied to.
+const DESTINATION_IS_THE_SOURCE_MESSAGE: &str =
+    "Destination bucket must not be the same as the source bucket.";
+
+/// The refusal `rule`'s destination earns for the MEMBERS it names, or `None` for a
+/// destination whose members describe one S3 can write.
+///
+/// Three documented requirements, each of which a container breaking leaves asking for a
+/// replication S3 cannot carry out — `InvalidRequest`, the code this operation answers a
+/// configuration it cannot apply with:
+///
+/// * `ReplicationTime` is specified together with `Metrics`: S3 Replication Time Control
+///   "must be specified together with a `Metrics` block" (`Destination$ReplicationTime`),
+///   because those metrics are what measure and report the control — so a destination asking
+///   for the control alone asks for one nothing measures. `Metrics` on its OWN is a
+///   destination with replication metrics and no time control, which is a configuration S3
+///   applies, so it is not refused;
+/// * `AccessControlTranslation` changes "replica ownership to the Amazon Web Services account
+///   that owns the destination bucket", and `Account` is "the account ID of the destination
+///   bucket owner … if you direct Amazon S3 to change replica ownership … by specifying the
+///   `AccessControlTranslation` property" — so the translation says WHOSE the replicas become
+///   and names nobody without the account beside it;
+/// * `EncryptionConfiguration`: "if `SourceSelectionCriteria` is specified, you must specify
+///   this element" (`Destination$EncryptionConfiguration`) — the criteria select the
+///   KMS-encrypted objects to replicate, which nothing can be re-encrypted for without the key
+///   the replica is sealed under;
+/// * and the `StorageClass` a replica is stored in has to be one a replica can be stored in:
+///   "`FSX_OPENZFS` is not an accepted value when replicating objects"
+///   (`Destination$StorageClass`) — that class holds the objects of an Amazon FSx file system,
+///   which no replication writes into.
+///
+/// Judged on the request alone, before anything is written.
+fn destination_members_refusal(rule: &ReplicationRule) -> Option<PutBucketReplicationError> {
+    let destination = &rule.destination;
+    let invalid = |message: &'static str| {
+        Some(crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::INVALID_REQUEST_CODE,
+            crate::state::INVALID_REQUEST_STATUS,
+            message,
+        ))
+    };
+    if destination.replication_time.is_some() && destination.metrics.is_none() {
+        return invalid(REPLICATION_TIME_AND_METRICS_MESSAGE);
+    }
+    if destination.access_control_translation.is_some() && destination.account.is_none() {
+        return invalid(ACCESS_CONTROL_TRANSLATION_NEEDS_ACCOUNT_MESSAGE);
+    }
+    if rule.source_selection_criteria.is_some() && destination.encryption_configuration.is_none() {
+        return invalid(SOURCE_SELECTION_NEEDS_ENCRYPTION_MESSAGE);
+    }
+    if destination.storage_class.as_deref() == Some(UNREPLICATED_STORAGE_CLASS) {
+        return invalid(UNREPLICATED_STORAGE_CLASS_MESSAGE);
+    }
+    None
+}
+
+/// The `StorageClass` value no replica may be stored in: "`FSX_OPENZFS` is not an accepted
+/// value when replicating objects" (`Destination$StorageClass`).
+const UNREPLICATED_STORAGE_CLASS: &str = "FSX_OPENZFS";
+
+/// The `<Message>` S3 refuses a destination naming [`UNREPLICATED_STORAGE_CLASS`] with: that
+/// member's own sentence, as fixed text.
+const UNREPLICATED_STORAGE_CLASS_MESSAGE: &str =
+    "FSX_OPENZFS is not an accepted value when replicating objects.";
+
+/// The `<Message>` S3 refuses a destination asking for `ReplicationTime` without `Metrics`
+/// with: the requirement itself, as fixed text naming the two members and both ways to satisfy
+/// it. Nothing of the request is in it.
+const REPLICATION_TIME_AND_METRICS_MESSAGE: &str =
+    "Replication destination must contain both ReplicationTime and Metrics or neither.";
+
+/// The `<Message>` S3 refuses a destination naming `AccessControlTranslation` and no `Account`
+/// with: the requirement itself, as fixed text naming the two members.
+const ACCESS_CONTROL_TRANSLATION_NEEDS_ACCOUNT_MESSAGE: &str =
+    "AccessControlTranslation cannot be specified without Account.";
+
+/// And for a rule naming `SourceSelectionCriteria` whose destination names no
+/// `EncryptionConfiguration`.
+const SOURCE_SELECTION_NEEDS_ENCRYPTION_MESSAGE: &str =
+    "EncryptionConfiguration must be specified when SourceSelectionCriteria is specified.";
 
 /// The element a V2 `ReplicationRule` leaves out, or `None` when it names the one the schema
 /// requires of it beside the `@required` `Status`.

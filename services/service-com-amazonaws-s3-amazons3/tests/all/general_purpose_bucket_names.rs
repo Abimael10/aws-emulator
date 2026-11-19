@@ -3,13 +3,25 @@
 //! `CreateBucket` refuses a name Amazon S3 holds no general purpose bucket under.
 //!
 //! The rule under test: a create whose bucket name is outside the published *General
-//! purpose bucket naming rules* is refused with HTTP 400, the error code
-//! `InvalidBucketName` and the sentence S3's published error list states for that code,
-//! with the rejected name in the `<BucketName>` member of the error document — and nothing
-//! is recorded, so the account holds no bucket under a name it could never address. The
-//! rules themselves are the ones every service in this workspace judges a caller-supplied
-//! bucket name by (`service_common::s3_bucket_name`), which is where the length bounds and
-//! the reserved prefix and suffix catalogs below come from.
+//! purpose bucket naming rules* is refused and nothing is recorded, so the account holds no
+//! bucket under a name it could never address. WHICH refusal depends on which kind of
+//! sentence the name broke:
+//!
+//! * a name in the namespace AWS keeps for its OWN buckets — the `sthree-` prefix, Amazon
+//!   S3's internal one — is spelled the way a bucket name is spelled and what the caller may
+//!   not do is hold it, so the refusal is the authorization one: HTTP 403 `AccessDenied` with
+//!   the sentence that code publishes;
+//! * every other sentence is about how the name is SPELLED — including the prefixes and
+//!   suffixes reserved to OTHER S3 resource kinds, which no general purpose bucket exists
+//!   under at all — which is HTTP 400 `InvalidBucketName` with the sentence S3's published
+//!   error list states for that code and the rejected name in the `<BucketName>` member of the
+//!   error document.
+//!
+//! A client branching on "the name is malformed, fix it" against "the name is not yours to
+//! have" reads the two apart from the code, and retry logic keyed on one does not fire for the
+//! other. The rules themselves are the ones every service in this workspace judges a
+//! caller-supplied bucket name by (`service_common::s3_bucket_name`), which is where the
+//! length bounds and the reserved prefix and suffix catalogs below come from.
 //!
 //! The tables span what the rule generalises over:
 //!
@@ -33,26 +45,62 @@ use super::bucket_lifecycle::{create_bucket, head_bucket, router};
 use super::list_buckets::list_buckets;
 use super::object_and_tagging_roundtrip::text;
 
-/// The code S3's published error list states for a name outside the naming rules, and the
-/// sentence it publishes beside it.
+/// The code S3's published error list states for a name whose SPELLING is outside the naming
+/// rules, and the sentence it publishes beside it.
 const INVALID_BUCKET_NAME: &str = "InvalidBucketName";
 
 /// See [`INVALID_BUCKET_NAME`] — the fixed text of that error class.
 const INVALID_BUCKET_NAME_MESSAGE: &str = "The specified bucket is not valid.";
 
-/// One row: the case, the name the create carries, whether S3 holds a bucket under it, and
-/// the status a `HeadBucket` of that same name answers — 404 for a name a request can still
-/// ADDRESS a bucket by (it just holds none), and 400 for one it cannot, which is refused for
-/// the name itself ([`super::bucket_create_list_and_tagging_contracts`] pins that split
-/// across the bucket-addressed calls). Stated per row rather than computed, so the rule and
-/// not the implementation decides it.
+/// The code S3 refuses a name in AWS's OWN bucket namespace with, and the sentence that code
+/// publishes: the name is AWS's, not the caller's.
+const ACCESS_DENIED: &str = "AccessDenied";
+
+/// See [`ACCESS_DENIED`].
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// One row: the case, the name the create carries, whether S3 holds a bucket under it, the
+/// refusal the create earns (`None` for a name the rules admit), and the status a `HeadBucket`
+/// of that same name answers — 404 for a name a request can still ADDRESS a bucket by (it just
+/// holds none), and 400 for one it cannot, which is refused for the name itself
+/// ([`super::bucket_create_list_and_tagging_contracts`] pins that split across the
+/// bucket-addressed calls). Stated per row rather than computed, so the rule and not the
+/// implementation decides it.
 #[derive(Debug, Clone)]
 struct Row {
     case: String,
     bucket: String,
     held: bool,
+    refusal: Option<Refusal>,
     head_status: u16,
 }
+
+/// What a refused create answers: the status, the code, the message, and whether the error
+/// document names the rejected bucket in its `<BucketName>` member.
+#[derive(Debug, Clone, Copy)]
+struct Refusal {
+    status: u16,
+    code: &'static str,
+    message: &'static str,
+    names_the_bucket: bool,
+}
+
+/// The refusal a name whose SPELLING the rules do not admit earns.
+const MALFORMED: Refusal = Refusal {
+    status: 400,
+    code: INVALID_BUCKET_NAME,
+    message: INVALID_BUCKET_NAME_MESSAGE,
+    names_the_bucket: true,
+};
+
+/// The refusal a name in AWS's OWN bucket namespace earns: the sentence states that the caller
+/// may not have the name, and names nothing of the request.
+const RESERVED: Refusal = Refusal {
+    status: 403,
+    code: ACCESS_DENIED,
+    message: ACCESS_DENIED_MESSAGE,
+    names_the_bucket: false,
+};
 
 impl Row {
     /// A row whose name the published rules ADMIT.
@@ -61,17 +109,30 @@ impl Row {
             case: case.to_string(),
             bucket: bucket.to_string(),
             held: true,
+            refusal: None,
             head_status: 200,
         }
     }
 
-    /// A row whose name the published CREATE rules refuse and a request can still address a
-    /// bucket by.
+    /// A row whose SPELLING the published create rules refuse and a request can still address
+    /// a bucket by.
     fn refused(case: &str, bucket: impl Into<String>) -> Self {
         Self {
             case: case.to_string(),
             bucket: bucket.into(),
             held: false,
+            refusal: Some(MALFORMED),
+            head_status: 404,
+        }
+    }
+
+    /// A row whose name is in the namespace AWS keeps for its own buckets.
+    fn reserved(case: &str, bucket: impl Into<String>) -> Self {
+        Self {
+            case: case.to_string(),
+            bucket: bucket.into(),
+            held: false,
+            refusal: Some(RESERVED),
             head_status: 404,
         }
     }
@@ -82,6 +143,7 @@ impl Row {
             case: case.to_string(),
             bucket: bucket.into(),
             held: false,
+            refusal: Some(MALFORMED),
             head_status: 400,
         }
     }
@@ -122,10 +184,15 @@ fn rows() -> Vec<Row> {
         Row::refused("a name formatted as an IP address of long octets", "255.255.255.255"),
     ];
     for prefix in RESERVED_PREFIXES {
-        rows.push(Row::refused(
-            &format!("the reserved prefix {prefix:?}"),
-            format!("{prefix}quarterly-logs"),
-        ));
+        // `sthree-` is Amazon S3's OWN internal namespace, so a name in it is refused the
+        // authorization refusal; the other published prefixes belong to another spelling or
+        // another S3 resource kind, under which no general purpose bucket exists at all.
+        let name = format!("{prefix}quarterly-logs");
+        let case = format!("the reserved prefix {prefix:?}");
+        rows.push(match prefix {
+            "sthree-" => Row::reserved(&case, name),
+            _ => Row::refused(&case, name),
+        });
     }
     for suffix in RESERVED_SUFFIXES {
         rows.push(Row::refused(
@@ -158,6 +225,7 @@ async fn a_create_is_refused_for_every_name_the_published_rules_do_not_admit() {
             case,
             bucket,
             held,
+            refusal,
             head_status,
         } = row;
         let created = create_bucket(&router, bucket, None, None).await;
@@ -178,33 +246,49 @@ async fn a_create_is_refused_for_every_name_the_published_rules_do_not_admit() {
             continue;
         }
 
+        let Refusal {
+            status,
+            code,
+            message,
+            names_the_bucket,
+        } = refusal.expect("a row S3 holds no bucket for states the refusal it earns");
         assert_eq!(
-            created.status, 400,
+            created.status, status,
             "case {case:?}: {bucket:?} is not a name S3 holds a bucket under, expected HTTP \
-             400, got {} with body {:?}",
+             {status}, got {} with body {:?}",
             created.status,
             text(&created)
         );
         assert_eq!(
             created.error_code(),
-            INVALID_BUCKET_NAME,
-            "case {case:?}: expected the error code {INVALID_BUCKET_NAME:?}, got {:?}",
+            code,
+            "case {case:?}: expected the error code {code:?}, got {:?}",
             created.error_code()
         );
         assert_eq!(
             created.error_message(),
-            INVALID_BUCKET_NAME_MESSAGE,
-            "case {case:?}: expected the message {INVALID_BUCKET_NAME_MESSAGE:?}, got {:?}",
+            message,
+            "case {case:?}: expected the message {message:?}, got {:?}",
             created.error_message()
         );
-        assert_eq!(
-            created.element("BucketName").as_deref(),
-            Some(bucket.as_str()),
-            "case {case:?}: the error document must name the rejected bucket, got {:?} in \
-             {:?}",
-            created.element("BucketName"),
-            text(&created)
-        );
+        let named = created.element("BucketName");
+        match names_the_bucket {
+            true => assert_eq!(
+                named.as_deref(),
+                Some(bucket.as_str()),
+                "case {case:?}: the error document must name the rejected bucket, got {named:?} \
+                 in {:?}",
+                text(&created)
+            ),
+            // The namespace refusal says nothing about the request: the sentence states that
+            // the caller may not have the name, and no member echoes it back.
+            false => assert_eq!(
+                named, None,
+                "case {case:?}: the refusal must echo nothing of the request, got {named:?} in \
+                 {:?}",
+                text(&created)
+            ),
+        }
         // Refused BEFORE anything is written: the bucket is not there afterwards. WHICH of
         // the two "no bucket here" answers a HEAD of the same name earns is the row's own
         // ([`Row`]): one S3 can ADDRESS no bucket by is refused for the name (400), and one

@@ -5,7 +5,9 @@
 //! IMPLEMENTED: this is the close of the multipart upload loop — it assembles the parts
 //! the request names, in ascending part-number order, into the object at the upload's key
 //! ([`crate::state::ComAmazonawsS3Amazons3State::complete_multipart_upload`]), answers that
-//! object's multipart entity tag ([`crate::state::multipart_object_etag`]), and leaves the
+//! object's multipart entity tag — the addressed bucket's own
+//! ([`crate::state::multipart_object_etag`] for a general purpose bucket,
+//! [`crate::state::directory_multipart_object_etag`] for a directory bucket) — and leaves the
 //! upload id naming nothing. `GetObject` and `HeadObject` read the assembled object back,
 //! and `ListParts` reports the upload is gone.
 //!
@@ -561,13 +563,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
         // "Upon receiving this request, Amazon S3 concatenates all the parts in ascending
         // order by part number to create a new object": the object's bytes are the parts'
         // bytes, in the order the list named them, and its entity tag is the multipart tag
-        // over those same parts ([`crate::state::multipart_object_etag`]) rather than the
-        // digest of the assembled bytes — sealed, where the encryption the upload was
-        // initiated under seals the body, into a tag that is not that digest either
-        // ([`crate::state::stored_object_etag`]), with the `-<parts>` suffix a multipart tag
-        // carries kept.
+        // over those same parts rather than the digest of the assembled bytes — sealed,
+        // where the encryption the upload was initiated under seals the body, into a tag that
+        // is not that digest either ([`crate::state::stored_object_etag`]), with the
+        // `-<parts>` suffix a multipart tag carries kept.
+        //
+        // WHICH multipart tag is the addressed bucket's: a general purpose bucket's is the
+        // MD5 composite ([`crate::state::multipart_object_etag`]) and a DIRECTORY bucket's is
+        // the opaque tag that is no MD5 digest of the object data
+        // ([`crate::state::directory_multipart_object_etag`] holds that rule and its source).
         let etag = crate::state::stored_object_etag(
-            &crate::state::multipart_object_etag(&assembled),
+            &match bucket_record.is_directory() {
+                true => crate::state::directory_multipart_object_etag(&assembled),
+                false => crate::state::multipart_object_etag(&assembled),
+            },
             &upload.encryption,
         );
         // The checksum the completed object carries: "when you perform a

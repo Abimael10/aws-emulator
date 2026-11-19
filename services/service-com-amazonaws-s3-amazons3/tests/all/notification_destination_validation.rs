@@ -174,6 +174,13 @@ const QUEUE_UNPERMITTED: &str = "Permissions on the destination queue do not all
 /// sentence).
 const FUNCTION_UNAUTHORIZED: &str = "Not authorized to invoke function";
 
+/// The whole `<Message>` a container naming a FIFO queue is refused with: a FIFO queue is a
+/// KIND of destination Amazon S3 does not publish to at all, which it states in a sentence of
+/// its own rather than in the destination-validation text — so the fix (use a standard queue)
+/// is readable from the refusal. Judged from the `QueueArn` alone, before any destination is
+/// resolved against the service that owns it.
+const FIFO_UNSUPPORTED: &str = "FIFO SQS queues are not supported.";
+
 /// One row of the table.
 struct Row {
     case: &'static str,
@@ -272,15 +279,17 @@ fn rows() -> Vec<Row> {
             expected_status: INVALID_ARGUMENT_STATUS,
         },
         Row {
-            // Granted the publish and still unable to take it, so what the put reports is
-            // that it could not publish to the destination at all.
+            // A FIFO queue is refused for its KIND, from the ARN alone: S3 publishes no
+            // notification to one, so the refusal states that restriction instead of
+            // reporting a destination it could not validate — and it is reported whatever
+            // grant the queue carries, because nothing about the queue is asked.
             case: "a FIFO queue, which exists and takes no publication from S3",
             destinations: &[Named {
                 kind: Kind::Queue,
                 name: "ordered-queue.fifo",
                 existing: Existing::AsFifoQueue,
                 grant: Grant::AnySource,
-                rejected: Some(QUEUE_ABSENT),
+                rejected: Some(FIFO_UNSUPPORTED),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -925,53 +934,85 @@ async fn a_configuration_is_recorded_only_once_every_destination_it_names_resolv
         } else {
             // Refused: the error document carries the code and the message S3 sends, and
             // the bucket still carries the configuration it had before the put.
+            //
+            // WHICH message depends on what refused the container. A FIFO queue destination
+            // is refused for its KIND, from the `QueueArn` alone and before any destination
+            // is resolved, so the document carries that restriction's own sentence and the
+            // single `<ArgumentName>` / `<ArgumentValue>` pair naming the queue; every other
+            // row is refused for the destinations that did not VALIDATE, which is the fixed
+            // destination-validation sentence and the numbered series naming each one.
+            let fifo = row
+                .destinations
+                .iter()
+                .find(|named| named.existing == Existing::AsFifoQueue);
+            let expected_message = match fifo {
+                Some(_) => FIFO_UNSUPPORTED,
+                None => UNABLE_TO_VALIDATE,
+            };
             assert!(
                 elements(&answer.text(), "Code").contains(&INVALID_ARGUMENT.to_string()),
                 "case {case:?}: expected the refusal's Code to be {INVALID_ARGUMENT:?}, got {}",
                 answer.text()
             );
             assert!(
-                elements(&answer.text(), "Message").contains(&UNABLE_TO_VALIDATE.to_string()),
-                "case {case:?}: expected the refusal's Message to be {UNABLE_TO_VALIDATE:?}, \
+                elements(&answer.text(), "Message").contains(&expected_message.to_string()),
+                "case {case:?}: expected the refusal's Message to be {expected_message:?}, \
                  got {}",
                 answer.text()
             );
 
-            // That message is the same sentence for every destination that failed, so the
-            // document also carries the NUMBERED pair naming each one and the reason it
-            // failed, in the order the container named them.
-            let expected: Vec<(String, String)> = row
-                .destinations
-                .iter()
-                .filter_map(refused_pair)
-                .collect();
-            let refused: Vec<(String, String)> = (1..=expected.len())
-                .map(|position| {
-                    let name = elements(&answer.text(), &format!("ArgumentName{position}"));
-                    let value = elements(&answer.text(), &format!("ArgumentValue{position}"));
-                    (
-                        name.first().cloned().unwrap_or_default(),
-                        value.first().cloned().unwrap_or_default(),
+            if let Some(named) = fifo {
+                let pair = (
+                    elements(&answer.text(), "ArgumentName"),
+                    elements(&answer.text(), "ArgumentValue"),
+                );
+                let expected = (
+                    vec![named.kind.elements().1.to_string()],
+                    vec![destination_arn(named)],
+                );
+                assert_eq!(
+                    pair, expected,
+                    "case {case:?}: expected the refusal to name the member and the queue as \
+                     {expected:?}, got {pair:?} in {}",
+                    answer.text()
+                );
+            } else {
+                // That message is the same sentence for every destination that failed, so the
+                // document also carries the NUMBERED pair naming each one and the reason it
+                // failed, in the order the container named them.
+                let expected: Vec<(String, String)> = row
+                    .destinations
+                    .iter()
+                    .filter_map(refused_pair)
+                    .collect();
+                let refused: Vec<(String, String)> = (1..=expected.len())
+                    .map(|position| {
+                        let name = elements(&answer.text(), &format!("ArgumentName{position}"));
+                        let value = elements(&answer.text(), &format!("ArgumentValue{position}"));
+                        (
+                            name.first().cloned().unwrap_or_default(),
+                            value.first().cloned().unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    refused,
+                    expected,
+                    "case {case:?}: expected the refusal to name each failed destination and its \
+                     reason as {expected:?}, got {refused:?} in {}",
+                    answer.text()
+                );
+                assert!(
+                    elements(
+                        &answer.text(),
+                        &format!("ArgumentName{}", expected.len() + 1)
                     )
-                })
-                .collect();
-            assert_eq!(
-                refused,
-                expected,
-                "case {case:?}: expected the refusal to name each failed destination and its \
-                 reason as {expected:?}, got {refused:?} in {}",
-                answer.text()
-            );
-            assert!(
-                elements(
-                    &answer.text(),
-                    &format!("ArgumentName{}", expected.len() + 1)
-                )
-                .is_empty(),
-                "case {case:?}: the refusal must name no destination past the ones that \
-                 failed, got {}",
-                answer.text()
-            );
+                    .is_empty(),
+                    "case {case:?}: the refusal must name no destination past the ones that \
+                     failed, got {}",
+                    answer.text()
+                );
+            }
             let answered = elements(&reported, "Queue");
             assert_eq!(
                 answered,

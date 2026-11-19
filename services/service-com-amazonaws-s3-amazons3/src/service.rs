@@ -79,6 +79,9 @@ pub mod chunked_upload;
 // The calls on the CONTENTS of an object, which CloudTrail delivers as DATA events into the
 // bucket of every trail whose event selectors admit them — see `service/data_events.rs`.
 pub mod data_events;
+// The operations a DIRECTORY bucket does not serve, and the refusal a request addressing one
+// of them earns — see `service/directory_bucket.rs`.
+pub mod directory_bucket;
 // The S3 Express session token a Zonal endpoint request presents, and what it authorizes —
 // see `service/express_session.rs`.
 pub mod express_session;
@@ -1399,6 +1402,16 @@ fn front_door<Eng: Send + Sync + 'static>(
     for (key, refusal) in express_session::SESSION_DENIED_KEYS {
         table.add_operation(key, Box::new(express_session::SessionDenied::new(refusal)));
     }
+    // And the refusal a request addressing a DIRECTORY bucket earns for naming an operation
+    // that kind of bucket does not serve, one entry per operation of the catalog: the sentence
+    // names the operation, so the answer is built here rather than per request. See
+    // [`directory_bucket`] for the rule and for why it is answered as an operation.
+    for (_, key, feature) in directory_bucket::UNSUPPORTED_BY_A_DIRECTORY_BUCKET {
+        table.add_operation(
+            key,
+            Box::new(directory_bucket::RefuseUnsupportedOperation::new(feature)),
+        );
+    }
     // And the refusal a request earns for the bucket NAME it addresses, held here for the
     // same reason and under a key of the same kind
     // ([`invalid_bucket_name::REFUSE_INVALID_BUCKET_NAME`]): it stands in front of every
@@ -1789,6 +1802,39 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             return self.door.get(express_session::REFUSE_READ_ONLY_SESSION);
         }
         None
+    }
+
+    /// The operation that answers `req` for the OPERATION it names, when the bucket it
+    /// addresses is a DIRECTORY bucket and that operation is one such a bucket does not serve
+    /// ([`directory_bucket::UNSUPPORTED_BY_A_DIRECTORY_BUCKET`]) — else `None`, which is every
+    /// request addressing a general purpose bucket, every request addressing no bucket this
+    /// emulator holds, and every operation S3 Express does serve.
+    ///
+    /// The bucket is read in the PATH-STYLE form every route of this service is bound in
+    /// ([`Self::path_style_path`]), so a virtual-hosted-style Zonal request — the form a client
+    /// addresses a directory bucket in — is judged about the bucket its host named; and it is
+    /// resolved against the STORE rather than off the name, so only a bucket this emulator
+    /// really holds as a directory bucket narrows the surface. A name nothing holds keeps the
+    /// answer it would otherwise get, which is the bucket-absent refusal the addressed
+    /// operation itself answers.
+    ///
+    /// Read-only: the guard is taken, the addressed bucket's kind is read, and nothing is
+    /// written.
+    fn refuses_the_addressed_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
+        let path = self.path_style_path(req);
+        let addressed = first_path_segment(&path)?;
+        let state = crate::state::service_state(&*self.engine)?;
+        let directory = {
+            let store = state.lock();
+            store
+                .bucket(addressed)
+                .is_some_and(crate::state::Bucket::is_directory)
+        };
+        if !directory {
+            return None;
+        }
+        let operation = self.addressed_operation(req)?;
+        self.door.get(directory_bucket::refusal_key(&operation)?)
     }
 
     /// The operation of this model `req`'s address names, or `None` for a request whose
@@ -2237,6 +2283,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // SIGNATURE by the time it reaches this seam, so this refusal is only ever about the
         // session. See [`express_session`].
         if let Some(refusal) = self.refused_session_token(req) {
+            return Some(refusal);
+        }
+        // A request addressing a DIRECTORY bucket and naming an operation that kind of bucket
+        // does not serve is refused for the operation, before that operation runs: S3 Express
+        // One Zone serves a narrower API, and a call it does not serve must not configure the
+        // bucket. See [`directory_bucket`] for the catalog and
+        // [`Self::refuses_the_addressed_operation`] for how the bucket and the operation are
+        // resolved.
+        if let Some(refusal) = self.refuses_the_addressed_operation(req) {
             return Some(refusal);
         }
         // A `?session` request against a bucket that HAS no session subresource — a general

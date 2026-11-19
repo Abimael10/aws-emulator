@@ -260,6 +260,38 @@ pub fn multipart_object_etag(parts: &[&[u8]]) -> String {
     format!("\"{}-{}\"", hex::encode(digest.finalize()), parts.len())
 }
 
+/// The entity tag S3 reports for an object a multipart upload was completed into in a
+/// DIRECTORY bucket, over the same parts in the same order.
+///
+/// A directory bucket's entity tag is NOT the MD5 composite a general purpose bucket's is:
+/// "the entity tag is an opaque string. The entity tag may or may not be an MD5 digest of the
+/// object data. If the entity tag is not an MD5 digest of the object data, it will contain one
+/// or more nonhexadecimal characters and/or will consist of less than 32 or more than 32
+/// hexadecimal digits" (`CompleteMultipartUploadOutput$ETag`) — and the S3 Express One Zone
+/// storage class a directory bucket holds its objects in is where that second case arises, so a
+/// client that keys on the tag's FORM can tell the two kinds of bucket apart, and one that
+/// expects to recompute the composite itself does not try.
+///
+/// What the same sentence still requires of it is what this computes: the tag identifies the
+/// object's DATA, so "objects with different object data will have different entity tags" — the
+/// digest is over the part digests, the composition a multipart tag is always built from
+/// ([`multipart_object_etag`]), carried into SHA-256 so the value is the 64 hexadecimal digits
+/// that same sentence names as a tag which is no MD5 digest. The `-<parts>` suffix is kept: the
+/// object is one a multipart upload assembled whatever kind of bucket holds it, and that is
+/// where a client reads how many parts it was assembled from.
+///
+/// Stable for the object — the write settles it and every later read reports the one the write
+/// recorded — and sealed, where the encryption the upload was initiated under seals the body,
+/// by the same [`stored_object_etag`] a general purpose bucket's tag goes through.
+pub fn directory_multipart_object_etag(parts: &[&[u8]]) -> String {
+    use ::sha2::Digest as _;
+    let mut digest = ::sha2::Sha256::new();
+    for part in parts {
+        digest.update(Md5::digest(part));
+    }
+    format!("\"{}-{}\"", hex::encode(digest.finalize()), parts.len())
+}
+
 /// The entity tag an object stored under `encryption` carries, given `plaintext` — the
 /// entity tag of its bytes as [`object_etag`] or [`multipart_object_etag`] computed it.
 ///

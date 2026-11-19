@@ -104,18 +104,18 @@ pub fn presented_token(req: &RtRequest) -> Option<&str> {
 /// How this service refuses a session that authorizes nothing on the bucket the request
 /// addressed: the wire code, the status and the sentence S3 publishes for it.
 ///
-/// Three conditions, three published codes, because a client branches on them differently —
+/// Three conditions, two published codes, because a client branches on them differently —
 /// each code, status and sentence taken from this service's own catalog
 /// (`crate::state`), which is where every wire refusal of this service is worded:
 ///
 /// * a token no session of this emulator carries — [`crate::state::INVALID_TOKEN_CODE`]
 ///   (400): nothing can be said about a session that was never vended;
-/// * a session whose expiry the CLOCK has passed — [`crate::state::EXPIRED_TOKEN_CODE`]
-///   (400), which is what tells a caller to take a new session rather than to fix its
-///   request; and
-/// * a live session created for ANOTHER bucket — [`crate::state::ACCESS_DENIED_CODE`] (403):
-///   the session is a credential this caller holds, and it grants nothing on the bucket this
-///   request addressed.
+/// * a session whose expiry the CLOCK has passed, and a live session created for ANOTHER
+///   bucket — [`crate::state::ACCESS_DENIED_CODE`] (403) for both: the session is a
+///   credential this caller holds, and what it authorizes on the bucket this request
+///   addressed is nothing, so the refusal is the one S3 answers a request a credential does
+///   not authorize. See [`EXPIRED_TOKEN`] for why an expired session is that condition rather
+///   than a malformed credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionRefusal {
     /// The `<Code>` a client branches on.
@@ -132,11 +132,22 @@ const INVALID_TOKEN: SessionRefusal = SessionRefusal {
     status: crate::state::INVALID_TOKEN_STATUS,
     message: crate::state::INVALID_TOKEN_MESSAGE,
 };
-/// See [`SessionRefusal`].
+/// A session the CLOCK has expired: "after the expiration time, any calls that you make with
+/// those credentials will fail" (`CreateSession`'s own documentation).
+///
+/// The same refusal a session created for another bucket earns, and for the same reason: the
+/// `x-amz-s3session-token` is not the request's SigV4 credential — the signature is computed
+/// from the session's key pair, and the framework has already verified it by the time this
+/// seam is reached — so what the token says is WHICH session the caller acts under, and a
+/// session past its expiry authorizes nothing on the bucket. That is the authorization
+/// refusal, 403 [`crate::state::ACCESS_DENIED_CODE`], which is also what tells an SDK to take
+/// a new session through `CreateSession`; the credential-level
+/// [`crate::state::EXPIRED_TOKEN_CODE`] (400) belongs to a security TOKEN presented as the
+/// credential itself.
 const EXPIRED_TOKEN: SessionRefusal = SessionRefusal {
-    code: crate::state::EXPIRED_TOKEN_CODE,
-    status: crate::state::EXPIRED_TOKEN_STATUS,
-    message: crate::state::EXPIRED_TOKEN_MESSAGE,
+    code: crate::state::ACCESS_DENIED_CODE,
+    status: crate::state::ACCESS_DENIED_STATUS,
+    message: crate::state::ACCESS_DENIED_MESSAGE,
 };
 /// See [`SessionRefusal`].
 const OTHER_BUCKET: SessionRefusal = SessionRefusal {
@@ -254,7 +265,7 @@ mod tests {
             (
                 "a token whose session has expired",
                 SessionTokenVerdict::Expired,
-                Some((crate::state::EXPIRED_TOKEN_CODE, crate::state::EXPIRED_TOKEN_STATUS)),
+                Some((crate::state::ACCESS_DENIED_CODE, crate::state::ACCESS_DENIED_STATUS)),
             ),
             (
                 "a session created for another bucket",

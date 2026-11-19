@@ -55,6 +55,9 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/s3-replication-role";
 /// The destination bucket, as the member takes it: an S3 bucket ARN.
 const DESTINATION_ARN: &str = "arn:aws:s3:::replication-destination";
 
+/// A SECOND destination, for the rows where two rules replicate into different buckets.
+const ANOTHER_DESTINATION_ARN: &str = "arn:aws:s3:::another-destination";
+
 /// One `ReplicationRule`, as a request carries it and as a report brings it back.
 ///
 /// The same type on both sides, so a round-trip assertion compares the rule that was sent
@@ -283,9 +286,31 @@ fn reported_configuration(answer: &Answer) -> (String, Vec<Rule>) {
     (role, rules)
 }
 
+/// Stand up the DESTINATION buckets the rules below replicate into, each versioning-enabled.
+///
+/// A replication rule's destination has to be a bucket that exists and has versioning enabled
+/// — the published requirement both ends of a replication must satisfy — so a suite that puts
+/// a configuration stands its destinations up first, exactly as it stands up the source.
+///
+/// `pub(crate)`: the two destinations below are the ones every replication suite of this crate
+/// names ([`super::bucket_replication_delete`] and
+/// [`super::bucket_subresource_document_rules`] call this too), so one place stands them up
+/// and no suite repeats the reading of which buckets a rule needs.
+pub(crate) async fn replication_destinations(router: &MultiServiceRouter) {
+    for arn in [DESTINATION_ARN, ANOTHER_DESTINATION_ARN] {
+        versioned_bucket(router, destination_bucket(arn)).await;
+    }
+}
+
+/// The bucket name an S3 bucket ARN addresses: the resource part, which for a bucket ARN
+/// (`arn:aws:s3:::<name>`) is the bare name.
+pub(crate) fn destination_bucket(arn: &str) -> &str {
+    arn.rsplit(':').next().unwrap_or(arn)
+}
+
 /// Stand up a versioning-enabled bucket named `name`, which is the state a replication
 /// configuration may be applied to.
-async fn versioned_bucket(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn versioned_bucket(router: &MultiServiceRouter, name: &str) {
     let created = create_bucket(router, name, None, None).await;
     assert_eq!(
         created.status, 200,
@@ -359,7 +384,7 @@ fn round_trip_rows() -> Vec<(&'static str, Vec<Rule>)> {
                     .with_id("second")
                     .with_priority(2)
                     .with_filter_prefix("b/")
-                    .with_destination("arn:aws:s3:::another-destination"),
+                    .with_destination(ANOTHER_DESTINATION_ARN),
                 Rule::enabled()
                     .with_id("first")
                     .with_priority(1)
@@ -373,6 +398,7 @@ fn round_trip_rows() -> Vec<(&'static str, Vec<Rule>)> {
 #[tokio::test]
 async fn a_replication_configuration_round_trips_through_the_bucket() {
     let router = router();
+    replication_destinations(&router).await;
 
     for (index, (case, rules)) in round_trip_rows().into_iter().enumerate() {
         let bucket = format!("replication-round-trip-{index}");
@@ -431,6 +457,7 @@ async fn a_replication_configuration_round_trips_through_the_bucket() {
 #[tokio::test]
 async fn a_configuration_s3_cannot_apply_is_refused_and_changes_nothing() {
     let router = router();
+    replication_destinations(&router).await;
     let bucket = "replication-refusals";
     versioned_bucket(&router, bucket).await;
 
@@ -778,6 +805,7 @@ fn v2_schema_rows() -> Vec<(&'static str, Vec<String>, bool)> {
 #[tokio::test]
 async fn a_v2_rule_that_names_no_priority_is_refused_and_records_nothing() {
     let router = router();
+    replication_destinations(&router).await;
 
     for (index, (case, rules, accepted)) in v2_schema_rows().into_iter().enumerate() {
         let bucket = format!("replication-v2-schema-{index}");
@@ -852,6 +880,7 @@ async fn a_v2_rule_that_names_no_priority_is_refused_and_records_nothing() {
 #[tokio::test]
 async fn an_unexpected_bucket_owner_is_refused() {
     let router = router();
+    replication_destinations(&router).await;
     let bucket = "replication-owner-gate";
     versioned_bucket(&router, bucket).await;
 

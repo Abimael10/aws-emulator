@@ -621,7 +621,10 @@ fn refusal_rows() -> Vec<RefusalRow> {
             )]),
             code: "InvalidRequest",
             status: 400,
-            message: None,
+            message: Some(
+                "'ObjectSizeLessThan' has to be a value greater than 'ObjectSizeGreaterThan'."
+                    .to_string(),
+            ),
         },
         RefusalRow {
             case: "an expiration day count of zero",
