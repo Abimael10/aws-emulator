@@ -679,6 +679,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // launch from. Asked BEFORE this service's store is locked, so only one store is ever
         // held at a time, and before the instance profile below because a template that does
         // not resolve carries no profile to resolve either.
+        //
+        // And therefore before the group's name is weighed against the names already taken:
+        // the launch source a request names is resolved first, so a request whose launch
+        // source resolves to nothing is told about the launch source and not about the name.
         if let Some(refusal) = crate::state::group_configuration::unresolvable_launch_template_error(
             &*self.engine,
             input.launch_template.as_ref(),
@@ -736,6 +740,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
 
+        // The last half of the launch source left to resolve: a group launches from a launch
+        // configuration the account holds. None can be created (`CreateLaunchConfiguration`
+        // is refused with `UnsupportedOperation`), so naming one is refused the same way any
+        // unknown name is: from the store, not from a constant. Resolved HERE, with the two
+        // reads above and before the name is weighed, because the launch source a request
+        // names is resolved before the group's name is checked for being taken — a request
+        // naming a launch source that resolves to nothing is told about the launch source,
+        // whatever its name states.
+        if let Some(configuration) = input.launch_configuration_name.as_deref() {
+            if !state.launch_configurations.contains_key(configuration) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "Launch configuration name not found - Launch configuration {configuration} \
+                     not found"
+                )));
+            }
+        }
+
         if state.groups.contains_key(&name) {
             return Err(CreateAutoScalingGroupErrorModeled::AlreadyExistsFault(
                 AlreadyExistsFault {
@@ -758,19 +779,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // A group launches from a launch configuration the account holds. None can
-        // be created (`CreateLaunchConfiguration` is refused with
-        // `UnsupportedOperation`), so naming one is refused the same way any
-        // unknown name is: from the store, not from a constant.
-        if let Some(configuration) = input.launch_configuration_name.as_deref() {
-            if !state.launch_configurations.contains_key(configuration) {
-                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                    "Launch configuration name not found - Launch configuration {configuration} \
-                     not found"
-                )));
-            }
-        }
-
         let resource_id = state.mint_resource_id();
         let arn = crate::state::group_arn(&region, &resource_id, &name);
         // How many tags ONE call may state, checked on the request's own length before the
