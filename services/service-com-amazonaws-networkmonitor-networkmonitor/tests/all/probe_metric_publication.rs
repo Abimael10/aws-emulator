@@ -26,8 +26,10 @@
 //! The rows span what the rule generalises over: both `aggregationPeriod` values the
 //! model documents and a monitor that names none, both protocols a probe can use,
 //! IPv4 and IPv6 destinations, packet sizes across the documented range, more than
-//! one probe of one monitor (so a series belongs to ONE probe), and a probe switched
-//! off before it ever goes live.
+//! one probe of one monitor (so a series belongs to ONE probe), how the probe got
+//! there — created WITH its monitor or added to a standing one by `CreateProbe`,
+//! beside a probe already publishing or as the monitor's first — a probe switched off
+//! before it ever goes live, and a probe switched off and back on.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -38,17 +40,15 @@ use service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::monitor_and_probe::{
-    call, create_monitor, get_monitor, probe_json, probes_of, source_arn_of, string_at, REGION,
+    call, create_monitor, create_probe, get_monitor, probe_json, probe_json_in_subnet, probes_of,
+    string_at, update_probe, REGION,
 };
 
-/// One probe body whose `sourceArn` names the subnet at `index`, for the cases that
-/// give each probe of ONE monitor a subnet of its own: a monitor holds only so many
-/// probes in one source subnet, and that limit is not what these rows are about.
+/// One ICMP probe body whose `sourceArn` names the subnet at `index`, for the cases
+/// that give each probe of ONE monitor a subnet of its own: a monitor holds only so
+/// many probes in one source subnet, and that limit is not what these rows are about.
 fn probe_in_subnet(index: usize, destination: &str) -> String {
-    format!(
-        r#"{{"sourceArn":"{}","destination":"{destination}","protocol":"ICMP","packetSize":56}}"#,
-        source_arn_of(index)
-    )
+    probe_json_in_subnet(index, destination, "ICMP", r#","packetSize":56"#)
 }
 
 /// The namespace CloudWatch Network Monitor publishes a probe's measurements in, as a
@@ -251,8 +251,7 @@ async fn published(
     loop {
         if let Some(dimensions) = series_of_probe(case, router, probe_id).await {
             let points = datapoints(case, router, &dimensions).await;
-            let observed: f64 = points.iter().map(|(_, sample_count, _)| sample_count).sum();
-            if observed >= windows {
+            if observations(&points) >= windows {
                 return (dimensions, points);
             }
         }
@@ -276,6 +275,34 @@ async fn get_probe(router: &MultiServiceRouter, name: &str, probe_id: &str) -> (
     .await
 }
 
+/// How many observations a read of a series reports altogether: a window is one
+/// observation, and a read at the storage minute reports the windows of that minute
+/// as the `SampleCount` of one datapoint.
+fn observations(points: &[(f64, f64, String)]) -> f64 {
+    points.iter().map(|(_, sample_count, _)| sample_count).sum()
+}
+
+/// Wait until `probe_id` of `name` reports `ACTIVE`, which is the state the clock owes
+/// a probe once its provisioning span has passed — polled for, never slept through.
+async fn wait_active(case: &str, router: &MultiServiceRouter, name: &str, probe_id: &str) {
+    let deadline = Instant::now() + PUBLISH_DEADLINE;
+    loop {
+        let (status, probe) = get_probe(router, name, probe_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetProbe expected 200, got {status} {probe:?}"
+        );
+        if string_at(&probe, "state") == "ACTIVE" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected {probe_id} to reach ACTIVE, it reports {probe:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// The `probeId` of the single probe `GetMonitor` lists for `name`, waited for the
 /// way the client does: a monitor lists the probe it was created with, and the probe
 /// reaches `ACTIVE` once the clock has made its activation due.
@@ -292,18 +319,12 @@ async fn live_probe(case: &str, router: &MultiServiceRouter, name: &str) -> Stri
             .map(|probe| string_at(probe, "probeId"))
             .unwrap_or_default();
         if !probe_id.is_empty() {
-            let (status, probe) = get_probe(router, name, &probe_id).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: GetProbe expected 200, got {status} {probe:?}"
-            );
-            if string_at(&probe, "state") == "ACTIVE" {
-                return probe_id;
-            }
+            wait_active(case, router, name, &probe_id).await;
+            return probe_id;
         }
         assert!(
             Instant::now() < deadline,
-            "case {case:?}: expected the monitor's probe to reach ACTIVE, it has not"
+            "case {case:?}: expected the monitor to list its probe, it has not"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -509,7 +530,7 @@ async fn a_live_probe_keeps_publishing_one_window_per_aggregation_period() {
     );
     let probe_id = live_probe(case, &router, name).await;
     let (_, points) = published(case, &router, &probe_id, 2.0).await;
-    let observed: f64 = points.iter().map(|(_, sample_count, _)| sample_count).sum();
+    let observed = observations(&points);
     assert!(
         observed >= 2.0,
         "case {case:?}: expected the series to gain a window per aggregation period, got \
@@ -559,11 +580,11 @@ async fn a_probe_switched_off_before_it_goes_live_publishes_nothing() {
         !silent_probe.is_empty(),
         "case {case:?}: the monitor must list its probe, got {got:?}"
     );
-    let (status, updated) = call(
+    let (status, updated) = update_probe(
         &router,
-        "PATCH",
-        &format!("/monitors/{silent}/probes/{silent_probe}"),
-        Some(r#"{"state":"INACTIVE"}"#),
+        silent,
+        &silent_probe,
+        r#"{"state":"INACTIVE"}"#,
     )
     .await;
     assert_eq!(
@@ -591,5 +612,238 @@ async fn a_probe_switched_off_before_it_goes_live_publishes_nothing() {
         string_at(&probe, "state"),
         "INACTIVE",
         "case {case:?}: the switched-off probe must still report INACTIVE, got {probe:?}"
+    );
+}
+
+/// One row of the rule's other half of the "how did the probe get here" dimension: a
+/// probe ADDED to a monitor that already stands, by `CreateProbe`.
+struct AddedProbeCase {
+    case: &'static str,
+    /// The monitor's `aggregationPeriod`, which spaces the windows of every probe it
+    /// holds, however that probe was added.
+    aggregation_period: i64,
+    destination: &'static str,
+    protocol: &'static str,
+    /// The members that protocol needs beside them, as on the rows above.
+    extra: &'static str,
+    /// Whether the monitor already holds a probe of its own — and therefore a series
+    /// already running — when this one is added.
+    beside_a_live_probe: bool,
+}
+
+/// The rows: both documented aggregation periods, both protocols, IPv4 and IPv6
+/// destinations, packet sizes at both ends of the documented range, and a probe added
+/// as the monitor's first as well as one added beside a probe already publishing.
+const ADDED_PROBE_CASES: &[AddedProbeCase] = &[
+    AddedProbeCase {
+        case: "added to a standing monitor with 30 s windows, ICMP, packetSize 56",
+        aggregation_period: 30,
+        destination: "10.5.0.1",
+        protocol: "ICMP",
+        extra: r#","packetSize":56"#,
+        beside_a_live_probe: false,
+    },
+    AddedProbeCase {
+        case: "added beside a probe already publishing, 60 s windows, the largest packet",
+        aggregation_period: 60,
+        destination: "10.5.0.2",
+        protocol: "ICMP",
+        extra: r#","packetSize":8500"#,
+        beside_a_live_probe: true,
+    },
+    AddedProbeCase {
+        case: "a TCP probe added later, which carries a destination port",
+        aggregation_period: 30,
+        destination: "192.0.2.20",
+        protocol: "TCP",
+        extra: r#","destinationPort":443,"packetSize":56"#,
+        beside_a_live_probe: false,
+    },
+    AddedProbeCase {
+        case: "an IPv6 destination added beside a probe already publishing",
+        aggregation_period: 60,
+        destination: "2001:db8::2",
+        protocol: "ICMP",
+        extra: r#","packetSize":56"#,
+        beside_a_live_probe: true,
+    },
+];
+
+/// RULE: it is being LIVE that makes a probe publish, not the call that created it —
+/// so a probe added to a monitor that already stands (`CreateProbe POST
+/// /monitors/{monitorName}/probes`) publishes the same series, dimensioned by that
+/// monitor and by itself, once it reaches `ACTIVE`.
+#[tokio::test]
+async fn a_probe_added_to_a_standing_monitor_publishes_its_own_series() {
+    let router = emulator();
+    for (index, row) in ADDED_PROBE_CASES.iter().enumerate() {
+        let case = row.case;
+        let name = format!("added-{index}");
+        // Each probe of these rows gets a subnet of its own: a monitor holds only so
+        // many probes in one source subnet, which is not what the row is about.
+        let resident_subnet = 200 + index * 2;
+        let added_subnet = resident_subnet + 1;
+        let body = if row.beside_a_live_probe {
+            format!(
+                r#"{{"monitorName":"{name}","aggregationPeriod":{},"probes":[{}]}}"#,
+                row.aggregation_period,
+                probe_in_subnet(resident_subnet, "10.5.255.1")
+            )
+        } else {
+            format!(
+                r#"{{"monitorName":"{name}","aggregationPeriod":{}}}"#,
+                row.aggregation_period
+            )
+        };
+        let (status, created) = create_monitor(&router, &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateMonitor expected 200, got {status} {created:?}"
+        );
+        // The series the monitor was already running, if the row gave it one: it has
+        // to still be the resident probe's own after another probe joins it.
+        let resident = if row.beside_a_live_probe {
+            let resident_id = live_probe(case, &router, &name).await;
+            let (dimensions, _) = published(case, &router, &resident_id, 1.0).await;
+            Some((resident_id, dimensions))
+        } else {
+            None
+        };
+
+        let (status, added) = create_probe(
+            &router,
+            &name,
+            &format!(
+                r#"{{"probe":{}}}"#,
+                probe_json_in_subnet(added_subnet, row.destination, row.protocol, row.extra)
+            ),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateProbe expected 200, got {status} {added:?}"
+        );
+        let probe_id = string_at(&added, "probeId");
+        assert!(
+            !probe_id.is_empty(),
+            "case {case:?}: CreateProbe must report the probe it minted, got {added:?}"
+        );
+        wait_active(case, &router, &name, &probe_id).await;
+        let (dimensions, points) = published(case, &router, &probe_id, 1.0).await;
+
+        let values: BTreeSet<&String> = dimensions.values().collect();
+        let expected: BTreeSet<&String> = [&name, &probe_id].into_iter().collect();
+        assert_eq!(
+            values, expected,
+            "case {case:?}: expected the added probe's series to be dimensioned by the monitor \
+             and the probe, got {dimensions:?}"
+        );
+        for (average, sample_count, unit) in &points {
+            assert_eq!(
+                *average, TOTAL_LOSS,
+                "case {case:?}: a destination that never answers loses every packet, so the \
+                 average must be {TOTAL_LOSS}, got {average} in {points:?}"
+            );
+            assert!(
+                *sample_count > 0.0,
+                "case {case:?}: a published window is an observation, got a sample count of \
+                 {sample_count} in {points:?}"
+            );
+            assert_eq!(
+                unit, PERCENT,
+                "case {case:?}: a share of packets is published in {PERCENT}, got {unit:?} in \
+                 {points:?}"
+            );
+        }
+        if let Some((resident_id, resident_series)) = resident {
+            assert_ne!(
+                resident_series, dimensions,
+                "case {case:?}: the probe added to the monitor publishes a series of its own, \
+                 {resident_id} already had {resident_series:?}"
+            );
+            assert!(
+                !dimensions.values().any(|value| *value == resident_id),
+                "case {case:?}: the added probe's series must not name {resident_id}, got \
+                 {dimensions:?}"
+            );
+        }
+    }
+}
+
+/// RULE, the half that lets a series RESUME: what publishes is a probe that is LIVE,
+/// so a probe switched back on publishes again — into the same series, reopened from
+/// the instant it returned. (That a probe which is not live publishes nothing is the
+/// subject of `a_probe_switched_off_before_it_goes_live_publishes_nothing` above; this
+/// case asserts only the resumption.)
+///
+/// Timing-free: the monitor's windows are 60 s apart and the count is read only after
+/// the probe has been switched OFF, so no window of it is owed while the test holds
+/// that count; whatever the series gains afterwards is the switch-on's own, waited for
+/// as a condition.
+#[tokio::test]
+async fn a_probe_switched_back_on_publishes_again() {
+    let case = "a probe switched off after it published, then switched back on";
+    let router = emulator();
+    let name = "reactivated-monitor";
+    let body = format!(
+        r#"{{"monitorName":"{name}","aggregationPeriod":60,"probes":[{}]}}"#,
+        probe_json("10.6.0.1", "ICMP", r#","packetSize":56"#)
+    );
+    let (status, created) = create_monitor(&router, &body).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateMonitor expected 200, got {status} {created:?}"
+    );
+    let probe_id = live_probe(case, &router, name).await;
+    let (series, _) = published(case, &router, &probe_id, 1.0).await;
+
+    switch_probe(case, &router, name, &probe_id, "INACTIVE").await;
+    // Taken with the probe already off, so nothing is owed for it: this count cannot
+    // move until it is switched back on.
+    let off = observations(&datapoints(case, &router, &series).await);
+    assert!(
+        off > 0.0,
+        "case {case:?}: the probe published before it was switched off, got {off} observation(s)"
+    );
+
+    switch_probe(case, &router, name, &probe_id, "ACTIVE").await;
+    let (reopened, points) = published(case, &router, &probe_id, off + 1.0).await;
+    assert_eq!(
+        reopened, series,
+        "case {case:?}: a probe switched back on publishes into the same series, got \
+         {reopened:?} after {series:?}"
+    );
+    for (average, _, unit) in &points {
+        assert_eq!(
+            *average, TOTAL_LOSS,
+            "case {case:?}: every window of an unanswered destination reads {TOTAL_LOSS}, got \
+             {average} in {points:?}"
+        );
+        assert_eq!(
+            unit, PERCENT,
+            "case {case:?}: a share of packets is published in {PERCENT}, got {unit:?}"
+        );
+    }
+}
+
+/// Ask for `state`, the toggle `UpdateProbe` sets (`ProbeState`'s settable values), and
+/// check the stored probe reports it back.
+async fn switch_probe(
+    case: &str,
+    router: &MultiServiceRouter,
+    name: &str,
+    probe_id: &str,
+    state: &str,
+) {
+    let (status, updated) =
+        update_probe(router, name, probe_id, &format!(r#"{{"state":"{state}"}}"#)).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: UpdateProbe {state} expected 200, got {status} {updated:?}"
+    );
+    assert_eq!(
+        string_at(&updated, "state"),
+        state,
+        "case {case:?}: UpdateProbe {state} must report it back, got {updated:?}"
     );
 }

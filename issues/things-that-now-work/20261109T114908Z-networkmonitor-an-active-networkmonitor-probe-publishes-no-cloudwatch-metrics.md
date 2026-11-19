@@ -10,6 +10,26 @@ Issue-Commit: e38416fc0970ac2ae0c65df6bda0d7aff4be2337
 
 > _Note: this issue was identified against the code base at commit `e38416fc0970ac2ae0c65df6bda0d7aff4be2337`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+The publication itself had already landed when this filing was worked: a live probe's
+windows are published by the clock-owed publisher in
+`services/service-com-amazonaws-networkmonitor-networkmonitor/src/state/probe_metrics.rs`,
+which every write that can change which probes are live drives, and which appends into
+CloudWatch's own metric store — so `ListMetrics(Namespace='AWS/NetworkMonitor',
+MetricName='PacketLoss')` lists the probe's series and `GetMetricStatistics` reads its
+windows, each 100 Percent for a destination that never answers. The replay of
+`networkmonitor.probe-native-round-trip-metrics` passes.
+
+What this filing added is the regression coverage for the halves of that rule the suite
+did not span, in `tests/all/probe_metric_publication.rs`: a probe ADDED to a standing
+monitor by `CreateProbe` (the operation this report names) publishes its own series, and
+a probe switched off and back on publishes again into it.
+
+`20261024T153105Z-networkmonitor-createprobe-event-propagation.md` is left open: it asks
+for `RTT` and `HealthIndicator` as well, and neither has a sample to publish for a path
+nothing answers on, so what that record wants is decided on its own.
+
 ## Operation
 CreateProbe
 

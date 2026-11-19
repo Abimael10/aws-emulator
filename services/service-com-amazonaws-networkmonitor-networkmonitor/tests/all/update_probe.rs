@@ -31,7 +31,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::monitor_and_probe::{
     call, create_monitor, create_probe, error_code, get_monitor, probes_of, router, source_arn,
-    string_at, ACCOUNT, PAST_ACTIVATION, PAST_TEARDOWN, REGION,
+    string_at, update_probe, ACCOUNT, PAST_ACTIVATION, PAST_TEARDOWN, REGION,
 };
 
 /// Every value the model's `ProbeState` enum admits
@@ -74,21 +74,6 @@ async fn get_probe(router: &MultiServiceRouter, name: &str, probe_id: &str) -> (
         "GET",
         &format!("/monitors/{name}/probes/{probe_id}"),
         None,
-    )
-    .await
-}
-
-async fn update_probe(
-    router: &MultiServiceRouter,
-    name: &str,
-    probe_id: &str,
-    body: &str,
-) -> (u16, Value) {
-    call(
-        router,
-        "PATCH",
-        &format!("/monitors/{name}/probes/{probe_id}"),
-        Some(body),
     )
     .await
 }

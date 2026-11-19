@@ -33,7 +33,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::monitor_and_probe::{
     call, create_monitor, create_probe, error_code, get_monitor, probe_json, probes_of, router,
-    string_at, PAST_ACTIVATION, PAST_TEARDOWN,
+    string_at, update_probe, PAST_ACTIVATION, PAST_TEARDOWN,
 };
 use super::resource_tags::list_tags;
 use super::update_probe::timestamp;
@@ -115,21 +115,6 @@ pub(crate) async fn delete_probe(
         "DELETE",
         &format!("/monitors/{name}/probes/{probe_id}"),
         None,
-    )
-    .await
-}
-
-async fn update_probe(
-    router: &MultiServiceRouter,
-    name: &str,
-    probe_id: &str,
-    body: &str,
-) -> (u16, Value) {
-    call(
-        router,
-        "PATCH",
-        &format!("/monitors/{name}/probes/{probe_id}"),
-        Some(body),
     )
     .await
 }

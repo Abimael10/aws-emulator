@@ -192,10 +192,42 @@ pub(crate) fn error_message(body: &Value) -> String {
 /// `ProbeInput` and `CreateMonitorProbeInput` both require, plus whatever
 /// `extra` adds (`,"destinationPort":443`, `,"packetSize":56`, …).
 pub(crate) fn probe_json(destination: &str, protocol: &str, extra: &str) -> String {
+    probe_json_from(&source_arn(), destination, protocol, extra)
+}
+
+/// The same body with the subnet at `index` as its source, for a case that gives each
+/// probe of ONE monitor a subnet of its own ([`source_arn_of`]).
+pub(crate) fn probe_json_in_subnet(
+    index: usize,
+    destination: &str,
+    protocol: &str,
+    extra: &str,
+) -> String {
+    probe_json_from(&source_arn_of(index), destination, protocol, extra)
+}
+
+/// The ONE spelling of a probe body, so a suite that names its own source subnet and
+/// one that takes this account's cannot drift in the members they send.
+fn probe_json_from(source_arn: &str, destination: &str, protocol: &str, extra: &str) -> String {
     format!(
-        r#"{{"sourceArn":"{}","destination":"{destination}","protocol":"{protocol}"{extra}}}"#,
-        source_arn()
+        r#"{{"sourceArn":"{source_arn}","destination":"{destination}","protocol":"{protocol}"{extra}}}"#
     )
+}
+
+/// `PATCH /monitors/{monitorName}/probes/{probeId}`: the probe write a caller makes.
+pub(crate) async fn update_probe(
+    router: &MultiServiceRouter,
+    name: &str,
+    probe_id: &str,
+    body: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "PATCH",
+        &format!("/monitors/{name}/probes/{probe_id}"),
+        Some(body),
+    )
+    .await
 }
 
 /// Whether `id` satisfies the model's `ProbeId` pattern,

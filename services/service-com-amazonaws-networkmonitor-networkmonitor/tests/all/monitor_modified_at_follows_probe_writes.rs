@@ -27,7 +27,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::monitor_and_probe::{
     call, create_monitor, create_probe, get_monitor, probes_of, router, source_arn_of, string_at,
-    PAST_ACTIVATION,
+    update_probe, PAST_ACTIVATION,
 };
 use super::update_probe::timestamp;
 
@@ -50,21 +50,6 @@ enum Call {
     Delete,
     /// `GetMonitor`: a read, which writes nothing.
     Read,
-}
-
-async fn update_probe(
-    router: &MultiServiceRouter,
-    name: &str,
-    probe_id: &str,
-    body: &str,
-) -> (u16, Value) {
-    call(
-        router,
-        "PATCH",
-        &format!("/monitors/{name}/probes/{probe_id}"),
-        Some(body),
-    )
-    .await
 }
 
 async fn delete_probe(router: &MultiServiceRouter, name: &str, probe_id: &str) -> (u16, Value) {
