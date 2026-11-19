@@ -14,6 +14,11 @@
 //! invariants above instead, because no sentence of the service's has been observed for it
 //! to pin.
 //!
+//! A description of a link's STATE is also never the wording of a REFUSED request: a refusal
+//! says something about a request and is stated in that refusal's own answer, so every sentence
+//! the service refuses a VPC link call with ([`refusal_sentences`]) is held against every
+//! description the readers below serve.
+//!
 //! The two surfaces name that pair differently — `status`/`statusMessage` on the REST-API
 //! surface and `vpcLinkStatus`/`vpcLinkStatusMessage` on the HTTP-API one — and each is
 //! served by its OWN service crate, so the sentence they agree on is only observable from
@@ -335,6 +340,53 @@ fn member(case: &str, label: &str, projection: &Value, name: &str) -> String {
         .to_string()
 }
 
+/// Every sentence the service REFUSED a VPC link call with, on both surfaces: a read and an
+/// update of a link id nothing minted.
+///
+/// A refusal's wording belongs to that refusal's own answer — it describes a REQUEST, not the
+/// state of a resource — so no link's status description may state it. The sentences are taken
+/// from the service rather than written out here, so a change to either surface's wording keeps
+/// being checked.
+async fn refusal_sentences(router: &MultiServiceRouter) -> Vec<String> {
+    /// A `VpcLinkId` of the form either surface mints that nothing minted.
+    const UNKNOWN: &str = "nosuchlink";
+    let mut sentences = Vec::new();
+    for surface in [&REST, &V2] {
+        let unknown = format!("{}/{UNKNOWN}", surface.collection);
+        for (label, method, body) in [
+            ("a read of a link id nothing minted", "GET", None),
+            (
+                "an update of a link id nothing minted",
+                "PATCH",
+                Some(update_request(surface, 0)),
+            ),
+        ] {
+            let answer = apigw(router, method, &unknown, body).await;
+            assert!(
+                (400..500).contains(&answer.status),
+                "{label} ({}): expected the service to refuse it, got {} with {}",
+                surface.label,
+                answer.status,
+                answer.body
+            );
+            let sentence = answer
+                .body
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                !sentence.is_empty(),
+                "{label} ({}): expected the refusal to state why, got {}",
+                surface.label,
+                answer.body
+            );
+            sentences.push(sentence);
+        }
+    }
+    sentences
+}
+
 /// Assert what the rule says of the status/description pair `projection` carries, record the
 /// sentence that status reports in `seen`, and answer the status it reported.
 fn assert_pair(
@@ -343,6 +395,7 @@ fn assert_pair(
     reader: &str,
     projection: &Value,
     carries_nothing_of: &[String],
+    refusals: &[String],
     seen: &mut SentencePerStatus,
 ) -> String {
     let label = format!("{} / {reader}", surface.label);
@@ -364,6 +417,14 @@ fn assert_pair(
             !message.contains(value.as_str()),
             "case {case:?} ({label}): expected the sentence for {status:?} to carry nothing of \
              the request or the record, but {message:?} carries {value:?}"
+        );
+    }
+    // And a description of a link's STATE is never the wording of a refused request.
+    for sentence in refusals {
+        assert!(
+            !message.contains(sentence.as_str()),
+            "case {case:?} ({label}): expected the sentence for {status:?} to state nothing of \
+             the refusal {sentence:?}, got {message:?}"
         );
     }
     // Neither the Region a request was signed for nor the account it was signed by is part
@@ -399,6 +460,7 @@ async fn settled(
     case: &str,
     id: &str,
     carries_nothing_of: &[String],
+    refusals: &[String],
     seen: &mut SentencePerStatus,
 ) -> Value {
     let path = format!("{}/{id}", surface.collection);
@@ -419,6 +481,7 @@ async fn settled(
             "GetVpcLink",
             &read.body,
             carries_nothing_of,
+            refusals,
             seen,
         );
         if status != PENDING {
@@ -486,6 +549,9 @@ fn update_request(surface: &Surface, round: usize) -> Value {
 async fn both_api_gateway_surfaces_describe_one_vpc_link_status_with_one_sentence() {
     let router = build_router();
     let subnets = ec2_subnets(&router).await;
+    // What the service says when it REFUSES a call about a VPC link: no description of a
+    // link's own status may state any of it.
+    let refusals = refusal_sentences(&router).await;
 
     // Every reading of every row on either surface goes in here, so the sentences are held
     // to being one per status ACROSS the rows, the readers and the two surfaces.
@@ -517,6 +583,7 @@ async fn both_api_gateway_surfaces_describe_one_vpc_link_status_with_one_sentenc
                 "CreateVpcLink",
                 &created.body,
                 &forbidden,
+                &refusals,
                 &mut seen,
             );
             assert_eq!(
@@ -525,7 +592,7 @@ async fn both_api_gateway_surfaces_describe_one_vpc_link_status_with_one_sentenc
                 surface.label, created.body
             );
 
-            let read = settled(&router, surface, case, &id, &forbidden, &mut seen).await;
+            let read = settled(&router, surface, case, &id, &forbidden, &refusals, &mut seen).await;
             let settled_status = member(case, surface.label, &read, surface.status_member);
             assert_eq!(
                 settled_status, AVAILABLE,
@@ -536,7 +603,15 @@ async fn both_api_gateway_surfaces_describe_one_vpc_link_status_with_one_sentenc
 
             // The collection reader and the updater describe the settled link the same way.
             let item = listed_item(&router, surface, case, &id).await;
-            assert_pair(case, surface, "GetVpcLinks", &item, &forbidden, &mut seen);
+            assert_pair(
+                case,
+                surface,
+                "GetVpcLinks",
+                &item,
+                &forbidden,
+                &refusals,
+                &mut seen,
+            );
             assert_eq!(
                 item.get(surface.message_member),
                 read.get(surface.message_member),
@@ -566,6 +641,7 @@ async fn both_api_gateway_surfaces_describe_one_vpc_link_status_with_one_sentenc
                 "UpdateVpcLink",
                 &patched.body,
                 &forbidden,
+                &refusals,
                 &mut seen,
             );
         }
