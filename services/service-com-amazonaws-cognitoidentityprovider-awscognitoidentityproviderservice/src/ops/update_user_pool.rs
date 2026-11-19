@@ -347,6 +347,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::SMS_CONFIGURATION_REQUIRED_MESSAGE.to_string(),
             ));
         }
+        // A pool that routes its messages to a custom sender trigger hands the
+        // code to that function encrypted under the key the same `LambdaConfig`
+        // names, so an update that would leave the pool with such a trigger and
+        // no key is refused rather than leaving a trigger that could never be
+        // handed a code ([`crate::state::custom_sender_without_kms_key`], the
+        // same question `CreateUserPool` asks of the same values; the whole
+        // `LambdaConfig` is a member this update replaces).
+        if crate::state::custom_sender_without_kms_key(&lambda_config) {
+            return Err(invalid_parameter(
+                crate::state::CUSTOM_SENDER_KMS_KEY_REQUIRED_MESSAGE.to_string(),
+            ));
+        }
         // MFA is turned on when a pool is CREATED or through `SetUserPoolMfaConfig`,
         // which is also where the factor an MFA challenge is presented over is
         // configured — this operation models no factor at all — so an update that

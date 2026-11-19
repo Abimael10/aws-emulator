@@ -443,6 +443,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::SMS_CONFIGURATION_REQUIRED_MESSAGE.to_string(),
             ));
         }
+        // A pool that routes its messages to a custom sender trigger hands the
+        // code to that function encrypted under the key the same `LambdaConfig`
+        // names, so a configuration that names no key is refused rather than
+        // stored as a trigger that could never be handed a code
+        // ([`crate::state::custom_sender_without_kms_key`], the same question
+        // `UpdateUserPool` asks of the same values).
+        if crate::state::custom_sender_without_kms_key(&pool.lambda_config) {
+            return Err(invalid_parameter(
+                crate::state::CUSTOM_SENDER_KMS_KEY_REQUIRED_MESSAGE.to_string(),
+            ));
+        }
         // A pool whose MFA mode this create turns on challenges over the one
         // factor this surface configures, so it takes that factor's whole
         // delivery path — an SMS caller to send through and the phone number

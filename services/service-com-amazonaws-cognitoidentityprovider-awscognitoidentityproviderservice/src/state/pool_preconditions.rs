@@ -47,6 +47,46 @@ pub fn sms_configuration_missing_for_auto_verification(
         && sms_configuration.is_none()
 }
 
+/// The message a user-pool write is refused with when its `LambdaConfig`
+/// configures a custom sender trigger without the key the codes it hands over
+/// are encrypted under ([`custom_sender_without_kms_key`]).
+///
+/// Fixed text: it names the member that is missing and the trigger family that
+/// needs it, which is the same pair for every such request, and neither the pool
+/// nor the function the trigger names.
+pub const CUSTOM_SENDER_KMS_KEY_REQUIRED_MESSAGE: &str =
+    "KMSKeyId parameter is required when Custom SMS/Email Lambda trigger is used.";
+
+/// Whether the `LambdaConfig` a write would leave the pool with routes messages
+/// to a custom sender trigger while naming no key to encrypt them under.
+///
+/// A custom sender trigger is handed the message instead of the pool sending it
+/// — "this trigger routes all SMS notifications from a user pool to a Lambda
+/// function that delivers the message using custom logic"
+/// (`LambdaConfigType$CustomSMSSender`, and `CustomEmailSender` for email) — and
+/// the code it is handed travels encrypted under the key the same configuration
+/// names: `LambdaConfigType$KMSKeyID` is "the ARN of an KMS key. Amazon Cognito
+/// uses the key to encrypt codes and temporary passwords sent to custom sender
+/// Lambda triggers" (this service's model). So EITHER custom sender without that
+/// key is a configuration whose trigger could never be handed a code at all
+/// ([`crate::state::lambda_triggers`] refuses the invocation for exactly that
+/// reason), and the write is refused rather than stored. A key member carrying
+/// the empty string names no key, exactly as an absent one does.
+///
+/// The argument is the EFFECTIVE value of the request — what the pool would hold
+/// once it is written — so the configuration is judged as the caller left it,
+/// whichever operation wrote it.
+#[must_use]
+pub fn custom_sender_without_kms_key(lambda_config: &LambdaConfigType) -> bool {
+    let configures_custom_sender = lambda_config.custom_sms_sender.is_some()
+        || lambda_config.custom_email_sender.is_some();
+    configures_custom_sender
+        && lambda_config
+            .kms_key_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+}
+
 /// The message a user-pool write is refused with when it requires or offers MFA
 /// without the SMS delivery path and phone-number verification that factor rests
 /// on ([`mfa_without_sms_delivery`]).
