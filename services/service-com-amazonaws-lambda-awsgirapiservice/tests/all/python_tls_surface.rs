@@ -371,8 +371,8 @@ async fn a_context_holds_what_a_client_configures(
     1
 }
 
-/// The certificate store takes certificate DATA and refuses a certificate FILE of the host,
-/// which is the one file refusal a function has.
+/// The certificate store takes certificate DATA and reads a bundle out of the files this
+/// execution environment has, refusing a certificate file of the host.
 ///
 /// Answers how many cases a run answered.
 async fn a_certificate_store_takes_data_and_refuses_a_host_file(

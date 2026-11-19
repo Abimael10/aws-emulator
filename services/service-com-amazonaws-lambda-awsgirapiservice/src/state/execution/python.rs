@@ -1284,6 +1284,12 @@ fn install_codec_registry(vm: &VirtualMachine) -> PyResult<()> {
 /// `io.open`, `_io.FileIO` — and the call raises. The rest of `_io` (the in-memory streams the
 /// standard library is built on) is left exactly as it is.
 ///
+/// What a run opens instead is the FILESYSTEM of its own execution environment: the runtime
+/// source answers `open` from the entries of the function's own mounts and calls the refusal
+/// installed here for every path under none of them ([`super::bootstrap`]), so a file the
+/// deployment package ships is read out of this process's memory and a path of the host is
+/// refused here, as it is for a run no package was mounted for at all.
+///
 /// Every one of those installations is CHECKED, and a failure refuses the whole run: a patch
 /// whose result was thrown away would leave this emulator running caller-supplied code in an
 /// interpreter that can still open a host file, and no later reading would say so. The names
