@@ -21,7 +21,11 @@
 //!   the pre-signed address its archive is served at, and that address serves those very
 //!   bytes;
 //! * the archive is the SNAPSHOT of the instant the job was recorded: a later change to the
-//!   bot does not reach a job already submitted.
+//!   bot does not reach a job already submitted;
+//! * a definition file carries the VALUES the resource it describes was created with —
+//!   whatever threshold the locale was given, whatever the intent is called and however many
+//!   sample utterances it holds — and the job that assembled it reports no reason for a
+//!   failure that did not happen.
 
 use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};
@@ -449,7 +453,7 @@ async fn an_export_archive_is_assembled_from_the_stored_definition_it_names() {
 
         // The TREE: one definition file per resource the exported version holds, and
         // nothing else — an export of one locale carries that locale alone.
-        let mut paths: Vec<String> = entries.iter().map(|(path, _)| path.clone()).collect();
+        let mut paths = paths_of(&entries);
         paths.sort();
         assert_eq!(
             paths,
@@ -752,10 +756,7 @@ async fn an_archive_is_the_snapshot_of_the_instant_its_job_was_recorded() {
     assert!(
         document(&snapshot_entries, &later_path).is_none(),
         "the archive of the earlier job must not hold {later_path}, got {:?}",
-        snapshot_entries
-            .iter()
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<String>>()
+        paths_of(&snapshot_entries)
     );
 
     let after = create_export(&router, case).await;
@@ -765,10 +766,7 @@ async fn an_archive_is_the_snapshot_of_the_instant_its_job_was_recorded() {
     let later = document(&after_entries, &later_path).unwrap_or_else(|| {
         panic!(
             "a job recorded after the change must hold {later_path}, got {:?}",
-            after_entries
-                .iter()
-                .map(|(path, _)| path.clone())
-                .collect::<Vec<String>>()
+            paths_of(&after_entries)
         )
     });
     assert_eq!(
@@ -776,4 +774,229 @@ async fn an_archive_is_the_snapshot_of_the_instant_its_job_was_recorded() {
         LATER_INTENT,
         "the later job's archive must carry the intent created before it, got {later:?}"
     );
+}
+
+/// The four bytes a zip archive opens with (the local-file-header signature of the ZIP file
+/// format), which is what a client that downloads the announced address reads first.
+const ZIP_LOCAL_FILE_HEADER: [u8; 4] = [b'P', b'K', 0x03, 0x04];
+
+/// One locale whose definition files an export's archive must report the stored values of:
+/// the locale it is, the confidence threshold it was created with, and the intent created in
+/// it with the sample utterances that call was given.
+struct Definitions {
+    case: &'static str,
+    locale_id: &'static str,
+    threshold: f64,
+    intent_name: &'static str,
+    utterances: Vec<&'static str>,
+}
+
+/// The table [`an_exported_locale_definition_carries_the_values_it_was_created_with`] runs
+/// over.
+///
+/// The rows differ in the locale, in the confidence threshold — including both bounds the
+/// modelled `ConfidenceThreshold` publishes
+/// (`smithy_query(query="shape",shape="ConfidenceThreshold")`: a double in range 0..1) — in
+/// the intent's name and in how many sample utterances the intent was created with,
+/// including none at all, because what a definition file owes is the values the store holds
+/// for the resource, not the ones of any one run.
+fn definition_cases() -> Vec<Definitions> {
+    vec![
+        Definitions {
+            case: "a threshold between the published bounds, one utterance",
+            locale_id: "en_US",
+            threshold: 0.4,
+            intent_name: "OrderPizza",
+            utterances: vec!["I want to order a pizza"],
+        },
+        Definitions {
+            case: "the threshold at the published minimum, two utterances",
+            locale_id: "de_DE",
+            threshold: 0.0,
+            intent_name: "BlumenBestellen",
+            utterances: vec!["Ich möchte Blumen bestellen", "Blumen bitte"],
+        },
+        Definitions {
+            case: "the threshold at the published maximum, no utterances",
+            locale_id: "ja_JP",
+            threshold: 1.0,
+            intent_name: "CheckBalance",
+            utterances: vec![],
+        },
+        Definitions {
+            case: "a locale id with a numeric region subtag, three utterances",
+            locale_id: "es_419",
+            threshold: 0.75,
+            intent_name: "Transferir-Fondos",
+            utterances: vec![
+                "Quiero transferir fondos",
+                "Transferir dinero",
+                "Hacer una transferencia",
+            ],
+        },
+    ]
+}
+
+/// The paths an archive holds, for a message that has to say what was there instead.
+fn paths_of(entries: &[(String, String)]) -> Vec<String> {
+    entries.iter().map(|(path, _)| path.clone()).collect()
+}
+
+/// The `sampleUtterances` a definition file carries for an intent created with
+/// `utterances` — the member is left out entirely when the intent holds none, which is the
+/// same as an absent member on the wire.
+fn expected_utterances(utterances: &[&str]) -> Value {
+    if utterances.is_empty() {
+        return Value::Null;
+    }
+    Value::Array(
+        utterances
+            .iter()
+            .map(|utterance| json!({ "utterance": utterance }))
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn an_exported_locale_definition_carries_the_values_it_was_created_with() {
+    let router = emulator();
+    let bot_name = "ArchiveDefinitionsBot";
+    let bot_id = create_bot(&router, &create_body(bot_name, 300, json!({}))).await;
+    let cases = definition_cases();
+
+    // Each row gets its OWN locale of the same draft version, created with its own
+    // threshold and holding its own intent, so no two rows share a stored value.
+    let mut intent_ids: Vec<String> = Vec::new();
+    for case in &cases {
+        let (status, created) = call(
+            &router,
+            "PUT",
+            &locales_uri(&bot_id, "DRAFT"),
+            Some(locale_body(case.locale_id, case.threshold, json!({}))),
+        )
+        .await;
+        assert_eq!(
+            status, 202,
+            "case {:?}: expected CreateBotLocale to answer 202, got {status} {created:?}",
+            case.case
+        );
+        let utterances = expected_utterances(&case.utterances);
+        let extra = if utterances.is_null() {
+            json!({})
+        } else {
+            json!({ "sampleUtterances": utterances })
+        };
+        intent_ids.push(
+            create_intent(
+                &router,
+                &bot_id,
+                case.locale_id,
+                &intent_body(case.intent_name, extra),
+            )
+            .await,
+        );
+    }
+
+    // Every export is submitted first, so the span the clock owes each job runs alongside
+    // the others rather than one after another.
+    let mut submitted: Vec<String> = Vec::new();
+    for case in &cases {
+        let body = json!({
+            "resourceSpecification": {
+                "botLocaleExportSpecification": {
+                    "botId": bot_id,
+                    "botVersion": "DRAFT",
+                    "localeId": case.locale_id,
+                },
+            },
+            "fileFormat": "LexJson",
+        });
+        let (status, created) = call(&router, "PUT", EXPORTS_URI, Some(body)).await;
+        assert_eq!(
+            status, 202,
+            "case {:?}: expected CreateExport to answer 202, got {status} {created:?}",
+            case.case
+        );
+        submitted.push(text(&created, "exportId"));
+    }
+
+    for ((case, export_id), intent_id) in cases.iter().zip(&submitted).zip(&intent_ids) {
+        let name = case.case;
+
+        // A specification that resolved reaches the status in which the export is ready to
+        // download, and states no reason for a failure that did not happen.
+        let described = completed_export(&router, name, export_id).await;
+        assert_eq!(
+            member(&described, "failureReasons"),
+            Value::Null,
+            "case {name:?}: a job whose archive was assembled states no reason for a \
+             failure, got {described:?}"
+        );
+
+        // The address it announces serves the archive itself.
+        let bytes = archive_bytes(&router, name, &described).await;
+        assert_eq!(
+            bytes.get(..ZIP_LOCAL_FILE_HEADER.len()),
+            Some(&ZIP_LOCAL_FILE_HEADER[..]),
+            "case {name:?}: the download must open with a zip local-file-header signature, \
+             got {:?} of {} bytes",
+            bytes.get(..ZIP_LOCAL_FILE_HEADER.len()),
+            bytes.len()
+        );
+        let entries = entries(name, &bytes);
+
+        // The LOCALE's definition, keyed by the bot's name and the locale, carries the
+        // locale it is for and the threshold the locale was created with.
+        let locale_root = format!(
+            "{bot_name}/{}/{}",
+            state::BOT_LOCALES_DIRECTORY,
+            case.locale_id
+        );
+        let locale_path = format!("{locale_root}/{}", state::BOT_LOCALE_DEFINITION_FILE);
+        let locale = document(&entries, &locale_path).unwrap_or_else(|| {
+            panic!(
+                "case {name:?}: the archive must hold {locale_path}, got {:?}",
+                paths_of(&entries)
+            )
+        });
+        assert_eq!(
+            text(&locale, "identifier"),
+            case.locale_id,
+            "case {name:?}: the locale's definition must name the locale exported, got \
+             {locale:?}"
+        );
+        assert_eq!(
+            member(&locale, "nluConfidenceThreshold"),
+            json!(case.threshold),
+            "case {name:?}: the locale's definition must carry the threshold the locale was \
+             created with, got {locale:?}"
+        );
+
+        // The INTENT's definition, keyed by the intent's name, carries what CreateIntent
+        // was given and the id that call minted.
+        let intent_path = format!(
+            "{locale_root}/{}/{}/{}",
+            state::INTENTS_DIRECTORY,
+            case.intent_name,
+            state::INTENT_DEFINITION_FILE
+        );
+        let intent = document(&entries, &intent_path).unwrap_or_else(|| {
+            panic!(
+                "case {name:?}: the archive must hold {intent_path}, got {:?}",
+                paths_of(&entries)
+            )
+        });
+        assert_eq!(
+            (text(&intent, "name"), text(&intent, "identifier")),
+            (case.intent_name.to_string(), intent_id.clone()),
+            "case {name:?}: the intent's definition must carry the name and id it was \
+             created under, got {intent:?}"
+        );
+        assert_eq!(
+            member(&intent, "sampleUtterances"),
+            expected_utterances(&case.utterances),
+            "case {name:?}: the intent's definition must carry exactly the utterances \
+             CreateIntent was given, got {intent:?}"
+        );
+    }
 }
