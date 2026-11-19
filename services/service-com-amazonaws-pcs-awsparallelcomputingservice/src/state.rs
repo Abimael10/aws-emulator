@@ -108,6 +108,9 @@ pub const STATUS_UPDATING: &str = "UPDATING";
 
 /// The cluster statuses an update can start from: "You can only update clusters that are
 /// in ACTIVE, UPDATE_FAILED, or SUSPENDED state" (`UpdateCluster`'s own documentation).
+///
+/// This is the first half of that note's precondition; the second half is about the
+/// cluster's children and is answered by [`ClusterRecord::non_active_child`].
 pub const UPDATABLE_CLUSTER_STATUSES: &[&str] = &[STATUS_ACTIVE, "UPDATE_FAILED", "SUSPENDED"];
 
 /// How a scheduler release is LABELLED: the `major.minor` of a Slurm release, optionally
@@ -454,6 +457,37 @@ impl ClusterRecord {
                 .values()
                 .filter(|group| !group.is_being_deleted())
                 .count()
+    }
+
+    /// The first of this cluster's children that is NOT in [`STATUS_ACTIVE`] — the kind of
+    /// resource it is and its generated id — or `None` when every stored child is
+    /// `ACTIVE`.
+    ///
+    /// "All associated resources (queues and compute node groups) must be in `ACTIVE` state
+    /// before you can update the cluster" (`UpdateCluster`'s own documentation): a child in
+    /// ANY other status is a resource the service is still settling, so it blocks a change
+    /// to the cluster that holds it. This is the OPPOSITE exclusion to
+    /// [`Self::blocking_children`], which counts the children that block the cluster's own
+    /// DELETE and therefore skips a child already on its way out: there, a child being taken
+    /// out is exactly what does not block; here, it is not `ACTIVE`, so it does — including
+    /// the compute node group a later request still finds [`STATUS_DELETED`].
+    ///
+    /// Examined in creation order, compute node groups before the queues that assign jobs to
+    /// them, so the child a refusal names is the same on every call.
+    pub fn non_active_child(&self) -> Option<(ResourceKind, String)> {
+        let unsettled_group = self
+            .compute_node_groups
+            .values()
+            .filter(|group| group.status != STATUS_ACTIVE)
+            .min_by_key(|group| group.seq)
+            .map(|group| (COMPUTE_NODE_GROUP, group.id.clone()));
+        unsettled_group.or_else(|| {
+            self.queues
+                .values()
+                .filter(|queue| queue.status != STATUS_ACTIVE)
+                .min_by_key(|queue| queue.seq)
+                .map(|queue| (QUEUE, queue.id.clone()))
+        })
     }
 
     /// Apply every transition this service owes this cluster and its children.

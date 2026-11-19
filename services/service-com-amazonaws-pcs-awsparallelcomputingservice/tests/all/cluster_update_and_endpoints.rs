@@ -8,7 +8,9 @@
 //!
 //! What `UpdateComputeNodeGroup` does to a cluster's compute node groups is its own suite,
 //! in the submodule below
-//! (`tests/all/cluster_update_and_endpoints/compute_node_group_update.rs`).
+//! (`tests/all/cluster_update_and_endpoints/compute_node_group_update.rs`), and so is what
+//! the status of a cluster's children does to an `UpdateCluster`
+//! (`tests/all/cluster_update_and_endpoints/children_must_be_active.rs`).
 
 // `tests/all/cluster_update_and_endpoints.rs` is itself loaded by `#[path]` from
 // `tests/all.rs`, so a submodule of it is looked up beside it rather than in a directory
@@ -16,6 +18,8 @@
 // `tests/all/cluster_update_and_endpoints/`. The layout check declares suites DIRECTLY
 // under `tests/all/`; a file deeper than that is declared by its own parent module, which
 // is this one.
+#[path = "cluster_update_and_endpoints/children_must_be_active.rs"]
+mod children_must_be_active;
 #[path = "cluster_update_and_endpoints/compute_node_group_update.rs"]
 mod compute_node_group_update;
 

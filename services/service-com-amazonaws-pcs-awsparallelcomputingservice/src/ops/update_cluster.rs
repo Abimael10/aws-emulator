@@ -2,9 +2,10 @@
 
 //! @op UpdateCluster
 //! Applies an update to a STORED cluster: refuses a scheduler version the service cannot
-//! move a cluster to, merges the requested Slurm options into the stored record, and
-//! reports the cluster `UPDATING`, which the service owes `ACTIVE` again from the next
-//! request on. `GetCluster` reads back exactly what this wrote.
+//! move a cluster to, refuses a cluster whose own status — or whose queues and compute
+//! node groups — the service has not settled, merges the requested Slurm options into the
+//! stored record, and reports the cluster `UPDATING`, which the service owes `ACTIVE`
+//! again from the next request on. `GetCluster` reads back exactly what this wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -238,6 +239,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !crate::state::UPDATABLE_CLUSTER_STATUSES.contains(&cluster.status.as_str()) {
             return Err(UpdateClusterErrorModeled::ConflictException(
                 crate::state::cluster_not_active(&cluster.id),
+            )
+            .into());
+        }
+
+        // "All associated resources (queues and compute node groups) must be in ACTIVE
+        // state before you can update the cluster": a stored child the service is still
+        // settling — one provisioning, updating, suspended, failed, or on its way out and
+        // still reported — conflicts too, and the refusal names that child. Refused before
+        // the record is touched, so the cluster is left exactly as it was.
+        if let Some((kind, child_id)) = cluster.non_active_child() {
+            return Err(UpdateClusterErrorModeled::ConflictException(
+                crate::state::not_active(kind, &child_id),
             )
             .into());
         }
