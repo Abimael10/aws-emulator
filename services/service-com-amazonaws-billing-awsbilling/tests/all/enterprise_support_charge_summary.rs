@@ -995,3 +995,216 @@ async fn reports_without_writing() {
         "case \"two reads\": expected a read to persist nothing"
     );
 }
+
+/// Seconds in one day — the step the plan boundaries below are placed on
+/// inside the billing month.
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// The first instant of the month AFTER [`PAST_MONTH`], the exclusive end of
+/// its billing period: 2024-03 has 31 days.
+const PAST_MONTH_END_SECS: u64 = PAST_MONTH_START_SECS + 31 * SECONDS_PER_DAY;
+
+/// The first instant of the `day`th day of [`PAST_MONTH`], as seconds past the
+/// epoch — a plan boundary part way through the month.
+fn day_of_past_month(day: u64) -> u64 {
+    PAST_MONTH_START_SECS + (day - 1) * SECONDS_PER_DAY
+}
+
+/// A pricing plan identified by `id`, in effect from `start_secs` until
+/// `end_secs` (open-ended when it has none), charging `rate_basis_points` of
+/// the whole Support-eligible spend with no monthly minimum and no plan
+/// discount — so the charge the answer reports names the plan that priced it.
+fn plan_in_effect(
+    id: &str,
+    start_secs: u64,
+    end_secs: Option<u64>,
+    rate_basis_points: i64,
+) -> EnterpriseSupportPricingPlan {
+    let mut plan = negotiated_plan(start_secs, 0, rate_basis_points, 0, false);
+    plan.pricing_plan_id = id.to_string();
+    plan.name = format!("Enterprise Support ({id})");
+    plan.end_date = end_secs.map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+    plan
+}
+
+/// Store exactly these plans on the contract, replacing the standard plan, so
+/// each row below is priced by the timeline it names and nothing else.
+fn store_plans(engine: &Arc<engine::InMemoryEngine>, plans: Vec<EnterpriseSupportPricingPlan>) {
+    let state = engine.state::<ComAmazonawsBillingAwsbillingState>();
+    let mut state = state.lock();
+    state.enterprise_support_contract.pricing_plans = plans;
+}
+
+/// Ask what the Enterprise Support contract holds for one billing month — the
+/// sibling read of the same stored pricing-plan timeline.
+async fn contract_details(router: &MultiServiceRouter, billing_month: &str) -> (u16, Value) {
+    call(
+        router,
+        "GetEnterpriseSupportContractDetails",
+        &json!({ "billingMonth": billing_month }),
+    )
+    .await
+}
+
+/// One plan to store: its id, the instant it takes effect, the instant it
+/// stops being in effect when it has one, and the rate it charges in basis
+/// points.
+type PlanRow = (&'static str, u64, Option<u64>, i64);
+
+/// One row of the timeline table: the case, the plans stored on the contract,
+/// and the plan the month must be priced by with the charge it gives the
+/// seeded spend — `None` where no stored plan is in effect anywhere in the
+/// month and the month carries no charge at all.
+type TimelineCase = (
+    &'static str,
+    Vec<PlanRow>,
+    Option<(&'static str, &'static str)>,
+);
+
+/// A billing month is placed on the contract's pricing-plan timeline by
+/// OVERLAP: a plan that starts or ends inside the month is in effect for it,
+/// and of the plans in effect the most recently effective one — the one still
+/// in effect as the billing period closes and its bill is generated — prices
+/// the whole month. Only a month no stored plan is in effect anywhere in has no
+/// charge to report.
+///
+/// The rows differ along where the plan's own boundaries fall relative to the
+/// month: its first instant, part way through it, its last day, its closing
+/// second, the instant it closes, and a plan replaced part way through — and
+/// each row is checked against `GetEnterpriseSupportContractDetails`, the
+/// sibling read of the same timeline, so the two cannot disagree about whether
+/// the contract was in effect for the month.
+#[tokio::test]
+async fn prices_a_month_by_a_plan_in_effect_anywhere_in_its_billing_period() {
+    let cases: Vec<TimelineCase> = vec![
+        (
+            "a plan that took effect with the month",
+            vec![("plan-from-the-first", PAST_MONTH_START_SECS, None, 500)],
+            Some(("plan-from-the-first", "10000.00")),
+        ),
+        (
+            "a plan that took effect part way through the month",
+            vec![("plan-from-the-tenth", day_of_past_month(10), None, 700)],
+            Some(("plan-from-the-tenth", "14000.00")),
+        ),
+        (
+            "a plan that took effect on the month's last day",
+            vec![("plan-from-the-last-day", day_of_past_month(31), None, 250)],
+            Some(("plan-from-the-last-day", "5000.00")),
+        ),
+        (
+            "a plan that took effect a second before the month closed",
+            vec![("plan-from-the-last-second", PAST_MONTH_END_SECS - 1, None, 300)],
+            Some(("plan-from-the-last-second", "6000.00")),
+        ),
+        (
+            "a plan replaced part way through the month",
+            vec![
+                ("replaced-plan", 0, Some(day_of_past_month(10)), 700),
+                ("successor-plan", day_of_past_month(10), None, 250),
+            ],
+            // The successor is the plan in effect as the period closes, so the
+            // month is priced by it and not by the plan it replaced.
+            Some(("successor-plan", "5000.00")),
+        ),
+        (
+            "a plan that ended part way through the month, with no successor",
+            vec![("plan-until-the-tenth", 0, Some(day_of_past_month(10)), 500)],
+            Some(("plan-until-the-tenth", "10000.00")),
+        ),
+        (
+            "a plan that ended as the month began",
+            vec![("plan-until-the-first", 0, Some(PAST_MONTH_START_SECS), 500)],
+            None,
+        ),
+        (
+            "a plan that takes effect as the month closes",
+            vec![("plan-from-the-next-month", PAST_MONTH_END_SECS, None, 500)],
+            None,
+        ),
+        ("no plan at all", Vec::new(), None),
+    ];
+
+    for (case, rows, expected) in cases {
+        let (router, engine) = emulator();
+        persist(
+            &engine,
+            &[Seed::enterprise(caller_account_id(), PAST_MONTH, 200_000)],
+        );
+        store_plans(
+            &engine,
+            rows.iter()
+                .map(|(id, start, end, rate)| plan_in_effect(id, *start, *end, *rate))
+                .collect(),
+        );
+
+        let (status, body) = summary(&router, PAST_MONTH).await;
+        let (details_status, details) = contract_details(&router, PAST_MONTH).await;
+        assert_eq!(
+            details_status, 200,
+            "case {case:?}: expected the contract read answered, got {details_status} {details}"
+        );
+        // The two reads of one timeline agree about whether the contract was in
+        // effect for the month.
+        assert_eq!(
+            details["isContractActive"].as_bool(),
+            Some(expected.is_some()),
+            "case {case:?}: expected isContractActive {}, got {details}",
+            expected.is_some()
+        );
+
+        match expected {
+            Some((plan_id, total_support_charge)) => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected HTTP 200, got {status} {body}"
+                );
+                assert_eq!(
+                    body["supportEffectivePricingPlan"]["pricingPlanId"].as_str(),
+                    Some(plan_id),
+                    "case {case:?}: expected the month priced by {plan_id}, got {body}"
+                );
+                assert_eq!(
+                    body["totalSupportCharge"].as_str(),
+                    Some(total_support_charge),
+                    "case {case:?}: expected the charge that plan prices, got {body}"
+                );
+                // ...and the plan the charge was priced by is one the contract
+                // read reports for the same month.
+                let listed: Vec<String> = details["pricingPlans"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|plan| plan["pricingPlanId"].as_str().map(str::to_string))
+                    .collect();
+                assert!(
+                    listed.iter().any(|listed| listed == plan_id),
+                    "case {case:?}: expected {plan_id} among the contract's plans, got {listed:?}"
+                );
+            }
+            None => {
+                assert_eq!(
+                    status, 404,
+                    "case {case:?}: expected HTTP 404, got {status} {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "ResourceNotFoundException",
+                    "case {case:?}: expected a ResourceNotFoundException, got {body}"
+                );
+                assert_eq!(
+                    body["resourceId"].as_str(),
+                    Some(PAST_MONTH),
+                    "case {case:?}: expected the refusal to name the month, got {body}"
+                );
+                assert!(
+                    details["pricingPlans"]
+                        .as_array()
+                        .is_none_or(|plans| plans.is_empty()),
+                    "case {case:?}: expected the contract to report no plan either, got {details}"
+                );
+            }
+        }
+    }
+}

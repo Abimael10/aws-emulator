@@ -310,12 +310,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `supportEffectivePricingPlan` is "the effective pricing plan used for
         // the support charge calculation" — the one the contract was billed
-        // under in the requested billing period. A month no stored plan covers
-        // was not billed under this contract, so there is no charge to report
-        // for it.
+        // under in the requested billing period. The month is placed on the
+        // contract's pricing-plan timeline by OVERLAP, the same way the
+        // contract's own read of that timeline places it: a plan that starts or
+        // ends inside the month is in effect for it, and of the plans in effect
+        // the most recently effective one — the one still in effect as the
+        // period closes and its bill is generated — prices the month. A month
+        // no stored plan is in effect anywhere in was not billed under this
+        // contract, so there is no charge to report for it.
         let plan = state
             .enterprise_support_contract
-            .effective_pricing_plan(crate::state::date_time_secs(&billing_period_start_date))
+            .effective_pricing_plan_for_period(
+                crate::state::date_time_secs(&billing_period_start_date),
+                crate::state::date_time_secs(&billing_period_end_date),
+            )
             .ok_or_else(|| {
                 GetEnterpriseSupportChargeSummaryError::from(
                     GetEnterpriseSupportChargeSummaryErrorModeled::ResourceNotFoundException(

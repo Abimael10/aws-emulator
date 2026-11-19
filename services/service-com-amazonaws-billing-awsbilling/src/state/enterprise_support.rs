@@ -266,16 +266,6 @@ impl EnterpriseSupportPricingPlan {
         }
     }
 
-    /// Whether the plan is in effect at `at_secs` seconds past the epoch: its
-    /// start date is at or before that instant, and its end date — when it has
-    /// one — after it.
-    pub fn covers_instant(&self, at_secs: f64) -> bool {
-        epoch_secs(self.start_date) <= at_secs
-            && self
-                .end_date
-                .is_none_or(|end| at_secs < epoch_secs(end))
-    }
-
     /// Whether the plan is in effect anywhere in the half-open period
     /// `from_secs..to_secs`: its own period overlaps that one, so a plan that
     /// starts or ends inside a billing month is in effect for that month even
@@ -396,7 +386,8 @@ pub struct EnterpriseSupportContract {
     /// contract names no percentage for is charged none of the total.
     pub charge_allocation_basis_points: BTreeMap<String, i64>,
     /// The pricing plans the contract has been billed under. A month is priced
-    /// by the one in effect for it ([`Self::effective_pricing_plan`]).
+    /// by the one in effect for it
+    /// ([`Self::effective_pricing_plan_for_period`]).
     pub pricing_plans: Vec<EnterpriseSupportPricingPlan>,
     /// The covered accounts whose Support charge is calculated on charges
     /// BEFORE private discounts — the accounts the modeled `ContractAccount`
@@ -458,18 +449,30 @@ impl Default for EnterpriseSupportContract {
 }
 
 impl EnterpriseSupportContract {
-    /// The plan in effect at `at_secs` seconds past the epoch — the most
-    /// recently effective of the plans whose period covers that instant, so a
-    /// negotiated plan stored over the standard one prices the months it
-    /// covers.
+    /// The plan a billing period is priced by — the most recently effective of
+    /// the plans in effect anywhere in the half-open period
+    /// `from_secs..to_secs` ([`EnterpriseSupportPricingPlan::covers_period`]),
+    /// so a plan that took effect part way through the period prices it rather
+    /// than the one it replaced, and a negotiated plan stored over the
+    /// standard one prices the periods it is in effect for.
     ///
-    /// `None` when no stored plan covers the instant: the profile was not
-    /// billed under this contract then, so there is no charge to report for
-    /// it.
-    pub fn effective_pricing_plan(&self, at_secs: f64) -> Option<&EnterpriseSupportPricingPlan> {
+    /// A period is placed on the timeline by OVERLAP, not by its first instant:
+    /// a plan that starts or ends inside a billing month is in effect for that
+    /// month, which is the same rule [`Self::pricing_plans_for_period`]
+    /// reports the month's plans by, so the two readings of one contract cannot
+    /// disagree about whether it was in effect for a month.
+    ///
+    /// `None` when no stored plan is in effect anywhere in the period: the
+    /// profile was not billed under this contract then, so there is no charge
+    /// to report for it.
+    pub fn effective_pricing_plan_for_period(
+        &self,
+        from_secs: f64,
+        to_secs: f64,
+    ) -> Option<&EnterpriseSupportPricingPlan> {
         self.pricing_plans
             .iter()
-            .filter(|plan| plan.covers_instant(at_secs))
+            .filter(|plan| plan.covers_period(from_secs, to_secs))
             .max_by(|left, right| {
                 epoch_secs(left.start_date).total_cmp(&epoch_secs(right.start_date))
             })
