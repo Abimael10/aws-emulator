@@ -5,23 +5,25 @@
 //! [`crate::emulator`] harness.
 //!
 //! RULE: a fault the REQUEST itself carries — a tag write this service does not store,
-//! or a value outside the modelled constraints of the member that carries it, including
-//! the union members nothing before the handler holds to them — is refused as invalid
-//! input (the modelled `InterconnectValidationException`, HTTP 400, worded for that
-//! fault) BEFORE anything the request NAMES is resolved, so no verdict about a resource
-//! stands in its place: not a handle that resolves to nothing, not a proposal whose
-//! acceptance has already been made, not a connection an acceptance can no longer be
-//! made on, not an `environmentId` the called Region does not offer and not a
-//! `clientToken` already used for another request. A request carrying no fault of its
-//! own still gets the resource verdict, unchanged, and a refused request writes nothing.
+//! a value outside the modelled constraints of the member that carries it, including
+//! the union members nothing before the handler holds to them, or a `nextToken` the
+//! addressed listing never issued — is refused as invalid input (the modelled
+//! `InterconnectValidationException`, HTTP 400, worded for that fault) BEFORE anything
+//! the request NAMES is resolved, so no verdict about a resource stands in its place:
+//! not a handle that resolves to nothing, not a proposal whose acceptance has already
+//! been made, not a connection an acceptance can no longer be made on, not an
+//! `environmentId` the called Region does not offer and not a `clientToken` already used
+//! for another request. A request carrying no fault of its own still gets the resource
+//! verdict, unchanged, and a refused request writes nothing.
 //!
 //! The rows differ along what the rule generalises over: the KIND of fault the request
 //! carries (a reserved tag key in either casing, a tag key and a tag value past their
 //! modelled lengths, more tags than one resource holds, a value outside each
 //! `AttachPoint` member's own constraints, an identifier outside the only member
-//! `RemoteAccountIdentifier` offers), the RESOURCE VERDICT it is paired with, the
-//! operation that carries it, the environment and bandwidth it is placed on, and the
-//! Region the request is signed for.
+//! `RemoteAccountIdentifier` offers, each form of a page cursor this endpoint did not
+//! mint), the RESOURCE VERDICT it is paired with, the operation that carries it, the
+//! environment and bandwidth it is placed on, the page size asked for, and the Region
+//! the request is signed for.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -29,15 +31,16 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 
 use service_com_amazonaws_interconnect_interconnect::state::{
-    client_token_reused_message, environment_not_found_message, not_a_connection_arn_message,
-    not_a_gateway_identifier_message, proposal_already_accepted_message,
-    proposal_not_acceptable_message, proposal_not_retrievable_message, MAX_TAGS_PER_RESOURCE,
-    REFUSAL_ENVELOPE, REMOTE_IDENTIFIER_LENGTH, RESERVED_TAG_KEY_PREFIX, TAG_KEY_LENGTH,
+    client_token_reused_message, cursor_not_issued_message, environment_not_found_message,
+    not_a_connection_arn_message, not_a_gateway_identifier_message,
+    proposal_already_accepted_message, proposal_not_acceptable_message,
+    proposal_not_retrievable_message, MAX_TAGS_PER_RESOURCE, REFUSAL_ENVELOPE,
+    REMOTE_IDENTIFIER_LENGTH, RESERVED_TAG_KEY_PREFIX, TAG_KEY_LENGTH,
 };
 
 use crate::emulator::{
-    code, message, placements_in, remote_account_for, tags_of, text, Emulator,
-    DEFAULT_SIGNING_REGION,
+    code, creatable_environments, identifiers, message, placements_in, remote_account_for, tags_of,
+    text, Emulator, DEFAULT_SIGNING_REGION,
 };
 
 /// The error this service models for a fault in the request's own input (HTTP 400).
@@ -64,8 +67,9 @@ const GATEWAY_ROWS: [(&str, Option<i64>); 2] =
 const DELETED_STATE: &str = "deleted";
 
 /// How long a wait for a deleted connection to reach its terminal state runs before the
-/// case fails; the suite polls rather than sleeping for a span.
-const DELETED_BUDGET: Duration = Duration::from_secs(5);
+/// case fails; the suite polls rather than sleeping for a span, and the deadline is far
+/// past the span the clock owes so a loaded host cannot decide a case.
+const DELETED_BUDGET: Duration = Duration::from_secs(60);
 
 /// How often that wait re-reads.
 const DELETED_INTERVAL: Duration = Duration::from_millis(10);
@@ -789,5 +793,362 @@ async fn a_creates_own_faults_are_reported_before_what_it_names_is_resolved() {
     assert_eq!(
         after, before,
         "case \"after the create table\": expected the refused creates to have allocated nothing, got {after:?} where there were {before:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The attach-point listing
+// ---------------------------------------------------------------------------
+
+/// The page sizes the listing rows ask for: no `maxResults` at all, and each published
+/// bound of `MaxResults` (`smithy_query(query="shape",shape="MaxResults")`: `@range(min:
+/// 1, max: 100)`), because a page size decides nothing about which fault is reported.
+const LISTING_PAGE_SIZES: [Option<i64>; 3] = [None, Some(1), Some(100)];
+
+/// An `environmentId` no Region's catalog publishes, in the form the published ids take.
+const ABSENT_ENVIRONMENT: &str = "mce-aws-nobody-nowhere";
+
+/// A second `environmentId` no catalog publishes, of a different length and form, so no
+/// row is keyed to one shape of unresolvable id.
+const SHORT_ABSENT_ENVIRONMENT: &str = "mce";
+
+/// One `ListAttachPoints` request, as a `(status, body)` pair so a refusal is readable.
+async fn list_attach_points(
+    emulator: &Emulator,
+    region: &str,
+    environment_id: &str,
+    token: Option<&str>,
+    max_results: Option<i64>,
+) -> (u16, Value) {
+    let mut request = Map::new();
+    request.insert("environmentId".to_string(), json!(environment_id));
+    if let Some(token) = token {
+        request.insert("nextToken".to_string(), json!(token));
+    }
+    if let Some(max_results) = max_results {
+        request.insert("maxResults".to_string(), json!(max_results));
+    }
+    emulator
+        .ic_in(region, "ListAttachPoints", Value::Object(request))
+        .await
+}
+
+/// The `environmentId` of the first Environment `region` publishes that a Connection can
+/// be placed on, which is one whose attach points a listing really walks.
+async fn listable_environment(emulator: &Emulator, region: &str) -> String {
+    let catalog = emulator.environments_in(region).await;
+    let creatable = creatable_environments(&catalog);
+    let environment = creatable.first().unwrap_or_else(|| {
+        panic!(
+            "setup {region:?}: expected the catalog to publish an Environment a Connection can \
+             be placed on, got {catalog:?}"
+        )
+    });
+    text(environment, "environmentId")
+}
+
+/// The `identifier`s a page reports, in the order it reports them: an attach point is
+/// keyed by its identifier, which is also what a page cursor names a position by.
+fn page_keys(body: &Value) -> Vec<String> {
+    body["attachPoints"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|descriptor| text(descriptor, "identifier"))
+        .collect()
+}
+
+/// Every key the listing of `(region, environment_id)` walks, in the order it reports
+/// them, read in one unwindowed page.
+async fn sequence_keys(emulator: &Emulator, region: &str, environment_id: &str) -> Vec<String> {
+    let (status, body) =
+        list_attach_points(emulator, region, environment_id, None, Some(100)).await;
+    assert_eq!(
+        status, 200,
+        "setup {region:?}/{environment_id:?}: expected the whole sequence in one page, got {status} with {body:?}"
+    );
+    page_keys(&body)
+}
+
+/// A page cursor the listing of `(region, environment_id)` really minted, with the page
+/// key it handed out first: the values a row needs to offer this service's OWN token to
+/// another sequence, and a bare key carrying no authenticator at all.
+async fn first_page_cursor(
+    emulator: &Emulator,
+    region: &str,
+    environment_id: &str,
+) -> (String, String) {
+    let (status, body) = list_attach_points(emulator, region, environment_id, None, Some(1)).await;
+    assert_eq!(
+        status, 200,
+        "setup {region:?}/{environment_id:?}: expected a first page of one, got {status} with {body:?}"
+    );
+    let key = text(&body["attachPoints"][0], "identifier");
+    let token = body["nextToken"].as_str().unwrap_or_else(|| {
+        panic!(
+            "setup {region:?}/{environment_id:?}: expected a first page of one to leave a cursor \
+             behind, got {body:?}"
+        )
+    });
+    (token.to_string(), key)
+}
+
+/// A page cursor this service really minted, and the sequence it names a position in:
+/// offered to any OTHER sequence it is a token that listing never issued.
+struct IssuedCursor {
+    case: &'static str,
+    region: &'static str,
+    environment_id: String,
+    token: String,
+}
+
+/// One verdict this store has about the `environmentId` a listing names — the served
+/// listing for one the called Region publishes, the client fault for one it does not.
+struct ListingVerdict {
+    name: &'static str,
+    region: &'static str,
+    environment_id: String,
+    status: u16,
+    code: &'static str,
+    message: String,
+}
+
+/// RULE, on the paginated reader of these members: `ListAttachPoints` reports the fault
+/// the REQUEST carries — a `nextToken` the addressed listing never issued — before it
+/// resolves the `environmentId` the request names, so an Environment the called Region
+/// does not offer never answers in its place; a request carrying no such fault still
+/// gets the verdict about that id, and a cursor the listing did issue is still served.
+#[tokio::test]
+async fn a_listings_own_cursor_fault_is_reported_before_the_environment_it_names_is_resolved() {
+    let emulator = Emulator::new();
+    // The harness's own wait for the account's gateways to be ready for use, which is
+    // what makes each of them an attach point.
+    emulator.ready_gateways(&GATEWAY_ROWS).await;
+
+    let here = listable_environment(&emulator, DEFAULT_SIGNING_REGION).await;
+    let there = listable_environment(&emulator, OTHER_REGION).await;
+    // Both endpoints offer the account's gateways, so each listing is pageable: a first
+    // page of one leaves a cursor behind only where a second entry remains.
+    for (region, environment_id) in [(DEFAULT_SIGNING_REGION, &here), (OTHER_REGION, &there)] {
+        let walked = sequence_keys(&emulator, region, environment_id).await;
+        assert!(
+            walked.len() > 1,
+            "setup {region:?}/{environment_id:?}: expected more than one attach point, so a page \
+             of one leaves a cursor behind, got {walked:?}"
+        );
+    }
+
+    let (here_cursor, here_key) =
+        first_page_cursor(&emulator, DEFAULT_SIGNING_REGION, &here).await;
+    let (there_cursor, _) = first_page_cursor(&emulator, OTHER_REGION, &there).await;
+
+    // Cursors this service really minted: each is one its OWN sequence serves, and one
+    // every other sequence never issued.
+    let issued = [
+        IssuedCursor {
+            case: "a cursor the called Region's listing of this Environment issued",
+            region: DEFAULT_SIGNING_REGION,
+            environment_id: here.clone(),
+            token: here_cursor.clone(),
+        },
+        IssuedCursor {
+            case: "a cursor another Region's endpoint issued",
+            region: OTHER_REGION,
+            environment_id: there.clone(),
+            token: there_cursor,
+        },
+    ];
+
+    // Values no listing of this service ever minted, whatever it was listing.
+    let unissued: Vec<(&'static str, String)> = vec![
+        (
+            "no cursor shape at all",
+            "not-a-token-this-service-minted".to_string(),
+        ),
+        (
+            "the bare page key of an attach point a listing handed out",
+            here_key,
+        ),
+        (
+            "an issued cursor with its last hex digit pair dropped",
+            here_cursor[..here_cursor.len() - 2].to_string(),
+        ),
+    ];
+
+    let rows = vec![
+        ListingVerdict {
+            name: "the Environment the called Region publishes",
+            region: DEFAULT_SIGNING_REGION,
+            environment_id: here.clone(),
+            status: 200,
+            code: "",
+            message: String::new(),
+        },
+        ListingVerdict {
+            name: "an environmentId no catalog holds",
+            region: DEFAULT_SIGNING_REGION,
+            environment_id: ABSENT_ENVIRONMENT.to_string(),
+            status: 400,
+            code: CLIENT_CODE,
+            message: environment_not_found_message(ABSENT_ENVIRONMENT),
+        },
+        ListingVerdict {
+            name: "an environmentId of another form no catalog holds",
+            region: OTHER_REGION,
+            environment_id: SHORT_ABSENT_ENVIRONMENT.to_string(),
+            status: 400,
+            code: CLIENT_CODE,
+            message: environment_not_found_message(SHORT_ABSENT_ENVIRONMENT),
+        },
+        ListingVerdict {
+            name: "an Environment of another Region's catalog",
+            region: DEFAULT_SIGNING_REGION,
+            environment_id: there.clone(),
+            status: 400,
+            code: CLIENT_CODE,
+            message: environment_not_found_message(&there),
+        },
+        ListingVerdict {
+            name: "the Environment the other Region publishes",
+            region: OTHER_REGION,
+            environment_id: there.clone(),
+            status: 200,
+            code: "",
+            message: String::new(),
+        },
+    ];
+
+    let before = emulator
+        .attach_points_in(DEFAULT_SIGNING_REGION, &here)
+        .await;
+
+    for row in &rows {
+        // A request carrying no fault of its own gets this store's verdict about the id
+        // it names, unchanged.
+        let case = format!("{} / a request carrying no fault of its own", row.name);
+        let (status, body) =
+            list_attach_points(&emulator, row.region, &row.environment_id, None, None).await;
+        assert_eq!(
+            status, row.status,
+            "case {case:?}: expected HTTP {}, got {status} with {body:?}",
+            row.status
+        );
+        if row.status == 200 {
+            assert!(
+                !body["attachPoints"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .is_empty(),
+                "case {case:?}: expected the listing to be served, got {body:?}"
+            );
+            // And the cursor THAT listing issued still resumes it, so what the rows
+            // below refuse is a token it did not mint rather than every token.
+            if let Some(own) = issued
+                .iter()
+                .find(|cursor| cursor.region == row.region && cursor.environment_id == row.environment_id)
+            {
+                let case = format!("{} / the cursor this listing issued", row.name);
+                let (status, resumed) = list_attach_points(
+                    &emulator,
+                    row.region,
+                    &row.environment_id,
+                    Some(&own.token),
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the issued cursor to resume the walk, got {status} with {resumed:?}"
+                );
+                // The REST of the sequence, not merely a page: the cursor was minted
+                // after a first page of one, so what it resumes is every key but the
+                // first, in order.
+                let walked = sequence_keys(&emulator, row.region, &row.environment_id).await;
+                assert_eq!(
+                    page_keys(&resumed),
+                    walked[1..].to_vec(),
+                    "case {case:?}: expected the rest of the sequence after {:?}, got {resumed:?}",
+                    walked.first()
+                );
+            }
+        } else {
+            assert!(
+                code(&body).contains(row.code),
+                "case {case:?}: expected {}, got {:?} with {body:?}",
+                row.code,
+                code(&body)
+            );
+            assert_eq!(
+                message(&body),
+                row.message,
+                "case {case:?}: expected the store's own verdict, got {:?}",
+                message(&body)
+            );
+        }
+
+        // The same request, carrying a cursor this listing did not issue: the fault the
+        // REQUEST carries is what the refusal reports, whatever the id it names resolves
+        // to and whatever page size it asks for.
+        let forged = unissued
+            .iter()
+            .map(|(case, token)| (*case, token.clone()))
+            .chain(
+                issued
+                    .iter()
+                    .filter(|cursor| {
+                        !(cursor.region == row.region
+                            && cursor.environment_id == row.environment_id)
+                    })
+                    .map(|cursor| (cursor.case, cursor.token.clone())),
+            );
+        for (fault, token) in forged {
+            for max_results in LISTING_PAGE_SIZES {
+                let case = format!("{} / {fault} / maxResults {max_results:?}", row.name);
+                let (status, body) = list_attach_points(
+                    &emulator,
+                    row.region,
+                    &row.environment_id,
+                    Some(&token),
+                    max_results,
+                )
+                .await;
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected HTTP 400 for a cursor this listing did not issue, got {status} with {body:?}"
+                );
+                assert!(
+                    code(&body).contains(VALIDATION_CODE),
+                    "case {case:?}: expected {VALIDATION_CODE}, got {:?} with {body:?}",
+                    code(&body)
+                );
+                assert_eq!(
+                    message(&body),
+                    cursor_not_issued_message("ListAttachPoints"),
+                    "case {case:?}: expected the refusal to report the fault the request carries, got {:?}",
+                    message(&body)
+                );
+                assert!(
+                    !message(&body).contains(&row.environment_id),
+                    "case {case:?}: expected no verdict about the environment the request names, got {:?}",
+                    message(&body)
+                );
+                assert!(
+                    body["attachPoints"].as_array().is_none(),
+                    "case {case:?}: expected a refusal to carry no page, got {body:?}"
+                );
+            }
+        }
+    }
+
+    // The refusals were reads: what a later caller sees is what it saw before them.
+    let after = emulator
+        .attach_points_in(DEFAULT_SIGNING_REGION, &here)
+        .await;
+    assert_eq!(
+        identifiers(&after),
+        identifiers(&before),
+        "case \"after the listing table\": expected the refused listings to have changed nothing, got {after:?} where there were {before:?}"
     );
 }

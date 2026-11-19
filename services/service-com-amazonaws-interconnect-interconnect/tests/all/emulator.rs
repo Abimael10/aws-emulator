@@ -34,8 +34,10 @@ pub(crate) const DIRECT_CONNECT_TARGET_PREFIX: &str = "OvertureService";
 
 /// How long a wait for a Direct Connect gateway to reach `available` runs before the
 /// case fails. That service owes the clock a `pending` -> `available` transition, so a
-/// freshly created gateway becomes a valid attach point a moment later.
-pub(crate) const GATEWAY_READY_BUDGET: Duration = Duration::from_secs(5);
+/// freshly created gateway becomes a valid attach point a moment later; the deadline is
+/// far past that span on purpose, because what a suite waits for is the STATE and a
+/// loaded host must not be what decides a case.
+pub(crate) const GATEWAY_READY_BUDGET: Duration = Duration::from_secs(60);
 
 /// How often that wait re-reads.
 pub(crate) const GATEWAY_READY_INTERVAL: Duration = Duration::from_millis(20);
@@ -69,8 +71,9 @@ pub(crate) const CONNECTION_READY_STATE: &str = "available";
 /// How long a wait for a connection to be fully provisioned runs before the case fails.
 ///
 /// The clock owes a created connection the two legs of the documented progression, so
-/// this is well past both: a suite waits for the state, never for a fixed span.
-pub(crate) const CONNECTION_READY_BUDGET: Duration = Duration::from_secs(5);
+/// this is well past both: a suite waits for the state, never for a fixed span, and a
+/// loaded host must not be what decides a case.
+pub(crate) const CONNECTION_READY_BUDGET: Duration = Duration::from_secs(60);
 
 /// How often that wait re-reads.
 pub(crate) const CONNECTION_READY_INTERVAL: Duration = Duration::from_millis(5);

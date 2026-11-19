@@ -151,50 +151,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The attach points are listed FOR an Environment, so the catalog record the
-        // `environmentId` names is what the listing is scoped by — looked up in the
-        // catalog of the Region this request was signed for, because an Environment
-        // produces connections that land in that Region alone. An id that Region's
-        // catalog does not hold, one of another Region's catalog included, has no
-        // Environment here to list anything for. An unresolvable environment is this
-        // service's own client fault — the caller named an environment model that does
-        // not exist — so it is the 400 `InterconnectClientException` every
-        // environment-resolving operation gives, never the connection-scoped not-found
-        // shape and
-        // never an empty page, which a caller could not tell from "this environment
-        // offers none".
-        let Some(environment) = crate::state::environment_in_region(&region, &input.environment_id)
-        else {
-            return Err(ListAttachPointsErrorModeled::InterconnectClientException(
-                InterconnectClientException {
-                    message: crate::state::environment_not_found_message(&input.environment_id),
-                },
-            )
-            .into());
-        };
+        // The secret this listing's page cursors are authenticated under, which is what
+        // tells a `nextToken` this endpoint issued from one a caller built. It is the
+        // only thing taken off the store before the request's own members are judged,
+        // and `PageTokenKey` is `Copy`, so nothing of the guard outlives this line.
+        let token_key = state.lock().page_token_key;
 
-        // Two things come off the store, under one lock that is released here so nothing
-        // of it is held across the await below: the ARN attach points this service owns
-        // itself (the Connections of this endpoint that are providing connectivity), and
-        // the secret this listing's page cursors are authenticated under, which is what
-        // tells a `nextToken` this endpoint issued from one a caller built
-        // (`PageTokenKey` is `Copy`).
+        // What the request itself carries is judged BEFORE anything it names is
+        // resolved, so no verdict about a resource can mask a fault in the input.
         //
-        // Reporting only (`@readonly`): the one write here settles transitions the clock
-        // had ALREADY made due, the same settle `GetConnection` and `ListConnections`
-        // make, because a page must not offer — or withhold — an attach point on a
-        // `state` whose successor was owed before the call. Nothing else about this
-        // service's records changes, and a connection's own provisioning is not started,
-        // consumed or advanced by having been listed.
-        let (arn_descriptors, token_key) = {
-            let mut store = state.lock();
-            store.materialise_due_transitions(::std::time::Instant::now());
-            (
-                crate::state::arn_attach_point_descriptors(&store, &region, Some(&environment)),
-                store.page_token_key,
-            )
-        };
-
         // A cursor this operation did not issue is refused, rather than answered
         // with an empty page the caller cannot tell from "no more results" — or with a
         // silently restarted walk. The position travels INSIDE the token, so what tells
@@ -202,7 +167,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it, computed under the secret this store drew and never reveals. The scope the
         // authenticator covers names this operation, the Region it answered in and the
         // Environment the listing was scoped by, because those three decide the sequence
-        // a cursor names a position in.
+        // a cursor names a position in — and all three are read off the REQUEST, so this
+        // verdict needs nothing the request names to have been resolved first.
         let scope = crate::state::attach_point_cursor_scope(&region, &input.environment_id);
         let cursor = match input.next_token.as_deref() {
             Some(token) => {
@@ -217,6 +183,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(key)
             }
             None => None,
+        };
+
+        // The attach points are listed FOR an Environment, so the catalog record the
+        // `environmentId` names is what the listing is scoped by — looked up in the
+        // catalog of the Region this request was signed for, because an Environment
+        // produces connections that land in that Region alone. An id that Region's
+        // catalog does not hold, one of another Region's catalog included, has no
+        // Environment here to list anything for. An unresolvable environment is this
+        // service's own client fault — the caller named an environment model that does
+        // not exist — so it is the 400 `InterconnectClientException` every
+        // environment-resolving operation gives, never the connection-scoped not-found
+        // shape and never an empty page, which a caller could not tell from "this
+        // environment offers none". It is a verdict about what the request NAMES, so it
+        // is reached only once the request's own members have been judged above.
+        let Some(environment) = crate::state::environment_in_region(&region, &input.environment_id)
+        else {
+            return Err(ListAttachPointsErrorModeled::InterconnectClientException(
+                InterconnectClientException {
+                    message: crate::state::environment_not_found_message(&input.environment_id),
+                },
+            )
+            .into());
+        };
+
+        // The ARN attach points this service owns itself (the Connections of this
+        // endpoint that are already providing connectivity) come off the store under one
+        // lock that is released here, so nothing of it is held across the await below.
+        //
+        // Reporting only (`@readonly`): the one write here settles transitions the clock
+        // had ALREADY made due, the same settle `GetConnection` and `ListConnections`
+        // make, because a page must not offer — or withhold — an attach point on a
+        // `state` whose successor was owed before the call. Nothing else about this
+        // service's records changes, and a connection's own provisioning is not started,
+        // consumed or advanced by having been listed.
+        let arn_descriptors = {
+            let mut store = state.lock();
+            store.materialise_due_transitions(::std::time::Instant::now());
+            crate::state::arn_attach_point_descriptors(&store, &region, Some(&environment))
         };
 
         // "Lists ALL Attach Points the caller has access to that are valid for the
