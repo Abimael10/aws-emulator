@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGlobalTables
-//! IMPLEMENTED: reports the global tables this emulator holds — the replication groups
-//! in [`crate::state::ComAmazonawsDynamodbDynamodb20120810State::global_table_groups`],
-//! each with the regions holding one of its replicas — in ascending name order, so
-//! `ExclusiveStartGlobalTableName` resumes exactly where the previous page stopped.
-//! `RegionName` narrows the page to the groups with a replica in that region, and
-//! `Limit` (default 100, per the member doc below) truncates the page and sets
-//! `LastEvaluatedGlobalTableName` when more names remain.
+//! IMPLEMENTED: reports the global tables of the LEGACY (2017.11.29) version this
+//! emulator holds — the replication groups in
+//! [`crate::state::ComAmazonawsDynamodbDynamodb20120810State::global_table_groups`]
+//! established under that version, each with the regions holding one of its replicas — in
+//! ascending name order, so `ExclusiveStartGlobalTableName` resumes exactly where the
+//! previous page stopped. `RegionName` narrows the page to the groups with a replica in
+//! that region, and `Limit` (default 100, per the member doc below) truncates the page and
+//! sets `LastEvaluatedGlobalTableName` when more names remain.
+//!
+//! This operation is the ENUMERATION of the legacy surface beside it, so what it reports is
+//! that surface's own global tables: a group established by adding replicas to a table is
+//! one of the current version and is read back through `DescribeTable`'s `Replicas`,
+//! exactly as the legacy readers refuse to address it.
 //!
 //! A table created on its own is NOT a global table: it joins no replication group, so
 //! no page reports it.
@@ -179,8 +185,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.apply_due_transitions(now);
         // "Lists the global tables in a specific Region" (`ListGlobalTables$RegionName`):
         // with that member the walk holds the global tables with a replica there, and
-        // without it every global table this store holds.
-        let mut groups = store.global_tables_with_replica_in(input.region_name.as_deref());
+        // without it every global table this store holds — of the version THIS surface
+        // addresses, which is the legacy one.
+        let mut groups = store.global_tables_with_replica_in(
+            crate::state::GlobalTablesVersion::Legacy,
+            input.region_name.as_deref(),
+        );
 
         // "The first global table name that this operation will evaluate"
         // (`ExclusiveStartGlobalTableName`) is the one AFTER the name the previous page

@@ -869,6 +869,11 @@ pub const CLOUDWATCH_METRIC_STREAM: &str = "AWS::CloudWatch::MetricStream";
 /// StreamSpecification property to use this attribute").
 pub(super) const DYNAMODB_STREAM_SPECIFICATION: &str = "StreamSpecification";
 
+/// `AWS::DynamoDB::GlobalTable`: the same table declared for a GROUP of Regions, which
+/// `crate::state::provisioning` creates in Amazon DynamoDB itself. Named by the module that
+/// provisions it, so the type is spelled once in this crate.
+pub(crate) use crate::state::provisioning::dynamodb_table::global_table::DYNAMODB_GLOBAL_TABLE;
+
 /// The salt and length of the stand-in LABEL a declared stream's ARN carries until the
 /// table's own create answers the one Amazon DynamoDB minted
 /// (`TableDescription$LatestStreamLabel`, "a timestamp, in ISO 8601 format").

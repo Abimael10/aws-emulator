@@ -4,8 +4,17 @@
 //! Adds or removes replicas of one global table of the WITHDRAWN 2017.11.29 version of
 //! global tables, of which none exists — `CreateGlobalTable`, the only operation that
 //! creates one of that version, refuses every call
-//! ([`crate::state::legacy_version_withdrawn`]) — so every name answers the modelled
-//! `GlobalTableNotFoundException`.
+//! ([`crate::state::legacy_version_withdrawn`]).
+//!
+//! So this operation answers one of two client errors, in the order AWS decides them: a
+//! name no table of the request's Region carries addresses nothing at all, which is the
+//! modelled `GlobalTableNotFoundException`
+//! ([`crate::state::describe_global_table_not_found`]); a name a table DOES carry addresses
+//! a table whose replication group this call would make one of the legacy version, and that
+//! version is not on offer, which is the same `ValidationException` the create is refused
+//! with. That ORDER is what the recorded calls show: the same request is answered the
+//! not-found error for a name nothing holds and the version refusal for a name a table of
+//! the Region carries, so the resource is resolved before the version is judged.
 //!
 //! A table replicated under the CURRENT version gains and loses replicas through
 //! `UpdateTable`'s `ReplicaUpdates`.
@@ -168,18 +177,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The global table the request names is one of the legacy version, and no global
-        // table of that version exists, so the replica updates it carries address nothing.
-        let _ = (ctx, &self.engine);
-        Err(
-            UpdateGlobalTableErrorModeled::GlobalTableNotFoundException(
-                GlobalTableNotFoundException {
-                    message: Some(crate::state::legacy_global_table_not_found(
-                        &input.global_table_name,
-                    )),
-                },
-            )
-            .into(),
-        )
+        // WHICH of the two client errors this is depends on the store: the name has to
+        // address a table of this Region before the version it is addressed under can be
+        // the reason the call is refused.
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The clock's own transitions first, exactly as every other reader of this store
+        // materialises them: a table whose deletion has fallen due is one this Region no
+        // longer holds.
+        store.apply_due_transitions(now);
+        if store.table(&region, &input.global_table_name).is_err() {
+            return Err(
+                UpdateGlobalTableErrorModeled::GlobalTableNotFoundException(
+                    GlobalTableNotFoundException {
+                        message: Some(crate::state::describe_global_table_not_found(
+                            &input.global_table_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The table is there, so what the request asks for is a replication group of the
+        // version this operation addresses — which is not offered, whatever replica updates
+        // the request carries.
+        Err(crate::scaffolded::Scaffolded::validation(
+            crate::state::legacy_version_withdrawn(),
+        ))
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> UpdateGlobalTableError {
+    UpdateGlobalTableErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
 }

@@ -481,22 +481,46 @@ pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(
 /// bounded, and a table that never settles panics naming the last description it gave
 /// rather than hanging. `case` names the row the assertions belong to.
 pub async fn describe_when_active(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
+    table_when(router, case, REGION, name, |table| {
+        table["TableStatus"] == json!("ACTIVE")
+    })
+    .await
+}
+
+/// The same waiter over any Region and any condition: poll `DescribeTable` in `region`
+/// until the `Table` description satisfies `settled`, and answer that description.
+///
+/// The shared waiter for whatever the CLOCK owes a table or its replicas — a table reaching
+/// `ACTIVE`, a replica settling, a per-replica setting coming into force — so a suite about
+/// a global table waits for the CONDITION in the Region that answers it rather than
+/// spelling the loop again ([`describe_when_active`] is this loop over [`REGION`] and the
+/// table's own status). The wait is bounded by [`ACTIVE_DEADLINE`], and a condition that
+/// never holds panics naming the last description rather than hanging.
+pub async fn table_when(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    name: &str,
+    settled: impl Fn(&Value) -> bool,
+) -> Value {
     let started = std::time::Instant::now();
     let mut last = Value::Null;
     while started.elapsed() < ACTIVE_DEADLINE {
-        let (status, body) = call(router, "DescribeTable", json!({"TableName": name})).await;
+        let (status, body) = call_in(router, region, "DescribeTable", json!({"TableName": name})).await;
         assert_eq!(
             status, 200,
-            "case {case:?}: DescribeTable must resolve a table the create accepted, got {status} \
-             with {body}"
+            "case {case:?}: DescribeTable in {region} must resolve a table the create \
+             accepted, got {status} with {body}"
         );
-        if body["Table"]["TableStatus"] == json!("ACTIVE") {
+        if settled(&body["Table"]) {
             return body["Table"].clone();
         }
         last = body;
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    panic!("case {case:?}: the table never reached ACTIVE within {ACTIVE_DEADLINE:?}, last {last}")
+    panic!(
+        "case {case:?}: {name} in {region} never settled within {ACTIVE_DEADLINE:?}, last {last}"
+    )
 }
 
 /// Poll `DescribeContributorInsights` until the resource's insights report `status`,

@@ -12,8 +12,8 @@
 //! same name and schema. This module is therefore where the group of regional tables is
 //! kept in step — each one records the other Regions of its group, the store holds the
 //! group itself ([`super::ComAmazonawsDynamodbDynamodb20120810State::global_table_groups`],
-//! which `ListGlobalTables` pages over), and an item written to any of them is written to
-//! the others.
+//! under the CURRENT global tables version, which is the version every regional table of it
+//! then reports), and an item written to any of them is written to the others.
 //!
 //! Every status here is the clock's: a replica is `CREATING`, `UPDATING` or `DELETING`
 //! until [`super::STATUS_TRANSITION`] after the call that asked for it, and `ACTIVE` — or
@@ -265,7 +265,21 @@ impl TableReplica {
                     max_read_request_units: Some(units),
                 }
             }),
-            warm_throughput: Some(warm),
+            // "Represents the warm throughput value for this replica"
+            // (`ReplicaDescription$WarmThroughput`) — the REPLICA's, not the source
+            // table's: warm throughput is "the minimum provisioned capacity maintained for
+            // immediate data access" (the `TableWarmThroughputDescription` doc), and the
+            // read capacity this replica is provisioned for is the one it overrides
+            // ([`TableReplicaSettings::read_capacity_units`]), so that is what it keeps
+            // warm for reads. A replica that overrides nothing keeps the source table's
+            // pair warm, which is what `warm` carries.
+            warm_throughput: Some(TableWarmThroughputDescription {
+                read_units_per_second: self
+                    .settings
+                    .read_capacity_units
+                    .or(warm.read_units_per_second),
+                ..warm
+            }),
             // "Replica-specific global secondary index settings": one entry per index this
             // replica overrides a setting of, and no list at all for a replica whose
             // indexes all follow the source table's settings.
@@ -455,7 +469,7 @@ fn one_action(
     if let Some(create) = update.create.as_ref() {
         let region = checked_region(&create.region_name)?;
         if region == table_region {
-            return Err(local_region_create(&region));
+            return Err(local_region_add_or_delete());
         }
         return Ok(ReplicaAction::Create(TableReplicaSettings {
             table_name: table_name.to_string(),
@@ -499,7 +513,7 @@ fn one_action(
     if let Some(delete) = update.delete.as_ref() {
         let region = checked_region(&delete.region_name)?;
         if region == table_region {
-            return Err(local_region_delete(&region));
+            return Err(local_region_add_or_delete());
         }
         return Ok(ReplicaAction::Delete(region));
     }
@@ -608,17 +622,25 @@ fn checked_region(region: &str) -> Result<String, RequestError> {
     Ok(region.to_string())
 }
 
-/// How a `Create` naming the Region the table is already in is refused: the local table
-/// is not a replica of itself, so there is nothing in that Region to create.
-pub fn local_region_create(region: &str) -> RequestError {
-    RequestError::Validation(format!(
-        "One or more parameter values were invalid: Cannot create a replica in {region}, which is \
-         the Region the table is in"
-    ))
+/// How a `Create` or a `Delete` naming the Region the table is already in is refused: the
+/// local table is not a replica of itself, so `ReplicaUpdates` is not the member that adds
+/// or removes it — AWS's own sentence for that, which names the operations that do and
+/// takes nothing from the request.
+pub const LOCAL_REGION_THROUGH_REPLICA_UPDATES: &str =
+    "Cannot add or delete the local region through ReplicaUpdates. Use CreateTable, \
+     DeleteTable, or UpdateTable as required.";
+
+/// That refusal, as the request error this crate answers it with.
+pub fn local_region_add_or_delete() -> RequestError {
+    RequestError::Validation(LOCAL_REGION_THROUGH_REPLICA_UPDATES.to_string())
 }
 
-/// The same for an `Update`: the local table's own settings are changed by the members of
-/// the request beside `ReplicaUpdates`, not by a replica update naming its Region.
+/// How an `Update` naming the Region the table is already in is refused: the local table's
+/// own settings are changed by the members of the request beside `ReplicaUpdates`, not by a
+/// replica update naming its Region. The sentence above states the rule for an ADD and a
+/// DELETE, so it is not the one for this action, and no recording shows how AWS words this
+/// one: the refusal states the rule inside the clause this service opens every refusal of
+/// an invalid parameter value with.
 pub fn local_region_update(region: &str) -> RequestError {
     RequestError::Validation(format!(
         "One or more parameter values were invalid: Cannot update a replica in {region}, which is \
@@ -626,17 +648,23 @@ pub fn local_region_update(region: &str) -> RequestError {
     ))
 }
 
-/// The same for a `Delete`: the local table is removed by `DeleteTable`, and disassociated
-/// from its group by the `Disassociate` action.
-pub fn local_region_delete(region: &str) -> RequestError {
-    RequestError::Validation(format!(
-        "One or more parameter values were invalid: Cannot delete the replica in {region}, which \
-         is the Region the table is in"
-    ))
+/// How an `Update` or `Delete` entry of `ReplicaUpdates` naming a Region the table has no
+/// replica in is refused: the action addresses a replica of the replication group, and that
+/// group has none there — AWS's own sentence for it, which names the two actions it is the
+/// answer to and takes nothing from the request.
+pub fn replica_update_target_not_found() -> RequestError {
+    RequestError::Validation(
+        "Replica specified in the Replica Update or Replica Delete action of the request was not \
+         found."
+            .to_string(),
+    )
 }
 
-/// How an `Update` or `Delete` naming a Region the table has no replica in is refused: the
-/// action addresses a replica of the replication group, and that group has none there.
+/// The same question on the AUTO SCALING surface, where the member naming a Region is
+/// `UpdateTableReplicaAutoScaling`'s own `ReplicaUpdates`: that operation models
+/// `ReplicaNotFoundException` of its own and no recording shows its wording, so the refusal
+/// states the rule inside this service's invalid-parameter clause rather than borrowing the
+/// sentence of another operation's action.
 pub fn replica_not_in_group(region: &str) -> RequestError {
     RequestError::Validation(format!(
         "One or more parameter values were invalid: The replica in {region} is not part of this \
@@ -644,22 +672,17 @@ pub fn replica_not_in_group(region: &str) -> RequestError {
     ))
 }
 
-/// How a `Create` naming a Region the table already has a replica in is refused.
-pub fn replica_already_in_group(region: &str) -> RequestError {
+/// How a `Create` naming a Region that ALREADY HOLDS a table of the group's name is
+/// refused — whether that table is a replica of this group or a table of its own, because
+/// the replica is created in that Region under the group's name ("The table must have the
+/// same name as all of the other replicas") and that name is taken either way.
+///
+/// AWS's own sentence for it, typographic quotes and all, whose only variable is the table
+/// name the request named.
+pub fn replica_table_already_exists(name: &str) -> RequestError {
     RequestError::Validation(format!(
-        "One or more parameter values were invalid: The replica in {region} is already part of \
-         this table's replication group"
-    ))
-}
-
-/// How a `Create` is refused when the destination Region already holds a table of that
-/// name that is NOT a replica of this one: the replica is created there under the group's
-/// name ("The table must have the same name as all of the other replicas"), and that name
-/// is taken.
-pub fn replica_name_taken(region: &str, name: &str) -> RequestError {
-    RequestError::Validation(format!(
-        "One or more parameter values were invalid: Region {region} already has a table named \
-         {name}"
+        "Failed to create a the new replica of table with name: \u{2018}{name}\u{2019} because \
+         one or more replicas already existed as tables."
     ))
 }
 
@@ -968,7 +991,19 @@ impl Table {
     /// ([`ReplicaIndexSettings`]) — so the regional table this returns IS the replica the
     /// action asked for rather than a copy that reports the overrides without applying
     /// them.
-    fn replicated_into(&self, settings: &TableReplicaSettings, now: SystemTime) -> Table {
+    ///
+    /// `stream` is the stream REGISTERED for this replica's own Region, which the caller
+    /// takes from the streams registry before anything is written: a global table
+    /// replicates over "DynamoDB Streams enabled, with the stream containing both the new
+    /// and the old images of the item", and a stream is a resource of ONE Region, so the
+    /// replica's change feed is its own rather than the source table's. `None` for a replica
+    /// of a table that has no enabled stream, which has no change feed to mirror.
+    fn replicated_into(
+        &self,
+        settings: &TableReplicaSettings,
+        stream: Option<super::TableStream>,
+        now: SystemTime,
+    ) -> Table {
         let region = settings.region.clone();
         let provisioned_throughput = self.provisioned_throughput.as_ref().map(|throughput| {
             crate::ops::types::ProvisionedThroughput {
@@ -1055,13 +1090,14 @@ impl Table {
             // A resource-based policy is attached to ONE table by its own ARN, so the
             // replica carries none until a policy is put on it.
             resource_policy: crate::state::ResourcePolicySlot::default(),
-            // Its stream's policy is the stream's own, and the replica is created with no
-            // stream at all.
+            // Its stream's policy is the stream's own, and no policy is put on a stream the
+            // replica's own create registered.
             stream_resource_policy: crate::state::ResourcePolicySlot::default(),
-            // The replica's change feed is a stream of its own Region, which only a
-            // `StreamSpecification` on this table creates; the replica is created without
-            // one rather than reporting an ARN nothing registered.
-            stream: None,
+            // The replica's change feed is a stream of its OWN Region, registered for it
+            // before anything was written: a global table's replicas are added over a
+            // stream carrying both images of each item, and that stream is a resource of
+            // the Region the replica lives in.
+            stream,
             items: self.items.clone(),
             reported_counters: MeteredCounters::new(now),
             stored_bytes: self.stored_bytes,
@@ -1116,23 +1152,25 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         for action in actions {
             match action {
                 ReplicaAction::Create(settings) => {
-                    if table.replica(&settings.region).is_some() {
-                        return Err(replica_already_in_group(&settings.region));
-                    }
-                    if self.contains_table(&settings.region, name) {
-                        return Err(replica_name_taken(&settings.region, name));
+                    // One refusal for a destination Region that already holds a table of the
+                    // group's name, whether that table is a replica of this group or a
+                    // table of its own ([`replica_table_already_exists`]).
+                    if table.replica(&settings.region).is_some()
+                        || self.contains_table(&settings.region, name)
+                    {
+                        return Err(replica_table_already_exists(name));
                     }
                     check_overridden_indexes(table, settings)?;
                 }
                 ReplicaAction::Update(settings) => {
                     if table.replica(&settings.region).is_none() {
-                        return Err(replica_not_in_group(&settings.region));
+                        return Err(replica_update_target_not_found());
                     }
                     check_overridden_indexes(table, settings)?;
                 }
                 ReplicaAction::Delete(region) => {
                     if table.replica(region).is_none() {
-                        return Err(replica_not_in_group(region));
+                        return Err(replica_update_target_not_found());
                     }
                     // A replica that has just SOURCED an add is one the group cannot lose
                     // yet, whichever Region the delete is asked from: the question is asked
@@ -1264,16 +1302,28 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     /// table in its own Region holding the group's data, and every table of the group —
     /// the local one included — records it. A deleted replica's table is removed on the
     /// same span its record reports `DELETING` for.
+    ///
+    /// `streams` carries the stream REGISTERED for each created replica's own Region, by
+    /// Region ([`Self::create_replica`]): a stream is a resource of one Region and of the
+    /// streams service, so the registration is made by the handler before anything here is
+    /// written, and what reaches the store is the stream it answered.
     pub fn apply_replica_actions(
         &mut self,
         region: &str,
         name: &str,
         actions: &[ReplicaAction],
+        streams: &[(String, super::TableStream)],
         now: SystemTime,
     ) {
         for action in actions {
             match action {
-                ReplicaAction::Create(settings) => self.create_replica(region, name, settings, now),
+                ReplicaAction::Create(settings) => {
+                    let stream = streams
+                        .iter()
+                        .find(|(registered_region, _)| registered_region == &settings.region)
+                        .map(|(_, stream)| stream.clone());
+                    self.create_replica(region, name, settings, stream, now);
+                }
                 ReplicaAction::Update(settings) => {
                     self.change_replica(name, settings, now);
                 }
@@ -1288,17 +1338,19 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     fn group_regions(&self, name: &str) -> Vec<String> {
         self.global_table_groups
             .get(name)
-            .map(|regions| regions.iter().cloned().collect())
+            .map(|group| group.regions.iter().cloned().collect())
             .unwrap_or_default()
     }
 
-    /// Create one replica: the regional table in its own Region, the record of it on every
-    /// table of the group, and the group itself.
+    /// Create one replica: the regional table in its own Region — carrying the `stream`
+    /// registered for that Region, if the group's table publishes its changes — the record
+    /// of it on every table of the group, and the group itself.
     fn create_replica(
         &mut self,
         region: &str,
         name: &str,
         settings: &TableReplicaSettings,
+        stream: Option<super::TableStream>,
         now: SystemTime,
     ) {
         let Ok(source) = self.table(region, name) else {
@@ -1326,7 +1378,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             table_class: None,
             indexes: Vec::new(),
         });
-        let mut replica_table = source.replicated_into(settings, now);
+        let mut replica_table = source.replicated_into(settings, stream, now);
         replica_table.replicas = peers
             .into_iter()
             .map(|settings| TableReplica {
@@ -1360,9 +1412,19 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
                 }
             }
         }
-        let group = self.global_table_groups.entry(name.to_string()).or_default();
-        group.insert(region.to_string());
-        group.insert(settings.region.clone());
+        // Adding a replica to a table establishes a group of the CURRENT version — "to
+        // create a global table by specifying one or more Create actions in the
+        // ReplicaUpdates" — which is the version `DescribeTable` then reports for every
+        // regional table of it, and the one that decides which surface addresses the
+        // group ([`super::GlobalTableGroup`]).
+        let group = self
+            .global_table_groups
+            .entry(name.to_string())
+            .or_insert_with(|| {
+                super::GlobalTableGroup::established_under(super::GlobalTablesVersion::Current)
+            });
+        group.regions.insert(region.to_string());
+        group.regions.insert(settings.region.clone());
     }
 
     /// Apply new parameters to one replica: the record every table of the group holds for
@@ -1448,7 +1510,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             table.updated_at = Some(now + STATUS_TRANSITION);
         }
         if let Some(group) = self.global_table_groups.get_mut(name) {
-            group.remove(region);
+            group.regions.remove(region);
         }
         self.close_emptied_group(name);
     }
@@ -1464,7 +1526,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         if self
             .global_table_groups
             .get(name)
-            .is_some_and(|regions| regions.len() < 2)
+            .is_some_and(|group| group.regions.len() < 2)
         {
             self.global_table_groups.remove(name);
         }
@@ -1483,7 +1545,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         }
         for (name, region) in departed {
             if let Some(group) = self.global_table_groups.get_mut(&name) {
-                group.remove(&region);
+                group.regions.remove(&region);
             }
             self.close_emptied_group(&name);
         }
@@ -1512,6 +1574,9 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             return;
         }
         let targets = source.replicating_regions(now);
+        // What each replica's own change feed owes for this change, queued once the walk
+        // over the regional tables is done, because the queue is the STORE's.
+        let mut replicated: Vec<super::PendingStreamRecord> = Vec::new();
         for target in targets {
             let Ok(table) = self.table_mut(&target, name) else {
                 continue;
@@ -1527,6 +1592,29 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             // A replicated change is an item-level change of the replica, so the version
             // it replaced is kept for that table's own continuous backups.
             table.record_item_version(now, key, replaced.as_ref());
+            // ...and "DynamoDB Streams captures a time-ordered sequence of item-level
+            // modifications in any DynamoDB table": the change landed in the replica's own
+            // table, so the replica's own stream owes a record for it. Charged to no
+            // caller's access: the write the caller made was the one in the source Region.
+            if let Some(stream_arn) = table.enabled_stream_arn() {
+                let new_image = item.cloned();
+                let keys = match new_image.as_ref().or(replaced.as_ref()) {
+                    Some(image) => table.stream_keys(image),
+                    None => Item::default(),
+                };
+                replicated.push(super::PendingStreamRecord {
+                    region: target.clone(),
+                    table_name: table.name.clone(),
+                    keys,
+                    stream_arn: Some(stream_arn),
+                    old_image: replaced,
+                    new_image,
+                    by_caller: false,
+                });
+            }
+        }
+        for change in replicated {
+            self.queue_stream_record(Some(change));
         }
     }
 }

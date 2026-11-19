@@ -4,41 +4,61 @@
 //!
 //! The rule these tests pin:
 //!
-//! > a page of `ListGlobalTables` holds the global tables this store holds whose
-//! > replication group has a replica in the requested Region — in ascending name order,
-//! > resumed after `ExclusiveStartGlobalTableName`, truncated at `Limit` (100 when the
-//! > request names none) with the name it stopped on reported in
-//! > `LastEvaluatedGlobalTableName` — and a table that belongs to no replication group
-//! > is not a global table, so no page reports it.
+//! > a page of `ListGlobalTables` holds the global tables of the LEGACY (2017.11.29)
+//! > version this store holds whose replication group has a replica in the requested
+//! > Region — in ascending name order, resumed after `ExclusiveStartGlobalTableName`,
+//! > truncated at `Limit` (100 when the request names none) with the name it stopped on
+//! > reported in `LastEvaluatedGlobalTableName` — and a table that belongs to no
+//! > replication group, or to a group of the CURRENT (2019.11.21) version, is not a global
+//! > table of this surface, so no page reports it.
 //!
 //! A replication group spans Regions, so it is recorded in the store as the relation
-//! between a global table's name and the Regions holding its replicas
-//! (`ComAmazonawsDynamodbDynamodb20120810State::global_table_groups`). The surface that
-//! ESTABLISHES one — `UpdateTable`'s `ReplicaUpdates` — is still scaffolded, so the
-//! groups a reporting test needs are written straight into that store, exactly as the
-//! replica surface will write them; everything the operation is asked about then goes
-//! over the wire through the same router the emulator's front doors use.
+//! between a global table's name, the Regions holding its replicas and the version that
+//! established it (`ComAmazonawsDynamodbDynamodb20120810State::global_table_groups`). The
+//! surface that ESTABLISHES a group of the legacy version — `CreateGlobalTable` — refuses
+//! every call, because that version is no longer offered, so the groups a reporting test
+//! needs are written straight into that store, exactly as that surface would write them;
+//! everything the operation is asked about then goes over the wire through the same router
+//! the emulator's front doors use.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_dynamodb_dynamodb_20120810::state::{
+    GlobalTableGroup, GlobalTablesVersion,
+};
 use service_com_amazonaws_dynamodb_dynamodb_20120810::ComAmazonawsDynamodbDynamodb20120810State;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::emulator::{call, call_in, emulator, emulator_and_engine, error_code, message, ok};
+use crate::emulator::{
+    call, call_in, emulator, emulator_and_engine, error_code, message, ok, table_when,
+};
 
-/// Record one replication group in the store: the global table's name and the Regions
-/// holding a replica of it.
-fn seed_group(engine: &Arc<engine::InMemoryEngine>, name: &str, regions: &[&str]) {
+/// Record one replication group of `version` in the store: the global table's name and the
+/// Regions holding a replica of it.
+fn seed_versioned_group(
+    engine: &Arc<engine::InMemoryEngine>,
+    name: &str,
+    regions: &[&str],
+    version: GlobalTablesVersion,
+) {
     engine
         .state::<ComAmazonawsDynamodbDynamodb20120810State>()
         .lock()
         .global_table_groups
         .insert(
             name.to_string(),
-            regions.iter().map(ToString::to_string).collect::<BTreeSet<_>>(),
+            GlobalTableGroup {
+                regions: regions.iter().map(ToString::to_string).collect::<BTreeSet<_>>(),
+                version,
+            },
         );
+}
+
+/// Record one group of the version this surface addresses, which is the legacy one.
+fn seed_group(engine: &Arc<engine::InMemoryEngine>, name: &str, regions: &[&str]) {
+    seed_versioned_group(engine, name, regions, GlobalTablesVersion::Legacy);
 }
 
 /// The `GlobalTableName`s one page reports, in the order the page carries them.
@@ -181,6 +201,132 @@ async fn a_table_that_belongs_to_no_replication_group_is_not_a_global_table() {
             "case the store's own tables: expected {name} among them, got {tables}"
         );
     }
+}
+
+/// One row of the version table: the case, the group's name, the Regions it spans, the
+/// version that established it, and whether this surface's enumeration reports it.
+type VersionRow = (
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    GlobalTablesVersion,
+    bool,
+);
+
+#[tokio::test]
+async fn only_the_groups_of_this_surface_s_own_version_are_enumerated() {
+    // RULE: `ListGlobalTables` is the enumeration of the 2017.11.29 global-table surface,
+    // so it reports the replication groups established UNDER that version and none of the
+    // groups the current version establishes — which are addressed through `DescribeTable`
+    // and `UpdateTable` instead, exactly as the legacy readers refuse to address them.
+    let (router, engine) = emulator_and_engine();
+    // Rows differ in the version that established the group and in how many Regions it
+    // spans, so neither the size of a group nor the Region it is asked about decides the
+    // answer.
+    let rows: [VersionRow; 5] = [
+        (
+            "a legacy group of two Regions",
+            "legacy.pair",
+            &["us-east-1", "us-west-2"],
+            GlobalTablesVersion::Legacy,
+            true,
+        ),
+        (
+            "a legacy group of one Region",
+            "legacy.single",
+            &["us-east-1"],
+            GlobalTablesVersion::Legacy,
+            true,
+        ),
+        (
+            "a current group of two Regions",
+            "current.pair",
+            &["us-east-1", "eu-west-1"],
+            GlobalTablesVersion::Current,
+            false,
+        ),
+        (
+            "a current group of three Regions",
+            "current.three",
+            &["ap-south-1", "us-east-1", "us-west-2"],
+            GlobalTablesVersion::Current,
+            false,
+        ),
+        (
+            "a current group sharing no Region with the legacy ones",
+            "current.elsewhere",
+            &["sa-east-1"],
+            GlobalTablesVersion::Current,
+            false,
+        ),
+    ];
+    for (_, name, regions, version, _) in rows {
+        seed_versioned_group(&engine, name, regions, version);
+    }
+
+    let mut enumerated: Vec<String> = rows
+        .iter()
+        .filter(|(_, _, _, _, listed)| *listed)
+        .map(|(_, name, _, _, _)| (*name).to_string())
+        .collect();
+    enumerated.sort();
+    let page = ok(&router, "ListGlobalTables", json!({})).await;
+    assert_eq!(
+        listed_names(&page),
+        enumerated,
+        "case every version at once: expected only the legacy groups, got {page}"
+    );
+    for (case, name, regions, _, listed) in rows {
+        for region in regions {
+            let narrowed = ok(
+                &router,
+                "ListGlobalTables",
+                json!({"RegionName": region}),
+            )
+            .await;
+            assert_eq!(
+                listed_names(&narrowed).contains(&name.to_string()),
+                listed,
+                "case {case:?} asked about {region}: expected reported={listed}, got {narrowed}"
+            );
+        }
+    }
+
+    // ...and the one way a client really establishes a group — `UpdateTable`'s
+    // `ReplicaUpdates` — establishes one of the CURRENT version, so no page reports it
+    // even once its replica is settled, while `DescribeTable` reports both the replica and
+    // that version.
+    let replicated = "Replicated.Current";
+    ok(&router, "CreateTable", create_table_body(replicated)).await;
+    table_when(&router, "the table made global", "us-east-1", replicated, |table| {
+        table["TableStatus"] == json!("ACTIVE")
+    })
+    .await;
+    ok(
+        &router,
+        "UpdateTable",
+        json!({
+            "TableName": replicated,
+            "ReplicaUpdates": [{"Create": {"RegionName": "us-west-2"}}],
+        }),
+    )
+    .await;
+    let described = table_when(&router, "the settled group", "us-east-1", replicated, |table| {
+        table["Replicas"]
+            .as_array()
+            .is_some_and(|replicas| replicas.iter().all(|replica| replica["ReplicaStatus"] == json!("ACTIVE")))
+    })
+    .await;
+    let page = ok(&router, "ListGlobalTables", json!({})).await;
+    assert_eq!(
+        (
+            listed_names(&page).contains(&replicated.to_string()),
+            described["GlobalTableVersion"].clone(),
+        ),
+        (false, json!("2019.11.21")),
+        "case a group ReplicaUpdates established: expected it absent from the legacy \
+         enumeration and reported by DescribeTable, got {page} and {described}"
+    );
 }
 
 #[tokio::test]

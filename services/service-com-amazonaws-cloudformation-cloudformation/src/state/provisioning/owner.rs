@@ -48,6 +48,11 @@ impl Owner {
             Self::DynamodbTable => {
                 dynamodb_table::create(ctx, region, resource, propagated).await
             }
+            // A global table is the same table plus the replicas of its group, created by
+            // the same service's calls ([`dynamodb_table::global_table`]).
+            Self::DynamodbGlobalTable => {
+                dynamodb_table::global_table::create(ctx, region, resource, propagated).await
+            }
             // An inline policy carries no tags of its own: it is not a resource, so
             // CloudFormation propagates none to it.
             Self::IamPolicy(kind) => iam_policy::create(ctx, region, kind, resource)
@@ -285,6 +290,17 @@ impl Owner {
             Self::DynamodbTable => {
                 Ok(dynamodb_table::readiness(ctx, region, physical_resource_id, declared).await)
             }
+            // A global table is a COMPOSITE resource: the table itself and then each
+            // replica of its group has a window of its own, and the resource is ready once
+            // that service reports every one of them settled
+            // ([`dynamodb_table::global_table::readiness`]).
+            Self::DynamodbGlobalTable => Ok(dynamodb_table::global_table::readiness(
+                ctx,
+                region,
+                physical_resource_id,
+                declared,
+            )
+            .await),
             // The document is embedded in every entity it names the moment the put answers.
             Self::IamPolicy(_) => Ok(Readiness::Ready),
             // The alias is in force, and the version exists and can be invoked, the moment
@@ -474,8 +490,9 @@ impl Owner {
             | Self::LambdaPermission
             | Self::LambdaVersion => Ok(BTreeMap::new()),
             // A table's `Arn` and `StreamArn` are the ones its own `CreateTable` answered
-            // with, so there is nothing left to read once the resource is up.
-            Self::DynamodbTable => Ok(BTreeMap::new()),
+            // with, and a global table's `TableId` beside them, so there is nothing left to
+            // read once either resource is up.
+            Self::DynamodbTable | Self::DynamodbGlobalTable => Ok(BTreeMap::new()),
             // A log group's `Arn` is the one CloudFormation's own naming rules compute for
             // it, and neither a stream nor a metric filter publishes an attribute at all; an
             // authorizer's `Arn` is the one its create answered with. So there is nothing
@@ -627,7 +644,9 @@ impl Owner {
                 // Boxed for the reason [`Self::create`]'s arm records.
                 Box::pin(provisioner.removal(ctx, region, physical_resource_id)).await
             }
-            Self::DynamodbTable => {
+            // The table in the stack's own Region is the resource either DynamoDB type is
+            // addressed by, so the same read answers whether that service still holds it.
+            Self::DynamodbTable | Self::DynamodbGlobalTable => {
                 dynamodb_table::removal(ctx, region, physical_resource_id).await
             }
             // `Delete<entity>Policy` takes the embedded document away, so there is nothing
@@ -802,6 +821,12 @@ impl Owner {
             }
             Self::DynamodbTable => {
                 dynamodb_table::update(ctx, region, resource, declared).await
+            }
+            // A changed declaration of a global table moves the Regions its group spans,
+            // which is `UpdateTable`'s `ReplicaUpdates`
+            // ([`dynamodb_table::global_table::update`]).
+            Self::DynamodbGlobalTable => {
+                dynamodb_table::global_table::update(ctx, region, resource, declared).await
             }
             Self::IamPolicy(kind) => iam_policy::update(ctx, region, kind, resource, declared)
                 .await
@@ -1026,6 +1051,13 @@ impl Owner {
             Self::DynamodbTable => {
                 dynamodb_table::retag(ctx, region, resource, declared, propagated).await
             }
+            // A global table states its tag set per REPLICA, and the one this stack's
+            // resource carries is the table in its own Region: that replica's declaration is
+            // the tag set reconciled, by the same call pair.
+            Self::DynamodbGlobalTable => {
+                let local = dynamodb_table::global_table::local_replica(declared, region);
+                dynamodb_table::retag(ctx, region, resource, &local, propagated).await
+            }
             // Neither a layer version nor a policy statement is taggable, and neither is an
             // inline policy, so nothing is asked about their tags; the tags of a mapping that
             // already exists are reconciled by no arm here yet ([`Provisioner::retag`]'s own
@@ -1158,6 +1190,13 @@ impl Owner {
             // `Snapshot` deletion policy on this type deletes the table with no snapshot
             // invented for it.
             Self::DynamodbTable => dynamodb_table::delete(ctx, region, resource).await,
+            // A global table is deleted the way it was created, in reverse: its replicas
+            // first, then the table in the stack's own Region
+            // ([`dynamodb_table::global_table::delete`]). DynamoDB takes no snapshot of
+            // either on the way out, for the reason above.
+            Self::DynamodbGlobalTable => {
+                dynamodb_table::global_table::delete(ctx, region, resource).await
+            }
             // Lambda's `DeleteFunction` takes no snapshot of a function on the way out:
             // there is no such call, so a `Snapshot` deletion policy on this type deletes
             // the function with no snapshot invented for it.
@@ -1366,6 +1405,9 @@ impl Owner {
             Self::DynamodbTable => {
                 dynamodb_table::actual_configuration(ctx, region, resource).await?
             }
+            Self::DynamodbGlobalTable => {
+                dynamodb_table::global_table::actual_configuration(ctx, region, resource).await?
+            }
             // An embedded policy reports no configuration of its own to compare: the
             // document is read by the entity's own drift read, as a policy statement's is.
             Self::IamPolicy(_) => return Ok(ActualConfiguration::Unchecked),
@@ -1561,8 +1603,8 @@ impl Owner {
             | Self::LambdaLayerVersion
             | Self::LambdaPermission
             | Self::LambdaVersion => message.to_string(),
-            // Amazon DynamoDB's does the same.
-            Self::DynamodbTable => message.to_string(),
+            // Amazon DynamoDB's does the same, for the table and the global table alike.
+            Self::DynamodbTable | Self::DynamodbGlobalTable => message.to_string(),
             // AWS IoT's does the same. Amazon CloudWatch Logs's providers word the plugin's
             // invalid-request exception around the SDK exception they wrapped, and that
             // wording is applied where the refusal is READ — at the call, which is where the

@@ -3032,7 +3032,8 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
     /// the same client token is treated as a new request".
     pub transactions: HashMap<(String, String), CompletedTransaction>,
     /// The replication group of every GLOBAL table this store holds, keyed by the
-    /// global table's name: the regions that hold a replica of it.
+    /// global table's name: the regions that hold a replica of it, and the global tables
+    /// VERSION the group was established under ([`GlobalTableGroup`]).
     ///
     /// A global table is ONE resource spanning several regions, so it is not one of the
     /// per-region entries in [`Self::regions`]: each region of a group holds its own
@@ -3041,13 +3042,15 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
     /// in the specified Region" — the `ListGlobalTables` doc). A table created on its
     /// own joins no group, so it is not a global table and no reader reports it as one.
     ///
-    /// A group is established by the REPLICA surface — `CreateGlobalTable`,
-    /// `UpdateGlobalTable`, `UpdateTable`'s `ReplicaUpdates` and `CreateTable`'s
-    /// `GlobalTableSourceArn` — none of which this slice serves yet (each answers the
-    /// scaffold's 501 for the member or the whole operation), so a store driven through
-    /// this slice's own API holds no group and the readers report nothing, exactly as
-    /// they do for an account that has created no global table.
-    pub global_table_groups: BTreeMap<String, BTreeSet<String>>,
+    /// A group is established by the REPLICA surface, and WHICH surface established it is
+    /// what decides which operations address it: `UpdateTable`'s `ReplicaUpdates` (and
+    /// `CreateTable`'s `GlobalTableSourceArn`) establish a group of the current version,
+    /// read back through `DescribeTable`'s `Replicas`, while the legacy 2017.11.29
+    /// operations address (and `ListGlobalTables` enumerates) the groups of THEIR version
+    /// — which `CreateGlobalTable` is the only call that could establish, and it refuses
+    /// every call because that version is no longer offered
+    /// ([`legacy_version_withdrawn`]).
+    pub global_table_groups: BTreeMap<String, GlobalTableGroup>,
     /// Every on-demand backup this emulator holds, keyed by its own `BackupArn`.
     ///
     /// ONE map rather than one per region, because a `BackupArn` already carries the
@@ -3369,21 +3372,29 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         names
     }
 
-    /// The global tables whose replication group holds a replica in `region`, in
-    /// ascending name order, each with the regions of its group — the walk
+    /// The global tables OF `version` whose replication group holds a replica in `region`,
+    /// in ascending name order, each with the regions of its group — the walk
     /// `ListGlobalTables` pages over.
+    ///
+    /// `version` is the surface asking: a group belongs to the global tables version that
+    /// established it ([`GlobalTableGroup::version`]), and each version's operations
+    /// address their own groups, so the legacy enumeration reports the legacy groups and
+    /// nothing of the current version's.
     ///
     /// `region` is the `RegionName` the request named ("Lists the global tables in a
     /// specific Region" — `ListGlobalTables$RegionName`); a request that names none asks
-    /// for every global table this store holds, whichever regions their groups span.
+    /// for every global table of that version this store holds, whichever regions their
+    /// groups span.
     pub fn global_tables_with_replica_in(
         &self,
+        version: GlobalTablesVersion,
         region: Option<&str>,
     ) -> Vec<(String, Vec<String>)> {
         self.global_table_groups
             .iter()
-            .filter(|(_, group)| region.is_none_or(|region| group.contains(region)))
-            .map(|(name, group)| (name.clone(), group.iter().cloned().collect()))
+            .filter(|(_, group)| group.version == version)
+            .filter(|(_, group)| region.is_none_or(|region| group.regions.contains(region)))
+            .map(|(name, group)| (name.clone(), group.regions.iter().cloned().collect()))
             .collect()
     }
 

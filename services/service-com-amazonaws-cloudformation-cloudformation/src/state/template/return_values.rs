@@ -159,6 +159,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         S3VECTORS_VECTOR_BUCKET => &["VectorBucketArn"],
         S3VECTORS_INDEX => &["IndexArn"],
         "AWS::DynamoDB::Table" => &["Arn", "StreamArn"],
+        // The same type declared for a group of Regions publishes the table's own `TableId`
+        // beside them.
+        DYNAMODB_GLOBAL_TABLE => &["Arn", "StreamArn", "TableId"],
         "AWS::Lambda::Function" => &["Arn"],
         // "Fn::GetAtt … FunctionArn: the ARN of the version. Version: the version number."
         LAMBDA_VERSION => &["FunctionArn", "Version"],

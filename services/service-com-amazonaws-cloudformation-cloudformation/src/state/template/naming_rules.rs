@@ -945,6 +945,14 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         crate::state::provisioner::cloudwatch_composite_alarms::CLOUDWATCH_COMPOSITE_ALARM => {
             Some(crate::state::provisioner::cloudwatch_composite_alarms::COMPOSITE_ALARM_NAME_MEMBER)
         }
+        // Amazon DynamoDB's `CreateTable` takes the `TableName` of the table a global table
+        // IS in each of its Regions — "Ref returns the table name" for
+        // `AWS::DynamoDB::GlobalTable` as it does for `AWS::DynamoDB::Table` — so the type
+        // publishes `TableName`; the type's last segment is `GlobalTable`, so neither
+        // `GlobalTableName` nor `Name` finds it. That name is what every regional table of
+        // the group is CREATED under and the identifier every call on one takes, so it is
+        // the physical id.
+        crate::state::template::DYNAMODB_GLOBAL_TABLE => Some("TableName"),
         _ => None,
     }
 }

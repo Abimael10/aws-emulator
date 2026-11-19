@@ -673,6 +673,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(stream_specification_invalid(&name, STREAM_NOT_ENABLED))
             }
         };
+        // A replica this request CREATES is a table of its OWN Region, and a global table
+        // replicates over "DynamoDB Streams enabled, with the stream containing both the
+        // new and the old images of the item" (the `CreateGlobalTable` doc), so each new
+        // replica of a table that publishes its changes gets a stream of its own Region —
+        // registered HERE, while nothing has been written yet, so a registration this
+        // emulator refuses refuses the whole update rather than leaving a replica
+        // reporting a stream nothing holds.
+        let replica_streams = registered_replica_streams(
+            &*self.engine,
+            &name,
+            stream.as_ref(),
+            &table.key_schema,
+            &replica_actions,
+            now,
+        )
+        .map_err(stream_not_registered)?;
 
         // Nothing above wrote to the table, so from here on the update applies whole.
         //
@@ -746,7 +762,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Regions as well as this one: a created replica is a table of its own in its own
         // Region, and every regional table of the group records it
         // ([`crate::state::ComAmazonawsDynamodbDynamodb20120810State::apply_replica_actions`]).
-        store.apply_replica_actions(&region, &name, &replica_actions, now);
+        store.apply_replica_actions(&region, &name, &replica_actions, &replica_streams, now);
 
         // The description answers from the stored table, read back after every write this
         // update made — including the ones the replica actions made to it.
@@ -839,6 +855,47 @@ fn stream_not_registered(fault: crate::state::StreamFault) -> UpdateTableError {
             .into()
         }
     }
+}
+
+/// The stream REGISTERED for each replica this request creates, by Region: a global table's
+/// replicas are added over "DynamoDB Streams enabled, with the stream containing both the
+/// new and the old images of the item", and a stream is a resource of ONE Region and of the
+/// streams service, so each new replica gets a stream registered in its own Region,
+/// capturing what the group's table captures.
+///
+/// Empty for a table with no enabled stream — a replica of such a table has no change feed
+/// to mirror — and for a request that creates no replica. Made before anything is written,
+/// so a registration the streams service refuses refuses the whole update
+/// ([`stream_not_registered`]).
+fn registered_replica_streams<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
+    name: &str,
+    stream: Option<&crate::state::TableStream>,
+    key_schema: &[KeySchemaElement],
+    actions: &[crate::state::ReplicaAction],
+    now: ::std::time::SystemTime,
+) -> Result<Vec<(String, crate::state::TableStream)>, crate::state::StreamFault> {
+    let Some(stream) = stream.filter(|stream| stream.enabled) else {
+        return Ok(Vec::new());
+    };
+    let mut registered: Vec<(String, crate::state::TableStream)> = Vec::new();
+    for action in actions {
+        let crate::state::ReplicaAction::Create(settings) = action else {
+            continue;
+        };
+        registered.push((
+            settings.region.clone(),
+            crate::state::register_table_stream(
+                engine,
+                name,
+                &settings.region,
+                key_schema,
+                &stream.view_type,
+                now,
+            )?,
+        ));
+    }
+    Ok(registered)
 }
 
 /// The refusal a `StreamSpecification` that contradicts the table's stored stream gets:

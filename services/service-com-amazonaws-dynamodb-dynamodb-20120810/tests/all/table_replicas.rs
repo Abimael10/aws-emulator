@@ -16,9 +16,11 @@
 //! > regional table exactly as it was.
 //!
 //! Beside it, the LEGACY (2017.11.29) global-table operations: the version they address is
-//! no longer offered, so `CreateGlobalTable` is refused with `ValidationException` and
-//! every operation that addresses one global table of that version answers the modelled
-//! `GlobalTableNotFoundException` — both HTTP 400 client errors, never an unmodelled 501.
+//! no longer offered, so a call that would CREATE or CHANGE a global table of it is refused
+//! with `ValidationException`, and one that only ADDRESSES a name no table carries answers
+//! the modelled `GlobalTableNotFoundException` — both HTTP 400 client errors, never an
+//! unmodelled 501. The wording of each is pinned by
+//! `legacy_global_table_refusal_wording.rs`.
 //!
 //! The rows of each table below differ along what the rule generalises over: the Region a
 //! replica is created in, the action an entry carries, the operation that is called, and
@@ -79,7 +81,9 @@ fn replica_in(description: &Value, region: &str) -> Value {
 }
 
 /// The Regions `ListGlobalTables` reports for the group named `name`, in the ascending
-/// order a page carries them in.
+/// order a page carries them in. That operation is the enumeration of the LEGACY
+/// (2017.11.29) surface, so a group `ReplicaUpdates` established is not one of its
+/// entries and this answers no Region for it.
 async fn listed_group(router: &MultiServiceRouter, name: &str) -> Vec<String> {
     let page = ok_in(router, REGION, "ListGlobalTables", json!({})).await;
     page["GlobalTables"]
@@ -100,11 +104,10 @@ async fn listed_group(router: &MultiServiceRouter, name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The two Regions of a group, in the ascending order a listing reports them in.
-fn group_of(first: &str, second: &str) -> Vec<String> {
-    let mut regions = vec![first.to_string(), second.to_string()];
-    regions.sort();
-    regions
+/// The Regions a legacy enumeration reports for a group of the CURRENT version: none, as
+/// the whole surface refuses to address such a group ([`listed_group`]).
+fn unlisted() -> Vec<String> {
+    Vec::new()
 }
 
 /// The Regions a replica is created in, each row a Region code of a different shape — one
@@ -236,10 +239,10 @@ async fn a_created_replica_is_a_table_of_its_own_holding_the_group_s_data() {
             (
                 json!("ACTIVE"),
                 true,
-                group_of(REGION, target),
+                unlisted(),
             ),
-            "case {case}: the local table reports the replica and the group is listed, got \
-             {local}"
+            "case {case}: the local table reports the replica, which the legacy enumeration \
+             does not, got {local}"
         );
     }
 }
@@ -453,7 +456,7 @@ async fn a_replica_action_that_cannot_apply_is_refused_and_changes_nothing() {
         (
             json!("ACTIVE"),
             Some(1),
-            group_of(REGION, "us-west-2"),
+            unlisted(),
             (400, "ResourceNotFoundException".to_string()),
         ),
         "case after the refusals: the group is untouched, got {described} and {absent}"
@@ -816,7 +819,7 @@ async fn the_legacy_global_table_operations_answer_their_modelled_client_errors(
     // table, and in whether that name is a replicated table, a standalone table or no
     // table at all: the version these operations address is not offered, so the answer is
     // the same client error for all of them.
-    let cases: [(&str, &str, Value, &str); 7] = [
+    let cases: [(&str, &str, Value, &str); 8] = [
         (
             "a create naming a replicated table",
             "CreateGlobalTable",
@@ -866,10 +869,19 @@ async fn the_legacy_global_table_operations_answer_their_modelled_client_errors(
             "GlobalTableNotFoundException",
         ),
         (
-            "a replica update through the legacy operation",
+            "a replica update naming a table this Region holds",
             "UpdateGlobalTable",
             json!({
                 "GlobalTableName": name,
+                "ReplicaUpdates": [{"Create": {"RegionName": "eu-west-1"}}],
+            }),
+            "ValidationException",
+        ),
+        (
+            "a replica update naming no table at all",
+            "UpdateGlobalTable",
+            json!({
+                "GlobalTableName": "Legacy.Absent",
                 "ReplicaUpdates": [{"Create": {"RegionName": "eu-west-1"}}],
             }),
             "GlobalTableNotFoundException",
@@ -898,7 +910,7 @@ async fn the_legacy_global_table_operations_answer_their_modelled_client_errors(
     assert_eq!(
         (listed_group(&router, name).await, status, error_code(&absent)),
         (
-            group_of(REGION, "us-west-2"),
+            unlisted(),
             400,
             "ResourceNotFoundException".to_string(),
         ),
@@ -1024,7 +1036,7 @@ async fn a_region_that_has_just_sourced_a_replica_add_cannot_be_deleted() {
                 json!({"S": "OPEN"}),
                 json!("ACTIVE"),
                 json!("ACTIVE"),
-                group_of(REGION, "us-west-2"),
+                unlisted(),
             ),
             "case {case}: the refused removal left the group as it was, got {described}"
         );

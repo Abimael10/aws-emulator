@@ -91,6 +91,11 @@ use crate::state::StoredResource;
 /// exists, and reports through a read of its own.
 mod settings;
 
+/// `AWS::DynamoDB::GlobalTable`: the same table, declared for a GROUP of Regions. Its arm
+/// lives beside this one because it makes the same calls of the same service, through the
+/// same translations — a global table IS a table plus the replicas of its group.
+pub(crate) mod global_table;
+
 /// The resource type this module provisions.
 pub(crate) const DYNAMODB_TABLE: &str = "AWS::DynamoDB::Table";
 
@@ -1065,11 +1070,21 @@ fn addressed(physical_resource_id: &str) -> Value {
 /// table whose declaration enabled no stream has no stream ARN, and the resource keeps
 /// whatever the naming rules computed for the names it does publish.
 fn published_attributes(description: Option<&Value>) -> BTreeMap<String, String> {
+    attributes_from(description, PUBLISHED_ATTRIBUTES)
+}
+
+/// The same, over the attribute list of ONE type: the pairs each type publishes are its own
+/// ([`global_table`]'s own list), while the reading
+/// of a description is one rule for both.
+fn attributes_from(
+    description: Option<&Value>,
+    published: &[(&str, &str)],
+) -> BTreeMap<String, String> {
     let mut attributes = BTreeMap::new();
     let Some(description) = description else {
         return attributes;
     };
-    for (attribute, member) in PUBLISHED_ATTRIBUTES {
+    for (attribute, member) in published {
         if let Some(value) = description
             .get(*member)
             .and_then(Value::as_str)

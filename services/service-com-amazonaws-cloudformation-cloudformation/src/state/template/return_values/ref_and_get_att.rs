@@ -731,6 +731,39 @@ pub(crate) fn return_values(
             }
             (name.to_string(), attributes)
         }
+        // "Ref returns the table name"; Fn::GetAtt: Arn, StreamArn, TableId. The same type
+        // declared for a GROUP of Regions as the one above is for one, so the table ARN and
+        // the stand-in stream ARN are computed the same way — the stack's own Region holds
+        // the table the resource IS, and each replica's ARN is that Region's. `TableId` is
+        // "unique identifier of the table" Amazon DynamoDB mints per regional table, which
+        // no naming rule can compute: what the rules give the resource is a stand-in of that
+        // member's own form, which the create re-points at the id that service answered.
+        DYNAMODB_GLOBAL_TABLE => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("dynamodb", region, &format!("table/{name}")),
+            );
+            // A global table always HAS a stream: the recorded deployment of this type
+            // reports one for every regional table of the group, whatever the declaration
+            // states, so the attribute is published for every such resource — unlike the
+            // single-table type above, whose stream exists only where a declaration enables
+            // one.
+            let label = service_assigned_label(
+                DYNAMODB_STREAM_LABEL_SALT,
+                name,
+                DYNAMODB_STREAM_LABEL_DIGITS,
+            );
+            attributes.insert(
+                "StreamArn".to_string(),
+                ::emulator_server::emulator_arn(
+                    "dynamodb",
+                    region,
+                    &format!("table/{name}/stream/{label}"),
+                ),
+            );
+            attributes.insert("TableId".to_string(), generated_uuid(resource_type, name));
+            (name.to_string(), attributes)
+        }
         // "Ref returns the function name"; Fn::GetAtt: Arn.
         "AWS::Lambda::Function" => {
             attributes.insert(

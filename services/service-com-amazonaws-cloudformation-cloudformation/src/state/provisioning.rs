@@ -1146,6 +1146,9 @@ pub(super) enum Owner {
     Builtin(Provisioner),
     /// `AWS::DynamoDB::Table`, whose arms are [`dynamodb_table`]'s.
     DynamodbTable,
+    /// `AWS::DynamoDB::GlobalTable`, whose arms are [`dynamodb_table::global_table`]'s: the
+    /// same table with the replicas of its group, created by the same service's calls.
+    DynamodbGlobalTable,
     /// One of the inline-policy types [`iam_policy`] embeds in IAM (`AWS::IAM::Policy` and
     /// the per-entity `AWS::IAM::RolePolicy`, `UserPolicy` and `GroupPolicy`). Which of them
     /// it is travels with the owner, so the algorithm resolves the type once.
@@ -1288,6 +1291,9 @@ pub(super) enum Owner {
 pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     if resource_type == dynamodb_table::DYNAMODB_TABLE {
         return Some(Owner::DynamodbTable);
+    }
+    if resource_type == dynamodb_table::global_table::DYNAMODB_GLOBAL_TABLE {
+        return Some(Owner::DynamodbGlobalTable);
     }
     if let Some(kind) = iam_policy::kind_of(resource_type) {
         return Some(Owner::IamPolicy(kind));

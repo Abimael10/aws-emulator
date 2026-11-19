@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Err(
             DescribeGlobalTableErrorModeled::GlobalTableNotFoundException(
                 GlobalTableNotFoundException {
-                    message: Some(crate::state::legacy_global_table_not_found(
+                    message: Some(crate::state::describe_global_table_not_found(
                         &input.global_table_name,
                     )),
                 },
