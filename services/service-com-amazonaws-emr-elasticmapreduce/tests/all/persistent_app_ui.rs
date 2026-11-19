@@ -766,6 +766,105 @@ async fn unknown_persistent_app_ui_ids_and_types_are_refused_rather_than_answere
 }
 
 // ---------------------------------------------------------------------------
+// WHICH member a refusal names
+// ---------------------------------------------------------------------------
+
+/// THE RULE: a refusal names the member the caller got WRONG. On
+/// `GetPersistentAppUIPresignedURL` the member that did not resolve decides the sentence:
+/// an id no persistent application UI of this account carries is refused by naming the
+/// profiler id behind `PersistentAppUIId` ("ProfilerId is not valid."), and a
+/// `PersistentAppUIType` the UI it resolved does not publish is refused by naming that type
+/// ("PersistentAppUIType is not valid."). Both are HTTP 400.
+///
+/// The rows span what the rule generalises over: WHICH member is unresolvable (the id, the
+/// type, both at once) and the id forms a caller can get wrong — another resource's shape, a
+/// cluster id, an empty id, a stale-looking one and a near-miss of a real id. The type rows
+/// cover each `PersistentAppUIType` the UI under test does not publish, and the half of the
+/// rule that is NOT a refusal — the type the UI does publish — is asserted too, so the
+/// sentences cannot come from a blanket refusal.
+#[tokio::test]
+async fn a_presigned_url_refusal_names_the_member_that_did_not_resolve() {
+    /// The sentence an unresolvable `PersistentAppUIId` is refused with, spelled out here
+    /// rather than imported, so a wrong constant in the implementation cannot make this pass.
+    const UNKNOWN_ID_SENTENCE: &str = "ProfilerId is not valid.";
+    /// The sentence a `PersistentAppUIType` the UI does not publish is refused with.
+    const UNKNOWN_TYPE_SENTENCE: &str = "PersistentAppUIType is not valid.";
+
+    let uis = PersistentAppUis::new();
+    let cluster_arn = uis
+        .cluster_arn("refusal member", kept_alive_request("refusal-member"))
+        .await;
+    // The UI this account holds publishes SHS alone, so the other two types are types it
+    // does not publish.
+    let id = uis
+        .create_ok(
+            "the one UI this account holds",
+            json!({ "TargetResourceArn": cluster_arn, "ProfilerType": "SHS" }),
+        )
+        .await;
+
+    // (case, the request, the sentence it must be refused with)
+    let mut rows: Vec<(String, Value, &str)> = Vec::new();
+    for unknown in [
+        "p-NOSUCHUI00000",
+        "j-ABCDEFGHIJKLM",
+        "",
+        "p-0000000000000",
+        &format!("{id}x"),
+    ] {
+        // An unresolvable id alone, and the same id beside a well-formed type: the id is
+        // what did not resolve either way, so the type is never what is named.
+        rows.push((
+            format!("an unresolvable id {unknown:?}"),
+            json!({ "PersistentAppUIId": unknown }),
+            UNKNOWN_ID_SENTENCE,
+        ));
+        rows.push((
+            format!("an unresolvable id {unknown:?} with a well-formed type"),
+            json!({ "PersistentAppUIId": unknown, "PersistentAppUIType": DEFAULT_UI_TYPE }),
+            UNKNOWN_ID_SENTENCE,
+        ));
+        // Both members wrong: the id is resolved FIRST, so the id is still what is named.
+        rows.push((
+            format!("an unresolvable id {unknown:?} with a type the UI would not publish"),
+            json!({ "PersistentAppUIId": unknown, "PersistentAppUIType": "YTS" }),
+            UNKNOWN_ID_SENTENCE,
+        ));
+    }
+    for ui_type in ["TEZ", "YTS"] {
+        rows.push((
+            format!("a resolved id with the unpublished type {ui_type}"),
+            json!({ "PersistentAppUIId": &id, "PersistentAppUIType": ui_type }),
+            UNKNOWN_TYPE_SENTENCE,
+        ));
+    }
+
+    for (case, request, sentence) in &rows {
+        let (status, payload) = uis.presigned(request.clone()).await;
+        assert_refused(case, status, &payload, "ValidationException");
+        let message = super::refusal_messages::message(case, &payload);
+        assert_eq!(
+            message, *sentence,
+            "case {case:?}: expected the refusal {sentence:?}, got {message:?} in {payload}"
+        );
+    }
+
+    // The other half of the rule: the type the UI DOES publish is not refused at all.
+    let answered = uis
+        .presigned_ok(json!({
+            "PersistentAppUIId": &id,
+            "PersistentAppUIType": DEFAULT_UI_TYPE,
+        }))
+        .await;
+    assert_eq!(
+        at(&answered, &["PresignedURLReady"]).as_bool(),
+        Some(false),
+        "the UI this account holds is still starting, so the call answers its readiness \
+         rather than a refusal, got {answered}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The access record a state-changing call leaves
 // ---------------------------------------------------------------------------
 

@@ -27,9 +27,13 @@ use crate::job_flow_lifecycle::{
     assert_minted_id, assert_refused, at, kept_alive_request, minimal_request, step_config, Emr,
 };
 
-/// Longer than the service's clock-owed transition span (500 ms), so a step that was
-/// `CANCEL_PENDING` has reached `CANCELLED` by the time we look.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+/// How long a case waits for a step the caller cancelled to reach `CANCELLED` before it gives
+/// up: far above the transition span this service owes that move, so a slow host delays the
+/// case rather than failing it.
+const CANCELLED_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long such a wait sleeps between reads of the condition it waits on.
+const CANCELLED_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Cluster ids no cluster carries: the shape a real id has, a shorter and a longer
 /// body, a prefix with nothing after it, and the empty string (`ClusterId` is
@@ -381,23 +385,37 @@ async fn cancel_steps_reports_one_status_per_requested_step() {
         );
     }
 
-    // … and the clock owes it CANCELLED, with the end instant it was cancelled at.
-    tokio::time::sleep(PAST_TRANSITION).await;
+    // … and the clock owes it CANCELLED. The step never EXECUTED — the cancel reached it
+    // before the cluster was even up — so its timeline reports no end: "the date and time
+    // when the cluster step execution completed or failed" (`StepTimeline$EndDateTime` doc).
+    // The wait is for the CONDITION — `DescribeStep` reporting the state — under a deadline
+    // far above the span this service owes the move, so a slow host delays the case rather
+    // than failing it.
     for step_id in &step_ids {
-        let out = emr
-            .ok(
-                "DescribeStep",
-                json!({ "ClusterId": &cluster_id, "StepId": step_id }),
-            )
-            .await;
-        assert_eq!(
-            at(&out, &["Step", "Status", "State"]).as_str(),
-            Some("CANCELLED"),
-            "case {step_id:?}: the clock owes a cancelled step CANCELLED, got {out}"
+        let deadline = std::time::Instant::now() + CANCELLED_DEADLINE;
+        let out = loop {
+            let out = emr
+                .ok(
+                    "DescribeStep",
+                    json!({ "ClusterId": &cluster_id, "StepId": step_id }),
+                )
+                .await;
+            if at(&out, &["Step", "Status", "State"]).as_str() == Some("CANCELLED") {
+                break out;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case {step_id:?}: the clock owes a cancelled step CANCELLED, last {out}"
+            );
+            tokio::time::sleep(CANCELLED_POLL_INTERVAL).await;
+        };
+        assert!(
+            at(&out, &["Step", "Status", "Timeline", "StartDateTime"]).is_null(),
+            "case {step_id:?}: a step cancelled before its turn never started, got {out}"
         );
         assert!(
-            !at(&out, &["Step", "Status", "Timeline", "EndDateTime"]).is_null(),
-            "case {step_id:?}: a cancelled step has an EndDateTime, got {out}"
+            at(&out, &["Step", "Status", "Timeline", "EndDateTime"]).is_null(),
+            "case {step_id:?}: a step that never executed reports no end, got {out}"
         );
     }
 

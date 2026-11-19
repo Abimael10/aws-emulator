@@ -254,6 +254,12 @@ mod release_catalog;
 mod published_releases;
 mod step_records;
 pub use step_records::*;
+
+/// What a failed step's `ActionOnFailure` DOES — which steps behind it are cancelled and
+/// whether its cluster shuts down — split out of this root as its own concern and
+/// re-exported the same way.
+mod step_failure_actions;
+pub use step_failure_actions::*;
 pub use release_catalog::*;
 pub use spark_releases::*;
 
@@ -466,6 +472,11 @@ pub mod cluster_state_change_reason_code {
     /// A bootstrap action of the cluster did not succeed, so its nodes were never brought up
     /// the way the launch asked ([`super::bootstrap_run`]).
     pub const BOOTSTRAP_FAILURE: &str = "BOOTSTRAP_FAILURE";
+
+    /// A step of the cluster failed and its `ActionOnFailure` shuts the cluster down:
+    /// "`TERMINATE_CLUSTER` — Shuts down the cluster" (`StepConfig$ActionOnFailure` doc), as
+    /// applied by [`super::step_failure_actions`].
+    pub const STEP_FAILURE: &str = "STEP_FAILURE";
 }
 
 /// `com.amazonaws.emr#InvalidRequestException$ErrorCode` — "the error code associated
@@ -2999,6 +3010,12 @@ impl ClusterRecord {
             }
         }
         self.advance_steps(now);
+        // A step whose own work FAILED applies its `ActionOnFailure`: the queue behind it was
+        // stopped inside the runner above, and the shutdown the two terminating actions bring
+        // is started here ([`step_failure_actions`]). It stands before the self-shutdown
+        // below, because a cluster going down on a step failure ends
+        // `TERMINATED_WITH_ERRORS`/`STEP_FAILURE` rather than for having run its queue.
+        self.begin_step_failure_shutdown(now);
         self.stop_once_every_step_has_run(now);
     }
 
@@ -3039,8 +3056,14 @@ impl ClusterRecord {
             .unwrap_or(self.status.creation_date_time)
             + TRANSITION_SPAN;
         for step in &self.steps {
-            let ended = step.end_date_time.filter(|_| step.is_terminal())?;
-            finished = finished.max(ended);
+            if !step.is_terminal() {
+                return None;
+            }
+            // A step that never EXECUTED reports no end ([`StepTimeline$EndDateTime`]), so it
+            // contributes no instant: there is no run of it for the shutdown to wait behind.
+            if let Some(ended) = step.end_date_time {
+                finished = finished.max(ended);
+            }
         }
         Some(finished)
     }
@@ -3124,10 +3147,18 @@ impl ClusterRecord {
     /// "Specifies the number of steps that can be executed concurrently"
     /// (`RunJobFlow$StepConcurrencyLevel` doc): that many steps run at once and the rest
     /// wait, so a cluster at the default level of one runs its queue strictly in order.
+    ///
+    /// A step whose own work FAILED can STOP the queue here: its `ActionOnFailure` "cancels
+    /// any pending steps" (`StepConfig$ActionOnFailure` doc), and the steps behind it are
+    /// cancelled as of that step's own end rather than started
+    /// ([`step_failure_actions`]).
     fn advance_steps(&mut self, now: SystemTime) {
         let Some(live_at) = self.steps_runnable_from() else {
             return;
         };
+        // Whether a failed step's `ActionOnFailure` acts on this cluster at all, read before
+        // the queue is walked ([`ClusterRecord::applies_step_failure_actions`]).
+        let applies_failure_actions = self.applies_step_failure_actions();
         // The slot count is read back under the ceiling the band allows
         // ([`MAX_STEP_CONCURRENCY_LEVEL`]), which every entry point already refuses a level
         // outside ([`step_concurrency_level_violation`]): a level this service should never
@@ -3136,31 +3167,61 @@ impl ClusterRecord {
         let slots = usize::try_from(self.step_concurrency_level)
             .unwrap_or(1)
             .clamp(1, ceiling);
-        // The instant each concurrency slot next falls free. A cluster that is not ready
-        // yet has every slot falling free when it becomes ready.
-        let mut free_at: Vec<SystemTime> = vec![live_at; slots];
+        // The instant each concurrency slot next falls free, and `None` for a slot whose step
+        // has not ENDED yet. A step that has not ended has not given its slot back: the state
+        // it ends in is what its own work answers ([`StepRecord::awaits_application`],
+        // [`StepRecord::awaits_command`]), so the step behind it starts when it really ends
+        // rather than at a projected instant — which is what "Amazon EMR executes each step in
+        // the order listed" (`AddJobFlowSteps` doc) means for a cluster running one step at a
+        // time, and what lets a failed step's `ActionOnFailure` reach the steps behind it
+        // before they have started. A cluster that is not ready yet has every slot falling
+        // free when it becomes ready.
+        let mut free_at: Vec<Option<SystemTime>> = vec![Some(live_at); slots];
+        // The instant a failed step's action STOPPED this queue, once one of its steps has
+        // stopped it: every step behind that one never runs.
+        let mut stopped_at: Option<SystemTime> = None;
         for step in &mut self.steps {
+            // A step the stopped queue never started never will: it is cancelled as of the
+            // instant the queue stopped, and it occupies no slot.
+            if let Some(stopped) = stopped_at {
+                if step.start_date_time.is_none() {
+                    step.cancel_with_queue(stopped);
+                    step.advance_to(now);
+                    continue;
+                }
+            }
             // A step the queue dropped without running it — cancelled before its turn
             // came — occupied no slot, so it does not hold one up.
             if step.start_date_time.is_none() && step.will_not_run() {
                 continue;
             }
+            // The slot that frees first, with a slot still occupied sorting after every free
+            // one so a step takes a free slot while there is one.
             let slot = free_at
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, free)| **free)
+                .min_by_key(|(_, free)| (free.is_none(), **free))
                 .map_or(0, |(index, _)| index);
+            // A step whose slot has not freed has not had its turn: nothing of it is recorded
+            // and nothing is projected for it, so the call that comes after the step in front
+            // of it ended is what starts it.
+            let Some(freed) = free_at[slot] else {
+                continue;
+            };
             let start = step
                 .start_date_time
-                .unwrap_or_else(|| free_at[slot].max(step.creation_date_time));
+                .unwrap_or_else(|| freed.max(step.creation_date_time));
             // A step that was stopped gives its slot back when the stop comes due; one
             // running to completion holds it for its whole span.
             let end = step
                 .end_date_time
                 .or(step.stop_due_at)
                 .unwrap_or(start + STEP_RUN_SPAN);
-            free_at[slot] = end;
             step.run_between(start, end, now);
+            free_at[slot] = step.end_date_time.or(step.stop_due_at);
+            if applies_failure_actions && stopped_at.is_none() && step.stops_the_queue() {
+                stopped_at = step.end_date_time;
+            }
         }
     }
 
@@ -4305,10 +4366,24 @@ pub fn persistent_app_ui_type_of_profiler(profiler: &str) -> Option<&'static str
 /// completed application's event logs.
 pub const DEFAULT_PERSISTENT_APP_UI_TYPE: &str = "SHS";
 
-/// How `GetPersistentAppUIPresignedURL` refuses a request it can resolve no published
-/// user interface for: an id this account holds no UI for, or a type the UI it names
-/// does not publish. Amazon EMR answers both with one refusal, naming the member that
-/// selects the interface rather than echoing the id back.
+/// How `GetPersistentAppUIPresignedURL` refuses a request whose `PersistentAppUIId`
+/// resolves to no user interface of this account.
+///
+/// Recorded behavior for the text, which is fixed and has no variable part: the member AWS
+/// names is the PROFILER id behind `PersistentAppUIId` — a persistent application UI is
+/// created from a profiler (`CreatePersistentAppUI$ProfilerType`,
+/// [`persistent_app_ui_type_of_profiler`]) and that id is what did not resolve. The TYPE is
+/// a different refusal ([`PRESIGNED_URL_NO_SUCH_UI_MESSAGE`]): naming it for an id the
+/// service holds nothing under would send a caller to correct the one member that was well
+/// formed.
+pub const PRESIGNED_URL_NO_SUCH_PROFILER_MESSAGE: &str = "ProfilerId is not valid.";
+
+/// How `GetPersistentAppUIPresignedURL` refuses a request whose `PersistentAppUIType` names
+/// a user interface the UI it resolved does not publish.
+///
+/// Recorded behavior for the text, in the same fixed form: the id resolved, so what the
+/// caller got wrong is the member that selects the interface, and that is the member the
+/// sentence names.
 pub const PRESIGNED_URL_NO_SUCH_UI_MESSAGE: &str = "PersistentAppUIType is not valid.";
 
 /// The query parameter a presigned application-UI URL carries its session token in.

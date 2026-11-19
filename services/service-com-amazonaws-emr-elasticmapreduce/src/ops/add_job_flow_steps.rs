@@ -184,6 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             let cluster_state_now = cluster.status.state.clone();
             let already_held = cluster.steps.len();
+            // "Specifies the number of steps that can be executed concurrently"
+            // (`RunJobFlow$StepConcurrencyLevel` doc) — read here because what the cluster
+            // runs at once is what decides which `ActionOnFailure` values it admits below.
+            let concurrency = cluster.step_concurrency_level;
 
             // "You can only add steps to a cluster that is in one of the following states:
             // STARTING, BOOTSTRAPPING, RUNNING, or WAITING." (AddJobFlowSteps doc.) The
@@ -203,6 +207,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      {MAX_STEPS_PER_JOB_FLOW} steps are allowed in each job flow",
                     input.job_flow_id
                 )));
+            }
+
+            // "If a cluster's StepConcurrencyLevel is greater than 1, do not use
+            // AddJobFlowSteps to submit a step with this parameter set to CANCEL_AND_WAIT or
+            // TERMINATE_CLUSTER. The step is not submitted and the action fails with a message
+            // that the ActionOnFailure setting is not valid."
+            // (`StepConfig$ActionOnFailure` doc.) Such a cluster applies no step-failure
+            // action at all (`crate::state::step_failure_actions`), so the value is refused
+            // here rather than accepted and then ignored — and the whole request is refused,
+            // since none of its steps is submitted.
+            if let Some(message) = input.steps.iter().find_map(|step| {
+                crate::state::step_action_on_failure_violation(
+                    step.action_on_failure.as_deref(),
+                    concurrency,
+                )
+            }) {
+                return Err(crate::scaffolded::Scaffolded::validation(message));
             }
 
             let mut step_ids = Vec::with_capacity(submitted);

@@ -93,6 +93,17 @@ pub const APPLICATION_PERMIT_WAIT: Duration = Duration::from_secs(2);
 /// the ceiling on what one REQUEST costs, beside the ceiling on what one run costs.
 pub const MAX_APPLICATION_RUNS_PER_CALL: usize = 2;
 
+/// How many runs that ANSWERED NOTHING one step's application is given before the step is
+/// ended anyway ([`StepRecord::abandoned_runs`]).
+///
+/// A run this process gave up waiting for, or whose thread could not be started, is no answer
+/// about the submitted work, so the step stays owed its application and a later call runs it.
+/// CHOSEN as the bound on that retrying: past this many such runs nothing has answered for the
+/// step at all, so leaving it `RUNNING` would hold its cluster's concurrency slot for ever and
+/// re-run the application on every later call. The step then ends the way every step this
+/// emulator ran no application for ends ([`not_executed`]) — never a status nothing produced.
+pub const MAX_ABANDONED_APPLICATION_RUNS: u32 = 3;
+
 /// How long ONE call spends performing owed applications before it leaves the rest to the
 /// next call.
 ///
@@ -258,22 +269,18 @@ pub async fn run_due_step_applications<Eng: Send + Sync + 'static>(
     let Some(state) = service_state(engine) else {
         return;
     };
-    let (owed, job_flow_role): (Vec<StepApplicationPlan>, String) = {
+    let job_flow_role: String = {
         let mut store = state.lock();
         // The queue is run up to this instant first, so a step whose turn has come is
         // STARTED and its application is among the owed ones.
         run_due_steps(engine, &mut store, cluster_id, now);
         match store.clusters.get(cluster_id) {
-            Some(cluster) => (
-                cluster.owed_step_applications(),
-                cluster.job_flow_role.clone().unwrap_or_default(),
-            ),
-            None => (Vec::new(), String::new()),
+            Some(cluster) if !cluster.owed_step_applications().is_empty() => {
+                cluster.job_flow_role.clone().unwrap_or_default()
+            }
+            _ => return,
         }
     };
-    if owed.is_empty() {
-        return;
-    }
     // What the cluster's Amazon EC2 instances obtain from their instance profile, resolved
     // once for this call: the credential an application whose step carries no runtime role of
     // its own presents, which is nothing at all where that profile carries no role those
@@ -282,10 +289,33 @@ pub async fn run_due_step_applications<Eng: Send + Sync + 'static>(
     // What this CALL may spend performing them: a further application is started only while
     // a whole run still fits, so the rest stay owed to the next call.
     let started = ::std::time::Instant::now();
-    for plan in owed.into_iter().take(MAX_APPLICATION_RUNS_PER_CALL) {
+    // The steps this call has already run, or given up on, so re-reading the queue below
+    // never runs one application twice and never spins on a step nothing ran.
+    let mut attempted: HashSet<String> = HashSet::new();
+    while attempted.len() < MAX_APPLICATION_RUNS_PER_CALL {
         if started.elapsed().saturating_add(APPLICATION_RUN_CEILING) > APPLICATION_CALL_CEILING {
             return;
         }
+        // The queue is RE-READ every time round rather than listed once: the answer this run
+        // gives is what lets its step END, which frees the concurrency slot the step behind
+        // it was waiting for — so that step's application is owed inside this same call, and
+        // a queue whose steps run one at a time settles in the call that reports it instead
+        // of one step per call.
+        let next = {
+            let mut store = state.lock();
+            run_due_steps(engine, &mut store, cluster_id, now);
+            store
+                .clusters
+                .get(cluster_id)
+                .map(|cluster| cluster.owed_step_applications())
+                .unwrap_or_default()
+                .into_iter()
+                .find(|plan| !attempted.contains(&plan.step_id))
+        };
+        let Some(plan) = next else {
+            return;
+        };
+        attempted.insert(plan.step_id.clone());
         // A step's own runtime role is what its application's calls are signed as where it
         // carries one; every other step presents what the cluster's instances obtained.
         let credentials = match plan.execution_role_arn.as_deref() {
@@ -295,7 +325,27 @@ pub async fn run_due_step_applications<Eng: Send + Sync + 'static>(
         let Some(outcome) = run_step_application(engine, ctx, region, &plan, &credentials).await
         else {
             // Nothing ran: the step stays owed its application, so a later call performs it
-            // rather than this one reporting an outcome nothing produced.
+            // rather than this one reporting an outcome nothing produced — but the ATTEMPT is
+            // counted, so a run that never answers cannot leave the step `RUNNING` for good
+            // ([`MAX_ABANDONED_APPLICATION_RUNS`]).
+            let mut store = state.lock();
+            if let Some(step) = store
+                .clusters
+                .get_mut(cluster_id)
+                .and_then(|cluster| cluster.step_mut(&plan.step_id))
+            {
+                if step.awaits_application() {
+                    step.abandoned_runs = step.abandoned_runs.saturating_add(1);
+                    if step.abandoned_runs >= MAX_ABANDONED_APPLICATION_RUNS {
+                        // That many runs have answered nothing at all, so nothing is going to:
+                        // the step ends the way every step this emulator ran no application
+                        // for ends, rather than staying `RUNNING` and holding its cluster's
+                        // concurrency slot for ever.
+                        step.outcome = Some(not_executed());
+                    }
+                }
+            }
+            run_due_steps(engine, &mut store, cluster_id, now);
             continue;
         };
         let mut store = state.lock();
@@ -304,7 +354,12 @@ pub async fn run_due_step_applications<Eng: Send + Sync + 'static>(
             .get_mut(cluster_id)
             .and_then(|cluster| cluster.step_mut(&plan.step_id))
         {
-            step.outcome = Some(outcome);
+            // Only a step that STILL awaits its application takes this answer: in the window
+            // the guard was released the caller may have cancelled the step or its cluster,
+            // and neither is overwritten by an outcome computed before that happened.
+            if step.awaits_application() {
+                step.outcome = Some(outcome);
+            }
         }
         // The step can now reach the state its application answered, if its span has
         // already passed.
@@ -349,7 +404,7 @@ async fn run_step_application<Eng: Send + Sync + 'static>(
         }
         StepCredentials::Absent => None,
     };
-    Some(run_application(plan, &source, access, permit).await)
+    run_application(plan, &source, access, permit).await
 }
 
 /// The application's own source, read from the object its path names.
@@ -404,19 +459,27 @@ pub fn application_budget() -> python::Budget {
 }
 
 /// Run `source` as the step's application, on a thread of its own, and answer what the step
-/// ends in.
+/// ends in — or `None` when the run ANSWERED NOTHING at all.
 ///
 /// The interpreter is synchronous and CPU-bound, so it runs on a thread with a stack of its
 /// own rather than on the async runtime, and the caller's wait for it is bounded by the run's
 /// own budget plus [`APPLICATION_ABANDON_GRACE`]. `permit` is this run's share of
 /// [`MAX_CONCURRENT_APPLICATION_RUNS`] and is MOVED into that thread, so it comes back when
 /// the thread ends.
+///
+/// A run this call gave up waiting for, and one whose thread could not be started at all, is
+/// `None`: nothing is known about what the application came to, so the step stays OWED its
+/// application and a later call runs it — exactly as a command nothing answered for does
+/// ([`super::command_step_run`]). Reporting it as a step whose application was not started
+/// would settle the step on this process's own timing rather than on anything the submitted
+/// work answered. The run's OWN bounds are unaffected: an application that spends its budget
+/// is reported as stopped by the interpreter, which IS an answer.
 async fn run_application(
     plan: &StepApplicationPlan,
     source: &str,
     access: Option<AwsAccess>,
     permit: ::tokio::sync::OwnedSemaphorePermit,
-) -> StepOutcome {
+) -> Option<StepOutcome> {
     let budget = application_budget();
     let event = ::serde_json::json!({
         "path": plan.application.path,
@@ -460,11 +523,8 @@ async fn run_application(
             });
             let _ = sender.send(finished);
         });
-    if let Err(error) = spawned {
-        return failed(
-            APPLICATION_UNREADABLE_REASON,
-            format!("the thread the application runs on could not be started: {error}"),
-        );
+    if spawned.is_err() {
+        return None;
     }
     let waited = ::tokio::time::timeout(
         budget.wall_clock.saturating_add(APPLICATION_ABANDON_GRACE),
@@ -472,11 +532,11 @@ async fn run_application(
     )
     .await;
     match waited {
-        Ok(Ok(finished)) => read_outcome(&finished.completion),
+        Ok(Ok(finished)) => Some(read_outcome(&finished.completion)),
         // The run was given up on, or its thread ended without reporting: nothing is known
-        // about what the application came to, so the step ends the way every step this
-        // emulator ran no application for ends.
-        Ok(Err(_)) | Err(_) => not_executed(),
+        // about what the application came to, so the step stays owed it rather than being
+        // settled on an outcome nothing produced.
+        Ok(Err(_)) | Err(_) => None,
     }
 }
 

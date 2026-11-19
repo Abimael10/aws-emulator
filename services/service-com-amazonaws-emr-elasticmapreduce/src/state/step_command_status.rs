@@ -18,7 +18,12 @@
 //! output, which reaches the step's own log files and nothing else), `cat` (a file of the
 //! session's own tree), `true`,
 //! `false` and `:` (a status), `exit` (a status, ending the session) and `export`/`unset` (the
-//! session's own variables) — beside the ONE program the environment of a step's command line
+//! session's own variables), the text filters that read one input, and the FILE utilities a
+//! session with a working tree of its own provides (`printf`, `mkdir`, `touch`, `rm`, `tee`,
+//! `ls`, `test`, a nested `sh`/`bash`, `.`/`source` and `sleep`) — a step's command line runs
+//! on a cluster node, which has storage, so it is given the same tree and the same catalog a
+//! cluster's bootstrap script is ([`super::bootstrap_run`]) — beside the ONE program the
+//! environment of a step's command line
 //! provides, the AWS CLI's Amazon S3 transfers ([`super::step_command_transfers`]), which are
 //! really made against this emulator's own object store so the object a step's command line
 //! names exists once the step has run. Every command outside those, and every command FORM or
@@ -248,7 +253,15 @@ fn performed_command(command: &StepCommand, cli: Option<StepObjectCli>) -> Optio
             Box::new(cli) as Box<dyn EnvironmentPrograms>,
         ),
         None => ShellSession::new(BTreeMap::new(), config),
-    };
+    }
+    // A step's command line runs on a cluster NODE, which has storage of its own: the
+    // command-runner's own arguments are "commands on your cluster" (Amazon EMR
+    // documentation), so the line a step submits is given the same working tree and the same
+    // session-local file utilities a cluster's bootstrap script is given
+    // ([`super::bootstrap_run`]) rather than a narrower session than the one a script of the
+    // same cluster gets. The tree is the SESSION's own and nothing of the host's: it is
+    // created with the session and dropped with it, and its ceilings are that module's.
+    .with_file_utilities();
     let status = session.run(&command.as_line());
     if status == config.statuses.could_not_run && session.exit_status().is_none() {
         return None;

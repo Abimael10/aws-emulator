@@ -58,6 +58,14 @@ pub struct StepRecord {
     /// event bus exactly once however it was materialised ([`step_events`]). `None` while
     /// nothing of this step has been published.
     pub published_state: Option<String>,
+    /// How many runs of this step's application ANSWERED NOTHING at all — a run the process
+    /// gave up waiting for, or one whose thread could not be started.
+    ///
+    /// Such a run is no answer about the submitted work, so the step stays owed its
+    /// application and a later call runs it; this is what bounds that retrying
+    /// ([`MAX_ABANDONED_APPLICATION_RUNS`]), so a run that never answers cannot leave the step
+    /// `RUNNING` for good.
+    pub abandoned_runs: u32,
     /// The `s3://` directory this step's log files were DELIVERED to, once the clock owed
     /// them and they were written ([`deliver_due_step_logs`]) — which is what keeps one
     /// step's files written once however many calls report it afterwards, and is the
@@ -129,6 +137,7 @@ impl StepRecord {
             application,
             command,
             published_state: None,
+            abandoned_runs: 0,
             delivered_log_uri: None,
         }
     }
@@ -250,7 +259,14 @@ impl StepRecord {
             return;
         };
         self.state = stop_state;
-        self.end_date_time = Some(due);
+        // "The date and time when the cluster step EXECUTION completed or failed."
+        // (`StepTimeline$EndDateTime` doc.) A step whose execution never STARTED has none to
+        // report the end of — the stop reached it before its turn came — so the member stays
+        // absent rather than carrying the instant the stop landed; a step that was running
+        // when the stop landed did execute, and reports where that execution stopped.
+        if self.start_date_time.is_some() {
+            self.end_date_time = Some(due);
+        }
         self.stop_due_at = None;
     }
 
@@ -283,7 +299,9 @@ impl StepRecord {
     /// Because that failure is this service's own rather than the application's, it does
     /// NOT stand in for one in deciding what becomes of the rest of the queue: the step's
     /// `ActionOnFailure` is recorded and reported, and nothing cancels the steps behind it
-    /// or shuts the cluster down on the strength of an outcome no application produced.
+    /// or shuts the cluster down on the strength of an outcome no application produced
+    /// ([`StepRecord::work_answered`]). A failure the step's own work ANSWERED does apply
+    /// that action ([`super::step_failure_actions`]).
     ///
     /// The instants come from the schedule, not from `now`, so two reads of one step report
     /// the same timeline. A step that was stopped, or that has already reached a terminal

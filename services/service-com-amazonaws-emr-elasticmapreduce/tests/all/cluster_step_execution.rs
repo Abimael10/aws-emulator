@@ -7,7 +7,7 @@
 //! `dispatch`, and reads every outcome back through `DescribeCluster`, `DescribeStep` and
 //! `ListSteps`, so nothing here is evidence of anything but the persisted state.
 //!
-//! TWO RULES are under test.
+//! THREE RULES are under test.
 //!
 //! The cluster's: a cluster `RunJobFlow` has just launched is not up yet — it provisions
 //! its Amazon EC2 capacity (`STARTING`) and then runs its bootstrap actions
@@ -34,6 +34,13 @@
 //! two, four), how many of them may run at once (the documented default of one, two, more
 //! slots than steps), whether the steps arrived with the launch or through
 //! `AddJobFlowSteps`, and whether the cluster stays up after them.
+//!
+//! The third rule is the failed step's `ActionOnFailure`: "`TERMINATE_CLUSTER` — Shuts down
+//! the cluster. `CANCEL_AND_WAIT` — Cancels any pending steps and returns the cluster to the
+//! `WAITING` state. `CONTINUE` — Continues to the next step in the queue. `TERMINATE_JOB_FLOW`
+//! — Shuts down the cluster" (`StepConfig$ActionOnFailure`), applied when the step's own work
+//! answered the failure and only on a cluster running one step at a time, which that same doc
+//! is what says.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -181,20 +188,26 @@ async fn state_of(emr: &Emr, cluster_id: &str, step_id: &str) -> String {
         .to_string()
 }
 
-/// The queue of the cluster, in submission order: `ListSteps` reports newest first, so the
-/// order its answer is read back in is the reverse.
-async fn queue_of(emr: &Emr, cluster_id: &str) -> Vec<String> {
+/// Every step of the cluster in SUBMISSION order, as `ListSteps` projects it: that operation
+/// reports them newest first, so the order its answer is read back in is the reverse.
+///
+/// One call per read of a whole queue rather than one per step, which is what lets a poll over
+/// several clusters cost one read per cluster.
+async fn listed_queue(emr: &Emr, cluster_id: &str) -> Vec<Value> {
     let listed = emr.list_steps(json!({ "ClusterId": cluster_id })).await;
     at(&listed, &["Steps"])
         .as_array()
-        .map(|steps| {
-            steps
-                .iter()
-                .rev()
-                .map(|step| step["Id"].as_str().unwrap_or_default().to_string())
-                .collect()
-        })
+        .map(|steps| steps.iter().rev().cloned().collect())
         .unwrap_or_default()
+}
+
+/// The ids of that queue, in the same order.
+async fn queue_of(emr: &Emr, cluster_id: &str) -> Vec<String> {
+    listed_queue(emr, cluster_id)
+        .await
+        .iter()
+        .map(|step| step["Id"].as_str().unwrap_or_default().to_string())
+        .collect()
 }
 
 /// Poll until every step of `step_ids` is in a terminal state, answering the steps as they
@@ -495,8 +508,10 @@ async fn a_cluster_comes_up_in_phases_and_then_runs_its_queue() {
 }
 
 /// A step still queued when its cluster is shut down never runs: it leaves `PENDING` for
-/// `CANCELLED` when the shutdown completes, with no start instant, and the cluster itself
-/// reports `TERMINATED`.
+/// `CANCELLED` when the shutdown completes, with no start instant and — "the date and time
+/// when the cluster step EXECUTION completed or failed" (`StepTimeline$EndDateTime` doc) —
+/// no end instant either, since there was no execution; and the cluster itself reports
+/// `TERMINATED`.
 #[tokio::test]
 async fn a_queued_step_is_cancelled_when_its_cluster_is_terminated() {
     let case = "a pending step on a terminated cluster";
@@ -542,10 +557,8 @@ async fn a_queued_step_is_cancelled_when_its_cluster_is_terminated() {
             "case {case:?}: a step that never ran reports no start, got {step}"
         );
         assert!(
-            at(step, &["Status", "Timeline", "EndDateTime"])
-                .as_f64()
-                .is_some(),
-            "case {case:?}: a cancelled step reports when it ended, got {step}"
+            at(step, &["Status", "Timeline", "EndDateTime"]).is_null(),
+            "case {case:?}: a step that never executed reports no end either, got {step}"
         );
     }
     let cluster = emr.describe_cluster(&cluster_id).await;
@@ -616,5 +629,428 @@ async fn a_running_step_is_interrupted_when_its_cluster_is_terminated() {
     assert!(
         end >= start,
         "case {case:?}: expected an end at or after the start {start}, got {end}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What a failed step's ActionOnFailure DOES
+// ---------------------------------------------------------------------------
+
+/// What becomes of the CLUSTER once a row's queue has run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClusterEnd {
+    /// Nothing shut it down, so a cluster asked to stay up rests in `WAITING` and reports no
+    /// end instant.
+    StaysUp,
+    /// The step failure shut it down: `TERMINATED_WITH_ERRORS` carrying the modelled
+    /// `STEP_FAILURE` reason code, and an `EndDateTime` at or after the terminating step's.
+    ShutDownOnStepFailure,
+}
+
+/// One step of a row: what it submits and the `ActionOnFailure` it carries.
+#[derive(Clone, Copy)]
+struct ActionStep {
+    /// The shell program its `command-runner.jar` command submits — the status that program
+    /// exits with is what the step ends in — or `None` for a step that submits a jar of its
+    /// own, which is work this emulator runs nothing of: such a step FAILS without its
+    /// submission having answered anything.
+    program: Option<&'static str>,
+    action: &'static str,
+}
+
+/// One row of the table: a queue, the states its steps must settle in and what becomes of
+/// the cluster carrying it.
+struct ActionRow {
+    case: &'static str,
+    steps: Vec<ActionStep>,
+    states: Vec<&'static str>,
+    cluster: ClusterEnd,
+}
+
+/// A step submitting `program` through `command-runner.jar`, carrying `action`.
+fn ran(program: &'static str, action: &'static str) -> ActionStep {
+    ActionStep {
+        program: Some(program),
+        action,
+    }
+}
+
+/// A step submitting a jar of the caller's own, carrying `action`.
+fn unrun(action: &'static str) -> ActionStep {
+    ActionStep {
+        program: None,
+        action,
+    }
+}
+
+/// The rows the rule is asserted over.
+///
+/// They span what it generalises over: WHICH action the failing step carries (each of the
+/// four `ActionOnFailure` values the model declares), whether the step that carries it
+/// actually failed (a non-zero status against a zero one), whether its failure is one its own
+/// work answered (a command that exited non-zero against a jar nothing ran), and how long the
+/// queue behind it is (one step behind, two steps either side).
+fn action_rows() -> Vec<ActionRow> {
+    vec![
+        ActionRow {
+            case: "CONTINUE continues to the next step in the queue",
+            steps: vec![ran("exit 3", "CONTINUE"), ran("exit 0", "CONTINUE")],
+            states: vec!["FAILED", "COMPLETED"],
+            cluster: ClusterEnd::StaysUp,
+        },
+        ActionRow {
+            case: "CANCEL_AND_WAIT cancels the pending step and leaves the cluster up",
+            steps: vec![ran("exit 3", "CANCEL_AND_WAIT"), ran("exit 0", "CONTINUE")],
+            states: vec!["FAILED", "CANCELLED"],
+            cluster: ClusterEnd::StaysUp,
+        },
+        ActionRow {
+            case: "TERMINATE_CLUSTER shuts the cluster down",
+            steps: vec![ran("exit 4", "TERMINATE_CLUSTER"), ran("exit 0", "CONTINUE")],
+            states: vec!["FAILED", "CANCELLED"],
+            cluster: ClusterEnd::ShutDownOnStepFailure,
+        },
+        ActionRow {
+            case: "TERMINATE_JOB_FLOW, the same shutdown under its older name",
+            steps: vec![
+                ran("exit 1", "TERMINATE_JOB_FLOW"),
+                ran("exit 0", "CONTINUE"),
+            ],
+            states: vec!["FAILED", "CANCELLED"],
+            cluster: ClusterEnd::ShutDownOnStepFailure,
+        },
+        ActionRow {
+            case: "a terminating action in the middle of a queue",
+            steps: vec![
+                ran("exit 3", "CONTINUE"),
+                ran("exit 0", "CONTINUE"),
+                ran("exit 4", "TERMINATE_CLUSTER"),
+                ran("exit 0", "CONTINUE"),
+            ],
+            states: vec!["FAILED", "COMPLETED", "FAILED", "CANCELLED"],
+            cluster: ClusterEnd::ShutDownOnStepFailure,
+        },
+        ActionRow {
+            case: "a step that SUCCEEDS applies no action, whichever one it names",
+            steps: vec![ran("exit 0", "TERMINATE_CLUSTER"), ran("exit 0", "CONTINUE")],
+            states: vec!["COMPLETED", "COMPLETED"],
+            cluster: ClusterEnd::StaysUp,
+        },
+        ActionRow {
+            case: "a step whose work nothing ran applies no action either",
+            steps: vec![unrun("TERMINATE_CLUSTER"), ran("exit 0", "CONTINUE")],
+            states: vec!["FAILED", "COMPLETED"],
+            cluster: ClusterEnd::StaysUp,
+        },
+    ]
+}
+
+/// The `RunJobFlow` request one row launches: a cluster that stays up, running its queue one
+/// step at a time, so the action is one its `StepConcurrencyLevel` admits.
+fn action_launch(row: &ActionRow) -> Value {
+    let steps: Vec<Value> = row
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(ordinal, step)| {
+            let name = format!("step-{ordinal}");
+            let hadoop = match step.program {
+                Some(program) => json!({
+                    "Jar": "command-runner.jar",
+                    "Args": ["bash", "-c", program],
+                }),
+                None => json!({ "Jar": "s3://jars/analytics.jar" }),
+            };
+            json!({
+                "Name": name,
+                "ActionOnFailure": step.action,
+                "HadoopJarStep": hadoop,
+            })
+        })
+        .collect();
+    let mut request = kept_alive_request(row.case);
+    request["StepConcurrencyLevel"] = json!(1);
+    request["Steps"] = Value::Array(steps);
+    request
+}
+
+/// How long the table waits for every row's queue to settle: each row runs its steps one at a
+/// time behind two provisioning phases, and this is several times the longest row's work, so a
+/// slow host delays the table rather than failing it.
+const ACTION_DEADLINE: Duration = Duration::from_secs(180);
+
+/// How long the table waits between rounds of reads. Longer than [`POLL_INTERVAL`] because one
+/// round reads every row's whole queue, and each read performs the commands those steps
+/// submitted.
+const ACTION_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// THE RULE: `ActionOnFailure` is not a label a read echoes back — when a step whose own work
+/// FAILED carries one, it decides what becomes of the rest of the queue and of the cluster.
+/// "`TERMINATE_CLUSTER` — Shuts down the cluster. `CANCEL_AND_WAIT` — Cancels any pending
+/// steps and returns the cluster to the `WAITING` state. `CONTINUE` — Continues to the next
+/// step in the queue. `TERMINATE_JOB_FLOW` — Shuts down the cluster"
+/// (`StepConfig$ActionOnFailure` doc). A shutdown it brings is the cluster's own failure, so
+/// the cluster ends `TERMINATED_WITH_ERRORS` with the modelled `STEP_FAILURE` reason code and
+/// a `Timeline.EndDateTime` no earlier than the terminating step's own.
+///
+/// A failure the step's work did NOT answer decides nothing: a step this emulator ran no
+/// application for failed for a reason of this service's rather than the application's, so it
+/// cancels no step and shuts no cluster down.
+#[tokio::test]
+async fn a_failed_steps_action_on_failure_decides_the_queue_and_the_cluster() {
+    let emr = Emr::new();
+    let rows = action_rows();
+
+    // Every row is launched first and then drained TOGETHER, so the clock runs each queue
+    // alongside the others rather than one after another.
+    let mut launched: Vec<(String, Vec<String>)> = Vec::new();
+    for row in &rows {
+        let case = row.case;
+        let cluster_id = emr.run_job_flow(action_launch(row)).await;
+        let step_ids = queue_of(&emr, &cluster_id).await;
+        assert_eq!(
+            step_ids.len(),
+            row.steps.len(),
+            "case {case:?}: expected the launched steps to be listed, got {step_ids:?}"
+        );
+        launched.push((cluster_id, step_ids));
+    }
+
+    let started = Instant::now();
+    let mut settled: Vec<Vec<Value>> = vec![Vec::new(); rows.len()];
+    loop {
+        let mut all_done = true;
+        for (index, (row, (cluster_id, _))) in rows.iter().zip(&launched).enumerate() {
+            if !settled[index].is_empty() {
+                continue;
+            }
+            let steps = listed_queue(&emr, cluster_id).await;
+            let terminal = steps.len() == row.steps.len()
+                && steps.iter().all(|step| {
+                    at(step, &["Status", "State"])
+                        .as_str()
+                        .is_some_and(|state| TERMINAL.contains(&state))
+                });
+            // A row whose cluster is shutting down is not settled until the shutdown has
+            // completed either, since the cluster's own end is part of what is asserted.
+            let cluster_settled = row.cluster == ClusterEnd::StaysUp
+                || at(&emr.describe_cluster(cluster_id).await, &["Status", "State"])
+                    .as_str()
+                    == Some("TERMINATED_WITH_ERRORS");
+            if terminal && cluster_settled {
+                settled[index] = steps;
+            } else {
+                all_done = false;
+            }
+        }
+        if all_done {
+            break;
+        }
+        assert!(
+            started.elapsed() < ACTION_DEADLINE,
+            "expected every row's queue and cluster to settle; still waiting on {:?}",
+            rows.iter()
+                .zip(&settled)
+                .filter(|(_, steps)| steps.is_empty())
+                .map(|(row, _)| row.case)
+                .collect::<Vec<&str>>()
+        );
+        tokio::time::sleep(ACTION_POLL_INTERVAL).await;
+    }
+
+    for ((row, (cluster_id, _)), steps) in rows.iter().zip(&launched).zip(&settled) {
+        let case = row.case;
+        let states: Vec<&str> = steps
+            .iter()
+            .map(|step| at(step, &["Status", "State"]).as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            states, row.states,
+            "case {case:?}: expected the queue to settle in {:?}, got {states:?} from {steps:?}",
+            row.states
+        );
+
+        // A step the action cancelled never ran at all: it reports no start, and it ended
+        // when the queue stopped rather than when anybody looked.
+        for (step, state) in steps.iter().zip(&states) {
+            if *state == "CANCELLED" {
+                assert!(
+                    at(step, &["Status", "Timeline", "StartDateTime"]).is_null(),
+                    "case {case:?}: a cancelled step never started, got {step}"
+                );
+                // "The date and time when the cluster step EXECUTION completed or failed."
+                // (`StepTimeline$EndDateTime` doc.) There was no execution, so there is no
+                // end to report.
+                assert!(
+                    at(step, &["Status", "Timeline", "EndDateTime"]).is_null(),
+                    "case {case:?}: a cancelled step reports no end either, got {step}"
+                );
+            }
+        }
+
+        let cluster = emr.describe_cluster(cluster_id).await;
+        match row.cluster {
+            ClusterEnd::StaysUp => {
+                assert_eq!(
+                    at(&cluster, &["Status", "State"]).as_str(),
+                    Some("WAITING"),
+                    "case {case:?}: nothing shut this cluster down, got {cluster}"
+                );
+                assert!(
+                    at(&cluster, &["Status", "Timeline", "EndDateTime"]).is_null(),
+                    "case {case:?}: a cluster that is still up has not ended, got {cluster}"
+                );
+            }
+            ClusterEnd::ShutDownOnStepFailure => {
+                assert_eq!(
+                    at(&cluster, &["Status", "State"]).as_str(),
+                    Some("TERMINATED_WITH_ERRORS"),
+                    "case {case:?}: a step failure shutdown ends with errors, got {cluster}"
+                );
+                assert_eq!(
+                    at(&cluster, &["Status", "StateChangeReason", "Code"]).as_str(),
+                    Some("STEP_FAILURE"),
+                    "case {case:?}: the shutdown names the modelled reason, got {cluster}"
+                );
+                assert!(
+                    at(&cluster, &["Status", "StateChangeReason", "Message"])
+                        .as_str()
+                        .is_some_and(|message| !message.is_empty()),
+                    "case {case:?}: the shutdown carries a message beside the code, got \
+                     {cluster}"
+                );
+                // The terminating step is the one whose action asked for the shutdown, and
+                // the cluster cannot have ended before it did.
+                let terminating = row
+                    .steps
+                    .iter()
+                    .position(|step| step.action.starts_with("TERMINATE"))
+                    .and_then(|ordinal| steps.get(ordinal))
+                    .unwrap_or_else(|| panic!("case {case:?}: no terminating step in {steps:?}"));
+                let step_ended = instant(case, terminating, "EndDateTime");
+                let cluster_ended = at(&cluster, &["Status", "Timeline", "EndDateTime"])
+                    .as_f64()
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: a terminated cluster records its end, got {cluster}")
+                    });
+                assert!(
+                    cluster_ended + TOLERANCE >= step_ended,
+                    "case {case:?}: the cluster ended at {cluster_ended}, before the \
+                     terminating step's own end {step_ended}"
+                );
+            }
+        }
+    }
+}
+
+/// THE RULE: a cluster running MORE than one step at a time does not act on a failed step's
+/// `ActionOnFailure` — "if you change a cluster's `StepConcurrencyLevel` to be greater than 1
+/// while a step is running … for a step that fails with this parameter set to
+/// `CANCEL_AND_WAIT`, pending steps and the running step are not canceled; for a step that
+/// fails with this parameter set to `TERMINATE_CLUSTER`, the cluster does not terminate"
+/// (`StepConfig$ActionOnFailure` doc) — and `AddJobFlowSteps` refuses the two actions on such
+/// a cluster outright: "the step is not submitted and the action fails with a message that the
+/// `ActionOnFailure` setting is not valid", worded naming the action asked for.
+///
+/// The rows span both halves: every value the model declares, submitted to a cluster at a
+/// level of one (all accepted) and to one at a level of two (the two queue-acting values
+/// refused, `CONTINUE` accepted), and a launch carrying a failing `TERMINATE_CLUSTER` step at
+/// a level of two, whose cluster stays up and whose following step still runs.
+#[tokio::test]
+async fn a_cluster_running_several_steps_at_once_does_not_act_on_action_on_failure() {
+    /// The sentence the refusal is worded with, with the action it names as its one variable
+    /// part — spelled out here rather than imported.
+    fn refusal(action: &str) -> String {
+        format!("Action on failure '{action}' is invalid.")
+    }
+    /// Every value `ActionOnFailure` declares, with whether a cluster running more than one
+    /// step at a time refuses it. SOURCE: `StepConfig$ActionOnFailure` doc, which names
+    /// `CANCEL_AND_WAIT` and `TERMINATE_CLUSTER`; `TERMINATE_JOB_FLOW` is the same shutdown
+    /// under its backward-compatible name.
+    const ACTIONS: [(&str, bool); 4] = [
+        ("CONTINUE", false),
+        ("CANCEL_AND_WAIT", true),
+        ("TERMINATE_CLUSTER", true),
+        ("TERMINATE_JOB_FLOW", true),
+    ];
+
+    let emr = Emr::new();
+    for level in [1, 2] {
+        let mut request = kept_alive_request("concurrency-actions");
+        request["StepConcurrencyLevel"] = json!(level);
+        let cluster_id = emr.run_job_flow(request).await;
+        for (action, refused_above_one) in ACTIONS {
+            let case = format!("{action} at StepConcurrencyLevel {level}");
+            let (status, payload) = emr
+                .call(
+                    "AddJobFlowSteps",
+                    json!({
+                        "JobFlowId": &cluster_id,
+                        "Steps": [{
+                            "Name": action,
+                            "ActionOnFailure": action,
+                            "HadoopJarStep": {
+                                "Jar": "command-runner.jar",
+                                "Args": ["bash", "-c", "exit 0"],
+                            },
+                        }],
+                    }),
+                )
+                .await;
+            if refused_above_one && level > 1 {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected the submission to be refused, got {payload}"
+                );
+                let expected = refusal(action);
+                assert_eq!(
+                    crate::refusal_messages::message(&case, &payload),
+                    expected,
+                    "case {case:?}: expected {expected:?}, got {payload}"
+                );
+            } else {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the submission to be accepted, got {payload}"
+                );
+            }
+        }
+    }
+
+    // The launch is not the operation the refusal is documented against, so a cluster CAN
+    // carry such a step at a level of two — and then the action does nothing: the cluster
+    // stays up and the step behind the failing one still runs.
+    let case = "a failing TERMINATE_CLUSTER step at StepConcurrencyLevel two";
+    let mut request = kept_alive_request("concurrency-two-terminate");
+    request["StepConcurrencyLevel"] = json!(2);
+    request["Steps"] = json!([
+        {
+            "Name": "fails",
+            "ActionOnFailure": "TERMINATE_CLUSTER",
+            "HadoopJarStep": { "Jar": "command-runner.jar", "Args": ["bash", "-c", "exit 5"] },
+        },
+        {
+            "Name": "follows",
+            "ActionOnFailure": "CONTINUE",
+            "HadoopJarStep": { "Jar": "command-runner.jar", "Args": ["bash", "-c", "exit 0"] },
+        },
+    ]);
+    let cluster_id = emr.run_job_flow(request).await;
+    let step_ids = queue_of(&emr, &cluster_id).await;
+    let steps = drained(case, &emr, &cluster_id, &step_ids).await;
+    let states: Vec<&str> = steps
+        .iter()
+        .map(|step| at(step, &["Status", "State"]).as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        states,
+        vec!["FAILED", "COMPLETED"],
+        "case {case:?}: the step behind the failing one still runs, got {steps:?}"
+    );
+    let cluster = emr.describe_cluster(&cluster_id).await;
+    assert_eq!(
+        at(&cluster, &["Status", "State"]).as_str(),
+        Some("WAITING"),
+        "case {case:?}: the cluster does not terminate, got {cluster}"
     );
 }

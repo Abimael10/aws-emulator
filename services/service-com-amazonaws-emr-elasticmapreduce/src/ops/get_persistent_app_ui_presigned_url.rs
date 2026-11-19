@@ -6,10 +6,10 @@
 //! names, derived from the stored UI ([`crate::state::PersistentAppUIRecord::presigned_url`])
 //! and presigned against this emulator for a bounded validity.
 //!
-//! An id no UI carries, a `PersistentAppUIType` the UI does not publish and an
-//! `ExecutionRoleArn` that is not the ARN of an IAM role are each refused with HTTP 400
-//! `ValidationException` — the error code the service answers a rejected input on this
-//! operation with. While the UI is still starting there is nothing to open yet, which
+//! An id no UI carries is refused with HTTP 400 `ValidationException` naming the profiler
+//! id behind `PersistentAppUIId`; a `PersistentAppUIType` the UI does not publish and an
+//! `ExecutionRoleArn` that is not the ARN of an IAM role are refused the same way, each
+//! naming its own member. While the UI is still starting there is nothing to open yet, which
 //! is exactly what `PresignedURLReady` reports: the call answers
 //! `PresignedURLReady: false` and no URL until the UI is attached.
 //!
@@ -167,11 +167,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // An id this account holds no UI for is a client error, not an empty success or
-        // a URL for a UI that does not exist. The service answers it as a rejection of
-        // the member that selects the interface.
+        // a URL for a UI that does not exist. The member the refusal names is the one that
+        // did not resolve — the profiler id behind `PersistentAppUIId`
+        // ([`crate::state::PRESIGNED_URL_NO_SUCH_PROFILER_MESSAGE`]) — and not the type,
+        // which this request may have got perfectly right.
         let Some(record) = store.persistent_app_ui_mut(&input.persistent_app_ui_id, now) else {
             return Err(refuse(
-                crate::state::PRESIGNED_URL_NO_SUCH_UI_MESSAGE.to_string(),
+                crate::state::PRESIGNED_URL_NO_SUCH_PROFILER_MESSAGE.to_string(),
             ));
         };
 

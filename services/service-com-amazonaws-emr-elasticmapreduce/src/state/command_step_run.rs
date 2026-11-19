@@ -117,22 +117,18 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
     let Some(state) = service_state(engine) else {
         return;
     };
-    let (unanswered, job_flow_role): (Vec<StepCommandPlan>, String) = {
+    let job_flow_role: String = {
         let mut store = state.lock();
         // The queue is run up to this instant first, so a step whose turn has come is
         // STARTED and its command is among the unanswered ones.
         run_due_steps(engine, &mut store, cluster_id, now);
         match store.clusters.get(cluster_id) {
-            Some(cluster) => (
-                cluster.unanswered_step_commands(),
-                cluster.job_flow_role.clone().unwrap_or_default(),
-            ),
-            None => (Vec::new(), String::new()),
+            Some(cluster) if !cluster.unanswered_step_commands().is_empty() => {
+                cluster.job_flow_role.clone().unwrap_or_default()
+            }
+            _ => return,
         }
     };
-    if unanswered.is_empty() {
-        return;
-    }
     // What the cluster's Amazon EC2 instances obtain from their instance profile, resolved
     // once for this call: the credential a step carrying no runtime role of its own presents,
     // which is nothing at all where that profile carries no role those instances may assume.
@@ -140,10 +136,33 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
     // What this CALL may spend performing them: a further command is started only while a
     // whole one still fits, so the rest stay owed to the next call.
     let started = ::std::time::Instant::now();
-    for plan in unanswered.into_iter().take(MAX_COMMANDS_RESOLVED_PER_CALL) {
+    // The steps this call has already answered for, or given up on, so re-reading the queue
+    // below never performs one command twice and never spins on a step nothing answered for.
+    let mut attempted: HashSet<String> = HashSet::new();
+    while attempted.len() < MAX_COMMANDS_RESOLVED_PER_CALL {
         if started.elapsed().saturating_add(TRANSFER_BUDGET) > COMMAND_CALL_CEILING {
             return;
         }
+        // The queue is RE-READ every time round rather than listed once: the answer just
+        // given is what lets its step END, which frees the concurrency slot the step behind
+        // it was waiting for — so that step's command is owed an answer inside this same
+        // call, and a queue whose steps run one at a time settles in the call that reports
+        // it instead of one step per call.
+        let next = {
+            let mut store = state.lock();
+            run_due_steps(engine, &mut store, cluster_id, now);
+            store
+                .clusters
+                .get(cluster_id)
+                .map(|cluster| cluster.unanswered_step_commands())
+                .unwrap_or_default()
+                .into_iter()
+                .find(|plan| !attempted.contains(&plan.step_id))
+        };
+        let Some(plan) = next else {
+            return;
+        };
+        attempted.insert(plan.step_id.clone());
         // A step's own runtime role is what its calls are signed as where it carries one;
         // every other step presents what the cluster's instances obtained.
         let credentials = match plan.execution_role_arn.as_deref() {
