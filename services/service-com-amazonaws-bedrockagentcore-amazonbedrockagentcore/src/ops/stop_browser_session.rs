@@ -3,8 +3,11 @@
 //! @op StopBrowserSession
 //! Terminates one browser session: the stop is recorded on the session
 //! ([`crate::state::BrowserSessionRecord::stop`]), so every later
-//! [`crate::ops::get_browser_session`] reports `TERMINATED` and the session's automation
-//! stream is no longer enabled. A replayed `clientToken` answers with the stop it
+//! [`crate::ops::get_browser_session`] reports `TERMINATED`. The stop leaves the session's
+//! streams as they stand: `AutomationStreamStatus` is the STREAM's own status, which only
+//! `UpdateBrowserStream` sets, while whether the session can be used at all is the
+//! session's own `BrowserSessionStatus`
+//! ([`crate::state::BrowserSessionRecord::streams`]). A replayed `clientToken` answers with the stop it
 //! already performed, and a session that is already terminated is a conflict rather than
 //! a second stop — the model documents that a stopped session cannot be restarted.
 //!

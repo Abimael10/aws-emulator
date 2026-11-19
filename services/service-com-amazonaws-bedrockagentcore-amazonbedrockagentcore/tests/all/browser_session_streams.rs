@@ -17,6 +17,10 @@
 //!   conflict because a stopped session cannot be restarted.
 //! * `UpdateBrowserStream` moves the automation stream's status, and that status is what
 //!   every later read reports; the endpoints stay the session's own.
+//! * Every answer that models a `BrowserSessionStream` reports one populated — the
+//!   `@required` `automationStream` with both of its own `@required` members — for a
+//!   session in EVERY status `BrowserSessionStatus` names and however it reached that
+//!   status, the start's idempotent replay included.
 //!
 //! Every case drives real HTTP through the same `MultiServiceRouter` the emulator serves
 //! with, so what is asserted is the wire behaviour a client sees.
@@ -24,10 +28,15 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aws_smithy_types::date_time::{DateTime, Format};
 use service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore as agentcore;
 use service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol as agentcorecontrol;
+
+// Moving a stored session's clock is the shared harness's, so a case reaches the far side
+// of a time-to-live without sleeping and this crate's test target keeps ONE such helper.
+use super::harness::age_browser_session;
 
 /// The browser tool the service itself provides, held by every account without anything
 /// creating it (source: smithy_query query="shape" shape="BrowserId" on the control
@@ -53,6 +62,16 @@ const ENDPOINT_MAX_LEN: usize = 512;
 const ENABLED: &str = "ENABLED";
 const DISABLED: &str = "DISABLED";
 
+/// The values `BrowserSessionStatus` accepts (source: smithy_query query="shape"
+/// shape="BrowserSessionStatus").
+const READY: &str = "READY";
+const TERMINATED: &str = "TERMINATED";
+
+/// Longer than any time-to-live `BrowserSessionTimeout` allows (range 1..28800, source:
+/// smithy_query query="operation" operation="StartBrowserSession"), so a case that ages a
+/// session by this much has outlived its time-to-live whatever that time-to-live is.
+const BEYOND_EVERY_TIME_TO_LIVE: Duration = Duration::from_secs(28_800 + 60);
+
 /// The time-to-live a session runs under when its start asks for none, and the `@default`
 /// the request member declares — which the protocol binds for an absent member, so a
 /// request naming it is the same request on the wire as one naming no timeout at all
@@ -64,12 +83,18 @@ const MODELLED_DEFAULT_TIMEOUT: i64 = 3_600;
 /// CONTROL plane is mounted beside this service because it owns the browsers a session
 /// runs on.
 fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same emulator, with the shared engine beside it so a case can age a stored
+/// session's clock instead of waiting for a time-to-live to run out.
+fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(agentcore::EmulatedService::new(Arc::clone(&engine)));
-    router.register_service(agentcorecontrol::EmulatedService::new(engine));
-    router
+    router.register_service(agentcorecontrol::EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// Send one request and return its status and parsed JSON body (`Value::Null` for an
@@ -672,4 +697,260 @@ async fn a_replayed_stream_update_token_answers_with_the_update_it_applied() {
         DISABLED,
         "expected the replay to have applied nothing, got {read:?}"
     );
+}
+
+/// One row of [`every_response_that_models_streams_reports_them_in_every_status`]: a
+/// session started one way, moved on to a status another way, and the two statuses the
+/// answers must then report.
+struct StreamStatusCase {
+    case: &'static str,
+    browser: String,
+    /// The `StartBrowserSession` body the row starts its session with.
+    start: Value,
+    /// The `streamStatus` an `UpdateBrowserStream` asks for before the session is read, or
+    /// `None` when the row runs no update.
+    update_to: Option<&'static str>,
+    /// Whether a `StopBrowserSession` terminates the session.
+    stop: bool,
+    /// Whether the row moves the clock past the session's time-to-live, which terminates
+    /// it with no call at all.
+    outlive_time_to_live: bool,
+    expected_session_status: &'static str,
+    expected_stream_status: &'static str,
+}
+
+/// The `streams` structure of one response, checked member by member rather than through
+/// an accessor that reads an absent member as empty: `streams` is an object,
+/// `automationStream` is there with both of the members `AutomationStream` marks
+/// `@required`, and `liveViewStream` carries its endpoint. The endpoints' bounds, the
+/// session they address and the expected status — one of the values
+/// `AutomationStreamStatus` names — are [`assert_streams`]'s.
+fn assert_streams_are_fully_populated(
+    case: &str,
+    body: &Value,
+    session_id: &str,
+    expected_status: &str,
+) {
+    let streams = body.get("streams").unwrap_or_else(|| {
+        panic!("case {case:?}: expected a streams structure in the response, got {body:?}")
+    });
+    assert!(
+        streams.is_object(),
+        "case {case:?}: expected streams to be a structure, got {streams:?}"
+    );
+    let automation = streams.get("automationStream").unwrap_or_else(|| {
+        panic!("case {case:?}: expected the required automationStream member, got {streams:?}")
+    });
+    for required in ["streamEndpoint", "streamStatus"] {
+        assert!(
+            automation
+                .get(required)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty()),
+            "case {case:?}: expected a non-empty {required} on automationStream, got {automation:?}"
+        );
+    }
+    assert!(
+        streams
+            .pointer("/liveViewStream/streamEndpoint")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty()),
+        "case {case:?}: expected a non-empty liveViewStream streamEndpoint, got {streams:?}"
+    );
+    assert_streams(case, body, session_id, expected_status);
+}
+
+/// `BrowserSessionStream` is a structure the service returns for a session in ANY status,
+/// with `automationStream` — and both of that structure's own members — `@required` inside
+/// it: so every answer that models the member reports it populated, whatever status the
+/// session is in and however it reached that status, and the stream's own status is the
+/// one that was last set for it rather than a reading of the session's.
+///
+/// Rows differ along the browser the session runs on, what the start asked for, how the
+/// session reached its status (nothing, a stop, or a time-to-live the clock has outlived)
+/// and the automation status an update left behind.
+#[tokio::test]
+async fn every_response_that_models_streams_reports_them_in_every_status() {
+    let (router, engine) = emulator_with_engine();
+    let custom = create_browser(&router, CUSTOM_BROWSER_NAME).await;
+
+    let cases = vec![
+        StreamStatusCase {
+            case: "ready-with-a-viewport-and-a-timeout",
+            browser: SYSTEM_BROWSER.to_string(),
+            start: json!({"sessionTimeoutSeconds": 600, "viewPort": {"width": 1_280, "height": 900}}),
+            update_to: None,
+            stop: false,
+            outlive_time_to_live: false,
+            expected_session_status: READY,
+            expected_stream_status: ENABLED,
+        },
+        StreamStatusCase {
+            case: "ready-with-no-optional-members-on-a-custom-browser",
+            browser: custom.clone(),
+            start: json!({}),
+            update_to: None,
+            stop: false,
+            outlive_time_to_live: false,
+            expected_session_status: READY,
+            expected_stream_status: ENABLED,
+        },
+        StreamStatusCase {
+            case: "ready-with-the-automation-stream-disabled",
+            browser: SYSTEM_BROWSER.to_string(),
+            start: json!({"name": "disabled_stream", "sessionTimeoutSeconds": 28_800}),
+            update_to: Some(DISABLED),
+            stop: false,
+            outlive_time_to_live: false,
+            expected_session_status: READY,
+            expected_stream_status: DISABLED,
+        },
+        // A stop moves the SESSION's status; `AutomationStreamStatus` is the stream's
+        // own, which only `UpdateBrowserStream` sets, so a stopped session still reports
+        // the stream status that was last set for it.
+        StreamStatusCase {
+            case: "terminated-by-a-stop",
+            browser: custom.clone(),
+            start: json!({"sessionTimeoutSeconds": 28_800}),
+            update_to: None,
+            stop: true,
+            outlive_time_to_live: false,
+            expected_session_status: TERMINATED,
+            expected_stream_status: ENABLED,
+        },
+        StreamStatusCase {
+            case: "terminated-by-its-own-time-to-live",
+            browser: SYSTEM_BROWSER.to_string(),
+            start: json!({"sessionTimeoutSeconds": 1}),
+            update_to: None,
+            stop: false,
+            outlive_time_to_live: true,
+            expected_session_status: TERMINATED,
+            expected_stream_status: ENABLED,
+        },
+        StreamStatusCase {
+            case: "terminated-with-the-automation-stream-disabled",
+            browser: custom.clone(),
+            start: json!({"sessionTimeoutSeconds": 60}),
+            update_to: Some(DISABLED),
+            stop: true,
+            outlive_time_to_live: false,
+            expected_session_status: TERMINATED,
+            expected_stream_status: DISABLED,
+        },
+    ];
+
+    for row in cases {
+        let case = row.case;
+        let (status, started) = start_session(&router, &row.browser, row.start).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from StartBrowserSession, got {status} with {started:?}"
+        );
+        let session_id = text(&started, "sessionId").to_string();
+        // The start's own answer carries the streams it materialised.
+        assert_streams_are_fully_populated(case, &started, &session_id, ENABLED);
+
+        if let Some(requested) = row.update_to {
+            let update =
+                json!({"streamUpdate": {"automationStreamUpdate": {"streamStatus": requested}}});
+            let (status, updated) = update_stream(&router, &row.browser, &session_id, update).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from UpdateBrowserStream, got {status} with {updated:?}"
+            );
+            // `UpdateBrowserStreamResponse$streams` is itself `@required`.
+            assert_streams_are_fully_populated(case, &updated, &session_id, requested);
+        }
+
+        if row.stop {
+            let (status, stopped) =
+                stop_session(&router, &row.browser, &session_id, json!({})).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from StopBrowserSession, got {status} with {stopped:?}"
+            );
+        }
+        if row.outlive_time_to_live {
+            age_browser_session(&engine, &row.browser, &session_id, BEYOND_EVERY_TIME_TO_LIVE);
+        }
+
+        let (status, read) = get_session(&router, &row.browser, &session_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from GetBrowserSession, got {status} with {read:?}"
+        );
+        assert_eq!(
+            text(&read, "status"),
+            row.expected_session_status,
+            "case {case:?}: expected session status {}, got {read:?}",
+            row.expected_session_status
+        );
+        assert_streams_are_fully_populated(case, &read, &session_id, row.expected_stream_status);
+        assert_eq!(
+            (automation_endpoint(&read), live_view_endpoint(&read)),
+            (automation_endpoint(&started), live_view_endpoint(&started)),
+            "case {case:?}: expected the endpoints the start materialised, got {read:?}"
+        );
+    }
+}
+
+/// `StartBrowserSession` is `@idempotent` with an `@idempotencyToken` `clientToken`, and
+/// the session a replayed token answers with is the one that token already started — so
+/// the replay reports that session's streams, not none. Rows differ along the browser and
+/// the token's length inside `ClientToken`'s published 33..256.
+#[tokio::test]
+async fn a_replayed_start_token_answers_with_the_streams_it_already_materialised() {
+    let router = emulator();
+    let custom = create_browser(&router, CUSTOM_BROWSER_NAME).await;
+
+    let cases: Vec<(&str, String, String)> = vec![
+        (
+            "shortest-token-on-the-system-browser",
+            SYSTEM_BROWSER.to_string(),
+            "a".repeat(33),
+        ),
+        (
+            "hyphenated-token-on-a-custom-browser",
+            custom.clone(),
+            "start-replay-token-0123456789-abcd-0".to_string(),
+        ),
+        (
+            "longest-token-on-the-system-browser",
+            SYSTEM_BROWSER.to_string(),
+            "z".repeat(256),
+        ),
+    ];
+
+    for (case, browser, token) in cases {
+        let (status, started) = start_session(
+            &router,
+            &browser,
+            json!({"clientToken": token, "sessionTimeoutSeconds": 600}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from the first start, got {status} with {started:?}"
+        );
+        let session_id = text(&started, "sessionId").to_string();
+        assert_streams_are_fully_populated(case, &started, &session_id, ENABLED);
+
+        let (status, replayed) = start_session(
+            &router,
+            &browser,
+            json!({"clientToken": token, "sessionTimeoutSeconds": 120}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from the replay, got {status} with {replayed:?}"
+        );
+        assert_streams_are_fully_populated(case, &replayed, &session_id, ENABLED);
+        assert_eq!(
+            member(&replayed, "streams"),
+            member(&started, "streams"),
+            "case {case:?}: expected the replay to report the streams the first start materialised, got {replayed:?}"
+        );
+    }
 }

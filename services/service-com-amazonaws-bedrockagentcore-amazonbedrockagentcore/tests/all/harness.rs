@@ -5,6 +5,8 @@
 //! A suite reaches it as `use super::harness::label;` — `tests/all.rs` is the test
 //! target's crate root, so each suite is a sibling module of this one.
 
+use std::time::Duration;
+
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use service_common::agentcore_resources::AgentCoreResourceInventory;
 
@@ -60,4 +62,24 @@ pub(crate) fn delete_code_interpreter(engine: &engine::InMemoryEngine, code_inte
         .state::<AgentCoreResourceInventory>()
         .lock()
         .forget_code_interpreter(code_interpreter_id);
+}
+
+/// Move a stored browser session's creation instant `by` further into the past, so a case
+/// reaches the far side of a time-to-live without sleeping for it. This is the test
+/// reaching into the store the handlers share, not an emulator behaviour.
+pub(crate) fn age_browser_session(
+    engine: &engine::InMemoryEngine,
+    browser: &str,
+    session_id: &str,
+    by: Duration,
+) {
+    let state = service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore::state::service_state(
+        engine,
+    )
+    .expect("the service state");
+    let mut store = state.lock();
+    let session = store
+        .browser_session_mut(browser, session_id)
+        .expect("the session that was just started");
+    session.created_at -= by;
 }

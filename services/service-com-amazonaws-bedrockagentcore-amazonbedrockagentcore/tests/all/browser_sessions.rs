@@ -33,7 +33,7 @@ use aws_smithy_types::date_time::{DateTime, Format};
 use service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore as agentcore;
 use service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol as agentcorecontrol;
 
-use super::harness::label;
+use super::harness::{age_browser_session, label};
 
 /// The browser tool the service itself provides, held by every account without anything
 /// creating it: the control plane's `BrowserId` pattern reserves this id as its first
@@ -159,18 +159,6 @@ async fn get_session(
         None,
     )
     .await
-}
-
-/// Move a stored session's creation instant `by` further into the past, so a case can
-/// reach the far side of a time-to-live without sleeping for it. This is the test
-/// reaching into the store the handlers share, not an emulator behaviour.
-fn age_session(engine: &engine::InMemoryEngine, browser: &str, session_id: &str, by: Duration) {
-    let state = agentcore::state::service_state(engine).expect("the service state");
-    let mut store = state.lock();
-    let session = store
-        .browser_session_mut(browser, session_id)
-        .expect("the session that was just started");
-    session.created_at -= by;
 }
 
 /// How many sessions this emulator holds for one browser — the check that a replayed
@@ -469,7 +457,7 @@ async fn session_status_follows_the_time_to_live_the_request_asked_for() {
 
         // One second short of the time-to-live the session is still usable.
         let timeout_secs = u64::try_from(timeout).expect("a modelled timeout is positive");
-        age_session(
+        age_browser_session(
             &engine,
             SYSTEM_BROWSER,
             &session_id,
@@ -484,7 +472,7 @@ async fn session_status_follows_the_time_to_live_the_request_asked_for() {
 
         // At the instant it runs out the session is terminated, with no call needed to
         // make it so.
-        age_session(&engine, SYSTEM_BROWSER, &session_id, Duration::from_secs(1));
+        age_browser_session(&engine, SYSTEM_BROWSER, &session_id, Duration::from_secs(1));
         let (status, read) = get_session(&router, SYSTEM_BROWSER, &session_id).await;
         assert_eq!(
             (status, text(&read, "status")),
@@ -1261,7 +1249,7 @@ async fn an_action_on_a_terminated_session_is_refused() {
                 "case {case:?}: the fixture stop must succeed, got {status} with {stopped:?}"
             );
         } else {
-            age_session(
+            age_browser_session(
                 &engine,
                 SYSTEM_BROWSER,
                 &session_id,
@@ -1441,7 +1429,7 @@ async fn a_delivered_action_moves_last_updated_at_and_a_screenshot_does_not() {
     // Move the whole session back in time, so the instant an action writes is a different
     // one however fast this host runs. The session's time-to-live is far longer, so it is
     // still a session an action can be performed on.
-    age_session(
+    age_browser_session(
         &engine,
         SYSTEM_BROWSER,
         &session_id,
