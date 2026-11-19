@@ -55,3 +55,30 @@ would cause.
 3. Observe HTTP 200 with the handler's own result, and the item present in the table, instead of the
    `AccessDeniedException` the role's policies owe and the function error it causes.
 4. Or replay apigateway__cloudwatch__dynamodb__lambda__logs.sam-serverless-api-transform-workflow.
+
+## Resolution: not reproducible — NO code changed, two suites added that pin the rule
+
+The single cause was investigated and declined: the emulator already behaves as the report says
+AWS does, so nothing in `src/` was changed. What the report claims is missing is in place:
+
+* the seam a running handler calls through signs every request as a SESSION OF THE FUNCTION'S
+  EXECUTION ROLE — `state/execution/aws_api.rs`'s `sent` passes that identity to `signed`, and it
+  comes from `state/execution/execution_role_session.rs` (`execution_role_identity`, minted by the
+  token service), put on the seam by `function_sdk_access_in_vpc` at every invoke path
+  (`ops/invoke.rs`, `ops/invoke_async.rs`, `ops/invoke_with_response_stream.rs`,
+  `service/function_url.rs`);
+* the call is then judged by the service that SERVES it, which is where the decision belongs:
+  Amazon DynamoDB's `state/authorization.rs` resolves the session's principal, reads the role's
+  documents through IAM's own accessor and refuses with its own `AccessDeniedException`;
+* the SDK raises that refusal, the unhandled raise makes the invocation a function error, and an
+  `AWS_PROXY` integration whose function errored is answered `502` by API Gateway.
+
+Replaying the recorded unit was inconclusive (the corpus holds no replayable recording for it), so
+the evidence is two new end-to-end suites, both passing:
+
+* `services/service-com-amazonaws-lambda-awsgirapiservice/tests/all/handler_table_write_execution_role_grant.rs`
+* `core/router/tests/all/sam_function_table_write_follows_its_execution_role.rs`
+
+The second deploys the report's own shape — a SAM template whose function declares no `Policies`,
+behind the implicit api's `POST /items` — and observes `502` at the stage, the function error at
+`Invoke`, and no item in the table.
