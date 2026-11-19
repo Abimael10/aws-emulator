@@ -49,6 +49,11 @@ pub struct LaunchRequest<'a> {
     pub group_name: &'a str,
     /// How many instances to launch.
     pub count: usize,
+    /// The instant the launch was OWED: the instant of the call for a capacity change a
+    /// caller asked for, and the instant the step fell due for one this service's clock
+    /// owes. It is the instant Amazon EC2 dates each instance from and runs its own span to
+    /// `running` from, so the group's record and EC2's agree on how old an instance is.
+    pub launched_at: SystemTime,
     /// How many instances the group already holds, so the placements are used in turn
     /// ACROSS capacity changes instead of restarting at the first one every time.
     pub placed: usize,
@@ -242,7 +247,13 @@ pub fn launch<Eng: Send + Sync + 'static>(
     } else {
         ec2::MONITORING_STATE_DISABLED
     };
-    let launch_time = SystemTime::now();
+    // The instant the launch was OWED, which is the instant the group's own record dates
+    // the instance from: a capacity change a caller asked for is owed at the instant of that
+    // call, and one this service's clock owes at the instant its step fell due. Amazon EC2
+    // dates the instance from the same instant and runs its own span to `running` from it,
+    // so one instance is never two ages and a step retired after the fact does not restart a
+    // span that has already elapsed.
+    let launch_time = request.launched_at;
     // The credit option every instance of this launch runs under, resolved once by Amazon
     // EC2's own reading of a launch: the option the launch source named, the account's default
     // for the instance type's family otherwise, and none at all for a type that is not a
@@ -293,8 +304,9 @@ pub fn launch<Eng: Send + Sync + 'static>(
             // clock, so a caller that describes it straight away still sees `pending` —
             // the same transient state the group reports it `Pending` for.
             state: ec2::InstanceStateName::Pending,
-            pending_transition: Some(ec2::PendingTransition::starting_now(
+            pending_transition: Some(ec2::PendingTransition::starting_at(
                 ec2::InstanceStateName::Running,
+                launch_time,
             )),
             state_transition_reason: None,
             state_reason: None,
@@ -409,6 +421,9 @@ pub fn launch<Eng: Send + Sync + 'static>(
 /// Stop the instances `instance_ids` names in the account's Amazon EC2 store, or start
 /// them again — what a warm pool does to the instances it holds.
 ///
+/// `at` is the instant the move was OWED, which every writer here is anchored at (see
+/// [`terminate`]).
+///
 /// A warm pool keeps its instances in "the instance state to transition to after the
 /// lifecycle actions are complete" (`WarmPoolConfiguration$PoolState`), and only
 /// `Running` leaves them running: a `Stopped` or `Hibernated` pool holds instances
@@ -423,6 +438,7 @@ pub fn set_running<Eng: Send + Sync + 'static>(
     engine: &Eng,
     instance_ids: &[String],
     running: bool,
+    at: SystemTime,
 ) {
     if instance_ids.is_empty() {
         return;
@@ -431,7 +447,7 @@ pub fn set_running<Eng: Send + Sync + 'static>(
         return;
     };
     let mut store = state.lock();
-    let now = SystemTime::now();
+    let now = at;
     for instance_id in instance_ids {
         let Some(instance) = store.instances.get_mut(instance_id) else {
             continue;
@@ -442,8 +458,9 @@ pub fn set_running<Eng: Send + Sync + 'static>(
         match (running, instance.state) {
             (false, ec2::InstanceStateName::Pending | ec2::InstanceStateName::Running) => {
                 instance.state = ec2::InstanceStateName::Stopping;
-                instance.pending_transition = Some(ec2::PendingTransition::starting_now(
+                instance.pending_transition = Some(ec2::PendingTransition::starting_at(
                     ec2::InstanceStateName::Stopped,
+                    now,
                 ));
                 instance.state_transition_reason = Some(ec2::user_initiated_reason(now));
                 instance.state_reason = Some((
@@ -457,8 +474,9 @@ pub fn set_running<Eng: Send + Sync + 'static>(
             // while a stop was in progress would leave the instance stopped.
             (true, ec2::InstanceStateName::Stopped | ec2::InstanceStateName::Stopping) => {
                 instance.state = ec2::InstanceStateName::Pending;
-                instance.pending_transition = Some(ec2::PendingTransition::starting_now(
+                instance.pending_transition = Some(ec2::PendingTransition::starting_at(
                     ec2::InstanceStateName::Running,
+                    now,
                 ));
                 // A stopped instance has no running operating system, so starting it
                 // brings the guest up again, exactly as Amazon EC2's own start does.
@@ -480,7 +498,19 @@ pub fn set_running<Eng: Send + Sync + 'static>(
 /// still sees it on its way out. An instance already on its way to (or at) `terminated`
 /// is left alone — terminating is idempotent — and an id the store holds nothing for
 /// changes nothing.
-pub fn terminate<Eng: Send + Sync + 'static>(engine: &Eng, instance_ids: &[String]) {
+///
+/// `at` is the instant the termination was OWED: the instant of the call for a termination
+/// a caller asked for, and the instant the step FELL DUE for one this service's clock owes
+/// (a scale-in, a replacement of an instance refresh, a health check's replacement). That
+/// is the instant Amazon EC2's own span to `terminated` runs from, so a pass that retires a
+/// step the clock made due earlier does not restart a span that has already elapsed — and
+/// the work that owed the termination is never reported complete while the instance it
+/// terminated is still on its way out ([`ec2::PendingTransition::starting_at`]).
+pub fn terminate<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    instance_ids: &[String],
+    at: SystemTime,
+) {
     if instance_ids.is_empty() {
         return;
     }
@@ -488,7 +518,7 @@ pub fn terminate<Eng: Send + Sync + 'static>(engine: &Eng, instance_ids: &[Strin
         return;
     };
     let mut store = state.lock();
-    let now = SystemTime::now();
+    let now = at;
     for instance_id in instance_ids {
         let Some(instance) = store.instances.get_mut(instance_id) else {
             continue;
@@ -497,8 +527,9 @@ pub fn terminate<Eng: Send + Sync + 'static>(engine: &Eng, instance_ids: &[Strin
             continue;
         }
         instance.state = ec2::InstanceStateName::ShuttingDown;
-        instance.pending_transition = Some(ec2::PendingTransition::starting_now(
+        instance.pending_transition = Some(ec2::PendingTransition::starting_at(
             ec2::InstanceStateName::Terminated,
+            now,
         ));
         instance.state_transition_reason = Some(ec2::user_initiated_reason(now));
         // A scaling activity a caller asked for shut the instance down, so the shutdown

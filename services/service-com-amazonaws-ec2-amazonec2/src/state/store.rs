@@ -446,6 +446,28 @@ impl PendingTransition {
             due_at: Instant::now() + TRANSITION_DELAY,
         }
     }
+
+    /// A transition to `to`, due [`TRANSITION_DELAY`] after `started_at` — the instant the
+    /// change that starts it was OWED, which is not the instant it is applied when a
+    /// clock-owed change is materialised after the fact.
+    ///
+    /// A change a caller asks for is owed at the instant of that call, so
+    /// [`Self::starting_now`] is what a handler uses. A change the CLOCK owes — a capacity
+    /// change of an Auto Scaling group, a step of an instance refresh — is owed at the
+    /// instant it fell due, whether or not anything looked then: a pass that retires it
+    /// later must not restart the span it has already sat through, or the move would still
+    /// be pending when the work that owed it is already reported complete. A span that has
+    /// wholly elapsed leaves the move due at once, and an instant in the future is treated
+    /// as now.
+    pub fn starting_at(to: InstanceStateName, started_at: SystemTime) -> Self {
+        let elapsed = SystemTime::now()
+            .duration_since(started_at)
+            .unwrap_or_default();
+        Self {
+            to,
+            due_at: due_instant(TRANSITION_DELAY.saturating_sub(elapsed)),
+        }
+    }
 }
 
 /// The `InstanceAttributeName` enum's `kernel` member.

@@ -756,7 +756,7 @@ impl AutoScalingState {
         if !retired {
             return;
         }
-        super::ec2_instances::terminate(engine, &[instance_id.to_string()]);
+        super::ec2_instances::terminate(engine, &[instance_id.to_string()], now);
         if action.transition == HeldTransition::Launching {
             // The group reports the step it took: an instance it launched and then gave back
             // is one that left the group, recorded and announced like every other

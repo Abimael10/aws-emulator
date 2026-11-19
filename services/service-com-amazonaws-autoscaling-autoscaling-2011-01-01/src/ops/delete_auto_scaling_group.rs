@@ -350,10 +350,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // state, which is where this group launched them. (Without `ForceDelete` a group
         // that still holds instances was refused above, so there is nothing to
         // terminate on that path.)
-        crate::state::ec2_instances::terminate(&*self.engine, &instance_ids);
+        crate::state::ec2_instances::terminate(&*self.engine, &instance_ids, now);
         // The warm pool goes with the group's record, so the instances it was holding are
         // terminated where they live too.
-        crate::state::ec2_instances::terminate(&*self.engine, &warm_pool_instance_ids);
+        crate::state::ec2_instances::terminate(&*self.engine, &warm_pool_instance_ids, now);
         let cause = format!(
             "a user request deleted the AutoScalingGroup, terminating {instance_count} \
              instance(s)."

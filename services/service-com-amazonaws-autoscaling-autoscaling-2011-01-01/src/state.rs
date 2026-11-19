@@ -2499,6 +2499,7 @@ impl AutoScalingState {
             region: &region,
             group_name: request.group_name,
             count: wanted,
+            launched_at: request.launched_at,
             placed,
             zones: &zones,
             vpc_zone_identifier: vpc_zone_identifier.as_deref(),
@@ -2592,7 +2593,7 @@ impl AutoScalingState {
             (_, None) => false,
         };
         if !placed {
-            ec2_instances::terminate(engine, &launched_ids);
+            ec2_instances::terminate(engine, &launched_ids, request.launched_at);
             return GroupLaunchOutcome::unplaced(request.count, None);
         }
         // An instance launched INTO THE GROUP is held by every launch lifecycle hook the
@@ -2682,7 +2683,7 @@ impl AutoScalingState {
                 }
             }
         }
-        ec2_instances::terminate(engine, &leaving);
+        ec2_instances::terminate(engine, &leaving, now);
     }
 
     /// Materialise every instance-refresh replacement the clock has made due at

@@ -408,7 +408,7 @@ impl AutoScalingState {
             .filter(|instance| instance.lifecycle_state == warmed)
             .map(|instance| instance.instance_id.clone())
             .collect();
-        super::ec2_instances::set_running(engine, &settled, running);
+        super::ec2_instances::set_running(engine, &settled, running, now);
     }
 
     /// Launch what the pool is missing and take out what it holds beyond its target,
@@ -498,7 +498,7 @@ impl AutoScalingState {
                     }
                 }
             }
-            super::ec2_instances::terminate(engine, &taken);
+            super::ec2_instances::terminate(engine, &taken, now);
         }
 
         for instance_id in &launched_ids {
