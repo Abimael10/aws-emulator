@@ -8,11 +8,12 @@
 //! > `Stage$methodSettings` is "a map that defines the method settings for a Stage resource.
 //! > Keys (designated as /{method_setting_key) are method paths defined as
 //! > {resource_path}/{http_method} for an individual method override, or /\*/\* for
-//! > overriding all methods in the stage". A key therefore names a METHOD, in the method
-//! > path's own spelling: the resource path as ONE reference token — every separator in it,
-//! > the leading one included, escaped `~1` as `PatchOperation$path` spells a separator
-//! > inside a path name — then a real separator, then the HTTP method; and `*/*` for the
-//! > whole-stage path `/*/*`, which names no resource path. A patch may spell that method
+//! > overriding all methods in the stage". A key therefore names a METHOD, as the method
+//! > path itself: the resource path without its leading separator and with every other
+//! > separator literal, then a separator, then the HTTP method; and `*/*` for the
+//! > whole-stage path `/*/*`, which names no resource path. The `~1` escape of
+//! > `PatchOperation$path` belongs to the POINTER that addresses an entry and never to the
+//! > key the entry is reported under. A patch may spell that method
 //! > several ways (the resource path's leading separator escaped or left to the pointer's
 //! > own, the separator before the HTTP method escaped too so the whole method path rides in
 //! > one reference token), and every one of them addresses the one method, so a stage holds
@@ -51,7 +52,7 @@ struct Row {
 const ROWS: &[Row] = &[
     Row {
         case: "a child resource",
-        key: "~1pets/GET",
+        key: "pets/GET",
         spellings: &[
             // The resource path's leading separator escaped into the first token.
             ("/~1pets/GET/metrics/enabled", "metricsEnabled"),
@@ -64,7 +65,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         case: "a nested resource path",
-        key: "~1pets~1{petId}/DELETE",
+        key: "pets/{petId}/DELETE",
         spellings: &[
             (
                 "/~1pets~1{petId}/DELETE/metrics/enabled",
@@ -79,7 +80,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         case: "the root resource",
-        key: "~1/GET",
+        key: "/GET",
         spellings: &[
             ("/~1/GET/metrics/enabled", "metricsEnabled"),
             ("//GET/caching/enabled", "cachingEnabled"),
@@ -138,13 +139,11 @@ async fn every_spelling_of_one_method_writes_the_one_documented_key() {
                 keys, expected_keys,
                 "case {case}: expected the keys {expected_keys:?}, got {keys:?}"
             );
-            // Every key but the whole-stage one carries its resource path as one escaped
-            // reference token, so a key holds exactly one real separator: the one before the
-            // HTTP method.
+            // No key carries a pointer escape: that escape is the patch path's, while a key
+            // is the method path with its separators literal.
             assert!(
-                keys.iter().all(|key| key.matches('/').count() == 1),
-                "case {case}: a methodSettings key carries its resource path as one escaped \
-                 token, got {keys:?}"
+                keys.iter().all(|key| !key.contains("~1")),
+                "case {case}: a methodSettings key spells its separators literally, got {keys:?}"
             );
             let read = get_stage(&gateway, &api, "prod").await;
             assert_eq!(
@@ -235,6 +234,79 @@ async fn a_method_entry_is_removed_by_any_spelling_that_names_it() {
             read.body, body,
             "case {removed}: GetStage must report what UpdateStage answered, got {:?} after {:?}",
             read.body, body
+        );
+    }
+}
+
+/// RULE: the key of a `methodSettings` entry is the METHOD PATH `Stage$methodSettings`
+/// documents — `{resource_path}/{http_method}`, the resource path without its leading
+/// separator and with every other separator of it literal — and never the `~1`-escaped
+/// spelling the patch POINTER addressed the entry by.
+///
+/// The key is DERIVED here from the resource path and the verb of each row, so the row proves
+/// the form rather than one remembered string.
+#[tokio::test]
+async fn a_key_is_the_documented_method_path_derived_from_the_method_it_names() {
+    // Rows differ along what the rule generalises over: the DEPTH of the resource path (the
+    // root, a child, a nested one, a deeper one), a path part that is a path parameter, a part
+    // carrying a character the pointer leaves alone, the HTTP verb — the verbs are the ones
+    // `PutMethod$httpMethod` takes — and the wildcard that stands for every method of the
+    // stage.
+    let rows: [(&str, &str, &str); 6] = [
+        ("the root resource", "/", "GET"),
+        ("a child resource", "/pets", "POST"),
+        ("a nested resource", "/pets/{petId}", "DELETE"),
+        ("a deeply nested resource", "/a/b/c", "PUT"),
+        ("a resource part carrying a hyphen", "/order-items", "PATCH"),
+        ("every method of the stage", "/*", "*"),
+    ];
+
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "method-settings-key-form").await;
+    create_deployed_stage(&gateway, &api, "prod").await;
+    let uri = format!("/restapis/{api}/stages/prod");
+
+    let mut expected_keys: Vec<String> = Vec::new();
+    for (case, resource_path, verb) in rows {
+        // The method path as a key: the resource path's leading separator is the one the key
+        // leaves out.
+        let unprefixed = resource_path.strip_prefix('/').unwrap_or(resource_path);
+        let expected_key = format!("{unprefixed}/{verb}");
+        // The pointer that addresses a setting of that same method: a separator INSIDE the
+        // resource path is escaped `~1`, as `PatchOperation$path` requires of a path name.
+        let pointer = format!(
+            "/{}/{verb}/metrics/enabled",
+            unprefixed.replace('/', "~1")
+        );
+
+        let case = format!("{case} as {pointer:?}");
+        let body = patch_ok(&gateway, &case, &uri, vec![replace(&pointer, "true")]).await;
+        let actual = &body["methodSettings"][expected_key.as_str()]["metricsEnabled"];
+        assert_eq!(
+            actual,
+            &json!(true),
+            "case {case}: expected metricsEnabled under {expected_key:?}, got {:?}",
+            body["methodSettings"]
+        );
+
+        expected_keys.push(expected_key);
+        expected_keys.sort();
+        let keys = reported_keys(&body);
+        assert_eq!(
+            keys, expected_keys,
+            "case {case}: expected the keys {expected_keys:?}, got {keys:?}"
+        );
+        assert!(
+            keys.iter().all(|key| !key.contains("~1")),
+            "case {case}: a methodSettings key spells its separators literally, got {keys:?}"
+        );
+
+        let read = get_stage(&gateway, &api, "prod").await;
+        assert_eq!(
+            read.body["methodSettings"], body["methodSettings"],
+            "case {case}: GetStage must report the keys UpdateStage answered, got {:?} after \
+             {:?}",
+            read.body["methodSettings"], body["methodSettings"]
         );
     }
 }

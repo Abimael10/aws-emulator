@@ -269,14 +269,8 @@ async fn an_admitted_unique_id_earns_the_same_refusal_as_an_absent_stack() {
 
     for (case, identifier) in [
         ("the live stack's bare unique id", minted.as_str()),
-        (
-            "that unique id led by a digit",
-            digit_led.as_str(),
-        ),
-        (
-            "that unique id led by a letter",
-            letter_led.as_str(),
-        ),
+        ("that unique id led by a digit", digit_led.as_str()),
+        ("that unique id led by a letter", letter_led.as_str()),
         ("a name nothing created", "unique-id-never-created"),
         (
             "a letter-led unique id nothing ever minted",

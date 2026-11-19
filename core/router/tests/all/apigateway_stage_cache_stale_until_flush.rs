@@ -531,10 +531,10 @@ async fn front(
     let stage = settled_cluster(router, case, &api).await;
     let setting = stage
         .get("methodSettings")
-        // The key is the method path `Stage$methodSettings` documents: the resource path as
-        // ONE reference token, its separators — the leading one included — written as the
-        // `~1` escape a path name spells a separator with, then the HTTP method.
-        .and_then(|settings| settings.get(format!("~1{FRONT_PART}/GET")))
+        // The key is the method path `Stage$methodSettings` documents: the resource path
+        // without its leading separator, every other separator of it literal, then the HTTP
+        // method. The `~1` escape is the patch pointer's, not the key's.
+        .and_then(|settings| settings.get(format!("{FRONT_PART}/GET")))
         .cloned()
         .unwrap_or(Value::Null);
     match caching {

@@ -28,12 +28,13 @@
 //! Two paths of this surface are not a plain member of the `Stage` shape:
 //!
 //! * the per-method settings. A method-setting path is the TWO reference tokens naming
-//!   the method followed by the setting it writes (`/~1pets/GET/metrics/enabled`), the
-//!   key being `{escaped-resource-path}/{HTTP-METHOD}` or `*/*` as `Stage$methodSettings`
-//!   documents — so a `/` inside the resource path is escaped `~1` in the PATH and in the
-//!   KEY while the separator before the HTTP method is a real one, the path's own LEADING
-//!   separator is either escaped too or left to the pointer's (`/pets/GET/…`, the spelling
-//!   `MethodSetting$ResourcePath` states a path in), and a pointer that escapes the
+//!   the method followed by the setting it writes (`/~1pets/GET/metrics/enabled`), while the
+//!   KEY the stage holds that method's settings under is the method path
+//!   `{resource_path}/{http_method}` or `*/*` as `Stage$methodSettings` documents — the `~1`
+//!   escape is the POINTER's, so a `/` inside the resource path is escaped in the PATH and
+//!   literal in the KEY, which drops the resource path's own LEADING separator. In the path
+//!   that leading separator is either escaped too or left to the pointer's (`/pets/GET/…`, the
+//!   spelling `MethodSetting$ResourcePath` states a path in), and a pointer that escapes the
 //!   separator before the method too names the method in ONE token instead. Every one of
 //!   those spellings addresses the one method, so every one is keyed under the one
 //!   documented key — see [`apply_method_setting_patch`], [`METHOD_PATH_TOKENS`] and
@@ -955,7 +956,9 @@ const METHOD_SETTING_NAMES: &[(&str, &str)] = &[
 /// spells the resource path and the HTTP method separately: "method paths defined as
 /// {resource_path}/{http_method} for an individual method override, or /\*/\* for
 /// overriding all methods in the stage" (`Stage$methodSettings`), with every `/` INSIDE
-/// the resource path escaped `~1` the way a JSON Pointer requires.
+/// the resource path escaped `~1` in the POINTER the way a JSON Pointer requires — an
+/// escape the KEY those tokens resolve to carries none of
+/// ([`crate::state::method_settings_key`]).
 const METHOD_PATH_TOKENS: usize = 2;
 
 /// The method a patch path names and the setting it writes, or `None` for a path that

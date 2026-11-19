@@ -13,10 +13,11 @@
 //! > One `DeleteObjects` performs the delete of each `Object` its `Delete` payload names —
 //! > the version a `VersionId` names, or the simple delete that lays a delete marker on a
 //! > bucket carrying a versioning state — and reports the result of each in the response:
-//! > a key that held nothing is reported deleted too, a `VersionId` of the published shape
-//! > the bucket holds no version of is reported deleted as well — nothing was there, which
-//! > the result confirms — a token that is no version id at all is that key's own `Errors`
-//! > entry rather than a failure of the request, and `Quiet` leaves the successes out.
+//! > a key that held nothing is reported deleted too — a key's delete is idempotent — while
+//! > an identifier that pins a `VersionId` the bucket holds no version of resolves to no
+//! > version and is that key's own `Errors` entry rather than a failure of the request,
+//! > whether that token is of the published shape or no version id's shape at all, and
+//! > `Quiet` leaves the successes out.
 //!
 //! Its sources (this operation's own documentation): "For each key, Amazon S3 performs a
 //! delete operation and returns the result of that delete, success or failure, in the
@@ -290,6 +291,153 @@ async fn a_batch_delete_reports_the_result_of_every_identifier_it_names() {
 }
 
 #[tokio::test]
+async fn an_identifier_that_pins_an_unresolvable_version_is_one_error_and_takes_nothing_away() {
+    // RULE: an identifier that pins a `VersionId` resolves to exactly the version of that
+    // name, so one the bucket holds no version of resolves to none: that identifier is the
+    // key's own `Errors` entry — `NoSuchVersion` "indicates that the version ID specified in
+    // the request does not match an existing version" — reported exactly once, never in
+    // `Deleted`, and the key's stored versions are left where they are.
+    //
+    // The rows differ along the FORM of the unresolvable token: one of the published shape
+    // that this store never minted, the real version id with its last character changed (the
+    // nearest miss a client's own bookkeeping produces), a token at the shape's own minimum
+    // width, the literal `null` version id on a bucket that has no null version, and a token
+    // that is no version id at all. Each rides in one batch beside a LIVE version of the same
+    // key, so the two sides of the one response are graded together.
+    let key = "versioned.bin";
+    let other = "kept.bin";
+    // (case, how the unresolvable token is built from the live version id this run minted —
+    // `None` for a token that stands on its own).
+    let rows: [(&str, Option<String>); 5] = [
+        (
+            "a token of the published shape that nothing minted",
+            Some("a".repeat(36)),
+        ),
+        (
+            "a token at the shape's minimum width",
+            Some("b".repeat(VERSION_ID_CHARS)),
+        ),
+        (
+            "the literal null version on a versioned bucket",
+            Some("null".to_string()),
+        ),
+        (
+            "a token that is no version id at all",
+            Some("not-a-version".to_string()),
+        ),
+        ("the live version id with its last character changed", None),
+    ];
+    for (case, stated) in rows {
+        let router = router();
+        let name = "batch-delete-unresolvable";
+        bucket(&router, name).await;
+        set_versioning(&router, name, "Enabled").await;
+        // Two writes of the key, so the batch can take one version away and leave the other
+        // readable, and a second key whose version is never named.
+        let first = write_keys(&router, name, &[key]).await[key].clone();
+        let doomed = write_keys(&router, name, &[key]).await[key].clone();
+        let kept = write_keys(&router, name, &[other]).await[other].clone();
+        // The nearest miss a client's own bookkeeping produces is built from the id this run
+        // minted, since that id is a per-run value.
+        let bogus = match stated {
+            Some(stated) => stated,
+            None => {
+                let mut flipped: Vec<char> = doomed.chars().collect();
+                let last = flipped.len() - 1;
+                flipped[last] = if flipped[last] == 'a' { 'b' } else { 'a' };
+                flipped.into_iter().collect::<String>()
+            }
+        };
+        assert_ne!(
+            bogus, doomed,
+            "case {case:?}: the unresolvable token must not name the live version"
+        );
+
+        let answer = delete_objects(
+            &router,
+            name,
+            &[(key, Some(&doomed)), (key, Some(&bogus))],
+            false,
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?}: the batch itself answers 200, got {} with body {:?}",
+            answer.status,
+            text(&answer)
+        );
+        let result = delete_result_of(&answer);
+
+        // The live version is the one success, and the unresolvable identifier is on the
+        // error side exactly once, echoing the pair the request sent.
+        let deleted_pairs: Vec<(String, String)> = result
+            .deleted
+            .iter()
+            .map(|entry| {
+                (
+                    entry.get("Key").cloned().unwrap_or_default(),
+                    entry.get("VersionId").cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            deleted_pairs,
+            vec![(key.to_string(), doomed.clone())],
+            "case {case:?}: only the live version is reported deleted, got {deleted_pairs:?} \
+             in body {:?}",
+            text(&answer)
+        );
+        let errored: Vec<(String, String, String, String)> = result
+            .errors
+            .iter()
+            .map(|entry| {
+                let field = |name: &str| entry.get(name).cloned().unwrap_or_default();
+                (
+                    field("Key"),
+                    field("VersionId"),
+                    field("Code"),
+                    field("Message"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            errored,
+            vec![(
+                key.to_string(),
+                bogus.clone(),
+                "NoSuchVersion".to_string(),
+                "The specified version does not exist.".to_string()
+            )],
+            "case {case:?}: the unresolvable pair is reported once on the error side, got \
+             {errored:?} in body {:?}",
+            text(&answer)
+        );
+
+        // And nothing else moved: the key's other version and the untouched key are both
+        // still readable.
+        for (held_key, version_id) in [(key, &first), (other, &kept)] {
+            let read = get_object(
+                &router,
+                name,
+                held_key,
+                &format!("?versionId={version_id}"),
+                &[],
+            )
+            .await;
+            assert_eq!(
+                read.status,
+                200,
+                "case {case:?}: the version {version_id:?} of {held_key:?} must still be \
+                 readable, got {} with body {:?}",
+                read.status,
+                text(&read)
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
     let router = router();
     let name = "batch-delete-versions";
@@ -364,13 +512,12 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
     }
 
     // Naming every version AND every marker empties the bucket in one request. Each
-    // identifier performs exactly what a `DeleteObject` for it would and reports THAT
-    // delete's result: a `VersionId` of the published shape the bucket holds no version of
-    // took nothing away and is confirmed deleted ("if the object specified in the request
-    // isn't found, Amazon S3 confirms the deletion by returning the result as deleted"),
-    // while a token that is no version id at all names no version of any object and is that
-    // identifier's own failure beside the keys that did delete (the single-object path
-    // refuses the ARGUMENT instead, see `version_id_classification`).
+    // identifier performs exactly what a `DeleteObject` for it would and reports what it
+    // resolved to: a `VersionId` the bucket holds no version of resolves to no version, so it
+    // is that identifier's own failure beside the keys that did delete and takes nothing away
+    // — whether the token is of the published shape or no version id's shape at all (the
+    // single-object path refuses the ARGUMENT for the latter, see
+    // `version_id_classification`).
     let mut named: Vec<(String, Option<String>)> = Vec::new();
     for key in keys {
         named.push(((*key).to_string(), Some(minted[*key].clone())));
@@ -401,9 +548,9 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
     let result = delete_result_of(&drained);
     assert_eq!(
         result.deleted_keys().len(),
-        5,
-        "every version and marker named, and the one shaped token that named nothing, is \
-         reported deleted, got {:?}",
+        4,
+        "every version and marker named is reported deleted, and neither unresolvable token \
+         is, got {:?}",
         result.deleted_keys()
     );
     assert_eq!(
@@ -413,14 +560,17 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
             .filter_map(|entry| entry.get("VersionId").cloned())
             .filter(|version_id| *version_id == "a".repeat(VERSION_ID_CHARS))
             .count(),
-        1,
-        "the confirmed entry echoes the version id the identifier named, got {:?}",
+        0,
+        "the token naming no stored version confirms no delete, got {:?}",
         result.deleted
     );
     assert_eq!(
         result.error_codes(),
-        vec![("one".to_string(), "NoSuchVersion".to_string())],
-        "only the identifier naming no version id at all is a failure of its own, got {:?}",
+        vec![
+            ("one".to_string(), "NoSuchVersion".to_string()),
+            ("one".to_string(), "NoSuchVersion".to_string())
+        ],
+        "each identifier naming no stored version is a failure of its own, got {:?}",
         result.error_codes()
     );
     let emptied = version_listing_of(&list_object_versions(&router, name, "").await);

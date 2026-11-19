@@ -20,14 +20,12 @@
 //! failure for it and the absent-version row is its modelled success (HTTP 204, empty body),
 //! while a token that is not shaped like a version id is still the refused argument — the
 //! classification that separates "fix the request" from "that version is gone" survives in
-//! the one operation whose absent case is a no-op. The `DeleteObjects` batch reports, per
-//! identifier, the result the `DeleteObject` for that identifier has — "DeleteObjects itself
-//! has no modeled top-level errors; each result entry carries Key, VersionId, Code, Message" —
-//! so a shaped token naming no version is that entry's confirmed delete ("if the object
-//! specified in the request isn't found, Amazon S3 confirms the deletion by returning the
-//! result as deleted"), and a token that is no version id at all, which names no version of
-//! any object and so has nothing to confirm, is that entry's own absent-version failure
-//! instead of the argument refusal only an operation taking one `versionId` argument can make.
+//! the one operation whose absent case is a no-op. The `DeleteObjects` batch declares no
+//! top-level error — "each result entry carries Key, VersionId, Code, Message" — so neither
+//! half is a refusal of the request there: an identifier that pins a version the bucket holds
+//! none of resolves to no version, whether its token is of the published shape or no version
+//! id's shape at all, and is that ENTRY's own absent-version failure rather than the argument
+//! refusal only an operation taking one `versionId` argument can make.
 
 use service_com_amazonaws_s3_amazons3::state::{MAX_VERSION_ID_CHARS, VERSION_ID_CHARS};
 use smithy_server_runtime::MultiServiceRouter;
@@ -308,11 +306,11 @@ async fn a_version_id_is_classified_the_same_way_wherever_it_arrives() {
         }
 
         // The batch path: the same id, as one entry of a `DeleteObjects` request. The
-        // request itself succeeds — what the entry reports is that identifier's own result,
-        // which is the result a `DeleteObject` for the same pair has: the shaped token naming
-        // nothing is confirmed deleted, and the token that is no version id at all is the
-        // entry's own failure, under the absent-version code rather than under the argument
-        // refusal only an operation taking one `versionId` argument can make.
+        // request itself succeeds — what the entry reports is what that identifier resolved
+        // to, and neither a shaped token the bucket holds no version of nor a token that is
+        // no version id at all resolves to a version, so each is the entry's own
+        // absent-version failure rather than a confirmed delete or the argument refusal only
+        // an operation taking one `versionId` argument can make.
         let batch = delete_objects(&router, name, &[(KEY, &version_id)]).await;
         assert_eq!(
             batch.status, 200,
@@ -322,27 +320,17 @@ async fn a_version_id_is_classified_the_same_way_wherever_it_arrives() {
         );
         let reported = entry_error(&batch);
         let confirmed = entry_deleted(&batch);
-        match expected == ABSENT {
-            true => assert_eq!(
-                (reported.clone(), confirmed.clone()),
-                (None, Some((KEY.to_string(), version_id.clone()))),
-                "case {case:?}/DeleteObjects: a shaped token naming no version took nothing \
-                 away, so the entry confirms the delete and echoes the identifier, got \
-                 {reported:?}/{confirmed:?} in body {:?}",
-                text(&batch)
+        assert_eq!(
+            (reported.clone(), confirmed.clone()),
+            (
+                Some((ABSENT.code.to_string(), ABSENT.message.to_string())),
+                None
             ),
-            false => assert_eq!(
-                (reported.clone(), confirmed.clone()),
-                (
-                    Some((ABSENT.code.to_string(), ABSENT.message.to_string())),
-                    None
-                ),
-                "case {case:?}/DeleteObjects: a token that is no version id names nothing to \
-                 confirm, so the entry is its own failure, got {reported:?}/{confirmed:?} in \
-                 body {:?}",
-                text(&batch)
-            ),
-        }
+            "case {case:?}/DeleteObjects: a version-pinned identifier that resolves to no \
+             version is the entry's own failure and confirms nothing, got \
+             {reported:?}/{confirmed:?} in body {:?}",
+            text(&batch)
+        );
     }
 
     // The id the store DID mint is served throughout, so every row above failed on what it

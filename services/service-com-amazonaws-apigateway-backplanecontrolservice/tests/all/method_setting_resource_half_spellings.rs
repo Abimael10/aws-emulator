@@ -8,12 +8,12 @@
 //!
 //! > A `methodSettings` key is the METHOD the patch addressed — "method paths defined
 //! > as {resource_path}/{http_method} for an individual method override, or /\*/\* for
-//! > overriding all methods in the stage" (`Stage$methodSettings`), written with the resource
-//! > path as ONE reference token: every separator of it, the leading one included, escaped
-//! > `~1` as `PatchOperation$path` spells a separator inside a path name, and only the
-//! > separator before the HTTP method real. Inside the PATCH PATH the resource path is
-//! > escaped the same way, so a pointer that spells its leading separator either way —
-//! > escaped into its first reference token, or left to the pointer's own leading
+//! > overriding all methods in the stage" (`Stage$methodSettings`), written as the method
+//! > path itself: the resource path without its leading separator, every other separator of
+//! > it literal, then the separator before the HTTP method. Inside the PATCH PATH that
+//! > resource path is escaped `~1` as `PatchOperation$path` spells a separator inside a path
+//! > name, so a pointer that spells its leading separator either way — escaped into its
+//! > first reference token, or left to the pointer's own leading
 //! > `/` — names the one method and is keyed the one way. A resource half carrying an
 //! > unescaped separator of its own names no method, because nothing in the pointer says where
 //! > the resource path stops and the method begins, so it is the modelled
@@ -55,19 +55,19 @@ struct Row {
 const ROWS: &[Row] = &[
     Row {
         case: "a child resource",
-        key: "~1pets/GET",
+        key: "pets/GET",
         escaped: "/~1pets/GET/caching/enabled",
         unprefixed: Some("/pets/GET/caching/enabled"),
     },
     Row {
         case: "a nested resource path",
-        key: "~1pets~1{petId}/GET",
+        key: "pets/{petId}/GET",
         escaped: "/~1pets~1{petId}/GET/caching/enabled",
         unprefixed: Some("/pets~1{petId}/GET/caching/enabled"),
     },
     Row {
         case: "the root resource",
-        key: "~1/GET",
+        key: "/GET",
         escaped: "/~1/GET/caching/enabled",
         unprefixed: Some("//GET/caching/enabled"),
     },

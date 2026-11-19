@@ -221,6 +221,7 @@ mod tests {
             // does not name.
             "af2504e0-4f89-11d3-9a0c-0305e82c3301",
             "AF2504E0-4F89-11D3-9A0C-0305E82C3301",
+            // A value the whole of which is a name run, though no stack carries it.
             "ae81d159090a7b61985604d0999cb465",
             "0e81d159-090a-7b61-9856-04d0999cb465",
             "0E81D159-090A-7B61-9856-04D0999CB465",

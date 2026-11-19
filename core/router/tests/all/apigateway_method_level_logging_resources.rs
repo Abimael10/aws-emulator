@@ -268,12 +268,20 @@ fn traced_line(request_id: &str, line: &str) -> String {
     format!("({request_id}) {line}")
 }
 
-/// The `methodSettings` key the method `verb` of `resource_path` is held under, which is also the
-/// patch path that addresses it behind the pointer's own leading separator: the resource path is
-/// ONE reference token, so every separator in it — the leading one included — is written as the
-/// escape `PatchOperation$path` spells a separator inside a path name with ("Any slash ("/")
-/// character appearing in path names must be escaped with "~1"").
+/// The `methodSettings` key the method `verb` of `resource_path` is held under: the method path
+/// `{resource_path}/{http_method}` (`Stage$methodSettings`) — the resource path without its
+/// leading separator and with every other separator of it literal, joined to the verb.
 fn method_key(resource_path: &str, verb: &str) -> String {
+    let unprefixed = resource_path.strip_prefix('/').unwrap_or(resource_path);
+    format!("{unprefixed}/{verb}")
+}
+
+/// The patch path that addresses a setting of that same method, behind the pointer's own leading
+/// separator: inside a pointer the resource path is ONE reference token, so every separator in it
+/// — the leading one included — is written as the escape `PatchOperation$path` spells a separator
+/// inside a path name with ("Any slash ("/") character appearing in path names must be escaped
+/// with "~1"").
+fn method_patch_path(resource_path: &str, verb: &str) -> String {
     format!("{escaped}/{verb}", escaped = resource_path.replace('/', "~1"))
 }
 
@@ -468,7 +476,7 @@ async fn gate(router: &MultiServiceRouter, api: &str) {
         let key = method_key(resource_path, verb);
         operations.push(json!({
             "op": "replace",
-            "path": format!("/{key}/logging/loglevel"),
+            "path": format!("/{}/logging/loglevel", method_patch_path(resource_path, verb)),
             "value": OVERRIDE_LEVEL,
         }));
         expected.push(key);

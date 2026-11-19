@@ -19,11 +19,10 @@
 //! included: an identifier that would permanently remove a version a legal hold or a
 //! running retention period protects is that key's own 403 `AccessDenied` entry
 //! ([`crate::state::Bucket::object_lock_delete_refusal`] carries the rule) and the version
-//! stays stored. For the same reason, a `VersionId` of the published shape that names no
-//! stored version took nothing away and is CONFIRMED deleted, the way a `DeleteObject` for
-//! the same pair answers; a token that is no version id at all
-//! ([`crate::state::version_id_is_well_formed`]) names no version of any object, so there is
-//! nothing to confirm and it is that key's own `NoSuchVersion` entry.
+//! stays stored. An identifier that PINS a version the bucket holds none of resolves to no
+//! version at all, so it is that key's own `NoSuchVersion` entry and its stored versions are
+//! left alone — the confirmation of an absent address belongs to the identifier that names a
+//! key, whose delete is idempotent.
 //!
 //! ## Shape of an operation
 //!
@@ -505,18 +504,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
                 Some(version_id) => {
                     // What this identifier performs is exactly what a `DeleteObject` for the
                     // same pair performs, so what it REPORTS is that delete's own result. A
-                    // version token the bucket holds no version of took nothing away and is
-                    // confirmed: "if the object specified in the request isn't found, Amazon S3
-                    // confirms the deletion by returning the result as deleted" — the no-op
-                    // success `DeleteObject` answers the same identifier with. A token that is
-                    // not shaped like a version id at all
+                    // `VersionId` names ONE version, and S3 "indicates that the version ID
+                    // specified in the request does not match an existing version"
+                    // (`NoSuchVersion`) when the bucket holds none of that name: the
+                    // confirmation of an absent address — "if the object specified in the
+                    // request isn't found, Amazon S3 confirms the deletion by returning the
+                    // result as deleted" — belongs to the identifier that names a KEY, whose
+                    // delete is idempotent, not to one that pins a version that was never
+                    // there. The batch declares no error of its own to refuse the request
+                    // with, so that is THIS key's own failure, reported beside the keys that
+                    // did delete under the absent-version code, and nothing of the key is
+                    // taken away. A token that is not shaped like a version id at all
                     // ([`crate::state::version_id_is_well_formed`]) names no version of any
-                    // object in any bucket, so there is nothing for it to confirm; the batch
-                    // declares no error of its own to refuse the request with, so that is THIS
-                    // key's own failure, reported beside the keys that did delete under the code
-                    // a single-object delete of a version that is not there answers
-                    // (`NoSuchVersion`) rather than under the argument refusal only an operation
-                    // that judges one `versionId` argument can make.
+                    // object either, so it is the same entry rather than the argument refusal
+                    // only an operation that judges one `versionId` argument can make.
                     let removed_marker = store
                         .bucket(&input.bucket)
                         .and_then(|bucket| bucket.stored_version(key, version_id))
@@ -545,17 +546,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
                                     .then(|| version_id.to_string()),
                             });
                         }
-                        // A version token naming no stored version: nothing was there, which
-                        // the result confirms as deleted, echoing the identifier it performed.
-                        // Nothing was taken away, so nothing notifies.
-                        _ if crate::state::version_id_is_well_formed(version_id) => {
-                            deleted.push(DeletedObject {
-                                key: Some(key.to_string()),
-                                version_id: Some(version_id.to_string()),
-                                ..DeletedObject::default()
-                            });
-                        }
-                        // And a token that is no version id at all is this key's own failure.
+                        // A `VersionId` the bucket holds no version of: nothing was removed,
+                        // so the entry reports the version it could not resolve, echoing the
+                        // identifier it was handed. Nothing was taken away, so nothing
+                        // notifies.
                         _ => errors.push(Error {
                             key: Some(key.to_string()),
                             version_id: Some(version_id.to_string()),

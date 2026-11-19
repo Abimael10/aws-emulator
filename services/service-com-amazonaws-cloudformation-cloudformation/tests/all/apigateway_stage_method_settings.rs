@@ -7,10 +7,10 @@
 //! RULE under test: **a `MethodSettings` entry configures the method its `ResourcePath` and
 //! `HttpMethod` name, and `Stage$methodSettings` keys what it configured by that method path
 //! — "method paths defined as {resource_path}/{http_method} for an individual method
-//! override, or /\*/\* for overriding all methods in the stage" — with the resource path
-//! carried as ONE reference token: every separator in it, the leading one included, written
-//! as the `~1` escape a path name spells a separator with, and only the separator before the
-//! HTTP method real. The key is therefore the one API Gateway reports for that method
+//! override, or /\*/\* for overriding all methods in the stage" — the resource path
+//! without its leading separator, every other separator of it literal, then the separator
+//! before the HTTP method. The `~1` escape belongs to the patch POINTER that addresses the
+//! entry, not to the key. The key is therefore the one API Gateway reports for that method
 //! whichever way the declaration stated the path: `MethodSetting$ResourcePath` may state it
 //! already pointer-encoded, its initial slash included, or with its separators plain, and
 //! both state the one method.**
@@ -52,25 +52,25 @@ const ROWS: &[Row] = &[
         case: "a child resource",
         resource_path: "/cached",
         http_method: "GET",
-        key: "~1cached/GET",
+        key: "cached/GET",
     },
     Row {
         case: "a nested resource path, stated plainly",
         resource_path: "/items/{id}",
         http_method: "PUT",
-        key: "~1items~1{id}/PUT",
+        key: "items/{id}/PUT",
     },
     Row {
         case: "a nested resource path, stated encoded as the type documents",
         resource_path: "/~1orders~1{id}",
         http_method: "DELETE",
-        key: "~1orders~1{id}/DELETE",
+        key: "orders/{id}/DELETE",
     },
     Row {
         case: "the root resource",
         resource_path: "/",
         http_method: "HEAD",
-        key: "~1/HEAD",
+        key: "/HEAD",
     },
     Row {
         case: "every method of the stage",

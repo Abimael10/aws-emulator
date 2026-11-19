@@ -235,6 +235,10 @@ const ADMITTED_BUT_ABSENT: &[(&str, &str)] = &[
         "af2504e0-4f89-11d3-9a0c-0305e82c3301",
     ),
     (
+        "that form in upper-case hexadecimal",
+        "0E81D159-090A-7B61-9856-04D0999CB465",
+    ),
+    (
         "that form with a non-hexadecimal letter",
         "ag2504e0-4f89-11d3-9a0c-0305e82c3301",
     ),

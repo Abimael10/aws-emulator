@@ -221,10 +221,16 @@ async fn deployed(router: &MultiServiceRouter, function_arn: &str, label: &str) 
 }
 
 /// The `methodSettings` key API Gateway reports the per-method setting of `verb` on
-/// `/{RESOURCE_PART}` under, and — behind the pointer's own leading separator — the
-/// `UpdateStage` patch path that addresses it: the resource path is one reference token, so
-/// its leading separator is the escape `~1`.
+/// `/{RESOURCE_PART}` under: the method path, which is the resource path without its leading
+/// separator joined to the HTTP method.
 fn method_key(verb: &str) -> String {
+    format!("{RESOURCE_PART}/{verb}")
+}
+
+/// The `UpdateStage` patch path that addresses a setting of that same method, behind the
+/// pointer's own leading separator: inside a pointer the resource path is one reference token,
+/// so its leading separator is the escape `~1`.
+fn method_patch_path(verb: &str) -> String {
     format!("~1{RESOURCE_PART}/{verb}")
 }
 
@@ -254,7 +260,7 @@ async fn gate(
     for (verb, level) in per_method {
         operations.push(json!({
             "op": "replace",
-            "path": format!("/{}/logging/loglevel", method_key(verb)),
+            "path": format!("/{}/logging/loglevel", method_patch_path(verb)),
             "value": level,
         }));
         expected.push(method_key(verb));
