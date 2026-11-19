@@ -27,7 +27,9 @@
 //! is delivered at all whatever queued the event is
 //! `async_retry_exhaustion_destination.rs`'s; this suite is about the LENGTH of the ladder of
 //! attempts, which is what a client relying on Lambda to retry a transient failure reads the
-//! retry policy through.
+//! retry policy through. `async_retry_budget_from_stored_config.rs` drives that same ladder
+//! for a budget `UpdateFunctionEventInvokeConfig` stated, through the wiring and the one
+//! reader of what a ladder leaves behind this file shares with it ([`assert_each_ladder`]).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,8 +48,11 @@ use crate::synchronous_invoke_run::package;
 /// Where `CreateFunction` and `Invoke` are bound.
 const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
-/// Where `PutFunctionEventInvokeConfig` is bound.
-const EVENT_INVOKE_CONFIG_URI: &str = "/2019-09-25/functions";
+/// Where `PutFunctionEventInvokeConfig` is bound, and the other two operations of that
+/// resource with it.
+///
+/// Shared with [`crate::async_retry_budget_from_stored_config`]; see [`assert_each_ladder`].
+pub(crate) const EVENT_INVOKE_CONFIG_URI: &str = "/2019-09-25/functions";
 
 /// The Region every call below is made in, and so the Region of every ARN it mints.
 const REGION: &str = "us-east-1";
@@ -115,7 +120,7 @@ def lambda_handler(event, context):
 /// Lambda beside the queue service the counting messages and the invocation records are read
 /// on — all on ONE engine, so every write the handler and the destination delivery make is
 /// where a client reads it.
-fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(engine)));
@@ -135,7 +140,9 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// One Lambda control-plane or data-plane call, as its status and its body.
-async fn lambda(
+///
+/// Shared with [`crate::async_retry_budget_from_stored_config`]; see [`assert_each_ladder`].
+pub(crate) async fn lambda(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -190,7 +197,9 @@ async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16
 }
 
 /// A queue of this account, as the queue itself reports it: its url and its ARN.
-async fn given_queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {
+///
+/// Shared with [`crate::async_retry_budget_from_stored_config`]; see [`assert_each_ladder`].
+pub(crate) async fn given_queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {
     let (status, created) = sqs(router, "CreateQueue", &json!({ "QueueName": name })).await;
     assert_eq!(
         status, 200,
@@ -218,7 +227,9 @@ async fn given_queue(router: &MultiServiceRouter, case: &str, name: &str) -> (St
 }
 
 /// A function whose package RUNS [`HANDLER_SOURCE`], brought to `Active`.
-async fn given_function(
+///
+/// Shared with [`crate::async_retry_budget_from_stored_config`]; see [`assert_each_ladder`].
+pub(crate) async fn given_function(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     case: &str,
@@ -263,7 +274,11 @@ fn make_active(engine: &Arc<engine::InMemoryEngine>) {
 
 /// `PutFunctionEventInvokeConfig` on the function's unpublished version: the retries it
 /// allows, when the row states any, and the queue its failed invocations' records go to.
-async fn given_event_invoke_config(
+///
+/// Shared with [`crate::async_retry_budget_from_stored_config`], whose rows PUT their
+/// destination this way and then state the budget in force through an update; see
+/// [`assert_each_ladder`].
+pub(crate) async fn given_event_invoke_config(
     router: &MultiServiceRouter,
     case: &str,
     function: &str,
@@ -292,7 +307,9 @@ async fn given_event_invoke_config(
 
 /// Queue one event for `function` through an asynchronous `Invoke`, which the accepting call
 /// answers `202` for.
-async fn invoked_asynchronously(
+///
+/// Shared with [`crate::async_retry_budget_from_stored_config`]; see [`assert_each_ladder`].
+pub(crate) async fn invoked_asynchronously(
     router: &MultiServiceRouter,
     case: &str,
     function: &str,
@@ -359,18 +376,22 @@ struct Row {
     attempts: usize,
 }
 
-/// What one row is observed through.
-struct Wired {
+/// What one row is observed through, once it is wired and its event queued.
+///
+/// Shared with [`crate::async_retry_budget_from_stored_config`], whose rows state the budget
+/// in force through an update; see [`assert_each_ladder`].
+pub(crate) struct Ladder {
+    /// The row this wiring belongs to, which every assertion below names.
+    pub(crate) case: &'static str,
     /// The queue the handler writes its counting message to on every entry.
-    attempts_url: String,
+    pub(crate) attempts_url: String,
     /// The queue the qualifier's `DestinationConfig$OnFailure` names.
-    failure_url: String,
+    pub(crate) failure_url: String,
     /// The marker this row's event carries, which every attempt of it repeats.
-    marker: String,
-    /// What has been taken off the attempts queue so far.
-    counted: Vec<Value>,
-    /// What has been taken off the failure destination so far.
-    records: Vec<Value>,
+    pub(crate) marker: String,
+    /// The entries into the handler the budget in force allows this row's event: the first
+    /// invocation plus the retries the configuration holds.
+    pub(crate) attempts: usize,
 }
 
 /// RULE: a failing asynchronous event enters the handler `1 + MaximumRetryAttempts` times —
@@ -411,7 +432,7 @@ async fn a_failing_event_enters_the_handler_once_plus_the_retries_it_is_allowed(
 
     // Every row is wired and its event queued first, so the ladders of attempts run alongside
     // one another rather than one suite-length wait per row.
-    let mut wired: Vec<Wired> = Vec::new();
+    let mut wired: Vec<Ladder> = Vec::new();
     for row in rows {
         let (attempts_url, _) =
             given_queue(&router, row.case, &format!("{}-attempts", row.function)).await;
@@ -428,43 +449,61 @@ async fn a_failing_event_enters_the_handler_once_plus_the_retries_it_is_allowed(
             &json!({ "marker": marker, "attempts": attempts_url }),
         )
         .await;
-        wired.push(Wired {
+        wired.push(Ladder {
+            case: row.case,
             attempts_url,
             failure_url,
             marker,
-            counted: Vec::new(),
-            records: Vec::new(),
+            attempts: row.attempts,
         });
     }
+
+    assert_each_ladder(&router, &wired).await;
+}
+
+/// Assert the RULE over every wired row whose event has been queued: the handler is entered
+/// exactly [`Ladder::attempts`] times, every entry carrying the queued event's marker and one
+/// invocation's request id; no further entry and no second record arrive inside the quiet
+/// window; and exactly one record reports `RetriesExhausted` with those entries as
+/// `requestContext.approximateInvokeCount`.
+///
+/// Shared with [`crate::async_retry_budget_from_stored_config`], so the two suites that drive
+/// a ladder of attempts have ONE reader of what it leaves behind. Every wait looks again until
+/// what it waits for is there or [`BUDGET`] passes, so a loaded host — where an attempt that
+/// finds no capacity to run the function is made again rather than counted — is waited for,
+/// and only something that never arrives fails a row.
+pub(crate) async fn assert_each_ladder(router: &MultiServiceRouter, ladders: &[Ladder]) {
+    // What has been taken off each row's two queues so far, one entry per ladder.
+    let mut counted: Vec<Vec<Value>> = ladders.iter().map(|_| Vec::new()).collect();
+    let mut records: Vec<Vec<Value>> = ladders.iter().map(|_| Vec::new()).collect();
 
     // Look again until every row has the attempts its configuration allows AND its record, or
     // the patience above runs out: what each wait reports is what the emulator did rather than
     // how fast this host is.
     let deadline = Instant::now() + BUDGET;
     loop {
-        for (row, held) in rows.iter().zip(wired.iter_mut()) {
-            let counted = drained(&router, row.case, &held.attempts_url).await;
-            held.counted.extend(counted);
-            let records = drained(&router, row.case, &held.failure_url).await;
-            held.records.extend(records);
+        for (index, ladder) in ladders.iter().enumerate() {
+            let more = drained(router, ladder.case, &ladder.attempts_url).await;
+            counted[index].extend(more);
+            let again = drained(router, ladder.case, &ladder.failure_url).await;
+            records[index].extend(again);
         }
-        let complete = rows
-            .iter()
-            .zip(wired.iter())
-            .all(|(row, held)| held.counted.len() >= row.attempts && !held.records.is_empty());
+        let complete = ladders.iter().enumerate().all(|(index, ladder)| {
+            counted[index].len() >= ladder.attempts && !records[index].is_empty()
+        });
         if complete {
             break;
         }
-        let progress: Vec<String> = rows
+        let progress: Vec<String> = ladders
             .iter()
-            .zip(wired.iter())
-            .map(|(row, held)| {
+            .enumerate()
+            .map(|(index, ladder)| {
                 format!(
                     "{:?}: {} of {} attempts, {} record(s)",
-                    row.case,
-                    held.counted.len(),
-                    row.attempts,
-                    held.records.len()
+                    ladder.case,
+                    counted[index].len(),
+                    ladder.attempts,
+                    records[index].len()
                 )
             })
             .collect();
@@ -480,16 +519,16 @@ async fn a_failing_event_enters_the_handler_once_plus_the_retries_it_is_allowed(
     // arrives inside this window rather than after it.
     let quiet_until = Instant::now() + QUIET_WINDOW;
     while Instant::now() < quiet_until {
-        for (row, held) in rows.iter().zip(wired.iter()) {
-            let case = row.case;
-            let more = drained(&router, case, &held.attempts_url).await;
+        for ladder in ladders {
+            let case = ladder.case;
+            let more = drained(router, case, &ladder.attempts_url).await;
             assert!(
                 more.is_empty(),
                 "case {case:?}: expected exactly {} entries into the handler, got another \
                  {more:?}",
-                row.attempts
+                ladder.attempts
             );
-            let again = drained(&router, case, &held.failure_url).await;
+            let again = drained(router, case, &ladder.failure_url).await;
             assert!(
                 again.is_empty(),
                 "case {case:?}: expected exactly one invocation record, got another {again:?}"
@@ -498,25 +537,25 @@ async fn a_failing_event_enters_the_handler_once_plus_the_retries_it_is_allowed(
         tokio::time::sleep(LOOK_AGAIN).await;
     }
 
-    for (row, held) in rows.iter().zip(wired.iter()) {
-        let case = row.case;
-        let counted = &held.counted;
+    for (index, ladder) in ladders.iter().enumerate() {
+        let case = ladder.case;
+        let entries = &counted[index];
         assert_eq!(
-            counted.len(),
-            row.attempts,
-            "case {case:?}: expected the handler to be entered {} times, got {counted:?}",
-            row.attempts
+            entries.len(),
+            ladder.attempts,
+            "case {case:?}: expected the handler to be entered {} times, got {entries:?}",
+            ladder.attempts
         );
         // Every retry is of the SAME event under the SAME invocation, so every entry carries
         // the marker the accepting call queued and that invocation's own request id.
-        let request_ids: Vec<&str> = counted
+        let request_ids: Vec<&str> = entries
             .iter()
             .map(|message| message["requestId"].as_str().unwrap_or_default())
             .collect();
-        for message in counted {
+        for message in entries {
             assert_eq!(
                 message["marker"].as_str(),
-                Some(held.marker.as_str()),
+                Some(ladder.marker.as_str()),
                 "case {case:?}: expected every entry to carry the queued event's marker, got \
                  {message}"
             );
@@ -530,13 +569,13 @@ async fn a_failing_event_enters_the_handler_once_plus_the_retries_it_is_allowed(
         );
         let invocation = request_ids.first().copied().unwrap_or_default();
 
+        let held_records = &records[index];
         assert_eq!(
-            held.records.len(),
+            held_records.len(),
             1,
-            "case {case:?}: expected exactly one invocation record, got {:?}",
-            held.records
+            "case {case:?}: expected exactly one invocation record, got {held_records:?}"
         );
-        let record = &held.records[0];
+        let record = &held_records[0];
         // (the member the record carries, the value it must carry)
         let stated: &[(&str, Value)] = &[
             (
@@ -545,10 +584,10 @@ async fn a_failing_event_enters_the_handler_once_plus_the_retries_it_is_allowed(
             ),
             (
                 "/requestContext/approximateInvokeCount",
-                json!(row.attempts),
+                json!(ladder.attempts),
             ),
             ("/requestContext/requestId", json!(invocation)),
-            ("/requestPayload/marker", json!(held.marker)),
+            ("/requestPayload/marker", json!(ladder.marker)),
         ];
         for (pointer, expected) in stated {
             let read = record.pointer(pointer).cloned().unwrap_or(Value::Null);
