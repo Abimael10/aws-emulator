@@ -168,7 +168,9 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // `acm__cloudformation__mediaconvert.deploy-mediaconvert-certificateassociation-unknown-certificate-rejected`,
     // whose reason reads `Resource handler returned message: "<the service's sentence>
     // (Service: MediaConvert; Operation: AssociateCertificate; Status Code: 404; Error Code:
-    // NotFoundException; Request ID: …)" (RequestToken: …, HandlerErrorCode: NotFound)`).
+    // NotFoundException; Request ID: …)" (RequestToken: …, HandlerErrorCode: NotFound)`). Its
+    // three TRANSCODING types are provisioned by a provider that words another shape, which is
+    // recorded per provider ([`SDK_PROVIDER_SHAPES`]).
     ("mediaconvert", "MediaConvert", SdkDiagnostic::Operation),
     // Neptune Analytics' SDK names it `NeptuneGraph` — that model's own `sdkId`
     // (`Neptune Graph`) written as one word, exactly as Application Auto Scaling's above is —
@@ -234,14 +236,69 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     ("xray", "XRay", SdkDiagnostic::Envelope),
 ];
 
+/// The PROVIDERS whose diagnostic shape differs from the one their service's entry above
+/// carries, keyed by the OPERATION the provider's refused call named.
+///
+/// A resource provider is a per-TYPE artifact, built against whichever generation of its
+/// service's SDK it was published with, so two providers of ONE service can word two shapes —
+/// and the shape belongs to the provider, not to the service. Where a service's providers
+/// disagree, its entry above carries one of them and the operations the other provider calls
+/// are recorded here, each citing the recorded reason the shape was read from.
+///
+/// Read only where the caller NAMED the operation ([`in_process_calls::call_rest_json_named`]),
+/// since that is what says which provider made the call; a call that names none takes its
+/// service's own shape.
+///
+/// A row is per OPERATION rather than per recorded call, because the shape is the PROVIDER's:
+/// one recorded reason fixes the shape for every call the provider that answered it makes, and
+/// the rows below say which reason that was, so a later recording of another of those calls can
+/// correct them.
+const SDK_PROVIDER_SHAPES: &[(&str, &str, SdkDiagnostic)] = &[
+    // AWS Elemental MediaConvert's three TRANSCODING types — the queue a stack's jobs run in,
+    // the job template they are created from and the preset an output is written with
+    // ([`provisioning::mediaconvert_resources`]) — are provisioned by a provider that words the
+    // ATTEMPT-counting shape, where that service's entry above carries the semicolon-separated
+    // one its certificate association's provider words. Read from the recorded
+    // `ResourceStatusReason` of an `AWS::MediaConvert::Queue` declared `RESERVED` — a type that
+    // publishes no reservation-plan property, so the create reaches that service without the
+    // settings a reserved queue requires (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check
+    // `cloudformation__mediaconvert.deploy-mediaconvert-queue-reserved-pricing-plan-rejected`,
+    // whose reason reads `Resource handler returned message: "<the service's sentence>
+    // (Service: MediaConvert, Status Code: 400, Request ID: …) (SDK Attempt Count: …)"
+    // (RequestToken: …, HandlerErrorCode: InvalidRequest)`). That is the one reason RECORDED for
+    // these providers; the other eight rows are the same provider's other calls, which word the
+    // shape it words — a recording of one of them is what would correct them.
+    ("mediaconvert", "CreateQueue", SdkDiagnostic::Attempts),
+    ("mediaconvert", "UpdateQueue", SdkDiagnostic::Attempts),
+    ("mediaconvert", "DeleteQueue", SdkDiagnostic::Attempts),
+    ("mediaconvert", "CreateJobTemplate", SdkDiagnostic::Attempts),
+    ("mediaconvert", "UpdateJobTemplate", SdkDiagnostic::Attempts),
+    ("mediaconvert", "DeleteJobTemplate", SdkDiagnostic::Attempts),
+    ("mediaconvert", "CreatePreset", SdkDiagnostic::Attempts),
+    ("mediaconvert", "UpdatePreset", SdkDiagnostic::Attempts),
+    ("mediaconvert", "DeletePreset", SdkDiagnostic::Attempts),
+];
+
+/// The shape the provider that called `operation` of `signing_name` words, where that differs
+/// from its service's own ([`SDK_PROVIDER_SHAPES`]).
+fn provider_shape(signing_name: &str, operation: Option<&str>) -> Option<SdkDiagnostic> {
+    let operation = operation?;
+    SDK_PROVIDER_SHAPES
+        .iter()
+        .find(|(name, called, _)| *name == signing_name && *called == operation)
+        .map(|(_, _, shape)| *shape)
+}
+
 /// The SHAPE of the parenthesis an SDK appends to the message of the exception it raises for
 /// a refused call.
 ///
 /// Each names the service and the HTTP status; what differs is what else they carry and how
 /// the parts are separated. Which of them a called service's SDK words is that SDK's, and it
 /// is not derivable from the service, so it is RECORDED per service in
-/// [`SDK_SERVICE_NAMES`] — each entry citing where that shape was read from — and a service
-/// with no entry has no diagnostic invented for it at all.
+/// [`SDK_SERVICE_NAMES`] — each entry citing where that shape was read from, with
+/// [`SDK_PROVIDER_SHAPES`] recording the providers of a service that word another one — and a
+/// service with no entry has no diagnostic invented for it at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SdkDiagnostic {
     /// `(Service: <service>, Status Code: <status>, Request ID: <id>) (SDK Attempt Count:
@@ -331,6 +388,9 @@ pub(super) fn sdk_diagnostic(
         .iter()
         .find(|(name, _, _)| *name == signing_name)
         .map(|(_, service, shape)| (*service, *shape))?;
+    // The shape the PROVIDER that made this call words, where that service's providers do not
+    // all word the same one ([`SDK_PROVIDER_SHAPES`]).
+    let shape = provider_shape(signing_name, operation).unwrap_or(shape);
     // The envelope the two comma-separated shapes open with, written once so the two cannot
     // state the service, the status and the call's id differently.
     let envelope = || {

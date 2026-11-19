@@ -69,6 +69,15 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // different group, which CloudFormation replaces. (A subnet group needs no entry:
         // both of its properties beside the name are `UpdateSubnetGroup`'s own members.)
         MEMORYDB_PARAMETER_GROUP => &["Description", "Family"],
+        // A MediaConvert queue keeps the PRICING PLAN it was created with: `pricingPlan` is a
+        // member of `CreateQueue` and of no member of `UpdateQueue` — which takes a queue's
+        // description, status, concurrency and reservation plan and no pricing plan at all
+        // (`smithy_query(query="operation",operation="CreateQueue,UpdateQueue")`) — so a
+        // declaration restating it asks for a different queue, which CloudFormation replaces.
+        // (Its NAME is in that position through [`name_is_create_only`], as a job template's
+        // and a preset's are; every other property of the three is a member of that type's own
+        // update.)
+        MEDIACONVERT_QUEUE => &["PricingPlan"],
         // A spending limit is a cost control ABOUT one device: `UpdateSpendingLimit` takes
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.

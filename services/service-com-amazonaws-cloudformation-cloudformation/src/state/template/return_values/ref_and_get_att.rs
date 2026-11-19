@@ -2554,6 +2554,34 @@ pub(crate) fn return_values(
             );
             (name.to_string(), attributes)
         }
+        // "Ref returns the name" for each of the three AWS Elemental MediaConvert types, and
+        // each publishes `Arn` — "the Amazon Resource Name (ARN) of the queue", of the job
+        // template, of the preset. The arm exists for the ARN's RESOURCE PATH: MediaConvert
+        // writes it with the PLURAL noun (`queues/<name>`, `jobTemplates/<name>`,
+        // `presets/<name>` — the segments its own answers carry in each resource's `Arn`
+        // member and its tagging calls resolve), where the uniform convention
+        // ([`super::super::conventional_attributes`]) would give them the singular, hyphenated
+        // type segment. The ARN computed here is therefore the one that service reports for the
+        // resource of this name, which is also the one
+        // [`crate::state::provisioning::mediaconvert_resources`] reads off the create's own
+        // answer — both built from the one account id this emulator mints and the resource's
+        // name.
+        MEDIACONVERT_QUEUE | MEDIACONVERT_JOB_TEMPLATE | MEDIACONVERT_PRESET => {
+            let segment = match resource_type {
+                MEDIACONVERT_QUEUE => MEDIACONVERT_QUEUE_SEGMENT,
+                MEDIACONVERT_JOB_TEMPLATE => MEDIACONVERT_JOB_TEMPLATE_SEGMENT,
+                _ => MEDIACONVERT_PRESET_SEGMENT,
+            };
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    MEDIACONVERT_ARN_NAMESPACE,
+                    region,
+                    &format!("{segment}/{name}"),
+                ),
+            );
+            (name.to_string(), attributes)
+        }
         // "Ref returns the record name"; the type publishes no `Fn::GetAtt` attribute. The
         // record name CloudFormation reports is the DNS name WITHOUT its terminal dot: a
         // zone's own names are fully qualified in Route 53 ("Route 53 treats

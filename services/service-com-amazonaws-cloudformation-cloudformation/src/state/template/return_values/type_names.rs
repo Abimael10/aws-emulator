@@ -1412,6 +1412,36 @@ pub const APPCONFIG_DEPLOYMENT_STRATEGY: &str = "AWS::AppConfig::DeploymentStrat
 pub const MEMORYDB_PARAMETER_GROUP: &str = "AWS::MemoryDB::ParameterGroup";
 pub const MEMORYDB_SUBNET_GROUP: &str = "AWS::MemoryDB::SubnetGroup";
 
+/// The `AWS::<cloudFormationName>::<Resource>` types of the AWS Elemental MediaConvert
+/// transcoding estate a stack declares. The middle segment is that model's own
+/// `awsService.cloudFormationName` (`MediaConvert`,
+/// `smithy_query(query="service_info")` on that service's model).
+///
+/// "Ref returns the name" for each — the `Name` the declaration states, which is the
+/// identifier every MediaConvert call on one takes (`GetQueue$Name`,
+/// `GetJobTemplate$Name` and `GetPreset$Name` are each that operation's one `@httpLabel`)
+/// — so none of the three identities is service-assigned
+/// ([`identity_is_service_assigned`]). Each publishes its own `Arn`, built from the
+/// resource-type segment that service's ARNs carry
+/// ([`MEDIACONVERT_QUEUE_SEGMENT`] and its siblings), and
+/// [`crate::state::provisioning::mediaconvert_resources`] is what creates them.
+pub const MEDIACONVERT_QUEUE: &str = "AWS::MediaConvert::Queue";
+pub const MEDIACONVERT_JOB_TEMPLATE: &str = "AWS::MediaConvert::JobTemplate";
+pub const MEDIACONVERT_PRESET: &str = "AWS::MediaConvert::Preset";
+
+/// AWS Elemental MediaConvert's ARN namespace, which is its model's own
+/// `awsService.arnNamespace` (`mediaconvert`).
+pub const MEDIACONVERT_ARN_NAMESPACE: &str = "mediaconvert";
+
+/// The resource-type segments a MediaConvert ARN spells these three with: the PLURAL noun,
+/// `queues/<name>`, `jobTemplates/<name>` and `presets/<name>` — the segments that service's
+/// own answers carry in each resource's `Arn` member, and the ones its tagging calls resolve
+/// — where the uniform convention ([`super::super::conventional_attributes`]) would give them
+/// the singular, hyphenated type segment (`queue`, `job-template`).
+pub const MEDIACONVERT_QUEUE_SEGMENT: &str = "queues";
+pub const MEDIACONVERT_JOB_TEMPLATE_SEGMENT: &str = "jobTemplates";
+pub const MEDIACONVERT_PRESET_SEGMENT: &str = "presets";
+
 /// Amazon MemoryDB's ARN namespace, which is its model's own `awsService.arnNamespace`
 /// (`memorydb`) rather than the `MemoryDB` its resource types are spelled with.
 pub const MEMORYDB_ARN_NAMESPACE: &str = "memorydb";

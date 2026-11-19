@@ -413,6 +413,10 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         MEMORYDB_PARAMETER_GROUP | MEMORYDB_SUBNET_GROUP => {
             &[crate::state::template::UPPER_CASE_ARN_ATTRIBUTE]
         }
+        // Each AWS Elemental MediaConvert type publishes its own ARN, under the member name
+        // that service's model spells it with (`Queue$Arn`, `JobTemplate$Arn`, `Preset$Arn`:
+        // "an identifier for this resource that is unique within all of AWS").
+        MEDIACONVERT_QUEUE | MEDIACONVERT_JOB_TEMPLATE | MEDIACONVERT_PRESET => &["Arn"],
         _ => &[],
     }
 }

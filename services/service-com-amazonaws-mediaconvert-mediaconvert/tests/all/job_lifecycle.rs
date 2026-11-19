@@ -912,7 +912,8 @@ async fn re_creating_a_queue_is_idempotent_and_unknown_queues_are_not_found() {
 
 /// `ReservationPlanSettings` is "Required for reserved queues and not applicable to
 /// on-demand queues", so each pairing of `PricingPlan` with the member's presence is
-/// accepted or refused accordingly.
+/// accepted or refused accordingly — and a refused pairing carries the sentence AWS words
+/// for it, which is fixed text with nothing of the request in it.
 #[tokio::test]
 async fn a_reservation_plan_is_required_exactly_for_reserved_queues() {
     let plan = json!({
@@ -920,37 +921,98 @@ async fn a_reservation_plan_is_required_exactly_for_reserved_queues() {
         "renewalType": "EXPIRE",
         "reservedSlots": 1
     });
-    // (label, pricingPlan, reservation plan present, expected status)
-    let cases: Vec<(&str, Option<&str>, bool, u16)> = vec![
-        ("reserved without a plan", Some("RESERVED"), false, 400),
-        ("reserved with a plan", Some("RESERVED"), true, 201),
-        ("on-demand with a plan", Some("ON_DEMAND"), true, 400),
-        ("on-demand without a plan", Some("ON_DEMAND"), false, 201),
-        ("defaulted plan, no settings", None, false, 201),
-        ("defaulted plan with settings", None, true, 400),
+    /// The sentence a reserved queue submitted without reservation plan settings is refused
+    /// with, as AWS words it.
+    const RESERVED_WITHOUT_A_PLAN: &str =
+        "You must provide reservation plan settings when creating a reserved queue.";
+    /// One pairing of `PricingPlan` with the member's presence, and what the create must
+    /// answer for it.
+    struct Pairing {
+        label: &'static str,
+        /// The `PricingPlan` the request states, or `None` for a request stating none.
+        pricing_plan: Option<&'static str>,
+        /// Whether the request carries `ReservationPlanSettings`.
+        with_plan: bool,
+        /// The HTTP status the create must answer.
+        expected: u16,
+        /// The message a refusal must state, where the pairing has one.
+        message: Option<&'static str>,
+    }
+    let cases: &[Pairing] = &[
+        Pairing {
+            label: "reserved without a plan",
+            pricing_plan: Some("RESERVED"),
+            with_plan: false,
+            expected: 400,
+            message: Some(RESERVED_WITHOUT_A_PLAN),
+        },
+        Pairing {
+            label: "reserved with a plan",
+            pricing_plan: Some("RESERVED"),
+            with_plan: true,
+            expected: 201,
+            message: None,
+        },
+        Pairing {
+            label: "on-demand with a plan",
+            pricing_plan: Some("ON_DEMAND"),
+            with_plan: true,
+            expected: 400,
+            message: None,
+        },
+        Pairing {
+            label: "on-demand without a plan",
+            pricing_plan: Some("ON_DEMAND"),
+            with_plan: false,
+            expected: 201,
+            message: None,
+        },
+        Pairing {
+            label: "defaulted plan, no settings",
+            pricing_plan: None,
+            with_plan: false,
+            expected: 201,
+            message: None,
+        },
+        Pairing {
+            label: "defaulted plan with settings",
+            pricing_plan: None,
+            with_plan: true,
+            expected: 400,
+            message: None,
+        },
     ];
 
     let emulator = Emulator::new();
-    for (index, (label, pricing_plan, with_plan, expected)) in cases.iter().enumerate() {
+    for (index, case) in cases.iter().enumerate() {
+        let label = case.label;
         let mut request = json!({ "name": format!("queue-{index}") });
-        if let Some(pricing_plan) = pricing_plan {
+        if let Some(pricing_plan) = case.pricing_plan {
             request["pricingPlan"] = json!(pricing_plan);
         }
-        if *with_plan {
+        if case.with_plan {
             request["reservationPlanSettings"] = plan.clone();
         }
         let reply = emulator.create_queue(request).await;
         assert_eq!(
-            reply.status, *expected,
-            "case {label:?}: expected HTTP {expected}, got {} with body {}",
-            reply.status, reply.body
+            reply.status, case.expected,
+            "case {label:?}: expected HTTP {}, got {} with body {}",
+            case.expected, reply.status, reply.body
         );
-        if *expected == 400 {
+        if case.expected == 400 {
             assert_eq!(
                 reply.error_type.as_deref(),
                 Some("BadRequestException"),
                 "case {label:?}: expected BadRequestException, got {:?}",
                 reply.error_type
+            );
+        }
+        if let Some(message) = case.message {
+            assert_eq!(
+                reply.body.get("message").and_then(Value::as_str),
+                Some(message),
+                "case {label:?}: expected the refusal to state {message:?}, got {}",
+                reply.body
             );
         }
     }

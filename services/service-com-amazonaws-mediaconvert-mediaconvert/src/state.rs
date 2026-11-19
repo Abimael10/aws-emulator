@@ -826,11 +826,11 @@ pub fn reservation_plan_not_applicable_message() -> String {
 
 /// As [`reservation_plan_not_applicable_message`], for a reserved queue created without
 /// the plan it requires.
+///
+/// The sentence is the one AWS words for that refusal — fixed text with no slot in it, naming
+/// what the request must provide and the kind of queue it is creating.
 pub fn reservation_plan_required_message() -> String {
-    format!(
-        "ReservationPlanSettings is required when PricingPlan is {}.",
-        PRICING_PLAN_RESERVED
-    )
+    "You must provide reservation plan settings when creating a reserved queue.".to_string()
 }
 
 /// How this service refuses a reservation plan that reserves fewer slots than a count of

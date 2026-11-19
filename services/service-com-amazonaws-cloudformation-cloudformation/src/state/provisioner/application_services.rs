@@ -1603,6 +1603,28 @@ pub(crate) fn lower_camel_members(value: &Value, depth: usize) -> Result<Value, 
     renamed_members(value, depth, &[])
 }
 
+/// The same walk where some of the members carry a MAP whose KEYS are the CALLER's own data
+/// rather than modelled member names: `keyed_by_data` names those members, by the API member
+/// name they reach the walk under, and the entries of such a map keep their keys while their
+/// VALUES are walked as any other structure is.
+///
+/// That is the exception [`lower_camel_members`] names as the hazard of a blanket re-casing,
+/// and the same arrangement [`camel_cased`] carries for the one such map of its own type: a key
+/// the caller CHOSE is data, and another member of the same document may reference it by that
+/// name (an audio selector's name, named again by the `audioSourceName` of the output that
+/// uses it), so re-casing it would store a document the declaration did not describe. A
+/// document nested deeper than [`MAX_PROPERTY_NESTING`] is refused rather than walked, exactly
+/// as the walks beside it refuse one.
+///
+/// `depth` is how many levels are already above this one, as in [`lower_camel_members`].
+pub(crate) fn lower_camel_members_except_data_keys(
+    value: &Value,
+    depth: usize,
+    keyed_by_data: &[&str],
+) -> Result<Value, Refusal> {
+    walked_members(value, depth, &[], keyed_by_data)
+}
+
 /// The same walk where some of the members are NOT the property with its initial letter
 /// lower-cased: `renamed` is the table of those, as (property, member) pairs, and every
 /// other key is re-cased exactly as [`lower_camel_members`] does it.
@@ -1617,6 +1639,20 @@ pub(super) fn renamed_members(
     depth: usize,
     renamed: &[(&str, &str)],
 ) -> Result<Value, Refusal> {
+    walked_members(value, depth, renamed, &[])
+}
+
+/// The ONE re-casing walk the three entry points above are, so none of them can come to walk a
+/// document differently: `renamed` is the members whose API name is not the property with its
+/// initial lower-cased, and `keyed_by_data` the members whose MAP keys are the caller's own
+/// ([`data_keyed_entries`]). A document nested deeper than [`MAX_PROPERTY_NESTING`] is refused
+/// rather than walked, for the reason that constant records.
+fn walked_members(
+    value: &Value,
+    depth: usize,
+    renamed: &[(&str, &str)],
+    keyed_by_data: &[&str],
+) -> Result<Value, Refusal> {
     if depth >= MAX_PROPERTY_NESTING {
         return Err(too_deeply_nested());
     }
@@ -1624,22 +1660,53 @@ pub(super) fn renamed_members(
         Value::Object(members) => {
             let mut converted = Map::new();
             for (name, member) in members {
-                converted.insert(
-                    renamed_member(name, renamed),
-                    renamed_members(member, depth + 1, renamed)?,
-                );
+                let member_name = renamed_member(name, renamed);
+                let walked = if keyed_by_data.contains(&member_name.as_str()) {
+                    data_keyed_entries(member, depth + 1, renamed, keyed_by_data)?
+                } else {
+                    walked_members(member, depth + 1, renamed, keyed_by_data)?
+                };
+                converted.insert(member_name, walked);
             }
             Ok(Value::Object(converted))
         }
         Value::Array(items) => {
             let mut converted = Vec::with_capacity(items.len());
             for item in items {
-                converted.push(renamed_members(item, depth + 1, renamed)?);
+                converted.push(walked_members(item, depth + 1, renamed, keyed_by_data)?);
             }
             Ok(Value::Array(converted))
         }
         scalar => Ok(scalar.clone()),
     }
+}
+
+/// One member whose KEYS are the caller's own ([`lower_camel_members_except_data_keys`]): each
+/// entry keeps the key the declaration gave it, and its VALUE is walked as any other structure.
+///
+/// A value that is not an object at all is no map, so it is walked as the member it is — which
+/// is what keeps a declaration that states the member as something else the owning service's
+/// own validation to judge rather than this walk's.
+fn data_keyed_entries(
+    value: &Value,
+    depth: usize,
+    renamed: &[(&str, &str)],
+    keyed_by_data: &[&str],
+) -> Result<Value, Refusal> {
+    if depth >= MAX_PROPERTY_NESTING {
+        return Err(too_deeply_nested());
+    }
+    let Value::Object(entries) = value else {
+        return walked_members(value, depth, renamed, keyed_by_data);
+    };
+    let mut converted = Map::new();
+    for (key, entry) in entries {
+        converted.insert(
+            key.clone(),
+            walked_members(entry, depth + 1, renamed, keyed_by_data)?,
+        );
+    }
+    Ok(Value::Object(converted))
 }
 
 /// The API member one property name is: the one `renamed` names it, and otherwise the

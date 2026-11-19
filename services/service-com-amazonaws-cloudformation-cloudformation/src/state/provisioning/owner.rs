@@ -233,6 +233,13 @@ impl Owner {
             Self::Athena(kind) => {
                 athena_resources::create(ctx, region, kind, resource, propagated).await
             }
+            // All three MediaConvert types are taggable: each publishes a `Tags` property and
+            // its create takes that map, so the resource carries the tags CloudFormation gives
+            // it beside its own — less the reserved namespace, which that service publishes no
+            // call to write from outside AWS.
+            Self::MediaConvert(kind) => {
+                mediaconvert_resources::create(ctx, region, kind, resource, propagated).await
+            }
         }
     }
 
@@ -386,6 +393,10 @@ impl Owner {
             Self::Athena(kind) => {
                 athena_resources::readiness(ctx, region, kind, physical_resource_id).await
             }
+            // A queue, a job template and a preset each EXIST from the moment their own create
+            // answers, and none of the three shapes publishes a state a brand-new one is still
+            // coming up in ([`mediaconvert_resources::ready`]).
+            Self::MediaConvert(_) => Ok(mediaconvert_resources::ready()),
         }
     }
 
@@ -473,6 +484,10 @@ impl Owner {
             // the three publishes a further `Fn::GetAtt` attribute this emulator carries, so
             // there is nothing to read once one is up.
             Self::Athena(_) => Ok(BTreeMap::new()),
+            // A MediaConvert queue, job template and preset each publish the NAME the stack
+            // created them under and the ARN their own create answered with, so there is
+            // nothing left to read once one is up.
+            Self::MediaConvert(_) => Ok(BTreeMap::new()),
             // A task-definition revision's `TaskDefinitionArn` is the one its own
             // registration answered with, so there is nothing left to read once it is up.
             Self::EcsTaskDefinition => Ok(BTreeMap::new()),
@@ -689,6 +704,10 @@ impl Owner {
             // resource away as they answer, so there is nothing to wait for
             // ([`athena_resources::removal`]).
             Self::Athena(_) => Ok(athena_resources::removal()),
+            // `DeleteQueue`, `DeleteJobTemplate` and `DeletePreset` each take the resource away
+            // as they answer, so there is nothing to wait for
+            // ([`mediaconvert_resources::removal`]).
+            Self::MediaConvert(_) => Ok(mediaconvert_resources::removal()),
         }
     }
 
@@ -885,6 +904,15 @@ impl Owner {
             Self::Athena(kind) => {
                 athena_resources::update(ctx, region, kind, resource, declared).await
             }
+            // Each of these three is changed by the update call MediaConvert publishes for it,
+            // addressed by the name it was created under and carrying what that call carries; a
+            // declaration that DROPS a value the call publishes a way to clear carries that
+            // value, and one restating a queue's pricing plan — which `UpdateQueue` has no
+            // member for — replaces the resource rather than reaching this arm
+            // ([`mediaconvert_resources::update`]).
+            Self::MediaConvert(kind) => {
+                mediaconvert_resources::update(ctx, region, kind, resource, declared).await
+            }
         }
     }
 
@@ -1017,6 +1045,10 @@ impl Owner {
             // no arm here yet ([`Provisioner::retag`]'s own default), and a saved query is not
             // taggable at all, so nothing is asked about them.
             Self::Athena(_) => Ok(()),
+            // The tags of a MediaConvert queue, job template or preset that already exists are
+            // reconciled by no arm here yet ([`Provisioner::retag`]'s own default), so nothing
+            // is asked about them.
+            Self::MediaConvert(_) => Ok(()),
         }
     }
 
@@ -1197,6 +1229,12 @@ impl Owner {
             // way out: there is no such call, so a `Snapshot` deletion policy on one of them
             // deletes the resource with no snapshot invented for it.
             Self::Athena(kind) => athena_resources::delete(ctx, region, kind, resource).await,
+            // MediaConvert takes no snapshot of a queue, a job template or a preset on the way
+            // out: there is no such call, so a `Snapshot` deletion policy on one of them deletes
+            // the resource with no snapshot invented for it.
+            Self::MediaConvert(kind) => {
+                mediaconvert_resources::delete(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -1346,6 +1384,13 @@ impl Owner {
             // owning service still holds as deleted would report drift that is not there: this
             // arm reads nothing back, so no one's configuration is guessed at.
             Self::Athena(_) => return Ok(ActualConfiguration::Unchecked),
+            // No MediaConvert type here reports a configuration of its own to compare yet: the
+            // settings document a job template and a preset are declared with is normalised by
+            // the owning service as it stores it — every member of the graph it did not state
+            // reported with the value that service applies — so comparing a read of it against
+            // the declaration would report drift that is not there. This arm reads nothing back,
+            // so no one's configuration is guessed at.
+            Self::MediaConvert(_) => return Ok(ActualConfiguration::Unchecked),
         };
         Ok(ActualConfiguration::read(reported))
     }
@@ -1436,6 +1481,8 @@ impl Owner {
             Self::ServiceDiscovery(_) => message.to_string(),
             // And so does Amazon Athena's.
             Self::Athena(_) => message.to_string(),
+            // And so does AWS Elemental MediaConvert's.
+            Self::MediaConvert(_) => message.to_string(),
         }
     }
 

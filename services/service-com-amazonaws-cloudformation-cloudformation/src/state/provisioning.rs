@@ -302,6 +302,10 @@ mod lambda_version;
 /// own NAMES live here, beside the arms that provision them, and more than one module answers
 /// about them ([`super::template`] reads a metric filter's own name property).
 pub(super) mod logs_resources;
+/// The three `AWS::MediaConvert::*` types a transcoding estate is declared with — the queue
+/// jobs run in, the job template they are created from and the preset an output is written
+/// with: created in AWS Elemental MediaConvert itself ([`mediaconvert_resources`]).
+mod mediaconvert_resources;
 /// `AWS::CloudFormation::Stack`: the NESTED STACK a stack declares, created in
 /// CloudFormation itself ([`nested_stack`]).
 mod nested_stack;
@@ -1243,6 +1247,11 @@ pub(super) enum Owner {
     /// in that workgroup. Which of them it is travels with the owner, as it does for the types
     /// above.
     Athena(athena_resources::Kind),
+    /// One of the three `AWS::MediaConvert::*` types [`mediaconvert_resources`] creates in AWS
+    /// Elemental MediaConvert: the queue a stack's jobs run in, the job template they are
+    /// created from, and the preset an output is written with. Which of them it is travels with
+    /// the owner, as it does for the types above.
+    MediaConvert(mediaconvert_resources::Kind),
 }
 
 /// The owner of a template resource type, or `None` for a type this emulator leaves
@@ -1343,6 +1352,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = athena_resources::kind_of(resource_type) {
         return Some(Owner::Athena(kind));
+    }
+    if let Some(kind) = mediaconvert_resources::kind_of(resource_type) {
+        return Some(Owner::MediaConvert(kind));
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }

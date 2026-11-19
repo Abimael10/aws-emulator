@@ -130,6 +130,18 @@ pub(super) const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
         resource_type: "AWS::Logs::SubscriptionFilter",
         required: &["LogGroupName"],
     },
+    // The two AWS Elemental MediaConvert types whose SETTINGS are the resource:
+    // `CreateJobTemplate` and `CreatePreset` each declare `Settings` required, which both types
+    // publish as `SettingsJson` with "Required: Yes" — a template or a preset describes no
+    // transcode at all without it.
+    RequiredProperties {
+        resource_type: crate::state::template::MEDIACONVERT_JOB_TEMPLATE,
+        required: &["SettingsJson"],
+    },
+    RequiredProperties {
+        resource_type: crate::state::template::MEDIACONVERT_PRESET,
+        required: &["SettingsJson"],
+    },
     // `AWS::SecretsManager::ResourcePolicy` IS a policy ON a secret: `PutResourcePolicy`
     // declares both the document and the secret required, and the type publishes both
     // "Required: Yes".
