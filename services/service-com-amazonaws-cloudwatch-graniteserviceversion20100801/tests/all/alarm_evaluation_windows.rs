@@ -73,13 +73,18 @@ const THRESHOLD: f64 = 10.0;
 /// The shortest period an aligned window may carry, one minute.
 const MINUTE_PERIOD: i32 = 60;
 
-/// How far from the next minute boundary a row's publish and its reading must both sit.
+/// How far from the next minute boundary a row's publish and its readings must all sit.
 ///
 /// Every period an aligned window may carry is a whole number of minutes, and every offset a
 /// zone may be stated in "must be aligned to a multiple of 5 minutes"
 /// (`smithy_query(query="shape",shape="WallClockWindow")`), so every boundary either grid can
 /// put a window at is a multiple of a minute: a publish and a read this far from the next minute
 /// fall in the same window of every grid below.
+///
+/// Each row anchors its own grid and reads its own alarms back, so what has to fit inside this
+/// room is ONE row's two writes, the evaluation they make due and its two readings — never the
+/// whole table's. Nothing is asserted about how long any of them takes: this is room, not a
+/// deadline.
 const MINUTE_ROOM_SECS: f64 = 10.0;
 
 /// How far apart two instants may read and still be the same instant: a document holds an
@@ -421,145 +426,224 @@ fn state_of(alarm: &Value) -> Option<&str> {
     alarm.get("StateValue").and_then(Value::as_str)
 }
 
+/// The granularity a REGULAR-resolution series has values at, in seconds: "Setting this to 60
+/// specifies this metric as regular resolution, which CloudWatch stores at 1-minute resolution."
+/// (`smithy_query(query="doc",shape="MetricDatum",member="StorageResolution")`).
+const REGULAR_RESOLUTION_SECS: f64 = 60.0;
+
+/// The instant the ROLLING range of an evaluation that queried the series at `query_date` ends
+/// at, for periods `period` seconds wide — the end every boundary of that grid is counted back
+/// from.
+///
+/// A sliding window "advances each time the alarm is evaluated, forming a rolling time window"
+/// (`smithy_query(query="shape",shape="EvaluationWindow")`), so where its range ends is decided by
+/// the clock the evaluation ran on: the newest instant the series it grades has a value at, which
+/// is the granularity that series is stored at — the minute of a regular-resolution series, or the
+/// alarm's own period where that is finer. It is read from the instant the evaluation's OWN record
+/// says it queried the series at, so the grid a twin's instants are checked against is the one its
+/// evaluation really ran on.
+fn rolling_range_end(query_date: f64, period: f64) -> f64 {
+    let granularity = period.min(REGULAR_RESOLUTION_SECS);
+    (query_date / granularity).floor() * granularity
+}
+
+/// Whether `instant` is a boundary of the grid of `period`-wide windows one of whose boundaries
+/// falls at `boundary` — a whole number of periods from it, to the millisecond a document holds an
+/// instant to.
+fn on_grid(instant: f64, boundary: f64, period: f64) -> bool {
+    let off = (instant - boundary).rem_euclid(period);
+    off.min(period - off) < DOCUMENT_INSTANT_TOLERANCE_SECS
+}
+
+/// How many times a row anchors its grid again before it grades whatever its alarms report.
+///
+/// A row places its datapoints relative to the aligned window the clock is IN and asserts the
+/// verdict reached over that window, so an attempt the clock left that window during measured a
+/// grid the row did not publish into. Each attempt asks for its own room inside the minute first
+/// ([`MINUTE_ROOM_SECS`]), many times over what one row's writes and readings need, so an attempt
+/// is abandoned only by a host that stalled for longer than that room — and the LAST one asserts
+/// whatever the alarms report, so a verdict this emulator really gets wrong is never retried away.
+const ROW_ANCHOR_ATTEMPTS: usize = 4;
+
 #[tokio::test]
 async fn an_aligned_alarm_grades_the_closed_periods_of_its_own_clock_boundaries() {
     let router = build_router();
-    // Every boundary either grid lays a window at is a multiple of a minute, so a publish and a
-    // reading this far from the next minute fall in the same windows.
+    // Each row anchors its own grid, publishes into it and reads its own alarms back, so the room
+    // a row needs inside the minute it anchors in is its own writes and readings.
+    for (index, row) in ROWS.iter().enumerate() {
+        for attempt in 0..ROW_ANCHOR_ATTEMPTS {
+            let last_attempt = attempt + 1 == ROW_ANCHOR_ATTEMPTS;
+            let suffix = format!("{index}-{attempt}");
+            if graded_over_the_window_it_anchored_in(&router, row, &suffix, last_attempt).await {
+                break;
+            }
+        }
+    }
+}
+
+/// Configure one row's aligned alarm beside a sliding twin, publish a breaching datapoint into
+/// each closed aligned period the row names, and assert the rule over the verdicts the two reach.
+///
+/// Answers whether those assertions were made: `false` for an attempt the clock left the aligned
+/// window the row anchored in, whose grid is no longer the one the row measured its datapoints
+/// from, so the row anchors again ([`ROW_ANCHOR_ATTEMPTS`]) rather than grading a window it never
+/// published into. The verdicts themselves are waited for by looking again until they arrive, so
+/// nothing here is asserted about how long this host takes over any of it.
+async fn graded_over_the_window_it_anchored_in(
+    router: &MultiServiceRouter,
+    row: &Row,
+    suffix: &str,
+    last_attempt: bool,
+) -> bool {
+    let case = row.case;
+    let period = f64::from(row.period);
+    // Every boundary either grid lays a window at is a multiple of a minute, so a publish and
+    // the readings that follow it this far from the next minute fall in the same windows.
     wait_for_period_room(f64::from(MINUTE_PERIOD), MINUTE_ROOM_SECS).await;
     let at = now_secs();
+    let shift = row.shift.secs(at);
+    let open_start = open_window_start(at, row.period, shift);
+    // The CLOSED periods the row names, newest first: the window before the one the clock is
+    // in, and the windows before that.
+    let boundaries: Vec<f64> = row
+        .breaching_periods_back
+        .iter()
+        .map(|back| open_start - period * f64::from(*back + 1))
+        .collect();
 
-    // Each row's aligned alarm, beside a SLIDING twin over the SAME series and configuration:
+    // The row's aligned alarm, beside a SLIDING twin over the SAME series and configuration:
     // the control that keeps the rolling range the default window has always had.
-    let mut configured: Vec<(Row, String, String, Vec<f64>)> = Vec::with_capacity(ROWS.len());
-    for (index, row) in ROWS.iter().enumerate() {
-        let period = f64::from(row.period);
-        let open_start = open_window_start(at, row.period, row.shift.secs(at));
-        // The CLOSED periods the row names, newest first: the window before the one the clock is
-        // in, and the windows before that.
-        let boundaries: Vec<f64> = row
-            .breaching_periods_back
-            .iter()
-            .map(|back| open_start - period * f64::from(*back + 1))
-            .collect();
+    let name = format!("aligned-{suffix}");
+    ok(
+        router,
+        "PutMetricAlarm",
+        &alarm_of(row, &name, &wall_clock_window(row)),
+    )
+    .await;
+    publish_breaching(router, &name, period, &boundaries).await;
 
-        let name = format!("aligned-{index}");
-        ok(
-            &router,
-            "PutMetricAlarm",
-            &alarm_of(row, &name, &wall_clock_window(row)),
-        )
-        .await;
-        publish_breaching(&router, &name, period, &boundaries).await;
+    let twin = format!("sliding-{suffix}");
+    ok(
+        router,
+        "PutMetricAlarm",
+        &alarm_of(row, &twin, &json!({"SlidingWindow": {}})),
+    )
+    .await;
+    // The twin watches a series of its own, published exactly like the aligned alarm's, so
+    // the two differ only in the window they select their range with.
+    publish_breaching(router, &twin, period, &boundaries).await;
 
-        let twin = format!("sliding-{index}");
-        ok(
-            &router,
-            "PutMetricAlarm",
-            &alarm_of(row, &twin, &json!({"SlidingWindow": {}})),
-        )
-        .await;
-        // The twin watches a series of its own, published exactly like the aligned alarm's, so
-        // the two differ only in the window they select their range with.
-        publish_breaching(&router, &twin, period, &boundaries).await;
-        configured.push((*row, name, twin, boundaries));
+    // Looked for in a loop until the alarm reports its verdict, so what the case waits on is that
+    // verdict rather than a span of this host's clock.
+    let reported = awaited_alarm_while_anchored(router, case, &name, row, open_start).await;
+    if !last_attempt && !anchored_in(row, open_start) {
+        return false;
     }
-    wait_for_evaluation();
+    assert_eq!(
+        state_of(&reported),
+        Some("ALARM"),
+        "case {case:?}: a breaching datapoint of a CLOSED aligned period decides the alarm, got \
+         {reported}"
+    );
+    // The window the alarm was created with reads back as it was asked for, and an alarm
+    // selecting its range with one reports no evaluation state of its own.
+    let asked = wall_clock_window(row);
+    let read_back = reported
+        .get("EvaluationWindow")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        same_json_value(&asked, &read_back),
+        "case {case:?}: expected EvaluationWindow {asked}, got {read_back}"
+    );
+    assert!(
+        reported.get("EvaluationState").is_none(),
+        "case {case:?}: an alarm selecting its range with an evaluation window reports no \
+         EvaluationState, got {reported}"
+    );
 
-    for (row, name, twin, boundaries) in &configured {
-        let case = row.case;
-        let period = f64::from(row.period);
-        let shift = row.shift.secs(at);
-        let reported = described(&router, case, name).await;
-        assert_eq!(
-            state_of(&reported),
-            Some("ALARM"),
-            "case {case:?}: a breaching datapoint of a CLOSED aligned period decides the alarm, \
-             got {reported}"
-        );
-        // The window the alarm was created with reads back as it was asked for, and an alarm
-        // selecting its range with one reports no evaluation state of its own.
-        let asked = wall_clock_window(row);
-        let read_back = reported
-            .get("EvaluationWindow")
-            .cloned()
-            .unwrap_or(Value::Null);
-        assert!(
-            same_json_value(&asked, &read_back),
-            "case {case:?}: expected EvaluationWindow {asked}, got {read_back}"
-        );
-        assert!(
-            reported.get("EvaluationState").is_none(),
-            "case {case:?}: an alarm selecting its range with an evaluation window reports no \
-             EvaluationState, got {reported}"
-        );
-
-        let record = reason_data(case, &reported);
-        let graded = graded_instants(&record);
-        let mut expected = boundaries.clone();
-        expected.sort_by(f64::total_cmp);
-        assert_eq!(
-            graded, expected,
-            "case {case:?}: the datapoints the verdict rests on are the ones aggregated out of \
-             the aligned periods ({expected:?}), got {graded:?} in {record}"
-        );
-        for instant in &graded {
-            assert_clock_boundary(case, *instant, row.period, shift);
-        }
-        let start_date = instant_of(case, &record, "startDate");
-        let oldest = expected
-            .first()
-            .copied()
-            .unwrap_or_else(|| panic!("case {case:?}: the row publishes at least one datapoint"));
-        assert!(
-            (start_date - oldest).abs() < DOCUMENT_INSTANT_TOLERANCE_SECS,
-            "case {case:?}: the record opens its span at the boundary of the oldest aligned \
-             period it graded ({oldest}), got {start_date} in {record}"
-        );
-        // The verdict was reached only after every period it names had CLOSED: both the instant
-        // the evaluation queried the series at and the instant it wrote the state are at or
-        // after the end of the newest period it graded.
-        let newest_close = graded
-            .iter()
-            .copied()
-            .reduce(f64::max)
-            .map_or(0.0, |newest| newest + period);
-        let query_date = instant_of(case, &record, "queryDate");
-        assert!(
-            query_date >= newest_close,
-            "case {case:?}: an aligned window grades no period before it closes, so the query \
-             instant ({query_date}) must be at or after {newest_close}, got {record}"
-        );
-        let updated = alarm_stamp(&reported, "StateUpdatedTimestamp").unwrap_or_else(|| {
-            panic!("case {case:?}: expected a StateUpdatedTimestamp, got {reported}")
-        });
-        assert!(
-            updated >= newest_close,
-            "case {case:?}: the state was written after the period it was decided over closed, \
-             so {updated} must be at or after {newest_close}, got {reported}"
-        );
-
-        // The sliding twin reaches the same verdict on data that is already in the past — the
-        // default window is unchanged — and its range is the rolling one, so a zone that shifts
-        // the aligned boundaries off the ones a rolling range falls on makes the two records
-        // name DIFFERENT instants.
-        let twin_reported = described(&router, case, twin).await;
-        assert_eq!(
-            state_of(&twin_reported),
-            Some("ALARM"),
-            "case {case:?}: the sliding twin grades the same past datapoint, got {twin_reported}"
-        );
-        let twin_record = reason_data(case, &twin_reported);
-        let twin_graded = graded_instants(&twin_record);
-        if shift.rem_euclid(period) != 0.0 {
-            assert!(
-                twin_graded != graded,
-                "case {case:?}: a zone that shifts the aligned boundaries off the rolling grid \
-                 must make the two windows grade different instants, got {graded:?} for the \
-                 aligned alarm and {twin_graded:?} for the twin ({twin_record})"
-            );
-        }
+    let record = reason_data(case, &reported);
+    let graded = graded_instants(&record);
+    let mut expected = boundaries;
+    expected.sort_by(f64::total_cmp);
+    assert_eq!(
+        graded, expected,
+        "case {case:?}: the datapoints the verdict rests on are the ones aggregated out of the \
+         aligned periods ({expected:?}), got {graded:?} in {record}"
+    );
+    for instant in &graded {
+        assert_clock_boundary(case, *instant, row.period, shift);
     }
+    let start_date = instant_of(case, &record, "startDate");
+    let oldest = expected
+        .first()
+        .copied()
+        .unwrap_or_else(|| panic!("case {case:?}: the row publishes at least one datapoint"));
+    assert!(
+        (start_date - oldest).abs() < DOCUMENT_INSTANT_TOLERANCE_SECS,
+        "case {case:?}: the record opens its span at the boundary of the oldest aligned period it \
+         graded ({oldest}), got {start_date} in {record}"
+    );
+    // The verdict was reached only after every period it names had CLOSED: both the instant the
+    // evaluation queried the series at and the instant it wrote the state are at or after the end
+    // of the newest period it graded.
+    let newest_close = graded
+        .iter()
+        .copied()
+        .reduce(f64::max)
+        .map_or(0.0, |newest| newest + period);
+    let query_date = instant_of(case, &record, "queryDate");
+    assert!(
+        query_date >= newest_close,
+        "case {case:?}: an aligned window grades no period before it closes, so the query instant \
+         ({query_date}) must be at or after {newest_close}, got {record}"
+    );
+    let updated = alarm_stamp(&reported, "StateUpdatedTimestamp").unwrap_or_else(|| {
+        panic!("case {case:?}: expected a StateUpdatedTimestamp, got {reported}")
+    });
+    assert!(
+        updated >= newest_close,
+        "case {case:?}: the state was written after the period it was decided over closed, so \
+         {updated} must be at or after {newest_close}, got {reported}"
+    );
+
+    // The sliding twin reaches the same verdict on data that is already in the past — the default
+    // window is unchanged — and its range is the ROLLING one: its periods are counted back from
+    // the end the clock has carried that range to ([`rolling_range_end`]) rather than from a
+    // boundary the alarm's period repeats at.
+    let twin_reported = awaited_alarm_while_anchored(router, case, &twin, row, open_start).await;
+    if !last_attempt && !anchored_in(row, open_start) {
+        return false;
+    }
+    assert_eq!(
+        state_of(&twin_reported),
+        Some("ALARM"),
+        "case {case:?}: the sliding twin grades the same past datapoint, got {twin_reported}"
+    );
+    let twin_record = reason_data(case, &twin_reported);
+    let twin_graded = graded_instants(&twin_record);
+    let twin_end = rolling_range_end(instant_of(case, &twin_record, "queryDate"), period);
+    for instant in &twin_graded {
+        assert!(
+            on_grid(*instant, twin_end, period),
+            "case {case:?}: a rolling range's periods are counted back from the end it has \
+             advanced to ({twin_end}), so each is a whole {period}-second period from it, got \
+             {instant} in {twin_record}"
+        );
+    }
+    // So wherever that end does NOT fall on the aligned grid — which is what a zone shifting the
+    // aligned boundaries off the clock a rolling range ends on produces — the two windows grade
+    // DIFFERENT instants.
+    if !on_grid(twin_end, open_start, period) {
+        assert!(
+            twin_graded != graded,
+            "case {case:?}: a rolling range ending at {twin_end}, off the aligned boundaries the \
+             row's periods repeat at ({open_start} and every {period} seconds from it), must make \
+             the two windows grade different instants, got {graded:?} for the aligned alarm and \
+             {twin_graded:?} for the twin ({twin_record})"
+        );
+    }
+    true
 }
 
 /// How long a case waits for a verdict the clock owes before calling it a hang rather than a
@@ -570,6 +654,41 @@ const VERDICT_DEADLINE: Duration = Duration::from_secs(180);
 
 /// How often a case looks again while waiting for one.
 const LOOK_AGAIN: Duration = Duration::from_millis(100);
+
+/// Whether the clock is still in the aligned window a row anchored at `open_start`: the window
+/// its datapoints were placed relative to, and the one the verdict over them is graded on.
+fn anchored_in(row: &Row, open_start: f64) -> bool {
+    let now = now_secs();
+    open_window_start(now, row.period, row.shift.secs(now)) == open_start
+}
+
+/// Look at the alarm `name` until it reports `ALARM`, the row's aligned window has closed, or the
+/// deadline passes, and answer it as it then reads.
+///
+/// A wait on the CONDITION the row is about to assert, so what follows is about the state and
+/// never about a span of this host's clock. The anchor is part of that condition: once the clock
+/// has left the window the row measured its datapoints from, no verdict over that window is owed
+/// any more and the row anchors again ([`graded_over_the_window_it_anchored_in`]) instead of
+/// looking for one until the deadline.
+async fn awaited_alarm_while_anchored(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    row: &Row,
+    open_start: f64,
+) -> Value {
+    let deadline = Instant::now() + VERDICT_DEADLINE;
+    loop {
+        let reported = described(router, case, name).await;
+        if state_of(&reported) == Some("ALARM")
+            || !anchored_in(row, open_start)
+            || Instant::now() >= deadline
+        {
+            return reported;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
 
 /// Look at the alarm `name` until it reports `ALARM`, and answer it as it then reads — a wait on
 /// the CONDITION, so the assertions that follow are about the state and not about a span.
