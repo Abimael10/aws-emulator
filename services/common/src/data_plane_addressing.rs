@@ -16,7 +16,8 @@
 //! What every one of them needs to read that addressing is the same, and is here so the
 //! planes cannot drift on which requests they claim: the reserved path segment that names a
 //! plane ([`EMULATOR_PATH_NAMESPACE`]), the first path segment and the rest
-//! ([`first_segment`]), the host without its userinfo or port ([`host_only`]), the port a
+//! ([`first_segment`]), the authority a request ADDRESSED ([`addressed_authority`]), the host
+//! without its userinfo or port ([`host_only`]), the port a
 //! client addressed ([`addressed_port`]), whether a host names a SERVICE at all
 //! ([`names_a_service`]) — which is what separates the emulator's own endpoint from
 //! another service's — whether a host is one AWS itself publishes an endpoint at
@@ -80,26 +81,88 @@ pub fn addressed_port(host: Option<&str>) -> Option<i32> {
     after_host.rsplit_once(':')?.1.parse::<i32>().ok()
 }
 
-/// The host a request ADDRESSED, which is what a plane compares its resource's published
-/// name against: the `Host` header, or the authority of an absolute-form URI for a
-/// request that carries its endpoint there (HTTP/2, or an SDK-built request).
+/// The host a request NAMED, as an owned value: the `Host` header it carries, and the
+/// authority of an absolute-form request target for a request that carries its endpoint
+/// there (HTTP/2, or an SDK-built request) and no header.
 ///
-/// Both are passed in rather than a whole request, because the framework hands
-/// `Service::can_handle` the request's PARTS and the other seams a runtime-API request:
-/// each has these two things and no common type.
+/// The host the CLIENT STATED, which is the subject of everything a service REPORTS about
+/// where a request arrived — the endpoint a URL it announces has to lead back to
+/// ([`reached_endpoint_host`], [`reached_emulator_endpoint`]), and the host a signature was
+/// computed over. WHICH RESOURCE a request addresses is the other question, and
+/// [`addressed_authority`] is the reading for it: the two differ only for a request another
+/// service RELAYED, where the target names the next hop and the header names the host that
+/// relay's own client addressed.
+///
+/// Both parts of the request are passed in rather than a whole request, because the
+/// framework hands `Service::can_handle` the request's PARTS and the other seams a
+/// runtime-API request: each has these two things and no common type.
 ///
 /// `None` when the request names no host at all, which addresses nothing.
 #[must_use]
 pub fn addressed_host(uri: &str, host_header: Option<&str>) -> Option<String> {
-    if let Some(host) = host_header.filter(|host| !host.is_empty()) {
-        return Some(host.to_string());
-    }
-    let after_scheme = uri.split_once("://")?.1;
-    let authority = after_scheme
-        .split(['/', '?', '#'])
+    host_header
+        .filter(|host| !host.is_empty())
+        .or_else(|| absolute_form_authority(uri))
+        .map(str::to_string)
+}
+
+/// The authority a request was SENT TO, borrowed from the request it was read off: the
+/// authority of an ABSOLUTE-FORM request target when the request carries one, and the `Host`
+/// header otherwise.
+///
+/// The reading a plane resolves ITS OWN RESOURCE from — which load balancer, api,
+/// distribution or domain a request addresses — as opposed to the host the client stated
+/// ([`addressed_host`]). Which of the two names the server the request was sent to is
+/// RFC 9112's rule rather than a preference: a request target in absolute form carries the
+/// authority of the server it addresses, and "when an origin server receives a request with
+/// an absolute-form of request-target, the server MUST ignore the received Host header field
+/// (if any) and instead use the host information of the request-target" (RFC 9112 section
+/// 3.2.2). A request a service RELAYS is where the two differ — the relay addresses the next
+/// hop in the request target and passes the client's own `Host` along for the server at that
+/// hop to read — so a plane resolving its resource from the header alone would resolve the
+/// host the relay's own client addressed instead of the one the request was sent to. A
+/// request a client sent on the wire carries an origin-form target and no authority at all,
+/// which is the `Host` header's case.
+///
+/// `None` when the request names no host at all, which addresses nothing.
+#[must_use]
+pub fn addressed_authority<'a>(uri: &'a str, host_header: Option<&'a str>) -> Option<&'a str> {
+    addressed_authority_of(absolute_form_authority(uri), host_header)
+}
+
+/// The authority of an ABSOLUTE-FORM request target, or `None` for a target that is not one.
+///
+/// A target is in absolute form only when it BEGINS with a scheme — RFC 3986's
+/// `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` — followed by `://`. So an origin-form target
+/// whose path or query carries `://` of its own (a callback or redirect parameter is the
+/// ordinary case) names no authority at all, and the request's `Host` is what it addressed:
+/// a value a caller wrote inside its own path cannot become the host a plane resolves.
+fn absolute_form_authority(uri: &str) -> Option<&str> {
+    let (scheme, rest) = uri.split_once("://")?;
+    let mut characters = scheme.chars();
+    let names_a_scheme = characters
         .next()
-        .unwrap_or(after_scheme);
-    (!authority.is_empty()).then(|| authority.to_string())
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && characters.all(|next| next.is_ascii_alphanumeric() || matches!(next, '+' | '-' | '.'));
+    if !names_a_scheme {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    (!authority.is_empty()).then_some(authority)
+}
+
+/// [`addressed_authority`] over an ALREADY PARSED request target, for a caller holding the
+/// request's parts (whose `uri` is an [`::http::Uri`] rather than a string): the same rule,
+/// so the two shapes a plane reads a request in cannot disagree about which host it
+/// addressed.
+#[must_use]
+pub fn addressed_authority_of<'a>(
+    uri_authority: Option<&'a str>,
+    host_header: Option<&'a str>,
+) -> Option<&'a str> {
+    uri_authority
+        .filter(|authority| !authority.is_empty())
+        .or_else(|| host_header.filter(|host| !host.is_empty()))
 }
 
 /// The endpoint host a request REACHED this emulator on, as a URL the service hands
@@ -759,24 +822,81 @@ mod tests {
     }
 
     #[test]
-    fn a_request_addresses_the_host_it_names() {
-        // The rows span where a host can travel: the header, an absolute-form URI with
-        // and without a path or query, an empty header falling back to the URI, and a
-        // request naming no host at all.
-        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
-            ("/apps/d1", Some("main.d1.amplifyapp.com"), Some("main.d1.amplifyapp.com")),
-            ("https://main.d1.amplifyapp.com/index.html", None, Some("main.d1.amplifyapp.com")),
-            ("https://127.0.0.1:9297", None, Some("127.0.0.1:9297")),
-            ("https://host.example/p?q=a://b", None, Some("host.example")),
-            ("https://host.example/p", Some(""), Some("host.example")),
-            ("/apps/d1", None, None),
+    fn a_request_names_the_host_its_client_stated_and_addresses_the_one_it_was_sent_to() {
+        // The rows span where a host can travel and what each of the two readings answers
+        // for it: the header, an absolute-form target with and without a path or query, an
+        // empty header falling back to the target, a request naming no host at all, the
+        // RELAYED request where the two disagree (the target names the next hop, the header
+        // the host the relay's own client addressed), and an origin-form target carrying
+        // `://` of its own, which names no authority at all.
+        // (the target, the `Host` header, the host NAMED, the authority SENT TO)
+        type Row = (&'static str, Option<&'static str>, Option<&'static str>, Option<&'static str>);
+        let cases: &[Row] = &[
+            (
+                "/apps/d1",
+                Some("main.d1.amplifyapp.com"),
+                Some("main.d1.amplifyapp.com"),
+                Some("main.d1.amplifyapp.com"),
+            ),
+            (
+                "https://main.d1.amplifyapp.com/index.html",
+                None,
+                Some("main.d1.amplifyapp.com"),
+                Some("main.d1.amplifyapp.com"),
+            ),
+            ("https://127.0.0.1:9297", None, Some("127.0.0.1:9297"), Some("127.0.0.1:9297")),
+            (
+                "https://host.example/p?q=a://b",
+                None,
+                Some("host.example"),
+                Some("host.example"),
+            ),
+            (
+                "https://host.example/p",
+                Some(""),
+                Some("host.example"),
+                Some("host.example"),
+            ),
+            ("/apps/d1", None, None, None),
+            (
+                "http://origin.example:8080/object.txt",
+                Some("d111111abcdef8.cloudfront.net"),
+                Some("d111111abcdef8.cloudfront.net"),
+                Some("origin.example:8080"),
+            ),
+            (
+                "https://origin.example",
+                Some("127.0.0.1:34567"),
+                Some("127.0.0.1:34567"),
+                Some("origin.example"),
+            ),
+            (
+                "/redirect?to=https://attacker.example/x",
+                Some("cdn.example.com"),
+                Some("cdn.example.com"),
+                Some("cdn.example.com"),
+            ),
+            ("/redirect?to=https://attacker.example/x", None, None, None),
+            (
+                "1http://host.example/p",
+                Some("cdn.example.com"),
+                Some("cdn.example.com"),
+                Some("cdn.example.com"),
+            ),
         ];
-        for (uri, header, expected) in cases {
+        for (uri, header, named, sent_to) in cases {
             let answered = addressed_host(uri, *header);
             assert_eq!(
                 answered.as_deref(),
-                *expected,
-                "case ({uri:?}, {header:?}): expected {expected:?}, got {answered:?}"
+                *named,
+                "case ({uri:?}, {header:?}): expected the host named {named:?}, got \
+                 {answered:?}"
+            );
+            let answered = addressed_authority(uri, *header);
+            assert_eq!(
+                answered, *sent_to,
+                "case ({uri:?}, {header:?}): expected the authority addressed {sent_to:?}, \
+                 got {answered:?}"
             );
         }
     }

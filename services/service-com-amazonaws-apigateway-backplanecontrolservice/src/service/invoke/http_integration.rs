@@ -395,17 +395,35 @@ pub(super) fn onward_request(
     }
     // WHICH of the two the request is passed on as, decided on the request as it will
     // actually be CLAIMED — after the integration's own mapped headers, which have the last
-    // word over the `host` set above. A service reads an onward request's endpoint off that
-    // header, so a request whose final host or path names a stage of THIS plane re-enters
-    // this plane's own serving, where `hop` travels with it; deciding it on the address
-    // before the mappings were applied would let a mapping onto `host` send the request out
-    // over the transport and back in through the claim with the count reset, which is a
-    // chain nothing then bounds.
-    let within_this_plane = {
-        let claimed_host = passed.headers().get("host").unwrap_or(host);
-        endpoint_labels(claimed_host).is_some()
-            || split_execute_api_prefix(path_of(passed.uri())).is_some()
-    };
+    // word over the `host` set above. A request whose final host or path names a stage of
+    // THIS plane re-enters this plane's own serving, where `hop` travels with it; deciding it
+    // on the address before the mappings were applied would let a mapping onto `host` send
+    // the request out over the transport and back in through the claim with the count reset,
+    // which is a chain nothing then bounds.
+    let claimed_host = passed
+        .headers()
+        .get("host")
+        .unwrap_or(host)
+        .to_string();
+    let claims_an_endpoint = endpoint_labels(&claimed_host).is_some();
+    let within_this_plane =
+        claims_an_endpoint || split_execute_api_prefix(path_of(passed.uri())).is_some();
+    // The endpoint a mapping onto `host` named is where the request is going, so the request
+    // this plane re-enters is ADDRESSED there as well: which resource a request addresses is
+    // read off its own target before the header it carries
+    // (`service_common::data_plane_addressing::addressed_authority`), so a target still
+    // naming the `uri`'s host would resolve to no api of this plane.
+    if claims_an_endpoint && claimed_host != host {
+        let re_addressed = re_addressed(passed.uri(), &claimed_host);
+        if passed.set_uri(re_addressed).is_err() {
+            return Some(PassedThrough::Unserved(UnservedIntegration {
+                refusal: API_CONFIGURATION_ERROR,
+                reason: "the host the integration maps onto the request is not an address a \
+                         request can be made at"
+                    .to_string(),
+            }));
+        }
+    }
     Some(if within_this_plane {
         PassedThrough::Request(Box::new(passed))
     } else {
@@ -415,6 +433,23 @@ pub(super) fn onward_request(
         // reached only if a service of this emulator CLAIMS it.
         PassedThrough::Onward(Box::new(passed))
     })
+}
+
+/// `uri` with its authority replaced by `authority`, keeping its scheme, path and query: the
+/// same request, addressed at another endpoint.
+///
+/// A URI carrying no `scheme://` names no authority to replace, so it is addressed at the new
+/// one over the scheme an endpoint of this emulator is served on.
+fn re_addressed(uri: &str, authority: &str) -> String {
+    let (scheme, rest) = match uri.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        None => return format!("https://{authority}{uri}"),
+    };
+    let after_authority = match rest.find(['/', '?', '#']) {
+        Some(start) => &rest[start..],
+        None => "",
+    };
+    format!("{scheme}://{authority}{after_authority}")
 }
 
 /// The body a STANDARD (non-proxy) integration request carries, and what the template that

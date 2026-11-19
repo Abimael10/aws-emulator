@@ -85,13 +85,21 @@ pub struct Addressed<'a> {
 
 impl<'a> Addressed<'a> {
     /// The addressing of the buffered request these parts came from.
+    ///
+    /// The host is the one reading of which host a request addressed
+    /// (`service_common::data_plane_addressing::addressed_authority`): the authority of an
+    /// absolute-form request target when the request carries one, and the `Host` header
+    /// otherwise — so a request another service RELAYS here resolves to the repository
+    /// endpoint the relay addressed rather than to the host the relay's own client named.
     pub fn of_parts(parts: &'a ::http::request::Parts) -> Self {
         Self {
-            host: parts
-                .headers
-                .get("host")
-                .and_then(|host| host.to_str().ok())
-                .or_else(|| parts.uri.authority().map(::http::uri::Authority::as_str)),
+            host: ::service_common::data_plane_addressing::addressed_authority_of(
+                parts.uri.authority().map(::http::uri::Authority::as_str),
+                parts
+                    .headers
+                    .get("host")
+                    .and_then(|host| host.to_str().ok()),
+            ),
             path: parts.uri.path(),
         }
     }
@@ -100,10 +108,10 @@ impl<'a> Addressed<'a> {
     /// by the `http` crate rather than split by hand.
     pub fn of_request(req: &'a RtRequest, uri: &'a ::http::Uri) -> Self {
         Self {
-            host: req
-                .headers()
-                .get("host")
-                .or_else(|| uri.authority().map(::http::uri::Authority::as_str)),
+            host: ::service_common::data_plane_addressing::addressed_authority(
+                req.uri(),
+                req.headers().get("host"),
+            ),
             path: uri.path(),
         }
     }

@@ -558,14 +558,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 return true;
             }
         }
-        if let Some(host) = ::service_common::data_plane_addressing::addressed_host(
-            &parts.uri.to_string(),
+        if let Some(host) = ::service_common::data_plane_addressing::addressed_authority_of(
+            parts.uri.authority().map(::http::uri::Authority::as_str),
             parts
                 .headers
                 .get(::http::header::HOST)
                 .and_then(|value| value.to_str().ok()),
         ) {
-            if self.hosts_a_branch(&crate::state::HostedSiteAddress::Host(&host)) {
+            if self.hosts_a_branch(&crate::state::HostedSiteAddress::Host(host)) {
                 return true;
             }
         }
@@ -648,11 +648,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 return Some(self.serve_hosted_site(req, &address, within));
             }
         }
-        if let Some(host) = ::service_common::data_plane_addressing::addressed_host(
+        if let Some(host) = ::service_common::data_plane_addressing::addressed_authority(
             &uri,
             req.headers().get("host"),
         ) {
-            let address = crate::state::HostedSiteAddress::Host(&host);
+            let address = crate::state::HostedSiteAddress::Host(host);
             if self.hosts_a_branch(&address) {
                 return Some(self.serve_hosted_site(req, &address, request_path));
             }

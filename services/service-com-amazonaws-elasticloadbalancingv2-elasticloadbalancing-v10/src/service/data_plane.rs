@@ -130,8 +130,8 @@ use crate::state::{
 // reserved path namespace, the first path segment, the host without its port, the port a
 // client addressed, and whether a host names a service at all.
 use ::service_common::data_plane_addressing::{
-    addressed_port, first_segment, host_only, names_a_service, service_named_by_host,
-    EMULATOR_PATH_NAMESPACE,
+    addressed_authority, addressed_authority_of, addressed_port, first_segment, host_only,
+    names_a_service, service_named_by_host, EMULATOR_PATH_NAMESPACE,
 };
 
 /// The segment that names THIS service's data plane behind [`EMULATOR_PATH_NAMESPACE`]:
@@ -374,12 +374,16 @@ use crate::state::rule_actions::{
 };
 
 /// What a data-plane request ADDRESSES, as the wire carries it: the host it was sent to —
-/// absent on a request that carries neither a `Host` header nor an absolute URI — its
-/// path, and whether it presents what an AWS API call presents.
+/// absent on a request that carries neither an absolute-form request target nor a `Host`
+/// header — its path, and whether it presents what an AWS API call presents.
 ///
 /// Built from BOTH shapes the router hands this module, the buffered parts the claim reads
 /// and the runtime-API request the serving seam reads, so one rule resolves both and the
-/// claim cannot resolve a different load balancer than the answer does.
+/// claim cannot resolve a different load balancer than the answer does. The host is the one
+/// reading of which host a request addressed
+/// (`service_common::data_plane_addressing::addressed_authority`), so a request another
+/// service RELAYS here resolves to the load balancer the relay addressed rather than to the
+/// host the relay's own client named.
 #[derive(Debug)]
 struct Addressed<'a> {
     host: Option<&'a str>,
@@ -394,11 +398,13 @@ impl<'a> Addressed<'a> {
     /// The addressing of the buffered request these parts came from.
     fn of_parts(parts: &'a http::request::Parts) -> Self {
         Self {
-            host: parts
-                .headers
-                .get("host")
-                .and_then(|host| host.to_str().ok())
-                .or_else(|| parts.uri.authority().map(http::uri::Authority::as_str)),
+            host: addressed_authority_of(
+                parts.uri.authority().map(http::uri::Authority::as_str),
+                parts
+                    .headers
+                    .get("host")
+                    .and_then(|host| host.to_str().ok()),
+            ),
             path: parts.uri.path(),
             aws_api_call: AWS_API_CALL_HEADERS
                 .iter()
@@ -417,10 +423,7 @@ impl<'a> Addressed<'a> {
     /// parsed by the `http` crate (`uri`) rather than split by hand.
     fn of_request(req: &'a RtRequest, uri: &'a http::Uri) -> Self {
         Self {
-            host: req
-                .headers()
-                .get("host")
-                .or_else(|| uri.authority().map(http::uri::Authority::as_str)),
+            host: addressed_authority(req.uri(), req.headers().get("host")),
             path: uri.path(),
             aws_api_call: AWS_API_CALL_HEADERS
                 .iter()
@@ -757,15 +760,20 @@ impl DataPlaneRequest {
     /// beside it ([`FORWARDED_HOST_HEADER`]), so the listener is selected by the port the
     /// socket states while `#{host}` and a `host-header` condition read the name the client
     /// dialled.
+    ///
+    /// The PORT is read off the authority the request was SENT to
+    /// ([`addressed_authority`]), and the client's host off the `Host` header the request
+    /// carries for this plane to read — which is the same value for every request whose
+    /// target names no authority, and differs only for a request another service RELAYED
+    /// here, where the target names this load balancer and the header names the host that
+    /// relay's own client addressed.
     fn of(req: &RtRequest, uri: &http::Uri, path: &str) -> Self {
-        let addressed = req
-            .headers()
-            .get("host")
-            .or_else(|| uri.authority().map(http::uri::Authority::as_str));
+        let addressed = addressed_authority(req.uri(), req.headers().get("host"));
         let client_host = req
             .headers()
             .get(FORWARDED_HOST_HEADER)
             .filter(|host| !host.trim().is_empty())
+            .or_else(|| req.headers().get("host"))
             .or(addressed);
         let mut headers: Vec<(String, String)> = req
             .headers()
@@ -2022,6 +2030,16 @@ fn forward(
     // registration receives traffic on ([`super::instance_target`]). The hand-off is made
     // where the store's guard has been released, for the same reason a `lambda` target's
     // invocation is.
+    //
+    // NOTHING IS DIALLED HERE, and the registration's own id and port cannot make this
+    // process reach outside itself: the hand-off carries them, and what answers is resolved
+    // IN PROCESS ([`super::instance_target::serve`]) — the server another service of this
+    // emulator recorded at that address (`service_common::served_http_addresses`), else the
+    // guest Amazon EC2's own store holds for the instance the registration names. An address
+    // this emulator stands no server behind — a link-local or metadata address, a host of
+    // someone else's network, an instance this account does not hold — resolves to none of
+    // them and is answered [`TARGET_UNREACHABLE_STATUS`], which is also what a load balancer
+    // answers for a target it cannot connect to.
     Performed::ToTarget(Box::new(super::instance_target::Forwarded {
         target_group_arn: group.arn.clone(),
         target_type: group.target_type.clone(),

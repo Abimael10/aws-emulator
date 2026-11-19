@@ -492,6 +492,10 @@ const COOKIE: &str = "cookie";
 /// The response (and request) header naming the media type of a body.
 const CONTENT_TYPE: &str = "content-type";
 
+/// The request header naming the host the request is addressed to, which an origin request
+/// carries as [`origin_request_host`] decides.
+const HOST: &str = "host";
+
 /// What a viewer request addresses, as the wire carries it: the request's host — absent
 /// on a request that carries neither a `Host` header nor an absolute URI — its path, and
 /// its query.
@@ -519,7 +523,10 @@ impl<'a> Addressed<'a> {
     /// The addressing of a runtime-API request, which carries its URI as a string.
     fn of_request(req: &'a RtRequest) -> Self {
         Self {
-            host: req.headers().get("host").or_else(|| authority_of(req.uri())),
+            host: ::service_common::data_plane_addressing::addressed_authority(
+                req.uri(),
+                req.headers().get("host"),
+            ),
             path: path_of(req.uri()),
             query: query_of(req.uri()),
         }
@@ -2192,7 +2199,16 @@ fn plan_resolved(
             detail: NO_ORIGIN_DETAIL,
         };
     };
-    let headers = origin_request_headers(store, &behavior, origin, req, cf_id);
+    let headers = origin_request_headers(
+        store,
+        &behavior,
+        origin,
+        req,
+        cf_id,
+        // The host the VIEWER addressed, which is what a behaviour forwarding the viewer's
+        // own `Host` sends the origin ([`origin_request_host`]).
+        viewer_host(addressed, resolved),
+    );
     // A REQUEST LOOP: the origin is a host the edge itself serves, or this request has
     // already been through an edge (its `Via` names CloudFront). Either way, fetching it
     // would hand the request back to the edge it came from, so the fetch is not made and
@@ -2582,7 +2598,8 @@ fn origin_read_timeout(origin: &Origin) -> Duration {
 /// The headers one origin request carries.
 ///
 /// The origin's own `CustomHeaders` ("CloudFront adds these headers to every origin
-/// request"), the `Host` of the origin, the `X-Amz-Cf-Id` of the request the origin is
+/// request"), the `Host` the origin request carries ([`origin_request_host`]), the
+/// `X-Amz-Cf-Id` of the request the origin is
 /// being fetched for, a `Via` naming CloudFront, the `User-Agent` CloudFront sends when
 /// the viewer's is not forwarded, the viewer headers the behaviour's ORIGIN REQUEST POLICY
 /// forwards, the ones its CACHE POLICY keys on — "the headers, cookies, and query strings
@@ -2601,6 +2618,7 @@ fn origin_request_headers(
     origin: &Origin,
     req: &RtRequest,
     cf_id: &str,
+    viewer_host: &str,
 ) -> Vec<(String, String)> {
     let keyed = forwarding::cache_key_parameters(store, behavior);
     let forwarded = forwarding::forwarded_parameters(store, behavior);
@@ -2609,7 +2627,9 @@ fn origin_request_headers(
     let mut headers: Vec<(String, String)> = Vec::new();
     for (name, value) in req.headers().iter() {
         let name = name.to_ascii_lowercase();
-        if HEADERS_NEVER_FORWARDED.contains(&name.as_str()) || name == "host" {
+        // `Host` is not copied from the viewer's request here: WHICH host the origin request
+        // carries is one decision, made once below ([`origin_request_host`]).
+        if HEADERS_NEVER_FORWARDED.contains(&name.as_str()) || name == HOST {
             continue;
         }
         // A `CloudFront-*` header describes the viewer's CONNECTION, so the value the viewer
@@ -2651,7 +2671,10 @@ fn origin_request_headers(
     if let Some(value) = accept_encoding.header_value() {
         headers.push((ACCEPT_ENCODING.to_string(), value));
     }
-    headers.push(("host".to_string(), origin.domain_name.clone()));
+    headers.push((
+        HOST.to_string(),
+        origin_request_host(origin, &keyed, &forwarded, viewer_host).to_string(),
+    ));
     headers.push((X_AMZ_CF_ID.to_string(), cf_id.to_string()));
     headers.push((
         "via".to_string(),
@@ -2679,6 +2702,37 @@ fn origin_request_headers(
         ));
     }
     headers
+}
+
+/// The `Host` ONE ORIGIN REQUEST carries.
+///
+/// A CUSTOM origin is sent the host the VIEWER addressed — the distribution's own domain name
+/// or the alternate domain name the viewer used — exactly where the matched behaviour's
+/// policies carry the viewer's `Host` among the headers that reach the origin, and the
+/// origin's own domain name everywhere else. That is what makes `Host` worth forwarding at
+/// all: an origin behind several front doors tells them apart by the name the viewer
+/// addressed, which is why the header behaviours spell out both answers — `allViewer` carries
+/// every header the viewer sent, `allViewerExceptHostHeader` carries all of them but `Host`,
+/// and a `whitelist` carries it exactly when it names it ([`forwarding::NameSet`], which
+/// reads the legacy `ForwardedValues$Headers` list the same way).
+///
+/// An AMAZON S3 origin is always sent the origin's own domain name: a bucket is addressed by
+/// its own host, so CloudFront sets that host whatever a behaviour forwards — which is the
+/// reason `allViewerExceptHostHeader` exists for such an origin. An origin carrying no
+/// `CustomOriginConfig` is read as one here, exactly as [`origin_uri`] reads it when it
+/// chooses the scheme the origin is addressed over.
+fn origin_request_host<'a>(
+    origin: &'a Origin,
+    keyed: &forwarding::CacheKeyParameters,
+    forwarded: &forwarding::ForwardedParameters,
+    viewer_host: &'a str,
+) -> &'a str {
+    let forwards_viewer_host =
+        keyed.headers.contains_header(HOST) || forwarded.headers.contains_header(HOST);
+    if forwards_viewer_host && origin.custom_origin_config.is_some() {
+        return viewer_host;
+    }
+    &origin.domain_name
 }
 
 /// One answer the edge reached for the origin to produce, and what the metrics read it by:
@@ -3174,12 +3228,14 @@ fn status_code(status: u16) -> StatusCode {
     })
 }
 
-/// The `Host` header of a buffered request, or the URI authority when the request is
-/// HTTP/2 (which carries `:authority` on the URI instead of a `Host` header).
+/// The host a buffered request ADDRESSED, by the one reading of that question
+/// (`service_common::data_plane_addressing::addressed_authority`): the authority of an
+/// absolute-form request target when the request carries one, and the `Host` header
+/// otherwise.
 fn request_host(parts: &http::request::Parts) -> Option<&str> {
-    match parts.headers.get("host").and_then(|host| host.to_str().ok()) {
-        Some(host) => Some(host),
-        None => parts.uri.authority().map(http::uri::Authority::as_str),
+    match parts.uri.authority().map(http::uri::Authority::as_str) {
+        Some(authority) => Some(authority),
+        None => parts.headers.get("host").and_then(|host| host.to_str().ok()),
     }
 }
 
@@ -3639,15 +3695,17 @@ mod tests {
             let mut req = RtRequest::new(SdkBody::empty());
             req.set_uri("/index.html").expect("a valid URI");
             req.headers_mut().insert(header.to_string(), "v".to_string());
-            let headers = origin_request_headers(&store, &behavior, &origin, &req, "cfid");
+            let headers =
+                origin_request_headers(&store, &behavior, &origin, &req, "cfid", VIEWER_HOST);
             let carried = headers.iter().any(|(name, _)| name == header);
             assert_eq!(
                 carried, forwarded,
                 "case {case:?}: expected the origin request to carry {header:?} == \
                  {forwarded}, got {carried} (headers {headers:?})"
             );
-            // Whatever the policy says, the origin request always names the ORIGIN's host
-            // and the request it is being made for.
+            // The origin here carries no `CustomOriginConfig`, so it is an Amazon S3 origin:
+            // such an origin is addressed by its OWN host whatever a behaviour forwards
+            // ([`origin_request_host`]), and the request names what it is being made for.
             assert!(
                 headers
                     .iter()
@@ -3655,6 +3713,121 @@ mod tests {
                     && headers.iter().any(|(name, _)| name == X_AMZ_CF_ID),
                 "case {case:?}: expected the origin's host and an X-Amz-Cf-Id, got \
                  {headers:?}"
+            );
+        }
+    }
+
+    /// The host the viewer addressed in the rows below: the name a distribution publishes.
+    const VIEWER_HOST: &str = "d111111abcdef8.cloudfront.net";
+
+    #[test]
+    fn an_origin_request_carries_the_viewers_host_exactly_where_the_behaviour_forwards_it() {
+        // Rows differ along what the rule generalises over: WHICH reading names the headers
+        // that reach the origin (an AWS-managed origin request policy, the legacy
+        // `ForwardedValues` whitelist, neither), the header BEHAVIOUR that reading carries
+        // (`allViewer`, `allViewerExceptHostHeader`, a whitelist that names `Host`, one that
+        // names another header, the list naming every header), and the KIND of origin (a
+        // custom origin, an Amazon S3 one).
+        const ALL_VIEWER: &str = "216adef6-5c7f-47e4-b989-5492eafa07d3";
+        const ALL_VIEWER_EXCEPT_HOST: &str = "b689b0a8-53d0-40ab-baf2-68738e2966ac";
+        const ORIGIN_HOST: &str = "origin.example.com";
+        let store = ComAmazonawsCloudfrontCloudfront20200531State::default();
+        let custom = Some(CustomOriginConfig {
+            http_port: 80,
+            https_port: 443,
+            origin_protocol_policy: "https-only".to_string(),
+            ..CustomOriginConfig::default()
+        });
+        let whitelist = |names: &[&str]| ForwardedValues {
+            query_string: false,
+            headers: Some(crate::ops::types::Headers {
+                quantity: i32::try_from(names.len()).expect("a small list"),
+                items: Some(names.iter().map(|name| (*name).to_string()).collect()),
+            }),
+            ..ForwardedValues::default()
+        };
+        // (case, the origin request policy, the legacy member, a custom origin, the host)
+        type Row = (&'static str, Option<&'static str>, Option<ForwardedValues>, bool, &'static str);
+        let cases: [Row; 8] = [
+            ("no policy and no legacy member", None, None, true, ORIGIN_HOST),
+            ("allViewer over a custom origin", Some(ALL_VIEWER), None, true, VIEWER_HOST),
+            ("allViewer over an S3 origin", Some(ALL_VIEWER), None, false, ORIGIN_HOST),
+            (
+                "allViewerExceptHostHeader over a custom origin",
+                Some(ALL_VIEWER_EXCEPT_HOST),
+                None,
+                true,
+                ORIGIN_HOST,
+            ),
+            (
+                "a legacy whitelist naming Host",
+                None,
+                Some(whitelist(&["Host"])),
+                true,
+                VIEWER_HOST,
+            ),
+            (
+                "a legacy whitelist naming another header",
+                None,
+                Some(whitelist(&["Accept-Language"])),
+                true,
+                ORIGIN_HOST,
+            ),
+            (
+                "a legacy whitelist naming every header",
+                None,
+                Some(whitelist(&["*"])),
+                true,
+                VIEWER_HOST,
+            ),
+            (
+                "a legacy whitelist naming every header, over an S3 origin",
+                None,
+                Some(whitelist(&["*"])),
+                false,
+                ORIGIN_HOST,
+            ),
+        ];
+        for (case, policy, forwarded_values, custom_origin, expected) in cases {
+            let origin = Origin {
+                id: "primary".to_string(),
+                domain_name: ORIGIN_HOST.to_string(),
+                custom_origin_config: custom_origin.then(|| custom.clone().expect("the config")),
+                ..Origin::default()
+            };
+            let behavior = Behavior {
+                path_pattern: None,
+                realtime_log_config_arn: None,
+                target_origin_id: "primary".to_string(),
+                viewer_protocol_policy: "allow-all".to_string(),
+                allowed_methods: None,
+                trusted_key_groups: None,
+                cache_policy_id: None,
+                origin_request_policy_id: policy.map(str::to_string),
+                compress: false,
+                default_ttl: None,
+                max_ttl: None,
+                forwarded_values,
+                response_headers_policy_id: None,
+                function_associations: None,
+                lambda_function_associations: None,
+            };
+            let mut req = RtRequest::new(SdkBody::empty());
+            req.set_uri("/index.html").expect("a valid URI");
+            req.headers_mut()
+                .insert("host".to_string(), VIEWER_HOST.to_string());
+            let headers =
+                origin_request_headers(&store, &behavior, &origin, &req, "cfid", VIEWER_HOST);
+            let carried: Vec<&String> = headers
+                .iter()
+                .filter(|(name, _)| name == "host")
+                .map(|(_, value)| value)
+                .collect();
+            assert_eq!(
+                carried,
+                vec![&expected.to_string()],
+                "case {case:?}: expected the origin request to carry the one host \
+                 {expected:?}, got {carried:?} (headers {headers:?})"
             );
         }
     }
@@ -3821,7 +3994,8 @@ mod tests {
         ] {
             req.headers_mut().insert(name.to_string(), value.to_string());
         }
-        let headers = origin_request_headers(&store, &behavior, &origin, &req, "cfid");
+        let headers =
+            origin_request_headers(&store, &behavior, &origin, &req, "cfid", VIEWER_HOST);
         let carried = |name: &str| {
             headers
                 .iter()
@@ -3861,7 +4035,11 @@ mod tests {
                 ACCEPT_ENCODING,
                 Some("br"),
             ),
-            ("the origin's own host", "host", Some("origin.example.com")),
+            (
+                "the origin's own host, the policies naming no viewer Host beside it",
+                "host",
+                Some("origin.example.com"),
+            ),
         ];
         for (case, header, expected) in cases {
             let actual = carried(header);

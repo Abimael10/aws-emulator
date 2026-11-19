@@ -72,7 +72,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::http;
 
 use ::service_common::data_plane_addressing::{
-    addressed_host, first_segment, host_only, EMULATOR_PATH_NAMESPACE,
+    addressed_authority, addressed_authority_of, first_segment, host_only,
+    EMULATOR_PATH_NAMESPACE,
 };
 
 use crate::state::{self, CollectionRecord};
@@ -146,12 +147,17 @@ const ENGINE_VERSION: &str = "2.13.0";
 const TAGLINE: &str = "The OpenSearch Project: https://opensearch.org/";
 
 /// What a request ADDRESSES, as the wire carries it: the host it was sent to — absent on a
-/// request that names neither a `Host` header nor an absolute URI — its path, its query
+/// request that names neither a `Host` header nor an absolute-form request target — its
+/// path, its query
 /// string, and whether it names an RPC target.
 ///
 /// Built from BOTH shapes the router hands this module, the buffered parts the claim reads
 /// and the runtime-API request the serving seam reads, so one rule resolves both and the
-/// claim cannot resolve a different collection than the answer does.
+/// claim cannot resolve a different collection than the answer does. The host is the one
+/// reading of which host a request was SENT to
+/// (`service_common::data_plane_addressing::addressed_authority`), so a request another
+/// service RELAYS here resolves to the collection the relay addressed rather than to the
+/// host the relay's own client named.
 #[derive(Debug)]
 struct Addressed {
     host: Option<String>,
@@ -165,13 +171,16 @@ struct Addressed {
 impl Addressed {
     /// The addressing of the buffered request these parts came from.
     fn of_parts(parts: &http::request::Parts) -> Self {
-        let uri = parts.uri.to_string();
         let header = parts
             .headers
             .get("host")
             .and_then(|host| host.to_str().ok());
         Self {
-            host: addressed_host(&uri, header),
+            host: addressed_authority_of(
+                parts.uri.authority().map(http::uri::Authority::as_str),
+                header,
+            )
+            .map(str::to_string),
             path: parts.uri.path().to_string(),
             query: parts.uri.query().unwrap_or_default().to_string(),
             rpc_target: parts.headers.contains_key(RPC_TARGET_HEADER),
@@ -183,7 +192,8 @@ impl Addressed {
     fn of_request(req: &RtRequest) -> Self {
         let uri = parsed_uri(req.uri());
         Self {
-            host: addressed_host(req.uri(), req.headers().get("host")),
+            host: addressed_authority(req.uri(), req.headers().get("host"))
+                .map(str::to_string),
             path: uri.path().to_string(),
             query: uri.query().unwrap_or_default().to_string(),
             rpc_target: req.headers().get(RPC_TARGET_HEADER).is_some(),

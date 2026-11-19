@@ -192,7 +192,7 @@ use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{http, OperationContext};
 
 use super::data_plane::{
-    addresses_connections, api_id_of_host, authority_of, first_segment, forbidden, header_of,
+    addresses_connections, api_id_of_host, first_segment, forbidden, header_of,
     identity_source_value, json_response, not_found, path_of, path_segments,
     presents_identity_source, query_of, query_parameter_values, query_parameters,
     service_named_by_host, split_first_segment, FieldValues, EXECUTE_API_LABEL,
@@ -361,11 +361,19 @@ struct Addressed<'r> {
 
 impl<'r> Addressed<'r> {
     /// The reading of the request parts `Service::can_handle` is handed.
+    ///
+    /// The host is the one reading of which host a request addressed
+    /// (`service_common::data_plane_addressing::addressed_authority`): the authority of an
+    /// absolute-form request target when the request carries one, and the `Host` header
+    /// otherwise — so a request another service RELAYS here resolves to the api the relay
+    /// addressed rather than to the host the relay's own client named.
     fn of_parts(parts: &'r http::request::Parts) -> Self {
         Self {
             method: parts.method.as_str(),
-            host: header_of(&parts.headers, "host")
-                .or_else(|| parts.uri.authority().map(http::uri::Authority::as_str)),
+            host: ::service_common::data_plane_addressing::addressed_authority_of(
+                parts.uri.authority().map(http::uri::Authority::as_str),
+                header_of(&parts.headers, "host"),
+            ),
             path: parts.uri.path(),
         }
     }
@@ -374,7 +382,10 @@ impl<'r> Addressed<'r> {
     fn of_request(req: &'r RtRequest) -> Self {
         Self {
             method: req.method(),
-            host: req.headers().get("host").or_else(|| authority_of(req.uri())),
+            host: ::service_common::data_plane_addressing::addressed_authority(
+                req.uri(),
+                req.headers().get("host"),
+            ),
             path: path_of(req.uri()),
         }
     }

@@ -1016,12 +1016,18 @@ const FORBIDDEN_EXCEPTION: &str = "ForbiddenException";
 const INTERNAL_SERVER_ERROR_EXCEPTION: &str = "InternalServerErrorException";
 
 /// What an invoke addresses, as the wire carries it: the request's host — absent on a
-/// request that carries neither a `Host` header nor an absolute URI — its path, and the api
+/// request that carries neither an absolute-form request target nor a `Host` header — its
+/// path, and the api
 /// id a request addressed to a VPC endpoint's own DNS name carries in a header.
 ///
 /// Built from BOTH shapes the router hands this module, the buffered parts the claim reads
 /// and the runtime-API request the two serving seams read, so one rule resolves both and
-/// the claim cannot resolve a different api than the answer does.
+/// the claim cannot resolve a different api than the answer does. The host is the one
+/// reading of which host a request addressed
+/// (`service_common::data_plane_addressing::addressed_authority`), so a request another
+/// service RELAYS here — a CloudFront distribution fetching this stage as its origin —
+/// resolves to the api the relay addressed rather than to the host the relay's own client
+/// named.
 #[derive(Debug)]
 pub struct Addressed<'a> {
     host: Option<&'a str>,
@@ -1057,7 +1063,10 @@ impl<'a> Addressed<'a> {
     /// The addressing of a runtime-API request, which carries its URI as a string.
     fn of_request(req: &'a RtRequest) -> Self {
         Self {
-            host: req.headers().get("host").or_else(|| authority_of(req.uri())),
+            host: ::service_common::data_plane_addressing::addressed_authority(
+                req.uri(),
+                req.headers().get("host"),
+            ),
             path: path_of(req.uri()),
             api_id_header: req.headers().get(API_ID_HEADER),
             delivered_through: None,
@@ -4302,8 +4311,14 @@ fn every_query_parameter(query: &str) -> BTreeMap<String, Vec<String>> {
     sent
 }
 
-/// The endpoint host `req` was addressed on — the `Host` it carries, or the authority of its
-/// own URI — which is the domain name a PROXY integration's event reports the call arrived at.
+/// The endpoint host a CLIENT named for `req` — the `Host` it carries, or the authority of
+/// its own target for a request carrying no header — which is the domain name a PROXY
+/// integration's event reports the call arrived at.
+///
+/// The host a client NAMED, which is what the event reports, rather than the api the request
+/// ADDRESSED ([`Addressed`], which resolves the target first): the two differ only for a
+/// request another service relayed here, where the event reports the domain that service's
+/// own client addressed.
 fn request_host_of(req: &RtRequest) -> Option<String> {
     req.headers()
         .get("host")
@@ -4826,13 +4841,15 @@ fn response_with(status: u16, content_type: &str, body: Vec<u8>) -> RtResponse {
     response
 }
 
-/// The `Host` header of a buffered request, or the URI authority when the request is
-/// HTTP/2 (which carries `:authority` on the URI instead of a `Host` header).
+/// The host a buffered request ADDRESSED, by the one reading of that question
+/// (`service_common::data_plane_addressing::addressed_authority`): the authority of an
+/// absolute-form request target when the request carries one, and the `Host` header
+/// otherwise.
 fn request_host(parts: &http::request::Parts) -> Option<&str> {
-    match parts.headers.get("host").and_then(|host| host.to_str().ok()) {
-        Some(host) => Some(host),
-        None => parts.uri.authority().map(http::uri::Authority::as_str),
-    }
+    ::service_common::data_plane_addressing::addressed_authority_of(
+        parts.uri.authority().map(http::uri::Authority::as_str),
+        parts.headers.get("host").and_then(|host| host.to_str().ok()),
+    )
 }
 
 /// The authority of an absolute request URI, or `None` when the URI is origin-form.

@@ -52,8 +52,9 @@ const ALL_VIEWER: &str = "allViewer";
 /// CloudFront-generated headers the list carries ([`super::generated_headers`]).
 const ALL_VIEWER_AND_CLOUDFRONT: &str = "allViewerAndWhitelistCloudFront";
 
-/// The header behaviour that names every header the viewer sent but `Host`, which the origin
-/// request carries as the origin's own host either way.
+/// The header behaviour that names every header the viewer sent but `Host`, so an origin
+/// request made under it carries the origin's own host rather than the viewer's
+/// ([`super::origin_request_host`]).
 const ALL_VIEWER_EXCEPT_HOST: &str = "allViewerExceptHostHeader";
 
 /// The one header `allViewerExceptHostHeader` leaves out.

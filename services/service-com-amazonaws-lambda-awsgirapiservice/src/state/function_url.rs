@@ -52,10 +52,13 @@ const FUNCTION_URL_MAX_LEN: usize = 100;
 ///
 /// Both are passed in rather than a whole request, because the framework hands
 /// `Service::can_handle` the request's PARTS and the serving seams a runtime-API request:
-/// each has these two things and no common type. Which of the two carries the host is the
-/// SHARED data-plane reading's question, not this module's
-/// ([`service_common::data_plane_addressing::addressed_host`]), so every plane reads an
-/// address the same way.
+/// each has these two things and no common type. Which of the two carries the address the
+/// request was SENT TO is the shared data-plane reading's question, not this module's
+/// ([`service_common::data_plane_addressing::addressed_authority`]: the authority of an
+/// absolute-form request target when the request carries one, the `Host` header otherwise),
+/// so every plane reads an address the same way — and a request another service RELAYED here
+/// resolves to the function URL that relay addressed rather than to the host its own client
+/// named.
 #[derive(Debug, Clone)]
 pub struct AddressedFunctionUrl<'r> {
     /// The host the request is addressed to, when it names one.
@@ -69,19 +72,17 @@ impl<'r> AddressedFunctionUrl<'r> {
     #[must_use]
     pub fn of_parts(parts: &'r ::smithy_server_runtime::http::request::Parts) -> Self {
         Self {
-            host: ::service_common::data_plane_addressing::addressed_host(
-                "",
+            host: ::service_common::data_plane_addressing::addressed_authority_of(
+                parts
+                    .uri
+                    .authority()
+                    .map(::smithy_server_runtime::http::uri::Authority::as_str),
                 parts
                     .headers
                     .get("host")
-                    .and_then(|host| host.to_str().ok())
-                    .or_else(|| {
-                        parts
-                            .uri
-                            .authority()
-                            .map(::smithy_server_runtime::http::uri::Authority::as_str)
-                    }),
-            ),
+                    .and_then(|host| host.to_str().ok()),
+            )
+            .map(str::to_string),
             path: parts.uri.path(),
         }
     }
@@ -92,10 +93,11 @@ impl<'r> AddressedFunctionUrl<'r> {
     #[must_use]
     pub fn of_request(req: &'r ::aws_smithy_runtime_api::http::Request) -> Self {
         Self {
-            host: ::service_common::data_plane_addressing::addressed_host(
+            host: ::service_common::data_plane_addressing::addressed_authority(
                 req.uri(),
                 req.headers().get("host"),
-            ),
+            )
+            .map(str::to_string),
             path: ::service_common::request_path(req.uri()),
         }
     }

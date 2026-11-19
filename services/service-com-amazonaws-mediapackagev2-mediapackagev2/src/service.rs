@@ -853,10 +853,17 @@ fn data_plane_of_request(req: &RtRequest) -> Option<crate::state::AddressedDataP
     crate::state::addressed_data_plane(data_plane_host(req), request_path(req.uri()))
 }
 
-/// The `Host` header of a runtime request, or the authority of its URI when it carries
-/// none (an HTTP/2 request carries `:authority` on the URI instead).
+/// The host a runtime request ADDRESSED, by the one reading of that question
+/// (`service_common::data_plane_addressing::addressed_authority`): the authority of an
+/// absolute-form request target when the request carries one, and the `Host` header
+/// otherwise — so a request another service RELAYS here (a CloudFront distribution fetching
+/// this endpoint as its origin) resolves to the endpoint the relay addressed rather than to
+/// the host the relay's own client named.
 fn data_plane_host(req: &RtRequest) -> Option<&str> {
-    req.headers().get("host").or_else(|| authority_of(req.uri()))
+    ::service_common::data_plane_addressing::addressed_authority(
+        req.uri(),
+        req.headers().get("host"),
+    )
 }
 
 /// The action an anonymous player needs on an origin endpoint to fetch its content with
@@ -894,22 +901,12 @@ fn carries_sigv4_credential(req: &RtRequest) -> bool {
         .any(|pair| pair.starts_with("X-Amz-Credential="))
 }
 
-/// The `Host` header of a buffered request, or the URI authority when the request is
-/// HTTP/2 (which carries `:authority` on the URI instead of a `Host` header).
+/// The host a buffered request ADDRESSED, by the same reading [`data_plane_host`] applies.
 fn request_host(parts: &http::request::Parts) -> Option<&str> {
-    match parts.headers.get("host").and_then(|host| host.to_str().ok()) {
-        Some(host) => Some(host),
-        None => parts.uri.authority().map(http::uri::Authority::as_str),
-    }
-}
-
-/// The authority of an absolute request URI, or `None` when the URI is origin-form.
-fn authority_of(uri: &str) -> Option<&str> {
-    let (_scheme, rest) = uri.split_once("://")?;
-    Some(match rest.find('/') {
-        Some(path_start) => &rest[..path_start],
-        None => rest,
-    })
+    ::service_common::data_plane_addressing::addressed_authority_of(
+        parts.uri.authority().map(http::uri::Authority::as_str),
+        parts.headers.get("host").and_then(|host| host.to_str().ok()),
+    )
 }
 
 /// The path component of a request URI, with any scheme, authority and query removed.
