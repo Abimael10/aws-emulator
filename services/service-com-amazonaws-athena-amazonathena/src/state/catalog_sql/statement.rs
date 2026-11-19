@@ -1370,6 +1370,52 @@ pub fn relations_of<N: Visit>(node: &N, context: &QueryContext) -> Vec<Relation>
     collector.relations
 }
 
+/// Whether a parsed node NAMES the column `name` anywhere in it.
+///
+/// A column a statement reads appears as an identifier, on its own or qualified by the
+/// relation it belongs to, so both forms are looked at; the comparison is the one the
+/// catalog makes between two column names, which is case-insensitive. What this answers is
+/// whether a column has to be THERE for the statement at all — a column nothing names is a
+/// column nothing has to carry.
+pub fn names_column<N: Visit>(node: &N, name: &str) -> bool {
+    let mut collector = Columns {
+        name,
+        named: false,
+    };
+    let _ = node.visit(&mut collector);
+    collector.named
+}
+
+/// Answers whether one column is named; see [`names_column`].
+#[derive(Debug)]
+struct Columns<'n> {
+    /// The column name looked for.
+    name: &'n str,
+    /// Whether it was found.
+    named: bool,
+}
+
+impl Visitor for Columns<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        let named = match expr {
+            Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(self.name),
+            // A qualified name's LAST part is the column; the ones in front of it name the
+            // relation it is read from.
+            Expr::CompoundIdentifier(parts) => parts
+                .last()
+                .is_some_and(|ident| ident.value.eq_ignore_ascii_case(self.name)),
+            _ => false,
+        };
+        if named {
+            self.named = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// Collects the relations a query reads; see [`relations_of`].
 #[derive(Debug, Default)]
 struct Relations<'c> {

@@ -79,6 +79,18 @@ parquet = { version = "60", default-features = false, features = [
     "snap",
     "flate2-rust_backend",
 ] }
+# The codecs an object of a TEXT table can be compressed with, chosen by the extension of
+# the object's own key before the text SerDe reads it
+# (`state::catalog_sql::data::text_codecs`). Each one is read by the maintained decoder for
+# that compression, and each is pure Rust — the emulator links no native compression library:
+# `flate2` reads the gzip and zlib streams `.gz` and `.deflate` name, `bzip2` (over the Rust
+# port of libbz2) the `.bz2` stream, `ruzstd` the `.zst` stream, and `snap` and `lz4_flex` the
+# raw chunks the block-framed `.snappy` and `.lz4` objects carry.
+flate2 = "1"
+bzip2 = "0.6"
+ruzstd = "0.9"
+snap = "1"
+lz4_flex = "0.14"
 # `chrono`: a Parquet date or timestamp leaf carries a count of days, milliseconds or
 # microseconds from the epoch, and the calendar text a `date` or `timestamp` column holds it
 # as is read from a maintained date library rather than computed here.

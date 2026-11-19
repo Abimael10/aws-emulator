@@ -12,7 +12,10 @@
 
 /// The records one object of the columnar Parquet format holds.
 mod parquet_objects;
+/// The compression one TEXT object at a table's location carries.
+mod text_codecs;
 
+use ::std::borrow::Cow;
 use ::std::collections::HashMap;
 
 use ::service_com_amazonaws_glue_awsglue::state as glue_state;
@@ -109,6 +112,67 @@ enum Decoder {
     /// One row per record of a Parquet file, whose leaves are the columns
     /// ([`parquet_objects`]).
     Parquet,
+}
+
+/// A column of a catalog table's data that the table does not DECLARE: what Athena reports
+/// about the OBJECT each row was read from.
+///
+/// Such a column is addressed by the name below and carries, for every row, a property of
+/// the split that row came from. It is HIDDEN: a statement sees it only where it names it,
+/// so it is no part of the table's declared columns, of what `SELECT *` expands to, or of
+/// what the catalog reports the table's schema to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataColumn {
+    /// Where the object the row was read from lives, as its `s3://` URI.
+    Path,
+    /// How many bytes that object stores.
+    FileSize,
+    /// When that object was last written.
+    FileModifiedTime,
+}
+
+impl MetadataColumn {
+    /// Every one of these columns, in the order a read holds them.
+    pub const ALL: &'static [Self] = &[Self::Path, Self::FileSize, Self::FileModifiedTime];
+
+    /// The name a statement addresses this column by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Path => "$path",
+            Self::FileSize => "$file_size",
+            Self::FileModifiedTime => "$file_modified_time",
+        }
+    }
+
+    /// The type the engine holds it as, which is also the type a result set reports for it:
+    /// the location is character data, the size an exact number of bytes, and the instant is
+    /// held the way every other instant this engine reads is ([`timestamp_text`]).
+    fn declared(self) -> &'static str {
+        match self {
+            Self::Path | Self::FileModifiedTime => TYPE_TEXT,
+            Self::FileSize => TYPE_BIGINT,
+        }
+    }
+
+    /// What this column carries for a row read out of the object `at`.
+    fn value(self, at: &str, object: &s3_state::Object) -> ::rusqlite::types::Value {
+        use ::rusqlite::types::Value;
+        match self {
+            Self::Path => Value::Text(at.to_string()),
+            Self::FileSize => {
+                Value::Integer(i64::try_from(object.body.len()).unwrap_or(i64::MAX))
+            }
+            Self::FileModifiedTime => Value::Text(instant_text(object.last_modified)),
+        }
+    }
+
+    /// This column as the engine holds it.
+    fn local(self) -> LocalColumn {
+        LocalColumn {
+            name: self.name().to_string(),
+            declared: self.declared(),
+        }
+    }
 }
 
 /// Everything about one catalog table that decides what rows a read of it produces.
@@ -378,10 +442,14 @@ impl DataSource {
     /// A read the reader's grant narrows by a row predicate is handed to the engine as the
     /// rows plus that predicate ([`LocalObject::Filtered`]), so the engine is what decides
     /// which rows the statement sees.
+    /// `metadata` are the hidden metadata columns the statement NAMES ([`MetadataColumn`]):
+    /// a read carries them only where the statement reads one, so a statement that names
+    /// none is handed exactly the table's own columns.
     pub fn read(
         &self,
         objects: &s3_state::ComAmazonawsS3Amazons3State,
         budget: &mut Budget,
+        metadata: &[MetadataColumn],
     ) -> Result<(LocalObject, usize), Failure> {
         if self.columns.is_empty() {
             return Err(Failure::user(format!(
@@ -389,16 +457,26 @@ impl DataSource {
                 self.relation.database, self.relation.table
             )));
         }
-        let (rows, scanned) = self.rows(objects, budget)?;
+        let (rows, scanned) = self.rows(objects, budget, metadata)?;
         let local_column = |position: &usize| {
             self.columns.get(*position).map(|column| LocalColumn {
                 name: column.name.clone(),
                 declared: engine_type(&column.data_type),
             })
         };
-        let materialised: Vec<LocalColumn> =
-            self.materialised().iter().filter_map(local_column).collect();
-        let visible: Vec<LocalColumn> = self.visible.iter().filter_map(local_column).collect();
+        let hidden = || metadata.iter().map(|column| column.local());
+        let materialised: Vec<LocalColumn> = self
+            .materialised()
+            .iter()
+            .filter_map(local_column)
+            .chain(hidden())
+            .collect();
+        let visible: Vec<LocalColumn> = self
+            .visible
+            .iter()
+            .filter_map(local_column)
+            .chain(hidden())
+            .collect();
         let object = match &self.row_predicate {
             None => LocalObject::Table(LocalTable {
                 name: self.local_name.clone(),
@@ -424,6 +502,7 @@ impl DataSource {
         &self,
         objects: &s3_state::ComAmazonawsS3Amazons3State,
         budget: &mut Budget,
+        metadata: &[MetadataColumn],
     ) -> Result<(Vec<Vec<::rusqlite::types::Value>>, usize), Failure> {
         let mut rows: Vec<Vec<::rusqlite::types::Value>> = Vec::new();
         let mut scanned = 0usize;
@@ -453,20 +532,71 @@ impl DataSource {
             }
             budget.bytes_left -= object.body.len();
             scanned = scanned.saturating_add(object.body.len());
-            self.decode(
-                &object.body,
-                &format!("s3://{bucket_name}/{key}"),
-                &mut rows,
-                budget,
-            )?;
+            let split = format!("s3://{bucket_name}/{key}");
+            // What the hidden metadata columns carry is a property of THIS object, so it is
+            // read once per object and held by every row that object holds.
+            let held: Vec<::rusqlite::types::Value> = metadata
+                .iter()
+                .map(|column| column.value(&split, object))
+                .collect();
+            let body = self.uncompressed(key, &object.body, &split, budget)?;
+            self.decode(&body, &split, &held, &mut rows, budget)?;
         }
         Ok((rows, scanned))
+    }
+
+    /// One split's bytes as this table's SerDe reads them: the object's own bytes, with the
+    /// compression its KEY names undone ([`text_codecs`]).
+    ///
+    /// Only a TEXT object carries its compression in its key. A Parquet file holds its own,
+    /// per column and inside the file, which the format's reader undoes, so nothing is taken
+    /// off such an object here however it is keyed.
+    ///
+    /// What the object decompresses to is charged against the read's budget over and above
+    /// the stored bytes it was already charged for, and the decompression itself stops at
+    /// that bound — so an object that would expand past what one query may hold is refused
+    /// rather than held.
+    fn uncompressed<'body>(
+        &self,
+        key: &str,
+        body: &'body [u8],
+        split: &str,
+        budget: &mut Budget,
+    ) -> Result<Cow<'body, [u8]>, Failure> {
+        if matches!(self.decoder, Decoder::Parquet) {
+            return Ok(Cow::Borrowed(body));
+        }
+        let Some(codec) = text_codecs::of_key(key) else {
+            return Ok(Cow::Borrowed(body));
+        };
+        let decompressed = codec.decompress(body, budget.bytes_left).map_err(|refused| {
+            match refused {
+                text_codecs::NotDecompressed::TooLarge => {
+                    Budget::too_many_bytes(&self.relation)
+                }
+                text_codecs::NotDecompressed::NotTheCodec(reason) => {
+                    cannot_open_split(split, &reason)
+                }
+                text_codecs::NotDecompressed::NoDecoder(codec) => Failure::emulator(format!(
+                    "the data of {}.{} is compressed with the codec the {} suffix names, \
+                     which this emulator's query engine does not decompress",
+                    self.relation.database,
+                    self.relation.table,
+                    codec.extension()
+                )),
+            }
+        })?;
+        budget.charge_decoded(&self.relation, decompressed.len())?;
+        Ok(Cow::Owned(decompressed))
     }
 
     /// Decode one object's bytes into the rows it holds, appending them to `rows`.
     ///
     /// `split` is where the object this reads lives, which a failure to OPEN it at all names
     /// — the unit of work Hive calls a split is one object of the table's location.
+    ///
+    /// `metadata` are the values the hidden metadata columns of this object carry, which
+    /// every row read out of it holds beside its own fields.
     ///
     /// STREAMING, and budget-charged BEFORE each row is built: one record is read, charged
     /// and converted at a time, so a read stops at the first row over budget instead of
@@ -475,27 +605,30 @@ impl DataSource {
         &self,
         body: &[u8],
         split: &str,
+        metadata: &[::rusqlite::types::Value],
         rows: &mut Vec<Vec<::rusqlite::types::Value>>,
         budget: &mut Budget,
     ) -> Result<(), Failure> {
         // Only the cells the read MATERIALISES are built, so the width one row charges
         // against the budget is the width of the row the engine is handed.
         let materialised = self.materialised();
-        let width = materialised.len();
+        let width = materialised.len().saturating_add(metadata.len());
         match &self.decoder {
             Decoder::Delimited { separator, quote } => {
-                let mut reader = delimited_reader(body, *separator, *quote).map_err(|reason| {
-                    Failure::user(format!(
-                        "HIVE_BAD_DATA: Error reading the data of {}.{}: {reason}",
-                        self.relation.database, self.relation.table
-                    ))
-                })?;
+                // A text SerDe reads a split's bytes AS TEXT, byte for byte: a byte that is
+                // not text stands for the replacement character the way Hive's own text
+                // reader holds one, so a single such byte never fails the split — the
+                // records either side of it are still the records the object holds.
+                let text = String::from_utf8_lossy(body);
+                let mut reader =
+                    delimited_reader(text.as_bytes(), *separator, *quote).map_err(Failure::emulator)?;
                 let mut record = ::csv::StringRecord::new();
                 let mut skipped = 0usize;
                 loop {
                     let read = reader.read_record(&mut record).map_err(|reason| {
-                        Failure::user(format!(
-                            "HIVE_BAD_DATA: Error reading the data of {}.{}: {reason}",
+                        Failure::emulator(format!(
+                            "the records of {split} could not be read as the delimited text \
+                             the SerDe of {}.{} declares: {reason}",
                             self.relation.database, self.relation.table
                         ))
                     })?;
@@ -507,7 +640,9 @@ impl DataSource {
                         continue;
                     }
                     budget.charge_row(&self.relation, width)?;
-                    rows.push(self.row(&materialised, |position| record.get(position)));
+                    rows.push(self.row(&materialised, metadata, |position| {
+                        record.get(position)
+                    }));
                 }
             }
             Decoder::Json => {
@@ -536,7 +671,7 @@ impl DataSource {
                             members.and_then(|members| json_member(members, &column.name))
                         })
                         .collect();
-                    rows.push(self.row(&materialised, |position| {
+                    rows.push(self.row(&materialised, metadata, |position| {
                         fields.get(position).and_then(Option::as_deref)
                     }));
                 }
@@ -569,7 +704,7 @@ impl DataSource {
                                 .map(parquet_objects::Cell::size)
                                 .fold(0usize, usize::saturating_add),
                         )?;
-                        rows.push(self.parquet_row(&materialised, &values));
+                        rows.push(self.parquet_row(&materialised, metadata, &values));
                         Ok(())
                     },
                 )?;
@@ -579,10 +714,12 @@ impl DataSource {
     }
 
     /// One Parquet record as the row it holds: one value per MATERIALISED column, each read
-    /// out of the record by its column's own NAME.
+    /// out of the record by its column's own NAME, followed by what the hidden metadata
+    /// columns of the object it was read from carry.
     fn parquet_row(
         &self,
         materialised: &[usize],
+        metadata: &[::rusqlite::types::Value],
         values: &HashMap<String, parquet_objects::Cell>,
     ) -> Vec<::rusqlite::types::Value> {
         materialised
@@ -602,15 +739,18 @@ impl DataSource {
                     None => self.cell(column, None),
                 }
             })
+            .chain(metadata.iter().cloned())
             .collect()
     }
 
     /// One record as the row it holds: one value per MATERIALISED column, in the table's
     /// own column order, each read from the record by its column's own position in the
-    /// table — so leaving a column out of the row never shifts the ones beside it.
+    /// table — so leaving a column out of the row never shifts the ones beside it — followed
+    /// by what the hidden metadata columns of the object it was read from carry.
     fn row<'f>(
         &self,
         materialised: &[usize],
+        metadata: &[::rusqlite::types::Value],
         field: impl Fn(usize) -> Option<&'f str>,
     ) -> Vec<::rusqlite::types::Value> {
         materialised
@@ -620,6 +760,7 @@ impl DataSource {
                     .get(*position)
                     .map(|column| self.cell(column, field(*position)))
             })
+            .chain(metadata.iter().cloned())
             .collect()
     }
 
@@ -691,6 +832,14 @@ fn timestamp_text(field: &str) -> String {
         digits.push('0');
     }
     format!("{instant}.{digits}")
+}
+
+/// One instant the object store holds, as the text a column of instants holds it as: the
+/// UTC calendar date and the time of day, to the same digits of a second a stored timestamp
+/// is read to ([`TIMESTAMP_FRACTION_DIGITS`]).
+fn instant_text(at: ::std::time::SystemTime) -> String {
+    let instant: ::chrono::DateTime<::chrono::Utc> = at.into();
+    instant.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
 }
 
 /// Whether `text` names an instant as a timestamp writes one: a date, a separator and a
@@ -895,6 +1044,19 @@ fn is_hidden(key: &str) -> bool {
     }
     let name = key.rsplit('/').next().unwrap_or(key);
     name.is_empty() || name.starts_with('_') || name.starts_with('.')
+}
+
+/// The failure a split a read cannot OPEN reports: Hive's own class for it, naming the
+/// object and what refused it.
+///
+/// ONE wording for every reason an object at a table's location cannot be opened at all — a
+/// file that is not the format the table's descriptor declares, and one that is not the
+/// compressed stream its own key names — because to the reader both are the same thing: a
+/// split it could not open.
+fn cannot_open_split(split: &str, reason: &str) -> Failure {
+    Failure::user(format!(
+        "HIVE_CANNOT_OPEN_SPLIT: Error opening Hive split {split}: {reason}"
+    ))
 }
 
 /// The reader one object of delimited text is read RECORD BY RECORD with, or the reason

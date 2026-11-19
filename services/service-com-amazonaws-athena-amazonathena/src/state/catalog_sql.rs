@@ -977,9 +977,18 @@ fn resolved_sql<Eng: Send + Sync + 'static>(
             return Err(Failure::emulator(OBJECT_STORE_UNREACHABLE));
         };
         let store = state.lock();
+        // The hidden metadata columns the statement NAMES: each one says something about the
+        // OBJECT a row was read from rather than carrying a field of it, and a statement
+        // sees one only where it addresses it — so a read carries exactly the ones this
+        // statement reads, and a column list of `*` expands to none of them.
+        let metadata: Vec<data::MetadataColumn> = data::MetadataColumn::ALL
+            .iter()
+            .copied()
+            .filter(|column| statement::names_column(&statement, column.name()))
+            .collect();
         for source in &resolution.sources {
             hidden_columns.extend(source.hidden_columns());
-            let (object, scanned) = source.read(&store, &mut budget)?;
+            let (object, scanned) = source.read(&store, &mut budget, &metadata)?;
             scanned_bytes = scanned_bytes.saturating_add(scanned);
             objects.push(object);
         }

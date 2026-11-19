@@ -21,7 +21,7 @@ use ::parquet::file::reader::{FileReader, SerializedFileReader};
 use ::parquet::record::{Field, Row};
 use ::service_com_amazonaws_glue_awsglue::state as glue_state;
 
-use super::{ddl, Budget, Failure, Relation};
+use super::{cannot_open_split, ddl, Budget, Failure, Relation};
 
 /// The serialization libraries that read the columnar Parquet format: the one Athena's own
 /// `STORED AS PARQUET` records ([`ddl::PARQUET_SERDE`]), and the name the Hive integration
@@ -231,15 +231,6 @@ fn instant_text(count: i64, precision: Precision) -> Option<String> {
             .format(precision.format())
             .to_string(),
     )
-}
-
-/// The failure a read of an object that is not the Parquet file the table says it is
-/// reports: Hive's own class for a split it cannot OPEN, naming the object and why the
-/// format's own reader refused it.
-fn cannot_open_split(split: &str, reason: &str) -> Failure {
-    Failure::user(format!(
-        "HIVE_CANNOT_OPEN_SPLIT: Error opening Hive split {split}: {reason}"
-    ))
 }
 
 /// The failure a record of an object the reader DID open reports when that record cannot be
