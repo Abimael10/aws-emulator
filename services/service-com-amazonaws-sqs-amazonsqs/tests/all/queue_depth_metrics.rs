@@ -893,9 +893,12 @@ async fn the_series_reads_the_same_over_the_query_wire_a_legacy_client_speaks() 
         status, 200,
         "case the query form: expected HTTP 200, got {status} with {body}"
     );
+    // `Datapoint$Maximum` targets a `double`, and on the XML wire a double keeps its decimal
+    // form — so the one delayed message reads `1.0` here where the JSON wire above carries the
+    // number 1. The VALUE is the same reading; only the protocol's rendering of it differs.
     assert_eq!(
         xml_element(&body, "Maximum"),
-        Some("1".to_string()),
+        Some("1.0".to_string()),
         "case the query form: expected the delayed series to report the one delayed message, \
          got {body}"
     );

@@ -180,10 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Where this page resumes from, read off the token the request offered
-        // ([`ResumedAt`]): a value this listing can read a cursor out of names the rule the page
-        // starts at, one it cannot has no rule of this listing left to name, and no token at all
-        // asks for the first page.
-        let resume = ResumedAt::of(input.next_token.as_deref());
+        // ([`crate::state::ResumedAt`], the one rule every listing of this service that SERVES an
+        // unreadable token shares): a value this listing can read a cursor out of names the rule
+        // the page starts at, one it cannot has no rule of this listing left to name, and no
+        // token at all asks for the first page.
+        let resume = crate::state::ResumedAt::of(input.next_token.as_deref());
 
         let now = crate::state::now_secs();
         let store = state.lock();
@@ -231,13 +232,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(key, stored)| (&key.name, stored))
             .collect();
         selected.sort_unstable_by_key(|(name, _)| *name);
-        let from = match &resume {
-            ResumedAt::TheFirstRule => 0,
-            ResumedAt::TheRuleNamed(cursor) => {
-                selected.partition_point(|(name, _)| name.as_str() < cursor.as_str())
-            }
-            ResumedAt::NoRuleAtAll => selected.len(),
-        };
+        let from = resume.start_of(selected.len(), |cursor| {
+            selected.partition_point(|(name, _)| name.as_str() < cursor)
+        });
         let page = selected.get(from..).unwrap_or_default();
         // "The token to use when requesting the next set of results. If this field is absent,
         // there are no more results to retrieve." (`ListAlarmMuteRulesOutput$NextToken`) — present
@@ -268,43 +265,6 @@ const MIN_PAGE_SIZE: usize = 1;
 
 /// The widest page that member can ask for (its modelled range is 1..100).
 const MAX_PAGE_SIZE: usize = 100;
-
-/// Where one page of this listing starts, as the request's `NextToken` names it.
-///
-/// "The token returned from a previous call to indicate where to continue retrieving results."
-/// (`ListAlarmMuteRulesInput$NextToken`) — so a token names a POSITION in the enumeration, and
-/// there are three of them a request can ask for, including the one past its last rule.
-enum ResumedAt {
-    /// The beginning: what a request carrying no token asks for.
-    TheFirstRule,
-    /// The rule the token's cursor names — the one the previous page stopped before.
-    TheRuleNamed(String),
-    /// Past every rule this listing holds: the position a token it cannot read a cursor out of
-    /// names, which is served as the EMPTY page that ends a walk.
-    NoRuleAtAll,
-}
-
-impl ResumedAt {
-    /// Which of the three `token` asks for.
-    ///
-    /// A value this service did not mint carries no cursor of this enumeration
-    /// ([`crate::state::decode_page_token`]), so there is no rule of the listing it can name:
-    /// what it names is the position AFTER the last one, and the page there is empty and carries
-    /// no token of its own — "If this field is absent, there are no more results to retrieve."
-    /// (`ListAlarmMuteRulesOutput$NextToken`). That is what a walk run to its end asks for, so a
-    /// paging client terminates its loop on an empty page instead of aborting it on a refusal.
-    /// An EMPTY `NextToken` is no token at all and asks for the first page, the one rule every
-    /// paginated read of this service shares (`crate::state::requested_page`).
-    fn of(token: Option<&str>) -> Self {
-        match crate::state::requested_page(token) {
-            None => Self::TheFirstRule,
-            Some(token) => match crate::state::decode_page_token(token) {
-                Some(cursor) => Self::TheRuleNamed(cursor),
-                None => Self::NoRuleAtAll,
-            },
-        }
-    }
-}
 
 /// Whether `stored` targets the alarm the request filtered by, which a rule with no filter asked
 /// for is trivially true of.

@@ -2712,17 +2712,63 @@ pub fn requested_page(token: Option<&str>) -> Option<&str> {
     token.filter(|token| !token.is_empty())
 }
 
-/// The cursor a listing that TOLERATES an unusable `NextToken` resumes from: the key the token
-/// carries, or `None` — the first page — for a value that carries none.
+/// Where one page of a listing of this service starts, as the request's `NextToken` names it.
 ///
-/// Two conditions answer the same way here, and that is the whole point: a request that offered
-/// no token and a request whose token this service cannot read both name the first page of the
-/// enumeration. A listing whose recordings show it serving a page for a token it could not read
-/// resumes through this helper, where one that refuses such a token reads the cursor itself and
-/// words the refusal its own model declares ([`invalid_next_token_message`]).
-#[must_use]
-pub fn resumable_page(token: Option<&str>) -> Option<String> {
-    requested_page(token).and_then(decode_page_token)
+/// A token names a POSITION in the enumeration — "The token returned by a previous call to
+/// indicate that there is more data available." (`DescribeAlarmsInput$NextToken`), "The token
+/// returned from a previous call to indicate where to continue retrieving results."
+/// (`ListAlarmMuteRulesInput$NextToken`) — and there are three positions a request can ask for,
+/// including the one PAST the last item.
+///
+/// Shared by every listing of this service that SERVES a token it cannot read instead of
+/// refusing one, so one rule decides which position such a token names: not the first, which
+/// would deliver the items the walk already delivered a second time and never terminate, but the
+/// one after the last — the empty page that ends a walk. A listing that refuses such a token
+/// instead reads the cursor itself ([`decode_page_token`]) and words the refusal its own model
+/// declares ([`invalid_next_token_message`]).
+pub enum ResumedAt {
+    /// The beginning: what a request carrying no token asks for.
+    TheFirstItem,
+    /// The item the token's cursor names — the one the previous page stopped before.
+    TheItemNamed(String),
+    /// Past every item the listing holds: the position a token this service cannot read a
+    /// cursor out of names, served as the EMPTY page that ends a walk, which carries no token of
+    /// its own because there is nothing after it.
+    NoItemAtAll,
+}
+
+impl ResumedAt {
+    /// Which of the three `token` asks for.
+    ///
+    /// An EMPTY `NextToken` is no token at all and asks for the first page, the one rule every
+    /// paginated read of this service shares ([`requested_page`]). A value this service did not
+    /// mint carries no cursor of this enumeration ([`decode_page_token`]), so there is no item
+    /// of the listing it can name: what it names is the position after the last one.
+    #[must_use]
+    pub fn of(token: Option<&str>) -> Self {
+        match requested_page(token) {
+            None => Self::TheFirstItem,
+            Some(token) => match decode_page_token(token) {
+                Some(cursor) => Self::TheItemNamed(cursor),
+                None => Self::NoItemAtAll,
+            },
+        }
+    }
+
+    /// The index this position falls at in a listing of `len` items, where `before` reports how
+    /// many of them sort before the cursor a token named.
+    ///
+    /// The listing's own order is the caller's — a key is both the paging order and the cursor —
+    /// so only the three POSITIONS are decided here; `before` is how the caller locates one of
+    /// them in the order it sorted.
+    #[must_use]
+    pub fn start_of(&self, len: usize, before: impl FnOnce(&str) -> usize) -> usize {
+        match self {
+            Self::TheFirstItem => 0,
+            Self::TheItemNamed(cursor) => before(cursor),
+            Self::NoItemAtAll => len,
+        }
+    }
 }
 
 /// How a listing of this service that quotes an unusable `NextToken` refuses one it cannot
@@ -2736,9 +2782,9 @@ pub fn resumable_page(token: Option<&str>) -> Option<String> {
 /// listings states the same class WITHOUT the token: the metric-stream listing carries the bare
 /// sentence its own recordings show (`crate::ops::list_metric_streams`), the Contributor Insights
 /// listings their coded one ([`insight_rule_records::invalid_page_token_message`]), and two reads
-/// refuse such a token not at all because they serve a page instead: the alarm listing the first
-/// page ([`resumable_page`]) and the alarm mute rule listing the empty page that ends a walk
-/// (`crate::ops::list_alarm_mute_rules`). So this is the sentence of the reads recorded quoting
+/// refuse such a token not at all because they serve a page instead: the alarm listing and the
+/// alarm mute rule listing both serve the empty page that ends a walk ([`ResumedAt`]). So this
+/// is the sentence of the reads recorded quoting
 /// the token — the alarm HISTORY listing and the alarm CONTRIBUTOR read
 /// (`crate::ops::describe_alarm_contributors`) — not a fourth wording of one class.
 #[must_use]

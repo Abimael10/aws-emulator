@@ -239,12 +239,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // A `NextToken` this listing cannot read names no page of this enumeration, and this
-        // listing answers that with the page such a request asks for: the FIRST one. A value
-        // carrying no cursor is treated exactly as a request that offered no token at all
-        // ([`crate::state::resumable_page`]), which is what lets a caller resume a listing
-        // from a token that travelled through a store or a log without a hard refusal.
-        let start_at = crate::state::resumable_page(input.next_token.as_deref());
+        // Which POSITION of this enumeration the request's `NextToken` names, by the one rule
+        // every listing of this service that SERVES such a token shares
+        // ([`crate::state::ResumedAt`]). This read refuses no token: a value this service
+        // cannot read a cursor out of names the position AFTER the last alarm — the empty page
+        // that ends a walk — so a caller resuming from a token that travelled through a store
+        // or a log is neither refused nor handed the alarms it has already been given.
+        let start_at = crate::state::ResumedAt::of(input.next_token.as_deref());
 
         // One page size for every path below, so paging behaves the same whichever filter
         // was used.
@@ -286,10 +287,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The alarm NAME is the identity and therefore the paging order and the cursor
             // on this path too.
             related.sort();
-            let from = match start_at.as_deref() {
-                None => 0,
-                Some(cursor) => related.partition_point(|name| name.as_str() < cursor),
-            };
+            let from = start_at.start_of(related.len(), |cursor| {
+                related.partition_point(|name| name.as_str() < cursor)
+            });
             let page = related.get(from..).unwrap_or_default();
             let next_token = page
                 .get(limit)
@@ -432,10 +432,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // metric and composite alarms still advances exactly once.
         matching.sort_by(|left, right| left.0.cmp(right.0));
 
-        let from = match start_at.as_deref() {
-            None => 0,
-            Some(cursor) => matching.partition_point(|(name, _)| name.as_str() < cursor),
-        };
+        let from = start_at.start_of(matching.len(), |cursor| {
+            matching.partition_point(|(name, _)| name.as_str() < cursor)
+        });
         let page = matching.get(from..).unwrap_or_default();
         let next_token = page
             .get(limit)

@@ -40,7 +40,9 @@
 //!   whose model declares none of this service's parameter faults and whose input carries a
 //!   bounded COLLECTION through [`StatingTheSubmittedCollection`], so a collection over its
 //!   modelled maximum is refused in the request-validation class, quoting the collection the
-//!   request carried.
+//!   request carried. Every read whose response can carry a FLOATING-POINT member is served
+//!   through [`RenderingFloatsForTheWire`] as well, so such a member leaves this service in the
+//!   form the protocol of the request writes one in ([`decimal_floats`]).
 //!   The key itself is read through the protocol THIS REQUEST is served in, so a call in any
 //!   of the three protocols this service's model declares is served by the same wrappers.
 //! - `override_refusal` — how this service words a request the framework refused
@@ -71,11 +73,13 @@ use smithy_server_runtime::{
 use std::sync::Arc;
 
 pub mod authorization;
+pub mod decimal_floats;
 pub mod query_compatible_errors;
 pub mod request_protocol;
 pub mod submitted_collection_refusal;
 
 use authorization::AuthorizedByIam;
+use decimal_floats::RenderingFloatsForTheWire;
 use query_compatible_errors::{
     QueryCompatibleErrors, MISSING_PARAMETER, PARAMETER_VALUE, VALIDATION,
 };
@@ -162,6 +166,26 @@ macro_rules! stating_the_submitted_collection {
     };
 }
 
+/// The same, for an operation whose response can ALSO carry a FLOATING-POINT member: the
+/// renderer that writes one in the form the protocol of the request asks for
+/// ([`decimal_floats`]) sits inside the collection wording, because it decides only how the
+/// answer to a served request is written.
+macro_rules! stating_the_submitted_collection_and_rendering_floats {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                served(
+                    &$engine,
+                    StatingTheSubmittedCollection::new(RenderingFloatsForTheWire::new(
+                        crate::ops::$module::$operation::new(Arc::clone(&$engine)),
+                    )),
+                ),
+            );
+        )+
+    };
+}
+
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// Build this service from the shared engine. The engine is threaded into the
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
@@ -194,9 +218,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             served(
                 &engine,
                 JudgingTheValuesThisServiceEnforces::new(
-                    crate::ops::get_metric_statistics::GetMetricStatistics::new(Arc::clone(
-                        &engine,
-                    )),
+                    RenderingFloatsForTheWire::new(
+                        crate::ops::get_metric_statistics::GetMetricStatistics::new(Arc::clone(
+                            &engine,
+                        )),
+                    ),
                     parameter_fault_for,
                 ),
             ),
@@ -213,7 +239,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             served(
                 &engine,
                 JudgingTheValuesThisServiceEnforces::new(
-                    crate::ops::get_metric_data::GetMetricData::new(Arc::clone(&engine)),
+                    RenderingFloatsForTheWire::new(
+                        crate::ops::get_metric_data::GetMetricData::new(Arc::clone(&engine)),
+                    ),
                     the_request_validation_fault,
                 ),
             ),
@@ -330,9 +358,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             served(
                 &engine,
                 JudgingTheValuesThisServiceEnforces::new(
-                    crate::ops::get_insight_rule_report::GetInsightRuleReport::new(Arc::clone(
-                        &engine,
-                    )),
+                    RenderingFloatsForTheWire::new(
+                        crate::ops::get_insight_rule_report::GetInsightRuleReport::new(Arc::clone(
+                            &engine,
+                        )),
+                    ),
                     report_member_fault,
                 ),
             ),
@@ -389,8 +419,6 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             overridden,
             engine,
             delete_alarms::DeleteAlarms,
-            describe_alarms::DescribeAlarms,
-            describe_alarms_for_metric::DescribeAlarmsForMetric,
             disable_alarm_actions::DisableAlarmActions,
             enable_alarm_actions::EnableAlarmActions,
             put_alarm_mute_rule::PutAlarmMuteRule,
@@ -401,6 +429,16 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             update_o_tel_enrichment::UpdateOTelEnrichment,
             create_resource_metrics_configuration::CreateResourceMetricsConfiguration,
             update_resource_metrics_configuration::UpdateResourceMetricsConfiguration,
+        );
+        // The two of that set whose RESPONSE reports an alarm, and so can carry a
+        // floating-point member — a reported alarm's `Threshold` — are served through the
+        // renderer that writes one in the form the request's own protocol asks for as well
+        // ([`decimal_floats`]).
+        stating_the_submitted_collection_and_rendering_floats!(
+            overridden,
+            engine,
+            describe_alarms::DescribeAlarms,
+            describe_alarms_for_metric::DescribeAlarmsForMetric,
         );
         Self {
             metered: the_way_every_operation_is_served(Arc::clone(&engine), TheModelledOperation),

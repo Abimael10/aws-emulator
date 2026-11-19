@@ -15,9 +15,9 @@
 //!   own coded sentence**, naming that member and the contributor query the read is served by;
 //! * **a paginated listing answers a `NextToken` it cannot resume from in ITS OWN terms**: the
 //!   alarm HISTORY refuses it naming the value at fault, the Contributor Insights listings
-//!   refuse it with their coded sentence, and the alarm listing serves the FIRST page, because
-//!   a token it cannot read names no page of the enumeration and the first page is the page
-//!   such a request asks for;
+//!   refuse it with their coded sentence, and the alarm listing refuses it not at all — it
+//!   serves the position such a value names, the one PAST its last alarm, which is the empty
+//!   page that ends a walk;
 //! * **`SetAlarmState` refuses a `StateReasonData` that is not a JSON document with
 //!   `InvalidFormat` and leaves the alarm's state untouched**, whatever the value is wrong
 //!   about;
@@ -280,14 +280,19 @@ async fn a_next_token_a_listing_cannot_resume_from_is_answered_in_that_listings_
             );
         }
 
-        // The alarm LISTING serves the page such a request asks for: the first one, exactly as
-        // a request that offered no token at all is served.
+        // The alarm LISTING refuses no token: a value it cannot read a cursor out of names no
+        // alarm of the enumeration, so what it names is the position AFTER the last one — the
+        // empty page that ends a walk, carrying no token of its own. Serving the FIRST page for
+        // it would hand a caller continuing a walk the alarms it has already been given and
+        // leave a loop that terminates on an empty page running forever
+        // (`tests/all/paginated_read_cursor.rs` holds that rule over every listing of this
+        // service that serves such a token).
         let listed = ok(&router, "DescribeAlarms", &json!({"NextToken": token})).await;
-        let first = ok(&router, "DescribeAlarms", &json!({})).await;
         assert_eq!(
-            listed, first,
-            "case {case:?}: a token the alarm listing cannot read must answer the first page, \
-             got {listed}"
+            listed,
+            json!({"CompositeAlarms": [], "MetricAlarms": [], "LogAlarms": []}),
+            "case {case:?}: a token the alarm listing cannot read must answer the empty page \
+             that ends a walk, got {listed}"
         );
     }
 }

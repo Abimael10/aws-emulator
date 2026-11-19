@@ -54,19 +54,40 @@ use smithy_server_runtime::{
 /// the protocol a request is served in.
 const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 
-/// Whether `req` carries a form-encoded body, i.e. whether it is a query-protocol call.
+/// Whether `content_type` names the encoding a query-protocol call carries its body in.
 ///
 /// The media type alone decides; a `charset` or any other parameter after it is part of the
 /// header, not of the type, and the comparison is case-insensitive because a media type is.
+/// The ONE reading of that header in this service, so the layer that selects the protocol and
+/// the layer that renders a value in it cannot disagree about which protocol a request is.
+fn names_the_form_encoding(content_type: &str) -> bool {
+    content_type
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with(FORM_CONTENT_TYPE)
+}
+
+/// Whether `req` carries a form-encoded body, i.e. whether it is a query-protocol call.
 fn is_form_encoded(req: &RtRequest) -> bool {
     req.headers()
         .get("content-type")
-        .is_some_and(|value| {
-            value
-                .trim()
-                .to_ascii_lowercase()
-                .starts_with(FORM_CONTENT_TYPE)
-        })
+        .is_some_and(names_the_form_encoding)
+}
+
+/// Whether the request these `parts` belong to is a query-protocol call — the same question
+/// [`is_form_encoded`] answers, asked where a handler holds the request's metadata rather than
+/// the request ([`smithy_server_runtime::OperationContext::parts`]).
+///
+/// Needed because the WIRE FORM of a value can differ per protocol: a member this service
+/// renders differently on the XML wire than on the two binary ones is rendered inside the
+/// operation's own answer, where the only thing naming the protocol is the request's metadata
+/// (`super::decimal_floats`).
+pub fn is_a_query_call(parts: &smithy_server_runtime::http::request::Parts) -> bool {
+    parts
+        .headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(names_the_form_encoding)
 }
 
 /// A request that names the query protocol and nothing else, for asking a definition which of
