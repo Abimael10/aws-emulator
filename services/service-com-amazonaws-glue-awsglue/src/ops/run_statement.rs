@@ -10,12 +10,16 @@
 //! session's ids count up in submission order.
 //!
 //! A statement can only be taken by a runtime that is up and free, so this run is refused
-//! when the session is in any status but `READY` (its modelled
-//! `IllegalSessionStateException`), and when a statement of that session has not finished
-//! yet (its modelled `InvalidInputException`, which is the refusal this service is recorded
-//! answering a session still actioning a statement with). The statement itself is recorded
-//! in `WAITING` with `RUNNING` due [`crate::state::STATEMENT_SETTLES_AFTER`] out, so a
-//! caller that runs a second statement straight after this one still observes the session
+//! when the session has no runtime up and when a statement of that session has not finished
+//! yet. Which refusal depends on what the session's status says about its runtime: a session
+//! the service is itself still bringing up or taking down is in an invalid state for the run
+//! (its modelled `IllegalSessionStateException`), while a session that has ENDED
+//! ([`crate::state::session_has_ended`]) has no runtime at all any more, so its `SessionId`
+//! names nothing that can take code and the run is refused as invalid input — which is also
+//! the refusal this service is recorded answering a run on a stopped session with, and the
+//! one it answers a session still actioning a statement with. The statement itself is
+//! recorded in `WAITING` with `RUNNING` due [`crate::state::STATEMENT_SETTLES_AFTER`] out, so
+//! a caller that runs a second statement straight after this one still observes the session
 //! busy.
 //!
 //! Submitting a statement is also what STARTS it: the code is handed to a task of this
@@ -227,9 +231,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             session.settle_due_statements(now);
 
             // "The period in which a remote Spark runtime environment is running": a session
-            // still being provisioned, or one its own timeout has ended, has no runtime to
-            // take code, so the run is refused instead of recording a statement nothing could
-            // ever action.
+            // still being provisioned, or one being taken down, has no runtime up yet to take
+            // code, so the run is refused instead of recording a statement nothing could ever
+            // action. A session that has ENDED has no runtime at all any more and nothing
+            // brings one back, so its `SessionId` names nothing that could take code: that is
+            // refused as invalid input rather than as a state the session could leave.
+            if crate::state::session_has_ended(&session.status) {
+                return Err(RunStatementErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::messages::session_not_ready(
+                            &input.session_id,
+                            &session.status,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
             if session.status != crate::state::SESSION_STATUS_READY {
                 return Err(RunStatementErrorModeled::IllegalSessionStateException(
                     IllegalSessionStateException {

@@ -2144,24 +2144,28 @@ pub fn too_many_sessions(ceiling: usize) -> String {
     format!("this endpoint holds {ceiling} sessions, which is as many as it can hold")
 }
 
-/// A session request that cannot act on a session the service is still moving between
-/// statuses ([`super::session_status_is_transitional`]), which is what `DeleteSession`
-/// refuses with its modelled `IllegalSessionStateException`. RECORDED: the sentence is
-/// fixed text around the status the session is actually in, read off the store, and
-/// names no session — the caller already knows which id it asked about.
+/// A session request that cannot act on a session resting in, or being moved into, a
+/// status that leaves it nothing to act on, which is what `DeleteSession` refuses with its
+/// modelled `IllegalSessionStateException` and what `StopSession` refuses a session with no
+/// runtime up with. RECORDED: the sentence is fixed text around the status the session is
+/// actually in, read off the store, and names no session — the caller already knows which
+/// id it asked about.
 pub fn session_in_illegal_state(status: &str) -> String {
     format!("Session is in {status} status")
 }
 
 /// A statement run on a session whose `SessionStatus` is not
 /// [`super::SESSION_STATUS_READY`], which is the only status a remote Spark runtime
-/// can take code in. NOT recorded word for word: what is pinned is the behaviour —
-/// 400 with the run's modelled `IllegalSessionStateException` — so the sentence names
-/// the session the request addressed, the status it is actually in and the status it
-/// would have to be in, every part of it read off the request and the store.
+/// can take code in.
+///
+/// RECORDED template: the fixed sentence around its two variable parts, written as the
+/// service words them — the `SessionId` the request addressed and the status the session is
+/// actually in, read off the store, each stated as `<member>=<value>`. The behaviour it goes
+/// with is 400, with the run's modelled `IllegalSessionStateException` while the service is
+/// still bringing the runtime up or taking it down, and with its `InvalidInputException` once
+/// the session has ENDED ([`super::session_has_ended`]) and its id names no runtime at all.
 pub fn session_not_ready(id: &str, status: &str) -> String {
-    let ready = super::SESSION_STATUS_READY;
-    format!("Session {id} is in {status} status, and a statement can only be run on a session in {ready} status.")
+    format!("Session is not ready, session_id={id}, status={status}")
 }
 
 /// A statement run on a session that is still actioning one: the runtime is busy, so

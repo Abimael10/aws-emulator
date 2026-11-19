@@ -13,6 +13,11 @@
 //! reason [`crate::ops::get_statement`] gives: a statement leaves the state its run put it
 //! in at an instant that run recorded, whether or not anybody called.
 //!
+//! The statements of a session are held by the remote Spark runtime environment it IS, so a
+//! session that has ENDED ([`crate::state::session_has_ended`]) has no runtime whose
+//! statements this could list: the listing is then refused as invalid input rather than
+//! answered with an empty page that would read as "this session ran nothing".
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -228,8 +233,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // The only write a read makes: the state changes the clock had already made due.
+        // The only writes a read makes: the status and the states the clock had already made
+        // due. The session's own status decides whether this listing has a runtime to report
+        // the statements of at all, so it is materialised rather than read stale.
+        session.settle_if_due(now);
         session.settle_due_statements(now);
+
+        // The statements of a session are held by the remote Spark runtime environment it
+        // IS, so a session that has ENDED — its environment never came up, its own timeout
+        // ended it, or a stop took it down — has no runtime whose statements could be
+        // listed, and the listing is refused as invalid input rather than answered with an
+        // empty page that would read as "this session ran nothing".
+        if crate::state::session_has_ended(&session.status) {
+            return Err(ListStatementsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::session_not_ready(
+                        &input.session_id,
+                        &session.status,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
 
         // A session actions one statement at a time, in the order it took them, and the `Id`
         // it mints for each counts up in that same order — so this listing's order is over

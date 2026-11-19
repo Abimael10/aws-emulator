@@ -165,6 +165,50 @@ pub(crate) async fn statement_at_rest(
     }
 }
 
+/// Put the stored session `id` into `status`.
+///
+/// The way a suite reaches a status no call of this emulator produces, so a rule can be
+/// asserted over the whole modelled `SessionStatus` enum and not only over the statuses a
+/// create, the clock and a stop reach. ONE copy, shared by every session suite, so two of them
+/// cannot drift apart on how a status is forced.
+pub(crate) fn force_session_status(engine: &Arc<engine::InMemoryEngine>, id: &str, status: &str) {
+    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let mut store = state.lock();
+    let entry = store
+        .session_mut(REGION, id)
+        .unwrap_or_else(|| panic!("{id} was created"));
+    entry.settles_at = None;
+    entry.status = status.to_string();
+}
+
+/// Whether the store itself holds a session under `id` in `region`.
+///
+/// One copy, shared: a suite that asserts what a write or a refusal left behind reads the
+/// store the same way wherever it does it.
+pub(crate) fn stored_session(
+    engine: &Arc<engine::InMemoryEngine>,
+    region: &str,
+    id: &str,
+) -> bool {
+    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let store = state.lock();
+    store.session(region, id).is_some()
+}
+
+/// How many statements the store itself holds for the session `id`.
+///
+/// The one way to see what a run recorded for a session whose own statement surface is
+/// refused: a session that has ENDED holds no runtime for a statement to be read from, so the
+/// reads of it are refused whether or not a statement was written.
+pub(crate) fn stored_statement_count(engine: &Arc<engine::InMemoryEngine>, id: &str) -> usize {
+    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let store = state.lock();
+    store
+        .session(REGION, id)
+        .map(|session| session.statements.len())
+        .unwrap_or_default()
+}
+
 /// Pull the session `id`'s own instants back by `elapsed`, so a suite can observe the
 /// status the clock owes it without sleeping for the span.
 pub(crate) fn rewind_session(engine: &Arc<engine::InMemoryEngine>, id: &str, elapsed: Duration) {
@@ -441,8 +485,21 @@ async fn a_run_on_a_session_still_actioning_a_statement_is_refused() {
     );
 }
 
+/// Which refusal a READ of the statement a refused run would have recorded answers.
+///
+/// A session the service still holds a runtime for serves its statement surface, so the id
+/// nothing minted is the statement miss; a session that has ENDED has no runtime whose
+/// statements could be read, so the whole surface is refused the way the run was.
+enum ReadRefusal {
+    StatementMiss,
+    SessionEnded,
+}
+
 /// A session whose runtime is not up takes no statement: a run is refused in every status
-/// but `READY`, and nothing is recorded for it.
+/// but `READY`, and nothing is recorded for it. Which refusal it is follows from what the
+/// status says about the runtime — a session the service is still bringing up or taking down
+/// is in an invalid state for the run, while a session that has ENDED has no runtime at all
+/// and its id names nothing that could take code, which is refused as invalid input.
 ///
 /// The rows are the statuses a session reaches by the clock alone: the one its create put
 /// it in, and the one its own documented timeout brings it to.
@@ -451,14 +508,17 @@ async fn a_run_on_a_session_that_is_not_ready_is_refused() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(engine.clone());
 
-    // (case, the session, the create body, how far its clock is pulled back, the status)
-    let cases: Vec<(&str, &str, Value, Duration, &str)> = vec![
+    // (case, the session, the create body, how far its clock is pulled back, the status, the
+    //  modelled error the run is refused with, the refusal a read of its statements answers)
+    let cases: Vec<(&str, &str, Value, Duration, &str, &str, ReadRefusal)> = vec![
         (
             "a session whose provisioning has not finished",
             "provisioning",
             json!({}),
             Duration::ZERO,
             STATUS_PROVISIONING,
+            "IllegalSessionStateException",
+            ReadRefusal::StatementMiss,
         ),
         (
             // "The number of minutes before session times out", at the modelled floor of
@@ -468,10 +528,12 @@ async fn a_run_on_a_session_that_is_not_ready_is_refused() {
             json!({ "Timeout": 1, "IdleTimeout": 1 }),
             Duration::from_secs(2 * SECONDS_PER_MINUTE),
             STATUS_TIMEOUT,
+            "InvalidInputException",
+            ReadRefusal::SessionEnded,
         ),
     ];
 
-    for (case, session, extra, elapsed, status_expected) in &cases {
+    for (case, session, extra, elapsed, status_expected, error_expected, read_refusal) in &cases {
         create_session(&router, session, extra.clone()).await;
         if elapsed.is_zero() {
             // The provisioning this row is about is held open for the whole row.
@@ -493,8 +555,8 @@ async fn a_run_on_a_session_that_is_not_ready_is_refused() {
              {status} with {body}"
         );
         assert!(
-            error_code(&body).ends_with("IllegalSessionStateException"),
-            "case {case}: expected IllegalSessionStateException, got {} in {body}",
+            error_code(&body).ends_with(error_expected),
+            "case {case}: expected {error_expected}, got {} in {body}",
             error_code(&body)
         );
         assert_eq!(
@@ -504,7 +566,15 @@ async fn a_run_on_a_session_that_is_not_ready_is_refused() {
              {body}"
         );
 
-        // The refused run recorded nothing.
+        // The refused run recorded nothing: the session holds no statement at all. Read off
+        // the store, because a session that has ENDED refuses the reads of its own statement
+        // surface too, so a refusal from one of them would not tell a statement that was
+        // never written from one that was.
+        assert_eq!(
+            stored_statement_count(&engine, session),
+            0,
+            "case {case}: a refused run must record no statement"
+        );
         let (status, body) = call(
             &router,
             "GetStatement",
@@ -513,12 +583,18 @@ async fn a_run_on_a_session_that_is_not_ready_is_refused() {
         .await;
         assert_eq!(
             status, 400,
-            "case {case}: a refused run records no statement, got {status} with {body}"
+            "case {case}: no statement of this session reads back, got {status} with {body}"
         );
+        let expected_message = match read_refusal {
+            ReadRefusal::StatementMiss => {
+                messages::statement_not_found(session, FIRST_STATEMENT_ID)
+            }
+            ReadRefusal::SessionEnded => messages::session_not_ready(session, status_expected),
+        };
         assert_eq!(
             error_message(&body),
-            messages::statement_not_found(session, FIRST_STATEMENT_ID),
-            "case {case}: expected the miss to name the statement asked for, got {body}"
+            expected_message,
+            "case {case}: unexpected wording reading the statement back, got {body}"
         );
     }
 }

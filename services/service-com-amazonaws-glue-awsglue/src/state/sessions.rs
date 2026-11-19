@@ -27,6 +27,14 @@ pub const SESSION_STATUS_TIMEOUT: &str = "TIMEOUT";
 /// torn down. See [`SESSION_STATUS_PROVISIONING`].
 pub const SESSION_STATUS_STOPPING: &str = "STOPPING";
 
+/// The `SessionStatus` of a session whose environment a stop has taken all the way down: it
+/// runs nothing further. See [`SESSION_STATUS_PROVISIONING`].
+pub const SESSION_STATUS_STOPPED: &str = "STOPPED";
+
+/// The `SessionStatus` of a session whose environment never came up. See
+/// [`SESSION_STATUS_PROVISIONING`].
+pub const SESSION_STATUS_FAILED: &str = "FAILED";
+
 /// Whether a session in `status` is still being moved between statuses by the service
 /// itself, rather than resting in one only a caller can move it out of.
 ///
@@ -36,6 +44,23 @@ pub const SESSION_STATUS_STOPPING: &str = "STOPPING";
 /// four — `READY`, `FAILED`, `TIMEOUT` and `STOPPED` — are where a session rests.
 pub fn session_status_is_transitional(status: &str) -> bool {
     status == SESSION_STATUS_PROVISIONING || status == SESSION_STATUS_STOPPING
+}
+
+/// The `SessionStatus` values a session has ENDED in: of the modelled values quoted on
+/// [`SESSION_STATUS_PROVISIONING`], the three in which no remote Spark runtime environment
+/// exists any more and nothing brings one back — the environment never came up, the session's
+/// own timeout ended it, or a stop took it down.
+pub const ENDED_SESSION_STATUSES: [&str; 3] = [
+    SESSION_STATUS_FAILED,
+    SESSION_STATUS_TIMEOUT,
+    SESSION_STATUS_STOPPED,
+];
+
+/// Whether a session in `status` has ENDED, by [`ENDED_SESSION_STATUSES`] — so its `Id` names
+/// no runtime an operation could act on, where a session that is merely transitional
+/// ([`session_status_is_transitional`]) still has one on the way up or down.
+pub fn session_has_ended(status: &str) -> bool {
+    ENDED_SESSION_STATUSES.contains(&status)
 }
 
 /// How long a session stays in [`SESSION_STATUS_PROVISIONING`] before the clock owes it
@@ -124,9 +149,12 @@ pub struct SessionEntry {
     pub last_active_on: SystemTime,
     /// One of the modelled `SessionStatus` values: "The session status."
     pub status: String,
-    /// The instant the clock owes this session its next status; `None` once its
-    /// provisioning has settled.
+    /// The instant the clock owes this session its next status; `None` once it rests in a
+    /// status only a caller can move it out of.
     pub settles_at: Option<SystemTime>,
+    /// The `SessionStatus` the clock owes this session at [`Self::settles_at`]: the status
+    /// its environment is being brought up to, or taken down to.
+    pub settles_to: String,
     /// `Session$CompletedOn`: "The date and time that this session is completed", and
     /// `None` while it is still running.
     pub completed_on: Option<SystemTime>,
@@ -225,6 +253,7 @@ impl SessionEntry {
             last_active_on: now,
             status: SESSION_STATUS_PROVISIONING.to_string(),
             settles_at: Some(now.checked_add(SESSION_SETTLES_AFTER).unwrap_or(now)),
+            settles_to: SESSION_STATUS_READY.to_string(),
             completed_on: None,
             description: input.description.clone(),
             role: input.role.clone(),
@@ -278,18 +307,20 @@ impl SessionEntry {
 
     /// Move this session into the status the clock owed it at `now`, if it owed one.
     ///
-    /// Two changes are due by the clock alone, so materialising them on a read reports the
+    /// Three changes are due by the clock alone, so materialising them on a read reports the
     /// status the clock had already reached and two reads of a settled session agree: the
-    /// provisioning that was due to finish at [`Self::settles_at`], and the timeout that
-    /// was due at [`Self::times_out_at`]. A session already in a status nothing but a
-    /// caller can leave is untouched.
+    /// provisioning that was due to finish at [`Self::settles_at`], the tear-down a stop
+    /// began that was due to finish at that same instant ([`Self::stop`]), and the timeout
+    /// that was due at [`Self::times_out_at`]. A session already resting in a status nothing
+    /// but a caller can move it out of is untouched.
     pub fn settle_if_due(&mut self, now: SystemTime) {
-        if self.status == SESSION_STATUS_PROVISIONING {
-            if self.settles_at.is_none_or(|due| due > now) {
-                return;
-            }
+        if let Some(due) = self.settles_at.filter(|due| *due <= now) {
             self.settles_at = None;
-            self.status = SESSION_STATUS_READY.to_string();
+            self.status = self.settles_to.clone();
+            if self.status == SESSION_STATUS_STOPPED {
+                // The session ended when its tear-down fell due, not when somebody read it.
+                self.completed_on = Some(due);
+            }
         }
         if self.status != SESSION_STATUS_READY {
             return;
@@ -298,6 +329,26 @@ impl SessionEntry {
             self.status = SESSION_STATUS_TIMEOUT.to_string();
             // The session ended when the timeout fell due, not when somebody read it.
             self.completed_on = Some(due);
+        }
+    }
+
+    /// Begin taking this session's environment down, as of `now`.
+    ///
+    /// The session enters [`SESSION_STATUS_STOPPING`] and the clock owes it
+    /// [`SESSION_STATUS_STOPPED`] [`SESSION_SETTLES_AFTER`] out, exactly as a create owes it
+    /// [`SESSION_STATUS_READY`]: the span is not zero, so a caller reading straight after the
+    /// stop still observes the environment being taken down and the refusals that go with a
+    /// session that is not ready.
+    ///
+    /// A runtime that is being taken down takes no further work, so every statement still in
+    /// flight on it is cancelled here ([`StatementEntry::cancel`]) rather than left to settle
+    /// on an environment that is no longer running it.
+    pub fn stop(&mut self, now: SystemTime) {
+        self.status = SESSION_STATUS_STOPPING.to_string();
+        self.settles_at = Some(now.checked_add(SESSION_SETTLES_AFTER).unwrap_or(now));
+        self.settles_to = SESSION_STATUS_STOPPED.to_string();
+        for statement in &mut self.statements {
+            statement.cancel(now);
         }
     }
 
@@ -603,6 +654,30 @@ impl StatementEntry {
             self.settles_at = Some(rests_at);
             self.settles_to = self.rests_in().to_string();
         }
+    }
+
+    /// End this statement [`STATEMENT_STATE_CANCELLED`] as of `now`: the session's runtime is
+    /// no longer running it, so nothing further is owed to it — the state the model names for
+    /// "a statement a cancel stopped before it ran".
+    ///
+    /// Its `Output` is then the one [`Self::output`] builds for a statement whose code nothing
+    /// ran: the state it ended in and its execution count, carrying no data and no error,
+    /// because there is none to report and none is invented.
+    ///
+    /// A statement that has already come to rest keeps the state it reached: its code ran, and
+    /// its own execution decided what it came to.
+    pub fn cancel(&mut self, now: SystemTime) {
+        if self.is_terminal() {
+            return;
+        }
+        // The code of a cancelled statement is not run: the execution it owed is owed no
+        // longer, so no later call picks it up.
+        self.awaiting_execution = false;
+        self.settles_at = None;
+        self.rests_at = None;
+        self.settles_to = STATEMENT_STATE_CANCELLED.to_string();
+        self.state = STATEMENT_STATE_CANCELLED.to_string();
+        self.completed_on = Some(now);
     }
 
     /// The `StatementState` this statement comes to REST in: the one its own execution

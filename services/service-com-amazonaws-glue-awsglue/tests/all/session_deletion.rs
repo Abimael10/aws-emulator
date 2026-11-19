@@ -28,14 +28,15 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    messages, ComAmazonawsGlueAwsglueState, SESSION_STATUS_PROVISIONING, SESSION_STATUS_READY,
-    SESSION_STATUS_STOPPING, SESSION_STATUS_TIMEOUT,
+    messages, SESSION_STATUS_PROVISIONING, SESSION_STATUS_READY, SESSION_STATUS_STOPPING,
+    SESSION_STATUS_TIMEOUT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::job_runs::{already_past, far_future};
 use crate::statements::{
-    create_session, ready_session, rewind_session, run, set_session_due, statement_at_rest,
+    create_session, force_session_status, ready_session, rewind_session, run, set_session_due,
+    statement_at_rest, stored_session,
 };
 use crate::wire::{call, call_in_region, emulator_on, error_code, error_message, ok, REGION};
 
@@ -61,28 +62,6 @@ fn harness() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(engine.clone());
     (router, engine)
-}
-
-/// Put the stored session `id` into `status`.
-///
-/// The way a suite reaches a status no call of this emulator produces yet, so the rule can be
-/// asserted over the whole modelled `SessionStatus` enum and not only over the statuses the
-/// clock reaches.
-fn force_status(engine: &Arc<engine::InMemoryEngine>, id: &str, status: &str) {
-    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
-    let mut store = state.lock();
-    let entry = store
-        .session_mut(REGION, id)
-        .unwrap_or_else(|| panic!("{id} was created"));
-    entry.settles_at = None;
-    entry.status = status.to_string();
-}
-
-/// Whether the store itself holds a session under `id` in `region`.
-fn stored(engine: &Arc<engine::InMemoryEngine>, region: &str, id: &str) -> bool {
-    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
-    let store = state.lock();
-    store.session(region, id).is_some()
 }
 
 /// Delete the session `id` and return the `Id` the answer reports, if any.
@@ -224,7 +203,7 @@ async fn deleting_a_settled_session_removes_the_record_stored_under_its_id() {
             }
             Reach::Forced(status) => {
                 create_session(&router, id, json!({})).await;
-                force_status(&engine, id, status);
+                force_session_status(&engine, id, status);
             }
         }
 
@@ -255,7 +234,7 @@ async fn deleting_a_settled_session_removes_the_record_stored_under_its_id() {
 
         // The record is gone from the store, so every read of it is a miss.
         assert!(
-            !stored(&engine, REGION, id),
+            !stored_session(&engine, REGION, id),
             "case {case}: the store must hold no session under {id:?} after the delete"
         );
         assert_missing(&router, case, id).await;
@@ -349,7 +328,7 @@ async fn deleting_a_session_the_service_is_still_moving_is_refused() {
             // cannot cross it while the row's calls are made.
             set_session_due(&engine, id, far_future());
         } else {
-            force_status(&engine, id, status);
+            force_session_status(&engine, id, status);
         }
 
         let (code, body) = call(&router, "DeleteSession", &json!({ "Id": id })).await;
@@ -374,7 +353,7 @@ async fn deleting_a_session_the_service_is_still_moving_is_refused() {
 
         // The record survives the refusal exactly as it was.
         assert!(
-            stored(&engine, REGION, id),
+            stored_session(&engine, REGION, id),
             "case {case}: a refused delete must leave the session stored"
         );
         let read = ok(&router, "GetSession", &json!({ "Id": id })).await;
@@ -394,7 +373,7 @@ async fn deleting_a_session_the_service_is_still_moving_is_refused() {
         if *settles_on_its_own {
             set_session_due(&engine, id, already_past());
         } else {
-            force_status(&engine, id, SESSION_STATUS_STOPPED);
+            force_session_status(&engine, id, SESSION_STATUS_STOPPED);
         }
         assert_eq!(
             delete(&router, id).await.as_deref(),
@@ -448,7 +427,7 @@ async fn deleting_an_id_no_session_is_held_under_is_served_and_changes_nothing()
             "case {case}: a delete of {id:?} must be served and report that id"
         );
         assert!(
-            !stored(&engine, REGION, id),
+            !stored_session(&engine, REGION, id),
             "case {case}: {id:?} must still hold no session"
         );
         // Nothing else went with it: the one stored session is still readable.
@@ -476,7 +455,7 @@ async fn deleting_an_id_no_session_is_held_under_is_served_and_changes_nothing()
          with {body}"
     );
     assert!(
-        stored(&engine, REGION, "StoredSession"),
+        stored_session(&engine, REGION, "StoredSession"),
         "case a stored id in another Region: the session must stay where it was created"
     );
 

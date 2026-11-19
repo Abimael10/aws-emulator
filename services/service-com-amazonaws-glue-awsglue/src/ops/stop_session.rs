@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Stops the session stored under an `Id` in the Region the request is served in
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::sessions`]): the remote Spark runtime
+//! environment is taken down, so the session reports `STOPPING` and the clock owes it
+//! `STOPPED` [`crate::state::SESSION_SETTLES_AFTER`] later
+//! ([`crate::state::SessionEntry::stop`]), and the answer names the session that was
+//! stopped.
+//!
+//! Only a session whose environment is UP has one to take down. A session already coming
+//! down, or already down — its environment never came up, its own timeout ended it, or a stop
+//! already took it down ([`crate::state::session_has_ended`]) — has nothing further for a
+//! stop to begin, so the call is SERVED and changes nothing: stopping one session twice is a
+//! no-op. A session the service is still BRINGING UP has no settled environment a stop could
+//! take down, so that one is refused with the operation's modelled
+//! `IllegalSessionStateException` naming the status it is in and the record is left alone.
+//! The status the CLOCK had already made due is materialised before any of that is judged, so
+//! a session whose provisioning was due to finish is stopped rather than refused on a stale
+//! status.
+//!
+//! A runtime that is being taken down runs nothing further, so the statements still in
+//! flight on the session are cancelled with it.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +89,8 @@
 //! * `InternalServiceException` (HTTP 500) — An internal service error occurred.
 //! * `InvalidInputException` (HTTP 400) — The input provided was not valid.
 //! * `OperationTimeoutException` (HTTP 400) — The operation timed out.
+//! * `EntityNotFoundException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   the entity miss this service models, for an `Id` this Region holds no session under.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -90,10 +106,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `StopSessionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#StopSession")]
+//
+// `EntityNotFoundException` is widened in through `extra_errors`: an `Id` this Region holds
+// no session under addresses no runtime to stop, which is the entity miss this SERVICE models
+// and which every other operation that resolves a session by its `Id` (`GetSession`,
+// `RunStatement`) declares, while this operation's own `errors` list omits it. Answering such
+// a request as `InvalidInputException` instead would tell the caller its `Id` was malformed
+// when it was well-formed and simply names nothing.
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#StopSession",
+    extra_errors = ["EntityNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum StopSessionErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    EntityNotFoundException(EntityNotFoundException),
     ConcurrentModificationException(ConcurrentModificationException),
     IllegalSessionStateException(IllegalSessionStateException),
     InternalServiceException(InternalServiceException),
@@ -152,18 +179,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopSession"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(StopSessionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue session store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The origin of the request" names who is asking, not which session is stopped, so
+        // it changes nothing about this stop.
+        let _ = &input.request_origin;
+        // A session is served only through the endpoint that created it, so the Region and
+        // the id together are the whole address this stop resolves.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(entry) = store.session_mut(&region, &input.id) else {
+            return Err(StopSessionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    // The refusal names the id that resolved to nothing, which is the whole
+                    // address of a session.
+                    message: Some(crate::state::messages::session_not_found(&input.id)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // The only write made before the stop is judged is the one the clock had already
+        // made due: a session whose provisioning was due to finish has finished it whether
+        // or not anybody called, and that is the status this stop is allowed or refused on.
+        entry.settle_if_due(now);
+
+        // Three cases, each decided by what the session's status says about its environment.
+        let status = entry.status.clone();
+        if status == crate::state::SESSION_STATUS_READY {
+            // UP: "the period in which a remote Spark runtime environment is running". The
+            // environment starts coming down, so the session reports it being taken down
+            // until the instant the clock owes it the status it comes to rest in, and the
+            // statements it was still running are cancelled with it.
+            entry.stop(now);
+            ::tracing::info!(
+                operation = "StopSession",
+                region = %region,
+                session = %input.id,
+                "began stopping a Glue interactive session"
+            );
+        } else if status == crate::state::SESSION_STATUS_STOPPING
+            || crate::state::session_has_ended(&status)
+        {
+            // ALREADY COMING DOWN, OR ALREADY DOWN: nothing further for a stop to begin, so
+            // the call is served and changes nothing — stopping one session twice is a no-op
+            // rather than a refusal or a second tear-down. `DeleteSession` refuses a session
+            // being taken down because it would remove a record the service is still moving;
+            // a stop of one asks for exactly what is already under way.
+            ::tracing::debug!(
+                operation = "StopSession",
+                region = %region,
+                session = %input.id,
+                status = %status,
+                "a Glue interactive session that is already coming down needs no further stop"
+            );
+        } else {
+            // STILL BEING BROUGHT UP: every remaining status is one the service is itself
+            // still provisioning the environment in, which leaves nothing settled for a stop
+            // to take down, so it is refused in the state it is in and the record is left as
+            // it is — the same reading `DeleteSession` takes of a session that has not
+            // settled.
+            return Err(StopSessionErrorModeled::IllegalSessionStateException(
+                IllegalSessionStateException {
+                    message: Some(crate::state::messages::session_in_illegal_state(&status)),
+                },
+            )
+            .into());
+        }
+
+        // "Returns the Id of the stopped session": the id the stop was addressed by, which
+        // is the record it acted on.
+        Ok(StopSessionOutput { id: Some(input.id) })
     }
 }

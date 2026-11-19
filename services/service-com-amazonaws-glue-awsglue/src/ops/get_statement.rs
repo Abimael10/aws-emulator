@@ -15,6 +15,11 @@
 //! or not anybody called, so materialising it here reports the state the clock had already
 //! reached instead of a stale one.
 //!
+//! The statements of a session are held by the remote Spark runtime environment it IS, so a
+//! session that has ENDED ([`crate::state::session_has_ended`]) has no runtime a statement of
+//! it could be read from: the read is then refused as invalid input rather than reporting a
+//! record no runtime holds any more.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -199,8 +204,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // The only write a read makes: the state changes the clock had already made due.
+        // The only writes a read makes: the status and the states the clock had already made
+        // due. The session's own status decides whether this read has a runtime to report a
+        // statement of at all, so it is materialised rather than read stale.
+        session.settle_if_due(now);
         session.settle_due_statements(now);
+
+        // The statements of a session are held by the remote Spark runtime environment it
+        // IS, so a session that has ENDED — its environment never came up, its own timeout
+        // ended it, or a stop took it down — has no runtime a statement of it could be read
+        // from, and the read is refused as invalid input rather than reporting a record no
+        // runtime holds any more. The same reading `ListStatements` takes of the same
+        // statuses.
+        if crate::state::session_has_ended(&session.status) {
+            return Err(GetStatementErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::session_not_ready(
+                        &input.session_id,
+                        &session.status,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
 
         let Some(statement) = session.statement(input.id) else {
             return Err(GetStatementErrorModeled::EntityNotFoundException(

@@ -233,8 +233,11 @@
 //! endpoint that created it exactly as a job definition is. A session's status is not final
 //! when the create returns — the environment is still being provisioned — so the record
 //! carries the instant the clock owes it the next status ([`SessionEntry::settles_at`]) and
-//! the instant its own timeouts fall due, and whichever later call reads it materialises
-//! what the clock had already reached.
+//! the status it is owed there ([`SessionEntry::settles_to`]), beside the instant its own
+//! timeouts fall due, and whichever later call reads it materialises what the clock had
+//! already reached. A stop goes the same way ([`SessionEntry::stop`]): the environment is
+//! reported being taken down until the instant the clock owes the session the status it
+//! comes to rest in.
 //!
 //! A session also holds the STATEMENTS run on it ([`SessionEntry::statements`]), in the
 //! order they were submitted, because every operation that addresses a statement names its
