@@ -290,10 +290,9 @@ async fn the_config_read_refuses_an_id_no_control_holds() {
 
     // Rows: the retired id, the stored id with its last character changed, the stored id in
     // lower case, a token shaped like no id this service mints, and the control's name
-    // rather than its id. WHICH sentence each earns is decided by whether the value could
-    // ADDRESS a control at all: an id of the form this service issues one in could — one it
-    // issued for a control and retired included — so it is the control reported absent, while
-    // a value of any other form is the identifier this route reports it cannot read.
+    // rather than its id. This route reads NO form of the value — the model constrains `Id`
+    // no further than `string` and gives it one lookup failure — so every one of them is
+    // the control reported absent.
     let mut flipped: Vec<char> = id.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'A' { 'B' } else { 'A' };
@@ -311,17 +310,17 @@ async fn the_config_read_refuses_an_id_no_control_holds() {
         (
             "the stored id in lower case",
             id.to_lowercase(),
-            "Id format is invalid",
+            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
         ),
         (
             "a token that is no control id",
             "not-a-control-id".to_string(),
-            "Id format is invalid",
+            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
         ),
         (
             "a control name rather than an id",
             present_name.to_string(),
-            "Id format is invalid",
+            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
         ),
     ];
 

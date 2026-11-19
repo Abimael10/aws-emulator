@@ -1611,8 +1611,9 @@ impl TableEntry {
     /// what a read of a table whose history restarted (a `DeleteTable` and a create under
     /// the same name) addresses with an id of the old history.
     ///
-    /// Shared by every operation that resolves one version by id, so the read and the
-    /// single-version delete cannot word one miss two ways.
+    /// Shared by both operations that raise a version miss as an EXCEPTION, so the read and
+    /// the single-version delete cannot word one miss two ways; the batch, which reports it
+    /// in band instead, goes through [`Self::batch_version_miss_message`].
     ///
     /// Both sentences are RECORDED, on two reads of the SAME table in one wire fixture
     /// (`glue-table-versioning-and-column-statistics`, its two version reads): the one that
@@ -1621,14 +1622,43 @@ impl TableEntry {
     /// A later recording that showed the split anywhere else is the first thing to re-check
     /// here.
     pub fn version_miss_message(&self, version: Option<u64>) -> &'static str {
-        let minted = version.is_some_and(|wanted| {
-            parse_version_counter(&self.version_id).is_some_and(|current| wanted <= current)
-        });
-        if minted {
+        if self.minted_version(version) {
             messages::TABLE_VERSION_NOT_FOUND
         } else {
             messages::VERSION_NOT_FOUND
         }
+    }
+
+    /// How this table words the miss of ONE of its versions INSIDE the batch delete, whose
+    /// per-item record reports the failure in band at 200
+    /// (`TableVersionError$ErrorDetail$ErrorMessage`).
+    ///
+    /// The same split [`Self::version_miss_message`] makes, over the same two conditions, so
+    /// the batch cannot disagree with the single-version operations about WHICH miss an id
+    /// earns. What differs is the sentence a version the table once MINTED earns: the batch
+    /// states the version it is about ([`messages::batch_table_version_not_found`], over the
+    /// `VersionId` the item sent, exactly as sent), where the single-version read and delete
+    /// answer their constant. An id the table NEVER minted earns the one sentence both
+    /// forms word that condition with.
+    pub fn batch_version_miss_message(&self, version: Option<u64>, requested: &str) -> String {
+        if self.minted_version(version) {
+            messages::batch_table_version_not_found(requested)
+        } else {
+            messages::VERSION_NOT_FOUND.to_string()
+        }
+    }
+
+    /// Whether `version` is an id this table ever MINTED: "Each version is incremented by 1"
+    /// (`GetTableVersionRequest$VersionId`), so an id at or below the counter the live
+    /// definition carries stood for a definition of this table, and one above it never did.
+    ///
+    /// The ONE place that condition is read, so every wording of a version miss
+    /// ([`Self::version_miss_message`], [`Self::batch_version_miss_message`]) tells the two
+    /// apart the same way.
+    fn minted_version(&self, version: Option<u64>) -> bool {
+        version.is_some_and(|wanted| {
+            parse_version_counter(&self.version_id).is_some_and(|current| wanted <= current)
+        })
     }
 
     /// The key material the write that stored the definition of ONE of this table's

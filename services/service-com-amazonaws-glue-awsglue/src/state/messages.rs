@@ -1270,10 +1270,30 @@ pub const TABLE_ALREADY_EXISTS: &str = "Table already exists.";
 /// Recorded CONSTANT, and the whole message: the refusal names the resource kind that
 /// resolved to nothing and echoes back neither the `VersionId` the request addressed nor
 /// the table it was addressed in. Which of this and [`VERSION_NOT_FOUND`] a miss earns is
-/// decided by [`super::TableEntry::version_miss_message`], so no operation picks the
-/// wording itself — the batch delete's per-item `ErrorDetail$ErrorMessage` included,
-/// since that record carries the id and the table in its own members.
+/// decided by [`super::TableEntry::version_miss_message`], so neither of the two
+/// single-version operations picks the wording itself. The BATCH delete reports the same
+/// miss in band with its own templated sentence instead
+/// ([`batch_table_version_not_found`]).
 pub const TABLE_VERSION_NOT_FOUND: &str = "Table version not found.";
+
+/// The same miss — a version id this table ONCE MINTED whose definition its history no
+/// longer holds — as the BATCH delete reports it per item
+/// (`TableVersionError$ErrorDetail$ErrorMessage`).
+///
+/// RECORDED template, and a different sentence from the single-version operations'
+/// [`TABLE_VERSION_NOT_FOUND`]: the batch answers 200 and carries each failure in band, so
+/// its per-item record STATES which version it is about rather than leaving that to the
+/// exception the caller was handed. Its one variable part is the `VersionId` the item sent,
+/// taken from the request and reported exactly as sent, like `TableVersionError$VersionId`
+/// beside it.
+///
+/// Which of this and [`VERSION_NOT_FOUND`] a batch item earns is decided by
+/// [`super::TableEntry::batch_version_miss_message`], over the same split
+/// [`super::TableEntry::version_miss_message`] makes for the single-version operations, so
+/// no operation picks the wording itself.
+pub fn batch_table_version_not_found(version_id: &str) -> String {
+    format!("Table version ({version_id}) not found")
+}
 
 /// The same two operations for an id that is NO version of the addressed table at all —
 /// one past the counter its live definition carries, which the catalog has never minted

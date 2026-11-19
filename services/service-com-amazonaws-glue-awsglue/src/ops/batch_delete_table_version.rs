@@ -283,14 +283,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         deleted += 1;
                         None
                     } else {
-                        // `TableVersionError` carries the id and the table in its OWN
-                        // members, so the per-item message carries no part of the request:
-                        // it is the sentence this table words that miss with
-                        // (`crate::state::TableEntry::version_miss_message`), the same one
-                        // the single-version read and delete of that version answer.
+                        // `TableVersionError` reports this miss IN BAND at 200 rather than
+                        // as an exception, and the batch's own recorded sentence states the
+                        // version the item addressed
+                        // (`crate::state::TableEntry::batch_version_miss_message`), over the
+                        // same split the single-version read and delete are worded by.
                         Some((
                             "EntityNotFoundException",
-                            entry.version_miss_message(Some(counter)).to_string(),
+                            entry.batch_version_miss_message(Some(counter), requested),
                         ))
                     }
                 }

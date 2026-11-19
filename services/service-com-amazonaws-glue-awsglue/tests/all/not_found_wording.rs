@@ -532,12 +532,12 @@ async fn the_table_version_miss_is_worded_per_operation() {
         }
     }
 
-    // The batch reports the same failure inside `Errors`, one entry per item. Its
-    // per-item message is the SAME sentence the single-version read and delete answer for
-    // that version, carrying no part of the request: `TableVersionError` names the item's
-    // id and table in its own members. Version 0 is archived and goes; version 1 was
-    // deleted above and 2 is addressed twice, so the batch both deletes and reports — and
-    // both reported ids are versions the table minted, so both earn the minted sentence.
+    // The batch reports the same failure inside `Errors`, one entry per item. It answers
+    // 200 and carries each failure in band, so its per-item message STATES the version it
+    // is about — the id that item sent — beside the `TableVersionError` members naming the
+    // item's id and table. Version 0 is archived and goes; version 1 was deleted above and
+    // 2 is addressed twice, so the batch both deletes and reports — and both reported ids
+    // are versions the table minted, so both earn the batch's templated sentence.
     let batch = ok(
         &router,
         "BatchDeleteTableVersion",
@@ -568,8 +568,8 @@ async fn the_table_version_miss_is_worded_per_operation() {
     assert_eq!(
         reported,
         vec![
-            ("1", NOT_FOUND, "Table version not found."),
-            ("2", NOT_FOUND, "Table version not found."),
+            ("1", NOT_FOUND, "Table version (1) not found"),
+            ("2", NOT_FOUND, "Table version (2) not found"),
         ],
         "every item that missed must be reported under the id it sent, with the sentence the \
          service words that miss with, got {batch}"

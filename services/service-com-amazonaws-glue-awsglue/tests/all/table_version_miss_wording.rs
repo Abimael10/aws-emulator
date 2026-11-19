@@ -14,11 +14,14 @@
 //!    operation that resolves a table by name answers. The table READ's own fixed sentence,
 //!    which names nothing, belongs to `GetTable` alone, so a client can tell an absent
 //!    table from an absent version of a stored one.
-//! 2. A VERSION miss carries no part of the request: the per-item record of the batch
-//!    delete reports the very sentence the single-version read and delete answer for that
-//!    same id, because `TableVersionError` carries the identity in its own `VersionId` and
-//!    `TableName` members (`smithy_query shape=TableVersionError,ErrorDetail`) rather than
-//!    in `ErrorDetail$ErrorMessage`.
+//! 2. A VERSION miss is worded by the CONDITION the id met and by whether the operation
+//!    raises it as an exception or reports it in band. The single-version read and delete
+//!    raise it, and their sentence carries no part of the request. The batch answers 200 and
+//!    carries each failure inside `Errors`, so its per-item record STATES the version it is
+//!    about — the `VersionId` that item sent, exactly as sent — beside the identity
+//!    `TableVersionError` already carries in its own `VersionId` and `TableName` members
+//!    (`smithy_query shape=TableVersionError,ErrorDetail`); for an id the table never
+//!    minted, the one sentence that condition is worded with travels everywhere.
 //!
 //! Every call goes over the wire the way a client makes it, through the shared
 //! [`crate::wire`] harness, dispatched by the same `MultiServiceRouter` the production
@@ -29,9 +32,9 @@
 //! (never created, or created and then deleted) and which operation of the family asks;
 //! for rule 2 the addressed id's value and spelling, whether the table ever minted it, and
 //! which operation of the family asks. The recorded wire cases — a version read of a table
-//! the catalog does not hold, and a batch item naming a version past the table's newest —
-//! are one row each. The expected sentences are written out here as literals rather than
-//! read from the service's own constants, so this suite pins the wording instead of
+//! the catalog does not hold, and a batch item naming a version the table minted and gave
+//! up — are one row each. The expected sentences are written out here as literals rather
+//! than read from the service's own constants, so this suite pins the wording instead of
 //! restating it.
 
 use serde_json::{json, Value};
@@ -57,6 +60,13 @@ const MINTED_VERSION_MISS: &str = "Table version not found.";
 /// The whole sentence a miss of an id the table NEVER minted earns — one past that
 /// counter, which has never stood for a definition of this table.
 const NEVER_MINTED_MISS: &str = "Version not found.";
+
+/// The whole per-item `ErrorDetail$ErrorMessage` the BATCH delete reports a miss of a
+/// version the table once MINTED with: the sentence that STATES the version the item
+/// addressed, over the `VersionId` it sent and nothing else.
+fn batch_minted_version_miss(version_id: &str) -> String {
+    format!("Table version ({version_id}) not found")
+}
 
 /// The database every row below is written into.
 const DATABASE: &str = "version_miss_db";
@@ -210,27 +220,43 @@ async fn the_version_family_names_the_table_it_cannot_resolve() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 2: the version miss carries no part of the request
+// Rule 2: how a version miss is worded
 // ---------------------------------------------------------------------------
 
-/// One row of the version-miss table: an id of the stored table, and the sentence the
+/// One row of the version-miss table: an id of the stored table, and the sentences the
 /// service words that miss with.
 struct VersionMissCase {
     case: &'static str,
     /// The `VersionId` every operation of the family is asked for.
     version_id: &'static str,
-    /// The whole message each of them must answer.
+    /// The whole message the single-version read and delete must answer.
     expected: &'static str,
+    /// Whether the batch's per-item record states the id it addressed: a version the table
+    /// once minted is reported with the batch's own templated sentence, and an id it never
+    /// minted with the one sentence that condition is worded with everywhere.
+    minted: bool,
 }
 
-/// A version miss answers the service's sentence for that miss with NO part of the request
-/// in it, and the batch's per-item `ErrorDetail$ErrorMessage` is that same sentence: the
-/// id and the table travel in `TableVersionError`'s own members instead.
+impl VersionMissCase {
+    /// The whole per-item `ErrorDetail$ErrorMessage` the batch must report this row with.
+    fn batch_expected(&self) -> String {
+        if self.minted {
+            batch_minted_version_miss(self.version_id)
+        } else {
+            NEVER_MINTED_MISS.to_string()
+        }
+    }
+}
+
+/// The single-version read and delete answer the service's sentence for that miss with NO
+/// part of the request in it, while the batch's per-item `ErrorDetail$ErrorMessage` states
+/// the version its item addressed when the table once minted that id — the identity also
+/// travelling in `TableVersionError`'s own members.
 ///
 /// The rows differ along the addressed id's value and spelling and along whether the table
 /// ever minted it — the two conditions the service words differently.
 #[tokio::test]
-async fn a_version_miss_is_worded_without_the_requested_id() {
+async fn a_version_miss_is_worded_by_the_condition_the_id_met() {
     let router = emulator();
     let history = four_writes();
     write_history(&router, DATABASE, &history).await;
@@ -248,32 +274,44 @@ async fn a_version_miss_is_worded_without_the_requested_id() {
             case: "the counter after the newest version",
             version_id: "4",
             expected: NEVER_MINTED_MISS,
+            minted: false,
         },
         VersionMissCase {
-            // The recorded batch item addressed an id far past the table's newest.
             case: "a counter far past the newest version",
             version_id: "99",
             expected: NEVER_MINTED_MISS,
+            minted: false,
         },
         VersionMissCase {
             case: "a never-minted counter, zero-padded",
             version_id: "0004",
             expected: NEVER_MINTED_MISS,
+            minted: false,
         },
         VersionMissCase {
             case: "a large never-minted counter",
             version_id: "12345",
             expected: NEVER_MINTED_MISS,
+            minted: false,
         },
         VersionMissCase {
+            // The recorded batch item addressed a version the table minted and gave up.
             case: "a version the table minted and gave up",
             version_id: "1",
             expected: MINTED_VERSION_MISS,
+            minted: true,
         },
         VersionMissCase {
             case: "the same version, zero-padded",
             version_id: "01",
             expected: MINTED_VERSION_MISS,
+            minted: true,
+        },
+        VersionMissCase {
+            case: "the oldest version, minted and gone",
+            version_id: "0",
+            expected: MINTED_VERSION_MISS,
+            minted: true,
         },
     ];
 
@@ -281,6 +319,15 @@ async fn a_version_miss_is_worded_without_the_requested_id() {
         MINTED_VERSION_MISS, NEVER_MINTED_MISS,
         "the two version-miss sentences must stay distinguishable"
     );
+
+    // Version 0 is taken out of the history up front, so the row addressing it is a miss of
+    // a version this table minted too.
+    ok(
+        &router,
+        "DeleteTableVersion",
+        &json!({ "DatabaseName": DATABASE, "TableName": TABLE, "VersionId": "0" }),
+    )
+    .await;
 
     for row in &cases {
         let case = row.case;
@@ -304,8 +351,8 @@ async fn a_version_miss_is_worded_without_the_requested_id() {
             assert_withholds(&label, &error_message(&body), row.version_id);
         }
 
-        // The batch reports the same miss IN BAND at 200, in the same words, with the id
-        // and the table in their own members.
+        // The batch reports the same miss IN BAND at 200, with the id and the table in
+        // their own members and, for a version the table minted, in the message too.
         let label = format!("{case} via BatchDeleteTableVersion");
         let batch = ok(
             &router,
@@ -343,11 +390,11 @@ async fn a_version_miss_is_worded_without_the_requested_id() {
             Some(ENTITY_NOT_FOUND),
             "case {label}: expected ErrorCode {ENTITY_NOT_FOUND}, got {entry}"
         );
+        let batch_expected = row.batch_expected();
         assert_eq!(
             detail["ErrorMessage"].as_str(),
-            Some(row.expected),
-            "case {label}: expected ErrorMessage {:?}, got {entry}",
-            row.expected
+            Some(batch_expected.as_str()),
+            "case {label}: expected ErrorMessage {batch_expected:?}, got {entry}"
         );
         assert_eq!(
             detail["__type"].as_str(),
@@ -355,16 +402,19 @@ async fn a_version_miss_is_worded_without_the_requested_id() {
             "case {label}: expected the ErrorDetail type tag, got {entry}"
         );
         let reported = detail["ErrorMessage"].as_str().unwrap_or_default();
-        assert_withholds(&label, reported, row.version_id);
+        if !row.minted {
+            assert_withholds(&label, reported, row.version_id);
+        }
     }
 
-    // None of the misses above changed the history: versions 1 is the only one gone.
+    // None of the misses above changed the history: the two versions deleted up front are
+    // the only ones gone.
     let listed = listed_versions(&router, DATABASE).await;
-    let expected: Vec<String> = vec!["0".to_string(), "2".to_string(), "3".to_string()];
+    let expected: Vec<String> = vec!["2".to_string(), "3".to_string()];
     assert_eq!(
         listed, expected,
-        "case after every version miss: only the version deleted up front is gone; expected \
-         {expected:?}, got {listed:?}"
+        "case after every version miss: only the versions deleted up front are gone; \
+         expected {expected:?}, got {listed:?}"
     );
 
     // A version the table still holds is served, so every refusal above is a miss and not

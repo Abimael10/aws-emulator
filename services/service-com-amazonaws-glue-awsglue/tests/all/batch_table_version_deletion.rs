@@ -45,12 +45,22 @@ const MISS_CODE: &str = "EntityNotFoundException";
 /// The per-item wording a batch reports for an id the table NEVER MINTED — one past the
 /// counter its live definition carries.
 ///
-/// The batch reports a version miss with the very sentence a READ or a single-version
-/// delete of that version answers, carrying no part of the request: `TableVersionError`
-/// has its own `VersionId` and `TableName` members, which is what tells a caller which of
-/// its items failed. An id the table DID mint earns the service's other version-miss
-/// sentence ([`MISSING_VERSION_REFUSAL`]).
+/// The one sentence this condition is worded with wherever it is reported: the same text a
+/// READ or a single-version delete of such an id answers. An id the table DID mint earns
+/// the batch's own templated sentence instead ([`missing_version_refusal`]).
 const NEVER_MINTED_REFUSAL: &str = "Version not found.";
+
+/// The per-item wording a batch reports for a version the table once MINTED and whose
+/// definition its history no longer holds — written out here rather than taken from the
+/// service, so a reworded refusal fails this suite.
+///
+/// The batch answers 200 and carries each failure in band, so its per-item record states
+/// which version it is about: the one variable part is the `VersionId` that item sent,
+/// reported exactly as sent. The single-version read and delete of the same id answer
+/// their own constant ([`MISSING_VERSION_REFUSAL`]) instead.
+fn missing_version_refusal(version_id: &str) -> String {
+    format!("Table version ({version_id}) not found")
+}
 
 /// The error code a per-item failure carries for an id that addresses no deletable
 /// version: one that spells no integer, and the table's own current version.
@@ -312,8 +322,25 @@ async fn an_item_the_history_cannot_give_up_fails_only_itself() {
         FailureCase {
             case: "the same archived version addressed twice in one batch",
             sent: ids(&["0", "0"]),
-            expected: vec![("0", MISS_CODE, MISSING_VERSION_REFUSAL.to_string())],
+            expected: vec![("0", MISS_CODE, missing_version_refusal("0"))],
             survivors: vec![1, 2, 3],
+        },
+        FailureCase {
+            // The id travels into the message exactly as the item sent it, so a padded
+            // spelling of the same counter is reported in the spelling it arrived in.
+            case: "the same archived version addressed twice by a padded id",
+            sent: ids(&["01", "001"]),
+            expected: vec![("001", MISS_CODE, missing_version_refusal("001"))],
+            survivors: vec![0, 2, 3],
+        },
+        FailureCase {
+            case: "a wide archived counter the history gave up earlier in the batch",
+            sent: ids(&["2", "2", "0", "0"]),
+            expected: vec![
+                ("2", MISS_CODE, missing_version_refusal("2")),
+                ("0", MISS_CODE, missing_version_refusal("0")),
+            ],
+            survivors: vec![1, 3],
         },
         FailureCase {
             case: "two deletes beside three kinds of failing item",

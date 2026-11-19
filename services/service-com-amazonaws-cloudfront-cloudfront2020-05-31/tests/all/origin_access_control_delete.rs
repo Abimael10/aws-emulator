@@ -457,18 +457,25 @@ async fn an_id_no_control_holds_is_refused() {
     let (id, etag) = create(&router, &rows[0]).await;
 
     // Ids no control holds: one of the shape this service mints, one of another entity
-    // family's shape, and one that is no entity id at all. WHICH sentence each earns is
-    // decided by whether the value could ADDRESS a control at all: one of the shape this
-    // service issues could, so it is the control reported absent, while a value of any other
-    // shape is the identifier this route reports it cannot read.
+    // family's shape, and one that is no entity id at all. This route reads NO form of the
+    // value — the model constrains `Id` no further than `string` and gives it one lookup
+    // failure — so every one of them is the control reported absent.
     for (case, missing, expected) in [
         (
             "minted-shape",
             "E1A2B3C4D5E6F7",
             NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
         ),
-        ("another-family", "cg_1A2B3C4D5E6F7", "Id format is invalid"),
-        ("not-an-id", "no-such-control", "Id format is invalid"),
+        (
+            "another-family",
+            "cg_1A2B3C4D5E6F7",
+            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
+        ),
+        (
+            "not-an-id",
+            "no-such-control",
+            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
+        ),
     ] {
         for (version_case, if_match) in [("no-if-match", None), ("current-of-another", Some(&etag))]
         {
@@ -486,8 +493,8 @@ async fn an_id_no_control_holds_is_refused() {
                 answer.error_code(),
                 answer.raw
             );
-            // The refusal is about the STORE or about the identifier, so it carries the
-            // sentence that condition answers with and nothing out of the request.
+            // The refusal is about the STORE, so it carries the sentence that condition
+            // answers with and nothing out of the request.
             let message = answer.root().find_text("Message").unwrap_or_default();
             assert_eq!(
                 message, expected,

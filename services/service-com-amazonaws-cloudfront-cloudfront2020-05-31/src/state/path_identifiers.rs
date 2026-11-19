@@ -14,9 +14,10 @@
 //!   read the whole form their identifiers are ISSUED in — the record's own namespace letter
 //!   over a body of the issued width ([`super::is_field_level_encryption_config_id`],
 //!   [`super::is_field_level_encryption_profile_id`],
-//!   [`super::unresolved_field_level_encryption_config`]); the distribution and the origin
-//!   access control read the whole form their ids are minted in
-//!   ([`super::is_distribution_id`] and its neighbours);
+//!   [`super::unresolved_field_level_encryption_config`]); the distribution reads the whole
+//!   form its ids are minted in ([`super::is_distribution_id`]); and the origin access
+//!   control reads NONE of it, so every id it cannot resolve is the control reported absent
+//!   ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]);
 //! * which KIND an identifier belongs to, for the family CloudFront draws from ONE form. A
 //!   distribution, a streaming distribution, an origin access identity and an origin access
 //!   control all carry an `E` followed by an identifier body of the same width and alphabet,
@@ -117,20 +118,22 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// The modelled `NoSuchOriginAccessControl` an operation ADDRESSED by an origin access
     /// control `Id` answers an identifier it could not resolve.
     ///
-    /// The same two halves every other kind of this service reads
-    /// ([`Self::addresses`]): a value that could ADDRESS an origin access control — written
-    /// in the form CloudFront issues one in, and not one this account holds as another kind
-    /// of the `E`-form family — is a control that is simply not there, so it earns the
-    /// absent-control sentence; every other value is the identifier this operation reports it
-    /// cannot read.
-    pub fn unresolved_origin_access_control(&self, id: &str) -> NoSuchOriginAccessControl {
-        if self.addresses(EntityKind::OriginAccessControl, id) {
-            no_such_origin_access_control()
-        } else {
-            NoSuchOriginAccessControl {
-                message: Some(id_format_invalid_message(ADDRESSED_BY_ID)),
-            }
-        }
+    /// This resource kind makes NO form half at all: whatever `Id` a request carries is
+    /// resolved against the store, and every value the store holds no control under is the
+    /// control reported ABSENT. The recorded reads of this resource answer that one sentence
+    /// for an identifier of the issued form that names nothing AND for a value written in no
+    /// form this service mints an identifier in, so the control's routes word their single
+    /// lookup failure one way — which is also all the model gives them, `Id` being a plain
+    /// `string` `@httpLabel` with no `@pattern` and no `@length` and the lookup failure
+    /// `NoSuchOriginAccessControl` being the only error besides `AccessDenied`
+    /// (`smithy_query(query="operation",operation="GetOriginAccessControl")`).
+    ///
+    /// HOW MUCH of the form a route reads is each resource kind's own recorded contract (see
+    /// this module's own documentation), so the kinds whose recordings DO report an
+    /// identifier unreadable keep reading it ([`Self::unresolved_distribution`] and the free
+    /// functions beside the refusals they answer with).
+    pub fn unresolved_origin_access_control(&self, _id: &str) -> NoSuchOriginAccessControl {
+        no_such_origin_access_control()
     }
 }
 
