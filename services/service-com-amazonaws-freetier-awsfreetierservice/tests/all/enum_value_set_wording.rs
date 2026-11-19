@@ -34,11 +34,17 @@
 //! member and the operation carrying it, how the submitted value misses the set
 //! (an unknown word, wrong case, padding, the empty string, a value of another
 //! enum of this service), and — for the list member — the length of the list and
-//! the position of the element that missed. A last suite covers the other place
-//! a value set is NAMED: the sentences this service words itself
-//! (`GetFreeTierUsage`'s filter refusals), which resolve the order through the
-//! same one place (`state::listed_enum_value_set`), so a set this service
-//! publishes no order for is still listed as the model declares it.
+//! the position of the element that missed.
+//!
+//! The filter of `GetFreeTierUsage` reaches two more of this service's enums,
+//! `DimensionValues$Key` and the elements of `DimensionValues$MatchOptions`, at a
+//! member path that depends on WHERE in the expression tree the comparison sat;
+//! those rows drive the same one wording at the root and at four nested places,
+//! each a different path for the same member. A last suite covers the one place a
+//! value set is listed in a sentence of this service's own rather than in the AWS
+//! clause (`state::listed_enum_value_set`), where the order is resolved through
+//! the same one lookup, so a set this service publishes no order for is listed
+//! exactly as it was presented.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_freetier_awsfreetierservice::ops::types::{
@@ -360,6 +366,223 @@ fn every_listing_of_a_value_set_resolves_one_order() {
         assert_eq!(
             listed, expected,
             "case {enumerated}: expected the set listed {expected:?}, got {listed:?}"
+        );
+    }
+}
+
+/// One `Dimensions` comparison as a `GetFreeTierUsage` filter expression.
+fn comparison(key: &str, values: &[&str], match_options: &[&str]) -> Value {
+    json!({"Dimensions": {"Key": key, "Values": values, "MatchOptions": match_options}})
+}
+
+/// Where one comparison can sit inside a filter, and the dotted path its
+/// `Dimensions` member is then reached at: the root and four nested places, each
+/// naming a different path for the SAME member.
+///
+/// A filter is a tree, so a member of it has no one path — which is what the
+/// clause for a value outside an enumerated type has to state, because a client
+/// reading it has to know which comparison was refused.
+fn positions(bad: &Value) -> Vec<(&'static str, Value, &'static str)> {
+    let well_formed = comparison("REGION", &["us-east-1"], &["EQUALS"]);
+    vec![
+        ("at the root", bad.clone(), "filter.dimensions"),
+        (
+            "inside And",
+            json!({"And": [bad.clone()]}),
+            "filter.and.1.member.dimensions",
+        ),
+        (
+            "inside Or, after a well-formed branch",
+            json!({"Or": [well_formed, bad.clone()]}),
+            "filter.or.2.member.dimensions",
+        ),
+        (
+            "inside Not",
+            json!({"Not": bad.clone()}),
+            "filter.not.dimensions",
+        ),
+        (
+            "two levels down, inside Or inside And",
+            json!({"And": [{"Or": [bad.clone()]}]}),
+            "filter.and.1.member.or.1.member.dimensions",
+        ),
+    ]
+}
+
+/// `Dimension`'s value set in the order the model declares its members in
+/// (`smithy_query(query="shape",shape="Dimension")`), which is the order the
+/// schemas carry and so the order a clause lists it in: this service publishes
+/// no other order for it. Pinned by [`value_set`] to hold exactly the values the
+/// generated constant holds, so this can only reorder that set.
+const DECLARED_DIMENSIONS: [&str; 7] = [
+    "SERVICE",
+    "OPERATION",
+    "USAGE_TYPE",
+    "REGION",
+    "FREE_TIER_TYPE",
+    "DESCRIPTION",
+    "USAGE_PERCENTAGE",
+];
+
+/// The same for `MatchOption`
+/// (`smithy_query(query="shape",shape="MatchOption")`).
+const DECLARED_MATCH_OPTIONS: [&str; 5] = [
+    "EQUALS",
+    "STARTS_WITH",
+    "ENDS_WITH",
+    "CONTAINS",
+    "GREATER_THAN_OR_EQUAL",
+];
+
+/// RULE, at the members a `GetFreeTierUsage` filter reaches an enumerated type
+/// through: a value outside the type `DimensionValues$Key` targets is refused
+/// with the AWS clause naming the member at the position the value arrived at —
+/// and the handler layer's own re-check of the same modelled constraint states
+/// that clause too, rather than a sentence of its own.
+///
+/// The rows differ along how the submitted value misses the set (an unknown
+/// dimension, wrong case, the empty string, a value of another enum of this
+/// service) and along where in the expression tree the comparison sat, which is
+/// what the member path generalises over.
+#[tokio::test]
+async fn a_filter_dimension_outside_its_enumerated_type_is_refused_in_one_wording() {
+    let router = harness().0;
+    let dimensions = value_set("Dimension", &DECLARED_DIMENSIONS, DIMENSION_VALUES);
+
+    for submitted in ["SERVICE_NAME", "service", "EQUALS", ""] {
+        assert!(
+            !DIMENSION_VALUES.contains(&submitted),
+            "case {submitted:?}: the probe must not be a dimension the model declares"
+        );
+        let bad = comparison(submitted, &["us-east-1"], &["EQUALS"]);
+        for (place, filter, reached) in positions(&bad) {
+            let member = format!("{reached}.key");
+            let case = format!("Key {submitted:?} {place}");
+            let expected = expected_clause(&member, submitted, dimensions.as_str());
+
+            let actual = refusal_message(
+                &router,
+                &case,
+                "GetFreeTierUsage",
+                &json!({"maxResults": 10, "filter": filter}),
+            )
+            .await;
+            assert_eq!(
+                actual, expected,
+                "case {case}: expected {expected:?}, got {actual:?}"
+            );
+
+            let stated = enum_value_refusal(&member, submitted, &DECLARED_DIMENSIONS);
+            assert_eq!(
+                stated.as_deref(),
+                Some(expected.as_str()),
+                "case {case}: the handler layer must state the clause the boundary states, got \
+                 {stated:?}"
+            );
+        }
+    }
+
+    // The control: every dimension the model declares is served, at every
+    // position, so the rows above refuse nothing the model allows.
+    for key in DIMENSION_VALUES {
+        let value = if *key == "USAGE_PERCENTAGE" {
+            "0"
+        } else {
+            "us-east-1"
+        };
+        let good = comparison(key, &[value], &["EQUALS"]);
+        for (place, filter, _) in positions(&good) {
+            let served = ok(
+                &router,
+                "GetFreeTierUsage",
+                &json!({"maxResults": 10, "filter": filter}),
+            )
+            .await;
+            assert!(
+                served["freeTierUsages"].is_array(),
+                "case the declared dimension {key} {place}: expected a served page, got {served}"
+            );
+        }
+    }
+}
+
+/// The same rule at the LIST member of the same comparison, whose elements
+/// target `MatchOption`: the clause is stated once at the list, quoting the whole
+/// list the caller sent and nesting the element's requirements, at the path the
+/// list was reached at.
+///
+/// The rows differ along the length of the list, the position of the element that
+/// missed the set and how it missed it, as well as along the position of the
+/// comparison in the tree.
+#[tokio::test]
+async fn a_filter_match_option_outside_its_enumerated_type_is_refused_in_one_wording() {
+    let router = harness().0;
+    let options = value_set("MatchOption", &DECLARED_MATCH_OPTIONS, MATCH_OPTION_VALUES);
+
+    for submitted in [
+        vec!["GOLD"],
+        vec!["EQUALS", "GOLD"],
+        vec!["gold", "CONTAINS"],
+        vec![""],
+    ] {
+        assert!(
+            submitted
+                .iter()
+                .any(|option| !MATCH_OPTION_VALUES.contains(option)),
+            "case {submitted:?}: the probe must carry an option the model does not declare"
+        );
+        let bad = comparison("SERVICE", &["AWSLambda"], &submitted);
+        let owned: Vec<String> = submitted.iter().map(|value| (*value).to_string()).collect();
+        for (place, filter, reached) in positions(&bad) {
+            let member = format!("{reached}.matchOptions");
+            let case = format!("MatchOptions {submitted:?} {place}");
+            let expected = expected_element_clause(&member, &submitted, options.as_str());
+
+            let actual = refusal_message(
+                &router,
+                &case,
+                "GetFreeTierUsage",
+                &json!({"maxResults": 10, "filter": filter}),
+            )
+            .await;
+            assert_eq!(
+                actual, expected,
+                "case {case}: expected {expected:?}, got {actual:?}"
+            );
+
+            let stated = enum_element_refusal(&member, &owned, &DECLARED_MATCH_OPTIONS);
+            assert_eq!(
+                stated.as_deref(),
+                Some(expected.as_str()),
+                "case {case}: the handler layer must state the clause the boundary states, got \
+                 {stated:?}"
+            );
+        }
+    }
+
+    // The control: the single option every text dimension compares by is served
+    // at every position, and the handler layer refuses no list the model allows.
+    let stated = enum_element_refusal(
+        "filter.dimensions.matchOptions",
+        &["EQUALS".to_string()],
+        &DECLARED_MATCH_OPTIONS,
+    );
+    assert!(
+        stated.is_none(),
+        "case a declared option: a list of values the model declares must not be refused, got \
+         {stated:?}"
+    );
+    let good = comparison("SERVICE", &["AWSLambda"], &["EQUALS"]);
+    for (place, filter, _) in positions(&good) {
+        let served = ok(
+            &router,
+            "GetFreeTierUsage",
+            &json!({"maxResults": 10, "filter": filter}),
+        )
+        .await;
+        assert!(
+            served["freeTierUsages"].is_array(),
+            "case the declared option EQUALS {place}: expected a served page, got {served}"
         );
     }
 }

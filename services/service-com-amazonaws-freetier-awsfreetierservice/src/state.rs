@@ -869,11 +869,12 @@ fn published_enum_value_set(values: &[String]) -> Option<&'static [&'static str]
 /// comma-separated, in the order this service states that set in
 /// ([`stated_enum_value_set`]).
 ///
-/// For the refusals this service words in its own sentences rather than in the
-/// AWS validation clause ([`enum_value_refusal`]): the order a value set is
+/// For a refusal this service would word in a sentence of its own rather than in
+/// the AWS validation clause ([`enum_value_refusal`], which every refusal of a
+/// value outside an enumerated type goes through today): the order a value set is
 /// listed in is a property of the enum, so it is resolved in the one place
 /// wherever a set is named, and a set this service publishes no order for is
-/// listed as the model declares it.
+/// listed exactly as it was presented.
 pub fn listed_enum_value_set(declared: &[&str]) -> String {
     let presented: Vec<String> = declared.iter().map(|value| (*value).to_string()).collect();
     stated_enum_value_set(&presented).join(", ")

@@ -75,6 +75,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// How a dotted member path is spelled, so a clause this operation words for a
+// modelled constraint names the member exactly as the framework's own walk names
+// it — see [`member_path`].
+use ::aws_smithy_schema_server::constraints::path;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -170,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request's own encoding a second time.
         let filter = match input.filter.as_ref() {
             None => None,
-            Some(filter) => Some(check_expression(filter, 0)?),
+            Some(filter) => Some(check_expression(filter, FILTER_MEMBER, 0)?),
         };
 
         let store = state.lock();
@@ -228,6 +233,41 @@ const DIMENSION_USAGE_PERCENTAGE: &str = "USAGE_PERCENTAGE";
 const ROOT_OR: &str = "Or";
 /// See [`ROOT_OR`].
 const ROOT_AND: &str = "And";
+/// See [`ROOT_OR`].
+const ROOT_NOT: &str = "Not";
+/// See [`ROOT_OR`].
+const ROOT_DIMENSIONS: &str = "Dimensions";
+
+/// The member of this operation's input the filter arrives at, and the members
+/// of one `Dimensions` comparison that target an enumerated type
+/// (`DimensionValues$Key`, `DimensionValues$MatchOptions`).
+///
+/// Held as the MODEL spells them and re-cased into a path by [`member_path`],
+/// which is where the casing of a dotted path belongs.
+const FILTER_MEMBER: &str = "filter";
+/// See [`FILTER_MEMBER`].
+const DIMENSION_KEY_MEMBER: &str = "Key";
+/// See [`FILTER_MEMBER`].
+const MATCH_OPTIONS_MEMBER: &str = "MatchOptions";
+
+/// The dotted path the member `member` of the shape reached at `parent` is
+/// reported at, spelled by the one module both the deserializer and the
+/// constraint walk spell a path with (`path::member`).
+///
+/// A filter is a TREE, so one member of it is reached at as many paths as there
+/// are places a comparison can sit. Threading the parent's path through the
+/// check is what lets a clause this operation words name the member at the
+/// position the value really arrived at, which is the position the walk's own
+/// clause for the same value names.
+fn member_path(parent: &str, member: &str) -> String {
+    path::join(&[parent.to_string(), path::member(member)])
+}
+
+/// The path of one expression a logical operator lists: the operator's member,
+/// then that expression's 1-based position in the list it holds.
+fn branch_path(parent: &str, operator: &str, position: usize) -> String {
+    path::join(&[member_path(parent, operator), path::element(position)])
+}
 
 /// What the service states when an `Expression` does not set exactly one root
 /// operator — none of them, or more than one, whichever ones they are.
@@ -344,10 +384,11 @@ enum CheckedValues<'a> {
 /// Checking is separate from evaluating ([`matches_expression`]) because
 /// whether a filter is well formed depends on the filter alone: the answer must
 /// not vary with how many records the account happens to hold.
-fn check_expression(
-    filter: &Expression,
+fn check_expression<'a>(
+    filter: &'a Expression,
+    path: &str,
     depth: usize,
-) -> Result<CheckedExpression<'_>, GetFreeTierUsageError> {
+) -> Result<CheckedExpression<'a>, GetFreeTierUsageError> {
     if depth > MAX_FILTER_DEPTH {
         return Err(validation(format!(
             "filter: the expression nests more than {MAX_FILTER_DEPTH} levels"
@@ -375,10 +416,21 @@ fn check_expression(
     };
 
     Ok(match *root {
-        Root::Or(branches) => CheckedExpression::Any(check_branches(ROOT_OR, branches, depth)?),
-        Root::And(branches) => CheckedExpression::All(check_branches(ROOT_AND, branches, depth)?),
-        Root::Not(inner) => CheckedExpression::Negated(Box::new(check_expression(inner, depth + 1)?)),
-        Root::Dimensions(dimensions) => CheckedExpression::Dimension(check_dimension(dimensions)?),
+        Root::Or(branches) => {
+            CheckedExpression::Any(check_branches(ROOT_OR, branches, path, depth)?)
+        }
+        Root::And(branches) => {
+            CheckedExpression::All(check_branches(ROOT_AND, branches, path, depth)?)
+        }
+        Root::Not(inner) => CheckedExpression::Negated(Box::new(check_expression(
+            inner,
+            &member_path(path, ROOT_NOT),
+            depth + 1,
+        )?)),
+        Root::Dimensions(dimensions) => CheckedExpression::Dimension(check_dimension(
+            dimensions,
+            &member_path(path, ROOT_DIMENSIONS),
+        )?),
     })
 }
 
@@ -389,6 +441,7 @@ fn check_expression(
 fn check_branches<'a>(
     name: &'static str,
     branches: &'a [Expression],
+    path: &str,
     depth: usize,
 ) -> Result<Vec<CheckedExpression<'a>>, GetFreeTierUsageError> {
     if branches.is_empty() {
@@ -398,7 +451,10 @@ fn check_branches<'a>(
     }
     branches
         .iter()
-        .map(|inner| check_expression(inner, depth + 1))
+        .enumerate()
+        .map(|(index, inner)| {
+            check_expression(inner, &branch_path(path, name, index + 1), depth + 1)
+        })
         .collect()
 }
 
@@ -411,15 +467,26 @@ fn check_branches<'a>(
 /// values that each name a magnitude, i.e. one finite number — none of which
 /// depends on a record, so all of it is settled here — and settled ONCE: what
 /// this function decodes is what [`matches_dimension`] then compares by.
-fn check_dimension(
-    dimensions: &DimensionValues,
-) -> Result<CheckedComparison<'_>, GetFreeTierUsageError> {
+///
+/// `path` is the dotted path this comparison was reached at, so a clause about one
+/// of its members names that member where the caller really sent it
+/// ([`member_path`]).
+fn check_dimension<'a>(
+    dimensions: &'a DimensionValues,
+    path: &str,
+) -> Result<CheckedComparison<'a>, GetFreeTierUsageError> {
     let key = dimensions.key.as_str();
-    if !DIMENSION_VALUES.contains(&key) {
-        return Err(validation(format!(
-            "filter.Dimensions.Key: {key} is not a dimension; expected one of {}",
-            crate::state::listed_enum_value_set(DIMENSION_VALUES)
-        )));
+    // `Key` is an enum member, so the framework refuses a value outside it
+    // before `handle` runs; checking here as well keeps the refusal a 400
+    // `ValidationException` whatever the boundary does with a value the enum
+    // does not declare, and states the very clause that boundary refusal
+    // carries — value set, member path, requirement and envelope alike — so
+    // this operation holds no second rendering of any of them.
+    let key_member = member_path(path, DIMENSION_KEY_MEMBER);
+    if let Some(message) = crate::service::validation::declared_enum_values(&key_member)
+        .and_then(|declared| crate::state::enum_value_refusal(&key_member, key, declared))
+    {
+        return Err(stated_verbatim(&message));
     }
 
     if dimensions.values.is_empty() {
@@ -432,11 +499,17 @@ fn check_dimension(
         return Err(validation(ONE_MATCH_OPTION));
     };
     let option = option.as_str();
-    if !MATCH_OPTION_VALUES.contains(&option) {
-        return Err(validation(format!(
-            "filter.Dimensions.MatchOptions: {option} is not a match option; expected one of {}",
-            crate::state::listed_enum_value_set(MATCH_OPTION_VALUES)
-        )));
+    // The elements of `MatchOptions` target an enumerated type, which the same
+    // two layers check for the same reason as `Key` above; a clause about a
+    // list's elements is stated at the LIST member, so this one goes through the
+    // sibling writer for that case.
+    let options_member = member_path(path, MATCH_OPTIONS_MEMBER);
+    if let Some(message) =
+        crate::service::validation::declared_enum_values(&options_member).and_then(|declared| {
+            crate::state::enum_element_refusal(&options_member, &dimensions.match_options, declared)
+        })
+    {
+        return Err(stated_verbatim(&message));
     }
 
     let Some(kind) = crate::state::dimension_kind(key) else {
@@ -576,6 +649,21 @@ fn matches_text(value: &str, wanted: &str, option: &str) -> bool {
 fn validation(message: impl AsRef<str>) -> GetFreeTierUsageError {
     GetFreeTierUsageErrorModeled::ValidationException(ValidationException {
         message: crate::state::stated_validation(message.as_ref()),
+    })
+    .into()
+}
+
+/// Refuse the request with this operation's own modelled `ValidationException`
+/// (HTTP 400) whose `message` is `message` and nothing else.
+///
+/// The counterpart of [`validation`] for a refusal stated in the per-member
+/// validation envelope the boundary walk's own refusal carries, which this
+/// service's recordings show unwrapped — so a handler's re-check of a modelled
+/// constraint states that clause and no second envelope
+/// ([`crate::state::enum_value_refusal`]).
+fn stated_verbatim(message: &str) -> GetFreeTierUsageError {
+    GetFreeTierUsageErrorModeled::ValidationException(ValidationException {
+        message: message.to_string(),
     })
     .into()
 }

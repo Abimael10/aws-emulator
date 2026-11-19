@@ -41,7 +41,9 @@
 //!    very clause writer the walk's own refusal goes through
 //!    ([`outside_enum`], [`outside_element_enum`]) — so no second rendering of a value
 //!    set, of a member path or of a requirement exists in this crate to drift from the
-//!    one above.
+//!    one above; where the member's value set is not already in the handler's hands it is
+//!    read off the same schemas the walk checks against ([`declared_enum_values`]), so one
+//!    enum is never listed from two readings of the model.
 //!
 //! Rules 1-3 and 5 are `services/common`'s already
 //! (`service_common::validation_message::aws_validation_refusal`), which cannot be
@@ -368,6 +370,53 @@ fn element_constraints(list_path: &str) -> Option<Vec<String>> {
             Some(first) if *first != declared => return None,
             Some(_) => {}
             None => resolved = Some(declared),
+        }
+    }
+    resolved
+}
+
+/// The value set the enumerated type that the member a dotted path ends in targets
+/// declares, as the model-derived schemas hold it, or `None` when this service's request
+/// shapes describe no one set for that member name.
+///
+/// The counterpart of [`element_constraints`] for a value set, resolved the same way and
+/// for the same reason: it is read where the boundary walk reads it — a scalar member's
+/// own `@enum`, or, for a collection member, the one its ELEMENTS carry — so the set a
+/// handler's own re-check names (rule 8) cannot come from a second reading of the model.
+/// A member name two request shapes declare with DIFFERENT value sets is refused here
+/// rather than guessed at, exactly as [`element_constraints`] refuses one.
+pub(crate) fn declared_enum_values(member_path: &str) -> Option<&'static [&'static str]> {
+    let name = member_path.rsplit('.').next()?;
+    let mut resolved: Option<&'static [&'static str]> = None;
+    for shape in request_shapes() {
+        for member in shape.members() {
+            if !member
+                .member_name()
+                .is_some_and(|declared| path::member(declared) == name)
+            {
+                continue;
+            }
+            let Some(traits) = member.traits() else {
+                continue;
+            };
+            // A collection member carries its elements' constraints in a wrapper, which
+            // is where an element's value set lives for the walk as well.
+            let traits = traits
+                .get(&ElementConstraintsTrait::TRAIT_ID)
+                .and_then(|wrapper| wrapper.as_any().downcast_ref::<ElementConstraintsTrait>())
+                .map_or(traits, ElementConstraintsTrait::inner);
+            let Some(values) = traits
+                .get(&EnumTrait::TRAIT_ID)
+                .and_then(|found| found.as_any().downcast_ref::<EnumTrait>())
+                .map(|declared| declared.values)
+            else {
+                continue;
+            };
+            match resolved {
+                Some(first) if first != values => return None,
+                Some(_) => {}
+                None => resolved = Some(values),
+            }
         }
     }
     resolved
