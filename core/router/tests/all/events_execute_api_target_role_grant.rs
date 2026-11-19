@@ -49,7 +49,12 @@ const SOURCE_HEADER_VALUE: &str = "rule-denied";
 
 /// The action the delivery performs, which the target's role has to be allowed on the target's
 /// own ARN.
-const INVOKE_ACTION: &str = "execute-api:Invoke";
+///
+/// This suite's own setup is the crate's one setup for a CUSTOM BUS whose rules target a deployed
+/// stage: the sibling suite that varies the FAN-OUT of one event over several such targets
+/// (`crate::events_execute_api_target_role_independence`) imports the items marked `pub(crate)`
+/// here, so there is ONE set of setup calls and ONE wording of the refused invoke for both.
+pub(crate) const INVOKE_ACTION: &str = "execute-api:Invoke";
 
 /// The opening of the sentence EventBridge words a refused invoke with: the status the stage
 /// answered, and the request it answered it to.
@@ -64,22 +69,22 @@ const FORBIDDEN_CLAUSE: &str =
 const FORBIDDEN_TAIL: &str = "; Proxy: null)";
 
 /// How many retries the target allows, which a delivery no request is served for makes none of.
-const RETRIES_ALLOWED: i64 = 0;
+pub(crate) const RETRIES_ALLOWED: i64 = 0;
 
 /// The oldest an event the target still accepts may be, the modelled minimum
 /// (`RetryPolicy$MaximumEventAgeInSeconds`, `@range(min: 60)`).
-const MAX_EVENT_AGE_SECONDS: i64 = 60;
+pub(crate) const MAX_EVENT_AGE_SECONDS: i64 = 60;
 
 /// One identity-based policy that ALLOWS `action` on `resource` and explicitly denies it there
 /// as well, which is the pair an explicit deny decides.
-fn allow_and_deny(action: &str, resource: &str) -> String {
+pub(crate) fn allow_and_deny(action: &str, resource: &str) -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"{resource}"}},{{"Effect":"Deny","Action":"{action}","Resource":"{resource}"}}]}}"#
     )
 }
 
 /// Drain `url` of everything it holds, so the next row of a table reads only its own messages.
-async fn drained(router: &MultiServiceRouter, case: &str, url: &str) {
+pub(crate) async fn drained(router: &MultiServiceRouter, case: &str, url: &str) {
     for message in messages(router, case, url, 0).await {
         sqs(
             router,
@@ -95,19 +100,19 @@ async fn drained(router: &MultiServiceRouter, case: &str, url: &str) {
 }
 
 /// One stage this suite deploys, and everything the rows address it by.
-struct Deployed {
-    api: String,
-    account: String,
-    bus: String,
-    sink_url: String,
-    dead_letter_url: String,
-    dead_letter_arn: String,
+pub(crate) struct Deployed {
+    pub(crate) api: String,
+    pub(crate) account: String,
+    pub(crate) bus: String,
+    pub(crate) sink_url: String,
+    pub(crate) dead_letter_url: String,
+    pub(crate) dead_letter_arn: String,
 }
 
 impl Deployed {
     /// The ARN a target names the method of this stage by: every `POST` under `/orders`, whose
     /// one `*` the target's own path parameter fills.
-    fn target_arn(&self) -> String {
+    pub(crate) fn target_arn(&self) -> String {
         format!(
             "arn:aws:execute-api:{REGION}:{}:{}/{STAGE}/POST/orders/*",
             self.account, self.api
@@ -116,7 +121,7 @@ impl Deployed {
 }
 
 /// The custom bus, the queues, the api and its deployed stage every row below uses.
-async fn deployed(router: &MultiServiceRouter, name: &str) -> Deployed {
+pub(crate) async fn deployed(router: &MultiServiceRouter, name: &str) -> Deployed {
     let (sink_url, sink_arn) = queue(router, "sink", &format!("{name}-sink")).await;
     let (dead_letter_url, dead_letter_arn) =
         queue(router, "dead letter", &format!("{name}-dlq")).await;
@@ -294,8 +299,8 @@ async fn published(
 }
 
 /// Assert that `message` is the sentence EventBridge words a `403` answer with, for a request at
-/// `path`.
-fn assert_forbidden_sentence(case: &str, message: &str, path: &str) {
+/// `path`, answering the id that sentence names the answered request by.
+pub(crate) fn assert_forbidden_sentence(case: &str, message: &str, path: &str) -> String {
     assert!(
         message.starts_with(FORBIDDEN_OPENING),
         "case {case:?}: expected a message opening {FORBIDDEN_OPENING:?}, got {message:?}"
@@ -319,6 +324,7 @@ fn assert_forbidden_sentence(case: &str, message: &str, path: &str) {
         "case {case:?}: expected the sentence to name the request id of the answer, got \
          {message:?}"
     );
+    request_id
 }
 
 /// One row of the grant table: which document is in force on the target's role, and whether the
