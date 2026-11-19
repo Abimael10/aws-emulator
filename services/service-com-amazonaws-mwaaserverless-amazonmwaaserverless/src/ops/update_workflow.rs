@@ -372,25 +372,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The configuration the new version freezes: what this request supplies, plus the
         // encryption configuration an update cannot express. The code is copied "at the
         // time of the request", so the snapshot is taken now.
+        //
+        // The content read above and the schedule that content declares are both frozen
+        // by the new version, which is how a caller picks up a changed definition object —
+        // by creating a version, never by the object changing underneath an existing one.
+        // The schedule is also what the service derives this version's trigger mode from
+        // when the request named none, so it is bound here first.
+        let workflow_definition = definition
+            .as_ref()
+            .map(|snapshot| snapshot.content.clone());
+        let schedule_configuration = definition.and_then(|snapshot| snapshot.schedule_configuration);
         let snapshot = crate::state::WorkflowSnapshot {
             definition_s3_location: input.definition_s3_location.clone(),
-            // The content read above, and the schedule that content declares: the new
-            // version freezes both, which is how a caller picks up a changed definition
-            // object — by creating a version, never by the object changing underneath an
-            // existing one.
-            workflow_definition: definition
-                .as_ref()
-                .map(|snapshot| snapshot.content.clone()),
-            schedule_configuration: definition
-                .and_then(|snapshot| snapshot.schedule_configuration),
+            workflow_definition,
+            schedule_configuration: schedule_configuration.clone(),
             code: input.code.clone(),
             role_arn: input.role_arn.clone(),
             description: input.description.clone(),
             encryption_configuration,
-            logging_configuration: input.logging_configuration.clone(),
+            // The service applies its own default to each of these when the request names
+            // none, exactly as a create does, so a version created by an update reports
+            // the value in force rather than nothing.
+            logging_configuration: Some(crate::state::applied_logging_configuration(
+                input.logging_configuration.as_ref(),
+                &arn,
+            )),
             engine_version: input.engine_version,
             network_configuration: input.network_configuration.clone(),
-            trigger_mode: input.trigger_mode.clone(),
+            trigger_mode: Some(crate::state::applied_trigger_mode(
+                input.trigger_mode.as_deref(),
+                schedule_configuration.as_ref(),
+            )),
         };
 
         let workflow = store.workflow_in_mut(&region, &arn).ok_or_else(unavailable)?;

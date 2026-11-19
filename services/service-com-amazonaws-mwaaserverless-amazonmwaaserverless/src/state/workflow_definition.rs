@@ -63,16 +63,33 @@ const SCHEDULE_KEYS: &[&str] = &["schedule", "schedule_interval"];
 /// The key a definition may nest its DAG-level declarations under, so a document that
 /// wraps them in one mapping declares its schedule at `dag.schedule` rather than at the
 /// document root.
+///
+/// It is ONE spelling of "one mapping in", not a privileged one — the Apache Airflow YAML
+/// shape writes the DAG's own id in that position instead — so the predicate that reads
+/// the position takes the key as it finds it and this is what EXCLUDES the wrapper from
+/// the declaration keys ([`OpenNodes::at_dag_level_key`], [`is_dag_level_key`]).
 const DAG_KEY: &str = "dag";
 
-/// The key a definition declares its TASKS under, at the document root or inside its
-/// [`DAG_KEY`] mapping: the definition "defines the workflow structure using supported
+/// The key a definition declares its TASKS under, at the document root or inside the
+/// mapping that names the DAG: the definition "defines the workflow structure using supported
 /// Amazon Web Services operators and tasks" and is written to "include task dependencies,
 /// scheduling information, and operator configurations"
 /// (`smithy_query(query="doc", shape="CreateWorkflowRequest",
 /// member="DefinitionS3Location")`), and `tasks` is the key Apache Airflow's own DAG
 /// vocabulary spells that collection with.
 const TASKS_KEY: &str = "tasks";
+
+/// Whether `key` is one of the DAG-LEVEL declaration keys these readers look for.
+///
+/// What it is for: a mapping under one of these holds that declaration's OWN contents —
+/// the task entries of a `tasks` mapping — so a key inside it names part of that
+/// declaration and not a second DAG-level one
+/// ([`OpenNodes::at_dag_level_key`]).
+fn is_dag_level_key(key: &str) -> bool {
+    // The wrapper key is deliberately NOT one of them: it declares nothing of its own, it
+    // only holds the DAG's declarations one mapping in.
+    key != DAG_KEY && (key == TASKS_KEY || SCHEDULE_KEYS.contains(&key))
+}
 
 /// The keys ONE task entry declares its own identifier under, in the order they are
 /// looked for: Apache Airflow's `task_id` and the shorter `id` and `name` spellings a
@@ -534,6 +551,36 @@ impl OpenNodes {
         Some(keys)
     }
 
+    /// Whether the node now being read is the value of a DAG-LEVEL key this reader looks
+    /// for — one of `names`.
+    ///
+    /// A definition writes its DAG-level declarations either at the document ROOT, or ONE
+    /// MAPPING IN under the key that names the DAG: the [`DAG_KEY`] mapping a document may
+    /// wrap them in, or — the shape Apache Airflow's YAML DAG vocabulary uses — the DAG's
+    /// own id, which is the document's own top-level key. Both are the same position, one
+    /// mapping in, so one predicate reads both and no key spelling is privileged.
+    ///
+    /// A key that is ITSELF one of the DAG-level declaration keys ([`is_dag_level_key`])
+    /// opens that declaration's own contents — the task entries of a `tasks` mapping — so
+    /// what sits one level inside it is part of that declaration and not a second
+    /// DAG-level one.
+    ///
+    /// THE BREADTH IS DELIBERATE. Any other outer key counts, because the key that names a
+    /// DAG is the DAG's own id and this reader cannot know which word that is: a document
+    /// whose `tasks` sits under some unrelated top-level key is read as declaring that
+    /// collection, and a document declaring several top-level DAG ids contributes all their
+    /// tasks to the one definition. Both are what a definition file is NOT supposed to hold
+    /// — `DefinitionS3Location` names "the workflow definition file", one DAG — and reading
+    /// them widely is the side to err on: a declaration the reader cannot see is a run that
+    /// executes nothing, which is the defect this predicate replaced.
+    fn at_dag_level_key(&self, names: &[&str]) -> bool {
+        match self.key_path().as_deref() {
+            Some([key]) => names.contains(key),
+            Some([outer, key]) => names.contains(key) && !is_dag_level_key(outer),
+            _ => false,
+        }
+    }
+
     /// Account for a node that occupies a position in the enclosing mapping without being
     /// a scalar — a nested collection, or an alias standing in for one — so its key and
     /// value positions stay in step.
@@ -606,15 +653,11 @@ impl ScheduleFinder {
         true
     }
 
-    /// Whether the node now being read is the value of a DAG-level schedule key: the
-    /// open collections are all mappings, and their keys spell either `<schedule key>`
-    /// at the document root or `dag.<schedule key>` one level in.
+    /// Whether the node now being read is the value of a DAG-level schedule key: one of
+    /// [`SCHEDULE_KEYS`] at the document root or one mapping in under the key naming the
+    /// DAG ([`OpenNodes::at_dag_level_key`]).
     fn at_schedule_path(&self) -> bool {
-        match self.nodes.key_path().as_deref() {
-            Some([key]) => SCHEDULE_KEYS.contains(key),
-            Some([DAG_KEY, key]) => SCHEDULE_KEYS.contains(key),
-            _ => false,
-        }
+        self.nodes.at_dag_level_key(SCHEDULE_KEYS)
     }
 }
 
@@ -796,15 +839,11 @@ impl TaskFinder {
         true
     }
 
-    /// Whether the collection now being opened is a DAG-level `tasks` collection: the
-    /// open collections are all mappings, and their keys spell either `tasks` at the
-    /// document root or `dag.tasks` one level in.
+    /// Whether the collection now being opened is a DAG-level [`TASKS_KEY`] collection:
+    /// at the document root or one mapping in under the key naming the DAG
+    /// ([`OpenNodes::at_dag_level_key`]).
     fn at_tasks_path(&self) -> bool {
-        match self.nodes.key_path().as_deref() {
-            Some([key]) => *key == TASKS_KEY,
-            Some([DAG_KEY, key]) => *key == TASKS_KEY,
-            _ => false,
-        }
+        self.nodes.at_dag_level_key(&[TASKS_KEY])
     }
 
     /// Whether the collection now being opened is an ENTRY of the tasks collection: one

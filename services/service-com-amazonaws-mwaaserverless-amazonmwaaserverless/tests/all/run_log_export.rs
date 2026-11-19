@@ -12,9 +12,9 @@
 //! of the execution (the run, and each task-instance attempt the run ran) and the events
 //! those units produced; and each task instance that executed reports the stream it wrote
 //! to as `LogStream` ("The CloudWatch log stream name for this task instance execution"),
-//! which is a stream that group really holds. A workflow that configures NO log group has
-//! nowhere documented for its output to go, so nothing is exported and its instances report
-//! no `LogStream`.
+//! which is a stream that group really holds. A workflow whose create named NO group logs
+//! to the group the SERVICE names for it (`state::service_log_group_name`), which is the
+//! same rule reading the destination out of the same snapshot member.
 //!
 //! CloudWatch Logs is mounted beside this service on ONE engine and asked through its own
 //! `DescribeLogGroups`, `DescribeLogStreams` and `GetLogEvents` — the shape
@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-    RUN_STATUS_FAILED, RUN_STATUS_SUCCESS,
+    service_log_group_name, RUN_STATUS_FAILED, RUN_STATUS_SUCCESS,
 };
 
 use crate::run_execution_outcome::{read_task_instance, run_to_completion};
@@ -54,8 +54,9 @@ struct Row {
     case: &'static str,
     /// The definition content staged in Amazon S3.
     definition: &'static str,
-    /// The `LoggingConfiguration.LogGroupName` the workflow is created with, or `None` for
-    /// a workflow that configures no logging at all.
+    /// The `LoggingConfiguration.LogGroupName` the workflow is created with, and `None`
+    /// for a workflow that configures none — whose runs go to the group the service names
+    /// for it instead.
     log_group: Option<&'static str>,
     /// The `RunState` the run must finish in.
     expected_state: &'static str,
@@ -111,7 +112,7 @@ const ROWS: &[Row] = &[
         expected_tasks: &["start", "left", "right", "join"],
     },
     Row {
-        case: "a workflow that configures no logging",
+        case: "a workflow that names no group, so the service names it",
         definition: "tasks:\n  - id: extract\n    operator: EmptyOperator\n",
         log_group: None,
         expected_state: RUN_STATUS_SUCCESS,
@@ -293,23 +294,29 @@ async fn a_runs_output_reaches_the_configured_log_group_and_its_task_instances_n
         let arn = create_workflow(&router, &format!("runLogExport{index}"), &key, row.log_group)
             .await;
         let run_id = start_run(&router, &arn, case).await;
+        // Where this run's output goes: the group the create named, or — for a create that
+        // named none — the group the SERVICE names for the workflow, derived here from the
+        // workflow's own ARN rather than written out.
+        let log_group = row
+            .log_group
+            .map(str::to_string)
+            .unwrap_or_else(|| service_log_group_name(&arn));
+        let log_group = log_group.as_str();
 
-        // A configured group is the destination of the run from the moment it is
-        // admitted: the group exists and the run's own stream already holds the line
-        // saying so, before anything was read back.
-        if let Some(log_group) = row.log_group {
-            let groups = log_group_names(&router).await;
-            assert!(
-                groups.contains(log_group),
-                "case {case:?}: the configured log group {log_group:?} must exist once the run \
-                 is started, got {groups:?}"
-            );
-            let admitted = log_messages(&router, log_group, &run_id).await;
-            assert!(
-                admitted.iter().any(|message| message.contains(&run_id)),
-                "case {case:?}: the run's own stream must carry its admission, got {admitted:?}"
-            );
-        }
+        // That group is the destination of the run from the moment it is admitted: the
+        // group exists and the run's own stream already holds the line saying so, before
+        // anything was read back.
+        let groups = log_group_names(&router).await;
+        assert!(
+            groups.contains(log_group),
+            "case {case:?}: the log group {log_group:?} must exist once the run is started, \
+             got {groups:?}"
+        );
+        let admitted = log_messages(&router, log_group, &run_id).await;
+        assert!(
+            admitted.iter().any(|message| message.contains(&run_id)),
+            "case {case:?}: the run's own stream must carry its admission, got {admitted:?}"
+        );
 
         let report = run_to_completion(&router, &arn, &run_id, case).await;
         assert_eq!(
@@ -320,44 +327,17 @@ async fn a_runs_output_reaches_the_configured_log_group_and_its_task_instances_n
             report["RunDetail"]["RunState"]
         );
 
-        // Every instance the run executed names the stream it wrote to, and only when a
-        // group was configured for it to write into.
+        // Every instance the run executed names the stream it wrote to.
         for task in row.expected_tasks {
             let read = read_task_instance(&router, &arn, &run_id, task, case).await;
-            let reported = read["LogStream"].as_str();
-            match row.log_group {
-                None => assert!(
-                    read["LogStream"].is_null(),
-                    "case {case:?}: task {task:?} of a workflow with no logging configured \
-                     reports no LogStream, got {:?}",
-                    read["LogStream"]
-                ),
-                Some(_) => assert_eq!(
-                    reported,
-                    Some(task_stream(&run_id, task).as_str()),
-                    "case {case:?}: expected task {task:?} to name the stream its attempt \
-                     wrote to, got {:?}",
-                    read["LogStream"]
-                ),
-            }
+            assert_eq!(
+                read["LogStream"].as_str(),
+                Some(task_stream(&run_id, task).as_str()),
+                "case {case:?}: expected task {task:?} to name the stream its attempt \
+                 wrote to, got {:?}",
+                read["LogStream"]
+            );
         }
-
-        let Some(log_group) = row.log_group else {
-            // Nothing was exported for this run: no group holds a stream of it.
-            for group in log_group_names(&router).await {
-                let streams = log_stream_names(&router, &group).await;
-                let exported: Vec<&String> = streams
-                    .iter()
-                    .filter(|stream| stream.starts_with(&run_id))
-                    .collect();
-                assert!(
-                    exported.is_empty(),
-                    "case {case:?}: a workflow with no logging configured exports nothing, \
-                     but {group:?} holds {exported:?}"
-                );
-            }
-            continue;
-        };
 
         // The streams the group holds for this run are exactly the run's own and one per
         // task instance it executed.

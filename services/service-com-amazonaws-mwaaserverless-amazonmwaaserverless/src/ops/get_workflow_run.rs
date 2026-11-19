@@ -10,9 +10,11 @@
 //! It moves no status, consumes no quota and bumps no counter because the run was read.
 //!
 //! Every optional member is reported only when the stored run HOLDS a value for it: a run
-//! started with no `OverrideParameters` and a run holding no task instance report neither
-//! member rather than an empty map or an empty list, the same way `GetTaskInstance` omits
-//! the `Xcom` of an instance that exchanged no cross-task data. Which task instances a run
+//! holding no task instance reports no `TaskInstances` rather than an empty list, the same
+//! way `GetTaskInstance` omits the `Xcom` of an instance that exchanged no cross-task
+//! data. The parameter set a run reports is the one it executes with — the entry the
+//! service injects to name the run's workflow, plus whatever the caller's start supplied
+//! over it (`crate::state::run_parameters`). Which task instances a run
 //! holds, and the status, completion and `ErrorMessage` it reports, are what the execution
 //! of its definition's task graph produced (`crate::state::workflow_execution`).
 //!
@@ -246,8 +248,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workflow_version: Some(run.workflow_version.clone()),
             run_id: Some(run.run_id.clone()),
             run_type: Some(run.run_type.clone()),
-            // Absent, like every other unset optional member, for a run the caller
-            // started with no parameter overrides.
+            // The parameter set the run executes with: the service-injected entry naming
+            // its workflow, and whatever the caller's start supplied over it
+            // (`crate::state::run_parameters`). Absent only for a run recorded with no
+            // parameter set at all.
             override_parameters: (!run.override_parameters.is_empty()).then(|| {
                 run.override_parameters
                     .iter()

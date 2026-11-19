@@ -393,24 +393,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The definition snapshot the docs describe: "takes a snapshot of the definition
         // at creation time, so subsequent changes to the S3 object will not affect the
         // workflow unless you create a new version".
+        //
+        // The content read above and the schedule that content declares both belong to
+        // THIS version, so a later overwrite of the object cannot change what this
+        // version reports. The schedule is also what the service derives this version's
+        // trigger mode from when the request named none, so it is bound here first.
+        let workflow_definition = definition
+            .as_ref()
+            .map(|snapshot| snapshot.content.clone());
+        let schedule_configuration = definition.and_then(|snapshot| snapshot.schedule_configuration);
         let snapshot = crate::state::WorkflowSnapshot {
             definition_s3_location: input.definition_s3_location.clone(),
-            // The content read above, and the schedule that content declares: both
-            // belong to THIS version, so a later overwrite of the object cannot change
-            // what this version reports.
-            workflow_definition: definition
-                .as_ref()
-                .map(|snapshot| snapshot.content.clone()),
-            schedule_configuration: definition
-                .and_then(|snapshot| snapshot.schedule_configuration),
+            workflow_definition,
+            schedule_configuration: schedule_configuration.clone(),
             code: input.code.clone(),
             role_arn: input.role_arn.clone(),
             description: input.description.clone(),
             encryption_configuration: input.encryption_configuration.clone(),
-            logging_configuration: input.logging_configuration.clone(),
+            // The service applies its own default to each of these when the request
+            // names none, so every reader reports the value in force rather than
+            // nothing: the log group this service names for the workflow, and the
+            // trigger mode the snapshotted definition's schedule decides.
+            logging_configuration: Some(crate::state::applied_logging_configuration(
+                input.logging_configuration.as_ref(),
+                &arn,
+            )),
             engine_version: input.engine_version,
             network_configuration: input.network_configuration.clone(),
-            trigger_mode: input.trigger_mode.clone(),
+            trigger_mode: Some(crate::state::applied_trigger_mode(
+                input.trigger_mode.as_deref(),
+                schedule_configuration.as_ref(),
+            )),
         };
 
         let mut workflow = crate::state::Workflow {

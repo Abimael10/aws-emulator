@@ -17,12 +17,15 @@
 //! many updates the workflow has had. Every row is read back through the implemented
 //! `GetWorkflow`, so what a test asserts is what a client sees.
 
-use crate::workflow_lifecycle::{role_arn, Harness};
+use crate::workflow_lifecycle::{
+    assert_service_default, role_arn, Harness, SERVICE_DEFAULTED_MEMBERS,
+};
 
 /// The members `UpdateWorkflowRequest` and `GetWorkflowResponse` share, from
 /// `smithy_query(query="operation", operation="UpdateWorkflow,GetWorkflow")`. These are
 /// the whole configuration an update can set, so each one must read back exactly as the
-/// update supplied it — and read back ABSENT when the update supplied none.
+/// update supplied it — and read back ABSENT when the update supplied none, except for the
+/// two the service defaults itself ([`SERVICE_DEFAULTED_MEMBERS`]).
 const UPDATABLE_MEMBERS: &[&str] = &[
     "DefinitionS3Location",
     "Code",
@@ -150,9 +153,11 @@ fn is_workflow_version(version: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b.is_ascii_alphabetic()))
 }
 
-/// A response timestamp as a number of seconds, for the ordering assertions.
+/// A response timestamp as a number of seconds, for the ordering assertions: every
+/// timestamp of this service is a date-time STRING on the wire
+/// ([`crate::workflow_lifecycle::reported_instant`]).
 fn seconds(value: &serde_json::Value) -> Option<f64> {
-    value.as_f64()
+    crate::workflow_lifecycle::reported_instant(value)
 }
 
 #[tokio::test]
@@ -241,6 +246,12 @@ async fn an_update_appends_a_version_that_carries_exactly_the_configuration_supp
         for member in UPDATABLE_MEMBERS {
             let supplied = &body[member];
             if supplied.is_null() {
+                if SERVICE_DEFAULTED_MEMBERS.contains(member) {
+                    // The service applies its own value for these two, so the appended
+                    // version carries that rather than nothing.
+                    assert_service_default(case, member, &arn, &fetched);
+                    continue;
+                }
                 assert!(
                     fetched[member].is_null(),
                     "case {case:?}: the update supplied no {member}, so the new version must \

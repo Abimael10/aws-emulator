@@ -272,10 +272,12 @@ async fn tear_down_a_workflow(router: &MultiServiceRouter, name: &'static str) -
     }
 }
 
-/// A response timestamp as fractional epoch seconds — the form `awsJson1_0` writes a
-/// timestamp in.
+/// A response timestamp as fractional epoch seconds. Every timestamp of this service
+/// targets `TimestampValue`, which carries `@timestampFormat("date-time")`, so it is an
+/// ISO 8601 / RFC 3339 STRING on the wire ([`crate::workflow_lifecycle::reported_instant`]
+/// parses it).
 fn epoch_seconds(value: &Value) -> Option<f64> {
-    value.as_f64()
+    crate::workflow_lifecycle::reported_instant(value)
 }
 
 /// A `SystemTime` as fractional epoch seconds, so it compares with a response timestamp.

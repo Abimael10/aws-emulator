@@ -342,6 +342,121 @@ pub fn configured_log_group(snapshot: &WorkflowSnapshot) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+/// The fixed text in front of the log group this service names for a workflow whose
+/// create or update supplied no `LoggingConfiguration` of its own.
+///
+/// Recorded behaviour: the group the service generates is this prefix, the workflow's own
+/// id — the resource-id segment of its ARN ([`workflow_resource_id`]) — and a trailing
+/// `/`. Fixture `mwaa-serverless-workflow-run-two-dependent-tasks-succeed` reports
+/// `GetWorkflow`'s `LoggingConfiguration.LogGroupName` in exactly that form for a create
+/// that named none.
+const SERVICE_LOG_GROUP_PREFIX: &str = "/aws/mwaa-serverless/";
+
+/// The log group THIS SERVICE names for the runs of the workflow `workflow_arn`:
+/// [`SERVICE_LOG_GROUP_PREFIX`], the workflow's own id and a trailing `/`.
+///
+/// Every character of it is one a CloudWatch Logs log group name may carry
+/// ([`is_log_group_name`]) — the id segment the modelled `WorkflowArn` pattern allows is
+/// alphanumerics, `.`, `-` and `_` — so the group it names is one this service's run-log
+/// export can really create ([`run_logs`]).
+pub fn service_log_group_name(workflow_arn: &str) -> String {
+    format!(
+        "{SERVICE_LOG_GROUP_PREFIX}{}/",
+        workflow_resource_id(workflow_arn)
+    )
+}
+
+/// The `TriggerMode` a workflow reports when its create or update named none, for a
+/// version whose snapshotted definition declares NO schedule: its runs are the ones a
+/// caller starts, and nothing else starts them.
+///
+/// Recorded behaviour: the fixture above creates a workflow from a definition declaring
+/// `schedule: null` with no `TriggerMode` in the request, and `GetWorkflow` reports this
+/// token.
+pub const TRIGGER_MODE_MANUAL_ONLY: &str = "manual_only";
+
+/// The companion of [`TRIGGER_MODE_MANUAL_ONLY`] for a version whose definition DOES
+/// declare a schedule, which is the only other side of the same derivation: the service
+/// configures that definition's trigger, so the workflow's runs are not manual-only.
+///
+/// Only the manual-only token is recorded, so this spelling is the emulator's own for the
+/// case the recording does not cover; what is NOT the emulator's own is the derivation,
+/// which is the rule the recorded case establishes.
+pub const TRIGGER_MODE_SCHEDULED: &str = "scheduled";
+
+/// The `LoggingConfiguration` a version FREEZES: the one the request supplied, or the
+/// group this service names for the workflow when the request supplied none
+/// ([`service_log_group_name`]).
+///
+/// The service defaults the member at create and at update time, so every reader —
+/// `GetWorkflow`, `ListWorkflows`, `ListWorkflowVersions` and the run-log export that
+/// reads the destination out of the snapshot ([`configured_log_group`]) — reports the
+/// value the service applied rather than nothing.
+pub fn applied_logging_configuration(
+    supplied: Option<&LoggingConfiguration>,
+    workflow_arn: &str,
+) -> LoggingConfiguration {
+    match supplied {
+        Some(configuration) if !configuration.log_group_name.is_empty() => configuration.clone(),
+        _ => LoggingConfiguration {
+            log_group_name: service_log_group_name(workflow_arn),
+        },
+    }
+}
+
+/// The `TriggerMode` a version FREEZES: the one the request supplied, or the mode the
+/// service derives from the schedule that version's snapshotted definition declares when
+/// the request supplied none.
+///
+/// The derivation is the definition's, because the definition is where the service reads
+/// scheduling information from — "when a workflow includes schedule information in its
+/// YAML definition, the service automatically configures the appropriate triggers for
+/// automated execution" (`smithy_query(query="doc", shape="GetWorkflowResponse",
+/// member="ScheduleConfiguration")`) — so a definition declaring no schedule leaves the
+/// workflow's runs to a caller ([`TRIGGER_MODE_MANUAL_ONLY`]) and one declaring a schedule
+/// does not ([`TRIGGER_MODE_SCHEDULED`]).
+pub fn applied_trigger_mode(
+    supplied: Option<&str>,
+    schedule_configuration: Option<&ScheduleConfiguration>,
+) -> String {
+    match supplied {
+        Some(mode) if !mode.is_empty() => mode.to_string(),
+        _ if schedule_configuration.is_some() => TRIGGER_MODE_SCHEDULED.to_string(),
+        _ => TRIGGER_MODE_MANUAL_ONLY.to_string(),
+    }
+}
+
+/// The key the service's OWN entry in a run's parameter set is reported under.
+///
+/// Recorded behaviour: fixture
+/// `mwaa-serverless-workflow-run-two-dependent-tasks-succeed` starts a run carrying no
+/// `OverrideParameters` at all, and `GetWorkflowRun` reports a map holding this key
+/// against the workflow's own id.
+pub const RUN_WORKFLOW_ID_PARAMETER: &str = "mwaa_serverless_workflow_id";
+
+/// The parameter set a run of `workflow_arn` executes with: the service-injected entry
+/// naming the workflow the run belongs to ([`RUN_WORKFLOW_ID_PARAMETER`]), with the
+/// caller's own overrides merged over it.
+///
+/// Seeded first, so a caller that supplies the same key overrides it the way it overrides
+/// any other parameter, and reported by `GetWorkflowRun` out of the same map whatever
+/// started the run — a caller's `StartWorkflowRun` or the workflow's own trigger.
+pub fn run_parameters<I>(
+    workflow_arn: &str,
+    supplied: I,
+) -> BTreeMap<String, ::aws_smithy_types::Document>
+where
+    I: IntoIterator<Item = (String, ::aws_smithy_types::Document)>,
+{
+    let mut parameters = BTreeMap::new();
+    parameters.insert(
+        RUN_WORKFLOW_ID_PARAMETER.to_string(),
+        ::aws_smithy_types::Document::String(workflow_resource_id(workflow_arn).to_string()),
+    );
+    parameters.extend(supplied);
+    parameters
+}
+
 /// A run started under a workflow.
 #[derive(Debug, Clone)]
 pub struct WorkflowRun {
@@ -1511,8 +1626,9 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
                     // Nobody asked for this run: the workflow's own trigger did.
                     run_type: RUN_TYPE_SCHEDULED.to_string(),
                     status: RUN_STATUS_STARTING.to_string(),
-                    // A trigger carries no caller parameters to override with.
-                    override_parameters: BTreeMap::new(),
+                    // A trigger carries no caller parameters to override with, so the
+                    // run executes with the one parameter the service injects itself.
+                    override_parameters: run_parameters(&arn, []),
                     // Dated from the DUE instant, never from `now`, so the run a
                     // reader reports is the one the firing would have produced
                     // unpolled.
@@ -2046,13 +2162,47 @@ pub fn mint_workflow_version(workflow_arn: &str, fingerprint: &str, nonce: &str)
         .collect()
 }
 
-/// Mint a `RevisionId` for a workflow configuration revision. Changes whenever
-/// the version does, which is what makes it usable for optimistic concurrency.
+/// Mint a `RevisionId` for a workflow configuration revision: a canonical
+/// 36-character hyphenated UUID, the identifier form the recorded service answers this
+/// member with — a shape class the 32-character lowercase-hex `WorkflowVersion`
+/// ([`mint_workflow_version`]) deliberately does NOT share, so a client that tells a
+/// revision from a version by its form can.
+///
+/// `RevisionId` is a bare `String` in the model with no length or pattern to satisfy
+/// (`smithy_query(query="shape", shape="CreateWorkflowResponse")`), so the form comes
+/// from the recorded answer rather than from a constraint.
+///
+/// Derived from the workflow's identity and the version it belongs to, so it changes
+/// whenever the version does — which is what makes it usable "for optimistic concurrency
+/// control in update operations" — and two reads of one version report the same revision.
+/// The 16 bytes handed over are the leading bytes of that derivation; the textual form is
+/// `service_common`'s, the tree's one rendering of a UUID, so the group boundaries and the
+/// version and variant bits are not spelled out again here.
 pub fn mint_revision_id(workflow_arn: &str, version: &str) -> String {
-    digest(&["workflow-revision", workflow_arn, version])
-        .chars()
-        .take(32)
-        .collect()
+    ::service_common::uuid_from_random_bytes(digest_bytes(&[
+        "workflow-revision",
+        workflow_arn,
+        version,
+    ]))
+}
+
+/// The leading 16 bytes of the SHA-256 digest over `fields`, each field length-delimited
+/// exactly as [`digest`] delimits them, so the two derivations agree on what a field is.
+///
+/// What it is for: an identifier whose FORM is a UUID is rendered from bytes rather than
+/// from hex text ([`mint_revision_id`]).
+fn digest_bytes(fields: &[&str]) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    for field in fields {
+        hasher.update(field.len().to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    let digested = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    // `copy_from_slice` over two spans of the same length: SHA-256 is 32 bytes, so the
+    // leading 16 are always there.
+    bytes.copy_from_slice(&digested[..16]);
+    bytes
 }
 
 /// Mint a `RunId` matching the modelled `^[a-zA-Z0-9]+[a-zA-Z0-9\.\-_]*$`.

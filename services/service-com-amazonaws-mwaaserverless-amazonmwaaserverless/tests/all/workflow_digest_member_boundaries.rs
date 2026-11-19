@@ -32,12 +32,15 @@ use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
     DigestFields, WorkflowConfigurationView,
 };
 
-use crate::workflow_lifecycle::{role_arn, Harness};
+use crate::workflow_lifecycle::{
+    assert_service_default, role_arn, Harness, SERVICE_DEFAULTED_MEMBERS,
+};
 
 /// The members `GetWorkflow` reports back of what a create supplied, from
 /// `smithy_query(query="operation", operation="CreateWorkflow,GetWorkflow")`. After a
 /// refused second create, every one of them must still read back as the FIRST request
-/// supplied it.
+/// supplied it — and the two the service defaults itself
+/// ([`SERVICE_DEFAULTED_MEMBERS`]) as the value it applied for that first request.
 const READABLE_MEMBERS: &[&str] = &[
     "Description",
     "DefinitionS3Location",
@@ -259,6 +262,12 @@ async fn a_reused_client_token_conflicts_when_the_request_moves_a_value_to_anoth
         for member in READABLE_MEMBERS {
             let supplied = &first[*member];
             if supplied.is_null() {
+                if SERVICE_DEFAULTED_MEMBERS.contains(member) {
+                    // The service applies its own value for these two, so what the
+                    // workflow carries is that value rather than nothing.
+                    assert_service_default(case, member, &arn, &fetched);
+                    continue;
+                }
                 assert!(
                     fetched[*member].is_null(),
                     "case {case:?}: the stored create supplied no {member}, so the workflow \
@@ -324,6 +333,10 @@ async fn a_reused_client_token_conflicts_when_the_request_moves_a_value_to_anoth
         for member in READABLE_MEMBERS {
             let supplied = &second[*member];
             if supplied.is_null() {
+                if SERVICE_DEFAULTED_MEMBERS.contains(member) {
+                    assert_service_default(case, member, &other_arn, &other);
+                    continue;
+                }
                 assert!(
                     other[*member].is_null(),
                     "case {case:?}: the second create supplied no {member}, so its workflow \

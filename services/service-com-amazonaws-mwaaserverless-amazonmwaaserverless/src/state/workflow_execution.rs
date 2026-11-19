@@ -65,8 +65,9 @@ pub struct PlannedTask {
     pub task_instance_id: String,
     /// `TaskId`: the task in the workflow definition this instance executes.
     pub task_id: String,
-    /// `OperatorName`: the operator the definition declared for the task, when it
-    /// declared one this service can REPORT (see `reportable_operator_name`).
+    /// `OperatorName`: the operator the definition declared for the task, by the NAME that
+    /// declaration names it with (see [`reported_operator_name`]), when it declared one
+    /// this service can report.
     pub operator_name: Option<String>,
     /// How many dependency levels deep this task sits: 0 for a task that waits for
     /// nothing, and otherwise one past the deepest task it waits for. Tasks at one level
@@ -224,8 +225,8 @@ fn plan_tasks(declared: &[TaskDeclaration]) -> Result<Vec<PlannedTask>, String> 
             task_id: (*task_id).to_string(),
             operator_name: task
                 .operator_name
-                .clone()
-                .filter(|name| reportable_operator_name(name)),
+                .as_deref()
+                .and_then(reported_operator_name),
             level: level.unwrap_or_default(),
         })
         .collect())
@@ -240,6 +241,49 @@ fn plan_tasks(declared: &[TaskDeclaration]) -> Result<Vec<PlannedTask>, String> 
 /// this module's.
 fn reportable_task_id(task_id: &str) -> bool {
     super::validate_members(&[(&M_TASK_INSTANCE_ID, ConstrainedValue::Text(task_id))]).is_empty()
+}
+
+/// The `OperatorName` a task instance reports for the operator its definition declared,
+/// and `None` for a declaration this service cannot report at all.
+///
+/// `OperatorName` is "The name of the Apache Airflow operator used for this task
+/// instance" (`smithy_query(query="shape",
+/// shape="GetTaskInstanceResponse,TaskInstanceSummary")`), and an Apache Airflow DAG names
+/// an operator either by that NAME alone (`BashOperator`) or by the fully qualified Python
+/// import path of the class that implements it
+/// (`airflow.providers.standard.operators.bash.BashOperator`). The name is the class at the
+/// end of such a path, so a declaration written as one is reported by its last segment
+/// ([`operator_class_name`]) and a declaration that is not an import path is reported as it
+/// stands.
+fn reported_operator_name(declared: &str) -> Option<String> {
+    let name = operator_class_name(declared);
+    reportable_operator_name(name).then(|| name.to_string())
+}
+
+/// The class name at the end of `declared` when `declared` is a dotted Python import path
+/// — more than one segment, every one of them a Python identifier — and the whole of
+/// `declared` otherwise.
+///
+/// The identifier check is what keeps a declared name that merely CARRIES a dot (one
+/// written with punctuation or spaces, which the modelled `GenericString` admits) reported
+/// whole: only a path whose every segment could be a Python module or class name names a
+/// class at its end.
+fn operator_class_name(declared: &str) -> &str {
+    let segments: Vec<&str> = declared.split('.').collect();
+    if segments.len() > 1 && segments.iter().all(|segment| is_python_identifier(segment)) {
+        return segments.last().copied().unwrap_or(declared);
+    }
+    declared
+}
+
+/// Whether `text` could be one segment of a Python import path: a non-empty name of ASCII
+/// letters, digits and underscores that does not start with a digit.
+fn is_python_identifier(text: &str) -> bool {
+    let mut characters = text.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|rest| rest.is_ascii_alphanumeric() || rest == '_')
 }
 
 /// Whether a declared operator name is one this service can REPORT:

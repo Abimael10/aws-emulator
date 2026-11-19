@@ -13,7 +13,9 @@
 //! started by a caller. `TriggerMode` is a free string the model documents no value for
 //! (`GenericString`, length 1..255), so it is carried and reported but decides no
 //! trigger: the same definition behaves the same way under every mode, and no mode makes
-//! a workflow without declared schedule information fire.
+//! a workflow without declared schedule information fire. A create that supplies none is
+//! reported with the mode the SERVICE derives from that same declaration, which is the
+//! other half of the one rule and still decides nothing.
 //!
 //! The table spans what the rule generalises over: WHERE the schedule is declared (the
 //! document root, the `dag` mapping, below the DAG level, nowhere), HOW it is spelled (a
@@ -35,6 +37,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
     Workflow, RUN_TYPE_ON_DEMAND, RUN_TYPE_SCHEDULED, SCHEDULED_RUN_EVERY,
+    TRIGGER_MODE_MANUAL_ONLY, TRIGGER_MODE_SCHEDULED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -192,10 +195,20 @@ async fn the_definition_s_declared_schedule_decides_the_trigger_whatever_the_tri
                 row.cron,
                 fetched["ScheduleConfiguration"]
             );
+            // The mode a caller supplied is carried and reported unchanged; a create that
+            // supplied none reports the mode the service DERIVED from the schedule the
+            // snapshotted definition declares.
+            let expected_mode = mode.map(str::to_string).unwrap_or_else(|| {
+                if row.cron.is_some() {
+                    TRIGGER_MODE_SCHEDULED.to_string()
+                } else {
+                    TRIGGER_MODE_MANUAL_ONLY.to_string()
+                }
+            });
             assert_eq!(
                 fetched["TriggerMode"].as_str(),
-                *mode,
-                "case {case:?}: the trigger mode is carried and reported unchanged, got {:?}",
+                Some(expected_mode.as_str()),
+                "case {case:?}: expected the trigger mode {expected_mode:?}, got {:?}",
                 fetched["TriggerMode"]
             );
 

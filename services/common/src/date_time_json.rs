@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How a `restJson1` service carries a TIMESTAMP whose model declares the `date-time`
-//! form, for every service of that class — so two of them cannot answer one instant
-//! differently.
+//! How a JSON service carries a TIMESTAMP whose model declares the `date-time` form, for
+//! every service of that class — so two of them cannot answer one instant differently.
 //!
 //! # The rule
 //!
 //! A timestamp member whose model declares `@timestampFormat("date-time")` is read from,
 //! and written to, the JSON wire as an RFC 3339 / ISO 8601 date-time STRING
-//! (`"2024-01-01T00:00:00Z"`), never as the epoch-seconds NUMBER the `restJson1` protocol
-//! defaults to. Every generated SDK deserializes such a member with a date-time parser, so
-//! a bare number is a value no client of the modelled API can read.
+//! (`"2024-01-01T00:00:00Z"`), never as the epoch-seconds NUMBER the `restJson1` and
+//! `awsJson` protocols default to. Every generated SDK deserializes such a member with a
+//! date-time parser, so a bare number is a value no client of the modelled API can read.
 //!
 //! # Why a service needs this
 //!
@@ -30,7 +29,8 @@
 //! # Where a service takes it
 //!
 //! At `Service::override_protocol`, which hands back a borrow, so the service holds one
-//! [`DateTimeRestJson`] in a field and builds it in its constructor:
+//! [`DateTimeRestJson`] (or, for a model whose protocol is `awsJson1_0`,
+//! [`DateTimeAwsJson`]) in a field and builds it in its constructor:
 //!
 //! ```ignore
 //! fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
@@ -70,7 +70,9 @@ use aws_smithy_runtime_api::http::{Request, Response};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeDeserializer, ShapeSerializer};
 use aws_smithy_schema::traits::TimestampFormat;
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
+use aws_smithy_schema_server::json::JsonCodec;
 use aws_smithy_schema_server::protocol::{ProtocolError, ServerProtocol};
+use aws_smithy_schema_server::rpc::HttpRpcServerProtocol;
 use aws_smithy_schema_server::RestJsonServerProtocol;
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::{BigDecimal, BigInteger, Blob, DateTime, Document};
@@ -439,6 +441,102 @@ impl ServerProtocol for DateTimeRestJson {
         // Wrapped for the same reason the success body is: the seam is uniform, so a
         // timestamp member an error shape carries cannot silently go out in the protocol's
         // default form. The wrapper is a no-op for a shape that holds no timestamp.
+        self.inner
+            .serialize_error(&DateTimes(error), error_schema, error_code, http_status)
+    }
+
+    fn serialize_event_stream_message(
+        &self,
+        event_type: &str,
+        is_exception: bool,
+        event: &dyn SerializableStruct,
+        event_schema: &Schema,
+    ) -> Result<Self::Response, ProtocolError> {
+        self.inner.serialize_event_stream_message(
+            event_type,
+            is_exception,
+            &DateTimes(event),
+            event_schema,
+        )
+    }
+}
+
+/// The `awsJson1_0` codec with every timestamp in the `date-time` form the model declares:
+/// the model's own protocol in every other respect — the same correction
+/// [`DateTimeRestJson`] applies, over the RPC protocol instead of the REST one.
+///
+/// The wrappers above are the protocol's, not the codec's: both protocols drive the same
+/// JSON codec, which resolves a timestamp's wire form from the member schema alone, so one
+/// pair of wrappers serves both and neither can drift from the other.
+#[derive(Debug)]
+pub struct DateTimeAwsJson {
+    inner: HttpRpcServerProtocol<JsonCodec>,
+}
+
+impl DateTimeAwsJson {
+    /// Build the protocol once, at service construction: `Service::override_protocol` hands
+    /// back a borrow of it and must never build one per request.
+    ///
+    /// The inner protocol is the framework's own `awsJson1_0`
+    /// ([`aws_smithy_schema_server::AwsJson10`]), so the protocol id, the routing key (the
+    /// `X-Amz-Target` suffix), the media type and the error envelope are the model's.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: ::aws_smithy_schema_server::AwsJson10(),
+        }
+    }
+}
+
+impl Default for DateTimeAwsJson {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServerProtocol for DateTimeAwsJson {
+    type Request = Request;
+    type Response = Response;
+
+    fn protocol_id(&self) -> &ShapeId {
+        self.inner.protocol_id()
+    }
+
+    fn routing_key<'a>(&self, request: &'a Self::Request) -> Result<&'a str, ProtocolError> {
+        self.inner.routing_key(request)
+    }
+
+    fn deserialize_input<'a>(
+        &self,
+        request: &'a Self::Request,
+        input_schema: &Schema,
+    ) -> Result<Box<dyn ShapeDeserializer + 'a>, ProtocolError> {
+        let inner = self.inner.deserialize_input(request, input_schema)?;
+        Ok(Box::new(DateTimeReader(inner)))
+    }
+
+    fn serialize_output(
+        &self,
+        output: &dyn SerializableStruct,
+        output_schema: &Schema,
+        operation_name: &str,
+        success_status: u16,
+    ) -> Result<Self::Response, ProtocolError> {
+        self.inner.serialize_output(
+            &DateTimes(output),
+            output_schema,
+            operation_name,
+            success_status,
+        )
+    }
+
+    fn serialize_error(
+        &self,
+        error: &dyn SerializableStruct,
+        error_schema: &Schema,
+        error_code: &str,
+        http_status: u16,
+    ) -> Result<Self::Response, ProtocolError> {
         self.inner
             .serialize_error(&DateTimes(error), error_schema, error_code, http_status)
     }

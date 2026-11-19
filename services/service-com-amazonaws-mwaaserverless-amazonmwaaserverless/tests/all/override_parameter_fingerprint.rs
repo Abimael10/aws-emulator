@@ -237,11 +237,12 @@ async fn an_identical_retry_replays_whatever_the_override_parameters_hold() {
             row.case
         );
         let reported = &read["OverrideParameters"];
+        let expected = crate::workflow_lifecycle::expected_run_parameters(&arn, &row.parameters);
         assert_eq!(
-            reported, &row.parameters,
-            "case {:?}: expected the run to report the parameters it was started with ({:?}), \
-             got {reported:?}",
-            row.case, row.parameters
+            reported, &expected,
+            "case {:?}: expected the run to report the parameters it was started with, over \
+             the entry the service injects ({expected:?}), got {reported:?}",
+            row.case
         );
 
         // The SAME token with parameters that differ somewhere: the modelled conflict,

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-    RUN_ADMITTED_AFTER, RUN_DEQUEUED_AFTER, TASK_LEVEL_RUNS_FOR, WORKFLOW_DELETED_AFTER,
+    RUN_TERMINAL_STATUSES, WORKFLOW_DELETED_AFTER,
 };
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::{
     ComAmazonawsMwaaserverlessAmazonmwaaserverlessState, EmulatedService,
@@ -190,6 +190,149 @@ fn is_workflow_version(version: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() && b.is_ascii_alphabetic() || b.is_ascii_digit())
 }
 
+/// The instant a reported timestamp member names, as fractional epoch seconds, and `None`
+/// for a member that is not a date-time string at all.
+///
+/// Every timestamp of this service targets `TimestampValue`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape", shape="TimestampValue")`),
+/// so on the wire it is an ISO 8601 / RFC 3339 STRING — parsed here with the framework's
+/// own reader for that format, which is what a generated SDK client parses it with.
+///
+/// `pub(crate)` so every suite that compares two reported instants reads them the same
+/// way rather than writing a second parser.
+pub(crate) fn reported_instant(value: &serde_json::Value) -> Option<f64> {
+    let text = value.as_str()?;
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+        .map(|instant| instant.as_secs_f64())
+}
+
+/// Whether a reported member is a timestamp in the modelled date-time wire form.
+pub(crate) fn is_date_time(value: &serde_json::Value) -> bool {
+    reported_instant(value).is_some()
+}
+
+/// The configuration members the SERVICE itself defaults when a create or an update
+/// supplies none, so a reader reports the value in force rather than nothing: the
+/// CloudWatch Logs group this service names for the workflow, and the trigger mode its
+/// active version's snapshotted definition decides.
+///
+/// `pub(crate)` beside [`assert_service_default`] so every suite that reads a
+/// configuration back states the same two exceptions to "a member the request left out
+/// reads back absent".
+pub(crate) const SERVICE_DEFAULTED_MEMBERS: &[&str] = &["LoggingConfiguration", "TriggerMode"];
+
+/// Assert that `fetched` — one `GetWorkflow` answer — reports the value THIS SERVICE
+/// applies for `member`, which the request that wrote the version supplied no value for.
+///
+/// Both defaults are derived, never written out here: the log group from the workflow's
+/// own id ([`service_log_group_name`]) and the trigger mode from whether the version's
+/// definition declares a schedule, which is the same answer's own
+/// `ScheduleConfiguration`.
+pub(crate) fn assert_service_default(
+    case: &str,
+    member: &str,
+    workflow_arn: &str,
+    fetched: &serde_json::Value,
+) {
+    use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
+        service_log_group_name, TRIGGER_MODE_MANUAL_ONLY, TRIGGER_MODE_SCHEDULED,
+    };
+
+    let expected = match member {
+        "LoggingConfiguration" => {
+            serde_json::json!({"LogGroupName": service_log_group_name(workflow_arn)})
+        }
+        "TriggerMode" => {
+            let scheduled = !fetched["ScheduleConfiguration"].is_null();
+            serde_json::Value::String(
+                if scheduled {
+                    TRIGGER_MODE_SCHEDULED
+                } else {
+                    TRIGGER_MODE_MANUAL_ONLY
+                }
+                .to_string(),
+            )
+        }
+        other => panic!("case {case:?}: {other} is not a member this service defaults"),
+    };
+    assert_eq!(
+        fetched[member], expected,
+        "case {case:?}: the request supplied no {member}, so the service's own default \
+         must be reported, got {:?}",
+        fetched[member]
+    );
+}
+
+/// How long one poll of a run waits before asking again, and how many times. The budget is
+/// deliberately generous: it bounds a condition that has to HOLD — the run reporting a
+/// status it never leaves — and not how fast the host runs, and the loop returns as soon as
+/// that status is reported.
+const RUN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const RUN_POLLS: usize = 1_200;
+
+/// Poll `GetWorkflowRun` until the run reports a status it never leaves
+/// ([`RUN_TERMINAL_STATUSES`]), and answer that whole answer.
+///
+/// `pub(crate)` so a suite that has to let a run finish waits for the run rather than for a
+/// span of the clock.
+pub(crate) async fn settled_run(
+    harness: &Harness,
+    arn: &str,
+    run_id: &str,
+) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..RUN_POLLS {
+        let (status, report) = harness
+            .call(
+                "GetWorkflowRun",
+                serde_json::json!({"WorkflowArn": arn, "RunId": run_id}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "expected GetWorkflowRun to succeed, got {status} {report:?}"
+        );
+        let state = report["RunDetail"]["RunState"].as_str().unwrap_or_default();
+        if RUN_TERMINAL_STATUSES.contains(&state) {
+            return report;
+        }
+        last = report;
+        tokio::time::sleep(RUN_POLL_INTERVAL).await;
+    }
+    panic!("the run {run_id:?} never settled; last answer {last:?}")
+}
+
+/// The `OverrideParameters` a run of `workflow_arn` must report when its start supplied
+/// `supplied`: the entry the service injects to name the run's workflow, with the
+/// caller's own parameters merged over it.
+///
+/// `pub(crate)` so every suite that reads a run's parameter set states the rule the same
+/// way, and so the injected key and value are named once — out of the service's own
+/// constant and the workflow's own id, never written out by hand.
+pub(crate) fn expected_run_parameters(
+    workflow_arn: &str,
+    supplied: &serde_json::Value,
+) -> serde_json::Value {
+    let mut expected = serde_json::Map::new();
+    expected.insert(
+        service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::RUN_WORKFLOW_ID_PARAMETER
+            .to_string(),
+        serde_json::Value::String(
+            service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::workflow_resource_id(
+                workflow_arn,
+            )
+            .to_string(),
+        ),
+    );
+    if let Some(parameters) = supplied.as_object() {
+        for (key, value) in parameters {
+            expected.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::Value::Object(expected)
+}
+
 /// The modelled `IdString` a `RunId` uses: `^[a-zA-Z0-9]+[a-zA-Z0-9\.\-_]*$`, length 1..255.
 fn is_run_id(run_id: &str) -> bool {
     (1..=255).contains(&run_id.len())
@@ -317,8 +460,8 @@ async fn create_mints_a_modelled_workflow_and_get_reads_every_member_back() {
             created["IsLatestVersion"]
         );
         assert!(
-            created["CreatedAt"].is_number(),
-            "case {case:?}: expected a CreatedAt timestamp, got {:?}",
+            is_date_time(&created["CreatedAt"]),
+            "case {case:?}: expected a CreatedAt date-time string, got {:?}",
             created["CreatedAt"]
         );
         assert!(
@@ -368,8 +511,8 @@ async fn create_mints_a_modelled_workflow_and_get_reads_every_member_back() {
             );
         }
         assert!(
-            fetched["ModifiedAt"].is_number(),
-            "case {case:?}: expected a ModifiedAt timestamp, got {:?}",
+            is_date_time(&fetched["ModifiedAt"]),
+            "case {case:?}: expected a ModifiedAt date-time string, got {:?}",
             fetched["ModifiedAt"]
         );
         // The code artifacts are copied at the time of the request that supplies their
@@ -730,8 +873,8 @@ async fn a_started_run_is_persisted_and_read_back_with_its_override_parameters()
             started["Status"]
         );
         assert!(
-            started["StartedAt"].is_number(),
-            "case {case:?}: expected a StartedAt timestamp, got {:?}",
+            is_date_time(&started["StartedAt"]),
+            "case {case:?}: expected a StartedAt date-time string, got {:?}",
             started["StartedAt"]
         );
 
@@ -768,24 +911,17 @@ async fn a_started_run_is_persisted_and_read_back_with_its_override_parameters()
             "case {case:?}: a run started through StartWorkflowRun is ON_DEMAND, got {:?}",
             run["RunType"]
         );
-        // An optional member the run holds no value for is OMITTED, not reported as
-        // an empty collection: a run started with no overrides (and one started with
-        // an empty map, which is the same absence of overrides) carries none.
-        if parameters.as_object().is_none_or(serde_json::Map::is_empty) {
-            assert!(
-                run["OverrideParameters"].is_null(),
-                "case {case:?}: expected OverrideParameters absent for a run that holds \
-                 none, got {:?}",
-                run["OverrideParameters"]
-            );
-        } else {
-            assert_eq!(
-                run["OverrideParameters"], parameters,
-                "case {case:?}: OverrideParameters must come back exactly as supplied, \
-                 got {:?}",
-                run["OverrideParameters"]
-            );
-        }
+        // The parameter set a run reports is the one it EXECUTES with: the entry the
+        // service injects to name the run's workflow, with whatever the start supplied
+        // merged over it. A start that supplied none, and one that supplied an empty map,
+        // are the same absence and report just the injected entry.
+        assert_eq!(
+            run["OverrideParameters"],
+            expected_run_parameters(&arn, &parameters),
+            "case {case:?}: expected the injected workflow-id parameter with the supplied \
+             overrides over it, got {:?}",
+            run["OverrideParameters"]
+        );
         let detail = &run["RunDetail"];
         assert_eq!(
             detail["RunId"], started["RunId"],
@@ -803,8 +939,9 @@ async fn a_started_run_is_persisted_and_read_back_with_its_override_parameters()
             detail["RunState"]
         );
         assert!(
-            detail["CreatedAt"].is_number() && detail["StartedOn"].is_number(),
-            "case {case:?}: RunDetail must carry CreatedAt and StartedOn, got {detail:?}"
+            is_date_time(&detail["CreatedAt"]) && is_date_time(&detail["StartedOn"]),
+            "case {case:?}: RunDetail must carry CreatedAt and StartedOn as date-time \
+             strings, got {detail:?}"
         );
         for member in ["CompletedOn", "Duration", "ErrorMessage", "TaskInstances"] {
             assert!(
@@ -871,19 +1008,10 @@ async fn a_run_leaves_its_non_terminal_status_when_the_clock_makes_the_change_du
     );
 
     // Each transition is owed by the clock, so it lands without anybody polling for
-    // it. The whole schedule is covered row by row in `run_lifecycle_progression`.
-    tokio::time::sleep(
-        RUN_ADMITTED_AFTER + RUN_DEQUEUED_AFTER + TASK_LEVEL_RUNS_FOR + Duration::from_millis(300),
-    )
-    .await;
-
-    let (status, settled) = harness
-        .call(
-            "GetWorkflowRun",
-            serde_json::json!({"WorkflowArn": arn, "RunId": run_id}),
-        )
-        .await;
-    assert_eq!(status, 200, "expected GetWorkflowRun to succeed, got {settled:?}");
+    // it. The whole schedule is covered row by row in `run_lifecycle_progression`; what
+    // this test waits for is the CONDITION at the end of it — the run reporting a status
+    // it never leaves.
+    let settled = settled_run(&harness, &arn, &run_id).await;
     let detail = &settled["RunDetail"];
     assert_eq!(
         detail["RunState"], "SUCCESS",
@@ -897,8 +1025,8 @@ async fn a_run_leaves_its_non_terminal_status_when_the_clock_makes_the_change_du
         detail["ErrorMessage"]
     );
     assert!(
-        detail["CompletedOn"].is_number(),
-        "a complete run carries CompletedOn, got {:?}",
+        is_date_time(&detail["CompletedOn"]),
+        "a complete run carries CompletedOn as a date-time string, got {:?}",
         detail["CompletedOn"]
     );
     assert!(

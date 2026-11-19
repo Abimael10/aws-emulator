@@ -20,10 +20,11 @@
 //!    graph of the definition it runs, which `run_execution_outcome.rs` covers.
 //!
 //! 2. An optional member is reported only when the stored run HOLDS a value for it: a run
-//!    started with no (or an empty) `OverrideParameters` map, and a run of a version whose
-//!    definition declares no task, omit those members rather than answering an empty map or
-//!    an empty list — the same rule `GetTaskInstance` applies to the `Xcom` of an instance
-//!    that exchanged no cross-task data.
+//!    of a version whose definition declares no task omits `TaskInstances` rather than
+//!    answering an empty list — the same rule `GetTaskInstance` applies to the `Xcom` of an
+//!    instance that exchanged no cross-task data. The parameter set a run reports is the
+//!    one it EXECUTES with: the entry the service injects to name the run's workflow, with
+//!    whatever the start supplied merged over it.
 //!
 //! The first suite drives the schedule from SEEDED clock fields, so every state of the
 //! lifecycle (including the intermediate `QUEUED`) is asserted deterministically rather
@@ -577,25 +578,16 @@ async fn an_optional_run_member_is_reported_only_when_the_run_holds_it() {
                 "case {case:?}: expected GetWorkflowRun to succeed, got {status} {answered:?}"
             );
 
-            let supplied = parameters
-                .as_object()
-                .filter(|entries| !entries.is_empty())
-                .cloned();
-            match supplied {
-                None => assert!(
-                    answered["OverrideParameters"].is_null(),
-                    "case {case:?}: a run that holds no override parameters omits the \
-                     member rather than answering an empty map, got {:?}",
-                    answered["OverrideParameters"]
-                ),
-                Some(entries) => assert_eq!(
-                    answered["OverrideParameters"],
-                    serde_json::Value::Object(entries),
-                    "case {case:?}: the stored overrides must come back exactly as \
-                     supplied, got {:?}",
-                    answered["OverrideParameters"]
-                ),
-            }
+            // The parameter set a run reports is the one it executes with: the entry the
+            // service injects to name the run's workflow, with whatever the start
+            // supplied merged over it.
+            assert_eq!(
+                answered["OverrideParameters"],
+                crate::workflow_lifecycle::expected_run_parameters(&arn, &parameters),
+                "case {case:?}: expected the injected workflow-id parameter with the \
+                 supplied overrides over it, got {:?}",
+                answered["OverrideParameters"]
+            );
 
             let listed = &answered["RunDetail"]["TaskInstances"];
             if ids.is_empty() {

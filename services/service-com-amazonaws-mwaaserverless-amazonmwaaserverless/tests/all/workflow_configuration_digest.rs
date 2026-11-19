@@ -21,13 +21,16 @@
 //! supplies, the form and length of their values, list sizes, list order, and the split
 //! between two adjacent values.
 
-use crate::workflow_lifecycle::{role_arn, Harness};
+use crate::workflow_lifecycle::{
+    assert_service_default, role_arn, Harness, SERVICE_DEFAULTED_MEMBERS,
+};
 
 /// The configuration members `CreateWorkflowRequest` and `UpdateWorkflowRequest` both
 /// carry, from
 /// `smithy_query(query="operation", operation="CreateWorkflow,UpdateWorkflow")`. Each
 /// one must read back through `GetWorkflow` exactly as the request supplied it, and read
-/// back ABSENT when the request supplied none.
+/// back ABSENT when the request supplied none — except for the two the service defaults
+/// itself ([`SERVICE_DEFAULTED_MEMBERS`]), which read back as the value it applied.
 const SHARED_CONFIGURATION_MEMBERS: &[&str] = &[
     "DefinitionS3Location",
     "Code",
@@ -390,6 +393,12 @@ async fn one_configuration_digest_serves_both_the_create_token_ledger_and_the_up
         for member in SHARED_CONFIGURATION_MEMBERS {
             let supplied = &body[*member];
             if supplied.is_null() {
+                if SERVICE_DEFAULTED_MEMBERS.contains(member) {
+                    // The service applies its own value for these two, so the appended
+                    // version carries that rather than nothing.
+                    assert_service_default(case, member, &arn, &fetched);
+                    continue;
+                }
                 assert!(
                     fetched[*member].is_null(),
                     "case {case:?}: the update supplied no {member}, so the appended version \

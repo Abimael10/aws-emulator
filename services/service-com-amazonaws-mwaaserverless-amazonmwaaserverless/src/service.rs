@@ -35,6 +35,11 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! A sixth seam, `override_protocol`, is the one this service DOES take: it serves the
+//! model's `awsJson1_0` codec with every timestamp in the ISO 8601 `date-time` form this
+//! model's only timestamp shape declares — the tree's one reading of that rule,
+//! `service_common::date_time_json` (see [`date_time_wire`]).
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
@@ -45,6 +50,10 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Why a timestamp of this service is written to the JSON wire in the `date-time` form,
+/// and where that correction lives.
+pub mod date_time_wire;
+
 /// The `com-amazonaws-mwaaserverless-amazonmwaaserverless` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -52,6 +61,9 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol, built ONCE here because
+    /// [`Service::override_protocol`] hands back a borrow of it.
+    protocol: date_time_wire::DateTimeAwsJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +73,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: date_time_wire::DateTimeAwsJson::new(),
         }
     }
 }
@@ -135,5 +148,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own `awsJson1_0`, with the one correction the generated member
+        // schemas cannot carry: a `@timestampFormat("date-time")` member goes onto the
+        // wire as the date-time STRING the model declares rather than as the protocol's
+        // default epoch number. Every timestamp member of this model targets the one
+        // `TimestampValue` shape, which declares that format
+        // (`smithy_query(query="shape", shape="TimestampValue")`), so the correction is
+        // the whole service's; it lives in `service_common::date_time_json`, which is the
+        // tree's one reading of it.
+        Some(&self.protocol)
     }
 }

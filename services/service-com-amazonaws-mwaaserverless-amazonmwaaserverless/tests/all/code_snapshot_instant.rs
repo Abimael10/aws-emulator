@@ -19,7 +19,7 @@
 //! read back by name as well as through the default read, so an immutable version keeps
 //! answering for its own artifacts.
 
-use crate::workflow_lifecycle::{role_arn, Harness};
+use crate::workflow_lifecycle::{is_date_time, role_arn, Harness};
 
 /// The `Code` forms a request can supply, from
 /// `smithy_query(query="shape", shape="Code,S3Location")`: the union's single
@@ -107,8 +107,8 @@ fn assert_members_agree(case: &str, what: &str, response: &serde_json::Value) {
     );
     if !response["CodeSnapshottedAt"].is_null() {
         assert!(
-            response["CodeSnapshottedAt"].is_number(),
-            "case {case:?}, {what}: expected a timestamp on the wire, got {:?}",
+            is_date_time(&response["CodeSnapshottedAt"]),
+            "case {case:?}, {what}: expected a date-time timestamp on the wire, got {:?}",
             response["CodeSnapshottedAt"]
         );
     }

@@ -423,7 +423,8 @@ async fn a_run_executes_the_tasks_its_definition_declares_and_reports_their_outc
             }
         }
         assert!(
-            detail["CompletedOn"].is_number() && detail["Duration"].as_i64().is_some(),
+            crate::workflow_lifecycle::is_date_time(&detail["CompletedOn"])
+                && detail["Duration"].as_i64().is_some(),
             "case {case:?}: a finished run carries CompletedOn and Duration, got {:?} and {:?}",
             detail["CompletedOn"],
             detail["Duration"]

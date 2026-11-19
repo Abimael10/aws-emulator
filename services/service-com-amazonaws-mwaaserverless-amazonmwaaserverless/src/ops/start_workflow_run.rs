@@ -385,12 +385,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A run this operation starts is the caller's own, not the schedule's.
             run_type: crate::state::RUN_TYPE_ON_DEMAND.to_string(),
             status: crate::state::RUN_STATUS_STARTING.to_string(),
-            override_parameters: input
-                .override_parameters
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<BTreeMap<String, ::aws_smithy_types::Document>>(),
+            override_parameters: crate::state::run_parameters(
+                &input.workflow_arn,
+                input.override_parameters.clone().unwrap_or_default(),
+            ),
             created_at: now,
             started_on: now,
             completed_on: None,
