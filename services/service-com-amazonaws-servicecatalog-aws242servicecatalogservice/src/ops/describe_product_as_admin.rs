@@ -230,10 +230,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // read back from the same set a portfolio's are: one resource's
             // associations, rendered one way.
             tag_options: Some(state.resource_tag_option_details(&product.id)),
-            // Nothing can associate a budget with a product yet
-            // (`AssociateBudgetWithResource` is still scaffolded), so that set is empty
-            // rather than absent.
-            budgets: Some(Vec::new()),
+            // The budgets `AssociateBudgetWithResource` stored on this product, read
+            // back from the same set the end-user view and
+            // `ListBudgetsForResource` report.
+            budgets: Some(state.resource_budget_details(&product.id)),
         })
     }
 }

@@ -171,7 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 AssociateTagOptionWithResourceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("Resource not found: {}", input.resource_id)),
+                        message: Some(crate::state::not_found_message(
+                            crate::state::KIND_RESOURCE,
+                            &input.resource_id,
+                        )),
                     },
                 )
                 .into(),

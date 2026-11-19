@@ -215,10 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(crate::state::ProvisioningArtifact::listed)
                     .collect(),
             ),
-            // No budget can be associated with a product yet
-            // (`AssociateBudgetWithResource` is still scaffolded), so that set is
-            // empty rather than absent.
-            budgets: Some(Vec::new()),
+            // The budgets `AssociateBudgetWithResource` stored on this product, read
+            // back from the same set a portfolio's are: one resource's associations,
+            // rendered one way.
+            budgets: Some(state.resource_budget_details(&product.id)),
             // The launch paths this product was reached THROUGH: one per associated
             // portfolio, named by that portfolio, from the same stored set
             // `ProductViewSummary$HasDefaultPath` is derived from, so the two members of

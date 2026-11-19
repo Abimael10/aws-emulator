@@ -398,9 +398,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     source_connection: None,
                     provisioning_artifacts,
                     // A copied product lives in no portfolio and carries no TagOption
-                    // until something associates it with one.
+                    // and no budget until something associates it with one.
                     portfolio_ids: std::collections::BTreeSet::new(),
                     tag_option_ids: std::collections::BTreeSet::new(),
+                    budget_names: std::collections::BTreeSet::new(),
                 };
                 state.products.insert(id.clone(), product);
                 id

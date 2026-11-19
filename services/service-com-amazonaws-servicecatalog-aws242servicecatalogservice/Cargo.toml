@@ -41,6 +41,8 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so a new suite needs no declaration.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # The service that OWNS a CloudFormation template, and the object store a staged template

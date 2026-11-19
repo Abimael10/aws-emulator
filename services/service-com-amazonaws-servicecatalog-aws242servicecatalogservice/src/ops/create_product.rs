@@ -349,10 +349,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             provisioning_artifacts,
             // A new product lives in no portfolio until
-            // `AssociateProductWithPortfolio` puts it in one, and carries no TagOption
-            // until `AssociateTagOptionWithResource` associates one.
+            // `AssociateProductWithPortfolio` puts it in one, carries no TagOption
+            // until `AssociateTagOptionWithResource` associates one, and carries no
+            // budget until `AssociateBudgetWithResource` associates one.
             portfolio_ids: std::collections::BTreeSet::new(),
             tag_option_ids: std::collections::BTreeSet::new(),
+            budget_names: std::collections::BTreeSet::new(),
         };
 
         let product_view_detail = product.detail(created_time);

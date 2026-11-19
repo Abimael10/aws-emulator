@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateBudgetWithResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateBudgetWithResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateBudgetWithResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +133,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateBudgetWithResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateBudgetWithResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut state = state.lock();
+
+        // `ResourceId` is "the resource identifier. Either a portfolio-id or a
+        // product-id", so the stored resource under that id is what takes the
+        // association — either kind, through the one lookup both live behind. An id no
+        // portfolio and no product answers to names no resource that can carry a
+        // budget, and nothing is stored for it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateBudgetWithResource"))
+        // The BUDGET itself is named, not looked up: a budget lives in AWS Budgets,
+        // which this operation's model gives this service no read of, so the
+        // association records the name the request gave and every reader reports that
+        // name back.
+        let budget_name = input.budget_name;
+        let Some(associated) = state.resource_budget_names_mut(&input.resource_id) else {
+            return Err(
+                AssociateBudgetWithResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::not_found_message(
+                            crate::state::KIND_RESOURCE,
+                            &input.resource_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An association IS the (resource, budget) pair, so a pair already stored is
+        // what `DuplicateResourceException` ("The specified resource is a duplicate")
+        // refuses; the association already made stands unchanged.
+        if associated.contains(&budget_name) {
+            return Err(
+                AssociateBudgetWithResourceErrorModeled::DuplicateResourceException(
+                    DuplicateResourceException {
+                        message: Some(format!(
+                            "Budget {budget_name} is already associated with resource {}",
+                            input.resource_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The resource's quota, consulted for the pair that would grow the set and
+        // refused before it is stored, so a caller cannot grow one resource's
+        // associations without bound by repeating the call with fresh names.
+        if associated.len() >= crate::state::MAX_BUDGETS_PER_RESOURCE {
+            return Err(
+                AssociateBudgetWithResourceErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "A resource cannot hold more than {} associated budgets.",
+                            crate::state::MAX_BUDGETS_PER_RESOURCE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        associated.insert(budget_name);
+
+        Ok(AssociateBudgetWithResourceOutput {})
     }
 }

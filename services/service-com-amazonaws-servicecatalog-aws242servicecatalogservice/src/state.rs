@@ -31,12 +31,12 @@ mod service_principal_call;
 pub use service_principal_call::{ServicePrincipalCall, SERVICE_CATALOG_SERVICE_PRINCIPAL};
 
 use crate::ops::types::{
-    ConstraintDetail, ConstraintSummary, PortfolioDetail, ProductViewDetail, ProductViewSummary,
-    ProvisionedProductAttribute, ProvisionedProductDetail, ProvisionedProductPlanDetails,
-    ProvisioningArtifact as ModelledProvisioningArtifact, ProvisioningArtifactDetail,
-    ProvisioningArtifactSummary, RecordDetail, RecordTag, ResourceDetail, ServiceActionDetail,
-    ServiceActionSummary, SourceConnectionDetail, Tag, TagOptionDetail,
-    UpdateProvisioningParameter,
+    BudgetDetail, ConstraintDetail, ConstraintSummary, PortfolioDetail, ProductViewDetail,
+    ProductViewSummary, ProvisionedProductAttribute, ProvisionedProductDetail,
+    ProvisionedProductPlanDetails, ProvisioningArtifact as ModelledProvisioningArtifact,
+    ProvisioningArtifactDetail, ProvisioningArtifactSummary, RecordDetail, RecordTag,
+    ResourceDetail, ServiceActionDetail, ServiceActionSummary, SourceConnectionDetail, Tag,
+    TagOptionDetail, UpdateProvisioningParameter,
 };
 
 /// The `ResourceType` naming a portfolio, one of the two kinds a TagOption can be
@@ -82,6 +82,12 @@ pub struct Portfolio {
     /// `AssociateTagOptionWithResource` addresses an association by the (resource,
     /// TagOption) PAIR, so one resource holds each TagOption at most once.
     pub tag_option_ids: BTreeSet<String>,
+    /// The budgets associated with this portfolio, by budget NAME — the only member
+    /// the modelled `BudgetDetail` carries. A set because
+    /// `AssociateBudgetWithResource` addresses an association by the (resource,
+    /// budget) pair, so one resource holds each budget at most once, and a `BTreeSet`
+    /// so every report of them walks one stable order.
+    pub budget_names: BTreeSet<String>,
 }
 
 /// One portfolio-principal association: what was associated, and when in the
@@ -286,6 +292,12 @@ pub const KIND_CLOUDFORMATION_STACK: &str = "CloudFormation stack";
 /// The resource kind a product version is, as its not-found names it.
 pub const KIND_PROVISIONING_ARTIFACT: &str = "Provisioning artifact";
 
+/// The resource kind the operations that take "the resource identifier" of a portfolio
+/// OR a product report in their not-found: the request named neither kind, so the
+/// refusal names the generic resource it addressed rather than guessing which map the
+/// caller meant.
+pub const KIND_RESOURCE: &str = "Resource";
+
 /// The refusal for a request that names NEITHER `PathId` nor `PathName` for a product
 /// whose launch path cannot be inferred — "this value is optional if the product has a
 /// default path, and required if the product has more than one path", so a product that
@@ -438,6 +450,10 @@ pub struct Product {
     /// association [`Portfolio::tag_option_ids`] holds, because
     /// `AssociateTagOptionWithResource` takes either kind of resource.
     pub tag_option_ids: BTreeSet<String>,
+    /// The budgets associated with this product, by budget name — the same
+    /// association [`Portfolio::budget_names`] holds, because
+    /// `AssociateBudgetWithResource` takes either kind of resource.
+    pub budget_names: BTreeSet<String>,
 }
 
 /// The `Status` a product carries from the moment it is created.
@@ -1255,6 +1271,14 @@ pub const MAX_SERVICE_ACTIONS: usize = 500;
 /// here.
 pub const MAX_TAG_OPTIONS_PER_RESOURCE: usize = 25;
 
+/// The most budgets one resource — a portfolio or a product — can carry, bounding
+/// every resource record and answered with the `LimitExceededException` that
+/// `AssociateBudgetWithResource` models. The emulator's own bound, finite and small,
+/// checked before every association is stored; no AWS figure is quoted here. Without
+/// it a caller could grow one resource's record without bound by associating fresh
+/// budget names.
+pub const MAX_BUDGETS_PER_RESOURCE: usize = 25;
+
 /// The most TagOptions this account can hold, which also bounds this store.
 ///
 /// `CreateTagOption` models `LimitExceededException` for a create past the account's
@@ -1942,6 +1966,52 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
             .collect()
     }
 
+    /// The budgets associated with the resource `resource_id` names, or `None` when
+    /// this account holds no such resource.
+    ///
+    /// `AssociateBudgetWithResource` takes "the resource identifier. Either a
+    /// portfolio-id or a product-id", so both kinds resolve through this one lookup
+    /// and no handler has to know which map a resource lives in.
+    pub fn resource_budget_names(&self, resource_id: &str) -> Option<&BTreeSet<String>> {
+        self.portfolios
+            .get(resource_id)
+            .map(|portfolio| &portfolio.budget_names)
+            .or_else(|| {
+                self.products
+                    .get(resource_id)
+                    .map(|product| &product.budget_names)
+            })
+    }
+
+    /// The same set, for the handler that associates or disassociates a budget.
+    pub fn resource_budget_names_mut(
+        &mut self,
+        resource_id: &str,
+    ) -> Option<&mut BTreeSet<String>> {
+        if let Some(portfolio) = self.portfolios.get_mut(resource_id) {
+            return Some(&mut portfolio.budget_names);
+        }
+        self.products
+            .get_mut(resource_id)
+            .map(|product| &mut product.budget_names)
+    }
+
+    /// The stored budget associations of `resource_id` as the modelled
+    /// `BudgetDetail`s, in budget-name order — the one list every response that
+    /// reports a resource's `Budgets` carries, so a portfolio and a product report an
+    /// association the same way and `ListBudgetsForResource` pages over that same
+    /// order. Empty for a resource this account does not hold, which is a not-found
+    /// for the caller to answer.
+    pub fn resource_budget_details(&self, resource_id: &str) -> Vec<BudgetDetail> {
+        self.resource_budget_names(resource_id)
+            .into_iter()
+            .flatten()
+            .map(|name| BudgetDetail {
+                budget_name: Some(name.clone()),
+            })
+            .collect()
+    }
+
     /// The portfolios and products `tag_option_id` is associated with, portfolios
     /// first and each group in id order. A TagOption one of them still holds is in
     /// use, which is what `DeleteTagOption` refuses a delete for.
@@ -2172,6 +2242,15 @@ pub fn decode_page_cursor(token: &str) -> Option<String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
     well_formed.then_some(key)
+}
+
+/// The same inverse for a paged list whose cursor key is a modelled FREE-FORM string
+/// rather than an `Id` — a budget name, say, which the model constrains only by length —
+/// so the key cannot be held to the `Id` pattern. `None` for anything this service did
+/// not mint: not hex, not UTF-8, or empty.
+pub fn decode_text_page_cursor(token: &str) -> Option<String> {
+    let key = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    (!key.is_empty()).then_some(key)
 }
 
 /// The failure a handler answers when this service's state cannot be reached —

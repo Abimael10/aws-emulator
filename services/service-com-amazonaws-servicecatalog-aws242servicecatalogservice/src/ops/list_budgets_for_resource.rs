@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBudgetsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBudgetsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBudgetsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +139,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBudgetsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBudgetsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBudgetsForResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read: reporting the budgets a resource carries changes neither the
+        // resource nor its associations, page tokens included — a token is derived from
+        // the budget name the next page resumes at, so handing one back records
+        // nothing.
+        let state = state.lock();
+
+        // `ResourceId` is "the resource identifier" of the portfolio or product whose
+        // associations are reported, so the account has to hold such a resource before
+        // there is anything to report: an id neither kind answers to is the modelled
+        // not-found, not an empty page.
+        let Some(names) = state.resource_budget_names(&input.resource_id) else {
+            return Err(
+                ListBudgetsForResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::not_found_message(
+                            crate::state::KIND_RESOURCE,
+                            &input.resource_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A page token is this service's own opaque cursor — encoded and decoded by the
+        // crate-shared codec in `crate::state` — carrying the budget name the next page
+        // resumes AT. The key is a `BudgetName`, which the model constrains by length
+        // only, so it is read back through the codec's free-form form; anything that is
+        // not one of ours is a bad parameter.
+        let resume_at = match input.page_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => match crate::state::decode_text_page_cursor(token) {
+                Some(name) => Some(name),
+                None => {
+                    return Err(
+                        ListBudgetsForResourceErrorModeled::InvalidParametersException(
+                            InvalidParametersException {
+                                message: Some("PageToken is not a valid page token.".to_string()),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        // `PageSize` is modelled `0..20` with a default of 0, and 0 asks for no
+        // caller-imposed bound: the whole remaining set is returned, which the FINITE
+        // bound on how many budgets one resource can carry already caps.
+        let page_size = if input.page_size > 0 {
+            input.page_size as usize
+        } else {
+            crate::state::MAX_BUDGETS_PER_RESOURCE
+        };
+
+        // The reported set is the stored (resource, budget) pairs read from the
+        // resource side: exactly the budgets this resource's own readers report, in the
+        // one budget-name order the cursor below walks.
+        let mut budgets = Vec::new();
+        let mut next_page_token = None;
+        for name in names
+            .iter()
+            .filter(|name| resume_at.as_deref().is_none_or(|resume| name.as_str() >= resume))
+        {
+            if budgets.len() == page_size {
+                // More remain: hand back a cursor that resumes at this budget.
+                next_page_token = Some(crate::state::encode_page_cursor(name));
+                break;
+            }
+            budgets.push(BudgetDetail {
+                budget_name: Some(name.clone()),
+            });
+        }
+
+        Ok(ListBudgetsForResourceOutput {
+            budgets: Some(budgets),
+            next_page_token,
+        })
     }
 }
