@@ -24,7 +24,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_ssm_amazonssm::state::service_settings::{
     modifying_user, SettingDefinition, MAX_SERVICE_SETTINGS_TOTAL, PROVISIONING_USER, SETTINGS,
-    STATUS_CUSTOMIZED, STATUS_DEFAULT, UNSET_VALUE,
+    STATUS_CUSTOMIZED, STATUS_DEFAULT, STATUS_PENDING_UPDATE, UNSET_VALUE,
 };
 
 use super::parameter_store::{
@@ -47,7 +47,7 @@ const OTHER_REGION: &str = "eu-west-1";
 /// value list for those settings (`UpdateServiceSettingRequest$SettingValue` states one
 /// only for the settings that take a fixed word), so the rows differ in the form of the
 /// value they persist: a log-group path, an IAM role name, a boolean word.
-const FREE_TEXT_VALUES: &[&str] = &[
+pub(crate) const FREE_TEXT_VALUES: &[&str] = &[
     "/aws/ssm/automation-customer-scripts",
     "SSMDefaultEC2InstanceManagementRole",
     "true",
@@ -56,7 +56,7 @@ const FREE_TEXT_VALUES: &[&str] = &[
 /// The ARN spelling of `id` at `region`'s endpoint, as
 /// `UpdateServiceSettingRequest$SettingId` documents it
 /// (`arn:aws:ssm:us-east-1:111122223333:servicesetting/ssm/parameter-store/high-throughput-enabled`).
-fn setting_arn(region: &str, id: &str) -> String {
+pub(crate) fn setting_arn(region: &str, id: &str) -> String {
     format!("arn:aws:ssm:{region}:{ACCOUNT}:servicesetting{id}")
 }
 
@@ -64,7 +64,7 @@ fn setting_arn(region: &str, id: &str) -> String {
 /// the one its service team provisioned, or — for a setting the API documents no values
 /// for — one of [`FREE_TEXT_VALUES`], chosen by `index` so the table spans all three
 /// forms.
-fn custom_value(index: usize, setting: &SettingDefinition) -> String {
+pub(crate) fn custom_value(index: usize, setting: &SettingDefinition) -> String {
     setting
         .values
         .iter()
@@ -81,7 +81,7 @@ async fn get(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
 }
 
 /// The `ServiceSetting` a successful `GetServiceSetting` reports for `id`.
-async fn get_ok(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
+pub(crate) async fn get_ok(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
     let (status, body) = get(router, id).await;
     assert_eq!(
         status, 200,
@@ -224,16 +224,35 @@ async fn every_provisioned_setting_takes_a_value_and_is_reset_to_the_provisioned
             "case {case:?}: ResetServiceSetting must succeed, got {status} {body}"
         );
         let answered = body["ServiceSetting"].clone();
+        // A reset moves most settings straight back to the value their service team
+        // provisioned, credited to that team; one whose move off the account's value that
+        // team must approve keeps the account's value at the `PendingUpdate` status
+        // instead (`all/service_setting_restoration.rs` is that rule's own suite).
+        let (expected_value, expected_status, expected_modifier) = if setting.reset_awaits_approval
+        {
+            (custom.clone(), STATUS_PENDING_UPDATE, modifier.clone())
+        } else {
+            (
+                provisioned_value.clone(),
+                STATUS_DEFAULT,
+                PROVISIONING_USER.to_string(),
+            )
+        };
         assert_eq!(
             answered["SettingValue"],
-            json!(provisioned_value),
-            "case {case:?}: expected the provisioned value {provisioned_value:?} restored, got \
-             {answered}"
+            json!(expected_value),
+            "case {case:?}: expected the value {expected_value:?} after the reset, got {answered}"
         );
         assert_eq!(
             answered["Status"],
-            json!(STATUS_DEFAULT),
-            "case {case:?}: a reset setting is back at its provisioned value, got {answered}"
+            json!(expected_status),
+            "case {case:?}: expected the status {expected_status:?} after the reset, got {answered}"
+        );
+        assert_eq!(
+            answered["LastModifiedUser"],
+            json!(expected_modifier),
+            "case {case:?}: expected {expected_modifier:?} as the modifier after the reset, got \
+             {answered}"
         );
         assert_eq!(
             answered["SettingId"],

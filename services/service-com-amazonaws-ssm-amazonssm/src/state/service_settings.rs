@@ -15,9 +15,12 @@
 //! Only a setting an account has MODIFIED is stored ([`ServiceSettingRecord`]): a setting
 //! nobody has touched is reported from the catalogue, at the provisioned value and the
 //! `Default` status, and the modification that an update or a reset makes is what puts a
-//! record in the store. A reset is therefore a modification too — it records who restored
-//! the provisioned value and when — rather than the erasure of one, so no reader sees a
-//! setting's `LastModifiedDate` move backwards.
+//! record in the store. A reset is therefore recorded too — rather than the erasure of a
+//! record — so no reader sees a setting's `LastModifiedDate` move backwards, but what it
+//! records is the setting's restored state and not a customer overwrite
+//! ([`restoration`]): `LastModifiedUser` "is populated only if the setting value was
+//! overwritten", so a setting back at its provisioned value names the service team that
+//! provisioned it ([`PROVISIONING_USER`]) as its last modifier.
 //!
 //! A setting is reached through one Region's endpoint and its ARN names that Region
 //! ([`ServiceSettingRecord::to_service_setting`]), so the store is keyed by
@@ -46,6 +49,11 @@ pub const STATUS_DEFAULT: &str = "Default";
 /// current setting use a custom value specified by the customer."
 pub const STATUS_CUSTOMIZED: &str = "Customized";
 
+/// `ServiceSetting$Status` for a setting whose change has been asked for but is not
+/// effective yet: "PendingUpdate: The current setting uses a default or custom value, but
+/// a setting change request is pending approval."
+pub const STATUS_PENDING_UPDATE: &str = "PendingUpdate";
+
 /// Who last modified a setting nobody has modified: the service team that provisioned
 /// it, which is what `LastModifiedUser` names for a setting still at its default.
 pub const PROVISIONING_USER: &str = "System";
@@ -70,6 +78,15 @@ pub struct SettingDefinition {
     /// or EMPTY for a setting whose value is free text (the name of a log group, the name
     /// of an IAM role) and whose catalogue of values the API therefore does not state.
     pub values: &'static [&'static str],
+    /// Whether moving this setting OFF the account's own value needs the service team's
+    /// approval before it takes effect, so a reset of it registers a change request
+    /// instead of restoring the provisioned value at once ([`restoration`]) — the setting
+    /// keeps the value the account set and reports [`STATUS_PENDING_UPDATE`], "a setting
+    /// change request is pending approval".
+    ///
+    /// Which settings are reached that way is not in the model and not in the API
+    /// documentation: it is what Systems Manager is observed to answer for them.
+    pub reset_awaits_approval: bool,
 }
 
 /// The settings Systems Manager provisions, in the order
@@ -83,8 +100,9 @@ pub struct SettingDefinition {
 /// (`smithy_query(query="doc",shape="com.amazonaws.ssm#UpdateServiceSettingRequest",member="SettingValue")`);
 /// a setting the doc states no values for takes free text.
 ///
-/// Each `default_value` is the value the service team provisions, which for a feature an
-/// account opts into is the one that leaves it off — "if an Amazon Web Services service
+/// Each `default_value` is the value the service team provisions, which for a setting that
+/// governs what an account may do is the one leaving that as the team set it up, and for a
+/// feature an account opts into is the one that leaves it off — "if an Amazon Web Services service
 /// charges money to the account based on feature or service usage, then the Amazon Web
 /// Services service team might create a default setting of "false". This means the user
 /// can't use this feature unless they change the setting to "true" and intentionally opt
@@ -95,51 +113,66 @@ pub const SETTINGS: &[SettingDefinition] = &[
         id: "/ssm/appmanager/appmanager-enabled",
         default_value: "False",
         values: &["True", "False"],
+        reset_awaits_approval: false,
     },
     SettingDefinition {
         id: "/ssm/automation/customer-script-log-destination",
         default_value: UNSET_VALUE,
         values: &["CloudWatch"],
+        reset_awaits_approval: false,
     },
     SettingDefinition {
         id: "/ssm/automation/customer-script-log-group-name",
         default_value: UNSET_VALUE,
         values: &[],
+        reset_awaits_approval: false,
     },
     SettingDefinition {
         id: "/ssm/automation/enable-adaptive-concurrency",
         default_value: "false",
         values: &[],
+        reset_awaits_approval: false,
     },
     SettingDefinition {
+        // The console's public-sharing permission is provisioned ALLOWING the sharing it
+        // governs: the setting is what an account turns sharing off with, so the value a
+        // reset restores is the permissive one. Neither the model nor the API
+        // documentation states a default for it; this is what Systems Manager is observed
+        // to report for an account that has not changed it.
         id: "/ssm/documents/console/public-sharing-permission",
-        default_value: "Disable",
+        default_value: "Enable",
         values: &["Enable", "Disable"],
+        reset_awaits_approval: false,
     },
     SettingDefinition {
         id: "/ssm/managed-instance/activation-tier",
         default_value: "standard",
         values: &["standard", "advanced"],
+        reset_awaits_approval: true,
     },
     SettingDefinition {
         id: "/ssm/managed-instance/default-ec2-instance-management-role",
         default_value: UNSET_VALUE,
         values: &[],
+        reset_awaits_approval: false,
     },
     SettingDefinition {
         id: "/ssm/opsinsights/opscenter",
         default_value: "Disabled",
         values: &["Enabled", "Disabled"],
+        reset_awaits_approval: false,
     },
     SettingDefinition {
         id: "/ssm/parameter-store/default-parameter-tier",
         default_value: super::TIER_STANDARD,
         values: &["Standard", "Advanced", "Intelligent-Tiering"],
+        reset_awaits_approval: false,
     },
     SettingDefinition {
         id: "/ssm/parameter-store/high-throughput-enabled",
         default_value: "false",
         values: &["true", "false"],
+        reset_awaits_approval: false,
     },
 ];
 
@@ -169,7 +202,7 @@ pub const NOT_FOUND_MESSAGE: &str = "The specified service setting wasn't found.
 /// with an invented setting.
 pub const STORE_UNAVAILABLE: &str = "the service setting store is unavailable";
 
-/// The principal a modification records as its `LastModifiedUser`: the IAM user this
+/// The principal an OVERWRITE records as its `LastModifiedUser`: the IAM user this
 /// emulator's published long-term credential speaks for, which is the same principal STS
 /// reports as the caller of an operation
 /// (`::service_common::caller_principal::ambient_user_arn`) — so a client that reads its
@@ -267,12 +300,60 @@ pub struct ServiceSettingRecord {
     /// reset restored.
     pub value: String,
     /// `Default` once a reset has restored the provisioned value, `Customized` while the
-    /// account's own value stands.
+    /// account's own value stands, `PendingUpdate` while a change of it awaits approval.
     pub status: String,
     /// When the modification this record holds was made.
     pub last_modified_date: SystemTime,
-    /// The principal that made it, as `LastModifiedUser` names them.
+    /// The principal that made it, as `LastModifiedUser` names them: the account's own
+    /// principal while its value stands, and the provisioning service team once the
+    /// setting is back at the value that team provisioned.
     pub last_modified_user: String,
+}
+
+/// What a RESET of `setting` leaves recorded, for the reading `current` the setting holds
+/// now and the instant `at` the reset was asked for — or `None` when the setting is
+/// already at the value its service team provisioned, so the reset restores nothing and
+/// records nothing.
+///
+/// Restoring the provisioned value takes the setting back OUT of the account's ownership:
+/// `ServiceSetting$LastModifiedUser` is "populated only if the setting value was
+/// overwritten", so the restored setting names the team that provisioned it
+/// ([`PROVISIONING_USER`]) rather than whoever asked for the restore, at the `Default`
+/// status.
+///
+/// A setting whose move off the account's value needs that team's approval
+/// ([`SettingDefinition::reset_awaits_approval`]) is not restored by the call: the value
+/// the account set still stands and the setting reports [`STATUS_PENDING_UPDATE`] until
+/// the change is approved — which no API operation does — so the modification it reports
+/// stays the overwrite that is still in force, `at` included: the setting's value was not
+/// modified, only a change of it asked for, and an account that wants the provisioned
+/// value back without waiting writes it ([`super::ComAmazonawsSsmAmazonssmState::record_service_setting`]).
+///
+/// Whether the setting already holds the provisioned value ignores letter case, for the
+/// same reason [`value_rejection`] does: a value list is a set of values, not of
+/// spellings.
+#[must_use]
+pub fn restoration(
+    setting: &SettingDefinition,
+    current: &ServiceSettingRecord,
+    at: SystemTime,
+) -> Option<ServiceSettingRecord> {
+    let holds_provisioned = current.value.eq_ignore_ascii_case(setting.default_value);
+    if holds_provisioned && current.status == STATUS_DEFAULT {
+        return None;
+    }
+    if setting.reset_awaits_approval && !holds_provisioned {
+        return Some(ServiceSettingRecord {
+            status: STATUS_PENDING_UPDATE.to_string(),
+            ..current.clone()
+        });
+    }
+    Some(ServiceSettingRecord {
+        value: setting.default_value.to_string(),
+        status: STATUS_DEFAULT.to_string(),
+        last_modified_date: at,
+        last_modified_user: PROVISIONING_USER.to_string(),
+    })
 }
 
 impl ServiceSettingRecord {

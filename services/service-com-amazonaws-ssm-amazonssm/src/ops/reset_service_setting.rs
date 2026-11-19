@@ -8,10 +8,19 @@
 //! Amazon Web Services service team": the `SettingId` is resolved through the catalogue of
 //! settings those teams provision ([`crate::state::service_settings::SETTINGS`]) — by
 //! either of its documented spellings, the path or the setting's ARN — and the provisioned
-//! value that catalogue carries is what the reset stores, at the `Default` status. The
-//! reset is itself a modification, so it records who made it and when, and it answers
-//! with "the current, effective service setting after calling the ResetServiceSetting API
-//! operation" — the same reading `GetServiceSetting` reports afterwards.
+//! value that catalogue carries is what the reset stores, at the `Default` status. A
+//! setting back at that value is no longer overwritten, and `LastModifiedUser` is
+//! "populated only if the setting value was overwritten", so the restored setting reports
+//! the team that provisioned it rather than the principal that asked for the restore. It
+//! answers with "the current, effective service setting after calling the
+//! ResetServiceSetting API operation" — the same reading `GetServiceSetting` reports
+//! afterwards.
+//!
+//! A setting whose move off the account's own value needs the service team's approval
+//! ([`crate::state::service_settings::SettingDefinition::reset_awaits_approval`]) is NOT
+//! restored by the call: the value the account set stands and the setting reports
+//! `PendingUpdate`, "a setting change request is pending approval", which is what a later
+//! read reports too.
 //!
 //! Restoring the provisioned value is idempotent: a setting nobody has customized is
 //! already at it, and the reset reports that reading rather than refusing — and records
@@ -185,21 +194,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let region = crate::state::request_region(ctx.parts());
-        let restored = crate::state::service_settings::ServiceSettingRecord {
-            value: setting.default_value.to_string(),
-            status: crate::state::service_settings::STATUS_DEFAULT.to_string(),
-            last_modified_date: ::std::time::SystemTime::now(),
-            last_modified_user: crate::state::service_settings::modifying_user(),
-        };
         let mut held = state.lock();
-        // A reset restores the provisioned value, so one of a setting that is ALREADY at
-        // it restores nothing and records nothing: the reading it answers with is the one
-        // the setting already held, and the modification a later read reports stays the
-        // modification that was actually made.
+        // What the restore leaves recorded is computed from the setting's catalogue entry
+        // and the reading it holds NOW: the provisioned value at the `Default` status,
+        // credited to the service team that provisioned it; the account's value left
+        // standing at `PendingUpdate` for a setting whose restore that team must approve;
+        // and nothing at all for a setting already at its provisioned value, so the
+        // modification a later read reports stays the one that was actually made.
         let current = held.service_setting(&region, setting);
-        if current.value != setting.default_value
-            || current.status != crate::state::service_settings::STATUS_DEFAULT
-        {
+        if let Some(restored) = crate::state::service_settings::restoration(
+            setting,
+            &current,
+            ::std::time::SystemTime::now(),
+        ) {
             held.record_service_setting(&region, setting.id, restored)
                 .map_err(crate::scaffolded::Scaffolded::validation)?;
         }
