@@ -51,9 +51,12 @@ struct ArnOperation {
     approval: Option<&'static str>,
 }
 
-/// Every implemented operation whose input carries a `SubscriptionArn`. The three
-/// remaining ARN-taking operations are still 501 scaffolds owned by their own stub
-/// issues, so they publish no refusal surface yet.
+/// Every implemented operation whose input carries a `SubscriptionArn` and needs nothing
+/// of the subject beyond its ARN and its tag. The two remaining ARN-taking operations are
+/// still 501 scaffolds owned by their own stub issues, so they publish no refusal surface
+/// yet, and `DisassociateResourcesFromSubscription` needs a subject that holds a removable
+/// resource, so it carries these same three rules in the `subscription_lifecycle` suite
+/// beside its own rows.
 const ARN_OPERATIONS: &[ArnOperation] = &[
     ArnOperation {
         name: "GetSubscription",

@@ -218,12 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a new change, first cancel the pending change using CancelSubscriptionChange."
         if record.scheduled_change.is_some() {
             return Err(UpdateSubscriptionErrorModeled::ConflictException(
-                ConflictException {
-                    message: "the subscription has a scheduled change pending; cancel it \
-                              with CancelSubscriptionChange before making another change"
-                        .to_string(),
-                    resource_id: arn,
-                },
+                crate::state::scheduled_change_pending(&arn),
             )
             .into());
         }

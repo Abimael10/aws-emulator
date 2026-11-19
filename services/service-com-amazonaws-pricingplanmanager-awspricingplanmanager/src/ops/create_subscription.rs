@@ -308,6 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at: now,
             client_token,
             revision: crate::state::FIRST_REVISION,
+            sync_completes_at: None,
         };
         // Activating the subscription is a write of its own, so a subscription this call
         // put into service answers with the revision after the mint; one held for

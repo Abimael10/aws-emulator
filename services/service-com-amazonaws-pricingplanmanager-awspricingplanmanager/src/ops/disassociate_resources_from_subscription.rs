@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateResourcesFromSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateResourcesFromSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateResourcesFromSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes resources from a stored subscription: the request is weighed against the
+//! resource set it would LEAVE BEHIND ([`crate::state::plan_resource_removal`]), and only
+//! a set the subscription's plan family still admits is written back.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +160,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateResourcesFromSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateResourcesFromSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateResourcesFromSubscription"))
+        let _ = ctx;
+        // The ARN's syntax is checked before the store is reached and before the
+        // `If-Match` header and the named resources are weighed: a value that is not a
+        // subscription ARN is a malformed request, not a subscription that is absent.
+        if !crate::state::is_subscription_arn(&input.arn) {
+            return Err(
+                DisassociateResourcesFromSubscriptionErrorModeled::ValidationException(
+                    crate::state::invalid_subscription_arn(&input.arn),
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisassociateResourcesFromSubscriptionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::STORE_UNAVAILABLE_MESSAGE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let DisassociateResourcesFromSubscriptionInput {
+            arn,
+            resource_arns,
+            if_match,
+            client_token: _,
+        } = input;
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        store.apply_due_changes(now);
+        let record = match store.resolve_for_mutation(&arn, &if_match) {
+            Ok(record) => record,
+            Err(crate::state::PreconditionFailure::NotFound) => {
+                return Err(
+                    DisassociateResourcesFromSubscriptionErrorModeled::ResourceNotFoundException(
+                        crate::state::subscription_not_found(&arn),
+                    )
+                    .into(),
+                );
+            }
+            Err(crate::state::PreconditionFailure::ETagMismatch) => {
+                return Err(
+                    DisassociateResourcesFromSubscriptionErrorModeled::ValidationException(
+                        crate::state::stale_etag(&if_match),
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // What the subscription is LEFT covering decides the request: the plan family's
+        // required resources stay, the set never empties, a resource the subscription does
+        // not cover is nothing this call can remove, and a state that does not admit a
+        // change refuses one. The stored set is untouched on every one of those paths.
+        let retained = match crate::state::plan_resource_removal(record, &resource_arns) {
+            Ok(retained) => retained,
+            Err(refusal) => {
+                return Err(match refusal.into_modelled(&arn) {
+                    crate::state::ResourceChangeError::Conflict(conflict) => {
+                        DisassociateResourcesFromSubscriptionErrorModeled::ConflictException(
+                            conflict,
+                        )
+                    }
+                    crate::state::ResourceChangeError::Validation(validation) => {
+                        DisassociateResourcesFromSubscriptionErrorModeled::ValidationException(
+                            validation,
+                        )
+                    }
+                }
+                .into());
+            }
+        };
+
+        // The answer carries "the details of the subscription with the specified resources
+        // removed", so the removal is applied before it is reported, and the subscription
+        // reports the status of a change that is being applied until the clock says the
+        // change has taken effect — the model's own example for this operation answers
+        // `SYNC_IN_PROGRESS` with the resources already gone.
+        record.resource_arns = retained;
+        record.begin_sync(now);
+
+        Ok(DisassociateResourcesFromSubscriptionOutput {
+            subscription: record.to_subscription(),
+            e_tag: record.etag(),
+        })
     }
 }

@@ -14,16 +14,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    ResourceNotFoundException, ScheduledChange, Subscription, SubscriptionSummary,
-    ValidationException, APPROVAL_MODE_VALUES, SCHEDULED_CHANGE_TYPE_VALUES, STATUS_VALUES,
+    ConflictException, ResourceNotFoundException, ScheduledChange, Subscription,
+    SubscriptionSummary, ValidationException, APPROVAL_MODE_VALUES, SCHEDULED_CHANGE_TYPE_VALUES,
+    STATUS_VALUES,
 };
 
 /// Whether the resources a subscription names are eligible for the plan family it asks
 /// for — a question about state ANOTHER service holds, so it lives on its own.
 pub mod resource_eligibility;
 
+/// Which resource set a stored subscription may hold, and how a change to it is refused —
+/// a rule about this service's own record, shared by every operation that changes the set.
+pub mod subscription_resources;
+
 pub use resource_eligibility::{
     ineligible_resources, ineligible_resources_message, CLOUDFRONT_PLAN_FAMILY,
+};
+
+pub use subscription_resources::{
+    is_required_resource, plan_resource_removal, required_resources_message,
+    ResourceChangeError, ResourceChangeRefusal, RESOURCE_CHANGE_STATUS,
 };
 
 /// The region an unsigned request is served in. A signed request carries its own
@@ -211,7 +221,24 @@ pub struct SubscriptionRecord {
     /// writes the `CreateSubscription` call itself made. It IS the concurrency token
     /// [`Self::etag`] publishes, so only a write moves it.
     pub revision: u64,
+    /// When the change this subscription is applying will have taken effect, for a record
+    /// in [`Status::SyncInProgress`]; `None` for one that is applying nothing. Never on the
+    /// wire: the status is what a caller reads, and this is the instant at which the clock
+    /// owes that status its move to [`Status::Active`]
+    /// ([`ComAmazonawsPricingplanmanagerAwspricingplanmanagerState::apply_due_changes`]).
+    pub sync_completes_at: Option<DateTime>,
 }
+
+/// How long a subscription reports [`Status::SyncInProgress`] before the change it is
+/// applying has taken effect.
+///
+/// A change to a subscription's resources is applied asynchronously — the model's own
+/// example for `DisassociateResourcesFromSubscription` answers `SYNC_IN_PROGRESS` with the
+/// resources already removed, and `Status` documents that value as "A change is being
+/// applied to the subscription" — but AWS publishes no duration for it, so this span is
+/// the emulator's own choice. It is never zero, so a caller that acts immediately still
+/// sees the transient status and the refusals that go with it.
+pub const SYNC_SPAN_MILLIS: i64 = 3_000;
 
 /// The revision a subscription record carries when it has just been minted and nothing
 /// else has been written to it yet.
@@ -275,6 +302,17 @@ impl SubscriptionRecord {
         self.revision = self.revision.saturating_add(1);
     }
 
+    /// Record a change to this subscription that is now being applied: the status moves to
+    /// [`Status::SyncInProgress`] and the instant the change is due to have taken effect is
+    /// stored, so [`ComAmazonawsPricingplanmanagerAwspricingplanmanagerState::apply_due_changes`]
+    /// can move it back to [`Status::Active`] when the clock reaches it, with or without a
+    /// caller. Counts as the write it is, so the answer carries the next concurrency token.
+    pub fn begin_sync(&mut self, now: DateTime) {
+        self.status = Status::SyncInProgress;
+        self.sync_completes_at = Some(instant_after_millis(now, SYNC_SPAN_MILLIS));
+        self.touch(now);
+    }
+
     /// Record the write that puts a just-minted subscription into service.
     ///
     /// Creating a subscription that is not held for approval does two things to the
@@ -331,6 +369,24 @@ pub fn invalid_subscription_arn(arn: &str) -> ValidationException {
         // The rejected value travels in the message; `resourceId` is "the identifier of
         // the resource that failed validation", and a malformed ARN identifies none.
         resource_id: None,
+    }
+}
+
+/// How every operation that changes a subscription refuses one that is already applying a
+/// change of its own: the modelled `ConflictException` (HTTP 409, "The request conflicts
+/// with the current state of the resource"), whose `resourceId` is `@required` and names
+/// the subscription.
+///
+/// A change cannot be stacked on a pending one — "You cannot update a subscription while a
+/// scheduled change is pending. To make a new change, first cancel the pending change
+/// using CancelSubscriptionChange" — so every mutator states it identically through this
+/// one constructor.
+pub fn scheduled_change_pending(arn: &str) -> ConflictException {
+    ConflictException {
+        message: "the subscription has a scheduled change pending; cancel it with \
+                  CancelSubscriptionChange before making another change"
+            .to_string(),
+        resource_id: arn.to_string(),
     }
 }
 
@@ -458,6 +514,17 @@ impl ComAmazonawsPricingplanmanagerAwspricingplanmanagerState {
     pub fn apply_due_changes(&mut self, now: DateTime) {
         let mut cancelled: Vec<String> = Vec::new();
         for (arn, record) in &mut self.subscriptions {
+            // A change that was being applied has finished once its completion instant has
+            // passed: the subscription is covered again and reports `ACTIVE`.
+            if record.status == Status::SyncInProgress
+                && record
+                    .sync_completes_at
+                    .is_some_and(|due| instant_key(due) <= instant_key(now))
+            {
+                record.status = Status::Active;
+                record.sync_completes_at = None;
+                record.touch(now);
+            }
             let Some(change) = record.scheduled_change.as_ref() else {
                 continue;
             };
@@ -491,6 +558,16 @@ impl ComAmazonawsPricingplanmanagerAwspricingplanmanagerState {
 /// this rather than relying on an ordering impl the type does not promise.
 fn instant_key(value: DateTime) -> (i64, u32) {
     (value.secs(), value.subsec_nanos())
+}
+
+/// The instant `millis` milliseconds after `value`, at the millisecond resolution this
+/// service's `date-time` timestamps carry. Saturating, so no span can wrap the clock.
+fn instant_after_millis(value: DateTime, millis: i64) -> DateTime {
+    let at = value
+        .secs()
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(value.subsec_nanos() / 1_000_000));
+    DateTime::from_millis(at.saturating_add(millis))
 }
 
 /// The current instant, at the millisecond resolution the model's `date-time`

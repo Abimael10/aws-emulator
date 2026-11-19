@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end HTTP coverage of the subscription lifecycle: `CreateSubscription`,
-//! `GetSubscription`, `UpdateSubscription`, `ListSubscriptions`, `CancelSubscription`
-//! and `ApprovePaidSubscription`.
+//! `GetSubscription`, `UpdateSubscription`, `ListSubscriptions`, `CancelSubscription`,
+//! `ApprovePaidSubscription` and `DisassociateResourcesFromSubscription`.
 //!
 //! Every assertion here goes over the wire through the same `MultiServiceRouter` the
 //! emulator boots, so what is proven is the HTTP behaviour: the status, the `ETag`
@@ -28,7 +28,7 @@ use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::state::{
 // integration tests, so this suite adds no second copy of the request builder, the
 // response reader, the router or the create helper.
 use super::subscription_wire_form::{
-    call, create, create_body as subscription_body, router, router_on,
+    call, create, create_body as subscription_body, router, router_on, Answer,
 };
 
 /// The canonical account id every emulated ARN carries.
@@ -1343,10 +1343,6 @@ async fn the_operations_outside_this_slice_still_answer_501() {
             "AssociateResourcesToSubscription",
             json!({"arn": arn.clone(), "resourceArns": [format!("arn:aws:cloudfront::{ACCOUNT}:distribution/EX")]}),
         ),
-        (
-            "DisassociateResourcesFromSubscription",
-            json!({"arn": arn.clone(), "resourceArns": [format!("arn:aws:cloudfront::{ACCOUNT}:distribution/EX")]}),
-        ),
         ("CancelSubscriptionChange", json!({"arn": arn.clone()})),
     ];
 
@@ -1358,4 +1354,785 @@ async fn the_operations_outside_this_slice_still_answer_501() {
             answer.status, answer.body
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Resource disassociation
+// ---------------------------------------------------------------------------
+
+/// The ARN of a CloudFront distribution: `arn:aws:cloudfront::<account>:distribution/<id>`.
+fn distribution(id: &str) -> String {
+    format!("arn:aws:cloudfront::{ACCOUNT}:distribution/{id}")
+}
+
+/// The ARN of a CLOUDFRONT-scope WAF web ACL:
+/// `arn:aws:wafv2:<region>:<account>:global/webacl/<name>/<id>`.
+fn web_acl(name: &str) -> String {
+    format!(
+        "arn:aws:wafv2:{REGION}:{ACCOUNT}:global/webacl/{name}/11111111-2222-3333-4444-555555555555"
+    )
+}
+
+/// The ARN of a Route 53 hosted zone, one of the other resources a subscription may also
+/// cover ("such as Amazon Route 53 hosted zones, and CloudFront KeyValueStores").
+fn hosted_zone(id: &str) -> String {
+    format!("arn:aws:route53:::hostedzone/{id}")
+}
+
+/// The ARN of a CloudFront KeyValueStore, the other resource that doc names.
+fn key_value_store(name: &str) -> String {
+    format!("arn:aws:cloudfront::{ACCOUNT}:key-value-store/{name}")
+}
+
+/// A `CreateSubscription` body naming `resources` exactly.
+///
+/// The harness's own body builder with its generated resource list replaced, so the crate
+/// keeps ONE `CreateSubscription` body builder and this suite only says which resources it
+/// wants named.
+fn create_body_naming(
+    family: &str,
+    tier: &str,
+    resources: &[String],
+    approval: Option<&str>,
+) -> Value {
+    let mut body = subscription_body(family, tier, 1, None, approval);
+    body["resourceArns"] = json!(resources);
+    body
+}
+
+/// Poll `GetSubscription` until the subscription reports `ACTIVE`, the status a change that
+/// has taken effect leaves behind.
+///
+/// Waits for the CONDITION, not for a time: how long a change takes is the service's
+/// business, so this looks again until the status moves or a deadline far past it passes.
+async fn poll_until_active(router: &MultiServiceRouter, arn: &str, case: &str) -> Answer {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let fetched = call(router, "GetSubscription", json!({"arn": arn}), None).await;
+        if fetched.status == 200
+            && fetched.body.get("status").and_then(Value::as_str) == Some("ACTIVE")
+        {
+            return fetched;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the subscription never reached ACTIVE, last answer {} {:?}",
+            fetched.status,
+            fetched.body
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Removing resources a subscription's plan family does not require takes exactly those
+/// off the stored set and leaves the rest, in order — and the subscription reports the
+/// change as being applied until the clock says it has taken effect.
+///
+/// The rows differ along what the rule generalises over: the plan family, which kinds of
+/// resource the subscription holds, how many are held, how many are removed at once, and
+/// the position of the removed entries in the stored list.
+#[tokio::test]
+async fn disassociating_optional_resources_leaves_the_rest_of_the_set() {
+    struct Case {
+        label: &'static str,
+        family: &'static str,
+        held: Vec<String>,
+        removed: Vec<String>,
+        retained: Vec<String>,
+    }
+
+    let dist = distribution("E1EXAMPLE");
+    let acl = web_acl("acl-one");
+    let zone = hosted_zone("Z1EXAMPLE");
+    let second_zone = hosted_zone("Z2EXAMPLE");
+    let kvs = key_value_store("kvs-1");
+
+    let cases = vec![
+        Case {
+            label: "the last entry beside the CloudFront pair",
+            family: "CloudFront",
+            held: vec![dist.clone(), acl.clone(), zone.clone()],
+            removed: vec![zone.clone()],
+            retained: vec![dist.clone(), acl.clone()],
+        },
+        Case {
+            label: "a middle entry of a CloudFront subscription",
+            family: "CloudFront",
+            held: vec![dist.clone(), zone.clone(), acl.clone()],
+            removed: vec![zone.clone()],
+            retained: vec![dist.clone(), acl.clone()],
+        },
+        Case {
+            label: "two optional entries at once, named in reverse order",
+            family: "CloudFront",
+            held: vec![dist.clone(), acl.clone(), zone.clone(), kvs.clone()],
+            removed: vec![kvs.clone(), zone.clone()],
+            retained: vec![dist.clone(), acl.clone()],
+        },
+        Case {
+            label: "one entry of a family with no required composition",
+            family: "Route53",
+            held: vec![zone.clone(), second_zone.clone(), kvs.clone()],
+            removed: vec![zone.clone()],
+            retained: vec![second_zone.clone(), kvs.clone()],
+        },
+        Case {
+            label: "a family with no required composition down to its last entry",
+            family: "Route53",
+            held: vec![zone.clone(), kvs.clone()],
+            removed: vec![kvs.clone()],
+            retained: vec![zone.clone()],
+        },
+        Case {
+            label: "eight of the ten entries the model admits",
+            family: "Route53",
+            held: (0..10).map(|index| hosted_zone(&format!("Z{index}"))).collect(),
+            removed: (0..8).map(|index| hosted_zone(&format!("Z{index}"))).collect(),
+            retained: (8..10).map(|index| hosted_zone(&format!("Z{index}"))).collect(),
+        },
+    ];
+
+    let router = router();
+    for case in &cases {
+        let label = case.label;
+        let created = create(
+            &router,
+            create_body_naming(case.family, "PRO", &case.held, Some("IMMEDIATE")),
+        )
+        .await;
+        let arn = created.string("arn");
+        let created_etag = created.require_etag(label);
+
+        let answer = call(
+            &router,
+            "DisassociateResourcesFromSubscription",
+            json!({"arn": arn.clone(), "resourceArns": case.removed}),
+            Some(&created_etag),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {label:?}: a removal the plan family admits must succeed, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.body["resourceArns"],
+            json!(case.retained),
+            "case {label:?}: expected the retained set {:?}, got {:?}",
+            case.retained,
+            answer.body["resourceArns"]
+        );
+        assert_eq!(
+            answer.string("status"),
+            "SYNC_IN_PROGRESS",
+            "case {label:?}: a resource change is reported as being applied, got {:?}",
+            answer.body
+        );
+        let changed_etag = answer.require_etag(label);
+        assert_ne!(
+            changed_etag, created_etag,
+            "case {label:?}: a write must hand out a new concurrency token"
+        );
+
+        // The response is a report of the STORE: the reader answers the same subscription
+        // and the same token.
+        let fetched = call(
+            &router,
+            "GetSubscription",
+            json!({"arn": arn.clone()}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            fetched.status, 200,
+            "case {label:?}: the subscription must still be readable, got {} {:?}",
+            fetched.status, fetched.body
+        );
+        assert_eq!(
+            fetched.body, answer.body,
+            "case {label:?}: the removal must report what it stored, got {:?}",
+            fetched.body
+        );
+        assert_eq!(
+            fetched.require_etag(label),
+            changed_etag,
+            "case {label:?}: the reader must report the token the write handed out"
+        );
+        let created_at = epoch_seconds(&fetched.body["createdAt"], label);
+        let updated_at = epoch_seconds(&fetched.body["updatedAt"], label);
+        assert!(
+            updated_at >= created_at,
+            "case {label:?}: a modified subscription's updatedAt must not precede its \
+             createdAt, got {updated_at} vs {created_at}"
+        );
+
+        // The change the call started is owed by the clock, so the subscription reaches
+        // ACTIVE on its own, still covering exactly the retained set.
+        let settled = poll_until_active(&router, &arn, label).await;
+        assert_eq!(
+            settled.body["resourceArns"],
+            json!(case.retained),
+            "case {label:?}: the settled subscription must keep the retained set, got {:?}",
+            settled.body["resourceArns"]
+        );
+    }
+}
+
+/// What a removal is refused for, and how: the plan family's required resources stay, the
+/// set never empties, a resource the subscription does not cover cannot be removed, and a
+/// subscription whose status does not admit a change refuses one — each the modelled
+/// `ValidationException` (HTTP 400) naming the offending value, and each inert.
+///
+/// The rows differ along which element of the rule stops the request, which kind of
+/// resource is named, where in the request list it is named, the plan family, and the
+/// subscription's status.
+#[tokio::test]
+async fn a_removal_the_rule_forbids_is_refused_and_changes_nothing() {
+    /// What the refusal must state, given the subscription's own ARN.
+    enum Expected {
+        /// The plan family requires the subscription keep these resources.
+        Required(Vec<String>),
+        /// The subscription does not cover this resource.
+        NotAssociated(String),
+        /// Nothing would be left covered.
+        LeavesNoResources,
+        /// The subscription's status does not admit a resource change.
+        NotActive(&'static str),
+    }
+
+    impl Expected {
+        fn message(&self, arn: &str) -> String {
+            match self {
+                Self::Required(required) => format!(
+                    "For subscriptions in the CloudFront plan family, the associated \
+                     resources must always include exactly one Amazon CloudFront \
+                     distribution and exactly one WAF web ACL. You cannot remove these \
+                     required resources: {}.",
+                    required.join(", ")
+                ),
+                Self::NotAssociated(resource) => format!(
+                    "Cannot remove {resource} from subscription {arn}: the resource is \
+                     not associated with this subscription."
+                ),
+                Self::LeavesNoResources => format!(
+                    "Cannot remove every resource from subscription {arn}: a subscription \
+                     must always include at least one resource."
+                ),
+                Self::NotActive(status) => format!(
+                    "Cannot change the resources of subscription {arn}: the subscription \
+                     is {status}; its resources can be changed only while it is ACTIVE."
+                ),
+            }
+        }
+
+        /// `resourceId` is "the identifier of the resource that failed validation": the
+        /// offending resource when exactly one failed, and the subscription when the
+        /// failure is about its own state or its set as a whole.
+        fn resource_id(&self, arn: &str) -> Option<String> {
+            match self {
+                Self::Required(required) => match required.as_slice() {
+                    [only] => Some(only.clone()),
+                    _ => None,
+                },
+                Self::NotAssociated(resource) => Some(resource.clone()),
+                Self::LeavesNoResources | Self::NotActive(_) => Some(arn.to_string()),
+            }
+        }
+    }
+
+    struct Case {
+        label: &'static str,
+        family: &'static str,
+        tier: &'static str,
+        approval: Option<&'static str>,
+        held: Vec<String>,
+        removed: Vec<String>,
+        expected: Expected,
+    }
+
+    let dist = distribution("E1EXAMPLE");
+    let acl = web_acl("acl-one");
+    let zone = hosted_zone("Z1EXAMPLE");
+    let kvs = key_value_store("kvs-1");
+
+    let cases = vec![
+        Case {
+            label: "the required CloudFront distribution",
+            family: "CloudFront",
+            tier: "PRO",
+            approval: Some("IMMEDIATE"),
+            held: vec![dist.clone(), acl.clone(), zone.clone()],
+            removed: vec![dist.clone()],
+            expected: Expected::Required(vec![dist.clone()]),
+        },
+        Case {
+            label: "the required WAF web ACL",
+            family: "CloudFront",
+            tier: "FREE",
+            approval: None,
+            held: vec![dist.clone(), acl.clone(), zone.clone()],
+            removed: vec![acl.clone()],
+            expected: Expected::Required(vec![acl.clone()]),
+        },
+        Case {
+            label: "the required pair, named behind an optional resource",
+            family: "CloudFront",
+            tier: "BUSINESS",
+            approval: Some("IMMEDIATE"),
+            held: vec![dist.clone(), acl.clone(), zone.clone()],
+            removed: vec![zone.clone(), acl.clone()],
+            expected: Expected::Required(vec![acl.clone()]),
+        },
+        Case {
+            label: "the whole CloudFront pair at once",
+            family: "CloudFront",
+            tier: "PRO",
+            approval: Some("IMMEDIATE"),
+            held: vec![dist.clone(), acl.clone()],
+            removed: vec![dist.clone(), acl.clone()],
+            expected: Expected::Required(vec![dist.clone(), acl.clone()]),
+        },
+        Case {
+            label: "a resource the subscription does not cover",
+            family: "CloudFront",
+            tier: "PRO",
+            approval: Some("IMMEDIATE"),
+            held: vec![dist.clone(), acl.clone()],
+            removed: vec![zone.clone()],
+            expected: Expected::NotAssociated(zone.clone()),
+        },
+        Case {
+            label: "a distribution another subscription covers",
+            family: "Route53",
+            tier: "FREE",
+            approval: None,
+            held: vec![zone.clone(), kvs.clone()],
+            removed: vec![distribution("E9ABSENT")],
+            expected: Expected::NotAssociated(distribution("E9ABSENT")),
+        },
+        Case {
+            label: "the only resource of a subscription",
+            family: "Route53",
+            tier: "PRO",
+            approval: Some("IMMEDIATE"),
+            held: vec![zone.clone()],
+            removed: vec![zone.clone()],
+            expected: Expected::LeavesNoResources,
+        },
+        Case {
+            label: "every resource of a subscription",
+            family: "Route53",
+            tier: "PRO",
+            approval: Some("IMMEDIATE"),
+            held: vec![zone.clone(), kvs.clone()],
+            removed: vec![zone.clone(), kvs.clone()],
+            expected: Expected::LeavesNoResources,
+        },
+        Case {
+            label: "a subscription waiting for approval",
+            family: "CloudFront",
+            tier: "PREMIUM",
+            approval: Some("MANUAL"),
+            held: vec![dist.clone(), acl.clone(), zone.clone()],
+            removed: vec![zone.clone()],
+            expected: Expected::NotActive("PENDING_APPROVAL"),
+        },
+    ];
+
+    let router = router();
+    for case in &cases {
+        let label = case.label;
+        let created = create(
+            &router,
+            create_body_naming(case.family, case.tier, &case.held, case.approval),
+        )
+        .await;
+        let arn = created.string("arn");
+        let created_etag = created.require_etag(label);
+
+        let refused = call(
+            &router,
+            "DisassociateResourcesFromSubscription",
+            json!({"arn": arn.clone(), "resourceArns": case.removed}),
+            Some(&created_etag),
+        )
+        .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {label:?}: the removal must be refused 400, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some("ValidationException"),
+            "case {label:?}: unexpected error code for {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.message(label),
+            case.expected.message(&arn),
+            "case {label:?}: unexpected message for {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.body.get("resourceId").and_then(Value::as_str),
+            case.expected.resource_id(&arn).as_deref(),
+            "case {label:?}: unexpected resourceId for {:?}",
+            refused.body
+        );
+
+        // Inert: the stored subscription still covers every resource it did, and still
+        // reports the token it had.
+        let unchanged = call(&router, "GetSubscription", json!({"arn": arn}), None).await;
+        assert_eq!(
+            unchanged.body, created.body,
+            "case {label:?}: a refused removal must not change the subscription"
+        );
+        assert_eq!(
+            unchanged.require_etag(label),
+            created_etag,
+            "case {label:?}: a refused removal must not mint a new token"
+        );
+    }
+}
+
+/// The removal path shares the ARN and `If-Match` refusals of every other operation that
+/// resolves a subscription ARN, and takes them BEFORE it weighs the resources it was given
+/// — so a malformed ARN, an absent subscription and a stale tag answer the same way here
+/// as everywhere else, and neither removes anything.
+#[tokio::test]
+async fn disassociate_shares_the_arn_and_if_match_refusals() {
+    let router = router();
+    let held = vec![
+        distribution("E1EXAMPLE"),
+        web_acl("acl-one"),
+        hosted_zone("Z1EXAMPLE"),
+    ];
+    let created = create(
+        &router,
+        create_body_naming("CloudFront", "PRO", &held, Some("IMMEDIATE")),
+    )
+    .await;
+    let arn = created.string("arn");
+    let current_etag = created.require_etag("shared refusals");
+    // Removing this one is admitted once the ARN and the tag are right, so every row below
+    // fails on the ARN or the tag rather than on the resource.
+    let removable = json!([hosted_zone("Z1EXAMPLE")]);
+
+    let malformed = "not-an-arn".to_string();
+    let absent = format!("arn:aws:pricingplanmanager::{ACCOUNT}:subscription:sub_absent1");
+    let rows = vec![
+        (
+            "a malformed subscription ARN",
+            malformed.clone(),
+            current_etag.clone(),
+            400,
+            "ValidationException",
+            format!("Invalid subscription ARN: {malformed}"),
+        ),
+        (
+            "a well-formed ARN naming nothing",
+            absent.clone(),
+            current_etag.clone(),
+            404,
+            "ResourceNotFoundException",
+            format!(
+                "Subscription not found: {absent}. Verify the ARN is correct and the \
+                 subscription exists in your account."
+            ),
+        ),
+        (
+            "a stale If-Match",
+            arn.clone(),
+            "stale-etag".to_string(),
+            400,
+            "ValidationException",
+            "Invalid or outdated ETag 'stale-etag': retrieve current ETag and retry."
+                .to_string(),
+        ),
+    ];
+
+    for (label, target, if_match, status, code, message) in &rows {
+        let refused = call(
+            &router,
+            "DisassociateResourcesFromSubscription",
+            json!({"arn": target, "resourceArns": removable}),
+            Some(if_match),
+        )
+        .await;
+        assert_eq!(
+            refused.status, *status,
+            "case {label:?}: expected HTTP {status}, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some(*code),
+            "case {label:?}: unexpected error code for {:?}",
+            refused.body
+        );
+        assert_eq!(
+            &refused.message(label),
+            message,
+            "case {label:?}: unexpected message for {:?}",
+            refused.body
+        );
+    }
+
+    // Inert, then admitted with the right ARN and tag.
+    let unchanged = call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
+    assert_eq!(
+        unchanged.body, created.body,
+        "case \"shared refusals\": no refused removal may change the subscription"
+    );
+    let accepted = call(
+        &router,
+        "DisassociateResourcesFromSubscription",
+        json!({"arn": arn, "resourceArns": removable}),
+        Some(&current_etag),
+    )
+    .await;
+    assert_eq!(
+        accepted.status, 200,
+        "case \"shared refusals\": the same removal must be admitted with the current \
+         ARN and tag, got {} {:?}",
+        accepted.status, accepted.body
+    );
+}
+
+/// The change a removal starts is owed by the CLOCK, not by the next caller: while its
+/// completion instant is still ahead the subscription reports `SYNC_IN_PROGRESS` however
+/// many times it is read, and once that instant has passed the next answer reports
+/// `ACTIVE` — with the resources gone either way.
+///
+/// The span is the service's, so this test moves the stored completion instant rather than
+/// waiting for it: first out of reach, to show that reading does not settle a change that
+/// is not due, then into the past, to show the clock settles it with no call of its own.
+#[tokio::test]
+async fn a_resource_change_completes_on_the_clock_without_a_caller() {
+    let case = "clock-owed completion";
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(Arc::clone(&engine));
+
+    let held = vec![
+        distribution("E1EXAMPLE"),
+        web_acl("acl-one"),
+        hosted_zone("Z1EXAMPLE"),
+    ];
+    let created = create(
+        &router,
+        create_body_naming("CloudFront", "PRO", &held, Some("IMMEDIATE")),
+    )
+    .await;
+    let arn = created.string("arn");
+    let etag = created.require_etag(case);
+
+    let removed = call(
+        &router,
+        "DisassociateResourcesFromSubscription",
+        json!({"arn": arn.clone(), "resourceArns": [hosted_zone("Z1EXAMPLE")]}),
+        Some(&etag),
+    )
+    .await;
+    assert_eq!(
+        (removed.status, removed.string("status").as_str()),
+        (200, "SYNC_IN_PROGRESS"),
+        "case {case:?}: the removal must be accepted and reported as being applied, got {} {:?}",
+        removed.status,
+        removed.body
+    );
+
+    // Far out of reach: no number of reads may settle a change the clock does not owe yet.
+    {
+        let state = engine.state::<ServiceState>();
+        let mut store = state.lock();
+        let record = store
+            .subscriptions
+            .get_mut(&arn)
+            .expect("the subscription is stored");
+        assert!(
+            record.sync_completes_at.is_some(),
+            "case {case:?}: the record must carry the instant its change is due"
+        );
+        record.sync_completes_at = Some(aws_smithy_types::DateTime::from_secs(32_000_000_000));
+    }
+    for read in 0..3 {
+        let fetched = call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
+        assert_eq!(
+            fetched.string("status"),
+            "SYNC_IN_PROGRESS",
+            "case {case:?}: read {read} settled a change that is not due, got {:?}",
+            fetched.body
+        );
+    }
+
+    // In the past: the change has taken effect, with nobody having called for it.
+    {
+        let state = engine.state::<ServiceState>();
+        let mut store = state.lock();
+        let record = store
+            .subscriptions
+            .get_mut(&arn)
+            .expect("the subscription is stored");
+        record.sync_completes_at = Some(aws_smithy_types::DateTime::from_secs(1_600_000_000));
+    }
+    let settled = call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
+    assert_eq!(
+        settled.string("status"),
+        "ACTIVE",
+        "case {case:?}: a due change must have taken effect, got {:?}",
+        settled.body
+    );
+    assert_eq!(
+        settled.body["resourceArns"],
+        json!([distribution("E1EXAMPLE"), web_acl("acl-one")]),
+        "case {case:?}: the settled subscription keeps the retained set, got {:?}",
+        settled.body["resourceArns"]
+    );
+}
+
+/// A subscription already busy with a change of its own refuses a resource change, and
+/// admits the identical one once that change is over: a pending scheduled change is the
+/// modelled `ConflictException` (409) every mutator of this service answers, and a change
+/// still being applied is the modelled `ValidationException` (400) naming the status that
+/// refused it. Both refusals are inert.
+#[tokio::test]
+async fn a_resource_change_is_refused_while_another_change_is_pending() {
+    let dist = distribution("E1EXAMPLE");
+    let acl = web_acl("acl-one");
+    let zone = hosted_zone("Z1EXAMPLE");
+    let kvs = key_value_store("kvs-1");
+
+    // (a) a scheduled cancellation is pending.
+    let case = "a scheduled change pending";
+    let router = router();
+    let held = vec![dist.clone(), acl.clone(), zone.clone()];
+    let created = create(
+        &router,
+        create_body_naming("CloudFront", "PRO", &held, Some("IMMEDIATE")),
+    )
+    .await;
+    let arn = created.string("arn");
+    let scheduled = call(
+        &router,
+        "CancelSubscription",
+        json!({"arn": arn.clone()}),
+        Some(&created.require_etag(case)),
+    )
+    .await;
+    assert_eq!(
+        scheduled.status, 200,
+        "case {case:?}: the cancellation must be scheduled, got {} {:?}",
+        scheduled.status, scheduled.body
+    );
+    let refused = call(
+        &router,
+        "DisassociateResourcesFromSubscription",
+        json!({"arn": arn.clone(), "resourceArns": [zone.clone()]}),
+        Some(&scheduled.require_etag(case)),
+    )
+    .await;
+    assert_eq!(
+        (refused.status, refused.error_code.as_deref()),
+        (409, Some("ConflictException")),
+        "case {case:?}: a pending change is the modelled conflict, got {} {:?}",
+        refused.status,
+        refused.body
+    );
+    assert_eq!(
+        refused.message(case),
+        "the subscription has a scheduled change pending; cancel it with \
+         CancelSubscriptionChange before making another change",
+        "case {case:?}: unexpected message for {:?}",
+        refused.body
+    );
+    assert_eq!(
+        refused.body.get("resourceId").and_then(Value::as_str),
+        Some(arn.as_str()),
+        "case {case:?}: the conflict must name the subscription, got {:?}",
+        refused.body
+    );
+    let unchanged = call(&router, "GetSubscription", json!({"arn": arn}), None).await;
+    assert_eq!(
+        unchanged.body, scheduled.body,
+        "case {case:?}: a refused removal must change nothing, got {:?}",
+        unchanged.body
+    );
+
+    // (b) a change of its own is still being applied.
+    let case = "a change still being applied";
+    let held = vec![dist.clone(), acl.clone(), zone.clone(), kvs.clone()];
+    let created = create(
+        &router,
+        create_body_naming("CloudFront", "PRO", &held, Some("IMMEDIATE")),
+    )
+    .await;
+    let arn = created.string("arn");
+    let syncing = call(
+        &router,
+        "DisassociateResourcesFromSubscription",
+        json!({"arn": arn.clone(), "resourceArns": [zone.clone()]}),
+        Some(&created.require_etag(case)),
+    )
+    .await;
+    assert_eq!(
+        (syncing.status, syncing.string("status").as_str()),
+        (200, "SYNC_IN_PROGRESS"),
+        "case {case:?}: the first removal must be accepted and be applying, got {} {:?}",
+        syncing.status,
+        syncing.body
+    );
+    let refused = call(
+        &router,
+        "DisassociateResourcesFromSubscription",
+        json!({"arn": arn.clone(), "resourceArns": [kvs.clone()]}),
+        Some(&syncing.require_etag(case)),
+    )
+    .await;
+    assert_eq!(
+        (refused.status, refused.error_code.as_deref()),
+        (400, Some("ValidationException")),
+        "case {case:?}: a change in flight refuses another, got {} {:?}",
+        refused.status,
+        refused.body
+    );
+    assert_eq!(
+        refused.message(case),
+        format!(
+            "Cannot change the resources of subscription {arn}: the subscription is \
+             SYNC_IN_PROGRESS; its resources can be changed only while it is ACTIVE."
+        ),
+        "case {case:?}: unexpected message for {:?}",
+        refused.body
+    );
+    let unchanged = call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
+    assert_eq!(
+        unchanged.body["resourceArns"],
+        json!([dist.clone(), acl.clone(), kvs.clone()]),
+        "case {case:?}: a refused removal must change nothing, got {:?}",
+        unchanged.body
+    );
+
+    // Once the first change has taken effect, the identical second one is admitted.
+    let settled = poll_until_active(&router, &arn, case).await;
+    let admitted = call(
+        &router,
+        "DisassociateResourcesFromSubscription",
+        json!({"arn": arn.clone(), "resourceArns": [kvs.clone()]}),
+        Some(&settled.require_etag(case)),
+    )
+    .await;
+    assert_eq!(
+        admitted.status, 200,
+        "case {case:?}: the same removal must be admitted once the subscription is active, \
+         got {} {:?}",
+        admitted.status,
+        admitted.body
+    );
+    assert_eq!(
+        admitted.body["resourceArns"],
+        json!([dist, acl]),
+        "case {case:?}: the second removal must take the named resource off, got {:?}",
+        admitted.body["resourceArns"]
+    );
 }

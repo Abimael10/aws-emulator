@@ -105,7 +105,7 @@ pub async fn ineligible_resources(
 ///
 /// An ARN whose id segment is empty names no distribution to ask about, so it is not one
 /// either.
-fn distribution_id(value: &str) -> Option<&str> {
+pub(super) fn distribution_id(value: &str) -> Option<&str> {
     if !::service_common::arn::is_resource_arn_of(value, CLOUDFRONT_VENDOR) {
         return None;
     }
@@ -114,7 +114,7 @@ fn distribution_id(value: &str) -> Option<&str> {
 }
 
 /// Whether the ARN `value` names a WAF web ACL, of either namespace.
-fn names_a_web_acl(value: &str) -> bool {
+pub(super) fn names_a_web_acl(value: &str) -> bool {
     ::service_common::arn::resource(value)
         .is_some_and(|resource| resource.contains(WEB_ACL_SEGMENT))
         && ::service_common::arn::is_resource_arn_of(value, WAFV2_VENDOR)
