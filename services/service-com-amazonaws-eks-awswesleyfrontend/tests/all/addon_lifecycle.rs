@@ -412,11 +412,13 @@ async fn a_cluster_that_does_not_exist_is_not_found_whatever_the_body_says() {
 
     // The rows differ along what else is wrong with the request — nothing, an
     // add-on name of a form no add-on has, a configuration document that is not
-    // valid JSON, a duplicated service account — because the cluster layer is
+    // valid JSON — because the cluster layer is
     // checked before any of them. What is NOT here is the request's own addressing:
-    // the `@httpLabel` cluster name and the `serviceAccountRoleArn` this request
-    // asks Amazon EKS to pass are judged BEFORE the cluster is resolved, which is
-    // the `addon_request_precedence` suite's rule.
+    // the `@httpLabel` cluster name, and the role the add-on's service account is
+    // given — which this request names in `serviceAccountRoleArn` and in each
+    // `podIdentityAssociations` entry's `roleArn` — are judged BEFORE the cluster is
+    // resolved, which is the `addon_request_precedence` and `refusal_contract` suites'
+    // rule.
     let cases: Vec<(&str, serde_json::Value)> = vec![
         ("nothing else wrong", serde_json::json!({ "addonName": "vpc-cni" })),
         (
@@ -428,10 +430,13 @@ async fn a_cluster_that_does_not_exist_is_not_found_whatever_the_body_says() {
             serde_json::json!({ "addonName": "vpc-cni", "configurationValues": "{nope" }),
         ),
         (
-            "an association role ARN that is not a role ARN",
+            "an association that maps one service account twice",
             serde_json::json!({
                 "addonName": "vpc-cni",
-                "podIdentityAssociations": [{ "serviceAccount": "sa", "roleArn": "nope" }],
+                "podIdentityAssociations": [
+                    { "serviceAccount": "sa", "roleArn": "arn:aws:iam::000000000000:role/One" },
+                    { "serviceAccount": "sa", "roleArn": "arn:aws:iam::000000000000:role/Two" },
+                ],
             }),
         ),
     ];

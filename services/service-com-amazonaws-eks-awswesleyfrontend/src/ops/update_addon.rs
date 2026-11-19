@@ -233,14 +233,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carry (`ClusterName` is `@length(1..100)` + `@pattern`,
         // [`crate::state::is_cluster_name`]), so a label outside it names no cluster in
         // any Region and is refused as the invalid parameter it is rather than looked
-        // up. And `serviceAccountRoleArn`, the IAM role the add-on's Kubernetes service
-        // account is given, must be a role this caller may hand Amazon EKS — the
-        // service-wide pass-role question, answered before dispatch as the 403 this
-        // operation does not model (`crate::service::precedence`), so it is not
-        // re-judged here — and one IAM could hold at all
-        // ([`crate::state::names_a_role_iam_could_hold`]), which is refused with the
-        // sentence this API states for that parameter. The pre-dispatch layer gives
-        // these same answers ahead of the framework's own refusal of a body member.
+        // up. And the role the add-on's Kubernetes service account is GIVEN — which this
+        // request names in `serviceAccountRoleArn` and in the `roleArn` of each
+        // `podIdentityAssociations` entry — must be a role this caller may hand Amazon
+        // EKS (the service-wide pass-role question, answered before dispatch as the 403
+        // this operation does not model, `crate::service::precedence`, so it is not
+        // re-judged here) that names a role a member of this API could carry at all
+        // ([`crate::state::addon_role_naming_no_role`]), which is refused with the
+        // sentence this API states for the add-on's service account role. The
+        // pre-dispatch layer gives the LABEL answer ahead of the framework's own refusal
+        // of a body member.
         if !state::is_cluster_name(&input.cluster_name) {
             return Err(UpdateAddonErrorModeled::InvalidParameterException(
                 InvalidParameterException {
@@ -254,10 +256,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if input
-            .service_account_role_arn
-            .as_deref()
-            .is_some_and(|role_arn| !state::names_a_role_iam_could_hold(role_arn))
+        if state::addon_role_naming_no_role(
+            input.service_account_role_arn.as_deref(),
+            input.pod_identity_associations.as_deref().unwrap_or_default(),
+        )
+        .is_some()
         {
             // The sentence ALONE: nothing was resolved when the role was judged, so
             // there is no cluster and no add-on for the payload to report.
@@ -461,9 +464,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &cluster_version,
                 now,
             ) {
-                return Err(invalid_parameter(
-                    state::ADDON_VERSION_NOT_SUPPORTED_MESSAGE.to_string(),
-                ));
+                // The same refusal of the same rule as the install's, in the shape the
+                // service this emulates answers it with: the payload's two identity
+                // members carry each other's request parameter
+                // ([`crate::state::addon_version_not_supported`]).
+                return Err(UpdateAddonErrorModeled::InvalidParameterException(
+                    state::addon_version_not_supported(&input.cluster_name, &input.addon_name),
+                )
+                .into());
             }
         }
         // `serviceAccountRoleArn` is judged with the request's own addressing, at the
@@ -543,20 +551,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if requested.len() > MAX_POD_IDENTITY_ASSOCIATIONS_PER_CLUSTER {
                 return Err(too_many(requested.len(), None));
             }
-            // Each entry maps a Kubernetes service account to an IAM role, so the role
-            // must be a role ARN and the service account must be a name a Kubernetes
-            // object can have, and one service account cannot be mapped twice by the
-            // same add-on. Both form checks are the ones the pod identity slice already
-            // shares.
+            // Each entry maps a Kubernetes service account to an IAM role. The role's
+            // own value is judged with the request's own addressing, at the top of this
+            // handler: it names the same role `serviceAccountRoleArn` does, so it earns
+            // the same refusal and earns it before the cluster is resolved. What is left
+            // here is the service account: it must be a name a Kubernetes object can
+            // have, and one service account cannot be mapped twice by the same add-on.
             let mut seen_service_accounts = ::std::collections::BTreeSet::new();
             for association in requested {
-                if !state::is_iam_role_arn(&association.role_arn) {
-                    return Err(invalid_parameter(format!(
-                        "podIdentityAssociations[].roleArn {:?} is not an IAM role ARN of the \
-                         form arn:<partition>:iam::<account>:role/<name>.",
-                        association.role_arn
-                    )));
-                }
                 if !state::is_kubernetes_name(&association.service_account) {
                     return Err(invalid_parameter(format!(
                         "podIdentityAssociations[].serviceAccount {:?} is not a Kubernetes \

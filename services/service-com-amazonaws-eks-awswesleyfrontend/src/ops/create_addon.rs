@@ -11,15 +11,21 @@
 //! OUTSIDE IN, and each layer's refusal is the modelled error for what it found:
 //!
 //! 0. the request's OWN ADDRESSING: the `@httpLabel` `clusterName` must be a name a
-//!    cluster of this API could carry, and the `serviceAccountRoleArn` must be a role
-//!    this caller may hand Amazon EKS (answered before dispatch as the 403 this
-//!    operation does not model, `crate::service::precedence`) that names a role IAM
-//!    could hold at all — otherwise `InvalidParameterException` (400). Neither
+//!    cluster of this API could carry, and the role the add-on's service account is
+//!    GIVEN — named in `serviceAccountRoleArn` and in the `roleArn` of each
+//!    `podIdentityAssociations` entry — must be a role this caller may hand Amazon EKS
+//!    (answered before dispatch as the 403 this operation does not model,
+//!    `crate::service::precedence`) that names a role a member of this API could carry
+//!    at all — otherwise `InvalidParameterException` (400). Neither
 //!    question needs any state, and a label outside the cluster-name grammar names no
 //!    cluster in any Region, so answering it as a not-found would invite a caller to
-//!    create a cluster under a name Amazon EKS will never accept. This stage runs
+//!    create a cluster under a name Amazon EKS will never accept. The LABEL half runs
 //!    ahead of the framework's own refusal of a body member, which only a pre-dispatch
 //!    layer can order (`crate::service::precedence`);
+//! 0b. the request must NAME AN ADD-ON at all: `addonName` says what to install, so a
+//!    request carrying none asks for nothing and is refused with the sentence this API
+//!    states for that parameter — `InvalidParameterException` (400) — before the
+//!    cluster is resolved, since no cluster could hold what the request did not name;
 //! 1. the cluster named by the `@httpLabel` must exist IN THE REQUEST'S REGION —
 //!    otherwise `ResourceNotFoundException` (404), before any member of the body is
 //!    looked at, because a request against a cluster that does not exist cannot be
@@ -174,6 +180,11 @@ use crate::state::{
 };
 use std::time::SystemTime;
 
+/// The member a `CreateAddon` names the add-on to install in, as the model spells it
+/// and as the walk that refuses an omitted one names it — the member this handler's
+/// required-parameter refusal is about.
+const ADDON_NAME_MEMBER: &str = "addonName";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -321,21 +332,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Still the request's own addressing: `serviceAccountRoleArn` is the IAM role
-        // the add-on's Kubernetes service account is given, so the add-on operations ask
-        // two questions about it, both decided from the value alone and both before the
-        // cluster is resolved. Whether this caller may PASS it is the service-wide
-        // pass-role question, answered as the 403 this operation does not model, before
-        // dispatch (`crate::service::precedence`), so it is not re-judged here. Whether
-        // the value names a role IAM could hold at all is this one
-        // ([`crate::state::names_a_role_iam_could_hold`]): a role name or path outside
-        // the grammar IAM publishes names no role in any account, and Amazon EKS refuses
-        // it with the sentence it states for that parameter
-        // ([`crate::state::ADDON_SERVICE_ACCOUNT_ROLE_ARN_REFUSAL`]).
-        if input
-            .service_account_role_arn
-            .as_deref()
-            .is_some_and(|role_arn| !state::names_a_role_iam_could_hold(role_arn))
+        // Still the request's own addressing: the role the add-on's Kubernetes service
+        // account is GIVEN, which this request names in `serviceAccountRoleArn` and in
+        // the `roleArn` of each `podIdentityAssociations` entry — the same role, bound
+        // through EKS Pod Identity rather than through the cluster's OIDC provider. The
+        // add-on operations ask two questions about it, both decided from the value
+        // alone and both before the cluster is resolved. Whether this caller may PASS it
+        // is the service-wide pass-role question, answered as the 403 this operation
+        // does not model, before dispatch (`crate::service::precedence`), so it is not
+        // re-judged here. Whether the value names a role a member of this API could
+        // carry at all is this one ([`crate::state::addon_role_naming_no_role`]): a bare
+        // role name where an ARN belongs, a role name or path outside the grammar IAM
+        // publishes, and a value past the length the model states for `RoleArn` all name
+        // no role in any account, and Amazon EKS refuses every one of them with the
+        // sentence it states for the add-on's service account role
+        // ([`crate::state::ADDON_SERVICE_ACCOUNT_ROLE_ARN_REFUSAL`]), which takes nothing
+        // from the request.
+        if state::addon_role_naming_no_role(
+            input.service_account_role_arn.as_deref(),
+            input.pod_identity_associations.as_deref().unwrap_or_default(),
+        )
+        .is_some()
         {
             return Err(invalid_parameter(
                 state::ADDON_SERVICE_ACCOUNT_ROLE_ARN_REFUSAL.to_string(),
@@ -353,6 +370,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     state::ADDON_SERVICE_ACCOUNT_ROLE_ARN_REFUSAL.to_string(),
                 ));
             }
+        }
+
+        // STILL BEFORE THE STORE — the request's COMPLETENESS. `addonName` is the
+        // parameter that says WHAT to install, and the model makes it `@required`, so a
+        // request that names no add-on at all asks for nothing: there is no name for
+        // the catalog to be asked about and nothing for any cluster to hold. Amazon EKS
+        // answers such a request with the sentence it states for that parameter
+        // ([`crate::state::parameter_required_message`]) rather than with the cluster it
+        // was addressed to, and it answers it whether the member is absent — which this
+        // service's codec reads as blank — or present and blank, because the two name an
+        // add-on equally little. A value that is present and NAMES something, but
+        // nothing an add-on could be called, is a different refusal: it is judged with
+        // the rest of the body, below, after the cluster.
+        if input.addon_name.trim().is_empty() {
+            return Err(invalid_parameter(state::parameter_required_message(
+                ADDON_NAME_MEMBER,
+            )));
         }
 
         let mut guard = store.lock();
@@ -444,9 +478,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &cluster_version,
                 now,
             ) {
-                return Err(invalid_parameter_about_the_addon(
-                    state::ADDON_VERSION_NOT_SUPPORTED_MESSAGE.to_string(),
-                ));
+                // The two identity members of THIS refusal carry each other's request
+                // parameter, which is the shape the service this emulates answers a
+                // build it does not offer with
+                // ([`crate::state::addon_version_not_supported`]) — unlike the add-on
+                // refusals around it, which report each name in its own member.
+                return Err(CreateAddonErrorModeled::InvalidParameterException(
+                    state::addon_version_not_supported(&input.cluster_name, &input.addon_name),
+                )
+                .into());
             }
         }
         // The build this install runs: the caller's version when it named one, else
@@ -547,13 +587,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let mut seen_service_accounts = ::std::collections::BTreeSet::new();
         for association in &requested_associations {
-            if !state::is_iam_role_arn(&association.role_arn) {
-                return Err(invalid_parameter(format!(
-                    "podIdentityAssociations[].roleArn {:?} is not an IAM role ARN of the \
-                     form arn:<partition>:iam::<account>:role/<name>.",
-                    association.role_arn
-                )));
-            }
+            // The entry's `roleArn` is judged with the request's own addressing, at the
+            // top of this handler: it names the same role `serviceAccountRoleArn` does,
+            // so it earns the same refusal and earns it before the cluster is resolved.
             if !state::is_kubernetes_name(&association.service_account) {
                 return Err(invalid_parameter(format!(
                     "podIdentityAssociations[].serviceAccount {:?} is not a Kubernetes \

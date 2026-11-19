@@ -43,6 +43,28 @@
 //!   it DOES hold and that signs for it is `ResourceInUseException` (409) in the
 //!   fixed sentence that names the remediation. Rows differ along the shape of the
 //!   id.
+//! * A `serviceAccountRoleArn` — OR A `podIdentityAssociations` ENTRY'S `roleArn`,
+//!   which names the same role — THAT NAMES NO ROLE A MEMBER OF THIS API COULD CARRY
+//!   is `InvalidParameterException` (400) with the sentence this API states for the
+//!   add-on's service account role and NOTHING else in the payload — answered before
+//!   the cluster the request is addressed to is resolved and before the rest of its
+//!   body is judged, because the role the request hands Amazon EKS belongs to the
+//!   request's own addressing. Rows differ along which member carries the role, how the
+//!   value names no role, what else the request gets wrong, the operation and whether
+//!   the cluster exists.
+//! * A `CreateAddon` THAT NAMES NO ADD-ON AT ALL is `InvalidParameterException` (400)
+//!   with the sentence this API states for that parameter, answered before the cluster
+//!   is resolved: the request asks for nothing, so there is nothing for any cluster to
+//!   hold. Rows differ along how the request names no add-on and along whether the
+//!   cluster exists; a value that names something no add-on can be called is the
+//!   contrast row, refused after the cluster as the body complaint it is.
+//! * AN ADD-ON BUILD THE CATALOG DOES NOT OFFER is `InvalidParameterException` (400)
+//!   in one fixed sentence whose payload reports the ADD-ON in `clusterName` and the
+//!   CLUSTER in `addonName` — the two identity members carry each other's request
+//!   parameter, which is how the service this emulates answers that one refusal class.
+//!   Rows differ along the cluster, the add-on, how the build misses and the operation
+//!   that pins it, and the contrast row is the neighbouring refusal of an add-on NAME
+//!   the catalog publishes nothing for, which reports each name in its own member.
 //!
 //! Each suite also checks the helper the handlers compose the sentence with against
 //! the text written out here, so neither the handlers nor the shared helper can drift
@@ -61,9 +83,11 @@
 use std::time::{Duration, Instant};
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    access_policy_arn, cancel_update_not_found_message, cluster_deletion_protected,
-    derive_cluster_resource_id, describe_update_not_found_message, ACCESS_ENTRY_ALREADY_IN_USE,
+    cluster_not_found_message, parameter_required_message, access_policy_arn,
+    cancel_update_not_found_message, cluster_deletion_protected, derive_cluster_resource_id,
+    describe_update_not_found_message, ACCESS_ENTRY_ALREADY_IN_USE,
     ACCESS_ENTRY_INVALID_NEXT_TOKEN_MESSAGE, ACTIVE_CERTIFICATE_AUTHORITY_UNDELETABLE,
+    ADDON_SERVICE_ACCOUNT_ROLE_ARN_REFUSAL, ADDON_VERSION_NOT_SUPPORTED_MESSAGE,
     CLUSTER_NOT_ACTIVE_FOR_UPDATE, INVALID_NEXT_TOKEN_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -1281,4 +1305,531 @@ async fn an_unknown_certificate_authority_id_is_refused_naming_the_id_and_the_cl
         "the constant this refusal is worded with must be AWS's sentence, got \
          {ACTIVE_CERTIFICATE_AUTHORITY_UNDELETABLE:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// RULE: the role an add-on request hands Amazon EKS is part of the request's OWN
+// ADDRESSING, so a `serviceAccountRoleArn` — or a `podIdentityAssociations` entry's
+// `roleArn`, which names the same role — that names no role a member of this API
+// could carry is 400 InvalidParameterException with the sentence this API states for
+// that role and nothing else in the payload, answered before the cluster the request
+// is addressed to is resolved and before the rest of its body is judged.
+// ---------------------------------------------------------------------------
+
+/// `CreateAddon`: `POST /clusters/{clusterName}/addons`.
+async fn create_addon(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    body: &serde_json::Value,
+) -> Answer {
+    call(
+        router,
+        REGION,
+        "POST",
+        &format!("/clusters/{}/addons", encode_label(cluster)),
+        &body.to_string(),
+    )
+    .await
+}
+
+/// `UpdateAddon`: `POST /clusters/{clusterName}/addons/{addonName}/update`.
+async fn update_addon(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    addon: &str,
+    body: &serde_json::Value,
+) -> Answer {
+    call(
+        router,
+        REGION,
+        "POST",
+        &format!(
+            "/clusters/{}/addons/{}/update",
+            encode_label(cluster),
+            encode_label(addon)
+        ),
+        &body.to_string(),
+    )
+    .await
+}
+
+/// `DescribeAddon`: `GET /clusters/{clusterName}/addons/{addonName}`.
+async fn describe_addon(router: &MultiServiceRouter, cluster: &str, addon: &str) -> Answer {
+    call(
+        router,
+        REGION,
+        "GET",
+        &format!(
+            "/clusters/{}/addons/{}",
+            encode_label(cluster),
+            encode_label(addon)
+        ),
+        "",
+    )
+    .await
+}
+
+/// One installed add-on, READ BACK until the install has settled out of `CREATING`
+/// — the precondition an update needs. The condition is waited for by looking again,
+/// never by waiting out the span the clock owes the install.
+async fn settled_addon(router: &MultiServiceRouter, case: &str, cluster: &str, addon: &str) {
+    let created = create_addon(
+        router,
+        cluster,
+        &serde_json::json!({ "addonName": addon }),
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: setup CreateAddon {addon:?} expected 200, got {created:?}"
+    );
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        let answer = describe_addon(router, cluster, addon).await;
+        if answer.status == 200 && answer.addon()["status"] != serde_json::json!("CREATING") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the add-on {addon:?} never settled, last read {answer:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The role-ARN prefix of the one account this emulator serves, read off the engine
+/// rather than written out, which every role row below builds on.
+fn role_prefix() -> String {
+    format!("arn:aws:iam::{}:role/", engine::emulator_account_id())
+}
+
+/// A role ARN of exactly `length` characters whose role name and path are both inside
+/// the grammar IAM publishes: the prefix, one path segment, and a one-character role
+/// name. What the rows at the published bound of the modelled `RoleArn` length, and
+/// one past it, are built from.
+fn role_arn_of_length(length: usize) -> String {
+    let prefix = role_prefix();
+    // `<prefix><path>/<name>`, with `<name>` one character and `<path>` filling the
+    // rest: printable ASCII, which is what a path segment takes.
+    let path = "a".repeat(length - prefix.chars().count() - 2);
+    format!("{prefix}{path}/R")
+}
+
+/// An add-on the catalog publishes a build of for every Kubernetes version, so a row
+/// meant to be refused for its role is never refused for its add-on name.
+const ROLE_ROW_ADDON: &str = "vpc-cni";
+
+/// The add-on's own role member, as the model spells it.
+const SERVICE_ACCOUNT_ROLE_ARN: &str = "serviceAccountRoleArn";
+/// The other member the SAME role travels in: the `roleArn` of a
+/// `podIdentityAssociations` entry, which binds that role to the add-on's Kubernetes
+/// service account through EKS Pod Identity.
+const ASSOCIATION_ROLE_ARN: &str = "podIdentityAssociations[].roleArn";
+
+/// One add-on request body naming `role` in `member`, for the two members an add-on
+/// request names the role its service account is given in.
+fn body_naming_the_role(member: &str, addon: &str, role: &str) -> serde_json::Value {
+    if member == SERVICE_ACCOUNT_ROLE_ARN {
+        serde_json::json!({ "addonName": addon, "serviceAccountRoleArn": role })
+    } else {
+        serde_json::json!({
+            "addonName": addon,
+            "podIdentityAssociations": [{ "serviceAccount": "sa", "roleArn": role }],
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_role_that_names_no_role_is_refused_before_the_cluster_and_before_the_body() {
+    const CLUSTER: &str = "addon-role-refusal";
+    const GHOST: &str = "addon-role-refusal-ghost";
+    let router = emulator();
+    active_cluster(&router, "setup", CLUSTER).await;
+    settled_addon(&router, "setup", CLUSTER, ROLE_ROW_ADDON).await;
+
+    let prefix = role_prefix();
+    // HOW the value names no role a member of this API could carry. The first rows
+    // miss the grammar IAM publishes for a role (`roleNameType` is `@length(1..64)` +
+    // `@pattern ^[\w+=,.@-]+$`, `pathType` is printable ASCII between slashes:
+    // `smithy_query query="shape" shape="roleNameType,pathType"` on the IAM model);
+    // the last is one character past the length the model states for this API's own
+    // `RoleArn` (`@length(1..255)`), which is also a value the boundary walk refuses.
+    //
+    // The third element is the members the row is refused in. A value that is not an
+    // ARN AT ALL is the one that differs: in `serviceAccountRoleArn` it is the role the
+    // request asks Amazon EKS to PASS, so it earns the pass-role denial (asserted just
+    // below, and owned as a value table by the `pass_role_authorization` suite), while
+    // in a `podIdentityAssociations` entry it is a parameter of the add-on and earns
+    // this refusal. Every other row names a role of this account, which no pass-role
+    // denial applies to, so both members refuse it the same way.
+    let both = vec![SERVICE_ACCOUNT_ROLE_ARN, ASSOCIATION_ROLE_ARN];
+    let names_no_role: Vec<(&str, String, Vec<&str>)> = vec![
+        (
+            "a bare role name where an ARN belongs",
+            "AmazonEKS_Addon_DriverRole".to_string(),
+            vec![ASSOCIATION_ROLE_ARN],
+        ),
+        (
+            "a space in the role name",
+            format!("{prefix}Addon Role"),
+            both.clone(),
+        ),
+        (
+            "a character outside the role-name set",
+            format!("{prefix}Addon*Role"),
+            both.clone(),
+        ),
+        (
+            "a role name one character past its published maximum",
+            format!("{prefix}{}", "r".repeat(65)),
+            both.clone(),
+        ),
+        (
+            "an empty path segment",
+            format!("{prefix}/AddonRole"),
+            both.clone(),
+        ),
+        (
+            "an ARN one character past the modelled maximum",
+            role_arn_of_length(256),
+            // `serviceAccountRoleArn` targets `RoleArn`, which the model states as
+            // `@length(1..255)`, so a value past it is refused by the boundary walk
+            // before any handler runs and keeps the framework's own violation report
+            // (the `addon_request_validation` suite pins that). An association's
+            // `roleArn` targets a plain `String`, which the walk cannot bound, so this
+            // is the refusal it earns.
+            vec![ASSOCIATION_ROLE_ARN],
+        ),
+    ];
+
+    // The sibling class the first row names in the other member: the role the request
+    // asks Amazon EKS to pass, when the value names no role of this account, is the
+    // pass-role denial — 403, and not this refusal.
+    let passed = create_addon(
+        &router,
+        GHOST,
+        &body_naming_the_role(
+            SERVICE_ACCOUNT_ROLE_ARN,
+            ROLE_ROW_ADDON,
+            "AmazonEKS_Addon_DriverRole",
+        ),
+    )
+    .await;
+    assert_eq!(
+        (passed.status, error_code(&passed).as_str()),
+        (403, "AccessDeniedException"),
+        "case CreateAddon asking Amazon EKS to pass a value that is no ARN: expected 403 \
+         AccessDeniedException, got {passed:?}"
+    );
+
+    // WHAT ELSE the same request gets wrong: nothing, an add-on name the catalog
+    // publishes no build of, and a configuration document that cannot be read at all.
+    // Each of those is a complaint about the body, which this API answers after the
+    // cluster — so the role's own refusal has to reach the caller ahead of all of them.
+    let also_wrong = [
+        ("nothing else", serde_json::json!({})),
+        (
+            "an add-on name the catalog publishes nothing for",
+            serde_json::json!({ "addonName": "definitely-not-an-addon" }),
+        ),
+        (
+            "a configuration document that cannot be read",
+            serde_json::json!({ "configurationValues": "{nope" }),
+        ),
+    ];
+
+    for (how, role, members) in &names_no_role {
+        for member in members {
+            let member = *member;
+            for (what_else, extra) in &also_wrong {
+                for operation in ["CreateAddon", "UpdateAddon"] {
+                    for addressed in [GHOST, CLUSTER] {
+                        let case = format!(
+                            "{operation} naming {how} in {member} and {what_else} on cluster \
+                             {addressed:?}"
+                        );
+                        let mut body = body_naming_the_role(member, ROLE_ROW_ADDON, role);
+                        for (extra_member, value) in extra.as_object().expect("a map of members")
+                        {
+                            body[extra_member] = value.clone();
+                        }
+                        let refused = if operation == "CreateAddon" {
+                            create_addon(&router, addressed, &body).await
+                        } else {
+                            update_addon(&router, addressed, ROLE_ROW_ADDON, &body).await
+                        };
+                        assert_eq!(
+                            (refused.status, error_code(&refused).as_str()),
+                            (400, "InvalidParameterException"),
+                            "case {case:?}: expected 400 InvalidParameterException, got \
+                             {refused:?}"
+                        );
+                        let actual = refused.message();
+                        assert_eq!(
+                            actual, ADDON_SERVICE_ACCOUNT_ROLE_ARN_REFUSAL,
+                            "case {case:?}: expected the add-on role sentence, got {actual:?}"
+                        );
+                        assert!(
+                            refused.body.get("clusterName").is_none()
+                                && refused.body.get("addonName").is_none(),
+                            "case {case:?}: nothing is resolved when the role is judged, so \
+                             this refusal carries the sentence alone, got {:?}",
+                            refused.body
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // THE CONTROLS: a value that DOES name a role this API takes leaves every other
+    // problem of the same request to be answered as it would be without it — the
+    // missing cluster on the ghost, the body's own refusal on the cluster that exists.
+    // The second row is the role ARN at exactly the modelled maximum, the bound the
+    // last refused row above is one character past.
+    for (how, role) in [
+        (
+            "a role inside every grammar",
+            format!("{prefix}AddonServiceAccountRole"),
+        ),
+        (
+            "an ARN at exactly the modelled maximum",
+            role_arn_of_length(255),
+        ),
+    ] {
+        for member in [SERVICE_ACCOUNT_ROLE_ARN, ASSOCIATION_ROLE_ARN] {
+            let mut body = body_naming_the_role(member, ROLE_ROW_ADDON, &role);
+            body["configurationValues"] = serde_json::json!("{nope");
+            let missing = create_addon(&router, GHOST, &body).await;
+            assert_eq!(
+                (missing.status, error_code(&missing).as_str()),
+                (404, "ResourceNotFoundException"),
+                "case CreateAddon naming {how} in {member} on an unknown cluster: expected 404 \
+                 ResourceNotFoundException, got {missing:?}"
+            );
+            assert_eq!(
+                missing.message(),
+                cluster_not_found_message(GHOST),
+                "case CreateAddon naming {how} in {member} on an unknown cluster: expected the \
+                 missing-cluster sentence, got {:?}",
+                missing.message()
+            );
+            let on_cluster = create_addon(&router, CLUSTER, &body).await;
+            assert_eq!(
+                on_cluster.status, 400,
+                "case CreateAddon naming {how} in {member} with an unreadable configuration on \
+                 an existing cluster: expected HTTP 400, got {on_cluster:?}"
+            );
+            assert_ne!(
+                on_cluster.message(),
+                ADDON_SERVICE_ACCOUNT_ROLE_ARN_REFUSAL,
+                "case CreateAddon naming {how} in {member} with an unreadable configuration on \
+                 an existing cluster: the body's own refusal is what is reported, got {:?}",
+                on_cluster.message()
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE: a `CreateAddon` that names NO ADD-ON at all asks for nothing, so it is 400
+// InvalidParameterException with the sentence this API states for that parameter,
+// answered before the cluster the request is addressed to is resolved. A value that
+// names SOMETHING no add-on can be called is a complaint about the body, answered
+// after that resolution.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_addon_request_that_names_no_addon_is_refused_before_the_cluster() {
+    const CLUSTER: &str = "addon-required-name";
+    const GHOST: &str = "addon-required-name-ghost";
+    let router = emulator();
+    active_cluster(&router, "setup", CLUSTER).await;
+
+    // HOW the request names no add-on: the member left out altogether, and present but
+    // carrying nothing — blank, or whitespace, which names an add-on equally little.
+    let names_nothing = [
+        ("the member left out", serde_json::json!({})),
+        ("an empty value", serde_json::json!({ "addonName": "" })),
+        ("a value of blanks", serde_json::json!({ "addonName": "   " })),
+    ];
+
+    let expected = parameter_required_message("addonName");
+    for (how, body) in &names_nothing {
+        for addressed in [GHOST, CLUSTER] {
+            let case = format!("CreateAddon with {how} on cluster {addressed:?}");
+            let refused = create_addon(&router, addressed, body).await;
+            assert_eq!(
+                (refused.status, error_code(&refused).as_str()),
+                (400, "InvalidParameterException"),
+                "case {case:?}: expected 400 InvalidParameterException, got {refused:?}"
+            );
+            let actual = refused.message();
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    // THE CONTRAST: a value that names something, but nothing an add-on can be called,
+    // is a complaint about the body — so on a cluster that does not exist the missing
+    // cluster is what is reported, and on one that does the value earns its own
+    // refusal.
+    for named in ["not an addon name", "vpc cni", "definitely-not-an-addon"] {
+        let body = serde_json::json!({ "addonName": named });
+        let missing = create_addon(&router, GHOST, &body).await;
+        assert_eq!(
+            (missing.status, error_code(&missing).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case CreateAddon naming {named:?} on an unknown cluster: expected 404 \
+             ResourceNotFoundException, got {missing:?}"
+        );
+        let on_cluster = create_addon(&router, CLUSTER, &body).await;
+        assert_eq!(
+            on_cluster.status, 400,
+            "case CreateAddon naming {named:?} on an existing cluster: expected HTTP 400, got \
+             {on_cluster:?}"
+        );
+        assert_ne!(
+            on_cluster.message(),
+            expected,
+            "case CreateAddon naming {named:?}: a value that names something is not the \
+             required-parameter refusal, got {:?}",
+            on_cluster.message()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE: an add-on BUILD the catalog does not offer is 400
+// InvalidParameterException in one fixed sentence, and its payload reports the
+// ADD-ON in `clusterName` and the CLUSTER in `addonName` — each identity member
+// the value of the OTHER request parameter, which is how the service this emulates
+// answers that one refusal class. The neighbouring refusal of an add-on NAME the
+// catalog publishes nothing for reports each name in its own member.
+// ---------------------------------------------------------------------------
+
+/// The two identity members of a refusal payload, as the strings a client reads.
+fn reported_names(answer: &Answer) -> (String, String) {
+    (
+        answer.body["clusterName"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        answer.body["addonName"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+#[tokio::test]
+async fn an_addon_build_the_catalog_does_not_offer_reports_the_two_names_transposed() {
+    const CLUSTER: &str = "addon-build-refusal";
+    const OTHER_CLUSTER: &str = "addon-build-refusal-other";
+    let router = emulator();
+    active_cluster(&router, "setup", CLUSTER).await;
+    active_cluster(&router, "setup", OTHER_CLUSTER).await;
+    settled_addon(&router, "setup", CLUSTER, ROLE_ROW_ADDON).await;
+
+    // HOW the build the request pins misses the set the catalog offers the cluster: a
+    // value in the published form that nothing publishes, and one that is no version
+    // at all. Both earn the one fixed sentence this class carries.
+    let builds = [
+        ("a build nothing publishes", "v9.99.0-eksbuild.1"),
+        ("a value that is not a version at all", "latest"),
+    ];
+
+    // Two clusters and two add-ons the catalog publishes, so what each member carries
+    // is read off the request rather than off one pair of names.
+    for cluster in [CLUSTER, OTHER_CLUSTER] {
+        for addon in [ROLE_ROW_ADDON, "coredns"] {
+            for (how, build) in builds {
+                let case = format!("CreateAddon {addon:?} on {cluster:?} pinning {how}");
+                let refused = create_addon(
+                    &router,
+                    cluster,
+                    &serde_json::json!({ "addonName": addon, "addonVersion": build }),
+                )
+                .await;
+                assert_eq!(
+                    (refused.status, error_code(&refused).as_str()),
+                    (400, "InvalidParameterException"),
+                    "case {case:?}: expected 400 InvalidParameterException, got {refused:?}"
+                );
+                let actual = refused.message();
+                assert_eq!(
+                    actual, ADDON_VERSION_NOT_SUPPORTED_MESSAGE,
+                    "case {case:?}: expected the build sentence, got {actual:?}"
+                );
+                let (reported_cluster, reported_addon) = reported_names(&refused);
+                assert_eq!(
+                    (reported_cluster.as_str(), reported_addon.as_str()),
+                    (addon, cluster),
+                    "case {case:?}: expected clusterName {addon:?} and addonName {cluster:?}, \
+                     got clusterName {reported_cluster:?} and addonName {reported_addon:?}"
+                );
+            }
+        }
+    }
+
+    // The same rule from the UPDATE, on the add-on installed above: one refusal class,
+    // one payload shape, whichever operation pinned the build.
+    for (how, build) in builds {
+        let case = format!("UpdateAddon {ROLE_ROW_ADDON:?} on {CLUSTER:?} pinning {how}");
+        let refused = update_addon(
+            &router,
+            CLUSTER,
+            ROLE_ROW_ADDON,
+            &serde_json::json!({ "addonVersion": build }),
+        )
+        .await;
+        assert_eq!(
+            (refused.status, error_code(&refused).as_str()),
+            (400, "InvalidParameterException"),
+            "case {case:?}: expected 400 InvalidParameterException, got {refused:?}"
+        );
+        let actual = refused.message();
+        assert_eq!(
+            actual, ADDON_VERSION_NOT_SUPPORTED_MESSAGE,
+            "case {case:?}: expected the build sentence, got {actual:?}"
+        );
+        let (reported_cluster, reported_addon) = reported_names(&refused);
+        assert_eq!(
+            (reported_cluster.as_str(), reported_addon.as_str()),
+            (ROLE_ROW_ADDON, CLUSTER),
+            "case {case:?}: expected clusterName {ROLE_ROW_ADDON:?} and addonName \
+             {CLUSTER:?}, got clusterName {reported_cluster:?} and addonName \
+             {reported_addon:?}"
+        );
+    }
+
+    // THE CONTRAST: the neighbouring refusal — an add-on NAME the catalog publishes no
+    // build of — is its own class, and it reports each name in its own member. So the
+    // shape above belongs to the build refusal rather than to add-on refusals at
+    // large, and a fix for one cannot be a blanket swap.
+    for cluster in [CLUSTER, OTHER_CLUSTER] {
+        for addon in ["definitely-not-an-addon", "vpc-cni-but-not-really"] {
+            let case = format!("CreateAddon {addon:?} on {cluster:?}, a name nothing publishes");
+            let refused = create_addon(
+                &router,
+                cluster,
+                &serde_json::json!({ "addonName": addon }),
+            )
+            .await;
+            assert_eq!(
+                (refused.status, error_code(&refused).as_str()),
+                (400, "InvalidParameterException"),
+                "case {case:?}: expected 400 InvalidParameterException, got {refused:?}"
+            );
+            let (reported_cluster, reported_addon) = reported_names(&refused);
+            assert_eq!(
+                (reported_cluster.as_str(), reported_addon.as_str()),
+                (cluster, addon),
+                "case {case:?}: expected clusterName {cluster:?} and addonName {addon:?}, got \
+                 clusterName {reported_cluster:?} and addonName {reported_addon:?}"
+            );
+        }
+    }
 }

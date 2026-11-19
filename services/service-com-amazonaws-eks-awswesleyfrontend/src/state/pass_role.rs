@@ -6,6 +6,8 @@
 //!
 //! It needs nothing from the store: the question is decided from the value alone.
 
+use crate::ops::types::AddonPodIdentityAssociations;
+
 /// The refusal a request that asks Amazon EKS to pass a role that is not a role
 /// of the caller's OWN account earns.
 ///
@@ -99,6 +101,55 @@ pub fn names_a_role_iam_could_hold(role_arn: &str) -> bool {
         .iter()
         .all(|segment| !segment.is_empty() && segment.bytes().all(|byte| (0x21..=0x7E).contains(&byte)));
     named && pathed
+}
+
+/// The longest role ARN this API takes: every member of this service that carries
+/// one targets `RoleArn`, which the model states as `@length(1..255)`
+/// (`smithy_query(query="shape",shape="RoleArn",
+/// model_path="services/service-com-amazonaws-eks-awswesleyfrontend/smithy-model/com-amazonaws-eks-awswesleyfrontend.json")`).
+const MAX_ROLE_ARN_LEN: usize = 255;
+
+/// Whether `role_arn` names a role a member of this API could carry at all: a
+/// value inside the length the model states for `RoleArn` that names a role IAM
+/// could hold ([`names_a_role_iam_could_hold`]).
+///
+/// The two readings are ONE question — is this a role this service could be
+/// handed? — and they are asked together so that a value outside the modelled
+/// length is answered in the sentence the operation states for that parameter
+/// rather than as whatever the boundary walk reports about the member: a caller
+/// is told the same thing about a role ARN that names no role whether or not it
+/// is also too long.
+pub fn names_a_role_this_api_takes(role_arn: &str) -> bool {
+    (1..=MAX_ROLE_ARN_LEN).contains(&role_arn.chars().count())
+        && names_a_role_iam_could_hold(role_arn)
+}
+
+/// The first role value an ADD-ON request hands Amazon EKS that names no role a
+/// member of this API could carry, or `None` when every one of them does.
+///
+/// An add-on request names the role its Kubernetes service account is given in TWO
+/// members: `serviceAccountRoleArn`, and the `roleArn` of each
+/// `podIdentityAssociations` entry — the same role, bound through EKS Pod Identity
+/// instead of through the cluster's OIDC provider. The recorded service refuses an
+/// unusable value in EITHER with the one sentence it states for the add-on's service
+/// account role ([`ADDON_SERVICE_ACCOUNT_ROLE_ARN_REFUSAL`]): a bare role name where
+/// an ARN belongs earns it exactly as a role name outside the grammar IAM publishes
+/// does.
+///
+/// Reading both members in one place is what keeps the pre-dispatch layer and the two
+/// add-on handlers to a single answer about the same value.
+pub fn addon_role_naming_no_role<'request>(
+    service_account_role_arn: Option<&'request str>,
+    associations: &'request [AddonPodIdentityAssociations],
+) -> Option<&'request str> {
+    service_account_role_arn
+        .into_iter()
+        .chain(
+            associations
+                .iter()
+                .map(|association| association.role_arn.as_str()),
+        )
+        .find(|role_arn| !names_a_role_this_api_takes(role_arn))
 }
 
 /// The service principal the EKS connector role must let assume it: the cluster

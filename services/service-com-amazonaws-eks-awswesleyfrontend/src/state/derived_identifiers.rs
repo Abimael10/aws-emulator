@@ -5,6 +5,7 @@
 //! ARNs each resource of this service carries.
 
 use super::*;
+use crate::ops::types::InvalidParameterException;
 
 /// The region a request is signed for, read from its SigV4 credential scope.
 ///
@@ -343,6 +344,31 @@ pub fn addon_not_updatable_message(addon_name: &str, status: &str) -> String {
 /// one it does not publish at all, and one whose `compatibilities` do not carry
 /// that Kubernetes version.
 pub const ADDON_VERSION_NOT_SUPPORTED_MESSAGE: &str = "Addon version specified is not supported";
+
+/// The whole `InvalidParameterException` payload an add-on BUILD the catalog does
+/// not offer is refused with: the sentence above, and the two identity members
+/// CARRYING EACH OTHER'S REQUEST PARAMETER — `clusterName` the add-on name the
+/// request asked for, `addonName` the cluster it addressed.
+///
+/// That is how the service this emulates answers THIS refusal class, as its
+/// recorded answer to an `addonVersion` it does not offer shows, and it is not how
+/// it answers the add-on refusals around it: a name the catalog publishes no build
+/// of reports each name in its own member ([`addon_not_supported_message`]'s
+/// refusal), and a refusal about the request's own text reports neither. So the
+/// payload is built here once, beside the sentence, rather than assembled at each
+/// call site: every operation that refuses a build answers the one shape, and a
+/// client reading either member reads what the service it emulates puts there.
+pub fn addon_version_not_supported(
+    cluster_name: &str,
+    addon_name: &str,
+) -> InvalidParameterException {
+    InvalidParameterException {
+        cluster_name: Some(addon_name.to_string()),
+        addon_name: Some(cluster_name.to_string()),
+        message: Some(ADDON_VERSION_NOT_SUPPORTED_MESSAGE.to_string()),
+        ..Default::default()
+    }
+}
 
 /// The digest one registration's server-generated values are derived from.
 ///
