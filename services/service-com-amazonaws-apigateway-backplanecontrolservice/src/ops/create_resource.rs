@@ -333,23 +333,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let parent_path = {
-            // A resource is created ON a parent resource, so the `(restApiId, parentId)`
-            // pair is resolved as ONE lookup for that parent: an identifier no stored API
-            // answers to leaves the parent unresolvable too, and the refusal names the
-            // resource the new one would hang off rather than the API above it.
-            let parent_path = store
-                .resource(&input.rest_api_id, &input.parent_id)
-                .map_err(|message| {
+            // The `restApiId` is resolved FIRST, and on its own: a create that names no
+            // stored API is refused for the API it could not resolve
+            // ([`crate::state::no_such_rest_api`]), before anything is asked of the parent
+            // the new resource would hang off. The parent is then resolved INSIDE that API,
+            // so the resource sentence answers a `parentId` that names no resource of an
+            // API that does exist.
+            let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+                CreateResourceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+                })
+            })?;
+            let parent_path = api
+                .resources
+                .get(&input.parent_id)
+                .ok_or_else(|| {
                     CreateResourceErrorModeled::NotFoundException(NotFoundException {
-                        message: Some(message),
+                        message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
                     })
                 })?
                 .path
                 .clone();
-            let api = store
-                .rest_apis
-                .get(&input.rest_api_id)
-                .ok_or_else(crate::state::state_unavailable)?;
             // One resource per request, and at most this many per API: the store cannot
             // grow past the quota however many requests arrive.
             if api.resources.len() >= crate::state::MAX_RESOURCES_PER_API {

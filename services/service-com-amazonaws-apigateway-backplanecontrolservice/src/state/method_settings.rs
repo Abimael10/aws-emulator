@@ -6,13 +6,14 @@
 //! `Stage$methodSettings` is "a map that defines the method settings for a Stage resource.
 //! Keys (designated as /{method_setting_key) are method paths defined as
 //! `{resource_path}/{http_method}` for an individual method override, or `/*/*` for
-//! overriding all methods in the stage". So one key is the METHOD PATH itself: the resource
-//! path, a separator, then the HTTP method, with every separator written as a separator. The
-//! `~1` of `PatchOperation$path` ("Any slash ("/") character appearing in path names must be
-//! escaped with "~1"") belongs to the POINTER that addresses an entry, not to the key the
-//! entry is held and reported under, so it never appears in a key; the resource path's own
-//! LEADING separator is the one the key leaves out, which is how the documented whole-stage
-//! path `/*/*` is keyed `*/*`.
+//! overriding all methods in the stage". So one key is the METHOD PATH: the resource path,
+//! then a separator, then the HTTP method — and API Gateway reports the resource path half
+//! the way a patch path NAMES it, with every separator inside it escaped `~1` the way
+//! `PatchOperation$path` requires of a path name ("Any slash ("/") character appearing in
+//! path names must be escaped with "~1""). A method of the resource `/pets` is therefore
+//! keyed `~1pets/GET`, the root resource's `~1/GET`, and the documented whole-stage path
+//! `/*/*` — whose resource half names no resource path at all — `*/*`. Only the separator
+//! BEFORE the HTTP method is a literal one.
 //!
 //! A `UpdateStage` patch may spell the same method several ways — the escape may stand for
 //! the leading separator or be left to the pointer's own, and the resource path and the HTTP
@@ -35,19 +36,29 @@ pub const EVERY_RESOURCE: &str = "*";
 /// The `methodSettings` key the method `http_method` of `resource_path` is held under.
 ///
 /// `resource_path` is the resource path as a reader of it has it — decoded, so its separators
-/// are real ones. A resource path "begins with a '/'" (`Resource$path`), and that leading
-/// separator is the one the method path leaves out: the key is the resource path's remainder,
-/// every separator in it a separator, then the separator before the HTTP method, then the
-/// method. A caller that left the leading separator to the pointer's own therefore addressed
-/// the same resource as one that escaped it, and both are keyed the one way.
+/// are real ones — or that path with its LEADING separator left to a pointer's own, which is
+/// how a two-token patch path spells it. A resource path "begins with a '/'"
+/// (`Resource$path`), so the missing leading separator is restored and the whole path is then
+/// written as a path NAME: every separator in it escaped `~1`, as `PatchOperation$path`
+/// requires of one, with `~` itself escaped `~0` ahead of it the way a JSON Pointer token is
+/// built. The literal separator that follows carries the HTTP method.
 ///
 /// The wildcard is the one key that names no resource path: `Stage$methodSettings` documents
-/// the whole-stage method path `/*/*` and keys it `*/*`, which is what dropping that leading
-/// separator gets it — the same rule, not a case of its own.
+/// the whole-stage method path `/*/*` and keys it `*/*`, so that half is carried over as it
+/// stands rather than escaped.
 #[must_use]
 pub fn method_settings_key(resource_path: &str, http_method: &str) -> String {
-    let unprefixed = resource_path.strip_prefix('/').unwrap_or(resource_path);
-    format!("{unprefixed}/{http_method}")
+    let resource = if resource_path == EVERY_RESOURCE
+        || resource_path.strip_prefix('/') == Some(EVERY_RESOURCE)
+    {
+        EVERY_RESOURCE.to_string()
+    } else {
+        let path = resource_path.strip_prefix('/').unwrap_or(resource_path);
+        // The leading separator the path begins with, escaped like every other one it
+        // carries: `~` first, so an escape this builds is never re-escaped.
+        format!("/{path}").replace('~', "~0").replace('/', "~1")
+    };
+    format!("{resource}/{http_method}")
 }
 
 #[cfg(test)]
@@ -55,9 +66,9 @@ mod tests {
     use super::*;
 
     /// RULE: a key is the method path `{resource_path}/{http_method}` — the resource path
-    /// without its leading separator and with every other separator literal, joined to the
-    /// HTTP method — whatever spelling of the resource path it is derived from, and `*/*`
-    /// for every method of the stage.
+    /// written as a path name, with every separator in it escaped `~1`, then a literal
+    /// separator and the HTTP method — whatever spelling of the resource path it is derived
+    /// from, and `*/*` for every method of the stage.
     #[test]
     fn a_key_names_the_method_however_its_resource_path_was_spelled() {
         // Rows span the DEPTH of the resource path (the root, a child, a nested one), both
@@ -65,17 +76,32 @@ mod tests {
         // — which a caller spells with that separator or without it, as the two readers of a
         // method path hand it over.
         let rows: [(&str, &str, &str, &str); 10] = [
-            ("a child resource", "/pets", "GET", "pets/GET"),
-            ("a child resource, leading separator left out", "pets", "GET", "pets/GET"),
-            ("a nested resource", "/pets/{petId}", "DELETE", "pets/{petId}/DELETE"),
+            ("a child resource", "/pets", "GET", "~1pets/GET"),
+            (
+                "a child resource, leading separator left out",
+                "pets",
+                "GET",
+                "~1pets/GET",
+            ),
+            (
+                "a nested resource",
+                "/pets/{petId}",
+                "DELETE",
+                "~1pets~1{petId}/DELETE",
+            ),
             (
                 "a nested resource, leading separator left out",
                 "pets/{petId}",
                 "DELETE",
-                "pets/{petId}/DELETE",
+                "~1pets~1{petId}/DELETE",
             ),
-            ("the root resource", "/", "GET", "/GET"),
-            ("the root resource, leading separator left out", "", "GET", "/GET"),
+            ("the root resource", "/", "GET", "~1/GET"),
+            (
+                "the root resource, leading separator left out",
+                "",
+                "GET",
+                "~1/GET",
+            ),
             ("every method of the stage", "*", "*", "*/*"),
             (
                 "every method of the stage, leading separator included",
@@ -84,7 +110,12 @@ mod tests {
                 "*/*",
             ),
             ("every resource at one verb", "*", "PUT", "*/PUT"),
-            ("every resource at one verb, leading separator included", "/*", "PUT", "*/PUT"),
+            (
+                "every resource at one verb, leading separator included",
+                "/*",
+                "PUT",
+                "*/PUT",
+            ),
         ];
 
         for (case, resource_path, http_method, expected) in rows {

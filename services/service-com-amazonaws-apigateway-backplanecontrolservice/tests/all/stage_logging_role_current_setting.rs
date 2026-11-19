@@ -108,9 +108,9 @@ fn rows() -> Vec<Row> {
         Row {
             case: "one named method at INFO, lowered to OFF again",
             enabling: vec![replace("/~1pets/GET/logging/loglevel", "INFO")],
-            enabled: vec![(method_setting("pets/GET", "loggingLevel"), json!("INFO"))],
+            enabled: vec![(method_setting("~1pets/GET", "loggingLevel"), json!("INFO"))],
             disabling: vec![replace("/~1pets/GET/logging/loglevel", "OFF")],
-            disabled: vec![(method_setting("pets/GET", "loggingLevel"), json!("OFF"))],
+            disabled: vec![(method_setting("~1pets/GET", "loggingLevel"), json!("OFF"))],
         },
         Row {
             case: "the data trace of every method, turned off again",

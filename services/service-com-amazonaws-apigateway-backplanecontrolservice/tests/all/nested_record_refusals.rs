@@ -14,7 +14,9 @@
 //! cannot exist without its API, so an API this account does not hold leaves the addressed
 //! record unresolvable too. The account-qualified identifier sentence
 //! (`Invalid API identifier specified <account>:<restApiId>`) belongs to a call whose own
-//! target IS the API, which `rest_api_identifier_refusals` asserts.
+//! target IS the API, which `rest_api_identifier_refusals` asserts, and to the one create
+//! that resolves the API as a precondition of its own before it looks at the parent it
+//! hangs the new record off (`CreateResource`, asserted below).
 //!
 //! The rows span what the rule generalises over rather than repeating one recorded call:
 //! both record families (the stage and the resource), every operation of this service
@@ -209,6 +211,11 @@ fn resource_child_requests(
 
 /// Every call of this service addressed by a RESOURCE of the API, with `api` and
 /// `resource` the address under test.
+///
+/// `CreateResource` is not among them: it resolves the `restApiId` as a precondition of its
+/// own, ahead of the parent it would hang the new resource off, so an unresolvable API is
+/// reported as the API there — see
+/// [`a_create_resource_reports_the_api_before_the_parent_it_cannot_resolve`].
 fn resource_requests(
     api: &str,
     resource: &str,
@@ -232,14 +239,8 @@ fn resource_requests(
             format!("/restapis/{api}/resources/{resource}"),
             None,
         ),
-        // The two calls that hang a NEW child off the resource: the child is being
-        // created, so the resource is the record whose existence the call needs.
-        (
-            "CreateResource",
-            "POST",
-            format!("/restapis/{api}/resources/{resource}"),
-            Some(json!({ "pathPart": "kittens" })),
-        ),
+        // The call that hangs a NEW child off the resource: the child is being created, so
+        // the resource is the record whose existence the call needs.
         (
             "PutMethod",
             "PUT",
@@ -423,6 +424,71 @@ async fn a_resource_addressed_call_reports_the_resource_it_cannot_resolve() {
         "case DeleteResource(stored pets): expected a success, got {} with {:?}",
         deleted.status,
         deleted.body
+    );
+}
+
+/// RULE: `CreateResource` resolves the `restApiId` as a precondition of its OWN, before the
+/// `parentId` the new resource would hang off, so an API this account does not hold is
+/// reported as the API — the account-qualified identifier sentence — and the fixed resource
+/// sentence answers only a `parentId` that names no resource of an API that DOES exist.
+#[tokio::test]
+async fn a_create_resource_reports_the_api_before_the_parent_it_cannot_resolve() {
+    let gateway = Gateway::new();
+    let (stored, root) = create_api(&gateway, "create-resource-precondition").await;
+    let parent = resource_under(&gateway, &stored, &root, "pets").await;
+
+    // The three ways the address of a create fails, each over unknown identifiers differing
+    // in length, alphabet and case: the API alone, the parent alone, and both at once. Where
+    // the API is unresolvable the API is what the refusal names, whatever the parent is.
+    for (index, unknown) in UNKNOWN_APIS.iter().enumerate() {
+        let unknown_parent = UNKNOWN_CHILDREN[index];
+        let rows = [
+            (
+                "an unresolvable api with a stored parent",
+                *unknown,
+                parent.as_str(),
+                crate::rest_api_identifier_refusals::no_such_api(unknown),
+            ),
+            (
+                "a stored api with an unresolvable parent",
+                stored.as_str(),
+                unknown_parent,
+                NO_SUCH_RESOURCE.to_string(),
+            ),
+            (
+                "an unresolvable api and parent",
+                *unknown,
+                unknown_parent,
+                crate::rest_api_identifier_refusals::no_such_api(unknown),
+            ),
+        ];
+        for (position, api, addressed, message) in rows {
+            let case = format!("CreateResource with {position} [{api} {addressed}]");
+            let answer = gateway
+                .call(
+                    "POST",
+                    &format!("/restapis/{api}/resources/{addressed}"),
+                    Some(json!({ "pathPart": "kittens" })),
+                )
+                .await;
+            assert_reports(&answer, &case, &message);
+        }
+    }
+
+    // The same call against the STORED address is served, so the refusals above are about
+    // the address and not about the request.
+    let created = gateway
+        .call(
+            "POST",
+            &format!("/restapis/{stored}/resources/{parent}"),
+            Some(json!({ "pathPart": "kittens" })),
+        )
+        .await;
+    assert!(
+        (200..300).contains(&created.status),
+        "case CreateResource(the stored parent): expected a success, got {} with {:?}",
+        created.status,
+        created.body
     );
 }
 

@@ -221,10 +221,10 @@ async fn deployed(router: &MultiServiceRouter, function_arn: &str, label: &str) 
 }
 
 /// The `methodSettings` key API Gateway reports the per-method setting of `verb` on
-/// `/{RESOURCE_PART}` under: the method path, which is the resource path without its leading
-/// separator joined to the HTTP method.
+/// `/{RESOURCE_PART}` under: the method path, which is the resource path written as a path
+/// name — its leading separator escaped `~1` — joined to the HTTP method.
 fn method_key(verb: &str) -> String {
-    format!("{RESOURCE_PART}/{verb}")
+    format!("~1{RESOURCE_PART}/{verb}")
 }
 
 /// The `UpdateStage` patch path that addresses a setting of that same method, behind the

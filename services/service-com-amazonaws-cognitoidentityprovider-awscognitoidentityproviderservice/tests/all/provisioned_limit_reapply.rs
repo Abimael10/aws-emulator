@@ -6,28 +6,29 @@
 //!
 //! The rule under test: `UpdateProvisionedLimit` "sets the provisioned limit for
 //! a specific API category. The value must be between the default limit and your
-//! account-level maximum limit in Service Quotas" (this service's model), so what
-//! decides a request is the account's RANGE for the identified limit and nothing
-//! else — every `RequestedLimitValue` from the limit's default (free) rate up to
-//! the account's ceiling is stored and answered as the limit's
-//! `ProvisionedLimitValue`, the rate the limit already reports included, whether
-//! an earlier call provisioned it or it is the rate the category includes at no
-//! additional cost. Applying a rate is therefore IDEMPOTENT: the flow a client
-//! reconciling a configuration runs — read the limit, write the rate it reported
-//! back — answers that rate rather than a refusal, however many times it repeats.
-//! Only a rate outside the range is refused, above the account's Service Quotas
-//! ceiling with `ServiceQuotaExceededException` and below the default rate with
-//! `InvalidParameterException`, and a refused request stores nothing.
+//! account-level maximum limit in Service Quotas" (this service's model), so a
+//! request has to ADJUST the limit and has to land inside the account's range
+//! for it. The rate a read of the limit reports as in force is compared first:
+//! a `RequestedLimitValue` equal to it adjusts nothing and is refused with
+//! `InvalidParameterException`, whether a previous call provisioned that rate or
+//! it is the rate the category includes at no additional cost. Every OTHER rate
+//! inside the range — from the included rate up to the account's Service Quotas
+//! ceiling — is stored and answered as the limit's `ProvisionedLimitValue`, and
+//! a rate outside the range is refused on the bound it missed: above the
+//! ceiling with `ServiceQuotaExceededException`, below the included rate with
+//! `InvalidParameterException`. Every refused request stores nothing, so the
+//! limit a later read reports is the one that was already in force.
 //!
-//! The suite varies the rate's position in the range (its floor, one step in, the
-//! midpoint, the account's ceiling), the width of the range (none, so the floor
-//! and the ceiling are the same rate, and one a granted quota increase opened),
-//! whether a provisioning stored the rate first or it is the included rate, how
-//! many times the same value is re-applied, and the limit itself — every API
-//! category this account holds, whose included rates differ. The wire harness is
-//! the one `log_delivery_configuration.rs` already builds for this service,
-//! reached through the test crate root rather than copied; this suite mounts its
-//! own router so it holds the engine the account's quota state lives in.
+//! The suite varies the state the rate in force comes from (the included rate,
+//! with nothing provisioned, and a rate a provisioning stored), the width of the
+//! account's range (none, so the included rate is both bounds at once, and one a
+//! granted quota increase opened), how many times the same value is re-applied,
+//! the position of an accepted rate in the range, and the limit itself — every
+//! API category this account holds, whose included rates differ. The wire
+//! harness is the one `log_delivery_configuration.rs` already builds for this
+//! service, reached through the test crate root rather than copied; this suite
+//! mounts its own router so it holds the engine the account's quota state lives
+//! in.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice as cognito_idp;
@@ -35,9 +36,11 @@ use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
 use super::log_delivery_configuration::{call, error_code, error_message, ok};
-// The two refusal sentences this suite's control asserts are the ones the
-// sibling suite already words, so they have one home in this test crate.
-use super::provisioned_limits::{above_ceiling_message, below_included_message};
+// The three refusal sentences this suite asserts are the ones the sibling suite
+// already words, so they have one home in this test crate.
+use super::provisioned_limits::{
+    above_ceiling_message, already_in_force_message, below_included_message,
+};
 
 /// How many times a rate in force is re-applied: more than twice, so the answer
 /// is asserted beyond the first repeat.
@@ -128,14 +131,42 @@ fn granted_increase(
     guard.api_category_quota_ceiling(category)
 }
 
+/// Assert that asking `category` for `requested` is refused as the rate already in force
+/// and that the limit still reports `expected`.
+async fn assert_refused_as_unchanged(
+    router: &MultiServiceRouter,
+    case: &str,
+    category: &cognito_idp::state::ApiCategory,
+    requested: i32,
+    expected: &Value,
+) {
+    let (status, payload) = provision(router, category.name, requested).await;
+    assert_eq!(
+        (
+            status,
+            error_code(&payload),
+            error_message(&payload).to_string()
+        ),
+        (400, "InvalidParameterException", already_in_force_message()),
+        "case {case:?}: asking for the rate in force ({requested}) adjusts nothing, got \
+         {status} with {payload}"
+    );
+    let reported = read_back(router, case, category.name).await;
+    assert_eq!(
+        &reported, expected,
+        "case {case:?}: a refused update must store nothing, got {reported}"
+    );
+}
+
 #[tokio::test]
-async fn the_rate_a_read_reports_is_stored_when_it_is_sent_back() {
-    // The flow a client converging on a configuration runs: read the limit,
-    // send back the rate it reported, and be answered that rate. The rows vary
-    // the width of the account's range — none, so the rate in force is both
-    // bounds at once, and one a granted increase opened — and run every API
-    // category this account holds through both, so the rule is asserted over
-    // limits with different included rates rather than over one.
+async fn the_rate_a_read_reports_is_refused_when_it_is_sent_back() {
+    // The flow a client converging on a configuration runs: read the limit and
+    // send back the rate it reported. That request adjusts nothing, so it is
+    // refused and the limit stands where it stood. The rows vary the width of
+    // the account's range — none, so the rate in force is both bounds at once,
+    // and one a granted increase opened — and run every API category this
+    // account holds through both, so the rule is asserted over limits with
+    // different included rates rather than over one.
     for increase in [0, GRANTED_INCREASE] {
         for category in cognito_idp::state::API_CATEGORIES {
             let (router, engine) = router_and_engine();
@@ -150,45 +181,85 @@ async fn the_rate_a_read_reports_is_stored_when_it_is_sent_back() {
             let baseline = read_back(&router, &case, category.name).await;
             let requested = rate_in_force(&case, &baseline);
             let expected = rendered(category, requested);
+            assert_eq!(
+                baseline, expected,
+                "case {case:?}: the rate in force is what the read reports, got {baseline}"
+            );
 
-            // Sending it back more than once: every repeat stores the same rate
-            // and answers it, so the write is idempotent rather than accepted
-            // once.
+            // Sending it back more than once: every repeat is refused the same
+            // way, so the refusal is the rule rather than a one-off.
             for repeat in 1..=REPEATS {
                 let case = format!("{case} (apply {repeat} of {REPEATS})");
-                let (status, answered) = provision(&router, category.name, requested).await;
-                assert_eq!(
-                    status, 200,
-                    "case {case:?}: re-applying the rate in force is an ordinary write, got \
-                     {status} with {answered}"
-                );
-                assert_eq!(
-                    answered.get("Limit"),
-                    Some(&expected),
-                    "case {case:?}: the update must answer the limit provisioned at \
-                     {requested}, got {answered}"
-                );
-
-                let reported = read_back(&router, &case, category.name).await;
-                assert_eq!(
-                    reported, expected,
-                    "case {case:?}: the read must render the stored limit, got {reported}"
-                );
+                assert_refused_as_unchanged(&router, &case, category, requested, &expected).await;
             }
         }
     }
 }
 
 #[tokio::test]
-async fn every_rate_inside_the_range_is_stored_however_often_it_is_applied() {
+async fn the_rate_a_provisioning_stored_is_refused_when_it_is_sent_back() {
+    // The same rule measured against a rate this account really provisioned
+    // rather than against the included one: a granted increase opens the range,
+    // a rate inside it is stored, and asking for THAT rate again is refused
+    // too.
+    for category in cognito_idp::state::API_CATEGORIES {
+        let (router, engine) = router_and_engine();
+        let ceiling = granted_increase(&engine, category, category.free_rate + GRANTED_INCREASE);
+        let stored = (category.free_rate + ceiling) / 2;
+        let case = format!("{} provisioned at {stored}", category.name);
+
+        let (status, answered) = provision(&router, category.name, stored).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a rate inside the range that differs from the one in force is \
+             stored, got {status} with {answered}"
+        );
+        let expected = rendered(category, stored);
+        assert_eq!(
+            answered.get("Limit"),
+            Some(&expected),
+            "case {case:?}: the update must answer the limit it stored, got {answered}"
+        );
+
+        for repeat in 1..=REPEATS {
+            let case = format!("{case} (re-applied {repeat} of {REPEATS})");
+            assert_refused_as_unchanged(&router, &case, category, stored, &expected).await;
+        }
+
+        // The included rate is no longer the rate in force, so asking for it is
+        // an adjustment back down and is stored — which is what makes the
+        // refusals above about the value being unchanged rather than about the
+        // operation refusing a second write.
+        let case = format!("{} released back to its included rate", category.name);
+        let (status, answered) = provision(&router, category.name, category.free_rate).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: releasing the limit back to its included rate is an adjustment, \
+             got {status} with {answered}"
+        );
+        let released = rendered(category, category.free_rate);
+        assert_eq!(
+            answered.get("Limit"),
+            Some(&released),
+            "case {case:?}: the update must answer the limit it stored, got {answered}"
+        );
+        let reported = read_back(&router, &case, category.name).await;
+        assert_eq!(
+            reported, released,
+            "case {case:?}: the read must render the stored limit, got {reported}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_other_rate_inside_the_range_is_stored() {
     let (router, engine) = router_and_engine();
 
-    // The rows differ along where in the account's range the rate sits: its
-    // floor (the rate the limit includes), one step in, the midpoint, and the
-    // account's ceiling. Each one is sent REPEATS times in a row: the first
-    // application is an adjustment, every later one asks for the rate the
-    // previous put in force — the case this suite is about — and is stored just
-    // the same.
+    // The rows differ along where in the account's range the rate sits: one step
+    // above its floor (the rate the limit includes), the midpoint, the account's
+    // ceiling, and back down to the floor. Each row asks for a rate the limit
+    // does NOT hold, which is what an adjustment is, and the row after it asks
+    // for the rate the row before put in force.
     for category in cognito_idp::state::API_CATEGORIES {
         let ceiling = granted_increase(&engine, category, category.free_rate + GRANTED_INCREASE);
         assert_eq!(
@@ -205,43 +276,43 @@ async fn every_rate_inside_the_range_is_stored_however_often_it_is_applied() {
             ("the account's ceiling", ceiling),
             ("the floor of the range", category.free_rate),
         ] {
+            let case = format!("{} asked for {requested} ({position})", category.name);
             let expected = rendered(category, requested);
 
-            for repeat in 1..=REPEATS {
-                let case = format!(
-                    "{} asked for {requested} ({position}, apply {repeat} of {REPEATS})",
-                    category.name
-                );
-                let (status, answered) = provision(&router, category.name, requested).await;
-                assert_eq!(
-                    status, 200,
-                    "case {case:?}: a rate inside the account's range is stored, got {status} \
-                     with {answered}"
-                );
-                assert_eq!(
-                    answered.get("Limit"),
-                    Some(&expected),
-                    "case {case:?}: the update must answer the limit it stored, got {answered}"
-                );
+            let (status, answered) = provision(&router, category.name, requested).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a rate inside the account's range is stored, got {status} \
+                 with {answered}"
+            );
+            assert_eq!(
+                answered.get("Limit"),
+                Some(&expected),
+                "case {case:?}: the update must answer the limit it stored, got {answered}"
+            );
 
-                let reported = read_back(&router, &case, category.name).await;
-                assert_eq!(
-                    reported, expected,
-                    "case {case:?}: the read must render the stored limit, got {reported}"
-                );
-            }
+            let reported = read_back(&router, &case, category.name).await;
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: the read must render the stored limit, got {reported}"
+            );
+
+            // The rate that was just stored is now the rate in force, so asking
+            // for it again is refused.
+            let case = format!("{case}, re-applied");
+            assert_refused_as_unchanged(&router, &case, category, requested, &expected).await;
         }
     }
 }
 
 #[tokio::test]
-async fn only_a_rate_outside_the_range_is_refused_and_stores_nothing() {
-    // The control for the two tests above: the operation is not accepting
-    // everything. A rate past the account's ceiling is a quota excess and a
-    // rate under the limit's included rate is a bad parameter, and neither
-    // changes the rate a later read reports. The rows run over every limit and
-    // over both widths of range, and the over-quota rows include a rate far
-    // beyond any ceiling as well as the first rate past it.
+async fn a_rate_outside_the_range_is_refused_on_the_bound_it_missed_and_stores_nothing() {
+    // The control for the tests above: the rate that is refused as unchanged is
+    // refused for being unchanged, while a rate past the account's ceiling is a
+    // quota excess and a rate under the limit's included rate is a bad
+    // parameter. The rows run over every limit and over both widths of range,
+    // and the over-quota rows include a rate far beyond any ceiling as well as
+    // the first rate past it.
     for increase in [0, GRANTED_INCREASE] {
         for category in cognito_idp::state::API_CATEGORIES {
             let (router, engine) = router_and_engine();
@@ -251,17 +322,23 @@ async fn only_a_rate_outside_the_range_is_refused_and_stores_nothing() {
                 category.free_rate
             };
 
-            // The rate in force is first applied through the API, so the
-            // refusals below are measured against a limit this account really
-            // provisioned.
-            let in_force = ceiling;
-            let (status, answered) = provision(&router, category.name, in_force).await;
-            assert_eq!(
-                status, 200,
-                "case {:?}: the rate the refusals are measured against is stored first, got \
-                 {status} with {answered}",
-                category.name
-            );
+            // The rate the refusals are measured against: where the increase
+            // opened the range, a rate this account really provisioned; where it
+            // did not, the included rate, which is the only rate the range
+            // holds.
+            let in_force = if increase > 0 {
+                let requested = category.free_rate + 1;
+                let (status, answered) = provision(&router, category.name, requested).await;
+                assert_eq!(
+                    status, 200,
+                    "case {:?}: the rate the refusals are measured against is stored first, \
+                     got {status} with {answered}",
+                    category.name
+                );
+                requested
+            } else {
+                category.free_rate
+            };
             let expected = rendered(category, in_force);
 
             let rows = [

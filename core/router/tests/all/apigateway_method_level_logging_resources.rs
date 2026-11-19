@@ -269,11 +269,12 @@ fn traced_line(request_id: &str, line: &str) -> String {
 }
 
 /// The `methodSettings` key the method `verb` of `resource_path` is held under: the method path
-/// `{resource_path}/{http_method}` (`Stage$methodSettings`) — the resource path without its
-/// leading separator and with every other separator of it literal, joined to the verb.
+/// `{resource_path}/{http_method}` (`Stage$methodSettings`) — the resource path written as a path
+/// name, every separator of it (the leading one included) escaped `~1`, joined by a literal
+/// separator to the verb.
 fn method_key(resource_path: &str, verb: &str) -> String {
     let unprefixed = resource_path.strip_prefix('/').unwrap_or(resource_path);
-    format!("{unprefixed}/{verb}")
+    format!("{}/{verb}", format!("/{unprefixed}").replace('/', "~1"))
 }
 
 /// The patch path that addresses a setting of that same method, behind the pointer's own leading

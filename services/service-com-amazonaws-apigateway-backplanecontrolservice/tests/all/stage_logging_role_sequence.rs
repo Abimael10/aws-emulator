@@ -167,7 +167,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "one named method at INFO, serving that method's GET",
             operations: vec![replace("/~1echo/GET/logging/loglevel", "INFO")],
-            expected: vec![("echo/GET", "loggingLevel", json!("INFO"))],
+            expected: vec![("~1echo/GET", "loggingLevel", json!("INFO"))],
             verb: "GET",
             traces_the_served_request: true,
             payloads: false,
