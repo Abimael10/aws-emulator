@@ -1,0 +1,38 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudformation__cloudwatch__sqs.cfn-metric-breach-rolls-back-only-the-update-it-triggers
+Issue-Key: cloudformation__cloudwatch__sqs.cfn-metric-breach-rolls-back-only-the-update-it-triggers|run#32|AssertionError|assert triggered == "UPDATE_ROLLBACK_COMPLETE", (
+Issue-Commit: bf5f1b716fd44070c371033dd9201606434af162
+
+# cloudformation__cloudwatch__sqs: a rollback trigger alarm that reaches ALARM inside an update's MonitoringTimeInMinutes window does not roll the update back — the stack settles UPDATE_COMPLETE
+
+> _Note: this issue was identified against the code base at commit `bf5f1b716fd44070c371033dd9201606434af162`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+UpdateStack
+
+## Description
+Cause 1 of 1: CloudFormation evaluates an update's RollbackConfiguration.RollbackTriggers only at the instant the operation starts, not for the MonitoringTimeInMinutes period after the resources are deployed, so an alarm that transitions OK->ALARM during the monitoring window never aborts the update.
+
+AWS: Smithy (com.amazonaws.cloudformation) models UpdateStack/CreateStack input member RollbackConfiguration = {RollbackTriggers: list @length(0..5) of RollbackTrigger{Arn @required, Type @required}, MonitoringTimeInMinutes: integer @range(0..180)}. The RollbackTrigger doc states the contract verbatim: "A rollback trigger CloudFormation monitors during creation and updating of stacks. If any of the alarms you specify goes to ALARM state during the stack operation OR WITHIN THE SPECIFIED MONITORING PERIOD AFTERWARDS, CloudFormation rolls back the entire stack operation." RollbackConfiguration.MonitoringTimeInMinutes doc: "The amount of time, in minutes, during which CloudFormation should monitor all the rollback triggers AFTER the stack creation or update operation deploys all necessary resources." So for an UpdateStack carrying MonitoringTimeInMinutes=5 and one AWS::CloudWatch::Alarm trigger, a PutMetricData breach that drives that alarm to ALARM after the resource change has already landed but inside the five minutes must abort the update: the stack reaches UPDATE_ROLLBACK_COMPLETE, exactly one UPDATE_ROLLBACK_IN_PROGRESS stack event carries ResourceStatusReason "The following CloudWatch Alarms were in ALARM state: <alarm name>" (fixed text "The following CloudWatch Alarms were in ALARM state: "; the only variable part is the alarm NAME from the trigger, no brackets, no trailing period), and the resources are restored to the values the PREVIOUS, already-completed update left — an earlier completed update is never re-rolled-back merely because its own (no longer monitored) trigger alarm is now in ALARM. Reference: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-cfn-rollback-triggers.html; the event wording is recorded behavior (the model carries no stack-event reason strings) and is the same sentence fixed issue 20261107T201046Z-cloudformation-cloudwatch-the-rollback-trigger-stack-event-reason.md established for the execute-time path.
+
+Emulator: the update's resource change lands (the queue's VisibilityTimeout becomes the new value, so the monitoring window is open), both trigger alarms then reach ALARM and DescribeAlarmHistory records the OK->ALARM StateUpdate — and the stack nevertheless settles in UPDATE_COMPLETE. No UPDATE_ROLLBACK_IN_PROGRESS event is emitted and nothing is reverted. The trigger list itself is stored and echoed correctly by DescribeStacks (that assertion passes), and an alarm ALREADY in ALARM when the operation starts does roll back (per the fixed issue above), so only the post-deploy monitoring period is unimplemented.
+
+Why: rollback triggers are the one CloudFormation mechanism that aborts a deployment on an application-health signal that only appears after the resources are in place — that is precisely what the monitoring period exists for. A client (or a pipeline) that deploys behind a canary alarm is told UPDATE_COMPLETE for an update AWS would have reverted, so a breaking change stays applied and the pipeline advances; the operator also loses the UPDATE_ROLLBACK_IN_PROGRESS event that is the only machine-readable record of which alarm aborted the deploy.
+
+Fix: the CloudFormation stack-update state machine — the rollback-trigger evaluation path must keep polling the configured triggers' alarm states for MonitoringTimeInMinutes after the last resource settles and, on any trigger in ALARM, drive the stack through UPDATE_ROLLBACK_IN_PROGRESS (with AWS's reason sentence naming that trigger's alarm name) to UPDATE_ROLLBACK_COMPLETE, restoring the previous update's property values; triggers belonging to an already-completed update must not be monitored.
+
+Traces: cloudformation__cloudwatch__sqs.cfn-metric-breach-rolls-back-only-the-update-it-triggers. Open issue 20261109T073558Z-cloudformation-cloudwatch-a-change-set-executed-with-a.md reports a DIFFERENT cause on the execute-time path (a change set whose trigger alarm is already in ALARM provisions the new resource before rolling back); it does not carry this check and does not cover the post-deploy monitoring period.
+
+## Evidence
+From the behavioral replay — cloudformation__cloudwatch__sqs.cfn-metric-breach-rolls-back-only-the-update-it-triggers [mismatch]:
+  assert triggered == "UPDATE_ROLLBACK_COMPLETE", (
+  AssertionError: the breached trigger alarm must roll the second update back, got 'UPDATE_COMPLETE'
+
+Expected (AWS): after UpdateStack(RollbackConfiguration={RollbackTriggers:[{Arn:<second alarm ARN>,Type:"AWS::CloudWatch::Alarm"}], MonitoringTimeInMinutes:5}) deploys the change and the alarm is then driven to ALARM by PutMetricData inside those 5 minutes, DescribeStacks reports StackStatus UPDATE_ROLLBACK_COMPLETE; DescribeStackEvents carries exactly one UPDATE_ROLLBACK_IN_PROGRESS event with ResourceStatusReason "The following CloudWatch Alarms were in ALARM state: <second alarm name>"; and the queue's VisibilityTimeout is back to the value the first (completed) update set.
+Actual (emulator): StackStatus UPDATE_ROLLBACK_COMPLETE never appears — the stack is UPDATE_COMPLETE, no UPDATE_ROLLBACK_IN_PROGRESS event exists, and the new VisibilityTimeout stays applied.
+The preceding steps all passed: both alarms start OK, the first update (MonitoringTimeInMinutes=0, trigger at OK) completes and is echoed by DescribeStacks RollbackConfiguration, the resource change of the second update lands, both alarms reach ALARM and DescribeAlarmHistory records the OK->ALARM transition.
+
+## Steps to Reproduce
+Replay the behavioral suite and re-run cloudformation__cloudwatch__sqs.cfn-metric-breach-rolls-back-only-the-update-it-triggers. Manually: cloudwatch:PutMetricAlarm(A, Namespace=<ns>, MetricName=<m>, Statistic=Maximum, Period=60, EvaluationPeriods=1, Threshold=1.0, ComparisonOperator=GreaterThanOrEqualToThreshold, TreatMissingData=notBreaching) and SetAlarmState(A, OK); CreateStack with one AWS::SQS::Queue whose VisibilityTimeout is a parameter, wait CREATE_COMPLETE; UpdateStack changing VisibilityTimeout with RollbackConfiguration={RollbackTriggers:[{Arn:<A>,Type:"AWS::CloudWatch::Alarm"}], MonitoringTimeInMinutes:5}; as soon as sqs:GetQueueAttributes shows the new VisibilityTimeout, cloudwatch:PutMetricData(<ns>,<m>,5.0) and wait for DescribeAlarms to report A in ALARM; then poll DescribeStacks for the terminal status and read DescribeStackEvents.
