@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let filters = input.filters.unwrap_or_default();
-        check_filter_names(&filters)?;
+        crate::state::check_filter_names(&filters, DOCUMENTED_FILTERS)?;
         // This operation's own range: "Default: 100 Constraints: Minimum 20, maximum 500"
         // (`MaxRecords` doc), which is a larger page than the service's other describes
         // take.
@@ -229,21 +229,6 @@ const MAX_RECORDS_MAX: i32 = 500;
 /// table-name | table-state".
 const DOCUMENTED_FILTERS: &[&str] = &["schema-name", "table-name", "table-state"];
 
-/// Refuse a filter name this operation does not document, rather than ignoring it and
-/// answering with tables the caller asked to exclude.
-fn check_filter_names(filters: &[Filter]) -> Result<(), DescribeTableStatisticsError> {
-    for filter in filters {
-        if !DOCUMENTED_FILTERS.contains(&filter.name.as_str()) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "{} is not a supported filter name; the valid filter names are {}",
-                filter.name,
-                DOCUMENTED_FILTERS.join(" | ")
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Whether `statistics` satisfies every filter the request carries: "A combination of
 /// filters creates an AND condition where each record matches all specified filters"
 /// (`Filters` doc), and each filter admits the records whose matching attribute is one of
@@ -256,7 +241,7 @@ fn matches_filters(statistics: &TableStatistics, filters: &[Filter]) -> bool {
         "schema-name" => admits(filter, statistics.schema_name.as_ref()),
         "table-name" => admits(filter, statistics.table_name.as_ref()),
         "table-state" => admits(filter, statistics.table_state.as_ref()),
-        // `check_filter_names` has already refused every other name.
+        // `crate::state::check_filter_names` has already refused every other name.
         _ => true,
     })
 }

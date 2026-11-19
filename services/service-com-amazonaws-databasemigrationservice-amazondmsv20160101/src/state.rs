@@ -12,6 +12,11 @@
 //!
 //! [`settle`]: ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State::settle
 
+/// The `Filters` guard every DMS `Describe*` that takes a `FilterList` shares: which
+/// filter names a report accepts, and the one refusal an unrecognized name is answered
+/// with.
+pub mod filters;
+
 /// The RUN of a replication task: the full load it performs between the endpoints' own
 /// data planes, the per-task and per-table accounting that load records, and the stop a
 /// task with no phase after it arrives at.
@@ -21,6 +26,7 @@ pub mod task_run;
 /// caller's own settings resolved against them.
 pub mod task_settings;
 
+pub use filters::{check_filter_names, unrecognized_filter_name_message};
 pub use task_run::{advance_task_runs, TaskRun};
 pub use task_settings::{
     default_task_settings, resolve_task_settings, LOG_COMPONENTS, LOG_SEVERITY_DEFAULT,

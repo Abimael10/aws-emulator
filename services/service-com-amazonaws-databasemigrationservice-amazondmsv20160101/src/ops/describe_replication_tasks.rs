@@ -150,7 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let filters = input.filters.unwrap_or_default();
-        check_filter_names(&filters)?;
+        crate::state::check_filter_names(&filters, DOCUMENTED_FILTERS)?;
         let size = crate::state::page_size(input.max_records)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
         let without_settings = input.without_settings.unwrap_or_default();
@@ -224,21 +224,6 @@ const DOCUMENTED_FILTERS: &[&str] = &[
     "replication-instance-arn",
 ];
 
-/// Refuse a filter name this operation does not document, rather than ignoring it and
-/// answering with tasks the caller asked to exclude.
-fn check_filter_names(filters: &[Filter]) -> Result<(), DescribeReplicationTasksError> {
-    for filter in filters {
-        if !DOCUMENTED_FILTERS.contains(&filter.name.as_str()) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "{} is not a supported filter name; the valid filter names are {}",
-                filter.name,
-                DOCUMENTED_FILTERS.join(" | ")
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Whether `record` satisfies every filter the request carries: each filter narrows the
 /// answer to the tasks whose matching attribute is one of that filter's values.
 fn matches_filters(record: &crate::state::ReplicationTaskRecord, filters: &[Filter]) -> bool {
@@ -252,7 +237,7 @@ fn matches_filters(record: &crate::state::ReplicationTaskRecord, filters: &[Filt
                 || filter.values.contains(&record.target_endpoint_arn)
         }
         "replication-instance-arn" => filter.values.contains(&record.replication_instance_arn),
-        // `check_filter_names` has already refused every other name.
+        // `crate::state::check_filter_names` has already refused every other name.
         _ => true,
     })
 }

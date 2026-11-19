@@ -13,9 +13,9 @@
 //! 2. `Filters` narrows the answer to the groups the one filter name the member doc
 //!    publishes selects ("Valid filter names: replication-subnet-group-id"), matched
 //!    against the identifier as it is stored ("This value is stored as a lowercase
-//!    string"); a filter name the operation does not document is refused, and a filter
-//!    that selects no group is answered with an empty list rather than a refusal, as the
-//!    recorded service answers it.
+//!    string"); a filter name the operation does not document is refused as a parameter
+//!    value DMS does not accept, and a filter that selects no group is answered with an
+//!    empty list rather than a refusal, as the recorded service answers it.
 //! 3. `MaxRecords` is bounded by the range its member doc publishes ("Default: 100",
 //!    "Constraints: Minimum 20, maximum 100") and `Marker` resumes the scan, so the pages
 //!    cover every group exactly once in the order the describe reports them.
@@ -41,6 +41,11 @@ use crate::subnet_group_placement::Subnet;
 /// The error code the framework answers a request that breaks a rule the model does not
 /// express with.
 const VALIDATION: &str = "ValidationException";
+
+/// The error code DMS answers a parameter whose value it does not accept with — a filter
+/// name outside the ones the member doc publishes among them. The model declares the
+/// shape for no operation, so the recorded responses are its only authority.
+const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValueException";
 
 /// The network types DMS publishes for a resource placed in a subnet group: "A value of
 /// IPV4 represents an instance profile with IPv4 network type and only supports IPv4
@@ -174,8 +179,8 @@ async fn a_describe_reports_each_group_exactly_as_its_create_answered() {
 enum Expect {
     /// HTTP 200, reporting exactly these identifiers.
     Reported(Vec<&'static str>),
-    /// HTTP 400 with this error code.
-    Refused(&'static str),
+    /// HTTP 400 with this error code and this message.
+    Refused(&'static str, String),
 }
 
 #[tokio::test]
@@ -239,12 +244,26 @@ async fn filters_narrow_a_describe_to_the_groups_the_documented_name_selects() {
                 "Name": "replication-subnet-group-arn",
                 "Values": ["arn:aws:dms:us-east-1:000000000000:subgrp:sng-filter-a"],
             }]),
-            Expect::Refused(VALIDATION),
+            Expect::Refused(
+                INVALID_PARAMETER_VALUE,
+                "Unrecognized filter name: replication-subnet-group-arn".to_string(),
+            ),
         ),
         (
             "a filter name from another describe",
             json!([{ "Name": "replication-instance-id", "Values": ["sng-filter-a"] }]),
-            Expect::Refused(VALIDATION),
+            Expect::Refused(
+                INVALID_PARAMETER_VALUE,
+                "Unrecognized filter name: replication-instance-id".to_string(),
+            ),
+        ),
+        (
+            "the documented filter name in upper case",
+            json!([{ "Name": "REPLICATION-SUBNET-GROUP-ID", "Values": ["sng-filter-a"] }]),
+            Expect::Refused(
+                INVALID_PARAMETER_VALUE,
+                "Unrecognized filter name: REPLICATION-SUBNET-GROUP-ID".to_string(),
+            ),
         ),
     ];
 
@@ -270,13 +289,12 @@ async fn filters_narrow_a_describe_to_the_groups_the_documented_name_selects() {
                      {reported:?}"
                 );
             }
-            Expect::Refused(code) => {
-                let reported = error_code(&response);
+            Expect::Refused(code, message) => {
                 assert_eq!(
-                    (status, reported.as_str()),
-                    (400, code),
-                    "case {case:?}: expected the describe to be refused with {code}, got \
-                     {status} {response}"
+                    (status, error_code(&response), text(&response, "/message")),
+                    (400, code.to_string(), message.clone()),
+                    "case {case:?}: expected the describe to be refused with {code} \
+                     {message:?}, got {status} {response}"
                 );
             }
         }

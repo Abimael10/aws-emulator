@@ -1169,7 +1169,7 @@ async fn table_statistics_are_filtered_paged_and_refused_as_the_model_says() {
                 "ReplicationTaskArn": task_arn,
                 "Filters": [{ "Name": "table-colour", "Values": ["blue"] }],
             }),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             "a page smaller than the documented minimum",
@@ -1202,6 +1202,25 @@ async fn table_statistics_are_filtered_paged_and_refused_as_the_model_says() {
             answer.status
         );
     }
+
+    // An unrecognized filter name is reported in DMS's own sentence for it, which names
+    // the name the request carried and nothing else.
+    let unrecognized = dms(
+        &router,
+        "DescribeTableStatistics",
+        &json!({
+            "ReplicationTaskArn": task_arn,
+            "Filters": [{ "Name": "table-colour", "Values": ["blue"] }],
+        }),
+    )
+    .await;
+    let body = unrecognized.json();
+    assert_eq!(
+        body.get("message").and_then(Value::as_str),
+        Some("Unrecognized filter name: table-colour"),
+        "case \"a filter name the operation does not document\": expected DMS's wording for \
+         an unrecognized filter name, got {body}"
+    );
 
     // The documented maximum page is accepted, which is what makes the two refusals above
     // a bound rather than a blanket refusal.

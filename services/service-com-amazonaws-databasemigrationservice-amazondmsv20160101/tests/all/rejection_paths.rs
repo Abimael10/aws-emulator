@@ -17,6 +17,10 @@
 //!    models for an absent resource instead of answering an empty list; an
 //!    unfiltered one still reports what the account holds, even when that is
 //!    nothing.
+//! 4. A `Filters` entry whose `Name` is not one the report's own member doc publishes
+//!    ("Valid filter names: ...") is refused as a parameter value DMS does not accept,
+//!    in the one sentence DMS answers an unrecognized filter name with, while a
+//!    documented name is never refused that way.
 //!
 //! Every case drives the real wire path through the router, so what is asserted is
 //! what a client sees, body and HTTP status included.
@@ -611,5 +615,243 @@ async fn a_filtered_describe_that_matches_nothing_raises_resource_not_found() {
         text(&matched, "/Endpoints/0/EndpointArn"),
         endpoint_arn,
         "case \"a filter that matches\": expected the matching endpoint, got {matched}"
+    );
+}
+
+/// The filter names each report of this service publishes, from its OWN `Filters` member
+/// doc ("Valid filter names: ..."), read with
+/// `smithy_query(query="doc",shape="<Describe*>Message",member="Filters")`. Every report
+/// this crate implements that takes a `FilterList` has a row, so the rule is asserted on
+/// reports the recorded trace never filtered as well as on the one it did.
+const DOCUMENTED_FILTER_NAMES: &[(&str, &[&str])] = &[
+    (
+        "DescribeReplicationInstances",
+        &[
+            "replication-instance-arn",
+            "replication-instance-id",
+            "replication-instance-class",
+            "engine-version",
+        ],
+    ),
+    (
+        "DescribeEndpoints",
+        &["endpoint-arn", "endpoint-type", "endpoint-id", "engine-name"],
+    ),
+    (
+        "DescribeReplicationTasks",
+        &[
+            "replication-task-arn",
+            "replication-task-id",
+            "migration-type",
+            "endpoint-arn",
+            "replication-instance-arn",
+        ],
+    ),
+    (
+        "DescribeReplicationSubnetGroups",
+        &["replication-subnet-group-id"],
+    ),
+    (
+        "DescribeTableStatistics",
+        &["schema-name", "table-name", "table-state"],
+    ),
+];
+
+/// The fixed text DMS answers an unrecognized `Filter$Name` with. The whole message is
+/// this text followed by the name the request carried, and nothing else.
+const UNRECOGNIZED_FILTER_PREFIX: &str = "Unrecognized filter name: ";
+
+/// A request for `operation` carrying `filters`, with whatever else that report requires.
+fn filtered_request(operation: &str, filters: Value) -> Value {
+    match operation {
+        // `ReplicationTaskArn` is required on this report. The filter-name check runs
+        // before the ARN is resolved against the account, so a well-formed ARN naming no
+        // task still drives the rule — which is what a client sees too.
+        "DescribeTableStatistics" => json!({
+            "ReplicationTaskArn": dms_arn(REGION, "task", "FILTERNAMEGUARDTASK"),
+            "Filters": filters,
+        }),
+        _ => json!({ "Filters": filters }),
+    }
+}
+
+/// Every unrecognized name the rule is asserted over for a report whose documented names
+/// are `documented`: `(case, name)`.
+///
+/// The rows differ along the FORM an unrecognized name takes — a name no report of the
+/// service publishes, a name another report of the service does publish, a documented
+/// name's casing, a documented name with surrounding whitespace, the empty name (which
+/// `Filter$Name`'s required `String` admits, since the model gives it no `length` or
+/// `pattern`), and a name carrying its own value — and a row whose name this report DOES
+/// document is dropped, so the table stays a table of unrecognized names.
+fn unrecognized_names(documented: &[&str]) -> Vec<(&'static str, String)> {
+    let first = documented[0];
+    [
+        ("a name no report of the service publishes", "not-a-real-filter".to_string()),
+        (
+            "a name that reads like an attribute the report does report",
+            "replication-subnet-group-arn".to_string(),
+        ),
+        (
+            "a name another report of the service publishes",
+            "replication-instance-class".to_string(),
+        ),
+        ("a documented name in upper case", first.to_uppercase()),
+        (
+            "a documented name with a trailing space",
+            format!("{first} "),
+        ),
+        ("the empty name", String::new()),
+        ("a name carrying its own value", format!("{first}=x")),
+    ]
+    .into_iter()
+    .filter(|(_, name)| !documented.contains(&name.as_str()))
+    .collect()
+}
+
+#[tokio::test]
+async fn an_unrecognized_filter_name_is_refused_as_a_parameter_value_dms_does_not_accept() {
+    let emulator = Emulator::new();
+
+    for (operation, documented) in DOCUMENTED_FILTER_NAMES {
+        for (case, name) in unrecognized_names(documented) {
+            let (status, response) = emulator
+                .call(
+                    operation,
+                    &filtered_request(
+                        operation,
+                        json!([{ "Name": name, "Values": ["any-value"] }]),
+                    ),
+                )
+                .await;
+            assert_eq!(
+                (
+                    status,
+                    error_code(&response),
+                    text(&response, "/message")
+                ),
+                (
+                    400,
+                    INVALID_PARAMETER_VALUE.to_string(),
+                    format!("{UNRECOGNIZED_FILTER_PREFIX}{name}")
+                ),
+                "case {case:?} ({name:?}) on {operation}: expected 400 \
+                 {INVALID_PARAMETER_VALUE} {UNRECOGNIZED_FILTER_PREFIX}{name:?}, got {status} \
+                 {response}"
+            );
+        }
+    }
+
+    // The refusal names the FIRST unrecognized name the request carried, in request
+    // order, whatever the names around it are.
+    for (case, filters, expected) in [
+        (
+            "a documented name first, an unrecognized one after it",
+            json!([
+                { "Name": "endpoint-id", "Values": ["filtered-ep"] },
+                { "Name": "endpoint-colour", "Values": ["blue"] },
+            ]),
+            "endpoint-colour",
+        ),
+        (
+            "two unrecognized names",
+            json!([
+                { "Name": "endpoint-colour", "Values": ["blue"] },
+                { "Name": "endpoint-size", "Values": ["large"] },
+            ]),
+            "endpoint-colour",
+        ),
+    ] {
+        let (status, response) = emulator
+            .call("DescribeEndpoints", &json!({ "Filters": filters }))
+            .await;
+        assert_eq!(
+            (
+                status,
+                error_code(&response),
+                text(&response, "/message")
+            ),
+            (
+                400,
+                INVALID_PARAMETER_VALUE.to_string(),
+                format!("{UNRECOGNIZED_FILTER_PREFIX}{expected}")
+            ),
+            "case {case:?} on DescribeEndpoints: expected the first unrecognized name \
+             {expected:?} to be reported, got {status} {response}"
+        );
+    }
+
+    // A documented name is never refused as unrecognized, whatever else the report
+    // answers for the values it carries.
+    for (operation, documented) in DOCUMENTED_FILTER_NAMES {
+        for name in *documented {
+            let (status, response) = emulator
+                .call(
+                    operation,
+                    &filtered_request(
+                        operation,
+                        json!([{ "Name": name, "Values": ["a-value-nothing-carries"] }]),
+                    ),
+                )
+                .await;
+            let message = text(&response, "/message");
+            assert!(
+                !(error_code(&response) == INVALID_PARAMETER_VALUE
+                    && message.starts_with(UNRECOGNIZED_FILTER_PREFIX)),
+                "case {name:?} on {operation}: expected a documented filter name not to be \
+                 refused as an unrecognized one, got {status} {response}"
+            );
+        }
+    }
+
+    // The rejection is per-request validation only: a report that refused one request's
+    // filter name still answers the next request that filters by the name it publishes.
+    persist_subnet_group(&emulator, "filter-name-guard-group");
+    let (status, response) = emulator
+        .call(
+            "DescribeReplicationSubnetGroups",
+            &json!({
+                "Filters": [{
+                    "Name": "not-a-real-filter",
+                    "Values": ["filter-name-guard-group"],
+                }],
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&response)),
+        (400, INVALID_PARAMETER_VALUE.to_string()),
+        "case \"the refused request\": expected 400 {INVALID_PARAMETER_VALUE}, got {status} \
+         {response}"
+    );
+    let described = emulator
+        .ok(
+            "the documented name after a refusal",
+            "DescribeReplicationSubnetGroups",
+            &json!({
+                "Filters": [{
+                    "Name": "replication-subnet-group-id",
+                    "Values": ["filter-name-guard-group"],
+                }],
+            }),
+        )
+        .await;
+    assert_eq!(
+        described
+            .pointer("/ReplicationSubnetGroups")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "case \"the documented name after a refusal\": expected the one group the filter \
+         selects, got {described}"
+    );
+    assert_eq!(
+        text(
+            &described,
+            "/ReplicationSubnetGroups/0/ReplicationSubnetGroupIdentifier"
+        ),
+        "filter-name-guard-group",
+        "case \"the documented name after a refusal\": expected the group the filter \
+         selects, got {described}"
     );
 }

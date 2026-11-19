@@ -1468,7 +1468,8 @@ async fn every_documented_filter_narrows_the_describe() {
     }
 
     // A filter name no doc publishes is refused, rather than ignored — which would
-    // answer with resources the caller asked to exclude.
+    // answer with resources the caller asked to exclude. DMS refuses it as a parameter
+    // value it does not accept, naming the filter name the request carried.
     for operation in [
         "DescribeReplicationInstances",
         "DescribeEndpoints",
@@ -1481,10 +1482,14 @@ async fn every_documented_filter_narrows_the_describe() {
             )
             .await;
         assert_eq!(
-            (status, error_code(&response).contains("ValidationException")),
-            (400, true),
-            "case \"undocumented filter\" on {operation}: expected 400 ValidationException, \
-             got {status} {response}"
+            (status, error_code(&response), text(&response, "/message")),
+            (
+                400,
+                "InvalidParameterValueException".to_string(),
+                "Unrecognized filter name: endpoint-colour".to_string()
+            ),
+            "case \"undocumented filter\" on {operation}: expected 400 \
+             InvalidParameterValueException naming the filter name, got {status} {response}"
         );
     }
 }
