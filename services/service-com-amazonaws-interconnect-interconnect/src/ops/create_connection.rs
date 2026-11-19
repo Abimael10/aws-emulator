@@ -248,14 +248,20 @@ fn judge_against_store(
     // "The same" is judged on EVERY member of the create the caller owns, absence
     // included, so no member of a retried request can be swapped silently.
     //
-    // The token is held under the Region the request addressed: the connection it
-    // created belongs to that Region, so the same token sent to another Region's
-    // endpoint is one that endpoint has never seen.
+    // What the token names is resolved by the one rule every resolution in this crate
+    // applies (`crate::state::...::idempotent_create_in`): the Region the request
+    // addressed — the connection the token created belongs to that Region, so the same
+    // token sent to another Region's endpoint is one that endpoint has never seen —
+    // and a resource this account still HOLDS. A token whose connection has had a
+    // `DeleteConnection` made on it names a resource that is going or gone, so it
+    // resolves to nothing: neither a record in a terminal, or terminating, state
+    // handed back as the connection this create produced, nor a mismatch judged
+    // against a create whose resource no longer exists. The retry is then the create
+    // it reads as, which is also the answer it gets once the deleted record's
+    // retention has elapsed — so what this well-formed request is answered with does
+    // not depend on how long the caller took to make it.
     if let Some(token) = input.client_token.as_deref() {
-        if let Some(created) = store
-            .idempotency_tokens
-            .get(&crate::state::idempotency_key(region, token))
-        {
+        if let Some((created, stored)) = store.idempotent_create_in(region, token) {
             if !created.matches(input) {
                 return Err(CreateConnectionErrorModeled::InterconnectValidationException(
                     InterconnectValidationException {
@@ -267,9 +273,7 @@ fn judge_against_store(
                 )
                 .into());
             }
-            if let Some(stored) = store.connection_in(region, &created.connection_id) {
-                return Ok(StoreVerdict::Replay(stored.connection.clone()));
-            }
+            return Ok(StoreVerdict::Replay(stored.connection.clone()));
         }
     }
 

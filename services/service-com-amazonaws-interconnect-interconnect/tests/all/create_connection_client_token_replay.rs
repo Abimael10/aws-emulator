@@ -13,8 +13,21 @@
 //! the optional ones, in presence against absence), across every Environment of the
 //! seeded catalog that takes connections — so the rule is checked on each kind of
 //! identifying information an Environment asks for, not on one request.
+//!
+//! SECOND RULE, the other half of the same resolution: what a `clientToken` names is
+//! the resource the create it was carried on produced, and only for as long as that
+//! resource is one the account HOLDS. From the moment a `DeleteConnection` is made on
+//! it the token names nothing — "the network connectivity provided by the Connection
+//! will cease to exist" (`smithy_query(query="doc",shape="DeleteConnection")`) — so a
+//! repeat carrying it is the create it reads as, never the torn-down record handed
+//! back as the connection this create produced and never a mismatch judged against a
+//! create whose resource is gone. Those rows differ in WHEN the repeat is made
+//! relative to the delete (inside the teardown, and once it has settled), in whether
+//! the repeat is the same request or a different one, and in the Region the request
+//! addresses.
 
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
@@ -283,5 +296,311 @@ async fn a_repeated_client_token_is_judged_on_every_caller_owned_member() {
             fresh_id, id,
             "case {case:?}: expected a distinct connection for a distinct client token, got {fresh_id:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A token whose connection has had a DeleteConnection made on it
+// ---------------------------------------------------------------------------
+
+/// The Regions the deletion rows address, so the rule is checked on more than one
+/// endpoint's store and not on the harness's default one alone.
+const DELETION_REGIONS: [&str; 2] = ["us-east-1", "eu-west-1"];
+
+/// The transient `ConnectionState` a `DeleteConnection` hands the connection to the
+/// clock in, and the terminal one that teardown settles into
+/// (`smithy_query(query="shape",shape="ConnectionState")` -> values: ["available",
+/// "requested", "pending", "down", "deleting", "deleted", "failed", "updating"]).
+const DELETING_STATE: &str = "deleting";
+const DELETED_STATE: &str = "deleted";
+
+/// How long a wait for a called teardown to reach its terminal state runs before the
+/// case fails. The row waits for the STATE the clock owes the record, re-reading it
+/// until it is there, so the budget is deliberately far longer than the transition
+/// takes.
+const TEARDOWN_SETTLED_BUDGET: Duration = Duration::from_secs(30);
+
+/// How often that wait re-reads.
+const TEARDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// When a row repeats the token, relative to the `DeleteConnection` made on the
+/// connection that token created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Repeated {
+    /// In the call right after the delete, while the teardown is still running.
+    WhileTearingDown,
+    /// Once the teardown has settled into the terminal state.
+    OnceTornDown,
+}
+
+/// Both repeat points, so every row below spans the whole teardown.
+const REPEAT_POINTS: [Repeated; 2] = [Repeated::WhileTearingDown, Repeated::OnceTornDown];
+
+/// One `CreateConnection` body for `region`, placed on the first Environment that
+/// Region's own catalog offers connections on and attached to one of the account's own
+/// Direct Connect gateways — so a deletion row's only subject is the client token.
+async fn deletion_row_request(
+    emulator: &Emulator,
+    region: &str,
+    description: &str,
+    token: &str,
+) -> Value {
+    let catalog = emulator.environments_in(region).await;
+    let environments = creatable_environments(&catalog);
+    let environment = environments
+        .first()
+        .unwrap_or_else(|| {
+            panic!("setup {region:?}: expected the catalog to offer an environment that takes connections, got {catalog:?}")
+        })
+        .clone();
+    let bandwidths = available_bandwidths(&environment);
+    let bandwidth = bandwidths.first().unwrap_or_else(|| {
+        panic!("setup {region:?}: expected the environment to offer a bandwidth, got {environment:?}")
+    });
+    create_request(
+        &text(&environment, "environmentId"),
+        bandwidth,
+        &emulator.attach_point().await,
+        description,
+        remote_account_for(&environment).as_ref(),
+        &json!({ "env": "test" }),
+        token,
+    )
+}
+
+/// The state `region`'s endpoint reports for `identifier` right now, the record being
+/// readable by its own identifier for the whole teardown and after it.
+async fn state_now(emulator: &Emulator, region: &str, identifier: &str) -> String {
+    let read = emulator
+        .ic_ok_in(region, "GetConnection", json!({ "identifier": identifier }))
+        .await;
+    text(&read["connection"], "state")
+}
+
+/// Re-read `identifier` until the teardown the delete armed has settled into its
+/// terminal state, answering the state observed. Polls for the CONDITION rather than
+/// waiting out a span.
+async fn settled_state(emulator: &Emulator, region: &str, identifier: &str) -> String {
+    let started = Instant::now();
+    loop {
+        let state = state_now(emulator, region, identifier).await;
+        if state == DELETED_STATE {
+            return state;
+        }
+        assert!(
+            started.elapsed() < TEARDOWN_SETTLED_BUDGET,
+            "setup {identifier:?}: expected the called teardown to settle into {DELETED_STATE:?}, last saw {state:?}"
+        );
+        tokio::time::sleep(TEARDOWN_POLL_INTERVAL).await;
+    }
+}
+
+/// Call `DeleteConnection` on `identifier` and, for a row that repeats the token after
+/// the teardown, poll until it has settled.
+async fn delete_and_reach(
+    emulator: &Emulator,
+    region: &str,
+    identifier: &str,
+    repeated: Repeated,
+    case: &str,
+) {
+    let deleted = emulator
+        .ic_ok_in(
+            region,
+            "DeleteConnection",
+            json!({ "identifier": identifier }),
+        )
+        .await;
+    assert_eq!(
+        text(&deleted["connection"], "state"),
+        DELETING_STATE,
+        "case {case:?}: expected the delete to arm the teardown, got {:?}",
+        deleted["connection"]["state"]
+    );
+    if repeated == Repeated::OnceTornDown {
+        let settled = settled_state(emulator, region, identifier).await;
+        assert_eq!(
+            settled, DELETED_STATE,
+            "case {case:?}: expected the teardown to settle into the terminal state, got {settled:?}"
+        );
+    }
+}
+
+/// RULE: a `clientToken` names the connection its create produced only while that
+/// connection is one the account HOLDS, so once a `DeleteConnection` has been made on
+/// it — whether the teardown is still running or has settled — the same request
+/// repeated allocates a NEW connection, readable back through `GetConnection`, instead
+/// of being answered with the torn-down record; the record itself stays readable by its
+/// own identifier, and the token then names the connection the repeat produced.
+#[tokio::test]
+async fn a_token_whose_connection_was_deleted_names_nothing_to_replay() {
+    let emulator = Emulator::new();
+    let mut repeated_inside_the_window = 0usize;
+
+    for (seed, repeated) in REPEAT_POINTS.into_iter().enumerate() {
+        for (offset, region) in DELETION_REGIONS.iter().enumerate() {
+            let token = format!("deleted-token-{seed}-{offset}");
+            let case = format!("{repeated:?} / {region} / {token}");
+            let base = deletion_row_request(
+                &emulator,
+                region,
+                &format!("deletion row {seed} {offset}"),
+                &token,
+            )
+            .await;
+
+            // The call the token names, and the replay it gets while the connection it
+            // created is a resource the account holds.
+            let created = emulator
+                .ic_ok_in(region, "CreateConnection", base.clone())
+                .await;
+            let id = text(&created["connection"], "id");
+            let replay = emulator
+                .ic_ok_in(region, "CreateConnection", base.clone())
+                .await;
+            assert_eq!(
+                replay["connection"], created["connection"],
+                "case {case:?}: expected the repeat of a live create to replay its connection, got {:?}",
+                replay["connection"]
+            );
+
+            delete_and_reach(&emulator, region, &id, repeated, &case).await;
+
+            // The repeat: the token names nothing any more, so this is the create it
+            // reads as — a connection of its own, in none of the states a delete leaves.
+            let fresh = emulator
+                .ic_ok_in(region, "CreateConnection", base.clone())
+                .await["connection"]
+                .clone();
+            let fresh_id = text(&fresh, "id");
+            let fresh_state = text(&fresh, "state");
+            assert_ne!(
+                fresh_id, id,
+                "case {case:?}: expected the repeat to allocate a connection of its own, got {fresh:?}"
+            );
+            assert!(
+                fresh_state != DELETING_STATE && fresh_state != DELETED_STATE,
+                "case {case:?}: expected the repeat to be answered with a connection the account holds, got state {fresh_state:?}"
+            );
+
+            // Backed by the store: the connection the repeat reported reads back through
+            // the implemented reader.
+            let fetched = emulator
+                .ic_ok_in(region, "GetConnection", json!({ "identifier": fresh_id }))
+                .await;
+            assert_eq!(
+                text(&fetched["connection"], "id"),
+                fresh_id,
+                "case {case:?}: expected the connection the repeat produced to read back, got {:?}",
+                fetched["connection"]
+            );
+
+            // The other half of the rule: the torn-down record is still readable by its
+            // own identifier, and the repeat neither resurrected nor removed it. Read
+            // right after the repeat, so a `deleting` answer says that repeat was made
+            // inside the teardown window.
+            let state_after = state_now(&emulator, region, &id).await;
+            assert!(
+                state_after == DELETING_STATE || state_after == DELETED_STATE,
+                "case {case:?}: expected the deleted record to stay readable in a state a delete leaves, got {state_after:?}"
+            );
+            if repeated == Repeated::WhileTearingDown && state_after == DELETING_STATE {
+                repeated_inside_the_window += 1;
+            }
+
+            // The token now names the connection the repeat produced, which IS a
+            // resource the account holds: a further identical repeat replays that one.
+            let second = emulator
+                .ic_ok_in(region, "CreateConnection", base.clone())
+                .await;
+            assert_eq!(
+                text(&second["connection"], "id"),
+                fresh_id,
+                "case {case:?}: expected the token to replay the connection the repeat produced, got {:?}",
+                second["connection"]
+            );
+        }
+    }
+
+    assert!(
+        repeated_inside_the_window > 0,
+        "case \"teardown window\": expected at least one row to repeat its token while the connection was still being torn down, got {repeated_inside_the_window}"
+    );
+}
+
+/// RULE, the refusal half: a repeat differing in a caller-owned member is a token
+/// reused for a different request only while the connection the token created is one
+/// the account holds — once a `DeleteConnection` has been made on it the token names no
+/// create to compare against, so the differing repeat is accepted as the create it is,
+/// carrying the members IT sent.
+#[tokio::test]
+async fn a_differing_repeat_is_not_judged_against_a_deleted_connection() {
+    let emulator = Emulator::new();
+
+    for (seed, repeated) in REPEAT_POINTS.into_iter().enumerate() {
+        for (offset, region) in DELETION_REGIONS.iter().enumerate() {
+            let token = format!("mismatch-after-delete-{seed}-{offset}");
+            let case = format!("{repeated:?} / {region} / {token}");
+            let base = deletion_row_request(
+                &emulator,
+                region,
+                &format!("mismatch row {seed} {offset}"),
+                &token,
+            )
+            .await;
+            let mut differing = base.clone();
+            let changed_description = format!("changed row {seed} {offset}");
+            differing["description"] = json!(changed_description);
+
+            let created = emulator
+                .ic_ok_in(region, "CreateConnection", base.clone())
+                .await;
+            let id = text(&created["connection"], "id");
+
+            // While the connection is held, the differing repeat is the mismatch the
+            // suite above pins, so what changes below is the state of that connection
+            // and nothing else.
+            let (status, body) = emulator
+                .ic_in(region, "CreateConnection", differing.clone())
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected a differing repeat to be refused while the connection is held, got {status} with {body:?}"
+            );
+            assert!(
+                code(&body).contains("InterconnectValidationException"),
+                "case {case:?}: expected InterconnectValidationException, got {:?}",
+                code(&body)
+            );
+            assert!(
+                message(&body).contains(&token) && message(&body).contains(&id),
+                "case {case:?}: expected the refusal to name the token and the connection it created, got {:?}",
+                message(&body)
+            );
+
+            delete_and_reach(&emulator, region, &id, repeated, &case).await;
+
+            // Once the delete has been made, the token names no create to compare
+            // against: the differing repeat is accepted, and carries what IT sent.
+            let (status, accepted) = emulator
+                .ic_in(region, "CreateConnection", differing.clone())
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected a differing repeat to be accepted once the token's connection was deleted, got {status} with {accepted:?}"
+            );
+            let fresh_id = text(&accepted["connection"], "id");
+            assert_ne!(
+                fresh_id, id,
+                "case {case:?}: expected a connection of its own, got {:?}",
+                accepted["connection"]
+            );
+            assert_eq!(
+                text(&accepted["connection"], "description"),
+                changed_description,
+                "case {case:?}: expected the accepted create to carry the description it sent, got {:?}",
+                accepted["connection"]["description"]
+            );
+        }
     }
 }

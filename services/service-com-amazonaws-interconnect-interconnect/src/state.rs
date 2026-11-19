@@ -343,7 +343,9 @@ pub struct ComAmazonawsInterconnectInterconnectState {
     /// Region is one that endpoint has never seen. Every
     /// entry names a connection in `connections`, and a dangling one is dropped on
     /// the next operation, so this map is bounded by [`MAX_STORED_RECORDS`] however
-    /// many tokens a caller invents.
+    /// many tokens a caller invents. The create an entry names is resolved through
+    /// [`Self::idempotent_create_in`], so a token whose connection belongs to another
+    /// Region, or has had a `DeleteConnection` made on it, resolves to nothing.
     pub idempotency_tokens: BTreeMap<(String, String), IdempotentCreate>,
     /// `activationKey` -> connection id: the reverse index
     /// `DescribeConnectionProposal` / `AcceptConnectionProposal` resolve a
@@ -474,6 +476,35 @@ impl ComAmazonawsInterconnectInterconnectState {
             .get(activation_key)
             .and_then(|connection_id| self.connection_in(region, connection_id))
             .filter(|stored| !is_deleted_or_deleting(&stored.connection.state))
+    }
+
+    /// What the `clientToken` of a repeated create names in `region`: the create that
+    /// token made, together with the connection it allocated — the only pair a replay
+    /// can be judged on.
+    ///
+    /// Two scopes, both the ones every other resolution here applies. The entry is held
+    /// under the Region the request addressed ([`idempotency_key`]), and the connection
+    /// it names is resolved through [`Self::connection_in`], so a token first carried by
+    /// another Region's endpoint resolves to nothing. And a connection a
+    /// `DeleteConnection` has been made on resolves to nothing either: what a create's
+    /// token names is the resource that create produced, and from the moment the delete
+    /// is called that resource is going or gone — the record stays readable BY ITS
+    /// IDENTIFIER so a caller polling the delete sees the teardown and then the terminal
+    /// state, but it is no longer a resource this account holds, so the token names
+    /// nothing to replay and nothing to compare a repeat against. That is also what
+    /// keeps the answer to one and the same well-formed request independent of the
+    /// clock: the retention that later evicts the record changes nothing a caller can
+    /// observe, because the token stopped naming a resource when the delete was made.
+    pub fn idempotent_create_in(
+        &self,
+        region: &str,
+        token: &str,
+    ) -> Option<(&IdempotentCreate, &StoredConnection)> {
+        let created = self.idempotency_tokens.get(&idempotency_key(region, token))?;
+        let stored = self
+            .connection_in(region, &created.connection_id)
+            .filter(|stored| !is_deleted_or_deleting(&stored.connection.state))?;
+        Some((created, stored))
     }
 
     /// [`Self::connection_in`] for the operations that MUTATE the record they
