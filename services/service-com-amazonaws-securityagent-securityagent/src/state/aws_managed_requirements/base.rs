@@ -9,12 +9,15 @@
 //! pack's content, which is why its descriptions are single statements where the three
 //! framework packs carry a framework requirement's published prose.
 //!
-//! WHICH TEXT IS WHICH: the pack's requirement NAMES and the count of them are recorded —
-//! they are what a fresh account's `ListSecurityRequirements` reports for this pack — as
-//! are the statements of the audit-logging and authentication rules, written here as the
-//! corpus states them. The remaining statements, and every `domain`, `evaluation` and
-//! `remediation`, are written to that same one-statement shape rather than recorded, and a
-//! later recording of the exact wording replaces them rather than being judged equal.
+//! WHICH TEXT IS WHICH: the pack's requirement NAMES, the count of them and the STATEMENT
+//! of each of the ten rules are recorded — they are what a fresh account's
+//! `ListSecurityRequirements` reports for this pack — and every statement below is written
+//! as the corpus states it, in full and word for word, because the whole string is the
+//! rule: it carries no name, id, limit or timestamp from the request or from state, so a
+//! re-wording of it is a different rule rather than a different rendering of the same one.
+//! The `domain`, `evaluation` and `remediation` beside each statement are written to that
+//! same one-statement shape rather than recorded, and a later recording of their exact
+//! wording replaces them rather than being judged equal.
 //!
 //! TEN, not twenty-eight: the report that filed the short tables reads the recording as
 //! holding 28 entries for this pack, but the recorded step reports these ten. Its own
@@ -54,7 +57,7 @@ pub const BASE_PACK_REQUIREMENTS: [AwsManagedRequirement; 10] = [
     },
     AwsManagedRequirement {
         name: "authorization-best-practices",
-        description: "Ensure users can only perform the actions they are permitted to.",
+        description: "Ensure systems follow authorization best practices.",
         domain: "IdentityAndAccessManagement",
         evaluation: "Check that each request is authorized against the caller's \
                      permissions for the resource it names, and not only authenticated.",
@@ -65,7 +68,7 @@ pub const BASE_PACK_REQUIREMENTS: [AwsManagedRequirement; 10] = [
     },
     AwsManagedRequirement {
         name: "information-protection-best-practices",
-        description: "Ensure sensitive information is protected wherever it is held.",
+        description: "Ensure sensitive data remains confidential and unaltered.",
         domain: "DataProtection",
         evaluation: "Check that sensitive information is classified, encrypted in transit \
                      and at rest, and reachable only by the identities that need it.",
@@ -76,7 +79,7 @@ pub const BASE_PACK_REQUIREMENTS: [AwsManagedRequirement; 10] = [
     },
     AwsManagedRequirement {
         name: "log-protection-best-practices",
-        description: "Ensure logs are protected and do not disclose sensitive data.",
+        description: "Protect the integrity and confidentiality of system logs.",
         domain: "Logging",
         evaluation: "Check that log records carry no credentials or sensitive data and \
                      that the log destination cannot be altered by what it records.",
@@ -87,7 +90,7 @@ pub const BASE_PACK_REQUIREMENTS: [AwsManagedRequirement; 10] = [
     },
     AwsManagedRequirement {
         name: "privileged-access-best-practices",
-        description: "Ensure privileged access is restricted and accountable.",
+        description: "Ensure there are adequate guardrails for privileged functions.",
         domain: "IdentityAndAccessManagement",
         evaluation: "Check that privileged access is held by the fewest identities \
                      possible, granted for a bounded time and recorded when used.",
@@ -98,7 +101,7 @@ pub const BASE_PACK_REQUIREMENTS: [AwsManagedRequirement; 10] = [
     },
     AwsManagedRequirement {
         name: "secret-protection-best-practices",
-        description: "Ensure secrets are protected from disclosure.",
+        description: "Ensure that secrets like credentials remain confidential.",
         domain: "DataProtection",
         evaluation: "Check the repository, build configuration and images for credential \
                      material, and that each secret is read from a managed secret store \
@@ -110,7 +113,7 @@ pub const BASE_PACK_REQUIREMENTS: [AwsManagedRequirement; 10] = [
     },
     AwsManagedRequirement {
         name: "secure-by-default-best-practices",
-        description: "Ensure the system is secure by default.",
+        description: "Ensure the system's default configuration is secure.",
         domain: "SecureConfiguration",
         evaluation: "Check that a component deployed with no configuration denies access, \
                      encrypts its data and exposes no optional interface.",
@@ -121,7 +124,7 @@ pub const BASE_PACK_REQUIREMENTS: [AwsManagedRequirement; 10] = [
     },
     AwsManagedRequirement {
         name: "tenant-isolation-best-practices",
-        description: "Ensure one tenant cannot reach another tenant's data.",
+        description: "Ensure appropriate separation between system tenants.",
         domain: "MultiTenancy",
         evaluation: "Check that every request carries the tenant it acts for and that \
                      each data access is scoped to that tenant at the store rather than \
@@ -133,7 +136,7 @@ pub const BASE_PACK_REQUIREMENTS: [AwsManagedRequirement; 10] = [
     },
     AwsManagedRequirement {
         name: "trusted-cryptography-best-practices",
-        description: "Ensure only trusted cryptography is used.",
+        description: "Ensure only trustworthy cryptographic implementations are used.",
         domain: "DataProtection",
         evaluation: "Check that the algorithms, key sizes and protocol versions in use \
                      are the ones currently trusted, and that no component implements its \

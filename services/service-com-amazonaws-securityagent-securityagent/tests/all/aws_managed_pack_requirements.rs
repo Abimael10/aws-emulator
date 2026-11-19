@@ -859,6 +859,104 @@ async fn a_shipped_requirements_description_is_its_published_statement() {
     }
 }
 
+/// The WHOLE published statement of every requirement the base pack ships, written out
+/// here rather than read from the catalog table, so that a re-wording of one statement
+/// fails a case instead of moving both sides of the comparison at once.
+///
+/// Source: the recorded `description` of each requirement of `srp-am-base` on step
+/// `task#1` of the `securityagent-catalog-list-security-requirements` fixture — the model
+/// enumerates neither which packs AWS ships nor what they hold, so the content is recorded
+/// behavior. Each string is wholly FIXED catalog text: it carries no name, id, limit or
+/// timestamp from the request or from state, so the statement IS the requirement rather
+/// than one run's value, and all ten are asserted — the ones the reports cited and the ones
+/// they did not.
+const PUBLISHED_BASE_PACK_STATEMENTS: [(&str, &str); 10] = [
+    (
+        "audit-logging-best-practices",
+        "Ensure the system supports security monitoring.",
+    ),
+    (
+        "authentication-best-practices",
+        "Ensure only legitimate users can access the system.",
+    ),
+    (
+        "authorization-best-practices",
+        "Ensure systems follow authorization best practices.",
+    ),
+    (
+        "information-protection-best-practices",
+        "Ensure sensitive data remains confidential and unaltered.",
+    ),
+    (
+        "log-protection-best-practices",
+        "Protect the integrity and confidentiality of system logs.",
+    ),
+    (
+        "privileged-access-best-practices",
+        "Ensure there are adequate guardrails for privileged functions.",
+    ),
+    (
+        "secret-protection-best-practices",
+        "Ensure that secrets like credentials remain confidential.",
+    ),
+    (
+        "secure-by-default-best-practices",
+        "Ensure the system's default configuration is secure.",
+    ),
+    (
+        "tenant-isolation-best-practices",
+        "Ensure appropriate separation between system tenants.",
+    ),
+    (
+        "trusted-cryptography-best-practices",
+        "Ensure only trustworthy cryptographic implementations are used.",
+    ),
+];
+
+/// RULE: a shipped requirement's `description` is the statement its pack publishes it
+/// with, word for word — the whole string is the rule, so a shortened or re-worded
+/// restatement of it is a different rule and not a different rendering of the same one.
+///
+/// The rows are every requirement the base pack publishes, crossed with the two readers
+/// that project a stored requirement (the listing and the batch read) and with two
+/// independent boots, because a statement is content of the pack rather than of one run:
+/// nothing in it may vary with the account's state or with when it was read.
+#[tokio::test]
+async fn a_shipped_statement_is_the_published_wording_through_every_reader() {
+    for boot in 0..2 {
+        let router = emulator();
+        let pack_id = "srp-am-base";
+        let names: Vec<&str> = PUBLISHED_BASE_PACK_STATEMENTS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        let case = format!("boot {boot} {pack_id}");
+        let summaries = list_all(&router, pack_id, None, &case).await;
+        let read = batch_get(&router, pack_id, &names, &case).await;
+
+        for (name, statement) in PUBLISHED_BASE_PACK_STATEMENTS {
+            let case = format!("{case} / {name}");
+            let summary = summaries
+                .iter()
+                .find(|summary| member(summary, "name").as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("case {case:?}: the listing does not report it"));
+            let record = read
+                .get(name)
+                .unwrap_or_else(|| panic!("case {case:?}: the batch read does not report it"));
+
+            for (reader, payload) in [("the listing", summary), ("the batch read", record)] {
+                assert_eq!(
+                    member(payload, "description").as_deref(),
+                    Some(statement),
+                    "case {case:?} through {reader}: expected the published statement \
+                     {statement:?}, got {:?}",
+                    member(payload, "description")
+                );
+            }
+        }
+    }
+}
+
 /// RULE: reading the shipped content changes nothing — two listings of an untouched
 /// account agree member for member, and the catalog table every case above is driven from
 /// names each requirement of a pack exactly once with no empty field.
