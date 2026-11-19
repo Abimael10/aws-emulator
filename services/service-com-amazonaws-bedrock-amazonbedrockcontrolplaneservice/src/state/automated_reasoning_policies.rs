@@ -20,19 +20,22 @@ use super::*;
 pub const MAX_AUTOMATED_REASONING_POLICIES_PER_ACCOUNT: usize = 100;
 
 /// The policy-definition FORMAT version this service digests every
-/// `AutomatedReasoningPolicyDefinition` under — the canonical form of that document
+/// `AutomatedReasoningPolicyDefinition` under — the canonical form of that document. It is
+/// the member's own modelled `@default`, which is what an omitted token means on the wire
 /// (`AutomatedReasoningPolicyDefinition$version`, a plain
-/// `AutomatedReasoningPolicyFormatVersion` string:
-/// `smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`).
+/// `AutomatedReasoningPolicyFormatVersion` string with `default: "1"`:
+/// `smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`), so the
+/// emulator never invents a token the model does not declare.
 ///
-/// The member describes the document's own format rather than the policy, and the token a
-/// request wrote into a document is the one that document reads back with. This token is
-/// the CANONICAL one: it stamps the document [`super::policy_definition_hash`] digests,
-/// which is what keeps a `definitionHash` a function of the definition's content rather
-/// than of the format token its writer spelled, and it stamps the empty document a
-/// revision holding no definition at all stands for. It is NOT the policy's own resource
-/// version (that one is the `:<version>` suffix of a versioned ARN).
-pub const POLICY_DEFINITION_FORMAT_VERSION: &str = "1.0";
+/// The member describes the document's own FORMAT rather than the policy, and the format is
+/// this service's rather than a writing request's: every read of a definition states this
+/// token, so a request that spelled another one names no format this service publishes. It
+/// stamps the document [`super::policy_definition_hash`] digests, which is what keeps a
+/// `definitionHash` a function of the definition's content rather than of the format token
+/// its writer spelled, and it stamps the empty document a revision holding no definition at
+/// all stands for. It is NOT the policy's own resource version (that one is the
+/// `:<version>` suffix of a versioned ARN).
+pub const POLICY_DEFINITION_FORMAT_VERSION: &str = "1";
 
 /// The most build workflows ONE Automated Reasoning policy may hold at once, past which a
 /// start is refused with `ServiceQuotaExceededException`.

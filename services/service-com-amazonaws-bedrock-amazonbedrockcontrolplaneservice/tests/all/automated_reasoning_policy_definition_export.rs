@@ -10,10 +10,10 @@
 //! 1. **The export reports the definition the addressed revision holds**: the unversioned
 //!    ARN exports the working draft, for drafts differing in whether a definition is
 //!    present, which of its lists are present and how many entries each carries — and the
-//!    exported definition carries the format token its writer spelled, the shape's own
-//!    `@default` standing for a writer that spelled none
-//!    (`AutomatedReasoningPolicyDefinition$version`, `@default("1")`), and the canonical
-//!    empty document's format for a draft holding no definition at all.
+//!    exported definition carries the format version this SERVICE writes definitions in,
+//!    the member's own modelled default
+//!    (`AutomatedReasoningPolicyDefinition$version`, `@default("1")`), whatever token the
+//!    writing request spelled and for a draft holding no definition at all.
 //! 2. **The exported definition is the one the revision's `definitionHash` is taken over**:
 //!    a policy created from an exported definition reports the hash the exported revision
 //!    reported, so the export loses nothing the hash depends on.
@@ -25,12 +25,13 @@
 //! 5. **An ARN naming no revision is 404**: an id nothing minted and a minted id in another
 //!    region are reported as a missing policy, while a version number the policy has not
 //!    cut is reported as the missing version.
-//! 6. **The format token is the document's own, and is not content**: whatever token the
+//! 6. **The format token is the service's own, and is not content**: whatever token the
 //!    request that wrote the definition carried — a dotted release number, another whole
-//!    number, an empty string, none at all — the definition read back carries that token,
-//!    while two definitions differing only in it report ONE `definitionHash`, because the
-//!    digest is taken over the canonical form of the document rather than over the token
-//!    its writer spelled (`automated_reasoning_policies.rs` pins the digest itself).
+//!    number, an empty string, none at all — the definition read back carries the one
+//!    format version this service writes definitions in, and two definitions differing only
+//!    in the token their writers spelled report ONE `definitionHash`, because the digest is
+//!    taken over the canonical form of the document rather than over the token its writer
+//!    spelled (`automated_reasoning_policies.rs` pins the digest itself).
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation",operation="ExportAutomatedReasoningPolicyVersion")`,
@@ -42,16 +43,12 @@ use serde_json::{json, Value};
 
 use crate::support::{emulator, label, Emulator, Reply, ACCOUNT, REGION};
 
-/// What an `AutomatedReasoningPolicyDefinition` carrying NO format token means, which is
-/// the token `AutomatedReasoningPolicyDefinition$version` declares as its `@default`
+/// What an exported `AutomatedReasoningPolicyDefinition` states as the format it is written
+/// in: the token `AutomatedReasoningPolicyDefinition$version` declares as its `@default`
 /// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`: target
-/// `AutomatedReasoningPolicyFormatVersion`, a plain string, `@default("1")`).
+/// `AutomatedReasoningPolicyFormatVersion`, a plain string, `@default("1")`), which is the
+/// format this service holds every definition in whatever a writing request spelled.
 const DEFAULT_FORMAT_VERSION: &str = "1";
-
-/// The format the CANONICAL document is written in: what a revision holding no definition
-/// at all exports, and the format every definition is digested under
-/// (`automated_reasoning_policies.rs` pins the digest).
-const CANONICAL_FORMAT_VERSION: &str = "1.0";
 
 /// What the refusal of an ARN naming a version the addressed policy has not cut says, as
 /// `GetAutomatedReasoningPolicy` reports the same ARN.
@@ -286,13 +283,10 @@ async fn an_export_reports_the_definition_the_addressed_draft_holds() {
              {expected:?}, got {:?}",
             exported.body
         );
-        // A draft that holds a document reads back with that document's token, the shape's
-        // own default standing for a request that spelled none; a draft holding NO document
-        // stands for the canonical empty one.
-        let expected_token = match &row.definition {
-            None => CANONICAL_FORMAT_VERSION,
-            Some(_) => DEFAULT_FORMAT_VERSION,
-        };
+        // Whatever a writer spelled, a read reports the format THIS SERVICE writes
+        // definitions in; a draft holding NO document stands for the empty one, stamped
+        // alike.
+        let expected_token = DEFAULT_FORMAT_VERSION;
         assert_eq!(
             exported.body.get("version").and_then(Value::as_str),
             Some(expected_token),
@@ -518,16 +512,17 @@ async fn an_arn_that_names_no_revision_is_refused() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 6. The format token an exported definition carries is its writer's, and is not content.
+// 6. The format token an exported definition carries is the service's, and is not content.
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn an_exported_definition_carries_the_format_token_its_writer_spelled() {
+async fn an_exported_definition_carries_the_services_own_format_token() {
     // Rows differ along the format token the WRITING request spelled for one and the same
     // definition content: `AutomatedReasoningPolicyFormatVersion` is a plain string with no
     // enum, pattern or length constraint
     // (`smithy_query(query="shape",shape="AutomatedReasoningPolicyFormatVersion")`), so any
-    // of these reaches the handler and is the token the document it wrote carries.
+    // of these reaches the handler — and none of them is a format this service publishes, so
+    // the document read back states the service's own format whichever row wrote it.
     let rows: Vec<(&str, Option<&str>)> = vec![
         ("no format version at all", None),
         ("the shape's own default", Some("1")),
@@ -558,9 +553,9 @@ async fn an_exported_definition_carries_the_format_token_its_writer_spelled() {
         )
         .await;
 
-        // The draft reads back carrying the token its writer spelled, the shape's own
-        // default standing for a writer that spelled none.
-        let expected_token = token.unwrap_or(DEFAULT_FORMAT_VERSION);
+        // The draft reads back carrying the format this service writes definitions in,
+        // whatever the writer spelled.
+        let expected_token = DEFAULT_FORMAT_VERSION;
         let exported = export(&emu, &policy_arn).await;
         assert_eq!(
             exported.status, 200,
@@ -634,6 +629,143 @@ async fn an_exported_definition_carries_the_format_token_its_writer_spelled() {
             "case {case:?}: a definition differing from {first_case:?} only in the format \
              token the request spelled must report its definitionHash {first_hash:?}, got \
              {hash:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// 7. The format token survives an export/import round trip, on every revision.
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_exported_format_token_is_the_modelled_default_on_every_revision() {
+    // The token is a property of the SERVICE's document format rather than of a revision,
+    // so every revision an export can be addressed by reports the same one. The rows differ
+    // along the revision addressed and along what wrote it: a draft nothing wrote a
+    // definition into, a draft written by the create, a draft the update rewrote, a version
+    // cut from such a draft, and the draft a re-import of an exported document wrote — and
+    // the writing requests spell the token differently (none at all, a dotted release
+    // number, a whole number past the default), so no row's answer can come from an echo.
+    struct Row {
+        case: &'static str,
+        /// The token the CREATE's definition spelled; `None` for a create carrying no
+        /// definition at all.
+        created_with: Option<Option<&'static str>>,
+        /// The token the UPDATE's definition spelled, when a row rewrites the draft.
+        updated_with: Option<&'static str>,
+    }
+
+    let rows = [
+        Row {
+            case: "a draft created with no definition",
+            created_with: None,
+            updated_with: None,
+        },
+        Row {
+            case: "a draft created with no format token",
+            created_with: Some(None),
+            updated_with: None,
+        },
+        Row {
+            case: "a draft created under a dotted release number",
+            created_with: Some(Some("1.0")),
+            updated_with: None,
+        },
+        Row {
+            case: "a draft rewritten under a whole number past the default",
+            created_with: Some(Some("1.0")),
+            updated_with: Some("2"),
+        },
+        Row {
+            case: "a draft rewritten under no format token",
+            created_with: Some(Some("9.9.9")),
+            updated_with: Some(""),
+        },
+    ];
+
+    let emu = emulator();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let mut body = json!({ "name": format!("token stamped policy {index}") });
+        if let Some(token) = row.created_with {
+            let mut written = definition(&["types", "variables", "rules"], (1, 1, 1), false);
+            if let Some(token) = token {
+                written["version"] = json!(token);
+            }
+            body["policyDefinition"] = written;
+        }
+        let (policy_arn, created_hash) = policy(&emu, body).await;
+
+        let mut draft_hash = created_hash;
+        if let Some(token) = row.updated_with {
+            let mut rewritten = definition(&["rules"], (0, 0, 2), false);
+            rewritten["version"] = json!(token);
+            let updated = update_policy(
+                &emu,
+                &policy_arn,
+                json!({ "policyDefinition": rewritten }),
+            )
+            .await;
+            assert_eq!(
+                updated.status, 200,
+                "case {case:?}: UpdateAutomatedReasoningPolicy must answer 200, got {} {:?}",
+                updated.status, updated.body
+            );
+            draft_hash = updated.text("definitionHash");
+        }
+
+        // The draft, the version cut from it, and the draft a re-import of the exported
+        // document wrote: three revisions, one token.
+        let exported = export(&emu, &policy_arn).await;
+        assert_eq!(
+            exported.status, 200,
+            "case {case:?}: the draft must export, got {} {:?}",
+            exported.status, exported.body
+        );
+        let cut = create_version(
+            &emu,
+            &policy_arn,
+            json!({ "lastUpdatedDefinitionHash": draft_hash.clone() }),
+        )
+        .await;
+        assert_eq!(
+            cut.status, 200,
+            "case {case:?}: CreateAutomatedReasoningPolicyVersion must answer 200, got {} {:?}",
+            cut.status, cut.body
+        );
+        let frozen = export(&emu, &cut.text("policyArn")).await;
+        let (reimported_arn, _) = policy(
+            &emu,
+            json!({
+                "name": format!("token stamped reimport {index}"),
+                "policyDefinition": exported.body.clone(),
+            }),
+        )
+        .await;
+        let reimported = export(&emu, &reimported_arn).await;
+
+        for (revision, answer) in [
+            ("the draft", &exported),
+            ("the version it cut", &frozen),
+            ("the re-imported draft", &reimported),
+        ] {
+            assert_eq!(
+                answer.body.get("version").and_then(Value::as_str),
+                Some(DEFAULT_FORMAT_VERSION),
+                "case {case:?}/{revision}: the exported definition must state the format \
+                 version this service writes definitions in ({DEFAULT_FORMAT_VERSION:?}), got \
+                 {:?}",
+                answer.body.get("version")
+            );
+        }
+        // And the re-import is a round trip: the document the export handed out describes the
+        // same definition, so it reports the hash the exported revision reported.
+        assert_eq!(
+            content(&reimported.body),
+            content(&exported.body),
+            "case {case:?}: the re-imported draft must hold the definition the export \
+             reported, got {:?}",
+            reimported.body
         );
     }
 }

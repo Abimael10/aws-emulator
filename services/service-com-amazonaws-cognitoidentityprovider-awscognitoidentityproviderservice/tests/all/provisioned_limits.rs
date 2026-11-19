@@ -638,11 +638,11 @@ async fn the_rate_a_read_reports_is_refused_when_it_is_re_applied() {
                 "case {case:?}: the limit must stand at {in_force}, got {after}"
             );
 
+            // The next rate up is a rate the account has NOT provisioned, so
+            // the refusal above is about the value adjusting nothing rather
+            // than about the limit refusing every write. Only the row that
+            // opened the range has room above the rate in force.
             if provisioned_first {
-                // The next rate up is a rate the limit does NOT hold, and the
-                // increase put it inside the account's range, so the refusal
-                // above is about the value being unchanged rather than about
-                // the operation refusing every write.
                 let (status, answered) = provision(&router, limit.category, in_force + 1).await;
                 assert_eq!(
                     status, 200,

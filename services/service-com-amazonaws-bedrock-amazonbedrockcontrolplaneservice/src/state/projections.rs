@@ -394,8 +394,8 @@ pub fn policy_definition_hash(definition: Option<&AutomatedReasoningPolicyDefini
     ::hex::encode(Sha512::digest(canonical.as_bytes()))
 }
 
-/// A policy definition as its CONTENT: the format version the document carries, and each
-/// of its three lists, an absent one read as the empty list.
+/// A policy definition as its CONTENT: the format version this service writes definitions
+/// in, and each of its three lists, an absent one read as the empty list.
 ///
 /// So a revision that holds NO definition, and one whose definition carries no types,
 /// variables or rules, hold the same three empty lists — and this is what
@@ -403,22 +403,20 @@ pub fn policy_definition_hash(definition: Option<&AutomatedReasoningPolicyDefini
 /// operation reports always hashes to the `definitionHash` the same revision reports.
 ///
 /// `version` names the FORMAT the definition document is written in rather than anything
-/// about the policy, so the token the document carries is the one its writer wrote into it
-/// (`AutomatedReasoningPolicyFormatVersion` is a plain string, and the member's own
-/// `@default` is what an absent one means:
-/// `smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`). A revision
-/// holding no document at all stands for the canonical EMPTY document, stamped
-/// [`POLICY_DEFINITION_FORMAT_VERSION`]. The token is not content: it is NOT what
-/// [`policy_definition_hash`] digests, so two definitions differing only in it are one
-/// definition to the hash.
+/// about the policy, and the format is the SERVICE's
+/// ([`POLICY_DEFINITION_FORMAT_VERSION`], the member's own modelled `@default`:
+/// `smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`), so a read
+/// reports the format the service holds the document in rather than echoing a token the
+/// writing request spelled — a request names no format this service publishes. The token is
+/// therefore not content: it is NOT what [`policy_definition_hash`] digests, so two
+/// definitions differing only in the token their writers spelled are one definition to the
+/// hash and read back alike.
 #[must_use]
 pub fn policy_definition_content(
     definition: Option<&AutomatedReasoningPolicyDefinition>,
 ) -> AutomatedReasoningPolicyDefinition {
     AutomatedReasoningPolicyDefinition {
-        version: definition
-            .map(|definition| definition.version.clone())
-            .unwrap_or_else(|| POLICY_DEFINITION_FORMAT_VERSION.to_string()),
+        version: POLICY_DEFINITION_FORMAT_VERSION.to_string(),
         types: Some(
             definition
                 .and_then(|definition| definition.types.clone())

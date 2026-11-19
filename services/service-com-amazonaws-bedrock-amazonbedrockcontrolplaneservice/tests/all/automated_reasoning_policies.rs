@@ -696,8 +696,10 @@ async fn more_tags_than_one_resource_may_hold_is_refused() {
 // ---------------------------------------------------------------------------------------
 
 /// The format the canonical definition document is written in, which is what a revision
-/// holding no definition at all stands for too.
-const CANONICAL_FORMAT_VERSION: &str = "1.0";
+/// holding no definition at all stands for too: the member's own modelled `@default`
+/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`:
+/// `version` targets `AutomatedReasoningPolicyFormatVersion`, `@default("1")`).
+const CANONICAL_FORMAT_VERSION: &str = "1";
 
 /// The canonical document a `definitionHash` is the digest OF, built here beside the
 /// emulator rather than read out of it.

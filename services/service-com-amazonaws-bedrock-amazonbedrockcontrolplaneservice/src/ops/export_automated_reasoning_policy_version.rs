@@ -11,11 +11,11 @@
 //! exactly as a read of that ARN is.
 //!
 //! The exported definition is the revision's CONTENT as
-//! [`crate::state::policy_definition_content`] reads it — the format token the document
-//! carries, the canonical one ([`crate::state::POLICY_DEFINITION_FORMAT_VERSION`]) for a
-//! revision that holds no document at all, and each of its three lists, an absent one as
-//! the empty list — which is the same reading
-//! [`crate::state::policy_definition_hash`] digests, under the canonical format token. So a
+//! [`crate::state::policy_definition_content`] reads it — the format version this service
+//! writes definitions in ([`crate::state::POLICY_DEFINITION_FORMAT_VERSION`], the member's
+//! own modelled default, rather than a token a writing request spelled) and each of its
+//! three lists, an absent one as the empty list — which is the same reading
+//! [`crate::state::policy_definition_hash`] digests, under the same format token. So a
 //! revision that holds no definition exports the empty definition rather than refusing a
 //! read of a policy that is there, and the definition this operation exports always hashes
 //! to the `definitionHash` the same revision reports.

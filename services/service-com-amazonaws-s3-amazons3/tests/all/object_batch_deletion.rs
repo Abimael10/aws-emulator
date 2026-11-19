@@ -14,10 +14,10 @@
 //! > the version a `VersionId` names, or the simple delete that lays a delete marker on a
 //! > bucket carrying a versioning state — and reports the result of each in the response:
 //! > a key that held nothing is reported deleted too — a key's delete is idempotent — while
-//! > an identifier that pins a `VersionId` the bucket holds no version of resolves to no
-//! > version and is that key's own `Errors` entry rather than a failure of the request,
-//! > whether that token is of the published shape or no version id's shape at all, and
-//! > `Quiet` leaves the successes out.
+//! > an identifier that pins a `VersionId` the bucket holds no version of is that key's own
+//! > `Errors` entry while the bucket still holds OTHER versions of that key, and is confirmed
+//! > deleted once the bucket holds no version of the key at all, whether that token is of the
+//! > published shape or no version id's shape at all, and `Quiet` leaves the successes out.
 //!
 //! Its sources (this operation's own documentation): "For each key, Amazon S3 performs a
 //! delete operation and returns the result of that delete, success or failure, in the
@@ -513,25 +513,27 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
 
     // Naming every version AND every marker empties the bucket in one request. Each
     // identifier performs exactly what a `DeleteObject` for it would and reports what it
-    // resolved to: a `VersionId` the bucket holds no version of resolves to no version, so it
-    // is that identifier's own failure beside the keys that did delete and takes nothing away
-    // — whether the token is of the published shape or no version id's shape at all (the
-    // single-object path refuses the ARGUMENT for the latter, see
-    // `version_id_classification`).
+    // resolved to, judged against what the bucket holds WHEN that identifier runs: a
+    // `VersionId` the bucket holds no version of is that identifier's own failure while the
+    // key still holds versions, and is confirmed once the batch has emptied the key — whether
+    // the token is of the published shape or no version id's shape at all (the single-object
+    // path refuses the ARGUMENT for the latter, see `version_id_classification`).
+    let shaped = "a".repeat(VERSION_ID_CHARS);
+    let shapeless = "not-a-version".to_string();
     let mut named: Vec<(String, Option<String>)> = Vec::new();
+    // Both unresolvable tokens BEFORE anything is drained, while the key holds its version
+    // and its marker.
+    named.push(("one".to_string(), Some(shaped.clone())));
+    named.push(("one".to_string(), Some(shapeless.clone())));
     for key in keys {
         named.push(((*key).to_string(), Some(minted[*key].clone())));
     }
     for (key, marker_id) in &marker_ids {
         named.push((key.clone(), Some(marker_id.clone())));
     }
-    // A token this store never minted, in two shapes: one of the published shape, and one of
-    // no version id's shape at all.
-    named.push((
-        "one".to_string(),
-        Some("a".repeat(VERSION_ID_CHARS)),
-    ));
-    named.push(("one".to_string(), Some("not-a-version".to_string())));
+    // And again AFTER, when the key the batch just emptied holds no version at all.
+    named.push(("one".to_string(), Some(shaped.clone())));
+    named.push(("one".to_string(), Some(shapeless.clone())));
     let borrowed: Vec<Identifier> = named
         .iter()
         .map(|(key, version_id)| (key.as_str(), version_id.as_deref()))
@@ -548,9 +550,9 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
     let result = delete_result_of(&drained);
     assert_eq!(
         result.deleted_keys().len(),
-        4,
-        "every version and marker named is reported deleted, and neither unresolvable token \
-         is, got {:?}",
+        6,
+        "every version and marker named is reported deleted, beside the two tokens the batch \
+         had already emptied their key of, got {:?}",
         result.deleted_keys()
     );
     assert_eq!(
@@ -558,10 +560,11 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
             .deleted
             .iter()
             .filter_map(|entry| entry.get("VersionId").cloned())
-            .filter(|version_id| *version_id == "a".repeat(VERSION_ID_CHARS))
+            .filter(|version_id| *version_id == shaped || *version_id == shapeless)
             .count(),
-        0,
-        "the token naming no stored version confirms no delete, got {:?}",
+        2,
+        "a token naming no stored version confirms a delete only once its key holds no \
+         version, got {:?}",
         result.deleted
     );
     assert_eq!(
@@ -570,7 +573,8 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
             ("one".to_string(), "NoSuchVersion".to_string()),
             ("one".to_string(), "NoSuchVersion".to_string())
         ],
-        "each identifier naming no stored version is a failure of its own, got {:?}",
+        "each identifier naming no stored version of a key that still holds versions is a \
+         failure of its own, got {:?}",
         result.error_codes()
     );
     let emptied = version_listing_of(&list_object_versions(&router, name, "").await);
@@ -690,6 +694,329 @@ async fn a_batch_delete_outside_what_it_can_serve_is_refused_not_guessed() {
 /// The identifiers of a payload that names keys and no version ids.
 fn identifiers<'a>(keys: &'a [&'a str]) -> Vec<Identifier<'a>> {
     keys.iter().map(|key| (*key, None)).collect()
+}
+
+// ---------------------------------------------------------------------------------------
+// Which SIDE of the result a version-pinned identifier that resolves to no version lands on.
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_version_pinned_identifier_is_confirmed_only_where_the_key_holds_no_version() {
+    // RULE: an identifier that pins a `VersionId` the bucket holds no version of is reported
+    // by what the bucket holds of its KEY — the version chain such an identifier addresses.
+    // While the key still holds versions, S3 "indicates that the version ID specified in the
+    // request does not match an existing version" (`NoSuchVersion`), and the versions it
+    // holds are left alone. Once the bucket holds no version of the key at all the key is not
+    // there, so the delete is confirmed — "if the object specified in the request isn't
+    // found, Amazon S3 confirms the deletion by returning the result as deleted" — which is
+    // what makes a repeated delete of one version idempotent.
+    //
+    // The rows differ along WHAT the bucket holds of the named key and along the form of the
+    // token: a key whose only version this run's own delete already took away (the repeated
+    // delete), a key nothing was ever written at, a key holding a live version, a key holding
+    // a version behind a delete marker, and a key holding nothing but a delete marker. The
+    // token varies with them: one of the published shape that nothing minted, a real-S3-shaped
+    // id of another width and alphabet, a token that is no version id at all, and the id this
+    // run really minted and deleted (a per-run value, so it is taken from the response rather
+    // than written out).
+    #[derive(Debug)]
+    enum Holding {
+        /// The key's only version is deleted by a batch of this test before the row runs.
+        VersionDeletedAgain,
+        /// Nothing was ever written at the key.
+        NeverWritten,
+        /// The key holds the version this run wrote.
+        LiveVersion,
+        /// The key holds its version behind a delete marker a simple delete laid.
+        VersionBehindMarker,
+        /// The key holds nothing but a delete marker: the version behind it is removed.
+        MarkerOnly,
+    }
+
+    // (case, what the key holds, the token the identifier pins — `None` for the id this run
+    // minted for that key, whether the entry must be confirmed).
+    let rows: [(&str, Holding, Option<String>, bool); 7] = [
+        (
+            "the same version deleted twice",
+            Holding::VersionDeletedAgain,
+            None,
+            true,
+        ),
+        (
+            "a key nothing was written at, with a shaped token",
+            Holding::NeverWritten,
+            Some("e3b0c44298fc1c149afbf4c8996fb924".to_string()),
+            true,
+        ),
+        (
+            "a key nothing was written at, with a real-S3-shaped id",
+            Holding::NeverWritten,
+            // The published example of an issued version id, which is what a client holding
+            // one against the real service hands back.
+            Some("3HL4kqtJlcpXroDTDmJ_RGrmHJ1PyFCY".to_string()),
+            true,
+        ),
+        (
+            "a key nothing was written at, with a token that is no version id",
+            Holding::NeverWritten,
+            Some("not-a-version".to_string()),
+            true,
+        ),
+        (
+            "a live version beside a token nothing minted",
+            Holding::LiveVersion,
+            Some("f".repeat(VERSION_ID_CHARS)),
+            false,
+        ),
+        (
+            "a version behind a delete marker",
+            Holding::VersionBehindMarker,
+            Some("not-a-version".to_string()),
+            false,
+        ),
+        (
+            "nothing but a delete marker",
+            Holding::MarkerOnly,
+            Some("e3b0c44298fc1c149afbf4c8996fb924".to_string()),
+            false,
+        ),
+    ];
+
+    for (case, holding, token, confirmed) in rows {
+        // A fresh store per row, so one row's deletes cannot decide another's.
+        let router = router();
+        let name = "batch-delete-absent-version";
+        bucket(&router, name).await;
+        set_versioning(&router, name, "Enabled").await;
+        let key = "svc-file1.txt";
+        let minted = write_keys(&router, name, &[key]).await[key].clone();
+        assert!(
+            !minted.is_empty(),
+            "case {case:?}: the setup write must mint a version to name, got {minted:?}"
+        );
+
+        // Bring the key to what this row holds of it.
+        match holding {
+            Holding::VersionDeletedAgain => {
+                let first = delete_objects(&router, name, &[(key, Some(&minted))], false).await;
+                let result = delete_result_of(&first);
+                assert_eq!(
+                    (first.status, result.deleted_keys(), result.error_codes()),
+                    (200, vec![key.to_string()], Vec::new()),
+                    "case {case:?}: the first delete of the version must be reported deleted, \
+                     got {} with body {:?}",
+                    first.status,
+                    text(&first)
+                );
+            }
+            Holding::NeverWritten => {
+                // The version the setup wrote goes away with the key it was written at, so
+                // the row's key really holds nothing.
+                let drained = delete_objects(&router, name, &[(key, Some(&minted))], false).await;
+                assert_eq!(
+                    drained.status,
+                    200,
+                    "case {case:?}: the setup version must be removed, got {} with body {:?}",
+                    drained.status,
+                    text(&drained)
+                );
+            }
+            Holding::LiveVersion => {}
+            Holding::VersionBehindMarker => {
+                let marked = delete_objects(&router, name, &[(key, None)], false).await;
+                assert_eq!(
+                    marked.status,
+                    200,
+                    "case {case:?}: the simple delete must lay a marker, got {} with body {:?}",
+                    marked.status,
+                    text(&marked)
+                );
+            }
+            Holding::MarkerOnly => {
+                let marked = delete_objects(&router, name, &[(key, None)], false).await;
+                let marker_id = delete_result_of(&marked)
+                    .deleted_entry(key)
+                    .and_then(|entry| entry.get("DeleteMarkerVersionId").cloned())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: the simple delete must report the marker it laid, \
+                             got body {:?}",
+                            text(&marked)
+                        )
+                    });
+                let purged = delete_objects(&router, name, &[(key, Some(&minted))], false).await;
+                assert_eq!(
+                    purged.status,
+                    200,
+                    "case {case:?}: the version behind the marker must be removed, got {} with \
+                     body {:?}",
+                    purged.status,
+                    text(&purged)
+                );
+                assert!(
+                    !marker_id.is_empty(),
+                    "case {case:?}: the marker must carry an id of its own"
+                );
+            }
+        }
+
+        // What the key holds now, which is what the rule is keyed on.
+        let held_before =
+            version_listing_of(&list_object_versions(&router, name, "").await).entries();
+
+        let pinned = token.unwrap_or_else(|| minted.clone());
+        let answer = delete_objects(&router, name, &[(key, Some(&pinned))], false).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?}: the batch itself answers 200, got {} with body {:?}",
+            answer.status,
+            text(&answer)
+        );
+        let result = delete_result_of(&answer);
+        let reported: Vec<(String, String)> = result
+            .deleted
+            .iter()
+            .map(|entry| {
+                (
+                    entry.get("Key").cloned().unwrap_or_default(),
+                    entry.get("VersionId").cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let errored: Vec<(String, String, String, String)> = result
+            .errors
+            .iter()
+            .map(|entry| {
+                let field = |name: &str| entry.get(name).cloned().unwrap_or_default();
+                (
+                    field("Key"),
+                    field("VersionId"),
+                    field("Code"),
+                    field("Message"),
+                )
+            })
+            .collect();
+        match confirmed {
+            true => assert_eq!(
+                (reported.clone(), errored.clone()),
+                (vec![(key.to_string(), pinned.clone())], Vec::new()),
+                "case {case:?}: a key the bucket holds no version of confirms the delete, \
+                 echoing the pair it named, got {reported:?}/{errored:?} in body {:?}",
+                text(&answer)
+            ),
+            false => assert_eq!(
+                (reported.clone(), errored.clone()),
+                (
+                    Vec::new(),
+                    vec![(
+                        key.to_string(),
+                        pinned.clone(),
+                        "NoSuchVersion".to_string(),
+                        "The specified version does not exist.".to_string()
+                    )]
+                ),
+                "case {case:?}: a key the bucket holds versions of reports the unresolved \
+                 version as that key's own failure, got {reported:?}/{errored:?} in body {:?}",
+                text(&answer)
+            ),
+        }
+
+        // Either way the identifier took nothing away: what the bucket held before the call
+        // is what it holds after it.
+        let held_after =
+            version_listing_of(&list_object_versions(&router, name, "").await).entries();
+        assert_eq!(
+            held_after, held_before,
+            "case {case:?}: an identifier that resolved to no version must leave every stored \
+             version where it was, got {held_after:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_mixed_batch_reports_each_identifier_on_its_own_side() {
+    // The two sides of ONE response, over identifiers of DIFFERENT keys: a live version is
+    // deleted and confirmed, an unresolvable token on a key that still holds a version is
+    // that key's own `NoSuchVersion` failure, and an unresolvable token on a key the bucket
+    // holds no version of is confirmed. Every identifier is reported exactly once and the
+    // two lists are disjoint.
+    let router = router();
+    let name = "batch-delete-mixed";
+    bucket(&router, name).await;
+    set_versioning(&router, name, "Enabled").await;
+    let doomed = write_keys(&router, name, &["svc-file1.txt"]).await["svc-file1.txt"].clone();
+    let kept = write_keys(&router, name, &["svc-file2.txt"]).await["svc-file2.txt"].clone();
+    // A real-S3-shaped id, which is what a client's stale bookkeeping hands back: longer than
+    // this store mints and drawn from another alphabet.
+    let stale = "3sL4kqtJlcpXroDTDmJ_rmSpXd3dIbrHY_MTRCxf3vjVBH40Nr8X8gdRQBpUMLUo";
+    assert_ne!(stale, kept, "the stale token must name no stored version");
+
+    let answer = delete_objects(
+        &router,
+        name,
+        &[
+            ("svc-file1.txt", Some(&doomed)),
+            ("svc-file2.txt", Some(stale)),
+            ("svc-file3.txt", Some(stale)),
+        ],
+        false,
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "the mixed batch answers 200, got {} with body {:?}",
+        answer.status,
+        text(&answer)
+    );
+    let result = delete_result_of(&answer);
+    let reported: Vec<(String, String)> = result
+        .deleted
+        .iter()
+        .map(|entry| {
+            (
+                entry.get("Key").cloned().unwrap_or_default(),
+                entry.get("VersionId").cloned().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        reported,
+        vec![
+            ("svc-file1.txt".to_string(), doomed.clone()),
+            ("svc-file3.txt".to_string(), stale.to_string()),
+        ],
+        "case \"a mixed batch\": the live version and the identifier of a key holding nothing \
+         are confirmed, got {reported:?} in body {:?}",
+        text(&answer)
+    );
+    assert_eq!(
+        result.error_codes(),
+        vec![("svc-file2.txt".to_string(), "NoSuchVersion".to_string())],
+        "case \"a mixed batch\": only the key that still holds versions reports a failure, got \
+         {:?} in body {:?}",
+        result.error_codes(),
+        text(&answer)
+    );
+
+    // The refused identifier took nothing away: the version it could not name is still there.
+    let read = get_object(
+        &router,
+        name,
+        "svc-file2.txt",
+        &format!("?versionId={kept}"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        read.status,
+        200,
+        "case \"a mixed batch\": the version the stale token missed must still be readable, got \
+         {} with body {:?}",
+        read.status,
+        text(&read)
+    );
 }
 
 #[tokio::test]
