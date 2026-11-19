@@ -12,6 +12,11 @@
 //! run and applies nothing. What a reader is handed is therefore always inside the length
 //! its own modelled shape declares.
 //!
+//! That length is a count of CHARACTERS — the unit a modelled `@length` on a string
+//! states, and the one the centralized boundary walk holds `Change$Details` to — so how
+//! wide the UTF-8 encoding of a value is decides nothing: the cases below build values
+//! out of one-, two-, three- and four-byte characters and hold them to the same count.
+//!
 //! Every assertion goes through the router, so each case exercises routing,
 //! deserialization, the handler, the persisted state and serialization.
 
@@ -261,11 +266,11 @@ fn details_with_options(options: usize, with_ids: bool, target: usize) -> Value 
 /// Assert that `details` is reportable as the modelled `Json` string: inside its
 /// `@length`, and matching its `^[\s]*\{[\s\S]*\}[\s]*$`.
 fn assert_reportable(case: &str, details: &str) {
+    let characters = details.chars().count();
     assert!(
-        details.len() <= DETAILS_JSON_LIMIT && details.len() >= DETAILS_JSON_MINIMUM,
+        (DETAILS_JSON_MINIMUM..=DETAILS_JSON_LIMIT).contains(&characters),
         "case {case:?}: a reported Details must be {DETAILS_JSON_MINIMUM}..\
-         {DETAILS_JSON_LIMIT} characters, got {}",
-        details.len()
+         {DETAILS_JSON_LIMIT} characters, got {characters}"
     );
     assert!(
         details.trim().starts_with('{') && details.trim().ends_with('}'),
@@ -570,7 +575,7 @@ async fn a_merge_past_the_bound_fails_the_change_set_and_leaves_the_entity() {
                 Some(Value::Object(held.clone())),
                 "case {case:?}: the entity must report exactly what the applied steps \
                  merged, got {} characters",
-                reported.len()
+                reported.chars().count()
             );
         }
     }
@@ -788,5 +793,411 @@ async fn the_ids_the_catalog_assigns_count_toward_the_bound() {
             entity.status,
             entity.body
         );
+    }
+}
+
+/// `DescribeChangeSet` for change set `id` once its run has ended: the answer whose
+/// `Status` is a terminal one.
+///
+/// The run is driven by the spans the implementation publishes, so the CONDITION is
+/// polled rather than a span waited out — the deadline is generous enough for a loaded
+/// machine, and the loop returns as soon as the run is over on a fast one.
+async fn settled_change_set(router: &MultiServiceRouter, id: &str) -> Answer {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Some(answer) = ended_run(router, id).await {
+            return answer;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "change set {id} never reached a terminal status"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// One look: the describe answer when the run has ended, and `None` while it is still
+/// under way.
+async fn ended_run(router: &MultiServiceRouter, id: &str) -> Option<Answer> {
+    let answer = describe_change_set(router, id).await;
+    let ended = matches!(
+        answer.text("/Status").as_str(),
+        "SUCCEEDED" | "FAILED" | "CANCELLED"
+    );
+    ended.then_some(answer)
+}
+
+/// A flat details object padded with `fill` so its `Json` string is EXACTLY `target`
+/// CHARACTERS — however many UTF-8 bytes each of those characters encodes to.
+///
+/// `fill` is a character `serde_json` writes through unescaped, so one character of
+/// padding is one character of the serialization whatever its width.
+fn details_of_characters(prefix: &str, fill: char, target: usize) -> Value {
+    let pad = format!("{prefix}Pad");
+    let mut members = Map::new();
+    members.insert(pad.clone(), json!(""));
+    let base = Value::Object(members.clone()).to_string().chars().count();
+    assert!(
+        base <= target,
+        "a case asking for {target} characters cannot be built, as the empty object under \
+         {prefix:?} already takes {base}"
+    );
+    members.insert(pad, json!(fill.to_string().repeat(target - base)));
+    let details = Value::Object(members);
+    let built = details.to_string().chars().count();
+    assert_eq!(
+        built, target,
+        "the case must submit exactly {target} characters, built {built}"
+    );
+    details
+}
+
+/// One row of [`the_bound_counts_characters_not_the_bytes_they_encode_to`]: the case, the
+/// character the value is padded with, the member carrying it, how many CHARACTERS the
+/// value takes, and the status the submit is answered with.
+type CharacterRow = (&'static str, char, &'static str, usize, u16);
+
+/// The length `Json` declares is a count of CHARACTERS, so a details value inside that
+/// count is accepted, applied and reported back whatever its UTF-8 encoding weighs, and
+/// only a value past it in characters is refused — the count the refusal reports being
+/// that same character count.
+///
+/// The rows differ along the width of the characters the value is built from (one, two,
+/// three and four UTF-8 bytes each), which member carries it (`Details` as the modelled
+/// string, `DetailsDocument` as the document the model bounds in no way), and where the
+/// value sits relative to the published bound (inside it, exactly on it, one character
+/// past it, far past it).
+#[tokio::test]
+async fn the_bound_counts_characters_not_the_bytes_they_encode_to() {
+    let rows: Vec<CharacterRow> = vec![
+        (
+            "one-byte characters, exactly on the bound",
+            'p',
+            "DetailsDocument",
+            DETAILS_JSON_LIMIT,
+            200,
+        ),
+        (
+            "two-byte characters, exactly on the bound",
+            'é',
+            "DetailsDocument",
+            DETAILS_JSON_LIMIT,
+            200,
+        ),
+        (
+            "three-byte characters, exactly on the bound",
+            '鍵',
+            "DetailsDocument",
+            DETAILS_JSON_LIMIT,
+            200,
+        ),
+        (
+            "four-byte characters, exactly on the bound",
+            '𝄞',
+            "DetailsDocument",
+            DETAILS_JSON_LIMIT,
+            200,
+        ),
+        (
+            "three-byte characters, one character inside the bound",
+            '鍵',
+            "DetailsDocument",
+            DETAILS_JSON_LIMIT - 1,
+            200,
+        ),
+        (
+            "three-byte characters, one character past the bound",
+            '鍵',
+            "DetailsDocument",
+            DETAILS_JSON_LIMIT + 1,
+            422,
+        ),
+        (
+            "four-byte characters, far past the bound",
+            '𝄞',
+            "DetailsDocument",
+            DETAILS_JSON_LIMIT * 2,
+            422,
+        ),
+        (
+            "three-byte characters on the bound, as the modelled Details string",
+            '鍵',
+            "Details",
+            DETAILS_JSON_LIMIT,
+            200,
+        ),
+        // Past `Json`'s own `@length`, the modelled string member is refused by the
+        // centralized boundary walk before the handler runs, which counts the same
+        // characters and answers its own `ValidationException`.
+        (
+            "three-byte characters one character past the bound, as the modelled Details \
+             string",
+            '鍵',
+            "Details",
+            DETAILS_JSON_LIMIT + 1,
+            400,
+        ),
+    ];
+
+    for (case, fill, member, characters, expected_status) in rows {
+        let router = emulator();
+        let details = details_of_characters("m", fill, characters);
+        let submitted = details.to_string();
+        let bytes = submitted.len();
+        // A row built from wide characters is exactly where the two units disagree: its
+        // encoding weighs more than the bound while its character count is inside it, so
+        // the answer shows which unit decided the case.
+        if fill.len_utf8() > 1 {
+            assert!(
+                bytes > DETAILS_JSON_LIMIT,
+                "case {case:?}: a multi-byte row must encode to more bytes than the bound, \
+                 got {bytes}"
+            );
+        }
+
+        let answer = start_change_set(
+            &router,
+            change_set("CreateProduct", member, &details, None),
+        )
+        .await;
+        assert_eq!(
+            answer.status, expected_status,
+            "case {case:?} ({characters} characters, {bytes} UTF-8 bytes, in {member}): \
+             expected {expected_status}, got {} with {:?}",
+            answer.status, answer.body
+        );
+
+        if expected_status != 200 {
+            assert_eq!(
+                answer.error_code(),
+                "ValidationException",
+                "case {case:?}: a details value past the modelled length must be refused as \
+                 a ValidationException, got {:?}",
+                answer.body
+            );
+            if expected_status == 422 {
+                let message = answer.message();
+                assert!(
+                    message.contains(member)
+                        && message.contains(&DETAILS_JSON_LIMIT.to_string())
+                        && message.contains(&characters.to_string()),
+                    "case {case:?}: the refusal must name the member, the bound and the \
+                     {characters} characters it sent, got {message:?}"
+                );
+                assert!(
+                    !message.contains(&bytes.to_string()),
+                    "case {case:?}: the refusal must not report the {bytes}-byte encoding \
+                     as a character count, got {message:?}"
+                );
+            }
+            let listed = list_change_sets(&router).await;
+            assert!(
+                listed.list("/ChangeSetSummaryList").is_empty(),
+                "case {case:?}: a refused submit must start no change set, got {:?}",
+                listed.body
+            );
+            continue;
+        }
+
+        let id = answer.text("/ChangeSetId");
+        let described = settled_change_set(&router, &id).await;
+        assert_eq!(
+            described.text("/Status"),
+            "SUCCEEDED",
+            "case {case:?}: details inside the modelled length must be applied, got {:?}",
+            described.body
+        );
+
+        let entity_id = entity_ids_of(&router, &id)
+            .await
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: the change set must name its entity"));
+        let entity = describe_entity(&router, &entity_id).await;
+        assert_eq!(
+            entity.status, 200,
+            "case {case:?}: the created entity must be readable, got {} with {:?}",
+            entity.status, entity.body
+        );
+        let reported = entity.text("/Details");
+        assert_reportable(case, &reported);
+        assert_eq!(
+            reported.chars().count(),
+            characters,
+            "case {case:?}: the entity must report the {characters} characters the change \
+             submitted, got {} ({} bytes)",
+            reported.chars().count(),
+            reported.len()
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&reported).ok(),
+            Some(details.clone()),
+            "case {case:?}: the entity must report the details the change submitted, got \
+             {} characters",
+            reported.chars().count()
+        );
+        assert_eq!(
+            entity.body.pointer("/DetailsDocument"),
+            Some(&details),
+            "case {case:?}: the document must carry the same details as the string, got {:?}",
+            entity.body
+        );
+    }
+}
+
+/// The merge a change set would leave is judged in the same unit: a merge inside `Json`'s
+/// length in CHARACTERS is applied however many bytes it encodes to, and only a merge
+/// past that count fails the change set — the `LIMIT_EXCEEDED` error naming the character
+/// count the merge reached.
+///
+/// The rows differ along the width of the characters each step is built from, how large
+/// each step is, and which step crosses the bound. The expected outcome of each step is
+/// derived from the rule itself — the merge the step describes is serialized here and its
+/// characters counted against the bound — rather than written down per row.
+#[tokio::test]
+async fn a_merge_is_judged_in_characters_not_in_the_bytes_it_encodes_to() {
+    // (case, the character each step is padded with, how many characters each step sends)
+    let rows: Vec<(&str, char, Vec<usize>)> = vec![
+        (
+            "three-byte characters, three steps, the last past the bound",
+            '鍵',
+            vec![6_000, 6_000, 6_000],
+        ),
+        (
+            "four-byte characters, two steps, the second past the bound",
+            '𝄞',
+            vec![9_000, 9_000],
+        ),
+        (
+            "two-byte characters, a first step just under the bound then one small member",
+            'é',
+            vec![DETAILS_JSON_LIMIT - 20, 64],
+        ),
+    ];
+
+    for (case, fill, steps) in rows {
+        let router = emulator();
+        // What the entity holds, carried forward across the steps that were applied.
+        let mut held: Map<String, Value> = Map::new();
+        let mut entity_id = String::new();
+
+        for (step, target) in steps.iter().copied().enumerate() {
+            let case = format!("{case}, step {step}");
+            // Each step submits a member of its OWN, so every step that is applied GROWS
+            // the stored object rather than replacing what the last one left.
+            let details = details_of_characters(&format!("s{step}"), fill, target);
+            let mut merged = held.clone();
+            for (key, value) in details.as_object().expect("the step builds an object") {
+                merged.insert(key.clone(), value.clone());
+            }
+            let serialized = Value::Object(merged.clone()).to_string();
+            let merged_characters = serialized.chars().count();
+            let merged_bytes = serialized.len();
+            let fits = merged_characters <= DETAILS_JSON_LIMIT;
+
+            let request = if step == 0 {
+                change_set("CreateProduct", "DetailsDocument", &details, None)
+            } else {
+                change_set(
+                    "UpdateInformation",
+                    "DetailsDocument",
+                    &details,
+                    Some(&entity_id),
+                )
+            };
+            let started = start_change_set(&router, request).await;
+            assert_eq!(
+                started.status, 200,
+                "case {case:?}: a step of {target} characters is inside the submitted \
+                 length and must be accepted, got {} with {:?}",
+                started.status, started.body
+            );
+            let id = started.text("/ChangeSetId");
+            let described = settled_change_set(&router, &id).await;
+
+            if step == 0 {
+                entity_id = entity_ids_of(&router, &id)
+                    .await
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| panic!("case {case:?}: the step must name its entity"));
+            }
+
+            if fits {
+                assert_eq!(
+                    described.text("/Status"),
+                    "SUCCEEDED",
+                    "case {case:?}: a merge of {merged_characters} characters \
+                     ({merged_bytes} bytes) is inside the bound and must be applied, got \
+                     {:?}",
+                    described.body
+                );
+                held = merged;
+            } else {
+                assert_eq!(
+                    (described.text("/Status"), described.text("/FailureCode")),
+                    ("FAILED".to_string(), "CLIENT_ERROR".to_string()),
+                    "case {case:?}: a merge of {merged_characters} characters passes the \
+                     bound and must fail the change set, got {:?}",
+                    described.body
+                );
+                let errors = described.list("/ChangeSet/0/ErrorDetailList");
+                let error = errors.first().cloned().unwrap_or(Value::Null);
+                assert_eq!(
+                    error["ErrorCode"],
+                    json!("LIMIT_EXCEEDED"),
+                    "case {case:?}: the change must report the bound it crossed, got \
+                     {error:?}"
+                );
+                let message = error["ErrorMessage"].as_str().unwrap_or_default();
+                assert!(
+                    message.contains(&DETAILS_JSON_LIMIT.to_string())
+                        && message.contains(&merged_characters.to_string())
+                        && message.contains(&entity_id),
+                    "case {case:?}: the error must name the bound, the \
+                     {merged_characters} characters the merge reached and the entity, got \
+                     {message:?}"
+                );
+                assert!(
+                    !message.contains(&merged_bytes.to_string()),
+                    "case {case:?}: the error must not report the {merged_bytes}-byte \
+                     encoding as a character count, got {message:?}"
+                );
+            }
+
+            let entity = describe_entity(&router, &entity_id).await;
+            assert_eq!(
+                entity.status, 200,
+                "case {case:?}: the entity must stay readable, got {} with {:?}",
+                entity.status, entity.body
+            );
+            let reported = entity.text("/Details");
+            assert_reportable(&case, &reported);
+            assert_eq!(
+                serde_json::from_str::<Value>(&reported).ok(),
+                Some(Value::Object(held.clone())),
+                "case {case:?}: the entity must report exactly what the applied steps \
+                 merged, got {} characters ({} bytes)",
+                reported.chars().count(),
+                reported.len()
+            );
+            // What the entity reports is the applied merge, in both units: the characters
+            // it was judged on, and the wider UTF-8 encoding those characters take — an
+            // encoding past the bound, which is what makes each of these rows a case the
+            // byte count would have refused.
+            if fits {
+                assert_eq!(
+                    (reported.chars().count(), reported.len()),
+                    (merged_characters, merged_bytes),
+                    "case {case:?}: the entity must report the merge as it was judged, \
+                     {merged_characters} characters in {merged_bytes} bytes"
+                );
+                assert!(
+                    merged_bytes > DETAILS_JSON_LIMIT,
+                    "case {case:?}: an applied merge of wide characters must encode to \
+                     more bytes than the bound, got {merged_bytes}"
+                );
+            }
+        }
     }
 }

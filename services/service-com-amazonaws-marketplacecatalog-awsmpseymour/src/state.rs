@@ -3805,11 +3805,17 @@ pub const DETAILS_JSON_LIMIT: usize = 16_384;
 /// insignificant whitespace, so the count is the length of the string a reader
 /// receives.
 ///
+/// Counted in CHARACTERS, which is the unit a modelled `@length` on a string
+/// states — the same unit the boundary walk holds `Change$Details` to — so a
+/// value the boundary admitted against [`DETAILS_JSON_LIMIT`] is measured here
+/// against that same bound, and not against its UTF-8 byte count, which is
+/// larger for every value that is not pure ASCII.
+///
 /// A map of JSON values has no serialization failure to report, and the
 /// unreachable case counts as PAST the bound rather than inside it: a length
 /// nothing could measure is not one this service may report.
 pub fn details_json_length(members: &Map<String, Value>) -> usize {
-    serde_json::to_string(members).map_or(usize::MAX, |text| text.len())
+    serde_json::to_string(members).map_or(usize::MAX, |text| text.chars().count())
 }
 
 /// How many characters an id the catalog assigns adds to one delivery option:
