@@ -523,13 +523,10 @@ impl DbInstanceRecord {
     /// listener the two are the same value.
     ///
     /// An instance of an engine whose data plane this emulator serves as an API
-    /// ([`engine_data_plane_is_an_api`]) has no engine listener of its own, so it publishes
-    /// the port its engine listens on rather than the port this process is served on — the
-    /// same reading its cluster follows ([`DbClusterRecord::published_port`]).
+    /// ([`engine_data_plane_is_an_api`]) publishes the port that API answers on — this
+    /// process's own, which `Endpoint$Address` is published beside — the same reading its
+    /// cluster follows ([`DbClusterRecord::published_port`]).
     pub fn published_port(&self) -> i32 {
-        if engine_data_plane_is_an_api(&self.engine) {
-            return self.endpoint_port;
-        }
         self.served_endpoint
             .as_ref()
             .map_or(self.endpoint_port, |served| served.port)

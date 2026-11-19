@@ -16,11 +16,14 @@
 //! ([`super::endpoint_domain`]) resolves to nothing here and would be no connection endpoint
 //! at all.
 //!
-//! Its `Port` is NOT this process's: no socket of this process is that cluster's database
-//! engine, so the cluster reports the port its engine listens on — the one the create
-//! configured, the engine's published default where the request named none
-//! ([`super::DbClusterRecord::published_port`]). The port this process is served on is a
-//! different number on every boot, which is not something the member promises.
+//! Its `Port` is that address's too. `Endpoint` carries no port of its own, so
+//! `Endpoint` + `Port` is the ONE pair a client dials, and a pair that names a port nothing
+//! answers on is no connection endpoint at all — exactly as a host nothing resolves is none.
+//! So a resource whose plane is served as an API publishes the port this process answers
+//! that API on, as a resource with a listener of its own publishes the port the core
+//! assigned that listener ([`super::DbClusterRecord::published_port`]): the port the create
+//! configured stays on the record, and is what the resource publishes only where this
+//! emulator serves its plane neither way.
 //!
 //! WHICH address is this emulator's own is the tree's one reading of that question
 //! (`service_common::data_plane_addressing::reached_emulator_host_and_port`), so this
@@ -42,11 +45,8 @@ pub fn engine_data_plane_is_an_api(engine: &str) -> bool {
 
 /// The address a cluster or instance running `engine` publishes, for an engine whose data
 /// plane this emulator serves as an API at its own endpoint: the HOST this request reached
-/// this emulator at, beside the address that plane is served on.
-///
-/// The port travels with it because this is one address — it is what the plane is reached at
-/// — but it is not what the RESOURCE reports as the port its database engine listens on; see
-/// [`super::DbClusterRecord::published_port`].
+/// this emulator at, and the PORT it reached it on — the address that plane is served on,
+/// which is what [`super::DbClusterRecord::published_port`] reports beside the host.
 ///
 /// `None` for an engine whose data plane is a native wire (the resource's own listener is
 /// its address), and for an emulator served on no port at all that no request addressed
