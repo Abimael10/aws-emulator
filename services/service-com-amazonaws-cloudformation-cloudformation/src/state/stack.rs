@@ -1826,6 +1826,19 @@ impl StoredStack {
         if due_at > now {
             return;
         }
+        // ...and an operation whose `RollbackConfiguration` asked for a MONITORING PERIOD is
+        // not through when its resources are: CloudFormation watches its triggers for that
+        // period "after the stack creation or update operation deploys all necessary
+        // resources", and an alarm that enters `ALARM` inside it rolls the whole operation
+        // back ([`rollback_triggers`]). So the operation stays in flight — and reports the
+        // `*_IN_PROGRESS` status a client polls — until the period is through, and what reads
+        // the triggers over it is the same pass that reads them while the deployment runs.
+        if self
+            .trigger_monitoring_until(due_at)
+            .is_some_and(|until| until > now)
+        {
+            return;
+        }
         // When each resource the walk acted on finished, which is the instant its own
         // status was updated — read before the walk is drained, since draining it is what
         // retires it.

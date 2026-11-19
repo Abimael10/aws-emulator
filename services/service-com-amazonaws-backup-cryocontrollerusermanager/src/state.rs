@@ -1544,6 +1544,27 @@ pub fn rejected_backup_plan_rule(reason: &str) -> InvalidParameterValueException
     }
 }
 
+/// `refusal`, as the same condition is stated when the member that carries it
+/// sits inside one of a plan body's RULES: the rule error after the class's
+/// fixed envelope ([`MESSAGE_BACKUP_PLAN_RULES_PREFIX`]).
+///
+/// A condition a rule of a backup plan fails is reported as a failure of that
+/// plan's RULES, which is what the envelope marks — so a client can attribute
+/// the refusal to `BackupPlan$Rules` rather than to a top-level plan parameter.
+/// Only the sentence changes: the condition's own token and `Context` are what
+/// they are wherever the condition is met, so the same condition stated by an
+/// operation on its own ([`rejected_lifecycle`]) and stated inside a rule carry
+/// one token and differ only in the envelope. Fixed text: nothing from the
+/// request enters it, so neither the rule's name nor its values appear.
+#[must_use]
+pub fn stated_in_plan_rule(
+    mut refusal: InvalidParameterValueException,
+) -> InvalidParameterValueException {
+    let reason = refusal.message.unwrap_or_default();
+    refusal.message = Some(format!("{MESSAGE_BACKUP_PLAN_RULES_PREFIX}{reason}"));
+    refusal
+}
+
 /// The modelled refusal for a call that would act under an IAM role AWS Backup
 /// cannot assume — see [`MESSAGE_ROLE_NOT_ASSUMABLE`], with the condition's own
 /// token.
@@ -2322,10 +2343,12 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
         // The lifecycle of the rule, and of each of its copy actions, keeps the
         // interval the model requires between a transition to cold storage and
         // the deletion that follows it; one that does not is refused as the
-        // LIFECYCLE it is, with the class's own token and sentence
-        // ([`rejected_lifecycle`]) rather than the per-rule envelope, so a
-        // lifecycle inside a plan body and one an operation takes on its own
-        // answer the same refusal.
+        // LIFECYCLE it is, with the class's own token and `Context`
+        // ([`rejected_lifecycle`]) — stated, because the member sits inside one
+        // of the plan's RULES, after the per-rule validation envelope
+        // ([`stated_in_plan_rule`]), so a lifecycle inside a plan body and one
+        // an operation takes on its own report one condition and differ only in
+        // that envelope.
         let lifecycles = ::std::iter::once(rule.lifecycle.as_ref()).chain(
             rule.copy_actions
                 .iter()
@@ -2334,7 +2357,7 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
         );
         for lifecycle in lifecycles {
             if let Some(refusal) = rejected_lifecycle(lifecycle) {
-                return Some(RejectedBackupPlanBody::Value(refusal));
+                return Some(RejectedBackupPlanBody::Value(stated_in_plan_rule(refusal)));
             }
         }
         // `TargetLogicallyAirGappedBackupVaultArn` and a copy action's

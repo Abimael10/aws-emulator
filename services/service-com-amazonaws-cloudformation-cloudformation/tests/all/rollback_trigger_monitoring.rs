@@ -28,7 +28,12 @@
 //!   composite alarm over one;
 //! * the number of triggers and the POSITION of the firing one, and a trigger whose ARN names
 //!   an alarm CloudWatch holds none of;
-//! * whether the configuration states a `MonitoringTimeInMinutes` at all.
+//! * whether the configuration states a `MonitoringTimeInMinutes` at all. A row that asks for
+//!   a NONZERO period states one of zero instead, because such a period holds the operation
+//!   open while it is watched (`crate::state::MAX_TRIGGER_MONITORING`) and what a period does
+//!   after the resources are deployed is the cross-service suite
+//!   `cloudformation_rollback_triggers_revert_the_operation`'s own rule; every row here is
+//!   about an alarm that is in `ALARM` when the operation BEGINS.
 //!
 //! Nothing is waited out: an alarm's state and a stack's terminal status are both due at an
 //! instant this emulator records, so each is POLLED for until it holds.
@@ -184,7 +189,7 @@ fn rows() -> Vec<Row> {
                 trigger: true,
             }],
             absent_trigger: false,
-            monitoring_minutes: Some("10"),
+            monitoring_minutes: Some("0"),
             fired: Vec::new(),
         },
         Row {
@@ -193,7 +198,7 @@ fn rows() -> Vec<Row> {
             operation: Operation::UpdateStack,
             alarms: Vec::new(),
             absent_trigger: true,
-            monitoring_minutes: Some("5"),
+            monitoring_minutes: Some("0"),
             fired: Vec::new(),
         },
         Row {
@@ -253,7 +258,7 @@ fn rows() -> Vec<Row> {
                 trigger: true,
             }],
             absent_trigger: false,
-            monitoring_minutes: Some("5"),
+            monitoring_minutes: Some("0"),
             fired: Vec::new(),
         },
     ]

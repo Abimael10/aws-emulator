@@ -2136,34 +2136,31 @@ mod describe_launch_template_versions {
             );
         }
 
-        // A parameter no image publishes resolves to nothing, and a create is refused for no
-        // alias — "the Systems Manager parameter will resolve to an AMI ID on launch", so the
-        // value is stored as given whatever it names — while a version stored under one
-        // reports the parameter the caller stored, whether or not the request asks for the
-        // alias to be resolved.
+        // A parameter no image publishes resolves to NOTHING, so neither writer stores a
+        // version naming one: both refuse it where it is written, which
+        // `launch_template_ssm_alias_forms` owns as its own rule. What this operation is held
+        // to here is what it reports for a stored version carrying such a value — one written
+        // straight into the store, the way a version this emulator's writers decline to
+        // create can only come about: the parameter itself, whatever `ResolveAlias` asks,
+        // beside the versions that do resolve.
         let unresolvable = format!("{SSM_IMAGE_ALIAS_PREFIX}/aws/service/no/such/parameter");
-        let unresolvable_template = create_template(
-            &router,
-            "alias.unresolvable",
-            &[data("ImageId", &unresolvable)],
-        )
-        .await;
-        for asked in [None, Some("false"), Some("true")] {
-            let mut params = vec![p("LaunchTemplateId", unresolvable_template.clone())];
-            if let Some(value) = asked {
-                params.push(p("ResolveAlias", value));
-            }
-            let (status, body) = api(&router, "DescribeLaunchTemplateVersions", &params).await;
+        for writer in ["CreateLaunchTemplate", "CreateLaunchTemplateVersion"] {
+            let params = match writer {
+                "CreateLaunchTemplate" => vec![
+                    p("LaunchTemplateName", "alias.unresolvable"),
+                    data("ImageId", &unresolvable),
+                ],
+                _ => vec![
+                    p("LaunchTemplateId", launch_template_id_of_first_published(&router, &published).await),
+                    data("ImageId", &unresolvable),
+                ],
+            };
+            let (status, body) = api(&router, writer, &params).await;
             assert_eq!(
-                status, 200,
-                "an unresolvable parameter with ResolveAlias={asked:?}: expected HTTP 200, \
-                 got {status} with body {body}"
-            );
-            assert_eq!(
-                element(&body, "imageId").as_deref(),
-                Some(unresolvable.as_str()),
-                "an unresolvable parameter with ResolveAlias={asked:?}: expected the stored \
-                 parameter {unresolvable}, got body {body}"
+                (status, error_code(&body)),
+                (400, "SsmInvalidParameter".to_string()),
+                "{writer} must refuse a parameter nothing resolves, got {status} with body \
+                 {body}"
             );
         }
 
@@ -2174,22 +2171,40 @@ mod describe_launch_template_versions {
         let alias = format!("{SSM_IMAGE_ALIAS_PREFIX}{resolvable_parameter}");
         let resolvable_template =
             create_template(&router, "alias.beside.unresolvable", &[data("ImageId", &alias)]).await;
-        // A second version of that template carrying the unresolvable parameter, created the
-        // way a caller creates one.
-        let (status, body) = api(
-            &router,
-            "CreateLaunchTemplateVersion",
-            &[
-                p("LaunchTemplateId", resolvable_template.clone()),
-                data("ImageId", &unresolvable),
-            ],
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "a version carrying an unresolvable parameter must be stored, got {status} with \
-             body {body}"
+        // A second version of that template carrying the unresolvable parameter, written into
+        // the store itself.
+        seed_versions(
+            &engine,
+            &resolvable_template,
+            &[(
+                2,
+                60,
+                RequestLaunchTemplateData {
+                    image_id: Some(unresolvable.clone()),
+                    ..RequestLaunchTemplateData::default()
+                },
+            )],
+            1,
         );
+
+        for asked in [None, Some("false")] {
+            let mut params = vec![p("LaunchTemplateId", resolvable_template.clone())];
+            if let Some(value) = asked {
+                params.push(p("ResolveAlias", value));
+            }
+            let (status, body) = api(&router, "DescribeLaunchTemplateVersions", &params).await;
+            assert_eq!(
+                status, 200,
+                "a stored unresolvable parameter with ResolveAlias={asked:?}: expected HTTP \
+                 200, got {status} with body {body}"
+            );
+            let reported = elements(&body, "imageId");
+            assert!(
+                reported.contains(&unresolvable),
+                "a stored unresolvable parameter with ResolveAlias={asked:?}: expected the \
+                 stored parameter {unresolvable}, got {reported:?}"
+            );
+        }
 
         // One unresolvable alias does not hide the versions that do resolve: both versions are
         // described in one call, each reporting its own image id.
@@ -2212,6 +2227,20 @@ mod describe_launch_template_versions {
             "expected the resolved AMI {resolvable_image} for {resolvable_template} beside the \
              unresolved parameter {unresolvable}, got {reported:?}"
         );
+    }
+
+    /// A template whose `ImageId` is the first published parameter, for a row that needs a
+    /// template to add a version to.
+    async fn launch_template_id_of_first_published(
+        router: &MultiServiceRouter,
+        published: &[(String, String)],
+    ) -> String {
+        let (parameter, _) = published
+            .first()
+            .cloned()
+            .expect("the image catalog publishes at least one parameter");
+        let alias = format!("{SSM_IMAGE_ALIAS_PREFIX}{parameter}");
+        create_template(router, "alias.version.host", &[data("ImageId", &alias)]).await
     }
 
     /// Every factor of the filtering cost the REQUEST chooses is bounded: the number of

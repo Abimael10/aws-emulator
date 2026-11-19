@@ -567,6 +567,26 @@ pub const STATUS_TRANSITION_DELAY: Duration = Duration::from_millis(500);
 /// `Timeout` names.
 pub const MAX_HELD_WAIT: Duration = Duration::from_secs(90);
 
+/// The longest this emulator holds a stack operation open to go on WATCHING its rollback
+/// triggers after the resources it deploys have settled.
+///
+/// `RollbackConfiguration$MonitoringTimeInMinutes` is "the amount of time, in minutes, during
+/// which CloudFormation should monitor all the rollback triggers after the stack creation or
+/// update operation deploys all necessary resources", and "if any of the alarms you specify
+/// goes to ALARM state during the stack operation or this monitoring period, CloudFormation
+/// rolls back the entire stack operation" (`RollbackConfiguration$RollbackTriggers`) — so an
+/// operation that asked for such a period is not finished when its resources are: it is still
+/// in flight, and an alarm entering that state inside the period rolls it back.
+///
+/// The period is a wait the CALLER asked for, so it keeps the value the request stated: an
+/// operation asking for five minutes of monitoring is watched for five minutes, exactly as it
+/// would be against the real service, and what ends it early is a trigger firing rather than a
+/// span of this emulator's choosing. This is only a CEILING on that value, so one request
+/// cannot hold an operation open for the three hours the member's `@range(min: 0, max: 180)`
+/// admits — chosen, as [`STATUS_TRANSITION_DELAY`] and [`MAX_HELD_WAIT`] are, and far above
+/// the periods a client driving a deployment behind a canary alarm states.
+pub const MAX_TRIGGER_MONITORING: Duration = Duration::from_secs(10 * 60);
+
 /// The region an unsigned request is served as. The emulator's own default; a signed
 /// request is served in the region of its SigV4 credential scope.
 pub const DEFAULT_REGION: &str = "us-east-1";

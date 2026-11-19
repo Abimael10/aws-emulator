@@ -250,19 +250,21 @@ pub const DEFAULT_SAMPLING_RULE_NAME: &str = "Default";
 /// nor the reserved name itself — whichever of the two selectors named it.
 pub const DEFAULT_SAMPLING_RULE_UNDELETABLE_MESSAGE: &str = "Cannot delete default sampling rule";
 
-/// What X-Ray answers a `CreateSamplingRule` whose `RuleName` the account
-/// already held when the request arrived.
+/// What X-Ray answers a `CreateSamplingRule` whose `RuleName` is held by a
+/// DIFFERENT sampling rule, settled there before the request arrived.
 ///
 /// FIXED text, as the service words it: the create is refused by the service's
-/// own read of the name, for the CONDITION that read found — a rule of that name
-/// is there already — so the sentence interpolates nothing from the request and
+/// own read of the name, for the CONDITION that read found — the name is taken
+/// by another rule — so the sentence interpolates nothing from the request and
 /// nothing from this store, neither the name asked for nor any identifier of the
 /// rule in the way.
 ///
 /// This is one of the TWO wordings a duplicate name is refused with, and which
-/// one answers is decided by [`SamplingRuleNameOnArrival`]: a create that lost a
-/// race to another create IN FLIGHT got past that read and is refused by the
-/// uniqueness constraint of the store the rule is written through, which words
+/// one answers is decided by what that read could refuse
+/// ([`sampling_rule_refused_by_the_name_read`]): a create the read let through —
+/// one that raced the create which took the name, or one that asks for exactly
+/// the rule already stored under it — is refused by the uniqueness constraint of
+/// the store the rule is written through, which words
 /// [`sampling_rule_exists_message`] instead. Both are recorded service
 /// behaviour, and together they are what lets a caller tell a name collision
 /// from the operation's other `InvalidRequestException`s — a rejected priority,
@@ -270,24 +272,90 @@ pub const DEFAULT_SAMPLING_RULE_UNDELETABLE_MESSAGE: &str = "Cannot delete defau
 /// code.
 pub const SAMPLING_RULE_EXISTS_MESSAGE: &str = "Sampling rule already exists";
 
-/// The fixed text of the refusal a create that LOST A RACE for its `RuleName` is
-/// answered with, which the id of the resource that won is appended to
-/// ([`sampling_rule_exists_message`]).
+/// The fixed text of the refusal a create the service's own name read LET
+/// THROUGH is answered with, which the id of the resource holding the name is
+/// appended to ([`sampling_rule_exists_message`]).
 ///
-/// Such a create got past the service's own read of the name — the name was free
-/// when the request arrived — so what refuses it is the uniqueness constraint of
-/// the store the accepted rule is written through: a resource of that name exists
-/// already and is a DIFFERENT resource from the one being created, which is what
-/// the sentence states, and the only variable part is that resource's internal
-/// id, read from this store rather than from the request.
+/// Such a create reached the write, so what refuses it is the uniqueness
+/// constraint of the store the accepted rule is written through, which speaks of
+/// RESOURCES rather than of sampling rules: a resource of that name exists
+/// already and is a DIFFERENT resource from the one this create would store —
+/// the ids are what differ, not the names and not the definitions — which is
+/// what the sentence states, and the only variable part is the existing
+/// resource's internal id, read from this store rather than from the request.
 pub const SAMPLING_RULE_EXISTS_PREFIX: &str =
     "A resource with the same resourceName but a different internalId already exists: ";
 
-/// The refusal for a create that lost a race for its `RuleName`:
-/// [`SAMPLING_RULE_EXISTS_PREFIX`], then the internal id of the rule that won.
+/// The refusal for a create the name read let through:
+/// [`SAMPLING_RULE_EXISTS_PREFIX`], then the internal id of the resource holding
+/// the name.
 #[must_use]
 pub fn sampling_rule_exists_message(internal_id: &str) -> String {
     format!("{SAMPLING_RULE_EXISTS_PREFIX}{internal_id}")
+}
+
+/// Whether the service's OWN read of the name is what refuses this create, as
+/// against the uniqueness constraint of the store behind it — the one place that
+/// decision is taken, so every surface words a duplicate name the same way.
+///
+/// X-Ray answers a duplicate `RuleName` from two layers, as a service that reads
+/// a name and then writes through a store with a uniqueness constraint does. The
+/// read refuses the create whose name it can SEE taken by another rule:
+///
+/// * `on_arrival` has to report the name as held and settled — a create that
+///   read the name as free, or that arrived while another create of that name
+///   was still being served, got past the read before the name was there to see
+///   ([`SamplingRuleNameOnArrival`]);
+/// * and the rule `submitted` has to DIFFER from the one `held` under the name,
+///   because what that read refuses is a name taken by another rule: a create
+///   that asks for exactly the rule already stored states no second rule for the
+///   name and is let through to the write.
+///
+/// Everything the read lets through collides at the write instead, and is
+/// refused by the constraint, which reports that the resource holding the name
+/// is a different resource from the one being stored
+/// ([`sampling_rule_exists_message`]) — the distinction a caller reads to tell a
+/// late duplicate from a collision of two resources.
+#[must_use]
+pub fn sampling_rule_refused_by_the_name_read(
+    on_arrival: SamplingRuleNameOnArrival,
+    held: &SamplingRule,
+    submitted: &SamplingRule,
+) -> bool {
+    on_arrival == SamplingRuleNameOnArrival::Held
+        && !same_sampling_rule_definition(held, submitted)
+}
+
+/// Whether two sampling rules state the SAME rule: every member a caller
+/// supplies carries the same value in both.
+///
+/// `RuleName` and `RuleARN` are left out: they are the rule's identity rather
+/// than its definition — "a sampling rule is specified by either name or ARN, but
+/// not both" (`smithy_query(query="shape",shape="SamplingRule")`), so a stored
+/// rule carries both while a submitted one carries one of them, and comparing
+/// them would make every create differ from what is stored. The real numbers are
+/// compared by their bits, so two values are the same exactly when the same
+/// value was submitted.
+#[must_use]
+pub fn same_sampling_rule_definition(left: &SamplingRule, right: &SamplingRule) -> bool {
+    let boost = |rule: &SamplingRule| {
+        rule.sampling_rate_boost
+            .as_ref()
+            .map(|boost| (boost.max_rate.to_bits(), boost.cooldown_window_minutes))
+    };
+    left.resource_arn == right.resource_arn
+        && left.priority == right.priority
+        && left.fixed_rate.to_bits() == right.fixed_rate.to_bits()
+        && left.reservoir_size == right.reservoir_size
+        && left.service_name == right.service_name
+        && left.service_type == right.service_type
+        && left.host == right.host
+        && left.http_method == right.http_method
+        && left.url_path == right.url_path
+        && left.version == right.version
+        && left.attributes.clone().unwrap_or_default()
+            == right.attributes.clone().unwrap_or_default()
+        && boost(left) == boost(right)
 }
 
 /// What a `CreateSamplingRule` request found of the `RuleName` it asks for when
@@ -296,17 +364,24 @@ pub fn sampling_rule_exists_message(internal_id: &str) -> String {
 ///
 /// X-Ray answers a duplicate name from two layers, as a service that reads a
 /// name and then writes through a store with a uniqueness constraint does: the
-/// read refuses a name that was already held ([`SAMPLING_RULE_EXISTS_MESSAGE`]),
-/// and a request that read the name as free and then lost the write is refused
-/// by that constraint, which names the resource now holding the name
-/// ([`sampling_rule_exists_message`]). So the handler reads the name when the
-/// request arrives and hands what it found here.
+/// read refuses a name the account HELD AND SETTLED before the request arrived
+/// ([`SAMPLING_RULE_EXISTS_MESSAGE`]), and a create that RACED another create of
+/// the same name is refused by that constraint, which names the resource now
+/// holding the name ([`sampling_rule_exists_message`]). So the handler reports
+/// its arrival here ([`ComAmazonawsXrayAwsxrayState::sampling_rule_create_arrived`])
+/// and hands back what that arrival found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SamplingRuleNameOnArrival {
-    /// The account held no rule of that name when the request arrived; a
-    /// collision at the write is therefore a race this request lost.
+    /// This create RACED another create of the name: either the account held no
+    /// rule of that name when the request arrived — so a collision at the write
+    /// is a race this request lost — or a create of that very name was still
+    /// being served beside it, so the caller sent this one before any answer
+    /// could have told it the name was taken. Either way the write is refused by
+    /// the store's uniqueness constraint.
     Free,
-    /// A rule of that name was already held when the request arrived.
+    /// A rule of that name was already held when the request arrived, by a
+    /// create that had been answered: nothing of that name was in flight beside
+    /// this request, so what refuses it is the service's own read of the name.
     Held,
 }
 
@@ -424,13 +499,15 @@ impl ComAmazonawsXrayAwsxrayState {
     /// The collision check and the insert are ONE step on the locked store, so N
     /// callers racing for one name have exactly one winner: every loser sees the
     /// winner's record already present. WHICH refusal a loser is answered with is
-    /// decided by `on_arrival` — what the request found of the name when it
-    /// arrived — because the service refuses a duplicate name from two layers:
-    /// its own read of the name refuses one that was already held
-    /// ([`SAMPLING_RULE_EXISTS_MESSAGE`]), and a request that read the name as
-    /// free and then lost the write is refused by the uniqueness constraint of
-    /// the store it writes through, which names the resource that won by its
-    /// internal id ([`sampling_rule_exists_message`]).
+    /// decided in one place
+    /// ([`sampling_rule_refused_by_the_name_read`]), from `on_arrival` — what the
+    /// request found of the name when it arrived — and from whether the rule it
+    /// submits is the one already stored under the name: the service's own read of
+    /// the name refuses a create whose name it can see taken by ANOTHER rule
+    /// ([`SAMPLING_RULE_EXISTS_MESSAGE`]), and every create that read lets
+    /// through is refused by the uniqueness constraint of the store it writes
+    /// through, which names the resource holding the name by its internal id
+    /// ([`sampling_rule_exists_message`]).
     pub fn insert_sampling_rule(
         &mut self,
         region: &str,
@@ -440,11 +517,14 @@ impl ComAmazonawsXrayAwsxrayState {
         on_arrival: SamplingRuleNameOnArrival,
     ) -> Result<&StoredSamplingRule, SamplingRuleRejection> {
         let name = sampling_rule_name(&rule)?.to_string();
-        if let Some(internal_id) = self.sampling_rule_internal_id_in_use(&name) {
-            return Err(SamplingRuleRejection::Invalid(match on_arrival {
-                SamplingRuleNameOnArrival::Held => SAMPLING_RULE_EXISTS_MESSAGE.to_string(),
-                SamplingRuleNameOnArrival::Free => sampling_rule_exists_message(&internal_id),
-            }));
+        if let Some(holder) = self.sampling_rule_holding_name(region, &name) {
+            return Err(SamplingRuleRejection::Invalid(
+                if sampling_rule_refused_by_the_name_read(on_arrival, &holder.rule, &rule) {
+                    SAMPLING_RULE_EXISTS_MESSAGE.to_string()
+                } else {
+                    sampling_rule_exists_message(&holder.internal_id)
+                },
+            ));
         }
         if self.created_sampling_rule_count() >= MAX_SAMPLING_RULES {
             return Err(SamplingRuleRejection::LimitExceeded(format!(
@@ -533,10 +613,76 @@ impl ComAmazonawsXrayAwsxrayState {
         self.sampling_rule_internal_id_in_use(rule_name).is_some()
     }
 
+    /// Report that a `CreateSamplingRule` for `rule_name` has ARRIVED and is
+    /// being served, and answer what its arrival found of the name
+    /// ([`SamplingRuleNameOnArrival`]).
+    ///
+    /// One step on the locked store, so two creates that arrive together each
+    /// see the other in flight. The name counts as HELD only when a create that
+    /// stored it had already been ANSWERED — a name held while another create of
+    /// it is still being served is a name the caller of this request cannot have
+    /// been told about, so this create is one of a race rather than a late
+    /// duplicate.
+    ///
+    /// Every registered create has to be reported finished again
+    /// ([`sampling_rule_create_finished`](Self::sampling_rule_create_finished)),
+    /// whichever way it ends, or a name would stay in flight for the life of the
+    /// store.
+    pub fn sampling_rule_create_arrived(&mut self, rule_name: &str) -> SamplingRuleNameOnArrival {
+        let in_flight = self
+            .sampling_rule_creates_in_flight
+            .get(rule_name)
+            .copied()
+            .unwrap_or_default();
+        *self
+            .sampling_rule_creates_in_flight
+            .entry(rule_name.to_string())
+            .or_default() += 1;
+        if in_flight == 0 && self.holds_sampling_rule_name(rule_name) {
+            SamplingRuleNameOnArrival::Held
+        } else {
+            SamplingRuleNameOnArrival::Free
+        }
+    }
+
+    /// Report that the `CreateSamplingRule` for `rule_name` registered by
+    /// [`sampling_rule_create_arrived`](Self::sampling_rule_create_arrived) has
+    /// been answered, however it ended.
+    pub fn sampling_rule_create_finished(&mut self, rule_name: &str) {
+        let Some(count) = self.sampling_rule_creates_in_flight.get_mut(rule_name) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.sampling_rule_creates_in_flight.remove(rule_name);
+        }
+    }
+
+    /// The record HOLDING `rule_name` in the account, the service-managed
+    /// [`DEFAULT_SAMPLING_RULE_NAME`] one included — the rule a create of that
+    /// name collides with, and the resource whose internal id the collision
+    /// reports ([`sampling_rule_exists_message`]).
+    ///
+    /// `None` means the name is free. The service-managed rule is derived rather
+    /// than stored until a write materialises it
+    /// ([`default_sampling_rule_record`](Self::default_sampling_rule_record)), so
+    /// the reserved name is held whether or not a record exists under it, and
+    /// `region` is what the derived record's ARN is built for.
+    #[must_use]
+    pub fn sampling_rule_holding_name(
+        &self,
+        region: &str,
+        rule_name: &str,
+    ) -> Option<StoredSamplingRule> {
+        if let Some(stored) = self.sampling_rules.get(rule_name) {
+            return Some(stored.clone());
+        }
+        (rule_name == DEFAULT_SAMPLING_RULE_NAME)
+            .then(|| self.default_sampling_rule_record(region))
+    }
+
     /// The internal id of the rule `rule_name` already names in the account, the
-    /// service-managed [`DEFAULT_SAMPLING_RULE_NAME`] one included — which is
-    /// what the refusal of a create that LOST A RACE for the name reports
-    /// ([`sampling_rule_exists_message`]).
+    /// service-managed [`DEFAULT_SAMPLING_RULE_NAME`] one included.
     ///
     /// `None` means the name is free. The service-managed rule is derived rather
     /// than stored until a write materialises it ([`default_sampling_rule`]), so

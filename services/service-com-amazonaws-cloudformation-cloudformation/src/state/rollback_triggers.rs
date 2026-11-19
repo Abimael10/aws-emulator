@@ -43,13 +43,16 @@
 //! lock, and the failure it uncovers was owed at the instant the alarm entered that state
 //! whether or not anybody called.
 //!
-//! `RollbackConfiguration$MonitoringTimeInMinutes` is the period CloudFormation goes on
+//! `MonitoringTimeInMinutes` is the period CloudFormation goes on
 //! watching the triggers for "after the stack creation or update operation deploys all
-//! necessary resources". This emulator's operations conclude on their own span
-//! ([`super::STATUS_TRANSITION_DELAY`]) rather than taking as long as real resources do, and
-//! that span is the window the triggers are read over: the member is kept and reported as the
-//! request stated it, and no operation is held open for minutes of wall clock that nothing
-//! here spends.
+//! necessary resources" — so an operation that asked for one is still IN FLIGHT once its
+//! resources have settled, and is held open, and monitored, until that period is through
+//! ([`StoredStack::trigger_monitoring_until`], read by [`super::StoredStack::settle`]): an
+//! alarm that enters `ALARM` after the change has landed rolls the operation back, which is
+//! what that period exists for. The period keeps the value the request stated — it is a wait
+//! the caller asked for — and is bounded only by the ceiling this emulator holds one operation
+//! open for ([`super::MAX_TRIGGER_MONITORING`]), so no request can hold one open for the hours
+//! the member admits.
 //!
 //! What a triggered failure then DOES is what every failure the clock makes due on this
 //! service does: the rollback, or the failed state a caller asked to keep. A create that asked
@@ -191,20 +194,53 @@ impl super::StoredStack {
     /// Only a CREATE or an UPDATE is monitored: those are the two operations
     /// `RollbackConfiguration` is supplied on ("after the stack creation or update operation
     /// deploys all necessary resources"), and a rollback already under way is what a trigger
-    /// would ask for anyway.
+    /// would ask for anyway. An update that has applied every change and is removing the
+    /// resources it replaced ([`super::status::UPDATE_COMPLETE_CLEANUP_IN_PROGRESS`]) is still
+    /// that update, so it is still monitored.
     pub fn monitored_rollback_triggers(&self) -> Vec<StoredRollbackTrigger> {
         if self.pending.is_none() {
             return Vec::new();
         }
-        if self.status != super::status::CREATE_IN_PROGRESS
-            && self.status != super::status::UPDATE_IN_PROGRESS
-        {
+        if !monitored_status(&self.status) {
             return Vec::new();
         }
         self.rollback_configuration
             .iter()
             .flat_map(|configuration| configuration.triggers.iter().cloned())
             .collect()
+    }
+
+    /// Until when the rollback triggers of the operation in flight are watched, where that
+    /// period outlasts the instant `due_at` the operation's own transition is due at — so the
+    /// operation is held open until then rather than concluding with its monitoring period
+    /// unspent.
+    ///
+    /// `MonitoringTimeInMinutes` is the period CloudFormation watches the triggers for "after
+    /// the stack creation or update operation deploys all necessary resources", and an alarm
+    /// that enters `ALARM` inside it rolls the whole operation back — so an operation that
+    /// asked for one is still IN FLIGHT while it runs, and the status a client polls says so.
+    /// The period is read from the configuration the operation supplied, as stated, bounded by
+    /// the ceiling this emulator holds an operation open for
+    /// ([`super::MAX_TRIGGER_MONITORING`]).
+    ///
+    /// `None` is an operation with nothing to watch: one that named no trigger, one that asked
+    /// for no monitoring period (`MonitoringTimeInMinutes` absent, zero or negative — "minimum
+    /// value is 0", `RollbackConfiguration$MonitoringTimeInMinutes`), and one whose triggers
+    /// are not being monitored at all ([`Self::monitored_rollback_triggers`]).
+    pub fn trigger_monitoring_until(&self, due_at: SystemTime) -> Option<SystemTime> {
+        if self.pending.is_none() || !monitored_status(&self.status) {
+            return None;
+        }
+        let configuration = self.rollback_configuration.as_ref()?;
+        if configuration.triggers.is_empty() {
+            return None;
+        }
+        let minutes = u64::try_from(configuration.monitoring_time_in_minutes.unwrap_or(0)).ok()?;
+        if minutes == 0 {
+            return None;
+        }
+        let asked = ::std::time::Duration::from_secs(minutes.saturating_mul(60));
+        Some(due_at + asked.min(super::MAX_TRIGGER_MONITORING))
     }
 
     /// Roll the operation in flight back because the alarms `fired` names — the alarms this
@@ -228,7 +264,8 @@ impl super::StoredStack {
             return None;
         }
         let creating = self.status == super::status::CREATE_IN_PROGRESS;
-        let updating = self.status == super::status::UPDATE_IN_PROGRESS;
+        let updating = self.status == super::status::UPDATE_IN_PROGRESS
+            || self.status == super::status::UPDATE_COMPLETE_CLEANUP_IN_PROGRESS;
         if !creating && !updating {
             return None;
         }
@@ -255,6 +292,19 @@ impl super::StoredStack {
             policies: self.rolled_back_resource_policies(),
         })
     }
+}
+
+/// Whether a stack in `status` has a MONITORED operation in flight: one of the two operations
+/// a `RollbackConfiguration` is supplied on, in a status that operation is still running in.
+///
+/// An update that has applied every change and is removing the resources it replaced is still
+/// that update ([`super::status::UPDATE_COMPLETE_CLEANUP_IN_PROGRESS`]), so its triggers are
+/// watched for as long as any other update's; a rollback is not monitored, since a rollback is
+/// what a firing trigger would ask for anyway.
+fn monitored_status(status: &str) -> bool {
+    status == super::status::CREATE_IN_PROGRESS
+        || status == super::status::UPDATE_IN_PROGRESS
+        || status == super::status::UPDATE_COMPLETE_CLEANUP_IN_PROGRESS
 }
 
 /// The `StateValue` CloudWatch reports for the alarm `name` in `region`, or `None` where it
@@ -464,6 +514,8 @@ pub(super) async fn settle_triggered_rollbacks(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     /// One row of the ARN-reading table: the ARN, and the alarm it names (or none).
@@ -563,5 +615,166 @@ mod tests {
                  name, got {actual:?}"
             );
         }
+    }
+
+    /// One row of the monitoring-window table: the `MonitoringTimeInMinutes` the configuration
+    /// states, how many triggers it names, and how long past the operation's own transition
+    /// the triggers are watched for — `None` for an operation nothing watches after it.
+    struct WindowRow {
+        case: &'static str,
+        minutes: Option<i32>,
+        triggers: usize,
+        watched_for: Option<Duration>,
+    }
+
+    /// The window the triggers of an update in flight are watched over is the period the
+    /// configuration ASKED FOR, kept as the request stated it and bounded only by the ceiling
+    /// this emulator holds one operation open for — and an operation with nothing to watch is
+    /// watched for no time at all.
+    ///
+    /// The rows walk the member's published range (`MonitoringTimeInMinutes` is
+    /// `@range(min: 0, max: 180)`): its own minimum, periods a client states, the ceiling
+    /// itself, one minute past it and the member's maximum, beside a configuration that states
+    /// no period and one that names no trigger.
+    #[test]
+    fn the_monitoring_window_is_the_period_the_configuration_asked_for() {
+        let rows: &[WindowRow] = &[
+            WindowRow {
+                case: "no period stated",
+                minutes: None,
+                triggers: 1,
+                watched_for: None,
+            },
+            WindowRow {
+                case: "the member's own minimum",
+                minutes: Some(0),
+                triggers: 1,
+                watched_for: None,
+            },
+            WindowRow {
+                case: "one minute, kept as the request stated it",
+                minutes: Some(1),
+                triggers: 1,
+                watched_for: Some(Duration::from_secs(60)),
+            },
+            WindowRow {
+                case: "five minutes, kept as the request stated it",
+                minutes: Some(5),
+                triggers: 2,
+                watched_for: Some(Duration::from_secs(5 * 60)),
+            },
+            WindowRow {
+                case: "the ceiling itself",
+                minutes: Some(10),
+                triggers: 1,
+                watched_for: Some(super::super::MAX_TRIGGER_MONITORING),
+            },
+            WindowRow {
+                case: "one minute past the ceiling",
+                minutes: Some(11),
+                triggers: 1,
+                watched_for: Some(super::super::MAX_TRIGGER_MONITORING),
+            },
+            WindowRow {
+                case: "the member's own maximum",
+                minutes: Some(180),
+                triggers: 2,
+                watched_for: Some(super::super::MAX_TRIGGER_MONITORING),
+            },
+            WindowRow {
+                case: "a period asked for by a configuration naming no trigger",
+                minutes: Some(5),
+                triggers: 0,
+                watched_for: None,
+            },
+        ];
+
+        let now = SystemTime::now();
+        let due_at = now + super::super::STATUS_TRANSITION_DELAY;
+        for row in rows {
+            let mut stack = super::super::StoredStack::new(
+                "stack/monitored".to_string(),
+                "monitored".to_string(),
+                None,
+                now,
+            );
+            stack.rollback_configuration = Some(super::super::StoredRollbackConfiguration {
+                triggers: (0..row.triggers)
+                    .map(|index| StoredRollbackTrigger {
+                        arn: format!("arn:aws:cloudwatch:us-east-1:000000000000:alarm:probe-{index}"),
+                        trigger_type: "AWS::CloudWatch::Alarm".to_string(),
+                    })
+                    .collect(),
+                monitoring_time_in_minutes: row.minutes,
+            });
+            stack.begin_transition(
+                now,
+                super::super::status::UPDATE_IN_PROGRESS,
+                super::super::status::UPDATE_COMPLETE,
+                None,
+                None,
+            );
+            let until = stack.trigger_monitoring_until(due_at);
+            assert_eq!(
+                until,
+                row.watched_for.map(|window| due_at + window),
+                "case {:?}: expected the triggers to be watched for {:?} past the transition, \
+                 got {:?}",
+                row.case,
+                row.watched_for,
+                until.map(|until| until.duration_since(due_at)),
+            );
+        }
+    }
+
+    /// ...and an operation nothing is in flight for, or one in a status no `RollbackConfiguration`
+    /// is supplied on, is watched for no time at all however long a period it asked for.
+    #[test]
+    fn a_stack_with_no_monitored_operation_watches_its_triggers_for_nothing() {
+        let now = SystemTime::now();
+        let due_at = now + super::super::STATUS_TRANSITION_DELAY;
+        let configuration = super::super::StoredRollbackConfiguration {
+            triggers: vec![StoredRollbackTrigger {
+                arn: "arn:aws:cloudwatch:us-east-1:000000000000:alarm:probe".to_string(),
+                trigger_type: "AWS::CloudWatch::Alarm".to_string(),
+            }],
+            monitoring_time_in_minutes: Some(5),
+        };
+
+        // Nothing in flight: the stack settled in its terminal status.
+        let mut settled = super::super::StoredStack::new(
+            "stack/settled".to_string(),
+            "settled".to_string(),
+            None,
+            now,
+        );
+        settled.rollback_configuration = Some(configuration.clone());
+        settled.status = super::super::status::UPDATE_COMPLETE.to_string();
+        assert_eq!(
+            settled.trigger_monitoring_until(due_at),
+            None,
+            "a concluded operation's triggers are watched by nothing"
+        );
+
+        // In flight, but ROLLING BACK: a rollback is what a firing trigger would ask for.
+        let mut rolling_back = super::super::StoredStack::new(
+            "stack/rolling-back".to_string(),
+            "rolling-back".to_string(),
+            None,
+            now,
+        );
+        rolling_back.rollback_configuration = Some(configuration);
+        rolling_back.begin_transition(
+            now,
+            super::super::status::UPDATE_ROLLBACK_IN_PROGRESS,
+            super::super::status::UPDATE_ROLLBACK_COMPLETE,
+            None,
+            None,
+        );
+        assert_eq!(
+            rolling_back.trigger_monitoring_until(due_at),
+            None,
+            "a rollback in flight is not monitored by the triggers it was forced by"
+        );
     }
 }

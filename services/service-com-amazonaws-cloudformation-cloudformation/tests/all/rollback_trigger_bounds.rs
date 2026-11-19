@@ -19,8 +19,12 @@
 //! (`CreateStack` and `UpdateStack`, the two that put one in force on a stack).
 
 use service_com_amazonaws_cloudformation_cloudformation::state::MAX_ROLLBACK_TRIGGERS;
+use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, create_stack, member, router, wait_for_the_transition, xml_blocks, xml_text, xml_texts};
+use crate::harness::{
+    call, create_stack, member, router, settled_stack_status, xml_blocks, xml_text, xml_texts,
+    REGION,
+};
 use crate::stack_lifecycle::describe_stack;
 
 /// A template every row shares, so the only thing a row varies is the trigger count.
@@ -33,8 +37,13 @@ fn alarm_arn(n: usize) -> String {
 }
 
 /// The members that spell one `RollbackConfiguration` naming `count` alarm triggers.
+///
+/// The monitoring period is stated as ZERO: this suite is about the trigger LIST, and a
+/// configuration that asks for a period holds its operation open while that period is watched
+/// ([`service_com_amazonaws_cloudformation_cloudformation::state::MAX_TRIGGER_MONITORING`]),
+/// which the monitoring suites own.
 fn rollback_triggers(count: usize) -> Vec<(String, String)> {
-    let mut members = vec![member("RollbackConfiguration.MonitoringTimeInMinutes", "5")];
+    let mut members = vec![member("RollbackConfiguration.MonitoringTimeInMinutes", "0")];
     for index in 0..count {
         let position = index + 1;
         members.push(member(
@@ -107,6 +116,14 @@ fn counts() -> Vec<(String, usize, bool)> {
     ]
 }
 
+/// The stack under test once the operation in flight on it has settled, with the status it
+/// settled in: an operation monitored by a rollback trigger that asked for a monitoring period
+/// is held open while that period is watched, and what the rows wait for is the CONDITION that
+/// it is through.
+async fn settled(router: &MultiServiceRouter, case: &str) -> String {
+    settled_stack_status(case, router, REGION, "rbt-count-updated").await
+}
+
 #[tokio::test]
 async fn create_stack_holds_the_trigger_list_to_the_models_bound() {
     assert_eq!(
@@ -165,7 +182,10 @@ async fn update_stack_holds_the_trigger_list_to_the_same_bound() {
         status, 200,
         "the stack under test must be created, got {status} {body}"
     );
-    wait_for_the_transition().await;
+    // A create monitored by a trigger with a monitoring period is held open while that period
+    // is watched, so every row below waits for the operation before it to SETTLE rather than
+    // for a fixed span: an update of a stack with one still in flight is a different refusal.
+    settled(&router, "the stack under test").await;
     // The triggers in force on the stack right now, which is what a REFUSED update must
     // leave untouched: it moves on every accepted row, so each refusal is judged against the
     // configuration the stack really carried when it arrived.
@@ -186,7 +206,7 @@ async fn update_stack_holds_the_trigger_list_to_the_same_bound() {
                 status, 200,
                 "case {case:?}: the update must be accepted, got {status} {body}"
             );
-            wait_for_the_transition().await;
+            settled(&router, &case).await;
             let (_, described) = describe_stack(&router, "rbt-count-updated").await;
             let expected: Vec<String> = (0..count).map(alarm_arn).collect();
             assert_eq!(

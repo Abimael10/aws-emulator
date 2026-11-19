@@ -9,8 +9,12 @@
 //! The id, the create time, the creating principal and the default and latest version
 //! numbers are derived by the store, never taken from the request; the first version keeps
 //! the request's `LaunchTemplateData` verbatim, so nothing a caller set is dropped — an
-//! `ImageId` naming a Systems Manager parameter included, which "will resolve to an AMI ID
-//! on launch" and so is stored unresolved here and read by the launch alone.
+//! `ImageId` naming a Systems Manager parameter included, which is stored UNRESOLVED and
+//! resolved again by each launch. Such a value is resolved here too, against the one catalog
+//! the launch reads: a parameter this account resolves no AMI for is refused as the invalid
+//! ALIAS it is (`SsmInvalidParameter`), so no template can be stored naming an image no launch
+//! from it could ever find
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::rejected_ssm_image_alias`]).
 //!
 //! A name is refused unless the modelled `LaunchTemplateName` can carry it, and a name the
 //! account already holds a template under is refused with
@@ -312,11 +316,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every remaining check is READ-ONLY, and a replay clears them all by storing
         // nothing.
         if replayed.is_none() {
-            // An `ImageId` naming a Systems Manager parameter is stored AS GIVEN and read by
-            // nothing here: "the Systems Manager parameter will resolve to an AMI ID on
-            // launch" (`RequestLaunchTemplateData$ImageId`), so which AMI it names — or
-            // whether it names one at all — is the launch's question, and a create is
-            // refused for no alias.
+            // An `ImageId` naming a Systems Manager parameter is stored AS GIVEN — "the
+            // Systems Manager parameter will resolve to an AMI ID on launch"
+            // (`RequestLaunchTemplateData$ImageId`), so a later launch resolves it again —
+            // but it is RESOLVED here, against the catalog that launch reads: a value naming
+            // a parameter this account resolves no AMI for is refused now rather than stored
+            // for a launch that could never find an image behind it.
+            if let Some(refusal) = store.rejected_ssm_image_alias(
+                ::engine::emulator_account_id(),
+                spec.data.image_id.as_deref(),
+            ) {
+                return Err(refusal);
+            }
             if store.launch_template_id_for_name(&spec.name).is_some() {
                 return Err(launch_template_name_already_exists());
             }

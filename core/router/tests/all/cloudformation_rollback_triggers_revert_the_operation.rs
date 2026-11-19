@@ -15,11 +15,21 @@
 //! and the operation completes.**
 //!
 //! The STACK OPERATION itself is monitored, so an alarm that is in that state when the
-//! operation BEGINS — which is every firing row below, each one settling its alarm before the
-//! call is made — aborts it before any resource change is carried out: nothing is asked of the
-//! service that owns the stack's resources, so there is nothing applied to put back and
-//! nothing applied to keep. That is why a caller that asked for the failed state to be kept
-//! (`DisableRollback`) gets `UPDATE_FAILED` over the property the stack already had.
+//! operation BEGINS — which is every firing row of the first tables below, each one settling
+//! its alarm before the call is made — aborts it before any resource change is carried out:
+//! nothing is asked of the service that owns the stack's resources, so there is nothing
+//! applied to put back and nothing applied to keep. That is why a caller that asked for the
+//! failed state to be kept (`DisableRollback`) gets `UPDATE_FAILED` over the property the
+//! stack already had.
+//!
+//! The MONITORING PERIOD is the other half of that sentence, and the last table below is
+//! about it: "the amount of time, in minutes, during which CloudFormation should monitor all
+//! the rollback triggers after the stack creation or update operation deploys all necessary
+//! resources" (`RollbackConfiguration$MonitoringTimeInMinutes`) — so an update that asked for
+//! one is still in flight once its change has LANDED, an alarm that enters `ALARM` while that
+//! period is watched rolls the whole update back and the property it applied is put back in
+//! the owning service, while an update that asked for no period is monitored by nothing once
+//! it has concluded.
 //!
 //! Only a cross-service suite can pin it: what decides the rollback is an alarm's `StateValue`
 //! in CLOUDWATCH's own records, read by CloudFormation in-process, and what says the rollback
@@ -508,7 +518,10 @@ async fn an_alarm_in_alarm_rolls_the_update_it_monitors_back() {
             case: "an alarm in OK rolls nothing back",
             stack: "rbt-update-quiet",
             triggers: &[QUIET],
-            monitoring: Some(5),
+            // Zero, because a nonzero period holds the operation open while it is watched and
+            // what such a period DOES is the last table's own rule; what this row is about is
+            // the alarm's state when the operation begins.
+            monitoring: Some(0),
             deploy: Deploy::UpdateStack,
             disable_rollback: false,
             expected_status: "UPDATE_COMPLETE",
@@ -548,7 +561,7 @@ async fn an_alarm_in_alarm_rolls_the_update_it_monitors_back() {
             case: "neither of two triggers firing leaves the update alone",
             stack: "rbt-update-neither",
             triggers: &[QUIET, UNKNOWN],
-            monitoring: Some(1),
+            monitoring: Some(0),
             deploy: Deploy::UpdateStack,
             disable_rollback: false,
             expected_status: "UPDATE_COMPLETE",
@@ -972,7 +985,10 @@ async fn an_alarm_in_alarm_rolls_the_create_it_monitors_back() {
         ];
         members.extend(rollback_configuration(
             std::slice::from_ref(&arn),
-            Some(5),
+            // Zero: what this table is about is a trigger whose alarm is in `ALARM` when the
+            // create BEGINS, and a nonzero period would hold the create open while that
+            // period is watched, which the monitoring-period table below owns.
+            Some(0),
         ));
         cfn_ok(&router, case, "CreateStack", &members).await;
 
@@ -1017,6 +1033,305 @@ async fn an_alarm_in_alarm_rolls_the_create_it_monitors_back() {
             assert!(
                 held.is_none(),
                 "case {case:?}: expected SNS to hold no topic {declared}, got {held:?}"
+            );
+        }
+    }
+}
+
+// =============================================================================
+// The MONITORING PERIOD after the resources are deployed
+// =============================================================================
+
+/// A metric alarm of its own METRIC, so one row's breach moves one row's alarm and nothing
+/// else: the alarm starts in `OK` on CloudWatch's own evaluation of a series nothing has
+/// published a datapoint for (`TreatMissingData` `notBreaching`), and reaches `ALARM` when a
+/// datapoint past its threshold is published. Answers the alarm's ARN, which is what a
+/// rollback trigger names.
+async fn given_quiet_alarm_on(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    metric: &str,
+) -> String {
+    cw(
+        router,
+        case,
+        "PutMetricAlarm",
+        &json!({
+            "AlarmName": name,
+            "Namespace": MONITORED_NAMESPACE,
+            "MetricName": metric,
+            "Statistic": "Maximum",
+            "Period": MONITORED_PERIOD,
+            "EvaluationPeriods": 1,
+            "Threshold": 1.0,
+            "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+            "TreatMissingData": TREAT_MISSING_NOT_BREACHING,
+        }),
+    )
+    .await;
+    alarm_arn(router, case, name).await
+}
+
+/// The namespace the monitoring-period rows publish into.
+const MONITORED_NAMESPACE: &str = "Custom/Monitoring";
+
+/// The `Period` every alarm of those rows watches, in seconds.
+const MONITORED_PERIOD: i32 = 60;
+
+/// How many periods back a breach publishes a datapoint for, beside the one it publishes for
+/// the period the clock is in: CloudWatch grades CLOSED periods, so a series that only carries
+/// a datapoint in the OPEN one decides nothing — a canary publishing every period does, which
+/// is what this writes.
+const BREACHED_PERIODS: i32 = 3;
+
+/// Publish datapoints PAST the threshold of the alarm watching `metric`, over the periods that
+/// alarm grades — which is what takes it into `ALARM` on its own next evaluation: the breach a
+/// client's canary reports once the change is live.
+async fn breach(router: &MultiServiceRouter, case: &str, metric: &str) {
+    let now_secs = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let period = f64::from(MONITORED_PERIOD);
+    let data: Vec<Value> = (0..=BREACHED_PERIODS)
+        .map(|back| {
+            json!({
+                "MetricName": metric,
+                "Value": 5.0,
+                "Unit": "Count",
+                "Timestamp": now_secs - f64::from(back) * period,
+            })
+        })
+        .collect();
+    cw(
+        router,
+        case,
+        "PutMetricData",
+        &json!({"Namespace": MONITORED_NAMESPACE, "MetricData": data}),
+    )
+    .await;
+}
+
+/// The `StackStatus` `DescribeStacks` reports for `stack` right now, without waiting for
+/// anything.
+async fn stack_status(router: &MultiServiceRouter, case: &str, stack: &str) -> String {
+    let body = cfn_ok(
+        router,
+        case,
+        "DescribeStacks",
+        &[member("StackName", stack)],
+    )
+    .await;
+    opt_element(&body, "StackStatus").unwrap_or_default()
+}
+
+/// The `DisplayName` SNS holds for `arn`, or `"<no topic>"`.
+async fn display_name(router: &MultiServiceRouter, arn: &str) -> String {
+    topic_attributes(router, arn)
+        .await
+        .and_then(|attributes| attributes.get(WATCHED_ATTRIBUTE).cloned())
+        .unwrap_or_else(|| "<no topic>".to_string())
+}
+
+/// One row of the monitoring-period table: how many triggers monitor the update, which of
+/// them the row breaches, the `MonitoringTimeInMinutes` it asks for, and whether the breach
+/// lands while that period is still open.
+struct PeriodRow {
+    case: &'static str,
+    stack: &'static str,
+    /// How many alarms the configuration names as triggers.
+    triggers: usize,
+    /// Which of them (by index) the row drives into `ALARM` after the change has landed.
+    breached: usize,
+    monitoring: Option<i32>,
+    /// Whether the breach happens while the period is still being watched — a row that waits
+    /// for the operation to conclude first breaches an update nothing monitors any more.
+    inside_the_period: bool,
+}
+
+/// RULE: an alarm a trigger names that enters `ALARM` AFTER the update's resources are
+/// deployed, while the `MonitoringTimeInMinutes` the configuration asked for is still being
+/// watched, rolls the whole update back — the stack reaches `UPDATE_ROLLBACK_COMPLETE`
+/// carrying the alarms that were in that state by name, and the property the update applied is
+/// put back in the service that owns the resource; the same breach after an update that asked
+/// for no period at all rolls nothing back, because the triggers of a concluded operation are
+/// monitored by nothing.
+///
+/// The rows differ along how many triggers monitor the update and which of them is breached,
+/// along the period asked for, and along whether the operation is still being monitored when
+/// the breach lands — the dimension the rule turns on. How long a period runs for, and the
+/// ceiling it is bounded by, is a table of its own in the crate
+/// (`state::rollback_triggers`'s `the_monitoring_window_is_the_period_the_configuration_asked_for`),
+/// so no row here spends that period's wall clock to pin it.
+#[tokio::test]
+async fn an_alarm_that_fires_inside_the_monitoring_period_rolls_the_deployed_update_back() {
+    let rows: &[PeriodRow] = &[
+        PeriodRow {
+            case: "one trigger breached inside the period",
+            stack: "rbt-period-one",
+            triggers: 1,
+            breached: 0,
+            monitoring: Some(5),
+            inside_the_period: true,
+        },
+        PeriodRow {
+            case: "the second of two triggers breached inside the period",
+            stack: "rbt-period-second",
+            triggers: 2,
+            breached: 1,
+            monitoring: Some(3),
+            inside_the_period: true,
+        },
+        PeriodRow {
+            case: "a trigger breached after an update that asked for no period",
+            stack: "rbt-period-none",
+            triggers: 1,
+            breached: 0,
+            monitoring: Some(0),
+            inside_the_period: false,
+        },
+        PeriodRow {
+            case: "a trigger breached after an update that stated no period at all",
+            stack: "rbt-period-unstated",
+            triggers: 2,
+            breached: 1,
+            monitoring: None,
+            inside_the_period: false,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let router = build_router();
+        let topic = format!("{}-topic", row.stack);
+
+        // The triggers, every one of them in `OK` before the update begins: what this rule is
+        // about is an alarm that enters `ALARM` LATER.
+        let mut arns: Vec<String> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut metrics: Vec<String> = Vec::new();
+        for index in 0..row.triggers {
+            let name = format!("{}-alarm-{index}", row.stack);
+            let metric = format!("{}-metric-{index}", row.stack);
+            arns.push(given_quiet_alarm_on(&router, case, &name, &metric).await);
+            alarm_settles_in(&router, case, &name, OK_STATE).await;
+            names.push(name);
+            metrics.push(metric);
+        }
+
+        // The stack, and the property the update then changes.
+        cfn_ok(
+            &router,
+            case,
+            "CreateStack",
+            &[
+                member("StackName", row.stack),
+                member("TemplateBody", &template(&topic, BEFORE)),
+            ],
+        )
+        .await;
+        let created = settled_stack(&router, case, row.stack).await;
+        assert_eq!(
+            opt_element(&created, "StackStatus").as_deref(),
+            Some("CREATE_COMPLETE"),
+            "case {case:?}: the stack under test must be created, got {created}"
+        );
+        let topic_arn = stack_topic_arn(&router, case, row.stack).await;
+
+        // The update, monitored by those triggers. Its change LANDS: the owning service holds
+        // the revised property from here on, which is what opens the monitoring period.
+        let mut members = vec![
+            member("StackName", row.stack),
+            member("TemplateBody", &template(&topic, AFTER)),
+        ];
+        members.extend(rollback_configuration(&arns, row.monitoring));
+        cfn_ok(&router, case, "UpdateStack", &members).await;
+        let applied = display_name(&router, &topic_arn).await;
+        assert_eq!(
+            applied, AFTER,
+            "case {case:?}: the update's change must land before the period is watched, got \
+             {applied:?}"
+        );
+
+        if row.inside_the_period {
+            // The period is still being watched, so the operation is still in flight: that is
+            // what lets an alarm that fires now roll it back.
+            let in_flight = stack_status(&router, case, row.stack).await;
+            assert!(
+                in_flight.ends_with("_IN_PROGRESS"),
+                "case {case:?}: an update watching its monitoring period is still in flight, \
+                 got {in_flight:?}"
+            );
+        } else {
+            // Nothing is monitoring this update: it asked for no period, so its conclusion is
+            // the CONDITION this waits for, by polling for the status that conclusion
+            // installs.
+            let settled = settled_stack(&router, case, row.stack).await;
+            assert_eq!(
+                opt_element(&settled, "StackStatus").as_deref(),
+                Some("UPDATE_COMPLETE"),
+                "case {case:?}: an update nothing rolled back completes, got {settled}"
+            );
+        }
+
+        // The breach, and the alarm state CloudWatch computes from it.
+        breach(&router, case, &metrics[row.breached]).await;
+        alarm_settles_in(&router, case, &names[row.breached], ALARM_STATE).await;
+
+        if row.inside_the_period {
+            let settled = settled_stack(&router, case, row.stack).await;
+            let status = opt_element(&settled, "StackStatus").unwrap_or_default();
+            assert_eq!(
+                status, "UPDATE_ROLLBACK_COMPLETE",
+                "case {case:?}: an alarm firing inside the monitoring period rolls the update \
+                 back, got {status:?} in {settled}"
+            );
+            let reason = opt_element(&settled, "StackStatusReason").unwrap_or_default();
+            assert_eq!(
+                reason,
+                expected_reason(&[names[row.breached].as_str()]),
+                "case {case:?}: expected the reason to name the alarm that was in ALARM, got \
+                 {reason:?}"
+            );
+            // The rollback is reported where a client reads which alarm aborted the deploy...
+            let reported = stack_event_reasons_at(
+                &router,
+                case,
+                row.stack,
+                "UPDATE_ROLLBACK_IN_PROGRESS",
+            )
+            .await;
+            assert_eq!(
+                reported,
+                vec![expected_reason(&[names[row.breached].as_str()])],
+                "case {case:?}: exactly one rollback event names the alarms that were in \
+                 ALARM, got {reported:?}"
+            );
+            // ...and the property the update had applied is PUT BACK in the service that
+            // owns the resource, which is what "rolls back the entire stack operation" means.
+            let restored = display_name(&router, &topic_arn).await;
+            assert_eq!(
+                restored, BEFORE,
+                "case {case:?}: the rolled-back update must put the property back, got \
+                 {restored:?}"
+            );
+        } else {
+            // The update is concluded, so the breach is nothing to it: every read of the
+            // stack reports the status it concluded in — a read is what would materialise a
+            // rollback that was owed — and the property it applied still stands.
+            for look in 0..3 {
+                let status = stack_status(&router, case, row.stack).await;
+                assert_eq!(
+                    status, "UPDATE_COMPLETE",
+                    "case {case:?}: read {look}: a concluded update is monitored by nothing, \
+                     got {status:?}"
+                );
+            }
+            let kept = display_name(&router, &topic_arn).await;
+            assert_eq!(
+                kept, AFTER,
+                "case {case:?}: the concluded update's property must stand, got {kept:?}"
             );
         }
     }

@@ -18,11 +18,13 @@
 //! `InvalidRequestException` (400), and the insert itself is ONE step on the
 //! locked store, so N callers racing for one name have exactly one winner.
 //!
-//! WHICH of the two a loser of a RACE is answered with therefore follows from
-//! how the two in-flight requests interleave, exactly as it does against a
-//! service whose read and write are two steps: what is fixed is that a name
-//! already committed when the request arrived takes the read's sentence, and a
-//! request that got past the read takes the constraint's. A store already holding
+//! WHICH of the two a loser is answered with follows from whether it RACED the
+//! create that took the name: a create that arrives while another create of the
+//! same name is still being served, or that read the name as free and then lost
+//! the insert, was sent before any answer could have told its caller the name
+//! was taken, so the constraint's sentence answers it; a create that arrives
+//! when the name is held by a create already answered, with none of that name in
+//! flight beside it, takes the read's sentence. A store already holding
 //! [`crate::state::MAX_SAMPLING_RULES`] rules answers the modelled
 //! `RuleLimitExceededException` instead, which is the one refusal that reports a
 //! limit rather than the request.
@@ -192,18 +194,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The service's OWN read of the name, taken as the request arrives and
         // before any of the work below: a duplicate name is refused by one of
-        // two layers, and this read is what decides which
-        // (`crate::state::SamplingRuleNameOnArrival`). The guard is released
-        // again at once — this is a read, not the write's critical section.
+        // two layers, and what this arrival finds is what decides which
+        // (`crate::state::SamplingRuleNameOnArrival`). The arrival also counts
+        // this create as in flight for the name it asks for, so a create that
+        // arrives beside it sees that it is racing rather than reading a name
+        // whose holder had been answered; the guard below reports this one
+        // finished however the request ends.
+        let name_in_flight = crate::state::sampling_rule_name(&input.sampling_rule)
+            .ok()
+            .map(str::to_string);
         let on_arrival = {
-            let store = state.lock();
-            let held = crate::state::sampling_rule_name(&input.sampling_rule)
-                .is_ok_and(|name| store.holds_sampling_rule_name(name));
-            if held {
-                crate::state::SamplingRuleNameOnArrival::Held
-            } else {
-                crate::state::SamplingRuleNameOnArrival::Free
+            let mut store = state.lock();
+            match name_in_flight.as_deref() {
+                Some(name) => store.sampling_rule_create_arrived(name),
+                // The rule names nothing a rule could be stored under, so there
+                // is no name to race for: `insert_sampling_rule` refuses it for
+                // what it says.
+                None => crate::state::SamplingRuleNameOnArrival::Free,
             }
+        };
+        let _in_flight = InFlightCreate {
+            state: state.clone(),
+            rule_name: name_in_flight,
         };
 
         // The same tag restrictions `TagResource` and `CreateGroup` enforce,
@@ -271,4 +283,29 @@ fn invalid(message: impl Into<String>) -> CreateSamplingRuleError {
         message: Some(message.into()),
     })
     .into()
+}
+
+/// The create this handler is serving, counted as IN FLIGHT for the `RuleName`
+/// it asks for until the request is answered.
+///
+/// Held for the whole of `handle` and reported finished when it is dropped, so
+/// every way the request can end — the stored rule, any of the refusals, a
+/// panic — leaves the count where it was. What it is for: a create that arrives
+/// while another create of its name is still being served is one of a RACE for
+/// that name, and which of X-Ray's two duplicate-name refusals answers a loser
+/// turns on exactly that (`crate::state::SamplingRuleNameOnArrival`).
+struct InFlightCreate {
+    /// The store the count lives in.
+    state: ::engine::ServiceState<crate::state::ComAmazonawsXrayAwsxrayState>,
+    /// The name this create asks for, or `None` when the submitted rule names
+    /// none for a rule to be stored under.
+    rule_name: Option<String>,
+}
+
+impl ::std::ops::Drop for InFlightCreate {
+    fn drop(&mut self) {
+        if let Some(name) = self.rule_name.as_deref() {
+            self.state.lock().sampling_rule_create_finished(name);
+        }
+    }
 }

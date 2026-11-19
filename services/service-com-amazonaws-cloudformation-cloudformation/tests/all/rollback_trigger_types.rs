@@ -19,7 +19,8 @@ use service_com_amazonaws_cloudformation_cloudformation::state::ROLLBACK_TRIGGER
 
 use crate::change_set_lifecycle::{create_change_set, describe_change_set};
 use crate::harness::{
-    call, create_stack, member, router, wait_for_the_transition, xml_blocks, xml_text, xml_texts,
+    call, create_stack, member, router, settled_stack_status, wait_for_the_transition, xml_blocks,
+    xml_text, xml_texts, REGION,
 };
 use crate::stack_lifecycle::describe_stack;
 
@@ -40,8 +41,12 @@ const ALARM_ARN: &str = "arn:aws:cloudwatch:us-east-1:000000000000:alarm:probe";
 const PLANNED_TEMPLATE: &str = r#"{"Resources":{"Topic":{"Type":"AWS::SNS::Topic"}}}"#;
 
 /// The members that spell one `RollbackConfiguration` with a trigger per entry of `types`.
+///
+/// The monitoring period is stated as ZERO: this suite is about the trigger TYPES, and a
+/// configuration that asks for a period holds its operation open while that period is watched
+/// (`state::MAX_TRIGGER_MONITORING`), which the monitoring suites own.
 fn rollback_triggers(types: &[&str]) -> Vec<(String, String)> {
-    let mut members = vec![member("RollbackConfiguration.MonitoringTimeInMinutes", "5")];
+    let mut members = vec![member("RollbackConfiguration.MonitoringTimeInMinutes", "0")];
     for (index, trigger_type) in types.iter().enumerate() {
         let n = index + 1;
         members.push(member(
@@ -251,7 +256,14 @@ async fn update_stack_refuses_an_unsupported_trigger_type_and_changes_nothing() 
         status, 200,
         "the stack under test must be created, got {status} {body}"
     );
-    wait_for_the_transition().await;
+    // The stack is created with a trigger and a monitoring period, so its create is held open
+    // while that period is watched: what the rows below need is the create SETTLED, which is
+    // polled for rather than waited out.
+    let settled = settled_stack_status("the stack under test", &router, REGION, "rbt-updated").await;
+    assert_eq!(
+        settled, "CREATE_COMPLETE",
+        "the stack under test must reach CREATE_COMPLETE, got {settled:?}"
+    );
 
     // One row per shape of unsupported update, each asserted against the configuration the
     // stack keeps.

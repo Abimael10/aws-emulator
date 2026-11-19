@@ -1073,6 +1073,17 @@ pub const INVALID_AMI_ID_NOT_FOUND: &str = "InvalidAMIID.NotFound";
 /// The code EC2 answers for something that is not an AMI id at all.
 pub const INVALID_AMI_ID_MALFORMED: &str = "InvalidAMIID.Malformed";
 
+/// The code EC2 answers for an `ImageId` that names a Systems Manager parameter the account
+/// resolves no AMI for — a refusal about the ALIAS rather than about an AMI id, which is why
+/// it carries neither of the two codes above (recorded behaviour; the model declares no error
+/// shapes at all for this service).
+pub const SSM_INVALID_PARAMETER: &str = "SsmInvalidParameter";
+
+/// The FIXED text EC2 states for that condition, which the aliases it could not resolve
+/// follow — each by the PARAMETER it names, the value after
+/// [`SSM_IMAGE_ALIAS_PREFIX`], and not the whole `resolve:ssm:` value the request carried.
+pub const INVALID_SSM_ALIASES_PREFIX: &str = "The following aliases are invalid: ";
+
 /// The code EC2 answers for an owner or executable-by term that is neither an account id
 /// nor one of the aliases — "you must specify a valid value for the owner or executableBy
 /// parameters, such as an Amazon Web Services account ID" (EC2 error codes,
@@ -1205,6 +1216,22 @@ pub fn invalid_ami_id_not_found<E>(image_id: &str) -> Scaffolded<E> {
             "The image id '[{}]' does not exist",
             echoed_resource_id(image_id)
         ),
+    )
+}
+
+/// Refuse a request whose `ImageId` names Systems Manager parameters this account resolves no
+/// AMI for, the way EC2 does: HTTP 400 [`SSM_INVALID_PARAMETER`], with
+/// [`INVALID_SSM_ALIASES_PREFIX`] and then the parameters that resolved to nothing, by name,
+/// comma-separated — each cut to the same bound every echoed value of this crate is
+/// ([`echoed_resource_id`]), a parameter name carrying no modelled length of its own.
+pub fn invalid_ssm_image_aliases<'a, E>(
+    parameters: impl IntoIterator<Item = &'a str>,
+) -> Scaffolded<E> {
+    let named: Vec<String> = parameters.into_iter().map(echoed_resource_id).collect();
+    Scaffolded::service_error(
+        SSM_INVALID_PARAMETER,
+        400,
+        format!("{INVALID_SSM_ALIASES_PREFIX}{}", named.join(", ")),
     )
 }
 
@@ -1985,6 +2012,33 @@ impl ComAmazonawsEc2Amazonec2State {
             }
         }
         resolved
+    }
+
+    /// The refusal an `ImageId` a launch template version would store earns when it names a
+    /// Systems Manager parameter this account resolves NO AMI for, or `None` when the value
+    /// names an AMI directly or names a parameter the catalog resolves.
+    ///
+    /// EC2 resolves such a value when the version is WRITTEN as well as when an instance is
+    /// launched from it, so a template cannot be stored naming a parameter that resolves to
+    /// nothing: the refusal is the one EC2 states about an ALIAS it could not resolve
+    /// ([`invalid_ssm_image_aliases`]), made against the same catalog
+    /// ([`Self::public_ssm_parameter_image_ids`]) the launch resolves the stored value against,
+    /// so the write and the launch cannot disagree about which values name an image — the write
+    /// refuses exactly the values a launch from it would find nothing behind.
+    pub fn rejected_ssm_image_alias<E>(
+        &self,
+        account: &str,
+        image_id: Option<&str>,
+    ) -> Option<Scaffolded<E>> {
+        let image_id = image_id?;
+        let parameter = ssm_image_alias_parameter(image_id)?;
+        if self
+            .public_ssm_parameter_image_ids(account)
+            .contains_key(parameter)
+        {
+            return None;
+        }
+        Some(invalid_ssm_image_aliases([parameter]))
     }
 }
 

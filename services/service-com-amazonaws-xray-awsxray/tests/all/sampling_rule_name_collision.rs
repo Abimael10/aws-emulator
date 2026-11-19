@@ -7,19 +7,23 @@
 //! steps — the read of the name and the insert — and each refusal is worded by
 //! the step that caught it, both as `InvalidRequestException` at HTTP 400:
 //!
-//! * a name the account ALREADY HELD when the request arrived is refused by the
-//!   read, with the service's fixed sentence for that condition, which
-//!   interpolates nothing from the request and nothing from the service's state
-//!   — so neither the name asked for nor any identifier of the rule in the way
-//!   appears in it, and the same sentence answers whichever held rule is in the
-//!   way, in whichever Region, however many callers ask one after another, and
-//!   whether or not the name was held by an earlier rule since deleted;
-//! * a create that read the name as FREE and then lost the insert to another
-//!   create IN FLIGHT beside it is refused by the uniqueness constraint of the
-//!   store the rule is written through, whose sentence names the resource that
-//!   won by the internal id it is held under — one id across every loser of one
-//!   race, and a different one for a name created again after a delete, because
-//!   that is a different resource.
+//! * a name taken by a DIFFERENT rule, settled there before the request
+//!   arrived, is refused by the read, with the service's fixed sentence for that
+//!   condition, which interpolates nothing from the request and nothing from the
+//!   service's state — so neither the name asked for nor any identifier of the
+//!   rule in the way appears in it, and the same sentence answers whichever held
+//!   rule is in the way, in whichever Region, however many callers ask one after
+//!   another, and whether or not the name was held by an earlier rule since
+//!   deleted;
+//! * a create that read passes — one that read the name as FREE and then lost
+//!   the insert to another create IN FLIGHT beside it, or one that asks for
+//!   EXACTLY the rule already stored under the name, which states no second rule
+//!   for it — reaches the insert and is refused by the uniqueness constraint of
+//!   the store the rule is written through, whose sentence speaks of resources
+//!   rather than of rules: it names the resource holding the name by the internal
+//!   id it is held under — one id across every loser of one race, and a different
+//!   one for a name created again after a delete, because that is a different
+//!   resource.
 //!
 //! Together those are what let a caller tell a name collision from the
 //! operation's other `InvalidRequestException`s, which carry the same status and
@@ -28,10 +32,12 @@
 //! The rows differ along what holds the name (a rule the account created, the
 //! service-managed one that exists without being created, a rule re-created
 //! under a freed name), along the Region the reserved name is asked for in,
-//! along the priority the losing create carries, along how many callers ask for
-//! one name, and along whether those callers are sequential or in flight
-//! together. `graphs_rules_retrievals_and_insights` grades the in-flight case
-//! once more, over the five joined creates it fires for one name.
+//! along the priority the losing create carries, along WHICH member of the rule
+//! the losing create states differently (and along stating none of them
+//! differently), along how many callers ask for one name, and along whether
+//! those callers are sequential or in flight together.
+//! `graphs_rules_retrievals_and_insights` grades the in-flight case once more,
+//! over the five joined creates it fires for one name.
 
 use serde_json::{json, Value};
 
@@ -66,21 +72,22 @@ fn rule_body(name: &str, priority: i64) -> Value {
     })
 }
 
-/// The sentence X-Ray words for a create whose `RuleName` the account already held
-/// when the request arrived, written out here as that service states it — so this
-/// suite checks AWS's own wording rather than only the constant the crate carries,
-/// which [`the_refusals_are_the_services_own_wording`] holds to this same text.
+/// The sentence X-Ray words for a create whose `RuleName` is held by another
+/// rule, settled there before the request arrived, written out here as that
+/// service states it — so this suite checks AWS's own wording rather than only
+/// the constant the crate carries, which
+/// [`the_refusals_are_the_services_own_wording`] holds to this same text.
 const ALREADY_EXISTS: &str = "Sampling rule already exists";
 
-/// The fixed text of the OTHER refusal, which a create that lost the insert to a
-/// create in flight beside it is answered with — written out here for the same
-/// reason, with the internal id of the rule that won as its only variable part.
+/// The fixed text of the OTHER refusal, which a create the name read let
+/// through is answered with — written out here for the same reason, with the
+/// internal id of the resource holding the name as its only variable part.
 const RACE_LOST_PREFIX: &str =
     "A resource with the same resourceName but a different internalId already exists: ";
 
-/// Assert that `answer` is the refusal a name already held when the request
-/// arrived is answered with: the modelled 400 and the service's fixed sentence,
-/// with nothing interpolated.
+/// Assert that `answer` is the refusal a name held by another rule, settled
+/// before the request arrived, is answered with: the modelled 400 and the
+/// service's fixed sentence, with nothing interpolated.
 fn refused_as_already_existing(case: &str, answer: &Answer) {
     assert_eq!(
         (answer.status, answer.error_type.as_deref()),
@@ -95,8 +102,8 @@ fn refused_as_already_existing(case: &str, answer: &Answer) {
     );
 }
 
-/// Assert that `answer` is the refusal a create that LOST A RACE is answered
-/// with, and answer the internal id it named.
+/// Assert that `answer` is the refusal a create the NAME READ LET THROUGH is
+/// answered with, and answer the internal id it named.
 fn refused_for_the_resource_that_won(case: &str, answer: &Answer) -> String {
     assert_eq!(
         (answer.status, answer.error_type.as_deref()),
@@ -233,8 +240,8 @@ async fn the_refusal_is_the_same_sentence_until_the_name_is_freed() {
 }
 
 // =============================================================================
-// 2. N callers for one name: one winner, and the refusal of the step that
-//    caught each loser
+// 2. N callers for one name, and WHICH rule each of them submits: one winner,
+//    and the refusal of the step that caught each loser
 // =============================================================================
 
 /// Assert exactly one of `answers` won, and answer the losers in order.
@@ -270,14 +277,17 @@ async fn times_held(xray: &Xray, name: &str) -> usize {
 #[tokio::test]
 async fn callers_asking_one_after_another_each_read_the_name_as_held() {
     // Each call here is answered before the next is made, so every loser's read
-    // of the name finds the winner's rule already there. The rows differ along
-    // how many callers ask for the name.
+    // of the name finds the winner's rule already there — and each loser asks
+    // for a rule that DIFFERS from it, which is what that read refuses. The rows
+    // differ along how many callers ask for the name.
     for callers in [2_usize, 5, 9] {
         let xray = Xray::new();
         let name = format!("queue-{callers}");
-        let body = rule_body(&name, 300);
         let mut answers: Vec<Answer> = Vec::new();
-        for _ in 0..callers {
+        for caller in 0..callers {
+            // A priority of its own per caller, so no call states the rule the
+            // call before it stored.
+            let body = rule_body(&name, 300 + caller as i64);
             answers.push(xray.call("/CreateSamplingRule", &body).await);
         }
         let case = format!("{callers} creates of one name, one after another");
@@ -290,6 +300,93 @@ async fn callers_asking_one_after_another_each_read_the_name_as_held() {
             "case {case:?}: the name must be held exactly once afterwards"
         );
     }
+}
+
+/// RULE: what the service's own read of the name refuses is a name taken by a
+/// DIFFERENT rule, so a create stating exactly the rule already stored under the
+/// name reaches the insert and is refused by the store's uniqueness constraint,
+/// for the resource holding the name — while a create differing in ANY member of
+/// the rule is refused by that read.
+///
+/// The rows walk every member of `SamplingRule` a caller supplies
+/// (`smithy_query(query="shape",shape="SamplingRule")`), each stated differently
+/// in turn, beside the row that states none of them differently. All of them are
+/// sequential calls, so what separates the rows is the rule they submit and
+/// nothing about timing.
+#[tokio::test]
+async fn a_create_of_the_rule_already_stored_is_refused_for_the_resource_holding_the_name() {
+    let xray = Xray::new();
+    let name = "granite-sampler";
+    // The rule under test carries a value for every member a caller may state,
+    // so a row can differ in any one of them.
+    let stored = json!({
+        "SamplingRule": {
+            "RuleName": name,
+            "ResourceARN": "*",
+            "Priority": 500,
+            "FixedRate": 0.05,
+            "ReservoirSize": 1,
+            "ServiceName": "*",
+            "ServiceType": "*",
+            "Host": "*",
+            "HTTPMethod": "*",
+            "URLPath": "*",
+            "Version": 1,
+            "Attributes": { "stage": "beta" },
+            "SamplingRateBoost": { "MaxRate": 0.5, "CooldownWindowMinutes": 10 },
+        }
+    });
+    let created = xray.call("/CreateSamplingRule", &stored).await;
+    assert_eq!(
+        created.status, 200,
+        "the rule under test must be created, got {created:?}"
+    );
+
+    // Stating exactly that rule again: the name read has no second rule to
+    // refuse, so the constraint answers, naming the resource holding the name.
+    let identical = xray.call("/CreateSamplingRule", &stored).await;
+    let held_id = refused_for_the_resource_that_won("the rule already stored", &identical);
+    // Asked again, the answer is the same: the id belongs to the stored
+    // resource, not to the request.
+    let twice = xray.call("/CreateSamplingRule", &stored).await;
+    assert_eq!(
+        refused_for_the_resource_that_won("the rule already stored, twice", &twice),
+        held_id,
+        "the resource holding the name does not change between two creates of it, got {twice:?}"
+    );
+
+    // One member stated differently, per member: that is a second rule for the
+    // name, which the service's own read refuses.
+    let differences: Vec<(&str, Value)> = vec![
+        ("ResourceARN", json!("arn:aws:ec2:us-east-1:000000000000:instance/i-0")),
+        ("Priority", json!(501)),
+        ("FixedRate", json!(0.1)),
+        ("ReservoirSize", json!(2)),
+        ("ServiceName", json!("checkout")),
+        ("ServiceType", json!("AWS::EC2::Instance")),
+        ("Host", json!("example.com")),
+        ("HTTPMethod", json!("GET")),
+        ("URLPath", json!("/checkout/*")),
+        ("Attributes", json!({ "stage": "prod" })),
+        (
+            "SamplingRateBoost",
+            json!({ "MaxRate": 0.6, "CooldownWindowMinutes": 10 }),
+        ),
+    ];
+    for (member, value) in differences {
+        let mut body = stored.clone();
+        body["SamplingRule"][member] = value.clone();
+        let answer = xray.call("/CreateSamplingRule", &body).await;
+        refused_as_already_existing(&format!("a rule differing in {member} ({value})"), &answer);
+    }
+
+    // None of those refusals touched the stored rule: the name is held once, by
+    // the resource every refusal named.
+    assert_eq!(
+        times_held(&xray, name).await,
+        1,
+        "the name must still be held exactly once"
+    );
 }
 
 #[tokio::test]
