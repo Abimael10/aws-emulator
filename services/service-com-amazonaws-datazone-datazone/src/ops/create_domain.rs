@@ -357,6 +357,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             account_pools: std::collections::BTreeMap::new(),
             user_profiles: std::collections::BTreeMap::new(),
             subscription_requests: std::collections::BTreeMap::new(),
+            subscriptions: std::collections::BTreeMap::new(),
             subscription_targets: std::collections::BTreeMap::new(),
             id: id.clone(),
         };

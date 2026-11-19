@@ -3,8 +3,9 @@
 //! @op AcceptSubscriptionRequest
 //! A decision on a subscription request: this operation moves a request that is still
 //! awaiting one to `ACCEPTED`, recording the reviewer, the comment and the asset scopes
-//! and permissions the decision narrows the access to, and refuses a request a decision
-//! has already been taken on.
+//! and permissions the decision narrows the access to, materialises the `APPROVED`
+//! subscription that access is held under, and refuses a request a decision has already
+//! been taken on.
 //!
 //! ## Shape of an operation
 //!
@@ -182,9 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, check_asset_references, now_ms, subscribed_asset_ids,
-            AssetReferenceRefusal, ResourceKind, SUBSCRIPTION_ALREADY_DECIDED_MESSAGE,
-            SUBSCRIPTION_REQUEST_STATUS_ACCEPTED,
+            approved_subscription, caller_principal, check_asset_references, now_ms,
+            subscribed_asset_ids, AssetReferenceRefusal, ResourceKind,
+            SUBSCRIPTION_ALREADY_DECIDED_MESSAGE, SUBSCRIPTION_REQUEST_STATUS_ACCEPTED,
         };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -274,6 +275,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Derived from the caller's own credential scope, never from the request body:
         // the reviewer of a decision is whoever took it.
         let reviewer = caller_principal(ctx);
+        // The id of the subscription this decision materialises, minted before the
+        // request is taken mutably below so the one store lock covers the whole decision.
+        let subscription_id = store.mint_id(now);
         // The request was found under this same lock just above, so it is still there; an
         // impossible disappearance is reported as a server fault rather than answered as
         // though the decision had been recorded.
@@ -302,10 +306,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         request.record_decision(
             SUBSCRIPTION_REQUEST_STATUS_ACCEPTED,
-            reviewer,
+            reviewer.clone(),
             input.decision_comment,
             now,
         );
+
+        // The access itself: accepting the ask GRANTS it, so the decision materialises
+        // the subscription the principal holds that access under, `APPROVED` and readable
+        // by `GetSubscription` from this call on. Built from the stored request, so the
+        // subscription is on exactly the listing revision and for exactly the principal
+        // the ask recorded.
+        let subscription = {
+            let request = store
+                .domains
+                .get(&input.domain_identifier)
+                .and_then(|domain| domain.subscription_requests.get(&input.identifier))
+                .ok_or_else(lost)?;
+            approved_subscription(subscription_id.clone(), request, reviewer, now).ok_or_else(
+                || {
+                    AcceptSubscriptionRequestErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: "the accepted subscription request records no principal or \
+                                      listing to subscribe"
+                                .to_string(),
+                        },
+                    )
+                },
+            )?
+        };
+        store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .ok_or_else(lost)?
+            .subscriptions
+            .insert(subscription_id, subscription);
 
         // Built from the record that was actually stored, so a 200 can never report a
         // decision this call did not persist.

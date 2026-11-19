@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one stored subscription of a domain: the access an accepted subscription
+//! request materialised, with the principal that holds it and the catalog listing it is
+//! on.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +163,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSubscription"))
+        use crate::state::{now_ms, subscription_view, ResourceKind};
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSubscriptionErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        // Authorization comes FIRST: a permission is held on a domain, so a caller holds
+        // none on an identifier this store serves no domain for, and the request is
+        // denied before any resource lookup rather than reported as a miss — the rule
+        // every domain-scoped read in this service applies.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(GetSubscriptionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
+        let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
+            GetSubscriptionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: ResourceKind::Domain.not_found_message(),
+            })
+        })?;
+        let subscription = domain.subscriptions.get(&input.identifier).ok_or_else(|| {
+            GetSubscriptionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: ResourceKind::Subscription.not_found_message(),
+            })
+        })?;
+        let rendered = subscription_view(domain, subscription).ok_or_else(|| {
+            GetSubscriptionErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store lost a listing a subscription records".to_string(),
+            })
+        })?;
+        Ok(GetSubscriptionOutput {
+            id: rendered.id,
+            created_by: rendered.created_by,
+            updated_by: rendered.updated_by,
+            domain_id: rendered.domain_id,
+            status: rendered.status,
+            created_at: rendered.created_at,
+            updated_at: rendered.updated_at,
+            subscribed_principal: rendered.subscribed_principal,
+            subscribed_listing: rendered.subscribed_listing,
+            subscription_request_id: rendered.subscription_request_id,
+            retain_permissions: rendered.retain_permissions,
+        })
     }
 }

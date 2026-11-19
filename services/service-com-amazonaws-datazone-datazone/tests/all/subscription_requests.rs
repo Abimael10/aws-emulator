@@ -10,8 +10,7 @@
 //! The rules under test, each asserted over a TABLE of inputs rather than one request:
 //!
 //! 1. A subscription request is RECORDED in its domain: the create answers the stored
-//!    record — the status it resolved to (no listing here has a subscription target
-//!    behind it, so each ask is resolved at once; the decision side is
+//!    record — the `PENDING` status every ask awaits a decision in (the decision side is
 //!    [`crate::subscription_request_decisions`]), the calling principal as `createdBy`,
 //!    the reason asked for, the
 //!    subscribed principal resolved against the domain, and the subscribed listing at the
@@ -32,7 +31,7 @@ use serde_json::{json, Value};
 // The enum members as the service stores them, so a drift between these constants and
 // the values on the wire fails here.
 use service_com_amazonaws_datazone_datazone::state::{
-    FILTER_STATUS_INVALID, FILTER_STATUS_VALID, SUBSCRIPTION_REQUEST_STATUS_ACCEPTED,
+    FILTER_STATUS_INVALID, FILTER_STATUS_VALID, SUBSCRIPTION_REQUEST_STATUS_PENDING,
 };
 
 /// The principal the harness's SigV4 scope names, which is what every `createdBy` this
@@ -377,9 +376,8 @@ async fn a_subscription_request_is_recorded_and_read_back() {
 
         assert_eq!(
             created.s("status"),
-            SUBSCRIPTION_REQUEST_STATUS_ACCEPTED,
-            "case {:?}: no subscription target applies to this listing, so the ask has no \
-             decision to await, got {:?}",
+            SUBSCRIPTION_REQUEST_STATUS_PENDING,
+            "case {:?}: a created request is an ask, so it awaits a decision, got {:?}",
             case.label,
             created.body
         );

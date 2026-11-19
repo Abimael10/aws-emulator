@@ -185,10 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, check_asset_references, created_subscription_request_status, now_ms,
-            stored_forms, AssetReferenceRefusal, IdempotencyKey, ResourceKind, SubscribedListingRef,
+            caller_principal, check_asset_references, now_ms, stored_forms,
+            AssetReferenceRefusal, IdempotencyKey, ResourceKind, SubscribedListingRef,
             SubscriptionRequest, DOMAIN_STATUS_AVAILABLE, ENTITY_TYPE_ASSET,
-            MAX_SUBSCRIPTION_REQUESTS_PER_DOMAIN,
+            MAX_SUBSCRIPTION_REQUESTS_PER_DOMAIN, SUBSCRIPTION_REQUEST_STATUS_PENDING,
         };
 
         // The metadata forms the request carries, read by the rule
@@ -358,18 +358,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Whether the created request awaits a decision at all, by the rule
-        // `crate::state::created_subscription_request_status` states: it does when the
-        // subscribed listings resolve to a subscription target the access would be
-        // granted through, and otherwise there is nothing to decide and the service
-        // resolves the ask at once.
-        let status = created_subscription_request_status(domain, &listings);
-
         let id = store.mint_id(now);
         let request = SubscriptionRequest {
             id: id.clone(),
             domain_id: input.domain_identifier.clone(),
-            status: status.to_string(),
+            // A created request is an ASK, so it is recorded AWAITING a decision: this
+            // operation takes none, and only `AcceptSubscriptionRequest` /
+            // `RejectSubscriptionRequest` move it to a terminal member of
+            // `SubscriptionRequestStatus`.
+            status: SUBSCRIPTION_REQUEST_STATUS_PENDING.to_string(),
             request_reason: input.request_reason,
             principals,
             listings,
@@ -382,15 +379,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // member — is the instant it was made, and `updatedBy` is absent.
             updated_by: None,
             updated_at_ms: now,
-            // No REVIEWER has decided the request: a request that awaits a decision has
-            // had none taken on it yet, and one the service resolved at create was
-            // resolved by nobody, so neither member is reported either way.
+            // No REVIEWER has decided the request: the ask awaits a decision, so
+            // neither the reviewer nor a decision comment is reported yet.
             reviewer_id: None,
             decision_comment: None,
             // `existingSubscriptionId` names the subscription the asked-for access
-            // already exists under. A listing with no subscription target behind it
-            // materialises no subscription at all — there is nothing to grant access
-            // through — so there is none to report.
+            // already exists under. A subscription is materialised by a decision that
+            // ACCEPTS a request, which this ask is still awaiting, so there is none to
+            // report.
             existing_subscription_id: None,
         };
 

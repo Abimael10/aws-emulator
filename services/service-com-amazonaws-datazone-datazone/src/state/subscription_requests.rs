@@ -26,46 +26,14 @@ use crate::ops::types::{
 /// The `SubscriptionRequestStatus` members (model enum
 /// `com.amazonaws.datazone#SubscriptionRequestStatus`: PENDING | ACCEPTED | REJECTED).
 ///
-/// A created request is PENDING when there is a decision to await and ACCEPTED when
-/// there is not ([`created_subscription_request_status`]); a decision moves a PENDING one
-/// to one of the two terminal members. None of the three is in-progress, so a stored
-/// request owes the clock no transition.
+/// A request is an ASK, so it is created awaiting a decision
+/// ([`SUBSCRIPTION_REQUEST_STATUS_PENDING`]) and only a decision operation —
+/// `AcceptSubscriptionRequest` or `RejectSubscriptionRequest` — moves it to one of the
+/// two terminal members. None of the three is in-progress, so a stored request owes the
+/// clock no transition.
 pub const SUBSCRIPTION_REQUEST_STATUS_PENDING: &str = "PENDING";
 pub const SUBSCRIPTION_REQUEST_STATUS_ACCEPTED: &str = "ACCEPTED";
 pub const SUBSCRIPTION_REQUEST_STATUS_REJECTED: &str = "REJECTED";
-
-/// The `SubscriptionRequestStatus` a request created against `listings` carries.
-///
-/// A subscription is fulfilled through a subscription target of the domain, so a request
-/// whose subscribed listings resolve to a target is an ask AWAITING a decision —
-/// [`SUBSCRIPTION_REQUEST_STATUS_PENDING`], which `AcceptSubscriptionRequest` /
-/// `RejectSubscriptionRequest` then move to a terminal member. A request whose listings
-/// resolve to NO target has no decision to await: there is nothing to grant through, so
-/// the service resolves it at once and it is already
-/// [`SUBSCRIPTION_REQUEST_STATUS_ACCEPTED`] when the create answers (recorded behaviour
-/// — the model says only that `status` is required and one of the three members).
-///
-/// Read off the store, so the same listing resolves the same way for every operation
-/// that reports the request, and a listing a target is created for later is PENDING from
-/// then on without this rule changing.
-pub fn created_subscription_request_status(
-    domain: &Domain,
-    listings: &[SubscribedListingRef],
-) -> &'static str {
-    let awaits_a_decision = listings.iter().any(|reference| {
-        domain
-            .listings
-            .get(&reference.listing_id)
-            .and_then(|listing| listing.revisions.get(&reference.revision))
-            .and_then(|revision| super::fulfilling_subscription_target(domain, revision))
-            .is_some()
-    });
-    if awaits_a_decision {
-        SUBSCRIPTION_REQUEST_STATUS_PENDING
-    } else {
-        SUBSCRIPTION_REQUEST_STATUS_ACCEPTED
-    }
-}
 
 /// The `ValidationException` message `AcceptSubscriptionRequest` refuses a request that
 /// is no longer PENDING with: a decision has already been taken on it, so there is none
@@ -304,7 +272,12 @@ pub fn subscription_request_view(
 ) -> Option<SubscriptionRequestView> {
     let mut subscribed_listings = Vec::with_capacity(request.listings.len());
     for reference in &request.listings {
-        subscribed_listings.push(subscribed_listing(domain, request, reference)?);
+        subscribed_listings.push(subscribed_listing(
+            domain,
+            &request.asset_scopes,
+            &request.asset_permissions,
+            reference,
+        )?);
     }
     Some(SubscriptionRequestView {
         id: request.id.clone(),
@@ -378,9 +351,16 @@ pub fn subscribed_principal(
 /// exception: `ownerProjectName` is the name the owning project carries NOW, because the
 /// name belongs to the project's own record. `None` when the listing or the pinned
 /// revision is no longer stored — see [`subscription_request_view`].
-fn subscribed_listing(
+///
+/// `asset_scopes` and `asset_permissions` are what was asked for ON the published assets,
+/// taken from the request the reference belongs to. They are passed in rather than read
+/// off a request, so the SUBSCRIPTION a decision materialises reports its subscribed
+/// listing through this same renderer ([`super::subscription_view`]) and the two cannot
+/// describe one catalog record differently.
+pub(super) fn subscribed_listing(
     domain: &Domain,
-    request: &SubscriptionRequest,
+    asset_scopes: &[AcceptedAssetScope],
+    asset_permissions: &[AssetPermission],
     reference: &SubscribedListingRef,
 ) -> Option<SubscribedListing> {
     let listing = domain.listings.get(&reference.listing_id)?;
@@ -394,7 +374,7 @@ fn subscribed_listing(
         // optional, so a listing recorded from an entity that had none reports the
         // empty description rather than omitting a member the model requires.
         description: revision.description.clone().unwrap_or_default(),
-        item: subscribed_listing_item(domain, request, listing, revision),
+        item: subscribed_listing_item(domain, asset_scopes, asset_permissions, listing, revision),
         owner_project_id: revision.owning_project_id.clone(),
         owner_project_name: domain
             .projects
@@ -423,7 +403,8 @@ fn subscribed_listing(
 /// the recordings shows this shape reporting an empty list.
 fn subscribed_listing_item(
     domain: &Domain,
-    request: &SubscriptionRequest,
+    asset_scopes: &[AcceptedAssetScope],
+    asset_permissions: &[AssetPermission],
     listing: &super::Listing,
     revision: &super::ListingRevision,
 ) -> SubscribedListingItem {
@@ -446,13 +427,11 @@ fn subscribed_listing_item(
         forms: super::listing_forms(&revision.forms),
         glossary_terms: (!revision.glossary_terms.is_empty())
             .then(|| super::detailed_glossary_terms(&revision.glossary_terms)),
-        asset_scope: request
-            .asset_scopes
+        asset_scope: asset_scopes
             .iter()
             .find(|scope| scope.asset_id == listing.entity_id)
             .map(|scope| accepted_asset_scope(domain, scope)),
-        permissions: request
-            .asset_permissions
+        permissions: asset_permissions
             .iter()
             .find(|permission| permission.asset_id == listing.entity_id)
             .map(|permission| permission.permissions.clone()),

@@ -30,6 +30,13 @@ pub use subscription_requests::*;
 mod subscription_targets;
 pub use subscription_targets::*;
 
+/// Subscriptions: the access an accepted subscription request materialises, and the view
+/// every operation that reports one renders it with. A concern of its own, so it lives in
+/// its own module beside this one; everything it declares is re-exported here, so a
+/// handler reaches it as `crate::state::…` like the rest of the store.
+mod subscriptions;
+pub use subscriptions::*;
+
 /// A domain's data portal: where this emulator publishes it, and the page served there. A
 /// concern of its own, so it lives in its own module beside this one; everything it declares
 /// is re-exported here, so a handler reaches it as `crate::state::…` like the rest of the
@@ -326,11 +333,20 @@ pub struct Domain {
     /// listing of them iterates in one stable order and a pagination token can resume
     /// from a key. Bounded by [`MAX_SUBSCRIPTION_REQUESTS_PER_DOMAIN`].
     pub subscription_requests: BTreeMap<String, SubscriptionRequest>,
+    /// The subscriptions of this domain, keyed by their `SubscriptionId` — the identifier
+    /// `GetSubscription` addresses one by — so they go with the domain when it is
+    /// deleted. A `BTreeMap` so every listing of them iterates in one stable order and a
+    /// pagination token can resume from a key.
+    ///
+    /// Bounded without a ceiling of its own: a subscription is materialised only by a
+    /// decision that ACCEPTS a subscription request, and a request takes at most one
+    /// decision ([`SubscriptionRequest::awaits_a_decision`]), so this map holds at most
+    /// one entry per stored request and inherits
+    /// [`MAX_SUBSCRIPTION_REQUESTS_PER_DOMAIN`].
+    pub subscriptions: BTreeMap<String, Subscription>,
     /// The subscription targets of this domain, keyed by their `SubscriptionTargetId` —
     /// the identifier `GetSubscriptionTarget` addresses one by — so they go with the
-    /// domain when it is deleted. Read by
-    /// [`created_subscription_request_status`] to decide whether a subscription to a
-    /// published listing has a fulfilment path behind it.
+    /// domain when it is deleted.
     pub subscription_targets: BTreeMap<String, SubscriptionTarget>,
 }
 
@@ -3463,6 +3479,7 @@ pub enum ResourceKind {
     UserProfile,
     GroupProfile,
     SubscriptionRequest,
+    Subscription,
 }
 
 impl ResourceKind {
@@ -3484,6 +3501,7 @@ impl ResourceKind {
             Self::UserProfile => "User profile",
             Self::GroupProfile => "Group profile",
             Self::SubscriptionRequest => "Subscription request",
+            Self::Subscription => "Subscription",
         }
     }
 
