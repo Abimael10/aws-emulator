@@ -20,6 +20,12 @@
 //! `BenefitIdentifier` of the create, and the `BenefitIdentifiers` filters of the two
 //! listings.
 //!
+//! One field of the ARN the service MINTS is a per-resource fact rather than a request
+//! one, and it is asserted here too: the account field is the one each resource's own ARN
+//! declares — EMPTY for a benefit, whose resource declares it carries no account, and the
+//! account the emulator presents for the other two resources, which declare no such
+//! thing.
+//!
 //! The tables' rows differ along what the rule generalises over: WHICH ARN field differs
 //! from the minted one (partition, region, account, several at once), the value it carries
 //! (another AWS partition, a partition no AWS ARN uses, another region, no region at all,
@@ -61,13 +67,15 @@ fn arn_with(
 }
 
 /// Each row: a case name and the (partition, region, account) it spells an ARN with, none
-/// of them the triple this service mints (`aws`, the region the request addressed, the
-/// emulator account id).
+/// of them the triple this service mints for the resource the row names (`aws`, the region
+/// the request addressed, and the account field that resource declares).
 ///
 /// Every value is one the modelled ARN pattern of this service admits
 /// (`^arn:[\w+=/,.@-]+:partnercentral:[\w+=/,.@-]*:[0-9]{12}:catalog/([a-zA-Z]+)/...$`,
 /// from `ListTagsForResource$resourceArn`), the empty region included, so no row is
-/// refused for being ill-formed.
+/// refused for being ill-formed. Every row's account field is a twelve-digit account, which
+/// is not what a benefit ARN carries at all — the account field of the ARN each resource
+/// declares has its own table, [`an_issued_arn_carries_the_account_field_its_resource_declares`].
 fn foreign_fields() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
     vec![
         ("another AWS partition", "aws-cn", REGION, ACCOUNT),
@@ -449,4 +457,339 @@ async fn a_benefit_identifiers_filter_resolves_only_the_issued_arn() {
              allocation, got {summaries:?} and {token:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The account field of the ARN the service MINTS
+// ---------------------------------------------------------------------------
+
+/// The six colon-separated fields of `arn`, so an assertion can speak about one of them.
+fn arn_fields(case: &str, arn: &str) -> Vec<String> {
+    let fields: Vec<String> = arn.splitn(6, ':').map(str::to_string).collect();
+    assert_eq!(
+        fields.len(),
+        6,
+        "case {case:?}: expected an ARN of six colon-separated fields, got {arn:?}"
+    );
+    fields
+}
+
+/// `arn` with its account field (the fifth) replaced by `account`, every other field left
+/// exactly as the service wrote it.
+fn with_account(case: &str, arn: &str, account: &str) -> String {
+    let mut fields = arn_fields(case, arn);
+    fields[4] = account.to_string();
+    fields.join(":")
+}
+
+/// One resource this service issues an ARN for: how the service reports that ARN, and the
+/// account field the resource's own ARN declaration gives it.
+struct Issued {
+    /// The case name every assertion about this row reports.
+    case: String,
+    /// The resource-type segment the ARN carries.
+    resource: &'static str,
+    /// The resource kind a lookup that finds nothing names in its message.
+    kind: &'static str,
+    /// The operation that reads the resource by identifier.
+    operation: &'static str,
+    catalog: String,
+    /// The bare id, the other form the identifier member admits.
+    id: String,
+    /// The ARN the service itself reported for the resource.
+    reported: String,
+    /// The account field that resource's ARN declares: EMPTY for a benefit, whose resource
+    /// declares it carries no account, and the account the emulator presents for an
+    /// application and an allocation, which declare no such thing.
+    account: &'static str,
+}
+
+/// Every resource this service issues an ARN for, read from the service's own reports:
+/// every benefit and every allocation of every seeded catalog, and one created
+/// application — so the row set cannot drift from the store.
+async fn issued_resources(harness: &Harness) -> Vec<Issued> {
+    let mut rows = Vec::new();
+    for catalog in SEEDED_CATALOGS {
+        for summary in harness.benefits(catalog).await {
+            let id = text(catalog, &summary, "Id");
+            rows.push(Issued {
+                case: format!("the benefit {id} of {catalog}"),
+                resource: BENEFIT_RESOURCE,
+                kind: BENEFIT_KIND,
+                operation: "GetBenefit",
+                catalog: (*catalog).to_string(),
+                reported: text(catalog, &summary, "Arn"),
+                id,
+                account: "",
+            });
+        }
+        let (summaries, _) = list(harness, catalog, &json!({ "Catalog": catalog })).await;
+        assert!(
+            !summaries.is_empty(),
+            "case {catalog:?}: the seeded catalog reports no allocation"
+        );
+        for summary in summaries {
+            let id = text(catalog, &summary, "Id");
+            rows.push(Issued {
+                case: format!("the allocation {id} of {catalog}"),
+                resource: ALLOCATION_RESOURCE,
+                kind: ALLOCATION_KIND,
+                operation: "GetBenefitAllocation",
+                catalog: (*catalog).to_string(),
+                reported: text(catalog, &summary, "Arn"),
+                id,
+                account: ACCOUNT,
+            });
+        }
+    }
+
+    let (benefit_id, _) = first_benefit(harness, CATALOG).await;
+    let case = "the created application";
+    let created = harness
+        .create(
+            case,
+            &json!({
+                "Catalog": CATALOG,
+                "ClientToken": "tok-arn-account-field",
+                "BenefitIdentifier": benefit_id,
+                "Name": "an application the account-field rule is asserted on",
+            }),
+        )
+        .await;
+    let id = text(case, &created, "Id");
+    rows.push(Issued {
+        case: format!("the application {id} of {CATALOG}"),
+        resource: APPLICATION_RESOURCE,
+        kind: APPLICATION_KIND,
+        operation: "GetBenefitApplication",
+        catalog: CATALOG.to_string(),
+        reported: text(case, &created, "Arn"),
+        id,
+        account: ACCOUNT,
+    });
+
+    rows
+}
+
+/// The ARN this service issues for a resource carries the account field that resource's own
+/// ARN declares — empty where the resource declares it has none, the account the emulator
+/// presents otherwise — the identifier resolution answers that same form, and the same ARN
+/// carrying the OTHER account field names no record.
+///
+/// Rows: every benefit, every allocation and one application, i.e. every resource type this
+/// service issues an ARN for, across every seeded catalog, each read through the operation
+/// that resolves it. Each row's ARN comes from the service's own report, so what is asserted
+/// is the form a client is handed.
+#[tokio::test]
+async fn an_issued_arn_carries_the_account_field_its_resource_declares() {
+    let harness = Harness::new();
+    let rows = issued_resources(&harness).await;
+    let mut covered = BTreeSet::new();
+
+    for row in &rows {
+        covered.insert(row.resource);
+        let fields = arn_fields(&row.case, &row.reported);
+        assert_eq!(
+            fields[4], row.account,
+            "case {:?}: expected the account field {:?} its resource declares, got {:?}",
+            row.case, row.account, row.reported
+        );
+        // Either form is one the modelled `Arn` pattern admits, whose account field is
+        // optional: `^arn:aws:([a-zA-Z0-9\-])+:([a-z]{2}(-gov)?-[a-z]+-\d{1})?:(\d{12})?:(.+)$`.
+        assert!(
+            fields[4].is_empty()
+                || (fields[4].len() == 12 && fields[4].bytes().all(|b| b.is_ascii_digit())),
+            "case {:?}: the account field must be empty or twelve digits, got {:?}",
+            row.case,
+            row.reported
+        );
+        assert_eq!(
+            row.reported,
+            expected_arn(&row.catalog, row.resource, &row.id),
+            "case {:?}: unexpected ARN form, got {:?}",
+            row.case,
+            row.reported
+        );
+
+        let body = |identifier: &str| json!({ "Catalog": row.catalog, "Identifier": identifier });
+        let by_arn = harness
+            .ok(&row.case, row.operation, &body(&row.reported))
+            .await;
+        let by_id = harness.ok(&row.case, row.operation, &body(&row.id)).await;
+        assert_eq!(
+            by_arn, by_id,
+            "case {:?}: the issued ARN and the bare id must name the same record, got {by_arn:?} \
+             and {by_id:?}",
+            row.case
+        );
+
+        let other_account = if row.account.is_empty() { ACCOUNT } else { "" };
+        let flipped = with_account(&row.case, &row.reported, other_account);
+        assert_ne!(
+            flipped, row.reported,
+            "case {:?}: this row must name an account field the resource does not declare",
+            row.case
+        );
+        refused(
+            &harness,
+            &format!("{}: the account field flipped", row.case),
+            row.operation,
+            &body(&flipped),
+            row.kind,
+            &flipped,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        covered,
+        BTreeSet::from([BENEFIT_RESOURCE, ALLOCATION_RESOURCE, APPLICATION_RESOURCE]),
+        "the table must span every resource type this service issues an ARN for, got \
+         {covered:?}"
+    );
+}
+
+/// The same rule on every member that takes a BENEFIT identifier: the benefit ARN the
+/// service issues (no account field) names the benefit on each of them, and the same ARN
+/// with the account the emulator presents in that field names no benefit — so it is refused
+/// the benefit-lookup 404 and selects nothing.
+///
+/// Rows: the read, the `BenefitIdentifier` of the create, and the `BenefitIdentifiers`
+/// filters of both listings, each given both spellings.
+#[tokio::test]
+async fn an_account_bearing_benefit_arn_names_no_benefit_on_any_identifier_member() {
+    let harness = Harness::new();
+    let (benefit_id, issued) = first_benefit(&harness, CATALOG).await;
+    let account_bearing = with_account("the issued benefit ARN", &issued, ACCOUNT);
+    assert_ne!(
+        account_bearing, issued,
+        "the issued benefit ARN must carry no account field, got {issued:?}"
+    );
+    harness
+        .create(
+            "the filtered application",
+            &json!({
+                "Catalog": CATALOG,
+                "ClientToken": "tok-arn-account-field-filter",
+                "BenefitIdentifier": benefit_id,
+                "Name": "an application the account-field rule is filtered on",
+            }),
+        )
+        .await;
+
+    // The read: the issued ARN is served, the account-bearing one is the benefit 404.
+    let read = |identifier: &str| json!({ "Catalog": CATALOG, "Identifier": identifier });
+    let by_issued = harness.ok("the issued ARN", "GetBenefit", &read(&issued)).await;
+    assert_eq!(
+        text("the issued ARN", &by_issued, "Id"),
+        benefit_id,
+        "the issued benefit ARN must name its benefit, got {by_issued:?}"
+    );
+    refused(
+        &harness,
+        "GetBenefit with an account-bearing benefit ARN",
+        "GetBenefit",
+        &read(&account_bearing),
+        BENEFIT_KIND,
+        &account_bearing,
+    )
+    .await;
+
+    // The create's `BenefitIdentifier`.
+    let created = harness
+        .create(
+            "the create naming the issued ARN",
+            &json!({
+                "Catalog": CATALOG,
+                "ClientToken": "tok-arn-account-field-create",
+                "BenefitIdentifier": issued,
+                "Name": "an application created against the issued benefit ARN",
+            }),
+        )
+        .await;
+    let application_id = text("the create naming the issued ARN", &created, "Id");
+    let stored = harness
+        .get_in("the create naming the issued ARN", CATALOG, &application_id)
+        .await;
+    assert_eq!(
+        text("the create naming the issued ARN", &stored, "BenefitId"),
+        benefit_id,
+        "the create must apply for the benefit the issued ARN names, got {stored:?}"
+    );
+    let whole = json!({ "Catalog": CATALOG });
+    let before = listed_applications(&harness, "before the refused create", &whole).await;
+    refused(
+        &harness,
+        "CreateBenefitApplication with an account-bearing benefit ARN",
+        "CreateBenefitApplication",
+        &json!({
+            "Catalog": CATALOG,
+            "ClientToken": "tok-arn-account-field-refused",
+            "BenefitIdentifier": account_bearing,
+            "Name": "an application no refused create may mint",
+        }),
+        BENEFIT_KIND,
+        &account_bearing,
+    )
+    .await;
+    let after = listed_applications(&harness, "after the refused create", &whole).await;
+    assert_eq!(
+        after, before,
+        "a refused create must mint nothing, got {after:?} where {before:?} was stored"
+    );
+
+    // The `BenefitIdentifiers` filter of both listings: the issued ARN selects what the
+    // bare id selects, the account-bearing one selects nothing.
+    let filter =
+        |identifier: &str| json!({ "Catalog": CATALOG, "BenefitIdentifiers": [identifier] });
+    let applications_by_id =
+        listed_applications(&harness, "applications by the bare id", &filter(&benefit_id)).await;
+    assert!(
+        !applications_by_id.is_empty(),
+        "the bare id must select the applications created for that benefit, got \
+         {applications_by_id:?}"
+    );
+    let applications_by_issued =
+        listed_applications(&harness, "applications by the issued ARN", &filter(&issued)).await;
+    assert_eq!(
+        applications_by_issued, applications_by_id,
+        "the issued benefit ARN must select what the bare id selects, got \
+         {applications_by_issued:?} and {applications_by_id:?}"
+    );
+    let by_account_bearing = listed_applications(
+        &harness,
+        "applications by the account-bearing ARN",
+        &filter(&account_bearing),
+    )
+    .await;
+    assert!(
+        by_account_bearing.is_empty(),
+        "an account-bearing benefit ARN must select no application, got {by_account_bearing:?}"
+    );
+
+    let (summaries, _) = list(
+        &harness,
+        "allocations by the bare id",
+        &filter(&benefit_id),
+    )
+    .await;
+    let allocations_by_id = ids(&summaries);
+    let (summaries, _) = list(&harness, "allocations by the issued ARN", &filter(&issued)).await;
+    assert_eq!(
+        ids(&summaries),
+        allocations_by_id,
+        "the issued benefit ARN must select the allocations the bare id selects, got \
+         {summaries:?}"
+    );
+    let (summaries, token) = list(
+        &harness,
+        "allocations by the account-bearing ARN",
+        &filter(&account_bearing),
+    )
+    .await;
+    assert!(
+        summaries.is_empty() && token.is_none(),
+        "an account-bearing benefit ARN must select no allocation, got {summaries:?} and \
+         {token:?}"
+    );
 }

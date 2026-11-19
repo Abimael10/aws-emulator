@@ -3104,7 +3104,8 @@ pub fn application_arn(region: &str, catalog: &str, id: &str) -> String {
     resource_arn(region, catalog, APPLICATION_RESOURCE, id)
 }
 
-/// The ARN of the benefit `id` of `catalog`, in `region`.
+/// The ARN of the benefit `id` of `catalog`, in `region` — account-less, because that is
+/// the ARN form the `Benefit` resource itself declares ([`arn_omits_account`]).
 pub fn benefit_arn(region: &str, catalog: &str, id: &str) -> String {
     resource_arn(region, catalog, BENEFIT_RESOURCE, id)
 }
@@ -3114,18 +3115,42 @@ pub fn allocation_arn(region: &str, catalog: &str, id: &str) -> String {
     resource_arn(region, catalog, ALLOCATION_RESOURCE, id)
 }
 
-/// `arn:aws:partnercentral:{region}:{account}:catalog/{catalog}/{resource}/{id}`.
+/// `arn:aws:partnercentral:{region}:{account}:catalog/{catalog}/{resource}/{id}`, where
+/// `{account}` is the account field a resource of `resource`'s type declares: the emulator
+/// account id, or EMPTY for a resource type that declares none ([`arn_omits_account`]).
 ///
 /// The `catalog/...` resource shape is the one the modelled
 /// `ListTagsForResource$resourceArn` pattern declares for this service
 /// (`^arn:[\w+=/,.@-]+:partnercentral:[\w+=/,.@-]*:[0-9]{12}:catalog/([a-zA-Z]+)/[\w+=,.@-]+(/[\w+=,.@-]+)*$`),
-/// so one ARN form serves both the resource members and the tagging operations.
+/// so one resource-path form serves both the resource members and the tagging operations.
+/// That pattern's `[0-9]{12}` account field binds the ARN of a TAGGABLE resource, which a
+/// resource type declaring no account field never is — see [`arn_omits_account`].
 fn resource_arn(region: &str, catalog: &str, resource: &str, id: &str) -> String {
-    ::engine::emulator_arn(
-        ARN_SERVICE,
-        region,
-        &format!("catalog/{catalog}/{resource}/{id}"),
-    )
+    let path = format!("catalog/{catalog}/{resource}/{id}");
+    if arn_omits_account(resource) {
+        // `engine::emulator_arn` always fills the account field, so an ARN that declares
+        // none is built from the same fields with that one left empty.
+        return format!("arn:aws:{ARN_SERVICE}:{region}::{path}");
+    }
+    ::engine::emulator_arn(ARN_SERVICE, region, &path)
+}
+
+/// Whether the ARN of a resource of `resource`'s type carries an EMPTY account field.
+///
+/// Every resource of this service declares the ARN form it is named by, and a resource
+/// whose ARN trait carries `noAccount` has no account field in it: `Benefit`
+/// (`catalog/{CatalogName}/benefit/ben-{BenefitId}`, `noAccount: true`) is the one resource
+/// of this service that declares it, while `BenefitApplication` and `BenefitAllocation`
+/// declare no such thing and so carry the account the emulator presents — see
+/// `smithy_query(query="shape",shape="Benefit,BenefitApplication,BenefitAllocation")`.
+/// The modelled `Arn` pattern admits both forms, its account field being optional
+/// (`^arn:aws:([a-zA-Z0-9\-])+:([a-z]{2}(-gov)?-[a-z]+-\d{1})?:(\d{12})?:(.+)$`), and a
+/// resource type that declares no account field is never a taggable one — the benefit
+/// application is the only resource of this service that holds a tag set, see
+/// [`ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::taggable_resource`]
+/// — so no ARN of such a type has to satisfy the tagging pattern's account field.
+fn arn_omits_account(resource: &str) -> bool {
+    resource == BENEFIT_RESOURCE
 }
 
 /// The `(catalog, id)` the ARN this service issues for a `resource` of `region` names, or
@@ -3135,6 +3160,8 @@ fn resource_arn(region: &str, catalog: &str, resource: &str, id: &str) -> String
 /// ([`resource_arn`]) — compared whole, so every field is a field this service minted: an
 /// ARN naming another partition, another region or another account names no resource here,
 /// just as one naming another service, another resource type or another catalog does not.
+/// For a resource type whose ARN declares no account field ([`arn_omits_account`]), an ARN
+/// that carries one is just such a foreign ARN, and names nothing.
 pub fn parse_resource_arn<'a>(
     arn: &'a str,
     region: &str,

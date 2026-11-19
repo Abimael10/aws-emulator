@@ -153,7 +153,32 @@ pub(crate) fn error_message(body: &Value) -> String {
 }
 
 /// The ARN this service gives the `resource` named `id` in `catalog`.
+///
+/// The account field is the one the resource type itself declares: a benefit's ARN carries
+/// an EMPTY account field (its modelled `@arn` trait declares `noAccount: true`), while a
+/// benefit application's and a benefit allocation's carry the emulator account id. The
+/// modelled `Arn` pattern admits both, its account field being optional
+/// (`^arn:aws:([a-zA-Z0-9\-])+:([a-z]{2}(-gov)?-[a-z]+-\d{1})?:(\d{12})?:(.+)$`). ONE
+/// construction of the rule for the whole test target, so no suite spells a form the
+/// service does not mint.
 pub(crate) fn expected_arn(catalog: &str, resource: &str, id: &str) -> String {
+    let account = if resource == BENEFIT_RESOURCE {
+        ""
+    } else {
+        ACCOUNT
+    };
+    format!("arn:aws:partnercentral:{REGION}:{account}:catalog/{catalog}/{resource}/{id}")
+}
+
+/// An ARN of the form the modelled `TaggableResourceArn` pattern requires: its account
+/// field is a twelve-digit account id
+/// (`^arn:[\w+=/,.@-]+:partnercentral:[\w+=/,.@-]*:[0-9]{12}:catalog/([a-zA-Z]+)/...$`),
+/// whatever ARN form the resource type it names declares.
+///
+/// A tagging row naming a resource type whose own ARN carries no account field (a benefit)
+/// spells it with this, so the call is answered by the resource LOOKUP — the rule those
+/// rows are about — instead of being refused for the member's pattern.
+pub(crate) fn taggable_arn(catalog: &str, resource: &str, id: &str) -> String {
     format!("arn:aws:partnercentral:{REGION}:{ACCOUNT}:catalog/{catalog}/{resource}/{id}")
 }
 
@@ -336,7 +361,8 @@ async fn tagging_one_resource_does_not_touch_another() {
 ///
 /// The rows span every way an ARN of the modelled form can fail to resolve: an id nothing
 /// holds, a resource type that holds no tag set (a benefit — the model binds `Tags` on no
-/// benefit shape), a catalog the service does not serve, and an existing resource's ARN
+/// benefit shape, and spelled with the account field the member's pattern requires, see
+/// [`taggable_arn`]), a catalog the service does not serve, and an existing resource's ARN
 /// in another region, account or partition.
 #[tokio::test]
 async fn tagging_an_arn_that_names_no_resource_is_404() {
@@ -354,11 +380,11 @@ async fn tagging_an_arn_that_names_no_resource_is_404() {
         (
             // The recorded instance of the rule.
             "a benefit that does not exist",
-            expected_arn(catalog, BENEFIT_RESOURCE, "ben-00000000000000"),
+            taggable_arn(catalog, BENEFIT_RESOURCE, "ben-00000000000000"),
         ),
         (
             "a benefit that does exist, which holds no tag set",
-            expected_arn(catalog, BENEFIT_RESOURCE, &benefit),
+            taggable_arn(catalog, BENEFIT_RESOURCE, &benefit),
         ),
         (
             "a catalog the service does not serve",
@@ -425,7 +451,7 @@ async fn tagging_an_arn_that_names_no_resource_is_404() {
 #[tokio::test]
 async fn an_unentitled_caller_is_answered_by_the_resource_lookup() {
     let harness = Harness::unentitled();
-    let resource_arn = expected_arn(
+    let resource_arn = taggable_arn(
         SEEDED_CATALOGS[0],
         BENEFIT_RESOURCE,
         "ben-00000000000000",

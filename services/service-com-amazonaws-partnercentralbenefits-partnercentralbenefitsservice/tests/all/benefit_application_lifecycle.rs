@@ -255,9 +255,11 @@ fn assert_id(case: &str, id: &str, prefix: &str) {
     );
 }
 
-/// The ARN this service gives the `resource` named `id` in `catalog`.
+/// The ARN this service gives the `resource` named `id` in `catalog`, through the one
+/// construction the whole test target shares ([`crate::resource_tagging::expected_arn`]),
+/// so the account field each resource type declares is written down once.
 fn expected_arn(catalog: &str, resource: &str, id: &str) -> String {
-    format!("arn:aws:partnercentral:{REGION}:{ACCOUNT}:catalog/{catalog}/{resource}/{id}")
+    crate::resource_tagging::expected_arn(catalog, resource, id)
 }
 
 /// A member of a JSON object as a string, failing the test when it is absent.

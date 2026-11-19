@@ -34,7 +34,9 @@ use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::
 };
 
 use crate::benefit_application_lifecycle::{error_code, Harness};
-use crate::resource_tagging::{application_arn, benefit_id, error_message, expected_arn, REGION};
+use crate::resource_tagging::{
+    application_arn, benefit_id, error_message, expected_arn, taggable_arn, REGION,
+};
 
 /// The status this service serves `AccessDeniedException` with — the recorded one, not
 /// the modelled 403. Written out here rather than read from the service's own constant so
@@ -199,7 +201,7 @@ async fn every_error_carries_the_status_this_service_serves_its_shape_with() {
             "ResourceNotFoundException",
             true,
             "ListTagsForResource",
-            json!({ "resourceArn": expected_arn(CATALOG, "benefit", &existing_benefit) }),
+            json!({ "resourceArn": taggable_arn(CATALOG, "benefit", &existing_benefit) }),
         ),
         (
             "ResourceNotFoundException",
@@ -307,7 +309,7 @@ async fn the_entitlement_denial_precedes_the_tag_lookup_for_every_resource_form(
         ),
         (
             "a benefit, which holds no tag set".to_string(),
-            expected_arn(CATALOG, "benefit", &benefit),
+            taggable_arn(CATALOG, "benefit", &benefit),
             false,
         ),
         (

@@ -44,8 +44,8 @@ use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::
 
 use crate::benefit_application_lifecycle::{error_code, Harness};
 use crate::resource_tagging::{
-    application_arn, benefit_id, error_message, expected_arn, filler, ok, tags_of, ACCOUNT,
-    REGION,
+    application_arn, benefit_id, error_message, expected_arn, filler, ok, taggable_arn, tags_of,
+    ACCOUNT, REGION,
 };
 
 /// The published bounds of the modelled `TagKeyList` (`length {min: 1, max: 50}`) and of
@@ -355,11 +355,11 @@ async fn untagging_an_arn_that_names_no_resource_is_404() {
         (
             // The recorded instance of the rule.
             "a benefit that does not exist",
-            expected_arn(catalog, BENEFIT_RESOURCE, "ben-00000000000000"),
+            taggable_arn(catalog, BENEFIT_RESOURCE, "ben-00000000000000"),
         ),
         (
             "a benefit that does exist, which holds no tag set",
-            expected_arn(catalog, BENEFIT_RESOURCE, &benefit),
+            taggable_arn(catalog, BENEFIT_RESOURCE, &benefit),
         ),
         (
             "a catalog the service does not serve",
@@ -425,7 +425,7 @@ async fn untagging_an_arn_that_names_no_resource_is_404() {
 #[tokio::test]
 async fn an_unentitled_untag_is_answered_by_the_resource_lookup() {
     let harness = Harness::unentitled();
-    let resource_arn = expected_arn(SEEDED_CATALOGS[0], BENEFIT_RESOURCE, "ben-00000000000000");
+    let resource_arn = taggable_arn(SEEDED_CATALOGS[0], BENEFIT_RESOURCE, "ben-00000000000000");
 
     let (status, out) = harness
         .call(
