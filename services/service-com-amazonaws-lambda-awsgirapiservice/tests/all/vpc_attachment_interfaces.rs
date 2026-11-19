@@ -54,7 +54,10 @@ pub(crate) const LAMBDA_INTERFACE_TYPE: &str = "lambda";
 /// The principal that creates those interfaces: the Lambda service principal, which
 /// `NetworkInterface$RequesterId` names. Written out here rather than taken from the crate, so
 /// the assertion is independent of the constant the implementation carries.
-const LAMBDA_SERVICE_PRINCIPAL: &str = "lambda.amazonaws.com";
+///
+/// `pub(crate)` because the suite over looking those interfaces up in EC2
+/// (`tests/all/vpc_attachment_ec2_lookups.rs`) names the same principal.
+pub(crate) const LAMBDA_SERVICE_PRINCIPAL: &str = "lambda.amazonaws.com";
 
 /// One case of the create table: its name, the subnets the configuration names, the groups it
 /// names, the `VpcId` it must report, and the subnets an interface must sit in.
@@ -236,6 +239,16 @@ async fn default_subnet(ec2: &aws_sdk_ec2::Client) -> (String, String) {
         .expect("the account must have a default subnet in this Region")
 }
 
+/// The description Lambda gives the interfaces of the function `function_name`: fixed text
+/// around the one name, which is how a lookup selects one function's interfaces out of the
+/// inventory.
+///
+/// `pub(crate)` because the suite over looking them up in EC2
+/// (`tests/all/vpc_attachment_ec2_lookups.rs`) selects them by the same description.
+pub(crate) fn interface_description(function_name: &str) -> String {
+    format!("AWS Lambda VPC ENI-{function_name}")
+}
+
 /// Every interface of the account's inventory that belongs to the function `function_name`,
 /// read through EC2's own `DescribeNetworkInterfaces` and selected by the interface type the
 /// model gives a function's interfaces and the description that names the function.
@@ -254,7 +267,7 @@ pub(crate) async fn function_interfaces(
         .send()
         .await
         .expect("EC2 must report the account's network interfaces");
-    let description = format!("AWS Lambda VPC ENI-{function_name}");
+    let description = interface_description(function_name);
     described
         .network_interfaces()
         .iter()
@@ -321,7 +334,10 @@ async fn create_attached_with(
 }
 
 /// `CreateFunction` attaching a function of `name` to `subnet_ids` with `group_ids`.
-async fn create_attached(
+///
+/// `pub(crate)` because the suite over looking a function's interfaces up in EC2
+/// (`tests/all/vpc_attachment_ec2_lookups.rs`) attaches its functions the same way.
+pub(crate) async fn create_attached(
     router: &MultiServiceRouter,
     name: &str,
     subnet_ids: &[String],

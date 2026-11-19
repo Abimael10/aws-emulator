@@ -119,7 +119,11 @@ async fn attach(router: &MultiServiceRouter, case: &str, role_name: &str, policy
 
 /// A second (and further) security group of `vpc_id`, for the rows whose configuration names
 /// more than one.
-async fn another_group(
+///
+/// `pub(crate)` because the suite over looking a function's interfaces up in EC2
+/// (`tests/all/vpc_attachment_ec2_lookups.rs`) needs a sibling group of the SAME VPC and mints
+/// it the same way, through EC2's own `CreateSecurityGroup`.
+pub(crate) async fn another_group(
     ec2: &aws_sdk_ec2::Client,
     case: &str,
     vpc_id: &str,
