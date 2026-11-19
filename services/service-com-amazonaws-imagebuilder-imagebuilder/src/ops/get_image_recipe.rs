@@ -6,10 +6,17 @@
 //! it — including its component list, in the order the create submitted it, the ONE
 //! platform it builds for and its own tags, both of which every read reports. Beside the
 //! recipe it answers the wildcard version ARNs that recipe is reached by
-//! ([`crate::state::latest_version_references`]). An ARN
-//! nothing is stored under, and one of another Region, resolve to nothing — which is
-//! reported MISSING, as the not-found error this service models for a resource its
-//! request references and it does not hold.
+//! ([`crate::state::latest_version_references`]).
+//!
+//! The ARN the request carries is resolved against the versions the store holds NOW
+//! ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::resolve_image_recipe`]):
+//! an exact version names the one recipe stored under it, and trailing `x` nodes name
+//! whichever stored version is greatest among those they admit — "You can use the `x`
+//! wildcard in trailing version positions to retrieve the latest matching version, for
+//! example `x.x.x` or `1.x.x`" (`imageRecipeArn`). So an ARN nothing is stored under, one
+//! whose versions have all been deleted, and one of another Region resolve to nothing —
+//! which is reported MISSING, as the not-found error this service models for a resource
+//! its request references and it does not hold.
 //!
 //! A pure read: it answers from the store and writes nothing a later caller sees.
 //!
@@ -186,11 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
 
-        // A pure read: the guard is taken, the record is copied out as the modelled
-        // view, and nothing is written.
+        // A pure read: the guard is taken, the record the reference reaches is copied out
+        // as the modelled view, and nothing is written.
         let view = state
             .lock()
-            .image_recipe(&input.image_recipe_arn, &region)
+            .resolve_image_recipe(&input.image_recipe_arn, &region)
             .map(crate::state::ImageRecipeRecord::view);
 
         let Some(image_recipe) = view else {
@@ -207,7 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetImageRecipeOutput {
             request_id: Some(crate::state::new_request_id()),
             // "A set of wildcard version ARNs that always reference the latest version of
-            // the resource", derived from the stored recipe's own ARN.
+            // the resource", derived from the ARN of the recipe this read RESOLVED to
+            // rather than from the reference the request carried, which may name a
+            // wildcard version.
             latest_version_references: image_recipe.arn.as_deref().and_then(|arn| {
                 crate::state::latest_version_references(arn, crate::state::IMAGE_RECIPE_ARN_PREFIX)
             }),
