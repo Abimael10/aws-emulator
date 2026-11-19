@@ -26,7 +26,8 @@
 //! this suite pays for is SHARED: the leg in
 //! [`crate::s3_notification_converts_on_a_started_emulator`] — the same chain wired by hand from
 //! the function onwards, and filtered by a key-name `Filter` whose rules this suite's template
-//! does not carry — runs on this emulator rather than starting a second one.
+//! does not carry — runs on this emulator rather than starting a second one, as do the Auto
+//! Scaling notification leg and the DynamoDB endpoint-discovery dial.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -183,9 +184,59 @@ impl Started {
         headers: &[(&str, &str)],
         body: Vec<u8>,
     ) -> (u16, String) {
-        let uri = format!("https://127.0.0.1:{}{path}", self.port);
-        let mut request = http::Request::builder().method(method).uri(uri);
-        request = request.header("host", format!("{signing_name}.{REGION}.amazonaws.com"));
+        let dialled = format!("127.0.0.1:{}", self.port);
+        let host = format!("{signing_name}.{REGION}.amazonaws.com");
+        self.sent((&dialled, &host), signing_name, method, path, headers, body)
+            .unwrap_or_else(|error| panic!("the emulator answers: {error}"))
+    }
+
+    /// One signed call DIALLED at `authority` rather than at the address this harness knows
+    /// the emulator by: the `host:port` is both what the connection is made to and what the
+    /// request carries as its `Host`, which is the position a client that was HANDED an
+    /// address is in — it has that value and nothing else.
+    ///
+    /// `Err` carries the transport's own diagnosis when the dial itself failed, so an address
+    /// nothing accepts a connection on is a case a suite can assert rather than a panic.
+    pub(crate) fn call_at(
+        &self,
+        authority: &str,
+        signing_name: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Result<(u16, String), String> {
+        self.sent(
+            (authority, authority),
+            signing_name,
+            method,
+            path,
+            headers,
+            body,
+        )
+    }
+
+    /// The one exchange both calls above are: the request is built for `path`, carries the
+    /// `Host` header of `addressed` and the digest of its body, is signed for `signing_name`
+    /// with the published key pair, and is sent over the connection the authority of
+    /// `addressed` names — so neither caller can drift from the other on how a call is made.
+    ///
+    /// `addressed` is the pair (the authority the connection is made to, the `Host` the
+    /// request carries), which a client addressing an AWS endpoint host on a local emulator
+    /// gives two different values.
+    fn sent(
+        &self,
+        addressed: (&str, &str),
+        signing_name: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Result<(u16, String), String> {
+        let (authority, host) = addressed;
+        let uri = format!("https://{authority}{path}");
+        let mut request = http::Request::builder().method(method).uri(&uri);
+        request = request.header("host", host);
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
@@ -193,13 +244,15 @@ impl Started {
         request = request.header("x-amz-content-sha256", digest);
         let request = request.body(body).expect("a well-formed request");
         let signed = self.signed(request, signing_name);
+        let sendable = signed
+            .try_into()
+            .map_err(|error| format!("{uri} is not a request reqwest can send: {error}"))?;
         let response = self
             .client
-            .execute(signed.try_into().expect("a request reqwest can send"))
-            .expect("the emulator answers");
+            .execute(sendable)
+            .map_err(|error| format!("nothing answered at {uri}: {error}"))?;
         let status = response.status().as_u16();
-        let body = response.text().unwrap_or_default();
-        (status, body)
+        Ok((status, response.text().unwrap_or_default()))
     }
 
     /// `request` signed with the published key pair for `signing_name`, as an SDK signs it.
@@ -613,4 +666,10 @@ fn a_deployed_pipeline_runs_on_the_emulator_a_client_starts() {
     // binary makes every cross-service call over.
     crate::asg_notifications_on_a_started_emulator::
         an_asg_notification_reaches_its_subscribed_queue(&emulator);
+
+    // The fourth leg, on this same started emulator: the authority DynamoDB endpoint
+    // discovery announces, DIALLED — which only a listening process can answer, so it needs
+    // a started emulator and not a second one.
+    crate::dynamodb_discovered_endpoint_is_dialled_by_a_client::
+        a_client_re_targeted_at_the_discovered_authority_is_served_there(&emulator);
 }

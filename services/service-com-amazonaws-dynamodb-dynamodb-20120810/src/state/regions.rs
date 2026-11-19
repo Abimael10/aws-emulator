@@ -108,9 +108,10 @@ pub const ENDPOINT_PREFIX: &str = "dynamodb";
 /// The name of an endpoint of AWS's, which is what an answer that NAMES the endpoint a
 /// request addressed states — the endpoint a health probe of this endpoint's root is told
 /// it reached. It is not an address for a caller to send anything to: an address this
-/// service ADVERTISES (`crate::ops::describe_endpoints`) names this service and the region
-/// in a zone this emulator answers, on the port it is served at, because a client dials that
-/// one.
+/// service ADVERTISES (`crate::ops::describe_endpoints`) is the `host[:port]` this emulator
+/// is served at, handed on exactly as the emulator publishes it, because a client DIALS
+/// that one — neither this name nor anything derived from the serving host is an authority
+/// this process accepts a connection on.
 pub fn regional_endpoint_host(region: &str) -> String {
     ::service_common::data_plane_addressing::service_endpoint_host(ENDPOINT_PREFIX, region)
 }
