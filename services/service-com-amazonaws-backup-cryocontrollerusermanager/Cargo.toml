@@ -49,6 +49,12 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # (`state::restore_execution::perform_restore`). Only the generated client is
 # needed — the emulator supplies the transport.
 aws-sdk-dynamodb = { version = "1", default-features = false }
+# The AWS SDK for Multi-party Approval, driven over the same in-process callback: the
+# approval team a vault is put under has to be a team the service that MINTS teams holds,
+# so `MpaApprovalTeamArn` is resolved through that service's own read
+# (`state::mpa_approval_team`). Only the generated client is needed — the emulator
+# supplies the transport.
+aws-sdk-mpa = { version = "1", default-features = false }
 # The KMS service crate, for the Amazon Web Services managed key a backup vault
 # created with no `EncryptionKeyArn` is encrypted under: the key behind the
 # predefined `alias/aws/backup` alias is resolved in the KMS store on the shared
@@ -93,6 +99,14 @@ service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 # the protected resource in the service that owns it, so the table a restore
 # creates is read back through DynamoDB's own wire.
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+# Multi-party approval is mounted beside Backup in the approval-team suite: the team a
+# vault is put under is resolved through that service's own read, so the team a case
+# associates is one created through its create and read back through its get.
+service-com-amazonaws-mpa-awsfluffycoreservice = { workspace = true }
+# AWS Organizations is mounted with it because creating an approval team is restricted to
+# the management account of the organization Organizations records, which that service is
+# the keeper of.
+service-com-amazonaws-organizations-awsorganizationsv20161128 = { workspace = true }
 
 [lints]
 workspace = true

@@ -1759,6 +1759,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-mpa"
+version = "1.48.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6634b47757e4e007c6f166f5e3ec19d476f7fc0ea7a97408c3676fd0551ace01"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-organizations"
 version = "1.140.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10457,6 +10482,7 @@ dependencies = [
  "aws-emulator-smithy-server-runtime",
  "aws-sdk-dynamodb",
  "aws-sdk-eventbridge",
+ "aws-sdk-mpa",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -10471,6 +10497,8 @@ dependencies = [
  "service-com-amazonaws-eventbridge-awsevents",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kms-trentservice",
+ "service-com-amazonaws-mpa-awsfluffycoreservice",
+ "service-com-amazonaws-organizations-awsorganizationsv20161128",
  "service-com-amazonaws-sns-amazonsimplenotificationservice",
  "service-com-amazonaws-sqs-amazonsqs",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",

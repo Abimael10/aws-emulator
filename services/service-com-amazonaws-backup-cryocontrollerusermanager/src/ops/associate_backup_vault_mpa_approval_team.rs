@@ -8,9 +8,12 @@
 //! approves access to the recovery points an air-gapped vault holds.
 //!
 //! A team can only be put in charge of a vault that supports multi-party
-//! approval, and only a value that names a team names one at all, so a request
-//! that fails either is refused as the VALUE of the member that names the team:
-//! `MpaApprovalTeamArn` is what the caller has to change.
+//! approval, and only a value that names a team names one at all — a value of
+//! the form a team's ARN takes names one only when the service that MINTS teams
+//! holds a team under it ([`crate::state::rejected_approval_team`]) — so a
+//! request that fails either is refused as the VALUE of the member that names
+//! the team: `MpaApprovalTeamArn` is what the caller has to change, and nothing
+//! is recorded on the vault.
 //!
 //! ## Shape of an operation
 //!
@@ -184,16 +187,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The model types `MpaApprovalTeamArn` as `ARN` with no pattern, so the
-        // framework admits the ARN of anything at all; only the ARN of an
-        // approval team names a team, and the form one takes is the service
-        // that MINTS teams' to state, so the check and the refusal are
-        // `crate::state`'s — shared with every other member this service types
-        // as the ARN of one kind of resource.
-        if let Some(refusal) = crate::state::rejected_mpa_approval_team_arn(
+        // Only a value that NAMES a team can be recorded on a vault: the model types
+        // `MpaApprovalTeamArn` as `ARN` with no pattern, so the framework admits the ARN
+        // of anything at all, and whether a team of that form exists is the answer of the
+        // service that MINTS teams rather than anything this service holds. Both halves
+        // are `crate::state`'s one resolution step
+        // (`crate::state::rejected_approval_team`), run — like the form check it grew out
+        // of — before this store is even reached, so a refused association leaves no team
+        // behind for a later read to report and takes no store lock across the hop that
+        // asks.
+        if let Some(refusal) = crate::state::rejected_approval_team(
+            ctx.callback(),
             "MpaApprovalTeamArn",
             &input.mpa_approval_team_arn,
-        ) {
+        )
+        .await
+        {
             return Err(
                 AssociateBackupVaultMpaApprovalTeamErrorModeled::InvalidParameterValueException(
                     refusal,

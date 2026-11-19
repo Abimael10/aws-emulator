@@ -159,6 +159,11 @@ pub use caller_authorization::*;
 mod vault_encryption_key;
 pub use vault_encryption_key::*;
 
+/// Whether the multi-party approval team a request names exists at all, as the service
+/// that mints teams answers. Re-exported for the reason given on `events`.
+mod mpa_approval_team;
+pub use mpa_approval_team::*;
+
 use crate::ops::types::{
     AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupPlanInput,
     BackupPlansListMember, BackupRule,
@@ -2357,9 +2362,9 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
 /// [`mpa_approval_team_arn_parts`] for the form, which is the owning service's.
 ///
 /// Whether a team of that form EXISTS is not decided here: that is the owning
-/// service's to answer, so the operation asks it (see
-/// `crate::ops::associate_backup_vault_mpa_approval_team`) and answers this same
-/// refusal when the answer is that it does not.
+/// service's to answer, so it is ASKED — [`rejected_approval_team`] puts the
+/// question to that service and answers this same refusal when the answer is
+/// that it holds no such team.
 pub fn rejected_mpa_approval_team_arn(
     member: &str,
     value: &str,
