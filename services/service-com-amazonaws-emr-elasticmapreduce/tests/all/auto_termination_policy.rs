@@ -22,12 +22,17 @@
 //! idle timeout) and its VALUE (each documented bound of `IdleTimeout` and one between
 //! them), across each place a policy is attached and each place it stops being attached.
 
+use std::collections::BTreeSet;
+
 use serde_json::{json, Value};
 
 // The wire harness this crate's suites share: one router over one engine, driving the
 // real `POST /` path.
 use crate::input_refusals::error_message;
 use crate::job_flow_lifecycle::{minimal_request, Emr};
+// The legacy job-flow surface's constant sentence, asserted here as the sentence this
+// family does NOT answer — reused from the suite that owns it rather than copied.
+use crate::refusal_wording::JOB_FLOW_SENTENCE;
 
 /// The documented bounds of `AutoTerminationPolicy$IdleTimeout`: "Specifies the amount of
 /// idle time in seconds after which the cluster automatically terminates. You can specify
@@ -530,6 +535,207 @@ async fn run_job_flow_holds_the_policy_to_the_same_window() {
         assert!(
             payload.get("JobFlowId").is_none(),
             "case {case:?}: a refused launch must mint no cluster, got {payload}"
+        );
+    }
+}
+
+/// The sentence the auto-termination-policy family answers a `ClusterId` it resolves no
+/// cluster for: fixed text around ONE variable part, the id the request carried.
+fn unknown_cluster_sentence(cluster_id: &str) -> String {
+    format!("Cluster id '{cluster_id}' is not valid.")
+}
+
+/// Ids no cluster is held under, spanning what the sentence's variable part can carry:
+/// the form a minted id has, a one-character body, a bare prefix, the empty string and a
+/// 256-character id — the published bounds of the member, `ClusterId` `@length min 0 max
+/// 256` (`smithy_query(query="operation", operation="PutAutoTerminationPolicy")`) — a
+/// body in the opposite case to the uppercase one Amazon EMR mints, a digits-only body,
+/// one carrying an underscore, a value in no cluster-id form at all, and the live
+/// cluster's own id with one character more.
+fn unresolvable_cluster_ids(live: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("the form a minted id has", "j-3ABCDEFGHIJKL".to_string()),
+        ("a one-character body", "j-1".to_string()),
+        ("a bare prefix", "j-".to_string()),
+        ("the empty id, the published minimum length", String::new()),
+        (
+            "an id at the published maximum length",
+            format!("j-{}", "A".repeat(254)),
+        ),
+        ("a lowercase body", "j-1abcdefghijk".to_string()),
+        ("a digits-only id", "1234567890".to_string()),
+        ("an id carrying an underscore", "j-1X_2Y3Z".to_string()),
+        ("a value in no cluster-id form", "not-a-cluster-id".to_string()),
+        (
+            "the live cluster's id with one character more",
+            format!("{live}Z"),
+        ),
+    ]
+}
+
+/// Every request of the auto-termination-policy family for one `ClusterId`: the read, the
+/// attachment in each form its optional policy member takes — including one whose
+/// `IdleTimeout` is outside the documented window, which is unusable twice over — and the
+/// removal.
+fn family_requests(cluster_id: &str) -> Vec<(&'static str, &'static str, Value)> {
+    vec![
+        (
+            "a policy read",
+            "GetAutoTerminationPolicy",
+            json!({ "ClusterId": cluster_id }),
+        ),
+        (
+            "an attachment",
+            "PutAutoTerminationPolicy",
+            json!({
+                "ClusterId": cluster_id,
+                "AutoTerminationPolicy": { "IdleTimeout": IDLE_TIMEOUT_BOUNDS[0] },
+            }),
+        ),
+        (
+            "an attachment carrying no policy member",
+            "PutAutoTerminationPolicy",
+            json!({ "ClusterId": cluster_id }),
+        ),
+        (
+            // The cluster is resolved BEFORE the policy is judged, so this one is refused
+            // for the cluster and not for the window.
+            "an attachment whose idle timeout is outside the window",
+            "PutAutoTerminationPolicy",
+            json!({
+                "ClusterId": cluster_id,
+                "AutoTerminationPolicy": { "IdleTimeout": IDLE_TIMEOUT_BOUNDS[1] + 1 },
+            }),
+        ),
+        (
+            "a removal",
+            "RemoveAutoTerminationPolicy",
+            json!({ "ClusterId": cluster_id }),
+        ),
+    ]
+}
+
+/// THE RULE: an operation of this family that resolves no cluster for the `ClusterId` it
+/// was given refuses with HTTP 400 `ValidationException` and the CLUSTER-ID sentence —
+/// fixed text whose one variable part is the id the request carried — never the legacy
+/// job-flow surface's constant, which names a member none of these inputs carries and
+/// quotes no id at all. Two different ids are therefore named by two different sentences,
+/// which is what lets a caller handling several of them learn which one was refused.
+#[tokio::test]
+async fn the_unknown_cluster_refusal_quotes_the_cluster_id_the_request_carried() {
+    let emr = Emr::new();
+    // A cluster the store DOES hold, carrying a policy: every refusal below is a lookup,
+    // and the attachment it already has is what a refused call must leave alone.
+    let live = emr.run_job_flow(minimal_request("live")).await;
+    let attached = json!({ "IdleTimeout": 3_600 });
+    put(&emr, "live cluster", &live, &attached).await;
+
+    let ids = unresolvable_cluster_ids(&live);
+    let mut sentences: BTreeSet<String> = BTreeSet::new();
+    for (label, cluster_id) in &ids {
+        let expected = unknown_cluster_sentence(cluster_id);
+        let mut said: BTreeSet<String> = BTreeSet::new();
+        for (what, operation, body) in family_requests(cluster_id) {
+            let case = format!("{operation} ({what}) with {label} ({cluster_id:?})");
+            let (status, payload) = emr.call(operation, body).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} with {payload}"
+            );
+            let code = payload
+                .get("__type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                code.contains("ValidationException"),
+                "case {case:?}: expected error code ValidationException, got {code:?} in \
+                 {payload}"
+            );
+            let message = error_message(&payload);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {payload}"
+            );
+            assert_ne!(
+                message, JOB_FLOW_SENTENCE,
+                "case {case:?}: the legacy job-flow constant is not this family's \
+                 sentence, got {message:?}"
+            );
+            assert!(
+                !message.to_lowercase().contains("job flow"),
+                "case {case:?}: the sentence names the cluster id, not a job flow, got \
+                 {message:?}"
+            );
+            if !cluster_id.is_empty() {
+                assert!(
+                    message.contains(cluster_id.as_str()),
+                    "case {case:?}: the sentence must quote the id the request carried, \
+                     got {message:?}"
+                );
+            }
+            said.insert(message);
+        }
+        assert_eq!(
+            said.len(),
+            1,
+            "case {label:?}: every operation of the family words ONE sentence, got {said:?}"
+        );
+        sentences.extend(said);
+    }
+    // One sentence per id, no two alike: the id is a variable part of the template rather
+    // than a constant the family carries.
+    assert_eq!(
+        sentences.len(),
+        ids.len(),
+        "each refused id must be named by its own sentence, got {sentences:?}"
+    );
+
+    // The refusals wrote nothing: the live cluster still reports the policy it carried.
+    let got = policy(&emr, "live cluster", &live).await;
+    assert_eq!(
+        got, attached,
+        "case \"live cluster\": a refused call must leave the attachment alone, got {got}"
+    );
+
+    // The control: the same removal on the id the store DOES hold is served, so every
+    // refusal above was a lookup and not a blanket refusal of the family.
+    emr.ok(
+        "RemoveAutoTerminationPolicy",
+        json!({ "ClusterId": &live }),
+    )
+    .await;
+    let got = policy(&emr, "live cluster", &live).await;
+    assert!(
+        got.is_null(),
+        "case \"live cluster\": the removal must take the policy off, got {got}"
+    );
+}
+
+/// A `ClusterId` one character PAST the maximum the member publishes is refused for that
+/// bound rather than looked up — still HTTP 400, and still never the legacy job-flow
+/// surface's constant.
+#[tokio::test]
+async fn a_cluster_id_past_the_published_maximum_is_refused() {
+    let emr = Emr::new();
+    // 257 characters: one past `ClusterId` `@length max 256`.
+    let too_long = format!("j-{}", "A".repeat(255));
+
+    for (what, operation, body) in family_requests(&too_long) {
+        let case = format!("{operation} ({what}) with an id past the published maximum");
+        let (status, payload) = emr.call(operation, body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {payload}"
+        );
+        let message = error_message(&payload);
+        assert_ne!(
+            message, JOB_FLOW_SENTENCE,
+            "case {case:?}: the legacy job-flow constant is not this family's sentence, \
+             got {message:?}"
+        );
+        assert!(
+            !message.is_empty(),
+            "case {case:?}: a refusal must say what it refused, got {payload}"
         );
     }
 }
