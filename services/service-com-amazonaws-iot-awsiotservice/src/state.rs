@@ -3757,41 +3757,14 @@ pub fn to_job_execution_summary_for_thing(
 /// of the constant the documentation does not fix.
 pub const COMMAND_EXECUTION_RETENTION_SECONDS: i64 = 6 * 30 * 24 * 60 * 60;
 
-/// How this service refuses a command-execution `targetArn` that names no DEVICE.
-///
-/// FIXED text naming the MEMBER that was not accepted, interpolating nothing. The sentence
-/// is about the member rather than about how the service read the value, so it is the same
-/// answer for every way a value fails to name a device — a thing GROUP, another IoT
-/// resource type, a value that is no IoT resource ARN at all, and a `thing/` ARN whose name
-/// no request could address are each "this `targetArn` is not a device". Keeping a per-branch
-/// reading in it would put a part of the request back into the response, which is what the
-/// member-naming form exists to avoid, and would make one member's refusal four sentences.
-pub const INVALID_COMMAND_EXECUTION_TARGET_MESSAGE: &str = "Invalid targetArn";
-
-/// The DEVICE a command-execution request names, or the message the caller reports with
-/// its modelled `ValidationException` when the supplied value names none.
-///
-/// `GetCommandExecution$targetArn` and `DeleteCommandExecution$targetArn` are "the
-/// ARN of the device on which the command execution is being performed" / "of the
-/// target device", i.e. `arn:<partition>:iot:<region>:<account>:thing/<name>`. A
-/// thing GROUP, any other IoT resource type, and a value that is no IoT resource ARN
-/// at all name no device, so the request is refused rather than answered from some
-/// other resource's executions. The parse is [`parse_job_target`], the one rule this
-/// service reads a caller-supplied IoT target ARN with; the refusal is
-/// [`INVALID_COMMAND_EXECUTION_TARGET_MESSAGE`] whichever of those a value is, so the
-/// reader and the delete of one execution say the same thing about one member.
-pub fn command_execution_target(target_arn: &str) -> Result<String, String> {
-    match parse_job_target(target_arn) {
-        Ok(JobTarget::Thing(thing_name)) => Ok(thing_name),
-        Ok(JobTarget::ThingGroup(_))
-        | Err(
-            JobTargetRejection::UnsupportedResourceType(_)
-            | JobTargetRejection::NotAnIotResourceArn
-            | JobTargetRejection::UnaddressableName(_),
-        ) => Err(INVALID_COMMAND_EXECUTION_TARGET_MESSAGE.to_string()),
-    }
-}
-
+// WHICH `targetArn` a command-execution request may address — the two classes a value that
+// names no device of the caller's account is refused as, and the sentence of each — lives in
+// `state/command_execution_access.rs`, beside the executions it addresses.
+pub mod command_execution_access;
+pub use command_execution_access::{
+    command_execution_target, CommandExecutionTargetRefusal,
+    INVALID_COMMAND_EXECUTION_TARGET_MESSAGE, TARGET_NOT_IN_ACCOUNT_MESSAGE,
+};
 /// Index of the COMMAND execution `execution_id` names among `thing_name`'s
 /// executions, or `None` when the device holds none.
 ///

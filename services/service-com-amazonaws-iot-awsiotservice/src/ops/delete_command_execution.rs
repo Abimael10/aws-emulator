@@ -17,8 +17,13 @@
 //! the status this gate consults is the one the deadline already decided and the device's
 //! own plane sees the same.
 //!
-//! `targetArn` must name a DEVICE (`…:thing/<name>`), or the request is refused 400
-//! `ValidationException` naming how the value was read. This operation models NO
+//! `targetArn` is RESOLVED against the DEVICES this account holds
+//! ([`crate::state::command_execution_access`]): a value that is no ARN at all is refused 400
+//! `ValidationException` naming the member, and an ARN that names no device of this account —
+//! another account's, another resource type's, another service's, or one naming a thing the
+//! registry does not hold — is refused 403 with the access-denied error code and the
+//! capitalised `Message` member the layer in front of the service frames that answer with,
+//! before anything is read or deleted. This operation models NO
 //! not-found error (`smithy_query(query="operation",operation="DeleteCommandExecution")`:
 //! `ConflictException`, `InternalServerException`, `ThrottlingException`,
 //! `ValidationException`), so a delete of an execution the device does not hold removes
@@ -99,6 +104,26 @@ fn invalid_request(message: String) -> DeleteCommandExecutionError {
     .into()
 }
 
+/// How a `targetArn` this operation will not delete from is answered: a value that is no
+/// ARN is a malformed member (the modelled 400), and an ARN that names no device of the
+/// caller's own account is the authorization refusal (403) the layer in front of the
+/// service answers — one classification, shared with the reader of one execution
+/// ([`crate::state::ComAmazonawsIotAwsiotserviceState::command_execution_device`]).
+fn refused_target(
+    refusal: crate::state::CommandExecutionTargetRefusal,
+) -> DeleteCommandExecutionError {
+    match refusal {
+        crate::state::CommandExecutionTargetRefusal::Malformed => invalid_request(
+            crate::state::INVALID_COMMAND_EXECUTION_TARGET_MESSAGE.to_string(),
+        ),
+        crate::state::CommandExecutionTargetRefusal::NotInAccount => {
+            crate::scaffolded::Scaffolded::access_denied(
+                crate::state::TARGET_NOT_IN_ACCOUNT_MESSAGE,
+            )
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -174,20 +199,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // execution this removes is the one the device polls, not a control-plane copy
         // of it. The request carries no other metadata this operation needs.
         let _ = ctx;
+        let unavailable = || -> DeleteCommandExecutionError {
+            DeleteCommandExecutionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+            .into()
+        };
+        // The DEVICES this account holds are this service's own store, which is where the
+        // `targetArn` is resolved; the executions are the shared one's.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
         let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
-            return Err(DeleteCommandExecutionErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some("the IoT emulator has no state store attached".to_string()),
-                },
-            )
-            .into());
+            return Err(unavailable());
         };
 
         // `targetArn` is "The Amazon Resource Number (ARN) of the target device for
-        // which you want to delete command executions": a value that names no device
-        // names no queue to delete from.
-        let thing_name =
-            crate::state::command_execution_target(&input.target_arn).map_err(invalid_request)?;
+        // which you want to delete command executions": it is RESOLVED against the devices
+        // this account holds. A value that is no ARN at all is the modelled 400; an ARN
+        // that names no device of this account is refused 403 before anything is read or
+        // deleted, so a caller naming a target outside the account neither changes this
+        // account's state nor learns what it holds.
+        //
+        // LOCK ORDER: this service's store first, the shared execution store second, as
+        // `crate::state::job_store` documents — so the resolution's guard is released
+        // before the executions are locked.
+        let thing_name = state
+            .lock()
+            .command_execution_device(&input.target_arn)
+            .map_err(refused_target)?;
 
         let now = ::service_common::iot_job_executions::now_epoch_seconds();
 

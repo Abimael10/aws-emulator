@@ -18,10 +18,14 @@
 //! and are reported only from a record that holds criteria. Every member of
 //! `JobProcessDetails` other than `processingTargets` is "the number of things" in one
 //! `JobExecutionStatus`, so each is a NUMBER — zero for a status no execution of the job
-//! is in — and `Job$isConcurrent` "will be true when a job is rolling out new job
-//! executions or canceling previously created executions, otherwise false", which is the
-//! `CONTINUOUS` job: the one that "will continue to run" and so has executions still to
-//! roll out, whatever its own status.
+//! is in — `processingTargets` is reported for no job (a create here has finished rolling
+//! out to every target before it answers, and the member "will be null after the job
+//! execution has finished rolling out to all the target devices"), and `Job$isConcurrent`
+//! "will be true when a job is rolling out new job executions or canceling previously
+//! created executions, otherwise false", which is every job that has not COMPLETED: one
+//! still has executions to roll out or to cancel until all its targets have finished, and a
+//! `CONTINUOUS` job — which "will continue to run" — never reaches that point whatever its
+//! own status.
 //!
 //! Every case drives the real wire path — `MultiServiceRouter::dispatch` over a restJson1
 //! `PUT /jobs/{jobId}` (`CreateJob`), `PATCH /jobs/{jobId}` (`UpdateJob`), `GET
@@ -39,6 +43,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
+use service_common::iot_job_executions::{JobExecutionRecord, JobExecutionStore, STATUS_QUEUED};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
@@ -50,6 +55,13 @@ const REGION: &str = "us-east-1";
 const JOB_IN_PROGRESS: &str = "IN_PROGRESS";
 /// The `JobStatus` of a job whose rollout was cancelled.
 const JOB_CANCELED: &str = "CANCELED";
+/// The `JobStatus` of a snapshot job every target has finished.
+const JOB_COMPLETED: &str = "COMPLETED";
+
+/// The `JobExecutionStatus` a device reports when it has finished the work
+/// (`smithy_query(query="shape",shape="JobExecutionStatus")`: QUEUED | IN_PROGRESS |
+/// SUCCEEDED | FAILED | TIMED_OUT | REJECTED | REMOVED | CANCELED).
+const STATUS_SUCCEEDED: &str = "SUCCEEDED";
 
 /// Every member of `JobProcessDetails` that counts things, from
 /// `smithy_query(query="shape",shape="JobProcessDetails")`: each is "the number of
@@ -119,9 +131,12 @@ impl Reply {
     }
 }
 
-/// The emulator under test: ONE shared engine with the IoT service mounted on it.
+/// The emulator under test: ONE shared engine with the IoT service mounted on it. The
+/// engine handle is kept so a case can put a targeted device's execution in a status only
+/// the device-facing plane would otherwise write.
 struct Emulator {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -129,8 +144,8 @@ impl Emulator {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
     }
 
     async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
@@ -211,6 +226,21 @@ impl Emulator {
         self.call("GET", &format!("/job-templates/{job_template_id}"), None)
             .await
     }
+
+    /// Put the stored execution of (thing, job) in `status`, the way the device-facing plane
+    /// does when a device reports the outcome of the work — the one state a case cannot
+    /// reach through this service's own surface.
+    fn report_execution(&self, thing_name: &str, job_id: &str, status: &str) {
+        let store = self.engine.state::<JobExecutionStore>();
+        let mut store = store.lock();
+        let index = store
+            .execution_index(thing_name, job_id, None)
+            .unwrap_or_else(|| panic!("{thing_name} must hold an execution of {job_id}"));
+        let record: &mut JobExecutionRecord = store
+            .record_mut(thing_name, index)
+            .expect("the index came from this store");
+        record.status = status.to_string();
+    }
 }
 
 /// The ARN a `targets` entry names a device by.
@@ -242,6 +272,11 @@ fn assert_counters(case: &str, job: &Value, queued: i64, canceled: i64) {
     let details = job
         .get("jobProcessDetails")
         .unwrap_or_else(|| panic!("case {case:?}: expected jobProcessDetails, got {job:?}"));
+    assert!(
+        details.get("processingTargets").is_none(),
+        "case {case:?}: a job that has finished rolling out to every target reports no \
+         processingTargets, got {details:?}"
+    );
     for member in PROCESS_COUNTERS {
         let expected = match member {
             "numberOfQueuedThings" => queued,
@@ -300,8 +335,8 @@ fn job_cases() -> Vec<JobCase> {
             target_selection: Some("SNAPSHOT"),
             timeout_minutes: None,
             expected_queued: 0,
-            // Nothing to roll out and nothing to cancel.
-            expected_is_concurrent: false,
+            // Nothing has completed the job, so its rollout is not finished with.
+            expected_is_concurrent: true,
         },
         JobCase {
             case: "a CONTINUOUS job targeting two devices with a timeout",
@@ -321,8 +356,8 @@ fn job_cases() -> Vec<JobCase> {
             target_selection: Some("SNAPSHOT"),
             timeout_minutes: Some(1),
             expected_queued: 1,
-            // A SNAPSHOT job rolls out once, to the targets it was created with.
-            expected_is_concurrent: false,
+            // Its one target is still QUEUED, so the job has not completed.
+            expected_is_concurrent: true,
         },
         JobCase {
             case: "a job naming no targetSelection, targeting a group of one device",
@@ -332,8 +367,8 @@ fn job_cases() -> Vec<JobCase> {
             target_selection: None,
             timeout_minutes: Some(10_080),
             expected_queued: 1,
-            // A job that named no selection says nothing about continuing to run.
-            expected_is_concurrent: false,
+            // A job whose target has not finished it has not completed either.
+            expected_is_concurrent: true,
         },
     ]
 }
@@ -667,6 +702,227 @@ async fn a_job_template_reports_its_configuration_structures() {
                 "case {label:?}: {member} is reported exactly when the record holds \
                  criteria, got {:?}",
                 read.body.get(member)
+            );
+        }
+    }
+}
+
+/// One row of the rollout table: the job as created and left, and what a read of it must
+/// then report about its rollout.
+struct RolloutCase {
+    case: &'static str,
+    job_id: &'static str,
+    /// `targetSelection`, or `None` for a request that names none.
+    target_selection: Option<&'static str>,
+    /// The devices the job targets, each with the `JobExecutionStatus` its execution is left
+    /// in — `STATUS_QUEUED` for one no device has reported on.
+    devices: &'static [(&'static str, &'static str)],
+    /// Whether the job's own lifecycle is cancelled before the read.
+    cancelled: bool,
+    expected_status: &'static str,
+    expected_is_concurrent: bool,
+    /// What `numberOfQueuedThings` and `numberOfSucceededThings` must report.
+    expected_queued: i64,
+    expected_succeeded: i64,
+}
+
+/// The rows differ in `targetSelection`, in the fan-out of the targets, in how far their
+/// executions have got and in whether the job's own lifecycle was cancelled.
+fn rollout_cases() -> Vec<RolloutCase> {
+    vec![
+        RolloutCase {
+            case: "a CONTINUOUS job whose one target is still queued",
+            job_id: "continuous-queued",
+            target_selection: Some("CONTINUOUS"),
+            devices: &[("continuous-queued-a", STATUS_QUEUED)],
+            cancelled: false,
+            expected_status: JOB_IN_PROGRESS,
+            expected_is_concurrent: true,
+            expected_queued: 1,
+            expected_succeeded: 0,
+        },
+        RolloutCase {
+            case: "a SNAPSHOT job whose one target is still queued",
+            job_id: "snapshot-queued",
+            target_selection: Some("SNAPSHOT"),
+            devices: &[("snapshot-queued-a", STATUS_QUEUED)],
+            cancelled: false,
+            expected_status: JOB_IN_PROGRESS,
+            expected_is_concurrent: true,
+            expected_queued: 1,
+            expected_succeeded: 0,
+        },
+        RolloutCase {
+            case: "a job naming no targetSelection with two queued targets",
+            job_id: "unselected-two-queued",
+            target_selection: None,
+            devices: &[
+                ("unselected-two-a", STATUS_QUEUED),
+                ("unselected-two-b", STATUS_QUEUED),
+            ],
+            cancelled: false,
+            expected_status: JOB_IN_PROGRESS,
+            expected_is_concurrent: true,
+            expected_queued: 2,
+            expected_succeeded: 0,
+        },
+        RolloutCase {
+            case: "a SNAPSHOT job one of whose two targets has succeeded",
+            job_id: "snapshot-part-done",
+            target_selection: Some("SNAPSHOT"),
+            devices: &[
+                ("snapshot-part-a", STATUS_SUCCEEDED),
+                ("snapshot-part-b", STATUS_QUEUED),
+            ],
+            cancelled: false,
+            expected_status: JOB_IN_PROGRESS,
+            expected_is_concurrent: true,
+            expected_queued: 1,
+            expected_succeeded: 1,
+        },
+        RolloutCase {
+            case: "a SNAPSHOT job every target of which has succeeded",
+            job_id: "snapshot-all-done",
+            target_selection: Some("SNAPSHOT"),
+            devices: &[
+                ("snapshot-done-a", STATUS_SUCCEEDED),
+                ("snapshot-done-b", STATUS_SUCCEEDED),
+            ],
+            cancelled: false,
+            // Every target has completed the job, so it is finished with: the one row that
+            // is NOT concurrent.
+            expected_status: JOB_COMPLETED,
+            expected_is_concurrent: false,
+            expected_queued: 0,
+            expected_succeeded: 2,
+        },
+        RolloutCase {
+            case: "a CONTINUOUS job every target of which has succeeded",
+            job_id: "continuous-all-done",
+            target_selection: Some("CONTINUOUS"),
+            devices: &[("continuous-done-a", STATUS_SUCCEEDED)],
+            cancelled: false,
+            // It "will continue to run": new executions are still to come, so it never
+            // reaches the completed state its current targets would give a snapshot job.
+            expected_status: JOB_IN_PROGRESS,
+            expected_is_concurrent: true,
+            expected_queued: 0,
+            expected_succeeded: 1,
+        },
+        RolloutCase {
+            case: "a SNAPSHOT job that was cancelled",
+            job_id: "snapshot-cancelled",
+            target_selection: Some("SNAPSHOT"),
+            devices: &[("snapshot-cancelled-a", STATUS_QUEUED)],
+            cancelled: true,
+            expected_status: JOB_CANCELED,
+            expected_is_concurrent: true,
+            // The cancel moved the one QUEUED execution to CANCELED.
+            expected_queued: 0,
+            expected_succeeded: 0,
+        },
+        RolloutCase {
+            case: "a CONTINUOUS job that was cancelled",
+            job_id: "continuous-cancelled",
+            target_selection: Some("CONTINUOUS"),
+            devices: &[("continuous-cancelled-a", STATUS_QUEUED)],
+            cancelled: true,
+            expected_status: JOB_CANCELED,
+            expected_is_concurrent: true,
+            expected_queued: 0,
+            expected_succeeded: 0,
+        },
+    ]
+}
+
+/// RULE: a reader of a job reports `isConcurrent` true for every job that has not COMPLETED
+/// — one that may still roll out executions or cancel the ones it created — and reports no
+/// `processingTargets` for any job, whatever its `targetSelection`, its fan-out, how far its
+/// executions have got or whether it was cancelled.
+#[tokio::test]
+async fn a_job_reports_whether_it_is_still_rolling_out() {
+    let emulator = Emulator::new();
+
+    for case in rollout_cases() {
+        let label = case.case;
+        let mut targets: Vec<String> = Vec::new();
+        for (thing_name, _) in case.devices {
+            let created = emulator.create_thing(thing_name).await;
+            assert_eq!(
+                created.status, 200,
+                "case {label:?}: the targeted thing must be creatable, got {} {:?}",
+                created.status, created.body
+            );
+            targets.push(thing_arn(thing_name));
+        }
+
+        let mut request = json!({
+            "targets": targets,
+            "document": r#"{"operation":"reboot"}"#,
+        });
+        if let Some(target_selection) = case.target_selection {
+            request["targetSelection"] = json!(target_selection);
+        }
+        let created = emulator.create_job(case.job_id, &request).await;
+        assert_eq!(
+            created.status, 200,
+            "case {label:?}: the job must be creatable, got {} {:?}",
+            created.status, created.body
+        );
+        for (thing_name, status) in case.devices {
+            if *status != STATUS_QUEUED {
+                emulator.report_execution(thing_name, case.job_id, status);
+            }
+        }
+        if case.cancelled {
+            let cancelled = emulator.cancel_job(case.job_id).await;
+            assert_eq!(
+                cancelled.status, 200,
+                "case {label:?}: the cancel must succeed, got {} {:?}",
+                cancelled.status, cancelled.body
+            );
+        }
+
+        let read = emulator.describe_job(case.job_id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {label:?}: expected 200, got {} {:?}",
+            read.status, read.body
+        );
+        let job = read.job();
+        assert_eq!(
+            job.get("status").and_then(Value::as_str),
+            Some(case.expected_status),
+            "case {label:?}: expected status {:?}, got {job:?}",
+            case.expected_status
+        );
+        assert_eq!(
+            job.get("isConcurrent").and_then(Value::as_bool),
+            Some(case.expected_is_concurrent),
+            "case {label:?}: expected isConcurrent == {}, got {:?}",
+            case.expected_is_concurrent,
+            job.get("isConcurrent")
+        );
+        let details = job
+            .get("jobProcessDetails")
+            .unwrap_or_else(|| panic!("case {label:?}: expected jobProcessDetails, got {job:?}"));
+        assert!(
+            details.get("processingTargets").is_none(),
+            "case {label:?}: a job that has finished rolling out reports no \
+             processingTargets, got {details:?}"
+        );
+        // The counters still report what the executions say, so the two members above are
+        // the only thing these rules change.
+        for (member, expected) in [
+            ("numberOfQueuedThings", case.expected_queued),
+            ("numberOfSucceededThings", case.expected_succeeded),
+        ] {
+            let actual = details.get(member).and_then(Value::as_i64);
+            assert_eq!(
+                actual,
+                Some(expected),
+                "case {label:?}: expected jobProcessDetails.{member} == {expected}, got \
+                 {actual:?} in {details:?}"
             );
         }
     }

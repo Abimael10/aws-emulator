@@ -19,9 +19,13 @@
 //!   `lastUpdatedAt`, `startedAt` (only once a device took it up), `completedAt` (only
 //!   once it finished), `executionTimeoutSeconds` and `timeToLive` — and reading it
 //!   twice gives the same answer;
-//! * a `targetArn` that names no DEVICE is refused 400 `ValidationException` with AWS's
+//! * a `targetArn` is RESOLVED against the devices the account holds: a value that is no
+//!   ARN at all is refused 400 `ValidationException` with AWS's
 //!   FIXED sentence for that member — `Invalid targetArn`, naming the member and echoing
-//!   no part of the request — and an
+//!   no part of the request — while one that IS an ARN but names no device of the caller's
+//!   own account (another account's, another resource type's, a thing nobody created) is
+//!   refused 403 with the Coral-located access-denied error code and the
+//!   capitalised `Message` member; an
 //!   `executionId` the device holds no command execution under is 404
 //!   `ResourceNotFoundException`;
 //! * an execution whose armed timeout the clock has already passed is reported
@@ -187,6 +191,18 @@ impl Emulator {
         .await
     }
 
+    /// `CreateThing`, so the device a seeded execution belongs to is one this account
+    /// holds: a command-execution request's `targetArn` is resolved against the registry.
+    async fn create_thing(&self, thing_name: &str, region: &str) -> Reply {
+        self.call(
+            "POST",
+            &format!("/things/{thing_name}"),
+            Some(&json!({})),
+            region,
+        )
+        .await
+    }
+
     /// `GetCommandExecution` for one execution of one target, signed for `region`.
     async fn get_execution(
         &self,
@@ -228,14 +244,22 @@ impl Emulator {
     /// `iot-jobs-data:StartCommandExecution` does — a job execution keyed by the minted
     /// `executionId`, carrying the command's ARN, the job document
     /// `{"commandArn": …, "parameters": …}` the device fetches and the execution
-    /// timeout the start was given — and then put it in the state the row asks for.
+    /// timeout the start was given — and then put it in the state the row asks for. The
+    /// DEVICE it belongs to is created first, through the real surface, because a
+    /// command-execution request's `targetArn` is resolved against the registry.
     ///
     /// Seeding the shared store directly is what lets ONE suite span every state a
     /// device can leave an execution in (a status only the device-facing plane reaches,
     /// an armed timer, a started execution); the cross-service suite
     /// (`core/router/tests/all/iot_command_execution_lifecycle.rs`) drives the real
     /// writer end to end.
-    fn seed(&self, seed: &Seed<'_>) {
+    async fn seed(&self, seed: &Seed<'_>) {
+        let created = self.create_thing(seed.thing_name, REGION).await;
+        assert_eq!(
+            created.status, 200,
+            "the device {} must be creatable, got {created:?}",
+            seed.thing_name
+        );
         let document = json!({
             "commandArn": seed.command_arn,
             "parameters": seed.parameters,
@@ -262,8 +286,14 @@ impl Emulator {
     }
 
     /// Enqueue an execution a JOB created — no `commandArn` — so a case can prove it is
-    /// not reachable as a command execution of the device.
-    fn seed_job_execution(&self, job_id: &str, thing_name: &str, status: &str) {
+    /// not reachable as a command execution of the device, whose own record is created
+    /// first for the same reason [`Emulator::seed`] creates one.
+    async fn seed_job_execution(&self, job_id: &str, thing_name: &str, status: &str) {
+        let created = self.create_thing(thing_name, REGION).await;
+        assert_eq!(
+            created.status, 200,
+            "the device {thing_name} must be creatable, got {created:?}"
+        );
         let mut record = JobExecutionRecord::queued(
             job_id.to_string(),
             thing_name.to_string(),
@@ -500,7 +530,8 @@ async fn a_stored_command_execution_is_read_back_from_the_shared_store() {
             created_at,
             started_at: case.started.then_some(created_at + 5),
             last_updated_at,
-        });
+        })
+        .await;
 
         let target = target_arn(case.region, case.thing_name);
         let reply = emulator
@@ -622,9 +653,11 @@ async fn a_stored_command_execution_is_read_back_from_the_shared_store() {
     }
 }
 
-/// RULE: a `targetArn` that does not name a DEVICE names no queue of command
-/// executions, so the request is refused 400 `ValidationException` with AWS's fixed
-/// sentence for that member and nothing is read.
+/// RULE: a `targetArn` that is no ARN at all is a malformed member — 400
+/// `ValidationException` with AWS's fixed sentence for it — while one that IS an ARN but
+/// names no device of the caller's own account is the authorization refusal: 403 with the
+/// Coral-located access-denied error code and the capitalised `Message` member. Neither
+/// reads nor writes anything.
 #[tokio::test]
 async fn a_target_that_names_no_device_is_refused() {
     let emulator = Emulator::new();
@@ -641,49 +674,79 @@ async fn a_target_that_names_no_device_is_refused() {
         created_at: now_epoch_seconds(),
         started_at: None,
         last_updated_at: now_epoch_seconds(),
-    });
+    })
+    .await;
 
-    // The rows span the ways a value can fail to name a device: another IoT resource
-    // type (including a thing GROUP, which is a set of devices and not one),
-    // another service's ARN, a value that is no ARN at all, the empty string
-    // (`TargetArn` is modelled len 0..2048, so it reaches the handler), an ARN with no
-    // resource name, and a `thing/` ARN whose name no `/things/{thingName}` request
-    // could address (`ThingName`: len 1..128, `^[a-zA-Z0-9:_-]+$`).
+    // The rows span the ways a value can fail to name a device of this account: another
+    // IoT resource type (including a thing GROUP, which is a set of devices and not one),
+    // another service's ARN, another ACCOUNT's and another PARTITION's thing ARN, an ARN
+    // with no resource name, a `thing/` ARN whose name no `/things/{thingName}` request
+    // could address (`ThingName`: len 1..128, `^[a-zA-Z0-9:_-]+$`) — each of them an ARN,
+    // so each the access-denied refusal — and the two values that are no ARN at all: a
+    // bare name and the empty string (`TargetArn` is modelled len 0..2048, so it reaches
+    // the handler).
     let long_name = "x".repeat(129);
-    let cases: Vec<(&str, String)> = vec![
+    // (case, targetArn, whether the value is an ARN at all)
+    let cases: Vec<(&str, String, bool)> = vec![
         (
             "a thing group",
             format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thinggroup/fleet"),
+            true,
         ),
         (
             "a job",
             format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:job/upgrade-42"),
+            true,
         ),
         (
             "a command",
             format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:command/cmd-validation"),
+            true,
         ),
         (
             "another service's thing ARN",
             format!("arn:aws:s3:{REGION}:{ACCOUNT_ID}:thing/{thing_name}"),
+            true,
         ),
-        ("not an ARN at all", "laser-target-validation".to_string()),
-        ("the empty target", String::new()),
+        (
+            "another account's thing ARN",
+            format!("arn:aws:iot:{REGION}:111122223333:thing/{thing_name}"),
+            true,
+        ),
+        (
+            "another partition's thing ARN",
+            format!("arn:aws-cn:iot:cn-north-1:111122223333:thing/{thing_name}"),
+            true,
+        ),
+        (
+            "a thing this account never created",
+            format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thing/laser-never-created"),
+            true,
+        ),
         (
             "a thing ARN with no name",
             format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thing/"),
+            true,
         ),
         (
             "a thing name past the modelled maximum",
             format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thing/{long_name}"),
+            true,
         ),
         (
             "a thing name outside the modelled character class",
             format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thing/laser 8"),
+            true,
         ),
+        (
+            "not an ARN at all",
+            "laser-target-validation".to_string(),
+            false,
+        ),
+        ("the empty target", String::new(), false),
     ];
 
-    for (case, target) in &cases {
+    for (case, target, is_arn) in &cases {
         for (operation, reply) in [
             (
                 "GetCommandExecution",
@@ -698,28 +761,151 @@ async fn a_target_that_names_no_device_is_refused() {
                     .await,
             ),
         ] {
-            assert_eq!(
-                (reply.status, reply.error_code.as_deref()),
-                (400, Some("ValidationException")),
-                "case {case:?}: {operation} must refuse a target that names no device, \
-                 got {reply:?}"
-            );
-            // The sentence is AWS's, spelled out here rather than taken from the code
-            // under test: fixed text naming the MEMBER, with no part of the request in
-            // it, so every row — another resource type, another service's ARN, a value
-            // that is no ARN at all, a name no request could address — reads the same.
-            assert_eq!(
-                reply.message(),
-                "Invalid targetArn",
-                "case {case:?}: {operation}'s refusal must state AWS's fixed sentence for \
-                 this member, got {reply:?}"
-            );
+            if *is_arn {
+                // The ARN is resolved in the caller's account and names no device there,
+                // which is an authorization answer and not a constraint violation: the
+                // error code carries the Coral locator and the text travels in a
+                // capitalised `Message`, both spelled out here rather than taken from the
+                // code under test.
+                assert_eq!(
+                    (reply.status, reply.error_code.as_deref()),
+                    (
+                        403,
+                        Some(
+                            "AccessDeniedException:http://internal.amazon.com/coral/\
+                             com.amazon.coral.service/"
+                        )
+                    ),
+                    "case {case:?}: {operation} must refuse an ARN outside the account as \
+                     an authorization failure, got {reply:?}"
+                );
+                assert_eq!(
+                    reply.member("Message").as_str(),
+                    Some("targetArn not found in account"),
+                    "case {case:?}: {operation}'s refusal must state AWS's fixed sentence \
+                     under the capitalised member, got {reply:?}"
+                );
+            } else {
+                assert_eq!(
+                    (reply.status, reply.error_code.as_deref()),
+                    (400, Some("ValidationException")),
+                    "case {case:?}: {operation} must refuse a value that is no ARN as a \
+                     malformed member, got {reply:?}"
+                );
+                // The sentence is AWS's, spelled out here rather than taken from the code
+                // under test: fixed text naming the MEMBER, with no part of the request in
+                // it.
+                assert_eq!(
+                    reply.message(),
+                    "Invalid targetArn",
+                    "case {case:?}: {operation}'s refusal must state AWS's fixed sentence \
+                     for this member, got {reply:?}"
+                );
+            }
         }
     }
 
     // A refused request is a request that read and wrote nothing.
     assert_eq!(
         emulator.stored_status(thing_name, "exec-validation"),
+        Some(STATUS_QUEUED.to_string()),
+        "a refused request must leave the stored execution exactly as it was"
+    );
+}
+
+/// RULE: the ownership answer comes FIRST. A request whose `targetArn` names no device of
+/// this account is refused 403 whatever else about the request is malformed, because that
+/// decision belongs to the layer in FRONT of the service — while the same malformed member
+/// on a request whose target IS a device of the account is answered as the constraint
+/// violation it is.
+///
+/// The rows span `CommandExecutionId` (len 1..64, `^[a-zA-Z0-9_-]+$`): a value the model
+/// admits, one outside its character class, and one past its maximum.
+#[tokio::test]
+async fn a_target_outside_the_account_is_refused_before_the_requests_own_members() {
+    let emulator = Emulator::new();
+    let thing_name = "laser-ordering";
+    emulator.create_command("cmd-ordering", REGION).await;
+    emulator.seed(&Seed {
+        execution_id: "exec-ordering",
+        thing_name,
+        command_arn: command_arn(REGION, "cmd-ordering"),
+        parameters: Value::Null,
+        timeout_seconds: None,
+        timeout_expires_at: None,
+        status: STATUS_QUEUED,
+        created_at: now_epoch_seconds(),
+        started_at: None,
+        last_updated_at: now_epoch_seconds(),
+    })
+    .await;
+
+    let held = target_arn(REGION, thing_name);
+    let outside = target_arn(REGION, "laser-no-such-device");
+    let too_long = "e".repeat(65);
+    // (case, executionId, whether the model admits that id)
+    let cases: [(&str, &str, bool); 3] = [
+        ("an executionId the model admits", "exec-ordering", true),
+        (
+            "an executionId outside the modelled character class",
+            "exec.ordering",
+            false,
+        ),
+        (
+            "an executionId past the modelled maximum",
+            too_long.as_str(),
+            false,
+        ),
+    ];
+
+    for (case, execution_id, admitted) in cases {
+        // The target outside the account: the authorization answer, whatever the id is.
+        for (operation, reply) in [
+            (
+                "GetCommandExecution",
+                emulator
+                    .get_execution(execution_id, &outside, None, REGION)
+                    .await,
+            ),
+            (
+                "DeleteCommandExecution",
+                emulator.delete_execution(execution_id, &outside, REGION).await,
+            ),
+        ] {
+            assert_eq!(
+                (reply.status, reply.member("Message").as_str()),
+                (403, Some("targetArn not found in account")),
+                "case {case:?}: {operation} must answer the ownership refusal before the \
+                 request's own members, got {reply:?}"
+            );
+        }
+
+        // The same id against a device this account holds: the member's own answer.
+        let reply = emulator.get_execution(execution_id, &held, None, REGION).await;
+        if admitted {
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: the admitted id names the seeded execution, got {reply:?}"
+            );
+        } else {
+            assert_eq!(
+                (
+                    reply.status,
+                    reply
+                        .error_code
+                        .as_deref()
+                        .is_some_and(|code| code.starts_with("InvalidRequestException"))
+                ),
+                (400, true),
+                "case {case:?}: a malformed executionId on a device of this account is the \
+                 constraint violation, got {reply:?}"
+            );
+        }
+    }
+
+    // Every refusal above left the seeded execution exactly as it was.
+    assert_eq!(
+        emulator.stored_status(thing_name, "exec-ordering"),
         Some(STATUS_QUEUED.to_string()),
         "a refused request must leave the stored execution exactly as it was"
     );
@@ -743,10 +929,13 @@ async fn an_execution_the_device_does_not_hold_is_not_found() {
         created_at: now_epoch_seconds(),
         started_at: None,
         last_updated_at: now_epoch_seconds(),
-    });
+    })
+    .await;
     // An execution a JOB created on the same device: reachable as a job execution of
     // that job, never as a command execution of the device.
-    emulator.seed_job_execution("job-not-a-command", "laser-present", STATUS_QUEUED);
+    emulator
+        .seed_job_execution("job-not-a-command", "laser-present", STATUS_QUEUED)
+        .await;
     // A COMMAND execution whose stored status this model has no value for: no
     // `CommandExecutionStatus` names `CANCELED`, so no reader of this surface reports
     // the record rather than inventing a status the model does not declare.
@@ -761,7 +950,18 @@ async fn an_execution_the_device_does_not_hold_is_not_found() {
         created_at: now_epoch_seconds(),
         started_at: None,
         last_updated_at: now_epoch_seconds(),
-    });
+    })
+    .await;
+    // Two more DEVICES of this account, holding no command execution of their own: a
+    // `targetArn` is resolved against the registry, so a device that must answer 404
+    // has to be one the account holds.
+    for thing_name in ["laser-empty", "laser-other"] {
+        let created = emulator.create_thing(thing_name, REGION).await;
+        assert_eq!(
+            created.status, 200,
+            "the device {thing_name} must be creatable, got {created:?}"
+        );
+    }
 
     let cases: [(&str, &str, &str); 5] = [
         (
@@ -843,7 +1043,8 @@ async fn a_due_timeout_is_materialised_before_the_execution_is_reported() {
             created_at: now - 600,
             started_at: None,
             last_updated_at: now - 600,
-        });
+        })
+        .await;
 
         let target = target_arn(REGION, &thing_name);
         let reply = emulator
@@ -986,7 +1187,8 @@ async fn only_a_device_reported_command_execution_is_deleted() {
             created_at: now - 120,
             started_at: Some(now - 100),
             last_updated_at: now - 60,
-        });
+        })
+        .await;
 
         let target = target_arn(REGION, &thing_name);
         let reply = emulator
@@ -1069,7 +1271,9 @@ async fn only_a_device_reported_command_execution_is_deleted() {
 #[tokio::test]
 async fn a_delete_of_what_the_device_does_not_hold_removes_nothing() {
     let emulator = Emulator::new();
-    emulator.seed_job_execution("job-protected", "laser-untouched", STATUS_QUEUED);
+    emulator
+        .seed_job_execution("job-protected", "laser-untouched", STATUS_QUEUED)
+        .await;
     emulator.create_command("cmd-untouched", REGION).await;
     // A command execution in a status this model cannot name is not one this surface
     // holds, so the delete must not remove it either.
@@ -1084,7 +1288,16 @@ async fn a_delete_of_what_the_device_does_not_hold_removes_nothing() {
         created_at: now_epoch_seconds(),
         started_at: None,
         last_updated_at: now_epoch_seconds(),
-    });
+    })
+    .await;
+    // A DEVICE of this account holding nothing at all: a `targetArn` is resolved against
+    // the registry, so the row about a device that holds nothing names one the account
+    // holds.
+    let created = emulator.create_thing("laser-unknown", REGION).await;
+    assert_eq!(
+        created.status, 200,
+        "the device laser-unknown must be creatable, got {created:?}"
+    );
 
     let cases: [(&str, &str, &str); 4] = [
         (

@@ -62,7 +62,10 @@
 //! shape is looked at, so every request this service serves passes through
 //! [`AuthorizationGate`] first: a caller whose identity-based policies do not allow
 //! `iot:<OperationName>` is refused `AccessDeniedException` (HTTP 403) and the call performs
-//! nothing ([`authorization`]). `override_operation` is the only seam that can run ahead of the
+//! nothing ([`authorization`]). The same layer answers the one other refusal that is an
+//! authorization answer rather than a statement about a member — a command-execution
+//! `targetArn` that names no device of this account ([`command_execution_target`]).
+//! `override_operation` is the only seam that can run ahead of the
 //! framework's deserialize -> validate -> handle walk, which is why the gate is picked there;
 //! every request it does not refuse is served by the modelled operation the request's own
 //! routing key names.
@@ -75,6 +78,15 @@ use std::sync::Arc;
 // How this service words a request the framework refused before any handler ran lives in
 // `service/validation.rs`, beside the seam that answers it.
 mod validation;
+
+// WHERE a command-execution `targetArn` outside this account is refused — in front of the
+// request's own shape, beside the IAM decision — lives in
+// `service/command_execution_target.rs`.
+mod command_execution_target;
+
+// The ONE reader of a request's query string, which both decisions above read a member from,
+// lives in `service/request_query.rs`.
+mod request_query;
 
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
 
@@ -244,6 +256,16 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizationGate<Eng> {
                 authorization::authorize(&*self.engine, ctx, operation, &resource)
             {
                 return authorization::refusal_response(&denial);
+            }
+            // The OTHER answer this layer owes: a request whose `targetArn` names no device
+            // of this account is refused on that ground before its own members are
+            // constraint-checked, which is where AWS answers it
+            // ([`command_execution_target`]). The operation decides the same thing for
+            // itself; what is decided here is only the order.
+            if let Some(refused) =
+                command_execution_target::refusal(&*self.engine, operation, req)
+            {
+                return refused;
             }
             match svc.definition().routing_table().get(operation) {
                 Some(modelled) => modelled.run(svc, req, ctx).await,

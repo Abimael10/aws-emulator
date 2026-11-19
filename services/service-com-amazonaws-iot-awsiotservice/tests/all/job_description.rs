@@ -411,7 +411,10 @@ async fn a_created_job_reads_back_member_for_member() {
         );
 
         // The progress is COUNTED from the executions the create queued: one QUEUED
-        // execution per targeted device, each device listed as a processing target.
+        // execution per targeted device. `processingTargets` is reported for none of
+        // them — the create has finished rolling out to every target by the time it
+        // answers, and the member "will be null after the job execution has finished
+        // rolling out to all the target devices".
         let devices = i64::try_from(case.things.len()).expect("a handful of devices");
         assert_eq!(
             read.body
@@ -422,25 +425,12 @@ async fn a_created_job_reads_back_member_for_member() {
             case.case,
             read.job()
         );
-        let mut processing: Vec<String> = read
-            .body
-            .pointer("/job/jobProcessDetails/processingTargets")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        processing.sort();
-        let mut expected_processing: Vec<String> =
-            case.things.iter().map(|thing| (*thing).to_string()).collect();
-        expected_processing.sort();
-        assert_eq!(
-            processing, expected_processing,
-            "case {:?}: expected the targeted devices as processing targets, got {:?}",
+        assert!(
+            read.body
+                .pointer("/job/jobProcessDetails/processingTargets")
+                .is_none(),
+            "case {:?}: a job that has finished rolling out reports no processingTargets, \
+             got {:?}",
             case.case,
             read.job()
         );
@@ -812,7 +802,7 @@ async fn a_job_template_request_the_store_cannot_take_is_refused() {
             }),
             409,
             "ConflictException",
-            format!("Job template {taken} already exists."),
+            format!("Job Template {taken} already exists."),
         ),
         (
             "a request naming no job document at all",

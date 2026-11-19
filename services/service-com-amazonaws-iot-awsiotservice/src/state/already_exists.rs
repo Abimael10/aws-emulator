@@ -84,9 +84,10 @@ pub fn existing_job_message(job_id: &str) -> String {
 }
 
 /// How this service refuses a `CreateJobTemplate` under an id a job template already
-/// holds: the jobs plane's clause, which every resource of that plane shares.
+/// holds: the jobs plane's clause, which every resource of that plane shares, with this
+/// family's noun in TWO capitalised words.
 pub fn existing_job_template_message(job_template_id: &str) -> String {
-    plane_already_exists("Job template", job_template_id)
+    plane_already_exists("Job Template", job_template_id)
 }
 
 /// How this service refuses a `CreateCommand` under an id a command already holds: the

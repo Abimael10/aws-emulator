@@ -321,6 +321,17 @@ fn a_started_command_execution_is_immediately_listed_by_the_control_plane() {
                 let target = target_arn(case.thing);
                 let command = command_arn(case.command_id);
 
+                // The DEVICE has to exist too: a command-execution request's `targetArn`
+                // is resolved against the things the account holds. Repeating the create
+                // for a thing another row already created is the same thing, so every row
+                // may ask for its own.
+                let (status, _, rendered, _) =
+                    control("POST", format!("/things/{}", case.thing), "{}".to_string());
+                assert_eq!(
+                    status, 200,
+                    "case {label:?}: CreateThing must answer 200, got {status} with {rendered}"
+                );
+
                 let mut request = json!({ "targetArn": target, "commandArn": command });
                 if !case.parameters.is_empty() {
                     request["parameters"] = serde_json::from_str(case.parameters)
@@ -833,6 +844,14 @@ fn a_start_is_served_only_in_the_form_the_created_command_admits() {
 
             for case in ADMISSION_CASES {
                 let label = case.case;
+                // The DEVICE the start names has to be one the account holds: the control
+                // plane resolves a command-execution `targetArn` against the registry.
+                let (status, _, rendered, _) =
+                    control("POST", format!("/things/{}", case.thing), "{}".to_string());
+                assert_eq!(
+                    status, 200,
+                    "case {label:?}: CreateThing must answer 200, got {status} with {rendered}"
+                );
                 let command_id = if case.static_payload {
                     STATIC_COMMAND
                 } else {

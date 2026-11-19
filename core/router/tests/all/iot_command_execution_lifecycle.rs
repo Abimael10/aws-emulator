@@ -201,6 +201,20 @@ fn a_started_command_execution_is_the_one_the_control_plane_reads_and_deletes() 
                      {rendered}"
                 );
 
+                // And so does the DEVICE the execution is performed on: a
+                // command-execution request's `targetArn` is resolved against the things
+                // the account holds, so the registry has to hold this one — and the
+                // second device the row reads with, which holds no execution of its own.
+                for thing_name in [thing.to_string(), format!("{thing}-elsewhere")] {
+                    let (status, _, rendered, _) =
+                        control("POST", format!("/things/{thing_name}"), "{}".to_string());
+                    assert_eq!(
+                        status, 200,
+                        "case {label:?}: CreateThing({thing_name}) must answer 200, got \
+                         {status} with {rendered}"
+                    );
+                }
+
                 // The DEVICE plane starts the execution.
                 let mut start = json!({ "targetArn": target, "commandArn": command });
                 if let Some(parameters) = parameters.clone() {
@@ -333,8 +347,8 @@ fn a_started_command_execution_is_the_one_the_control_plane_reads_and_deletes() 
                      {status} with {rendered}"
                 );
 
-                // The execution belongs to ITS device: another device's ARN holds nothing
-                // under that id.
+                // The execution belongs to ITS device: another device of this account
+                // holds nothing under that id.
                 let (status, error_code, rendered, _) = read(
                     &execution_id,
                     &format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thing/{thing}-elsewhere"),

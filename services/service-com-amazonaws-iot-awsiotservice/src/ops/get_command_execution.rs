@@ -15,10 +15,13 @@
 //! `JobExecutionStore::time_out_due_executions`) so the status this reader reports is
 //! the one every later reader of the shared store sees.
 //!
-//! `targetArn` must name a DEVICE (`…:thing/<name>`), or the request is refused 400
-//! `ValidationException` naming how the value was read; an `executionId` that device
-//! holds no command execution under is 404 `ResourceNotFoundException` rather than a
-//! 200 carrying no execution.
+//! `targetArn` is RESOLVED against the DEVICES this account holds
+//! ([`crate::state::command_execution_access`]): a value that is no ARN at all is refused 400
+//! `ValidationException` naming the member, and an ARN that names no device of this account —
+//! another account's, another resource type's, another service's, or one naming a thing the
+//! registry does not hold — is refused 403 with the access-denied error code the layer in
+//! front of the service frames that answer with. An `executionId` the device holds no command
+//! execution under is 404 `ResourceNotFoundException` rather than a 200 carrying no execution.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +120,26 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How a `targetArn` this operation will not read from is answered: a value that is no ARN
+/// is a malformed member (the modelled 400), and an ARN that names no device of the caller's
+/// own account is the authorization refusal (403) the layer in front of the service answers
+/// — the same classification the delete of one execution makes
+/// ([`crate::state::ComAmazonawsIotAwsiotserviceState::command_execution_device`]).
+fn refused_target(
+    refusal: crate::state::CommandExecutionTargetRefusal,
+) -> GetCommandExecutionError {
+    match refusal {
+        crate::state::CommandExecutionTargetRefusal::Malformed => invalid_request(
+            crate::state::INVALID_COMMAND_EXECUTION_TARGET_MESSAGE.to_string(),
+        ),
+        crate::state::CommandExecutionTargetRefusal::NotInAccount => {
+            crate::scaffolded::Scaffolded::access_denied(
+                crate::state::TARGET_NOT_IN_ACCOUNT_MESSAGE,
+            )
+        }
+    }
+}
+
 /// A refusal of this request as the modelled `ValidationException` (HTTP 400).
 fn invalid_request(message: String) -> GetCommandExecutionError {
     GetCommandExecutionErrorModeled::ValidationException(ValidationException {
@@ -197,21 +220,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The executions live in the SHARED store the IoT Jobs data plane serves, so
-        // this read answers from the very record the device polls and updates.
+        // this read answers from the very record the device polls. The DEVICES this
+        // account holds are this service's own store, which is where the `targetArn` is
+        // resolved.
+        let unavailable = || -> GetCommandExecutionError {
+            GetCommandExecutionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+            .into()
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
         let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
-            return Err(GetCommandExecutionErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some("the IoT emulator has no state store attached".to_string()),
-                },
-            )
-            .into());
+            return Err(unavailable());
         };
 
         // `targetArn` is "The Amazon Resource Number (ARN) of the device on which the
-        // command execution is being performed": a value that names no device names no
-        // queue to look in, so it is refused rather than answered as "not found".
-        let thing_name =
-            crate::state::command_execution_target(&input.target_arn).map_err(invalid_request)?;
+        // command execution is being performed": it is RESOLVED against the devices this
+        // account holds. A value that is no ARN is the modelled 400; an ARN that names no
+        // device of this account is the authorization refusal, answered before anything of
+        // the account is read rather than as "not found".
+        //
+        // LOCK ORDER: this service's store first, the shared execution store second, as
+        // `crate::state::job_store` documents — so the resolution's guard is released
+        // before the executions are locked.
+        let thing_name = state
+            .lock()
+            .command_execution_device(&input.target_arn)
+            .map_err(refused_target)?;
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::service_common::iot_job_executions::now_epoch_seconds();

@@ -46,8 +46,8 @@ pub struct JobProgress {
     pub details: JobProcessDetails,
     /// `Job$isConcurrent` — "Indicates whether a job is concurrent. Will be true when a
     /// job is rolling out new job executions or canceling previously created executions,
-    /// otherwise false": the `CONTINUOUS` job is the one with executions still to roll
-    /// out.
+    /// otherwise false": the job whose rollout is not finished with, which is every job
+    /// that has not COMPLETED.
     pub is_concurrent: bool,
 }
 
@@ -56,10 +56,12 @@ pub struct JobProgress {
 ///
 /// Each member of `JobProcessDetails` other than `processingTargets` is "the number of
 /// things" in one `JobExecutionStatus`, so a job whose executions include none in that
-/// status has a count of that many — zero — rather than an unknown. `processingTargets`
-/// is the one member documented as absent ("this value will be null after the job
-/// execution has finished rolling out to all the target devices"), so it alone starts
-/// unset.
+/// status has a count of that many — zero — rather than an unknown. `processingTargets` is
+/// "the target devices to which the job execution is being rolled out. This value will be
+/// null after the job execution has finished rolling out to all the target devices", and a
+/// job here has finished rolling out by the time its create answers — every target is given
+/// its execution in that one call — so there is no instant at which a device is still being
+/// rolled out to and the member stays unset.
 fn counted_from_no_executions() -> JobProcessDetails {
     JobProcessDetails {
         processing_targets: None,
@@ -87,11 +89,11 @@ fn counted_from_no_executions() -> JobProcessDetails {
 ///
 /// `processingTargets` is "the target devices to which the job execution is being
 /// rolled out. This value will be null after the job execution has finished rolling out
-/// to all the target devices", so it lists the things whose execution is still pending
-/// and is left out once none is.
+/// to all the target devices" — which here is the case for every job that exists, since a
+/// create hands every target its execution before it answers, so the member is reported
+/// for none of them ([`counted_from_no_executions`]).
 pub fn job_progress(job: &RegisteredJob, executions: &JobExecutionStore) -> JobProgress {
     let mut details = counted_from_no_executions();
-    let mut processing: Vec<String> = Vec::new();
     let (mut total, mut pending) = (0usize, 0usize);
     let mut finished_at: Option<i64> = None;
     for record in executions.executions_of_job(&job.job_id) {
@@ -115,7 +117,6 @@ pub fn job_progress(job: &RegisteredJob, executions: &JobExecutionStore) -> JobP
         *bucket = Some(bucket.unwrap_or(0).saturating_add(1));
         if record.is_pending() {
             pending += 1;
-            processing.push(record.thing_name.clone());
         } else {
             finished_at = Some(
                 finished_at
@@ -124,7 +125,6 @@ pub fn job_progress(job: &RegisteredJob, executions: &JobExecutionStore) -> JobP
             );
         }
     }
-    details.processing_targets = (!processing.is_empty()).then_some(processing);
 
     let completed = !job.is_terminal() && job.is_snapshot() && total > 0 && pending == 0;
     let status = if completed {
@@ -134,14 +134,13 @@ pub fn job_progress(job: &RegisteredJob, executions: &JobExecutionStore) -> JobP
     };
     // `Job$isConcurrent`: "Indicates whether a job is concurrent. Will be true when a job
     // is rolling out new job executions or canceling previously created executions,
-    // otherwise false." A `CONTINUOUS` job is the one that keeps rolling out new
-    // executions: it "will continue to run" and "may also be run on a thing when a change
-    // is detected in a target" (`Job$targetSelection`), so new executions are still to
-    // come whatever the job's own status says. A `SNAPSHOT` job — and a job whose creator
-    // named no selection — rolls out once to the targets it was created with, which here
-    // is done by the time the create answers, so it rolls out nothing new.
-    let is_concurrent = job.target_selection.as_deref()
-        == Some(::service_common::iot_jobs::TARGET_SELECTION_CONTINUOUS);
+    // otherwise false." A job is in that set until it is finished with: it is reported
+    // `COMPLETED` only once "all those things specified as targets have completed the job"
+    // (`Job$targetSelection`), and until then it still has executions to roll out or to
+    // cancel. A `CONTINUOUS` job never reaches that point — it "will continue to run" and
+    // "may also be run on a thing when a change is detected in a target" — so new
+    // executions are always still to come, whatever its own status says.
+    let is_concurrent = status != iot_jobs::JOB_STATUS_COMPLETED;
     JobProgress {
         status,
         // The job was completed when its last execution finished.

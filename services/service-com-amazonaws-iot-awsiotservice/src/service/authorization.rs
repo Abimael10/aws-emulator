@@ -267,13 +267,10 @@ fn arn_in_document(vendor: &str, body: &[u8]) -> Option<String> {
 /// The ARN of `vendor` the request's query string names at [`RESOURCE_ARN_MEMBER`], or `None`
 /// for a request whose query names none.
 ///
-/// The decoding is `form_urlencoded`'s, the one reader of a query string this tree uses, so a
-/// percent-encoded ARN is read exactly as the framework's own codec reads it.
+/// The decoding is [`super::request_query`]'s, the one reader of a query string this service
+/// has, so a percent-encoded ARN is read exactly as the framework's own codec reads it.
 fn arn_in_query(vendor: &str, uri: &str) -> Option<String> {
-    let query = uri.split_once('?').map(|(_path, query)| query)?;
-    ::form_urlencoded::parse(query.as_bytes())
-        .find(|(name, _value)| name == RESOURCE_ARN_MEMBER)
-        .map(|(_name, value)| value.into_owned())
+    super::request_query::value(uri, RESOURCE_ARN_MEMBER)
         .filter(|value| ::service_common::arn::is_resource_arn_of(value, vendor))
 }
 

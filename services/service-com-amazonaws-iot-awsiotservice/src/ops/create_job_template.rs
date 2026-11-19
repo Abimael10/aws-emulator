@@ -305,16 +305,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The id is the template's identity, so an id already taken is the conflict
-        // `ConflictException` (HTTP 409) names, reporting the resource that already
-        // exists at the member the shape has for it (`ConflictException$resourceId`, "A
-        // resource with the same name already exists"). Nothing is written.
+        // `ConflictException` (HTTP 409) names. The body carries the jobs plane's sentence
+        // ALONE — as for every other create of that plane, AWS reports no `resourceId` for
+        // the resource that already exists. Nothing is written.
         if let Some(existing) = store.job_templates.get(&template.job_template_id) {
             return Err(CreateJobTemplateErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(crate::state::existing_job_template_message(
                         &existing.job_template_id,
                     )),
-                    resource_id: Some(existing.job_template_id.clone()),
+                    resource_id: None,
                 },
             )
             .into());
