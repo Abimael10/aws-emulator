@@ -14,7 +14,10 @@
 //! meant — "either this or the `SchemaId` wrapper has to be provided"
 //! (`GetSchemaVersionInput$SchemaVersionId`). A request that addresses no version that way
 //! is refused with `InvalidInputException`; one that addresses a version this endpoint
-//! holds none of is refused with `EntityNotFoundException`.
+//! holds none of is refused with `EntityNotFoundException`, naming the SCHEMA as missing
+//! where the request addressed the version by an id alone (the id names no schema set, so
+//! resolving it starts there) and the VERSION where the request named a schema set this
+//! endpoint does hold.
 //!
 //! ## Shape of an operation
 //!
@@ -196,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             Some(version_id) => match store.schema_version_by_id(version_id) {
                 Some(found) => found,
-                None => return Err(version_not_found()),
+                None => return Err(version_id_not_found()),
             },
             // Otherwise the version is addressed within a schema set: the set by its
             // `SchemaId`, and which of its versions by the `SchemaVersionNumber`.
@@ -236,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 };
                 let Some(version) = version else {
-                    return Err(version_not_found());
+                    return Err(version_not_found(schema_id, version_number));
                 };
                 (schema, version)
             }
@@ -283,10 +286,26 @@ fn schema_not_found() -> GetSchemaVersionError {
 }
 
 /// The same for a request that resolves a schema set but names a version of it this
-/// endpoint holds none of, and for a `SchemaVersionId` no stored version carries.
-fn version_not_found() -> GetSchemaVersionError {
+/// endpoint holds none of: the refusal reports the ADDRESS the request asked for, so a
+/// caller holding several schema sets can tell which lookup missed
+/// ([`crate::state::schema_version_miss`]).
+fn version_not_found(
+    schema_id: &SchemaId,
+    version: &SchemaVersionNumber,
+) -> GetSchemaVersionError {
     GetSchemaVersionErrorModeled::EntityNotFoundException(EntityNotFoundException {
-        message: Some(crate::state::messages::SCHEMA_VERSION_NOT_FOUND.to_string()),
+        message: Some(crate::state::schema_version_miss(schema_id, version)),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// The refusal for a `SchemaVersionId` no stored version carries: the id addresses a
+/// version WITHOUT naming a schema set, so what the service reports missing is the schema
+/// the id would have belonged to ([`crate::state::messages::SCHEMA_NOT_FOUND_FOR_VERSION_ID`]).
+fn version_id_not_found() -> GetSchemaVersionError {
+    GetSchemaVersionErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(crate::state::messages::SCHEMA_NOT_FOUND_FOR_VERSION_ID.to_string()),
         from_federation_source: None,
     })
     .into()

@@ -1405,15 +1405,54 @@ pub const UNSUPPORTED_SOURCE_TABLE_PROPERTIES: &str =
 /// schema lookup, so one operation's miss cannot drift from another's.
 pub const SCHEMA_NOT_FOUND: &str = "Schema is not found.";
 
-/// Any schema-registry operation whose request resolves a schema set but names a VERSION
-/// of it this endpoint holds none of — the miss of a version READ, whether it was
-/// addressed by `SchemaVersionId` or by a version number of a schema set.
+/// A version read addressed by a `SchemaVersionId` no stored version carries
+/// (`GetSchemaVersion`).
 ///
-/// NOT recorded: it states the miss in the fixed words of the schema miss above, one
-/// resource level down, and echoes back neither the version the request named nor the
-/// schema set it was named in. Shared by every version lookup, so one operation's miss
-/// cannot drift from another's.
+/// RECORDED constant, and the whole message: a `SchemaVersionId` is the WHOLE address of a
+/// version — the request names no registry and no schema — so resolving one starts at the
+/// schema the id belongs to, and it is THAT lookup the service reports as missing rather
+/// than a version of a schema it never found. Nothing follows the sentence, which is why it
+/// carries no trailing period, and it echoes back neither the id the request sent nor
+/// anything else of the request.
+pub const SCHEMA_NOT_FOUND_FOR_VERSION_ID: &str = "Schema is not found";
+
+/// Any schema-registry operation whose request resolves a schema set but names NO version
+/// of it in a way that carries an address: `GetSchemaByDefinition`, whose request addresses
+/// a version by the definition stored on it rather than by a number, and the `UpdateSchema`
+/// that asks for a checkpoint at a version the set does not hold.
+///
+/// NOT recorded: it states the miss in the fixed words of the recorded version miss below,
+/// without the address labels, because such a request named no registry, schema or version
+/// number for them to carry.
 pub const SCHEMA_VERSION_NOT_FOUND: &str = "Schema version is not found.";
+
+/// A version read whose `SchemaId` resolves a schema set this endpoint HOLDS, but whose
+/// `SchemaVersionNumber` names no version of it (`GetSchemaVersion`).
+///
+/// RECORDED template: the fixed sentence [`SCHEMA_VERSION_NOT_FOUND`], then the ADDRESS the
+/// request asked for, label by label and in this order — the three `SchemaId` members as the
+/// request sent them, so the caller sees which form it addressed the schema set by, then the
+/// `VersionNumber` it named and whether it asked for the latest version instead. A member the
+/// request did not carry is spelled `null`; the labels, their order and their spelling
+/// (`isLatestVersion` among the capitalised ones) are fixed text.
+pub fn schema_version_not_found(
+    registry_name: Option<&str>,
+    schema_name: Option<&str>,
+    schema_arn: Option<&str>,
+    version_number: Option<i64>,
+    latest_version: bool,
+) -> String {
+    /// How a member the request did not carry is spelled in the labels below.
+    const ABSENT: &str = "null";
+    let number = version_number.map_or_else(|| ABSENT.to_string(), |number| number.to_string());
+    format!(
+        "{SCHEMA_VERSION_NOT_FOUND} RegistryName: {}, SchemaName: {}, SchemaArn: {}, \
+         VersionNumber: {number}, isLatestVersion: {latest_version}",
+        registry_name.unwrap_or(ABSENT),
+        schema_name.unwrap_or(ABSENT),
+        schema_arn.unwrap_or(ABSENT)
+    )
+}
 
 /// `RegisterSchemaVersion` against a schema set whose recorded `Compatibility` admits no
 /// further version. Stated by `CreateSchema`: "Compatibility mode 'DISABLED' restricts any

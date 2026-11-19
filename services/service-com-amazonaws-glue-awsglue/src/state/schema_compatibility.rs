@@ -35,6 +35,13 @@ pub const SCHEMA_VERSION_STATUS_FAILURE: &str = "FAILURE";
 /// modelled `DataFormat` (AVRO | JSON | PROTOBUF).
 pub const DATA_FORMAT_AVRO: &str = "AVRO";
 
+/// The other modelled `DataFormat` whose schema documents are written AS JSON, so a
+/// definition submitted for it is READ as JSON ([`schema_definition_fault`]) even though
+/// what a document of it says about a schema is not decided here.
+///
+/// Source: `smithy_query shape=DataFormat` (AVRO | JSON | PROTOBUF).
+pub const DATA_FORMAT_JSON: &str = "JSON";
+
 /// Ceiling on how much schema text ONE registration's compatibility check will parse.
 ///
 /// The check is work a single request drives: an `_ALL` mode asks for a comparison against
@@ -224,16 +231,22 @@ impl SchemaEntry {
 /// A `SchemaDefinition` is "the schema definition using the `DataFormat` setting for the
 /// schema set", so a registration whose text that format's own parser does not accept
 /// registers no version at all: the refusal is the registration's, not a version stored as
-/// failed, which is what the compatibility check produces. `Err` carries what the parser
+/// failed, which is what the compatibility check produces. The detail is what the parser
 /// reported, which is what names the position the document stops being one at.
 pub fn schema_definition_fault(data_format: &str, definition: &str) -> Option<String> {
     match data_format {
-        DATA_FORMAT_AVRO => {
-            // An Avro schema document is JSON, so text that is not JSON at all stops being
-            // one at a position, and that is what the detail names; the schema parser's own
-            // answer is what names a document that is JSON but no schema.
-            if let Err(fault) = ::serde_json::from_str::<::serde_json::Value>(definition) {
-                return Some(fault.to_string());
+        // An Avro schema document and a JSON Schema one are both written AS JSON, so text
+        // that is not JSON at all stops being either at a position, and the parser's own
+        // diagnostic of where that is is the detail
+        // ([`super::schema_definition_json::unreadable_definition_json`]).
+        DATA_FORMAT_AVRO | DATA_FORMAT_JSON => {
+            if let Some(fault) = super::unreadable_definition_json(definition) {
+                return Some(fault);
+            }
+            // Whether a document that IS JSON describes a schema of the format is the
+            // format's own question, which only Avro's rules are decided by here.
+            if data_format != DATA_FORMAT_AVRO {
+                return None;
             }
             ::apache_avro::Schema::parse_str(definition)
                 .err()

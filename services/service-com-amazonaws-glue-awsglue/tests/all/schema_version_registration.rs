@@ -697,19 +697,21 @@ async fn a_version_is_read_by_id_or_by_number() {
             "no version addressed at all",
             json!({}),
             "InvalidInputException",
-            "One of SchemaVersionId or SchemaId and SchemaVersionNumber has to be provided.",
+            "One of SchemaVersionId or SchemaId and SchemaVersionNumber has to be provided."
+                .to_string(),
         ),
         (
             "a SchemaId with no SchemaVersionNumber",
             json!({ "SchemaId": { "SchemaName": schema } }),
             "InvalidInputException",
-            "One of SchemaVersionId or SchemaId and SchemaVersionNumber has to be provided.",
+            "One of SchemaVersionId or SchemaId and SchemaVersionNumber has to be provided."
+                .to_string(),
         ),
         (
             "a SchemaVersionNumber naming neither member",
             json!({ "SchemaId": { "SchemaName": schema }, "SchemaVersionNumber": {} }),
             "InvalidInputException",
-            "One of LatestVersion or VersionNumber has to be provided.",
+            "One of LatestVersion or VersionNumber has to be provided.".to_string(),
         ),
         (
             "a SchemaVersionNumber naming both members",
@@ -718,7 +720,7 @@ async fn a_version_is_read_by_id_or_by_number() {
                 "SchemaVersionNumber": { "LatestVersion": true, "VersionNumber": 1 },
             }),
             "InvalidInputException",
-            "One of LatestVersion or VersionNumber has to be provided.",
+            "One of LatestVersion or VersionNumber has to be provided.".to_string(),
         ),
         (
             "a version number the set does not hold",
@@ -727,13 +729,17 @@ async fn a_version_is_read_by_id_or_by_number() {
                 "SchemaVersionNumber": { "VersionNumber": 99 },
             }),
             "EntityNotFoundException",
-            "Schema version is not found.",
+            // The refusal reports the address the request asked for, member for member.
+            format!(
+                "Schema version is not found. RegistryName: null, SchemaName: {schema}, \
+                 SchemaArn: null, VersionNumber: 99, isLatestVersion: false"
+            ),
         ),
         (
             "a SchemaVersionId no version carries",
             json!({ "SchemaVersionId": "00000000-0000-0000-0000-000000000000" }),
             "EntityNotFoundException",
-            "Schema version is not found.",
+            "Schema is not found".to_string(),
         ),
         (
             "a SchemaId naming no schema set",
@@ -742,7 +748,7 @@ async fn a_version_is_read_by_id_or_by_number() {
                 "SchemaVersionNumber": { "LatestVersion": true },
             }),
             "EntityNotFoundException",
-            "Schema is not found.",
+            "Schema is not found.".to_string(),
         ),
     ];
     for (case, body, expected_code, expected_message) in refusals {

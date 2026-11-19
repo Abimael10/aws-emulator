@@ -296,6 +296,7 @@ mod ml_transforms;
 mod pagination;
 mod partition_predicate;
 mod schema_compatibility;
+mod schema_definition_json;
 mod schema_registry;
 mod security_configurations;
 mod sessions;
@@ -342,6 +343,7 @@ pub use ml_transforms::*;
 pub use pagination::*;
 pub use partition_predicate::*;
 pub use schema_compatibility::*;
+pub use schema_definition_json::*;
 pub use schema_registry::*;
 pub use security_configurations::*;
 pub use sessions::*;
@@ -407,7 +409,8 @@ use crate::ops::types::{
     ProfileConfiguration,
     RLSProperties,
     RecrawlPolicy, RegistryId, S3Target, Schedule,
-    SchemaChangePolicy, SchemaColumn, SchemaId, SecurityConfiguration, SerDeInfo, Session,
+    SchemaChangePolicy, SchemaColumn, SchemaId, SchemaVersionNumber, SecurityConfiguration,
+    SerDeInfo, Session,
     SessionCommand,
     SourceControlDetails,
     SourceProcessingProperties, SourceTableConfig,

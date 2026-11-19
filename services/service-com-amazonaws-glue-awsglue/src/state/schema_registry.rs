@@ -401,6 +401,23 @@ pub fn schema_reference(
     }
 }
 
+/// The refusal a version read earns where the `SchemaId` resolved a schema set this endpoint
+/// holds but the `SchemaVersionNumber` names no version of it: the recorded sentence plus the
+/// ADDRESS the request asked for ([`messages::schema_version_not_found`]).
+///
+/// The ONE rendering of that address, so two operations addressing a version the same way
+/// cannot disagree about how the miss reads. Every part is read off the request, which is
+/// what makes the sentence reproducible.
+pub fn schema_version_miss(schema_id: &SchemaId, version: &SchemaVersionNumber) -> String {
+    messages::schema_version_not_found(
+        non_empty(schema_id.registry_name.as_deref()),
+        non_empty(schema_id.schema_name.as_deref()),
+        non_empty(schema_id.schema_arn.as_deref()),
+        version.version_number,
+        version.latest_version,
+    )
+}
+
 /// `value` when it carries a non-empty string. An absent member and one sent as `""` say
 /// the same thing about which member a wrapper carried, and `""` satisfies no name's
 /// modelled pattern.
