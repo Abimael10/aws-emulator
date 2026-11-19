@@ -8,7 +8,7 @@
 //! refusal seam and response serialization are all exercised, exactly as an AWS SDK
 //! `bedrock-data-automation` client would.
 //!
-//! Two rules, each asserted over a TABLE whose rows differ along what the rule generalises
+//! Three rules, each asserted over a TABLE whose rows differ along what the rule generalises
 //! over (the operation, the member, whether the value arrived in a URI label or in the
 //! body, the constraint class, the expression or value set the member declares) rather than
 //! over one recorded request:
@@ -18,7 +18,10 @@
 //!    and states NO value, while a clause whose requirement is a BOUND on the value keeps
 //!    the value half the framework renders;
 //! 2. every value the `EntityType` set admits is admitted ALIKE by each operation that
-//!    carries one, and a value outside the set is refused with the whole set stated.
+//!    carries one, and a value outside the set is refused with the whole set stated;
+//! 3. a member the request did not CARRY is refused with no value stated at all, named at
+//!    the path the MODEL traverses to it — every structure and union member name of that
+//!    traversal, and each list element by its 1-based position.
 
 use std::sync::Arc;
 
@@ -548,5 +551,238 @@ async fn every_admitted_entity_type_is_admitted_alike_and_the_rest_are_refused()
                  {message:?}"
             );
         }
+    }
+}
+
+/// The requirement every absent `@required` member fails (source:
+/// `vendor/smithy-schema-server`'s one sentence for that class, as AWS words it).
+const MUST_NOT_BE_NULL: &str = "Member must not be null";
+
+/// One complete `vocabulary` entry of an upsert payload: every member `VocabularyEntityInfo`
+/// requires, so a row can drop exactly one of them (source: `smithy_query(query="closure",
+/// operation="InvokeDataAutomationLibraryIngestionJob")`).
+fn vocabulary(entity_id: &str) -> Value {
+    json!({
+        "vocabulary": {
+            "entityId": entity_id,
+            "language": "EN",
+            "phrases": [{ "text": "a phrase" }],
+        }
+    })
+}
+
+/// An `InvokeDataAutomationLibraryIngestionJob` body carrying `payload` as the
+/// `inlinePayload` variant, and otherwise complete.
+fn ingestion_with(payload: Value, operation_type: &str) -> Value {
+    json!({
+        "entityType": "VOCABULARY",
+        "operationType": operation_type,
+        "inputConfiguration": { "inlinePayload": payload },
+        "outputConfiguration": { "s3Uri": "s3://a-test-bucket/out/" },
+    })
+}
+
+/// One request that omits exactly one `@required` member.
+struct AbsentCase {
+    case: &'static str,
+    method: &'static str,
+    uri: String,
+    body: Value,
+    /// The member path the refusal must name: the model's traversal to the omitted member.
+    stated_at: &'static str,
+}
+
+/// The rows: a member omitted under one union, under two unions and a list, inside a list
+/// nested under a variant, in the union's OTHER variant, at the top level, one and two
+/// structures down, in an element of a top-level list, and on another operation entirely.
+///
+/// Source for every path: `smithy_query(query="closure",
+/// operation="InvokeDataAutomationLibraryIngestionJob")` and
+/// `smithy_query(query="operation", operation="CreateBlueprint")`.
+fn absent_member_cases(library_arn: &str) -> Vec<AbsentCase> {
+    vec![
+        AbsentCase {
+            case: "phrases omitted in the first element of the list variant",
+            method: "PUT",
+            uri: ingestion_jobs_uri(library_arn),
+            body: ingestion_with(
+                json!({
+                    "upsertEntitiesInfo": [
+                        { "vocabulary": { "entityId": "entity-1", "language": "EN" } }
+                    ]
+                }),
+                "UPSERT",
+            ),
+            stated_at:
+                "inputConfiguration.inlinePayload.upsertEntitiesInfo.1.member.vocabulary.phrases",
+        },
+        AbsentCase {
+            case: "language omitted: a second required member of the same structure",
+            method: "PUT",
+            uri: ingestion_jobs_uri(library_arn),
+            body: ingestion_with(
+                json!({
+                    "upsertEntitiesInfo": [
+                        {
+                            "vocabulary": {
+                                "entityId": "entity-1",
+                                "phrases": [{ "text": "a phrase" }],
+                            }
+                        }
+                    ]
+                }),
+                "UPSERT",
+            ),
+            stated_at:
+                "inputConfiguration.inlinePayload.upsertEntitiesInfo.1.member.vocabulary.language",
+        },
+        AbsentCase {
+            case: "phrases omitted in the SECOND element: the index is that element's position",
+            method: "PUT",
+            uri: ingestion_jobs_uri(library_arn),
+            body: ingestion_with(
+                json!({
+                    "upsertEntitiesInfo": [
+                        vocabulary("entity-1"),
+                        { "vocabulary": { "entityId": "entity-2", "language": "EN" } }
+                    ]
+                }),
+                "UPSERT",
+            ),
+            stated_at:
+                "inputConfiguration.inlinePayload.upsertEntitiesInfo.2.member.vocabulary.phrases",
+        },
+        AbsentCase {
+            case: "text omitted in a phrase: a list nested under the variant",
+            method: "PUT",
+            uri: ingestion_jobs_uri(library_arn),
+            body: ingestion_with(
+                json!({
+                    "upsertEntitiesInfo": [
+                        {
+                            "vocabulary": {
+                                "entityId": "entity-1",
+                                "language": "EN",
+                                "phrases": [{ "displayAsText": "as shown" }],
+                            }
+                        }
+                    ]
+                }),
+                "UPSERT",
+            ),
+            stated_at: "inputConfiguration.inlinePayload.upsertEntitiesInfo.1.member.vocabulary.\
+                        phrases.1.member.text",
+        },
+        AbsentCase {
+            case: "entityIds omitted in the union's other variant",
+            method: "PUT",
+            uri: ingestion_jobs_uri(library_arn),
+            body: ingestion_with(json!({ "deleteEntitiesInfo": {} }), "DELETE"),
+            stated_at: "inputConfiguration.inlinePayload.deleteEntitiesInfo.entityIds",
+        },
+        AbsentCase {
+            case: "s3Uri omitted: a nested structure crossing no union",
+            method: "PUT",
+            uri: ingestion_jobs_uri(library_arn),
+            body: json!({
+                "entityType": "VOCABULARY",
+                "operationType": "UPSERT",
+                "inputConfiguration": {
+                    "inlinePayload": { "upsertEntitiesInfo": [vocabulary("entity-1")] }
+                },
+                "outputConfiguration": {},
+            }),
+            stated_at: "outputConfiguration.s3Uri",
+        },
+        AbsentCase {
+            case: "outputConfiguration omitted altogether: a top-level required member",
+            method: "PUT",
+            uri: ingestion_jobs_uri(library_arn),
+            body: json!({
+                "entityType": "VOCABULARY",
+                "operationType": "UPSERT",
+                "inputConfiguration": {
+                    "inlinePayload": { "upsertEntitiesInfo": [vocabulary("entity-1")] }
+                },
+            }),
+            stated_at: "outputConfiguration",
+        },
+        AbsentCase {
+            case: "eventBridgeEnabled omitted two structures down",
+            method: "PUT",
+            uri: ingestion_jobs_uri(library_arn),
+            body: json!({
+                "entityType": "VOCABULARY",
+                "operationType": "UPSERT",
+                "inputConfiguration": {
+                    "inlinePayload": { "upsertEntitiesInfo": [vocabulary("entity-1")] }
+                },
+                "outputConfiguration": { "s3Uri": "s3://a-test-bucket/out/" },
+                "notificationConfiguration": { "eventBridgeConfiguration": {} },
+            }),
+            stated_at: "notificationConfiguration.eventBridgeConfiguration.eventBridgeEnabled",
+        },
+        AbsentCase {
+            case: "value omitted in the second tag: an element of a top-level list",
+            method: "PUT",
+            uri: ingestion_jobs_uri(library_arn),
+            body: json!({
+                "entityType": "VOCABULARY",
+                "operationType": "UPSERT",
+                "inputConfiguration": {
+                    "inlinePayload": { "upsertEntitiesInfo": [vocabulary("entity-1")] }
+                },
+                "outputConfiguration": { "s3Uri": "s3://a-test-bucket/out/" },
+                "tags": [{ "key": "team", "value": "platform" }, { "key": "owner" }],
+            }),
+            stated_at: "tags.2.member.value",
+        },
+        AbsentCase {
+            case: "schema omitted on a create of another resource family",
+            method: "PUT",
+            uri: "/blueprints/".to_string(),
+            body: json!({ "blueprintName": "well-formed", "type": "DOCUMENT" }),
+            stated_at: "schema",
+        },
+    ]
+}
+
+/// RULE: a member the request did not carry is refused `400` `ValidationException` whose
+/// clause states NO value — there is no submitted value to state — and names the member at
+/// the path the MODEL traverses to it: every structure and union member name of that
+/// traversal, with each list element named by its 1-based position.
+#[tokio::test]
+async fn an_absent_required_member_is_named_at_the_path_the_model_traverses() {
+    let router = emulator();
+    let library_arn = live_library(&router, "absent-member-rows").await;
+    for row in absent_member_cases(&library_arn) {
+        let AbsentCase {
+            case,
+            method,
+            uri,
+            body,
+            stated_at,
+        } = row;
+        let (status, text, payload) = call(&router, method, &uri, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the modelled ValidationException status 400, got {status} \
+             with {payload:?}"
+        );
+        assert_eq!(
+            error_code(&payload),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {payload:?}"
+        );
+        let message = string_at(&payload, "message", case);
+        let expected = one_error(None, stated_at, MUST_NOT_BE_NULL);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+        assert!(
+            !text.contains("Value null"),
+            "case {case:?}: expected the refusal to state no value, but it stated one: {text}"
+        );
     }
 }
