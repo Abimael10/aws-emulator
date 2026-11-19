@@ -169,7 +169,11 @@ async fn settled_status(router: &MultiServiceRouter, case: &str, stack: &str) ->
 }
 
 /// The `(name, embeddingModelArn)` Amazon Bedrock Agent reports for one knowledge base.
-async fn reported_knowledge_base(
+///
+/// `pub(crate)` for the suite that asserts the same of a replacement whose create collided
+/// ([`crate::bedrock_knowledge_base_replacement_name_conflict`]): what a knowledge base kept
+/// is read one way.
+pub(crate) async fn reported_knowledge_base(
     router: &MultiServiceRouter,
     case: &str,
     knowledge_base_id: &str,

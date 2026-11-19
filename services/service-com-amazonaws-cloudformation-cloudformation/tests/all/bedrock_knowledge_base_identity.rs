@@ -51,7 +51,7 @@ const KNOWLEDGE_BASE_ID_CHARACTERS: usize = 10;
 
 /// The status a knowledge base ready to be queried reports
 /// (`KnowledgeBase$status`: "ACTIVE – The knowledge base is ready to be queried").
-const ACTIVE: &str = "ACTIVE";
+pub(crate) const ACTIVE: &str = "ACTIVE";
 
 /// The ARN of a foundation model, as an `embeddingModelArn` names one.
 pub(crate) fn model_arn(model: &str) -> String {
@@ -75,7 +75,7 @@ pub(crate) fn is_knowledge_base_id(value: &str) -> bool {
 /// One Amazon Bedrock Agent call over the `restJson1` wire its model declares, on the method
 /// and URI that operation's own `@http` binding names, signed for `bedrock` — the signing
 /// name every Bedrock-family model declares — in the Region the stack's resources live in.
-async fn bedrock_agent(
+pub(crate) async fn bedrock_agent(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
