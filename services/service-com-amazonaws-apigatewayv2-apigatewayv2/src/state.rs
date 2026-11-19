@@ -697,8 +697,10 @@ fn grouped(value: i32) -> String {
 /// The ARN of one `RoutingRule` of the custom domain name `domain_name`, in `region`.
 ///
 /// Built from the resource path the operations address the rule at
-/// (`/v2/domainnames/{DomainName}/routingrules/{RoutingRuleId}`) under the same account
-/// and namespace as [`domain_name_arn`], the resource that owns it.
+/// (`/v2/domainnames/{DomainName}/routingrules/{RoutingRuleId}`) under the same namespace
+/// as [`domain_name_arn`], the resource that owns it, and — unlike that one — under the
+/// emulator's canonical account: the recorded AWS answers for a routing rule carry the
+/// owning account in the ARN, so nothing here drops it.
 pub fn routing_rule_arn(domain_name: &str, routing_rule_id: &str, region: &str) -> String {
     ::engine::emulator_arn(
         ARN_SERVICE,
@@ -1576,9 +1578,11 @@ impl Api {
     pub fn to_wire(&self) -> wire::Api {
         wire::Api {
             api_endpoint: Some(self.api_endpoint.clone()),
-            // Only a resource another service created on the caller's behalf is
-            // API-Gateway-managed; an api created through CreateApi is not.
-            api_gateway_managed: Some(false),
+            // "Specifies whether an API is managed by API Gateway" (`Api$ApiGatewayManaged`)
+            // — reported only where the answer is yes, the way every `ApiGatewayManaged`
+            // member of this service is (see [`Route::to_wire`]). An api created through
+            // CreateApi is the caller's own, so nothing here is managed.
+            api_gateway_managed: None,
             api_id: Some(self.api_id.clone()),
             api_key_selection_expression: Some(self.api_key_selection_expression.clone()),
             cors_configuration: self.cors_configuration.clone(),
@@ -1702,7 +1706,11 @@ impl Route {
     /// one route the same way.
     pub fn to_wire(&self) -> wire::Route {
         wire::Route {
-            api_gateway_managed: Some(self.api_gateway_managed),
+            // "Specifies whether a route is managed by API Gateway"
+            // (`Route$ApiGatewayManaged`) — reported only where the answer is yes, because
+            // the member's presence is what a client tells a managed route from one of its
+            // own by, and a route the caller created is its own.
+            api_gateway_managed: self.api_gateway_managed.then_some(true),
             api_key_required: Some(self.api_key_required),
             authorization_scopes: (!self.authorization_scopes.is_empty()
                 || self.materialized_collections.authorization_scopes)
@@ -1799,6 +1807,13 @@ pub struct Integration {
     pub request_templates: BTreeMap<String, String>,
     pub response_parameters: BTreeMap<String, BTreeMap<String, String>>,
     pub template_selection_expression: Option<String>,
+    /// The expression this integration's own responses are selected by, resolved at write
+    /// time from the parent api's protocol: "Supported only for WebSocket APIs"
+    /// (`Integration$IntegrationResponseSelectionExpression`), so only a WebSocket api's
+    /// integration carries one (see
+    /// [`default_integration_response_selection_expression`]). No member of any request
+    /// sets it.
+    pub integration_response_selection_expression: Option<String>,
     /// The documented default for the parent api's protocol when the request named no
     /// timeout.
     pub timeout_in_millis: i32,
@@ -1834,7 +1849,11 @@ impl Integration {
     /// Project the record onto the modelled `Integration` shape.
     pub fn to_wire(&self) -> wire::Integration {
         wire::Integration {
-            api_gateway_managed: Some(self.api_gateway_managed),
+            // "If you created an API using quick create, the resulting integration is
+            // managed by API Gateway" (`Integration$ApiGatewayManaged`) — reported only
+            // where the answer is yes, the way every `ApiGatewayManaged` member of this
+            // service is (see [`Route::to_wire`]).
+            api_gateway_managed: self.api_gateway_managed.then_some(true),
             connection_id: self.connection_id.clone(),
             connection_type: Some(self.connection_type.clone()),
             content_handling_strategy: self.content_handling_strategy.clone(),
@@ -1842,13 +1861,12 @@ impl Integration {
             description: self.description.clone(),
             integration_id: Some(self.integration_id.clone()),
             integration_method: self.integration_method.clone(),
-            // "The integration response selection expression for the integration.
-            // Supported only for WebSocket APIs"
-            // (`Integration$IntegrationResponseSelectionExpression`): no request member
-            // sets it, and an integration response of this service is selected by the
-            // `IntegrationResponseKey` it was stored under, so the record holds no such
-            // expression to report.
-            integration_response_selection_expression: None,
+            // Resolved at write time from the parent api's protocol and reported from the
+            // record (see
+            // [`Integration::integration_response_selection_expression`]).
+            integration_response_selection_expression: self
+                .integration_response_selection_expression
+                .clone(),
             integration_subtype: self.integration_subtype.clone(),
             integration_type: Some(self.integration_type.clone()),
             integration_uri: self.integration_uri.clone(),
@@ -2807,7 +2825,11 @@ impl Stage {
     pub fn to_wire(&self) -> wire::Stage {
         wire::Stage {
             access_log_settings: self.access_log_settings.clone(),
-            api_gateway_managed: Some(self.api_gateway_managed),
+            // "If you created an API using quick create, the $default stage is managed by
+            // API Gateway" (`Stage$ApiGatewayManaged`) — reported only where the answer is
+            // yes, the way every `ApiGatewayManaged` member of this service is (see
+            // [`Route::to_wire`]).
+            api_gateway_managed: self.api_gateway_managed.then_some(true),
             auto_deploy: self.auto_deploy,
             client_certificate_id: self.client_certificate_id.clone(),
             created_date: Some(to_timestamp(self.created_date)),
@@ -3376,6 +3398,8 @@ pub use model_template::{unsupported_template_data_type, unsupported_template_da
 /// like every other part of this module.
 mod portal;
 mod protocol_restriction;
+mod hosted_zone;
+pub use hosted_zone::*;
 pub use protocol_restriction::*;
 
 pub use portal::*;
@@ -3732,6 +3756,11 @@ impl DomainName {
                 }
             }),
             routing_mode: Some(self.routing_mode.clone()),
+            // "The collection of tags associated with a domain name" (`DomainName$Tags`):
+            // the collection the resource carries, reported whether or not it holds
+            // entries, so a reader of the resource always reports what it is tagged with.
+            // The CREATE answers the tags its own request carried instead — see
+            // `crate::ops::create_domain_name`.
             tags: Some(self.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
         }
     }
@@ -4035,120 +4064,6 @@ pub fn portal_preview_url(site_base: &str) -> String {
     format!("https://{site_base}/{PORTAL_PREVIEW_SEGMENT}")
 }
 
-/// How many characters follow the leading `Z` of a hosted zone id, matching the
-/// fourteen-character ids AWS publishes for its endpoint hosted zones.
-const HOSTED_ZONE_ID_LEN: usize = 13;
-
-/// A hosted zone id DERIVED from the parts that decide WHICH endpoint it belongs to — the
-/// fallback for an endpoint whose published id this service does not carry.
-///
-/// AWS assigns ONE opaque hosted zone id per service endpoint per Region and publishes no
-/// formula for it, so an id it publishes is CARRIED verbatim where this service has it
-/// ([`CLOUDFRONT_HOSTED_ZONE_ID`], [`PORTAL_DOMAIN_HOSTED_ZONES`]) and derived from those
-/// parts otherwise, rather than invented afresh per read. The mixing is
-/// [`::service_common::stable_hex_id`] — the tree's one derived-id mixer, reproducible
-/// across builds — uppercased and cut to the published LENGTH: a leading `Z` and
-/// [`HOSTED_ZONE_ID_LEN`] characters, which the mixer renders as uppercase hexadecimal
-/// (a subset of the uppercase alphanumerics AWS's own ids use, e.g. `Z1UJRXOUMOOFQ8`).
-/// The same parts therefore always answer the same id, and two different part lists
-/// answer different ones.
-fn derived_hosted_zone_id(parts: &[&str]) -> String {
-    let mixed: String = ::service_common::stable_hex_id(parts)
-        .to_uppercase()
-        .chars()
-        .take(HOSTED_ZONE_ID_LEN)
-        .collect();
-    format!("Z{mixed}")
-}
-
-/// One Region's hosted zone for the domains API Gateway generates and manages for a
-/// developer portal: the zone, and the Region it is the zone OF.
-#[derive(Debug)]
-pub struct PortalDomainHostedZone {
-    pub region: &'static str,
-    pub hosted_zone_id: &'static str,
-}
-
-/// The hosted zones AWS PUBLISHES for portal default domains, one entry per Region.
-///
-/// Every portal in a Region is served on the one domain API Gateway generates and manages
-/// there (`EndpointConfigurationResponse$PortalDefaultDomainName`), so the zone an alias
-/// record for it targets is a fact about the REGION: AWS answers the same id for every
-/// portal created in that Region and for every read of it, as the recorded AWS answers for
-/// `us-west-2` show. AWS ASSIGNS the id and publishes no formula for it — the same as the
-/// one it publishes for a CloudFront distribution ([`CLOUDFRONT_HOSTED_ZONE_ID`]) — so the
-/// ids it publishes are CARRIED here rather than computed, and a Region this table does not
-/// name falls back to [`derived_hosted_zone_id`] (see
-/// [`portal_domain_hosted_zone_id`]).
-///
-/// `tests/all/portal_hosted_zone.rs` keeps its OWN copy of these ids and asserts the two
-/// agree Region for Region, so an entry here always has a published AWS answer behind it
-/// and a Region added to either belongs in both.
-pub const PORTAL_DOMAIN_HOSTED_ZONES: &[PortalDomainHostedZone] = &[PortalDomainHostedZone {
-    region: "us-west-2",
-    hosted_zone_id: "Z091913938PZVWK6ZMXI7",
-}];
-
-/// The published hosted zone of the portal default domain in `region`, or `None` for a
-/// Region [`PORTAL_DOMAIN_HOSTED_ZONES`] carries no published id for.
-pub fn published_portal_domain_hosted_zone_id(region: &str) -> Option<&'static str> {
-    PORTAL_DOMAIN_HOSTED_ZONES
-        .iter()
-        .find(|zone| zone.region == region)
-        .map(|zone| zone.hosted_zone_id)
-}
-
-/// The hosted zone id of the portal domain
-/// (`EndpointConfigurationResponse$PortalDomainHostedZoneId`), the zone an alias record
-/// for the portal's domain points at.
-///
-/// The member is REQUIRED on the modelled response, so a portal always reports one, and it
-/// is one id per Region: the id AWS publishes for the Region
-/// ([`published_portal_domain_hosted_zone_id`]) wherever this service carries it, since a
-/// caller writes a Route 53 alias record against that zone and a zone id of this emulator's
-/// own names no zone their account can reach. A Region with no published id carried here
-/// still reports one id of its own, derived by [`derived_hosted_zone_id`], so the member
-/// keeps its per-Region invariance and its stability everywhere.
-pub fn portal_domain_hosted_zone_id(region: &str) -> String {
-    published_portal_domain_hosted_zone_id(region)
-        .map_or_else(|| derived_hosted_zone_id(&[region]), str::to_string)
-}
-
-/// The `EndpointType` whose domain is fronted by a CloudFront distribution rather than by
-/// a regional endpoint: "an AWS-managed certificate that will be used by the
-/// edge-optimized endpoint for this domain name" (`DomainNameConfiguration$CertificateArn`
-/// and the rest of that shape's edge-optimized members).
-pub const EDGE_ENDPOINT_TYPE: &str = "EDGE";
-
-/// The one hosted zone every CloudFront distribution is aliased through, whatever Region
-/// the resource was created in. It is PUBLISHED rather than derived: Route 53's own
-/// `AliasTarget$HostedZoneId` states it ("CloudFront distribution: Specify
-/// `Z2FDTNDATAQYW2`"), and
-/// `services/service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice` reports the
-/// same value for its own CloudFront-fronted custom domains.
-pub const CLOUDFRONT_HOSTED_ZONE_ID: &str = "Z2FDTNDATAQYW2";
-
-/// "The Amazon Route 53 Hosted Zone ID of the endpoint"
-/// (`DomainNameConfiguration$HostedZoneId`) — the zone an ALIAS record for the custom
-/// domain names as its target, which is a fact about the endpoint rather than about the
-/// resource: one value per endpoint type, and for a regional endpoint one per Region.
-///
-/// * an `EDGE` endpoint is fronted by CloudFront, so every one of them is aliased through
-///   the single published [`CLOUDFRONT_HOSTED_ZONE_ID`], in every Region;
-/// * a `REGIONAL` endpoint lives in the Region the domain name was created in, so its zone
-///   is one per Region ([`derived_hosted_zone_id`] over the endpoint type and the Region),
-///   and never the CloudFront one.
-///
-/// Derived on every read from the stored endpoint type and the stored Region, so a domain
-/// name reports the same id for the life of the endpoint and reports a different one once
-/// an update moves it onto another endpoint type.
-pub fn endpoint_hosted_zone_id(endpoint_type: &str, region: &str) -> String {
-    if endpoint_type == EDGE_ENDPOINT_TYPE {
-        return CLOUDFRONT_HOSTED_ZONE_ID.to_string();
-    }
-    derived_hosted_zone_id(&[endpoint_type, region])
-}
-
 /// Resolve a portal's requested domain configuration into the one the readers report,
 /// generating the default domain of a portal with this id for the endpoint this REQUEST was
 /// addressed at.
@@ -4311,9 +4226,15 @@ impl DomainNameEndpoint {
 /// The ARN of a `DomainName` resource in `region`.
 ///
 /// API Gateway's resource portion for a custom domain name is `/domainnames/{name}`, and
-/// the account segment is the emulator's canonical one (see `engine::emulator_arn`).
+/// the ARN names it with an EMPTY account-id field — `arn:aws:apigateway:{region}::/…` —
+/// the form API Gateway documents for the resources of its own control plane and the one
+/// `services/service-com-amazonaws-apigateway-backplanecontrolservice` reports for the
+/// same resource. So this is not [`::engine::emulator_arn`], which always writes an
+/// account in: an account-qualified ARN never equals the ARN AWS produces for the same
+/// domain name, so no IAM resource pattern, ACM reference or Route 53 cross-reference a
+/// caller builds would match it.
 pub fn domain_name_arn(domain_name: &str, region: &str) -> String {
-    ::engine::emulator_arn(ARN_SERVICE, region, &format!("/domainnames/{domain_name}"))
+    format!("arn:aws:{ARN_SERVICE}:{region}::/domainnames/{domain_name}")
 }
 
 /// The regional host API Gateway serves a custom domain name on: the
@@ -4795,6 +4716,13 @@ pub use route_key::{
 /// The variable namespaces a selection expression may read — see
 /// [`selection_expression::SELECTION_EXPRESSION_VARIABLES`].
 pub use selection_expression::SELECTION_EXPRESSION_VARIABLES;
+
+/// The integration response selection expression a WebSocket api's integration reports —
+/// see [`selection_expression::INTEGRATION_RESPONSE_SELECTION_EXPRESSION`] and
+/// [`selection_expression::default_integration_response_selection_expression`].
+pub use selection_expression::{
+    default_integration_response_selection_expression, INTEGRATION_RESPONSE_SELECTION_EXPRESSION,
+};
 
 /// The reference a WEBSOCKET api's `RouteSelectionExpression` selects a route key with —
 /// see [`selection_expression::WEBSOCKET_ROUTE_SELECTION_REFERENCE_PREFIX`].

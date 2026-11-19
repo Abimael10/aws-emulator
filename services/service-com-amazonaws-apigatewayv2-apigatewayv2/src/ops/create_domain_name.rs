@@ -373,7 +373,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             domain_name_configurations: stored.domain_name_configurations,
             mutual_tls_authentication: stored.mutual_tls_authentication,
             routing_mode: stored.routing_mode,
-            tags: stored.tags,
+            // "The collection of tags associated with a domain name"
+            // (`CreateDomainName$Tags`): the create answers the tags it was ASKED to
+            // attach, so a request that attached none answers no `Tags` member at all —
+            // its presence is what a caller tests to tell a tagged resource from an
+            // untagged one, and an empty map answers that question the other way round.
+            // Every READER of the resource reports its collection either way
+            // (`crate::state::DomainName::to_wire`), which is what makes a tag a later
+            // write attaches visible.
+            tags: stored.tags.filter(|tags| !tags.is_empty()),
         })
     }
 }

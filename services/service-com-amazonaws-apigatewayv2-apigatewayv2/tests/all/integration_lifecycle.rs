@@ -78,7 +78,10 @@ fn rows() -> Vec<Row> {
                     // Defaulted, not echoed: the request named neither.
                     ("connectionType", json!("INTERNET")),
                     ("timeoutInMillis", json!(DEFAULT_HTTP_TIMEOUT_MILLIS)),
-                    ("apiGatewayManaged", json!(false)),
+                    // `apiGatewayManaged` is reported only for a resource API Gateway
+                    // manages, so an integration the caller created carries no such
+                    // member at all — these rows assert members that are PRESENT, and the
+                    // presence rule itself is `quick_create_servable_set.rs`'s.
                 ]
             },
         },

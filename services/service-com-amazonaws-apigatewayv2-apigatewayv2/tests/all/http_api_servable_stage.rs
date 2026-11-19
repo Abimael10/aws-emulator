@@ -245,10 +245,10 @@ async fn the_sequence_that_makes_an_api_servable_completes_and_reads_back() {
         );
         // "If you created an API using quick create, the $default stage is managed by
         // API Gateway" (`Stage$ApiGatewayManaged`) — a stage the caller asked for is its
-        // own, whatever it is called.
+        // own, whatever it is called, so it reports no such member at all.
         assert_eq!(
             stage.get("apiGatewayManaged"),
-            Some(&json!(false)),
+            None,
             "case {case:?}: a stage the caller created is not API-Gateway-managed, got {stage}"
         );
         assert_created_now(case, &stage);

@@ -919,6 +919,10 @@ impl ImportedIntegration {
             request_templates: BTreeMap::new(),
             response_parameters: self.response_parameters,
             template_selection_expression: None,
+            // "Supported only for WebSocket APIs" — an imported api is an HTTP one, so it
+            // has no integration responses to select among and reports no expression for
+            // selecting them.
+            integration_response_selection_expression: None,
             // "The default timeout is … 30 seconds for HTTP APIs"
             // (`CreateIntegration$TimeoutInMillis`).
             timeout_in_millis: self

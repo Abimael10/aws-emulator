@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: patches the model the URI names under the api that owns it — each member
+//! the request carries replaces the stored one and a member it omits leaves the stored
+//! value as it was — and answers the STORED record, so a later `GetModel` reports exactly
+//! what this call stored. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,25 +146,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UpdateModel";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_MODEL_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_MODEL_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // API Gateway answers a PATCH that rewrites a child of an api `201`, not the `200` this
+    // operation's `@http` trait declares — see `crate::state::wire_status`.
+    const SUCCESS_STATUS: u16 = crate::state::REWRITTEN_RESOURCE_STATUS;
 
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateModel"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("UpdateModel"));
+        };
+        let mut store = state.lock();
+
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(not_found(crate::state::invalid_api_identifier_message(
+                &input.api_id,
+            )));
+        };
+
+        // A Model is a WebSocket-only resource — the same whole-resource gate `CreateModel`
+        // applies — so an api of another protocol type has no model to patch.
+        if let Err(message) = crate::state::validate_protocol_restricted_resource(
+            &api.protocol_type,
+            "Models",
+            crate::state::WEBSOCKET_PROTOCOL_TYPE,
+        ) {
+            return Err(bad_request(&message));
+        }
+
+        // A model is addressed by the api that owns it AND its own id, so an id that names
+        // a model of ANOTHER api is not found here either — the same reading `GetModel`
+        // does.
+        let Some(existing) = api.models.get(&input.model_id) else {
+            return Err(not_found(crate::state::invalid_model_identifier_message(
+                &input.model_id,
+            )));
+        };
+
+        // The update is a PATCH (`PATCH /v2/apis/{ApiId}/models/{ModelId}`): a member the
+        // request carries replaces the stored one, and a member it omits leaves the stored
+        // value exactly as it was. The `ModelId` is the resource's identity and is never
+        // patched.
+        let mut updated = existing.clone();
+        if let Some(name) = input.name {
+            updated.name = name;
+        }
+        if let Some(content_type) = input.content_type {
+            updated.content_type = Some(content_type);
+        }
+        if let Some(description) = input.description {
+            updated.description = Some(description);
+        }
+        if let Some(schema) = input.schema {
+            // The schema SOURCE, verbatim: every reader of the model reports the document
+            // the caller supplied, not a reserialization of it.
+            updated.schema = schema;
+        }
+
+        // "The name of the model. Must be alphanumeric" (`UpdateModel$Name`), weighed on
+        // the name the model would CARRY, so the create and this patch hold a name to the
+        // same rule.
+        if !crate::state::model_name_is_alphanumeric(&updated.name) {
+            return Err(bad_request(&format!(
+                "Model name must be alphanumeric: {}",
+                updated.name
+            )));
+        }
+
+        // And the schema the model would carry has to be a document in the content type it
+        // would carry it in, so a patch that moves either member is weighed as the PAIR it
+        // would leave behind rather than as the member it happened to send.
+        if let Err(message) =
+            crate::state::validate_model_schema(updated.content_type.as_deref(), &updated.schema)
+        {
+            return Err(bad_request(&message));
+        }
+
+        // A model is referred to by NAME from a route's `RequestModels`/`ResponseModels`
+        // and from a mapping template, so a patch cannot move a model onto a name a SIBLING
+        // model of the same api already holds. The model being patched is excluded, so
+        // re-sending its own name conflicts with nothing; the refusal is the sentence the
+        // create answers with (`crate::state::duplicate_identity`).
+        if api
+            .models
+            .iter()
+            .any(|(id, model)| id != &input.model_id && model.name == updated.name)
+        {
+            return Err(UpdateModelErrorModeled::ConflictException(ConflictException {
+                message: Some(
+                    crate::state::duplicate_identity::MODEL_NAME_ALREADY_EXISTS_MESSAGE
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        // Project the record and then STORE it, so what the caller is told is the record
+        // the store now holds — byte for byte what a later GetModel will report. The model
+        // exists (checked above), so this replaces its record rather than minting a second
+        // one.
+        let stored = crate::state::Model::to_wire(&updated);
+        api.models.insert(input.model_id.clone(), updated);
+        // A model is part of the configuration the api's routes are served under (a route
+        // selects one through its `RequestModels`), so every stage of it that auto-deploys
+        // has the new configuration released to it.
+        api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
+        Ok(UpdateModelOutput {
+            content_type: stored.content_type,
+            description: stored.description,
+            model_id: stored.model_id,
+            name: Some(stored.name),
+            schema: stored.schema,
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint.
+fn bad_request(message: &str) -> UpdateModelError {
+    UpdateModelErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's report that the api or the model the URI addresses does not exist: the
+/// modelled `NotFoundException` ("The resource specified in the request was not found"),
+/// whose message names the identifier that resolved to nothing.
+fn not_found(message: String) -> UpdateModelError {
+    UpdateModelErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+        resource_type: ::std::option::Option::None,
+    })
+    .into()
 }

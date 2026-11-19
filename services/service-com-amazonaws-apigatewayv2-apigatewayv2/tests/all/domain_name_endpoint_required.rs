@@ -32,6 +32,21 @@ use crate::domain_name_lifecycle::{
     certificate_arn, configurations, create_domain_name, get_domain_name, update_domain_name,
 };
 
+/// `body` with its `tags` member removed, which is what a create's answer and a read's are
+/// compared on.
+///
+/// `CreateDomainName` answers the tags its own request attached — none in this suite, so no
+/// `tags` member at all — while every READER of the resource reports its tag collection,
+/// empty or not. The two documents therefore agree on every member but that one, which
+/// `domain_name_lifecycle` owns.
+fn without_tags(body: &Value) -> Value {
+    let mut body = body.clone();
+    if let Some(members) = body.as_object_mut() {
+        members.remove("tags");
+    }
+    body
+}
+
 /// The two forms in which a request names no endpoint configuration: the member left
 /// out, and the member sent as an empty list.
 fn absent_forms() -> Vec<(&'static str, Option<Value>)> {
@@ -167,7 +182,8 @@ async fn a_create_naming_any_endpoint_configuration_is_accepted() {
             "case {case:?}: expected 200 from GetDomainName, got {status} {read}"
         );
         assert_eq!(
-            read, body,
+            without_tags(&read),
+            without_tags(&body),
             "case {case:?}: expected GetDomainName to report the created record, got {read}"
         );
     }
@@ -242,7 +258,8 @@ async fn a_patch_that_would_remove_every_endpoint_is_refused() {
                 "case {case:?}: expected 200 from GetDomainName, got {status} {read}"
             );
             assert_eq!(
-                read, seeded,
+                without_tags(&read),
+                without_tags(&seeded),
                 "case {case:?}: expected the seeded record to survive the refusal, got {read}"
             );
             for (index, entry) in configurations(&read).iter().enumerate() {

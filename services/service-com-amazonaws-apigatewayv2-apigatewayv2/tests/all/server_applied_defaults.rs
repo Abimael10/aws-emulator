@@ -21,7 +21,14 @@
 //!   (`AWS_PROXY` naming no `IntegrationSubtype`), whose endpoint is reached through
 //!   Lambda's own function-invoking action, served at
 //!   `POST /2015-03-31/functions/{FunctionArn}/invocations`. Every other type's method
-//!   belongs to its own endpoint, so the service supplies none.
+//!   belongs to its own endpoint, so `CreateIntegration` supplies none — while the
+//!   integration QUICK CREATE mints for an HTTP target is reached through the catch-all
+//!   route it wires to it, which forwards whatever method the call arrived with, so that
+//!   one carries `ANY`.
+//! * `Integration$IntegrationResponseSelectionExpression` —
+//!   `${integration.response.statuscode}`, the expression an integration's own responses
+//!   are selected by. The member is "Supported only for WebSocket APIs", so only such an
+//!   api's integration carries one.
 //! * `Stage$DefaultRouteSettings` — the settings a stage's routes are served under, so a
 //!   stage that configured none of them, or only some, still reports every one the service
 //!   supplies: each facility `RouteSettings` switches reported off, and the logging level
@@ -41,6 +48,8 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_apigatewayv2_apigatewayv2::state::INTEGRATION_RESPONSE_SELECTION_EXPRESSION;
+
 use crate::api_lifecycle::{as_str, call, emulator};
 
 /// The `TimeoutInMillis` a WebSocket api's integration carries when the request names
@@ -50,6 +59,11 @@ const DEFAULT_WEBSOCKET_TIMEOUT_MILLIS: i64 = 29_000;
 
 /// The same for an HTTP api ("30 seconds for HTTP APIs").
 const DEFAULT_HTTP_TIMEOUT_MILLIS: i64 = 30_000;
+
+/// The `IntegrationResponseSelectionExpression` a WebSocket api's integration carries,
+/// pinned by VALUE here so the crate's own constant cannot drift away from the text AWS
+/// reports.
+const SELECTION_EXPRESSION: &str = "${integration.response.statuscode}";
 
 fn http_api(name: &str) -> Value {
     json!({ "name": name, "protocolType": "HTTP" })
@@ -94,6 +108,10 @@ fn integration_rows() -> Vec<IntegrationRow> {
                 ("passthroughBehavior", Some(json!("WHEN_NO_MATCH"))),
                 ("connectionType", Some(json!("INTERNET"))),
                 (
+                    "integrationResponseSelectionExpression",
+                    Some(json!(SELECTION_EXPRESSION)),
+                ),
+                (
                     "timeoutInMillis",
                     Some(json!(DEFAULT_WEBSOCKET_TIMEOUT_MILLIS)),
                 ),
@@ -108,6 +126,10 @@ fn integration_rows() -> Vec<IntegrationRow> {
                 ("integrationMethod", None),
                 ("payloadFormatVersion", Some(json!("1.0"))),
                 ("passthroughBehavior", Some(json!("WHEN_NO_MATCH"))),
+                (
+                    "integrationResponseSelectionExpression",
+                    Some(json!(SELECTION_EXPRESSION)),
+                ),
                 (
                     "timeoutInMillis",
                     Some(json!(DEFAULT_WEBSOCKET_TIMEOUT_MILLIS)),
@@ -125,6 +147,10 @@ fn integration_rows() -> Vec<IntegrationRow> {
                 ("integrationMethod", None),
                 ("payloadFormatVersion", Some(json!("1.0"))),
                 ("passthroughBehavior", Some(json!("WHEN_NO_MATCH"))),
+                (
+                    "integrationResponseSelectionExpression",
+                    Some(json!(SELECTION_EXPRESSION)),
+                ),
             ],
         },
         IntegrationRow {
@@ -138,6 +164,10 @@ fn integration_rows() -> Vec<IntegrationRow> {
                 ("integrationMethod", None),
                 ("payloadFormatVersion", Some(json!("1.0"))),
                 ("passthroughBehavior", Some(json!("WHEN_NO_MATCH"))),
+                (
+                    "integrationResponseSelectionExpression",
+                    Some(json!(SELECTION_EXPRESSION)),
+                ),
             ],
         },
         IntegrationRow {
@@ -155,6 +185,12 @@ fn integration_rows() -> Vec<IntegrationRow> {
                 ("integrationMethod", Some(json!("GET"))),
                 ("payloadFormatVersion", Some(json!("2.0"))),
                 ("passthroughBehavior", Some(json!("NEVER"))),
+                // No request member sets it, so even a request that filled every other
+                // member it could carries the service's own expression.
+                (
+                    "integrationResponseSelectionExpression",
+                    Some(json!(SELECTION_EXPRESSION)),
+                ),
                 ("timeoutInMillis", Some(json!(1_500))),
             ],
         },
@@ -172,6 +208,9 @@ fn integration_rows() -> Vec<IntegrationRow> {
                 // "Supported only for WebSocket APIs", so an HTTP api's integration
                 // carries no passthrough behaviour for the service to report.
                 ("passthroughBehavior", None),
+                // Nor an integration response selection expression: an HTTP api has no
+                // integration responses to select among.
+                ("integrationResponseSelectionExpression", None),
                 ("timeoutInMillis", Some(json!(DEFAULT_HTTP_TIMEOUT_MILLIS))),
             ],
         },
@@ -191,6 +230,7 @@ fn integration_rows() -> Vec<IntegrationRow> {
                 ("integrationMethod", None),
                 ("payloadFormatVersion", Some(json!("1.0"))),
                 ("passthroughBehavior", None),
+                ("integrationResponseSelectionExpression", None),
             ],
         },
         IntegrationRow {
@@ -205,6 +245,7 @@ fn integration_rows() -> Vec<IntegrationRow> {
                 ("integrationMethod", None),
                 ("payloadFormatVersion", Some(json!("1.0"))),
                 ("passthroughBehavior", None),
+                ("integrationResponseSelectionExpression", None),
             ],
         },
     ]
@@ -480,9 +521,12 @@ async fn the_resources_quick_create_mints_carry_the_same_supplied_members() {
             Some(json!("POST")),
         ),
         (
-            "an http target, whose method belongs to its backend",
+            // The catch-all route quick create wires to an HTTP target forwards whatever
+            // method the call arrived with, which is what an `IntegrationMethod` of `ANY`
+            // names.
+            "an http target, which the catch-all route forwards every method to",
             "https://example.com/upstream".to_string(),
-            None,
+            Some(json!("ANY")),
         ),
     ] {
         let api_id = create_api(
@@ -537,4 +581,15 @@ async fn the_resources_quick_create_mints_carry_the_same_supplied_members() {
             "case {case:?}: expected the HTTP api's own default route settings, got {stage}"
         );
     }
+}
+
+/// The expression the crate supplies is the text AWS reports, pinned by value here so the
+/// crate's constant cannot drift away from it.
+#[test]
+fn the_selection_expression_the_service_supplies_is_the_one_aws_reports() {
+    assert_eq!(
+        INTEGRATION_RESPONSE_SELECTION_EXPRESSION, SELECTION_EXPRESSION,
+        "expected the integration response selection expression AWS reports \
+         ({SELECTION_EXPRESSION:?}), got {INTEGRATION_RESPONSE_SELECTION_EXPRESSION:?}"
+    );
 }

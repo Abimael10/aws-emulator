@@ -555,6 +555,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             request_templates: input.request_templates.unwrap_or_default().into_iter().collect(),
             response_parameters,
             template_selection_expression: input.template_selection_expression,
+            // The expression this integration's responses are selected by: fixed text the
+            // service supplies, and only for an api whose protocol has integration
+            // responses at all (see
+            // `crate::state::default_integration_response_selection_expression`).
+            integration_response_selection_expression:
+                crate::state::default_integration_response_selection_expression(&protocol_type)
+                    .map(str::to_string),
             // "The default timeout is 29 seconds for WebSocket APIs and 30 seconds for
             // HTTP APIs" (`CreateIntegration$TimeoutInMillis`), so the default is the
             // parent api's protocol's.

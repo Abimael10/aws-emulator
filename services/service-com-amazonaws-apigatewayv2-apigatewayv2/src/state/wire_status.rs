@@ -21,8 +21,9 @@
 
 /// `201 Created`, the status a PATCH that rewrites an api or one of its children is
 /// answered with: `UpdateApi` (`PATCH /v2/apis/{ApiId}`), `UpdateRoute`
-/// (`PATCH /v2/apis/{ApiId}/routes/{RouteId}`) and `UpdateRouteResponse`
-/// (`PATCH …/routeresponses/{RouteResponseId}`), each modelled `code: 200`. The body is
+/// (`PATCH /v2/apis/{ApiId}/routes/{RouteId}`), `UpdateRouteResponse`
+/// (`PATCH …/routeresponses/{RouteResponseId}`) and `UpdateModel`
+/// (`PATCH /v2/apis/{ApiId}/models/{ModelId}`), each modelled `code: 200`. The body is
 /// the rewritten resource either way; only the status differs.
 pub const REWRITTEN_RESOURCE_STATUS: u16 = 201;
 

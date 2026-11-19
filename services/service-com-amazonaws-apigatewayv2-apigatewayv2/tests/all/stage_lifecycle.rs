@@ -320,8 +320,9 @@ fn assert_stage(case: &str, row: &Row, body: &Value, named_deployment: Option<&S
     );
     assert_eq!(
         body.get("apiGatewayManaged"),
-        Some(&json!(false)),
-        "case {case:?}: a stage the caller asked for is not API-Gateway-managed, got {body}"
+        None,
+        "case {case:?}: a stage the caller asked for is not API-Gateway-managed, so it \
+         reports no apiGatewayManaged member at all, got {body}"
     );
     assert_eq!(
         body.get("description"),

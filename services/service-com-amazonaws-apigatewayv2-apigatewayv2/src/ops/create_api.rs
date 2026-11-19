@@ -564,13 +564,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // A quick create whose target is a function mints the Lambda proxy
                     // integration, which is invoked through Lambda's own Invoke action, so
                     // the method is the service's to supply here too
-                    // (`crate::state::default_integration_method`); an HTTP target passes
-                    // the request's own method to its endpoint.
-                    integration_method: crate::state::default_integration_method(
-                        integration_type,
-                        ::std::option::Option::None,
-                    )
-                    .map(str::to_string),
+                    // (`crate::state::default_integration_method`); an HTTP target is
+                    // reached through the catch-all route quick create wires to it, which
+                    // forwards whatever method the call arrived with — every method, which
+                    // is what an `IntegrationMethod` of `ANY` names.
+                    integration_method: Some(
+                        crate::state::default_integration_method(
+                            integration_type,
+                            ::std::option::Option::None,
+                        )
+                        .unwrap_or(crate::ops::import_api::ANY_METHOD)
+                        .to_string(),
+                    ),
                     // "This property is part of quick create. It specifies the
                     // credentials required for the integration"
                     // (`CreateApi$CredentialsArn`) — the integration quick create mints

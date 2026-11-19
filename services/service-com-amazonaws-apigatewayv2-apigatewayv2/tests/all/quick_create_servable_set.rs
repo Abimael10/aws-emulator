@@ -21,6 +21,13 @@
 //! > `Stage$ApiGatewayManaged` ("If you created an API using quick create, …") — and a
 //! > `CreateApi` carrying NO target produces none of them.
 //!
+//! > **`ApiGatewayManaged` is reported only where the answer is YES**: a resource API
+//! > Gateway created on the caller's behalf carries `apiGatewayManaged: true`, and a
+//! > resource the CALLER created — the api itself, and every child it asks for — carries no
+//! > such member at all, because the member's presence is what a client tells the two apart
+//! > by. Every reader of the resource reports it the same way, and a patch of a managed
+//! > resource leaves it managed.
+//!
 //! The rows vary what the rule generalises over: the form of the target (a Lambda
 //! function ARN, an `https` URL, an `http` URL, a Lambda ARN carrying a version
 //! qualifier), whether the request names a `RouteKey` and its form, and whether it
@@ -414,8 +421,9 @@ async fn an_api_created_without_a_target_gets_none_of_the_quick_create_set() {
         );
         assert_eq!(
             created.get("apiGatewayManaged"),
-            Some(&json!(false)),
-            "case {case:?}: a $default stage the CALLER created is its own, got {created}"
+            None,
+            "case {case:?}: a $default stage the CALLER created is its own, so it reports \
+             no apiGatewayManaged member at all, got {created}"
         );
     }
 }
@@ -512,4 +520,341 @@ async fn the_name_of_quick_create_s_default_stage_is_already_taken() {
         Some(&json!(released)),
         "case {case:?}: expected the stage to serve the deployment just released, got {moved}"
     );
+}
+
+/// The member under test, as every shape that carries it names it on the wire.
+const MANAGED: &str = "apiGatewayManaged";
+
+/// Assert how `document` reports the member: `true` for a resource API Gateway manages, and
+/// no member at all for one the caller created.
+fn assert_managed(case: &str, reader: &str, document: &Value, managed: bool) {
+    let expected = managed.then(|| json!(true));
+    assert_eq!(
+        document.get(MANAGED),
+        expected.as_ref(),
+        "case {case:?}: expected {reader} to report {MANAGED}={expected:?}, got {document}"
+    );
+}
+
+/// The single item of a collection page, which is what each collection read here holds.
+fn only_item(case: &str, reader: &str, page: &Value) -> Value {
+    let items = page["items"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        items.len(),
+        1,
+        "case {case:?}: expected exactly one item from {reader}, got {page}"
+    );
+    items[0].clone()
+}
+
+/// The three resources quick create mints report that API Gateway manages them, through
+/// every reader of each and through a patch of one.
+#[tokio::test]
+async fn the_resources_quick_create_mints_report_that_api_gateway_manages_them() {
+    let emulator = emulator();
+    let case = "the quick-create managed set";
+    let api_id = create_api(
+        &emulator,
+        case,
+        &json!({
+            "name": "managed-set",
+            "protocolType": "HTTP",
+            "target": "arn:aws:lambda:eu-west-1:000000000000:function:managed-handler"
+        }),
+    )
+    .await;
+
+    // The integration, the route and the `$default` stage, each through its collection
+    // reader and its single reader.
+    let integration = only_item(
+        case,
+        "GetIntegrations",
+        &get(
+            &emulator,
+            case,
+            "GetIntegrations",
+            &format!("/v2/apis/{api_id}/integrations"),
+        )
+        .await,
+    );
+    assert_managed(case, "GetIntegrations", &integration, true);
+    let integration_id = as_str(&integration, "integrationId");
+    assert_managed(
+        case,
+        "GetIntegration",
+        &get(
+            &emulator,
+            case,
+            "GetIntegration",
+            &format!("/v2/apis/{api_id}/integrations/{integration_id}"),
+        )
+        .await,
+        true,
+    );
+
+    let route = only_route(&emulator, case, &api_id).await;
+    assert_managed(case, "GetRoutes", &route, true);
+    let route_id = as_str(&route, "routeId");
+    assert_managed(
+        case,
+        "GetRoute",
+        &get(
+            &emulator,
+            case,
+            "GetRoute",
+            &format!("/v2/apis/{api_id}/routes/{route_id}"),
+        )
+        .await,
+        true,
+    );
+
+    let stage = only_item(
+        case,
+        "GetStages",
+        &get(
+            &emulator,
+            case,
+            "GetStages",
+            &format!("/v2/apis/{api_id}/stages"),
+        )
+        .await,
+    );
+    assert_managed(case, "GetStages", &stage, true);
+    assert_managed(
+        case,
+        "GetStage",
+        &get(
+            &emulator,
+            case,
+            "GetStage",
+            &format!("/v2/apis/{api_id}/stages/{DEFAULT_STAGE_NAME}"),
+        )
+        .await,
+        true,
+    );
+
+    // A patch of a managed resource leaves it managed: the member follows the RESOURCE,
+    // not the call that last wrote it.
+    let (status, patched) = call(
+        &emulator,
+        "PATCH",
+        &format!("/v2/apis/{api_id}/routes/{route_id}"),
+        Some(json!({ "routeKey": "ANY /managed" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from UpdateRoute, got {status} {patched}"
+    );
+    assert_managed(case, "UpdateRoute", &patched, true);
+}
+
+/// An api, and every child of it the caller created, report NO `apiGatewayManaged` member —
+/// through the create, the single read, the collection read and the patch.
+#[tokio::test]
+async fn a_resource_the_caller_created_reports_no_managed_member_at_all() {
+    let emulator = emulator();
+    let case = "resources the caller created";
+
+    // The api itself: `CreateApi` is the caller asking for one, so no api of this service
+    // is API-Gateway-managed.
+    let (status, created_api) = call(
+        &emulator,
+        "POST",
+        "/v2/apis",
+        Some(json!({ "name": "my-own-api", "protocolType": "HTTP" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from CreateApi, got {status} {created_api}"
+    );
+    assert_managed(case, "CreateApi", &created_api, false);
+    let api_id = as_str(&created_api, "apiId");
+    assert_managed(
+        case,
+        "GetApi",
+        &get(&emulator, case, "GetApi", &format!("/v2/apis/{api_id}")).await,
+        false,
+    );
+    assert_managed(
+        case,
+        "GetApis",
+        &only_item(
+            case,
+            "GetApis",
+            &get(&emulator, case, "GetApis", "/v2/apis").await,
+        ),
+        false,
+    );
+    let (status, patched_api) = call(
+        &emulator,
+        "PATCH",
+        &format!("/v2/apis/{api_id}"),
+        Some(json!({ "description": "mine" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from UpdateApi, got {status} {patched_api}"
+    );
+    assert_managed(case, "UpdateApi", &patched_api, false);
+
+    // The integration the caller created under it.
+    let (status, created_integration) = call(
+        &emulator,
+        "POST",
+        &format!("/v2/apis/{api_id}/integrations"),
+        Some(json!({
+            "integrationType": "HTTP_PROXY",
+            "integrationUri": "https://example.com/upstream",
+            "integrationMethod": "ANY",
+            "payloadFormatVersion": "1.0"
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from CreateIntegration, got {status} \
+         {created_integration}"
+    );
+    assert_managed(case, "CreateIntegration", &created_integration, false);
+    let integration_id = as_str(&created_integration, "integrationId");
+    assert_managed(
+        case,
+        "GetIntegration",
+        &get(
+            &emulator,
+            case,
+            "GetIntegration",
+            &format!("/v2/apis/{api_id}/integrations/{integration_id}"),
+        )
+        .await,
+        false,
+    );
+    assert_managed(
+        case,
+        "GetIntegrations",
+        &only_item(
+            case,
+            "GetIntegrations",
+            &get(
+                &emulator,
+                case,
+                "GetIntegrations",
+                &format!("/v2/apis/{api_id}/integrations"),
+            )
+            .await,
+        ),
+        false,
+    );
+
+    // The route the caller created, wired to it.
+    let (status, created_route) = call(
+        &emulator,
+        "POST",
+        &format!("/v2/apis/{api_id}/routes"),
+        Some(json!({
+            "routeKey": "GET /mine",
+            "target": format!("{INTEGRATION_TARGET_PREFIX}{integration_id}")
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from CreateRoute, got {status} {created_route}"
+    );
+    assert_managed(case, "CreateRoute", &created_route, false);
+    let route_id = as_str(&created_route, "routeId");
+    assert_managed(
+        case,
+        "GetRoute",
+        &get(
+            &emulator,
+            case,
+            "GetRoute",
+            &format!("/v2/apis/{api_id}/routes/{route_id}"),
+        )
+        .await,
+        false,
+    );
+    assert_managed(
+        case,
+        "GetRoutes",
+        &only_route(&emulator, case, &api_id).await,
+        false,
+    );
+    let (status, patched_route) = call(
+        &emulator,
+        "PATCH",
+        &format!("/v2/apis/{api_id}/routes/{route_id}"),
+        Some(json!({ "routeKey": "GET /renamed" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from UpdateRoute, got {status} {patched_route}"
+    );
+    assert_managed(case, "UpdateRoute", &patched_route, false);
+
+    // And the stage the caller created, including under the `$default` name quick create
+    // would have used: the NAME is not what makes a stage managed.
+    for stage_name in ["prod", DEFAULT_STAGE_NAME] {
+        let (status, created_stage) = call(
+            &emulator,
+            "POST",
+            &format!("/v2/apis/{api_id}/stages"),
+            Some(json!({ "stageName": stage_name })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?} ({stage_name:?}): expected 201 from CreateStage, got {status} \
+             {created_stage}"
+        );
+        assert_managed(case, "CreateStage", &created_stage, false);
+        assert_managed(
+            case,
+            "GetStage",
+            &get(
+                &emulator,
+                case,
+                "GetStage",
+                &format!("/v2/apis/{api_id}/stages/{stage_name}"),
+            )
+            .await,
+            false,
+        );
+        let (status, patched_stage) = call(
+            &emulator,
+            "PATCH",
+            &format!("/v2/apis/{api_id}/stages/{stage_name}"),
+            Some(json!({ "description": "mine" })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?} ({stage_name:?}): expected 200 from UpdateStage, got {status} \
+             {patched_stage}"
+        );
+        assert_managed(case, "UpdateStage", &patched_stage, false);
+    }
+
+    // Every item of the stage collection, which now holds both of them.
+    let page = get(
+        &emulator,
+        case,
+        "GetStages",
+        &format!("/v2/apis/{api_id}/stages"),
+    )
+    .await;
+    let items = page["items"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        items.len(),
+        2,
+        "case {case:?}: expected both stages to be listed, got {page}"
+    );
+    for item in &items {
+        assert_managed(case, "GetStages", item, false);
+    }
 }

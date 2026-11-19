@@ -16,8 +16,11 @@
 //! > ([`CLOUDFRONT_HOSTED_ZONE_ID`], which `AliasTarget$HostedZoneId` states as
 //! > "CloudFront distribution: Specify Z2FDTNDATAQYW2"), in every Region; a `REGIONAL`
 //! > endpoint reports one id per Region, the same for every domain name and every read in
-//! > that Region and a different one in another, and never the CloudFront one. An id is
-//! > `Z` followed by the thirteen characters AWS's published endpoint zone ids carry.
+//! > that Region and a different one in another, and never the CloudFront one. Where AWS's
+//! > own answer for the Region is known, a regional endpoint reports THAT id
+//! > ([`REGIONAL_ENDPOINT_HOSTED_ZONES`], pinned here by value in [`PUBLISHED_ZONE_IDS`])
+//! > rather than one of its own. An id is `Z` followed by the twelve or thirteen characters
+//! > AWS's published endpoint zone ids carry.
 //!
 //! The rows span what the rule generalises over: the endpoint type (`REGIONAL` named,
 //! `REGIONAL` left to the default, `EDGE` — the whole `EndpointType` catalog), the Region
@@ -29,9 +32,12 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use std::collections::BTreeMap;
+
 use service_com_amazonaws_apigatewayv2_apigatewayv2::ops::types::ENDPOINT_TYPE_VALUES;
 use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
-    CLOUDFRONT_HOSTED_ZONE_ID, DEFAULT_ENDPOINT_TYPE, EDGE_ENDPOINT_TYPE,
+    published_regional_endpoint_hosted_zone_id, CLOUDFRONT_HOSTED_ZONE_ID, DEFAULT_ENDPOINT_TYPE,
+    EDGE_ENDPOINT_TYPE, REGIONAL_ENDPOINT_HOSTED_ZONES,
 };
 
 use crate::api_lifecycle::{as_str, call_in_region, emulator};
@@ -39,11 +45,50 @@ use crate::api_lifecycle::{as_str, call_in_region, emulator};
 /// The member every configuration entry must carry.
 const HOSTED_ZONE_ID: &str = "hostedZoneId";
 
-/// How a published endpoint hosted zone id is shaped on the wire: a leading `Z` and
-/// thirteen more characters (`Z2FDTNDATAQYW2`, `Z1UJRXOUMOOFQ8`). Spelled as the WHOLE
-/// length, which is one more than the crate's `HOSTED_ZONE_ID_LEN` (the count AFTER the
-/// leading `Z`), so the two are never read as the same number.
-const PUBLISHED_ZONE_ID_CHARS: usize = 14;
+/// How a published endpoint hosted zone id is shaped on the wire: a leading `Z` and twelve
+/// or thirteen more characters (`Z2FDTNDATAQYW2` and `Z1UJRXOUMOOFQ8` carry thirteen,
+/// `ZLY8HYME6SFDD` and `ZOJJZC49E0EPZ` twelve). Spelled as the WHOLE length, which is one
+/// more than the crate's `HOSTED_ZONE_ID_LEN` (the count AFTER the leading `Z`), so the two
+/// are never read as the same number.
+const PUBLISHED_ZONE_ID_CHARS: (usize, usize) = (13, 14);
+
+/// What AWS itself answers for a REGIONAL endpoint of a custom domain name created in a
+/// Region, Region by Region: the zone of that Region's API Gateway endpoint, which AWS
+/// assigns and this suite pins by VALUE.
+///
+/// The suite's OWN copy of the catalog the service carries
+/// ([`REGIONAL_ENDPOINT_HOSTED_ZONES`]), so the service asserts nothing against itself: an
+/// id added to or edited in the service's table without a published AWS answer behind it
+/// fails [`the_service_carries_the_regional_zone_ids_aws_publishes`], and a Region added to
+/// either belongs in both. `us-west-2` is the recorded AWS answer for a regional custom
+/// domain name created there; every other row is AWS's published answer for its own Region.
+const PUBLISHED_ZONE_IDS: &[(&str, &str)] = &[
+    ("af-south-1", "Z2DHW2332DAMTN"),
+    ("ap-east-1", "Z3FD1VL90ND7K5"),
+    ("ap-northeast-1", "Z1YSHQZHG15GKL"),
+    ("ap-northeast-2", "Z20JF4UZKIW1U8"),
+    ("ap-northeast-3", "Z2YQB5RD63NC85"),
+    ("ap-south-1", "Z3VO1THU9YC4UR"),
+    ("ap-southeast-1", "ZL327KTPIQFUL"),
+    ("ap-southeast-2", "Z2RPCDW04V8134"),
+    ("ca-central-1", "Z19DQILCV0OWEC"),
+    ("eu-central-1", "Z1U9ULNL0V5AJ3"),
+    ("eu-north-1", "Z3UWIKFBOOGXPP"),
+    ("eu-west-1", "ZLY8HYME6SFDD"),
+    ("eu-west-2", "ZJ5UAJN8Y3Z2Q"),
+    ("eu-west-3", "Z3KY65QIEKYHQQ"),
+    ("me-south-1", "Z20ZBPC0SS8806"),
+    ("sa-east-1", "ZCMLWB8V5SYIT"),
+    ("us-east-1", "Z1UJRXOUMOOFQ8"),
+    ("us-east-2", "ZOJJZC49E0EPZ"),
+    ("us-west-1", "Z2MUQ32089INYE"),
+    ("us-west-2", "Z2OJLYMUO9EFXC"),
+];
+
+/// Regions with no published API Gateway endpoint zone id carried by this service, spanning
+/// two partitions' naming. A regional endpoint in one still reports an id of its own, which
+/// is what keeps the member's per-Region invariance everywhere.
+const UNPUBLISHED_REGIONS: &[&str] = &["us-gov-west-1", "cn-north-1"];
 
 /// Send one control-plane request signed for `region`.
 async fn call(
@@ -108,11 +153,11 @@ fn hosted_zone_ids(case: &str, body: &Value) -> Vec<String> {
                 !zone.is_empty(),
                 "case {case:?}: configuration {index} must carry {HOSTED_ZONE_ID}, got {entry}"
             );
-            assert_eq!(
-                zone.chars().count(),
-                PUBLISHED_ZONE_ID_CHARS,
-                "case {case:?}: configuration {index} must carry a {PUBLISHED_ZONE_ID_CHARS}-character \
-                 zone id, got {zone:?}"
+            let (shortest, longest) = PUBLISHED_ZONE_ID_CHARS;
+            assert!(
+                (shortest..=longest).contains(&zone.chars().count()),
+                "case {case:?}: configuration {index} must carry a zone id of \
+                 {shortest}..{longest} characters, got {zone:?}"
             );
             assert!(
                 zone.starts_with('Z')
@@ -192,21 +237,32 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// The zone id an entry of `endpoint_type` must report, asserted against what the rule
-/// states for that type: the published CloudFront zone for an edge endpoint, and anything
-/// but it for a regional one.
-fn assert_zone_for_type(case: &str, index: usize, endpoint_type: &str, zone: &str) {
+/// The zone id an entry of `endpoint_type` in `region` must report, asserted against what
+/// the rule states for that type: the published CloudFront zone for an edge endpoint, and
+/// for a regional one the zone AWS publishes for the Region where that is known — never the
+/// CloudFront one either way round.
+fn assert_zone_for_type(case: &str, index: usize, region: &str, endpoint_type: &str, zone: &str) {
     if endpoint_type == EDGE_ENDPOINT_TYPE {
         assert_eq!(
             zone, CLOUDFRONT_HOSTED_ZONE_ID,
             "case {case:?}: configuration {index} is an {EDGE_ENDPOINT_TYPE} endpoint, which \
              is aliased through {CLOUDFRONT_HOSTED_ZONE_ID}, got {zone:?}"
         );
-    } else {
-        assert_ne!(
-            zone, CLOUDFRONT_HOSTED_ZONE_ID,
-            "case {case:?}: configuration {index} is a {endpoint_type} endpoint, which is not \
-             fronted by CloudFront, got {zone:?}"
+        return;
+    }
+    assert_ne!(
+        zone, CLOUDFRONT_HOSTED_ZONE_ID,
+        "case {case:?}: configuration {index} is a {endpoint_type} endpoint, which is not \
+         fronted by CloudFront, got {zone:?}"
+    );
+    if let Some((_, published)) = PUBLISHED_ZONE_IDS
+        .iter()
+        .find(|(published_region, _)| *published_region == region)
+    {
+        assert_eq!(
+            zone, *published,
+            "case {case:?}: configuration {index} is a {endpoint_type} endpoint in \
+             {region:?}, whose published zone is {published:?}, got {zone:?}"
         );
     }
 }
@@ -241,7 +297,7 @@ async fn every_configuration_reports_its_endpoint_s_hosted_zone_id() {
                 "case {case:?}: configuration {index} must describe a {endpoint_type} \
                  endpoint, got {created}"
             );
-            assert_zone_for_type(case, index, endpoint_type, &zones[index]);
+            assert_zone_for_type(case, index, row.region, endpoint_type, &zones[index]);
         }
 
         // The single reader: what the create answered is what a later read reports.
@@ -353,7 +409,7 @@ async fn moving_the_endpoint_type_moves_the_reported_zone() {
     )
     .await;
     let before = hosted_zone_ids(case, &created);
-    assert_zone_for_type(case, 0, "REGIONAL", &before[0]);
+    assert_zone_for_type(case, 0, region, "REGIONAL", &before[0]);
 
     let (status, patched) = call(
         &emulator,
@@ -370,7 +426,7 @@ async fn moving_the_endpoint_type_moves_the_reported_zone() {
         "case {case:?}: UpdateDomainName must answer 200, got {status} {patched}"
     );
     let after = hosted_zone_ids(case, &patched);
-    assert_zone_for_type(case, 0, EDGE_ENDPOINT_TYPE, &after[0]);
+    assert_zone_for_type(case, 0, region, EDGE_ENDPOINT_TYPE, &after[0]);
     assert_ne!(
         before, after,
         "case {case:?}: the endpoint moved, so its zone must move with it, got {before:?} \
@@ -394,4 +450,108 @@ async fn moving_the_endpoint_type_moves_the_reported_zone() {
         after,
         "case {case:?}: the read must report the patched endpoint's zone, got {read}"
     );
+}
+
+/// A regional endpoint in a Region AWS's answer is known for reports THAT id, through every
+/// reader, and one in a Region it is not known for still reports an id of its own.
+///
+/// The rows are the published catalog itself — twenty Regions, of which the recorded case
+/// (`us-west-2`) is one — plus Regions carrying no published id.
+#[tokio::test]
+async fn a_regional_endpoint_reports_the_zone_aws_publishes_for_its_region() {
+    let emulator = emulator();
+    let regional = json!([{ "endpointType": "REGIONAL" }]);
+    let mut by_region: BTreeMap<&str, String> = BTreeMap::new();
+
+    for region in PUBLISHED_ZONE_IDS
+        .iter()
+        .map(|(region, _)| *region)
+        .chain(UNPUBLISHED_REGIONS.iter().copied())
+    {
+        let case = region;
+        let domain = format!("zone-{region}.example.com");
+        let created = create(&emulator, case, region, &domain, &regional).await;
+        let zones = hosted_zone_ids(case, &created);
+        assert_zone_for_type(case, 0, region, "REGIONAL", &zones[0]);
+
+        // Every reader of the resource reports the id the create answered.
+        let (status, read) = call(
+            &emulator,
+            region,
+            "GET",
+            &format!("/v2/domainnames/{domain}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetDomainName must answer 200, got {status} {read}"
+        );
+        assert_eq!(
+            hosted_zone_ids(case, &read),
+            zones,
+            "case {case:?}: the read must report the zone the create answered, got {read}"
+        );
+
+        by_region.insert(region, zones[0].clone());
+    }
+
+    // One zone per Region: no two Regions share an id.
+    for (region, id) in &by_region {
+        let sharing: Vec<&&str> = by_region
+            .iter()
+            .filter(|(other, other_id)| *other != region && *other_id == id)
+            .map(|(other, _)| other)
+            .collect();
+        assert!(
+            sharing.is_empty(),
+            "case {region:?}: expected a hosted zone id of its own, but {sharing:?} report \
+             {id:?} too"
+        );
+    }
+}
+
+/// The service carries exactly the regional ids AWS publishes: every entry of its catalog is
+/// a Region AWS's answer is known for and carries that answer, and a Region AWS's answer is
+/// not known for carries nothing.
+#[test]
+fn the_service_carries_the_regional_zone_ids_aws_publishes() {
+    let carried: BTreeMap<&str, &str> = REGIONAL_ENDPOINT_HOSTED_ZONES
+        .iter()
+        .map(|zone| (zone.region, zone.hosted_zone_id))
+        .collect();
+    let published: BTreeMap<&str, &str> = PUBLISHED_ZONE_IDS.iter().copied().collect();
+    assert_eq!(
+        carried, published,
+        "expected the service to carry AWS's published zone ids, region for region, got \
+         {carried:?} against {published:?}"
+    );
+    assert_eq!(
+        carried.len(),
+        REGIONAL_ENDPOINT_HOSTED_ZONES.len(),
+        "expected one entry per region in the carried catalog, got {carried:?}"
+    );
+    let (shortest, longest) = PUBLISHED_ZONE_ID_CHARS;
+    for (region, id) in &published {
+        assert!(
+            (shortest..=longest).contains(&id.chars().count()),
+            "case {region:?}: expected a published id of {shortest}..{longest} characters, \
+             got {id:?}"
+        );
+        assert_eq!(
+            published_regional_endpoint_hosted_zone_id(region),
+            Some(*id),
+            "case {region:?}: expected the region's published id, got {:?}",
+            published_regional_endpoint_hosted_zone_id(region)
+        );
+    }
+    for region in UNPUBLISHED_REGIONS {
+        assert_eq!(
+            published_regional_endpoint_hosted_zone_id(region),
+            None,
+            "case {region:?}: AWS's answer for this region is not known, so the service \
+             carries none, got {:?}",
+            published_regional_endpoint_hosted_zone_id(region)
+        );
+    }
 }

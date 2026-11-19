@@ -244,7 +244,10 @@ async fn get_integrations_reports_each_stored_record_and_only_the_owning_api_s()
                 // Defaulted by the store, not echoed from the request.
                 ("connectionType", json!("INTERNET")),
                 ("timeoutInMillis", json!(30_000)),
-                ("apiGatewayManaged", json!(false)),
+                // `apiGatewayManaged` is reported only for a resource API Gateway manages,
+                // so an integration the caller created carries no such member at all —
+                // these rows assert members that are PRESENT, and the presence rule itself
+                // is `quick_create_servable_set.rs`'s.
             ],
         },
         Row {

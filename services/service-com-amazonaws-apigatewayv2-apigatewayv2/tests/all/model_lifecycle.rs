@@ -21,12 +21,22 @@
 //!   already carries is refused 409 `ConflictException`.
 //! * **An api holds at most `MAX_MODELS_PER_API` models**, after which a create is
 //!   refused 429 `TooManyRequestsException`; the bound is per api.
+//! * **`UpdateModel` is a PATCH of the stored record**: a member the request carries
+//!   replaces the stored one, a member it omits leaves the stored value exactly as it was,
+//!   the `ModelId` is never patched, and the record it leaves behind is what every later
+//!   `GetModel`/`GetModels` reports. The patch is weighed on the record it would LEAVE
+//!   BEHIND, held to the same name, schema and uniqueness rules as the create, and an
+//!   accepted patch is answered `201` — the status API Gateway answers every PATCH that
+//!   rewrites an api or one of its children with, not the `200` the model's `@http` trait
+//!   declares.
 //!
 //! The rows vary what each rule generalises over: the content type (absent, JSON, a
 //! `+json` suffixed media type, one with parameters, a non-JSON one), the schema's JSON
-//! type and well-formedness, which optional members the request carries, and the name's
-//! alphabet. The recorded case that filed the issue — a malformed schema refused with
-//! `BadRequestException` — is one row of the refusal table.
+//! type and well-formedness, which optional members the request carries, the name's
+//! alphabet, and — for the patch — WHICH member the patch carries, whether it was already
+//! set, and the value's own shape. The recorded cases that filed the issues — a malformed
+//! schema refused with `BadRequestException`, and a `Description` patched onto a model that
+//! had none — are one row of each table.
 
 use serde_json::{json, Value};
 
@@ -620,5 +630,425 @@ async fn a_model_belongs_to_the_one_api_that_owns_it() {
         error_code(&body),
         "NotFoundException",
         "expected NotFoundException, got {body}"
+    );
+}
+
+/// The status API Gateway answers a PATCH that rewrites a child of an api with — not the
+/// `200` the model's `@http` trait declares for `UpdateModel`.
+const PATCHED: u16 = 201;
+
+/// Create one model under `api_id` and answer its `ModelId`.
+async fn create_model(
+    emulator: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    api_id: &str,
+    request: Value,
+) -> String {
+    let (status, created) = call(
+        emulator,
+        "POST",
+        &format!("/v2/apis/{api_id}/models"),
+        Some(request),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from CreateModel, got {status} {created}"
+    );
+    as_str(&created, "modelId")
+}
+
+/// Read one model back through the api that owns it.
+async fn read_model(
+    emulator: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    api_id: &str,
+    model_id: &str,
+) -> Value {
+    let (status, fetched) = call(
+        emulator,
+        "GET",
+        &format!("/v2/apis/{api_id}/models/{model_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from GetModel, got {status} {fetched}"
+    );
+    fetched
+}
+
+/// Assert every member of `expected` on `document`, where `None` is a member the record has
+/// no value for and so reports not at all.
+fn assert_members(case: &str, reader: &str, document: &Value, expected: &[(&str, Option<Value>)]) {
+    for (member, value) in expected {
+        assert_eq!(
+            document.get(*member),
+            value.as_ref(),
+            "case {case:?}: expected {reader} to report {member}={value:?}, got {document}"
+        );
+    }
+}
+
+/// One `UpdateModel` row: the patch body, and what the record must report afterwards.
+struct PatchRow {
+    case: &'static str,
+    patch: Value,
+    expected: Vec<(&'static str, Option<Value>)>,
+}
+
+/// The rows the patch rule is asserted over: they differ along WHICH member the patch
+/// carries (each of `Name`, `ContentType`, `Description`, `Schema`, several at once, and
+/// none at all), whether that member was already set, and the value's own shape.
+fn patch_rows() -> Vec<PatchRow> {
+    vec![
+        PatchRow {
+            // The recorded case: a description onto a model created without one.
+            case: "a description onto a model that had none",
+            patch: json!({ "description": "an updated probe model" }),
+            expected: vec![
+                ("description", Some(json!("an updated probe model"))),
+                // Everything the patch did not name is untouched.
+                ("name", Some(json!("Probe"))),
+                ("contentType", Some(json!("application/json"))),
+                ("schema", Some(json!("{}"))),
+            ],
+        },
+        PatchRow {
+            case: "a second description, replacing the first",
+            patch: json!({ "description": "a further description" }),
+            expected: vec![
+                ("description", Some(json!("a further description"))),
+                ("name", Some(json!("Probe"))),
+            ],
+        },
+        PatchRow {
+            case: "the name alone",
+            patch: json!({ "name": "Renamed" }),
+            expected: vec![
+                ("name", Some(json!("Renamed"))),
+                ("description", Some(json!("a further description"))),
+                ("schema", Some(json!("{}"))),
+            ],
+        },
+        PatchRow {
+            case: "the schema alone, which is stored verbatim",
+            patch: json!({ "schema": draft4_schema() }),
+            expected: vec![
+                ("schema", Some(json!(draft4_schema()))),
+                ("name", Some(json!("Renamed"))),
+                ("contentType", Some(json!("application/json"))),
+            ],
+        },
+        PatchRow {
+            case: "a content type and the schema of its own language, at once",
+            patch: json!({
+                "contentType": "application/xml",
+                "schema": "<xs:schema><xs:element name=\"order\"/></xs:schema>"
+            }),
+            expected: vec![
+                ("contentType", Some(json!("application/xml"))),
+                (
+                    "schema",
+                    Some(json!("<xs:schema><xs:element name=\"order\"/></xs:schema>")),
+                ),
+                ("name", Some(json!("Renamed"))),
+            ],
+        },
+        PatchRow {
+            case: "a description emptied to the shortest its bound allows",
+            patch: json!({ "description": "" }),
+            expected: vec![
+                ("description", Some(json!(""))),
+                ("contentType", Some(json!("application/xml"))),
+            ],
+        },
+        PatchRow {
+            case: "a patch that carries no member at all, which changes nothing",
+            patch: json!({}),
+            expected: vec![
+                ("description", Some(json!(""))),
+                ("name", Some(json!("Renamed"))),
+                ("contentType", Some(json!("application/xml"))),
+                (
+                    "schema",
+                    Some(json!("<xs:schema><xs:element name=\"order\"/></xs:schema>")),
+                ),
+            ],
+        },
+    ]
+}
+
+/// `UpdateModel` replaces what its request carries and leaves what it omits, the patches
+/// compose, and every reader reports the record the last patch left behind.
+#[tokio::test]
+async fn update_model_replaces_what_it_carries_and_every_reader_reports_the_result() {
+    let emulator = emulator();
+    let api_id = create_api(&emulator, "the patched models api", "model-patch-api").await;
+    let model_id = create_model(
+        &emulator,
+        "the seed",
+        &api_id,
+        json!({ "name": "Probe", "contentType": "application/json", "schema": "{}" }),
+    )
+    .await;
+
+    for row in patch_rows() {
+        let case = row.case;
+        let (status, patched) = call(
+            &emulator,
+            "PATCH",
+            &format!("/v2/apis/{api_id}/models/{model_id}"),
+            Some(row.patch.clone()),
+        )
+        .await;
+        assert_eq!(
+            status, PATCHED,
+            "case {case:?}: expected {PATCHED} from UpdateModel, got {status} {patched}"
+        );
+        // The identity is the resource's and is never patched.
+        assert_eq!(
+            as_str(&patched, "modelId"),
+            model_id,
+            "case {case:?}: expected the patch to answer the same ModelId, got {patched}"
+        );
+        assert_members(case, "UpdateModel", &patched, &row.expected);
+
+        // The round trip: the single reader reports what the patch stored.
+        let fetched = read_model(&emulator, case, &api_id, &model_id).await;
+        assert_members(case, "GetModel", &fetched, &row.expected);
+        assert_eq!(
+            fetched, patched,
+            "case {case:?}: expected GetModel to report the patched record, got {fetched}"
+        );
+
+        // And so does the collection reader.
+        let (status, page) =
+            call(&emulator, "GET", &format!("/v2/apis/{api_id}/models"), None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetModels, got {status} {page}"
+        );
+        let listed = page["items"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| as_str(item, "modelId") == model_id)
+                    .cloned()
+            })
+            .unwrap_or_else(|| panic!("case {case:?}: GetModels must list the model, got {page}"));
+        assert_members(case, "GetModels", &listed, &row.expected);
+    }
+}
+
+/// A patch is weighed on the record it would LEAVE BEHIND, so one that would store a record
+/// the create could not is refused and writes nothing.
+#[tokio::test]
+async fn an_update_that_would_store_an_invalid_model_is_refused_and_writes_nothing() {
+    let emulator = emulator();
+    let api_id = create_api(&emulator, "the refusals api", "model-patch-refusal-api").await;
+    let model_id = create_model(
+        &emulator,
+        "the seed",
+        &api_id,
+        json!({
+            "name": "Order",
+            "contentType": "application/json",
+            "description": "the seeded description",
+            "schema": draft4_schema()
+        }),
+    )
+    .await;
+    // A sibling, so a patch can collide with a name the api already holds.
+    create_model(
+        &emulator,
+        "the sibling",
+        &api_id,
+        json!({ "name": "Sibling", "contentType": "application/json", "schema": "{}" }),
+    )
+    .await;
+    let before = read_model(&emulator, "the seed", &api_id, &model_id).await;
+
+    // (case, the patch, the status, the error code)
+    let refusals: Vec<(&str, Value, u16, &str)> = vec![
+        (
+            "a hyphenated name",
+            json!({ "name": "order-body" }),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "a name carrying a space",
+            json!({ "name": "order body" }),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "a name outside ASCII",
+            json!({ "name": "ordré" }),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "a schema that is not JSON at all, under a JSON content type",
+            json!({ "schema": "not a document" }),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "a schema that is JSON but not an object",
+            json!({ "schema": "[1, 2, 3]" }),
+            400,
+            "BadRequestException",
+        ),
+        (
+            // The content type MOVES and the stored schema stays: the PAIR the record
+            // would carry is what is weighed, so a JSON content type over a non-JSON
+            // schema is refused even though neither member alone is new.
+            "a JSON content type over a schema that is no JSON document",
+            json!({ "contentType": "application/json", "schema": "<order/>" }),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "a name the sibling already holds",
+            json!({ "name": "Sibling" }),
+            409,
+            "ConflictException",
+        ),
+    ];
+
+    for (case, patch, expected_status, code) in refusals {
+        let (status, body) = call(
+            &emulator,
+            "PATCH",
+            &format!("/v2/apis/{api_id}/models/{model_id}"),
+            Some(patch.clone()),
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected {expected_status} from UpdateModel, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            code,
+            "case {case:?}: expected {code}, got {body}"
+        );
+        // The refused patch wrote nothing.
+        let after = read_model(&emulator, case, &api_id, &model_id).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: expected the refused patch to leave the record alone, got {after}"
+        );
+    }
+
+    // Re-sending the model's OWN name conflicts with nothing.
+    let (status, patched) = call(
+        &emulator,
+        "PATCH",
+        &format!("/v2/apis/{api_id}/models/{model_id}"),
+        Some(json!({ "name": "Order", "description": "kept its own name" })),
+    )
+    .await;
+    assert_eq!(
+        status, PATCHED,
+        "expected {PATCHED} when a patch re-sends the model's own name, got {status} \
+         {patched}"
+    );
+    assert_eq!(
+        patched.get("description"),
+        Some(&json!("kept its own name")),
+        "expected the rest of the patch to be applied, got {patched}"
+    );
+}
+
+/// A model is addressed by the api that owns it AND its own id, so a patch naming either
+/// wrongly is 404 and writes nothing; and a `Model` is WebSocket-only, so an api of another
+/// protocol has none to patch.
+#[tokio::test]
+async fn an_update_naming_no_model_of_this_api_is_refused() {
+    let emulator = emulator();
+    let api_id = create_api(&emulator, "the owning api", "model-patch-owner-api").await;
+    let other_api = create_api(&emulator, "another api", "model-patch-other-api").await;
+    let model_id = create_model(
+        &emulator,
+        "the seed",
+        &api_id,
+        json!({ "name": "Owned", "contentType": "application/json", "schema": "{}" }),
+    )
+    .await;
+
+    for (case, uri) in [
+        (
+            "an api nothing minted",
+            format!("/v2/apis/nosuchapi00/models/{model_id}"),
+        ),
+        (
+            "a model id nothing minted",
+            format!("/v2/apis/{api_id}/models/absentmodel"),
+        ),
+        (
+            "a model of ANOTHER api",
+            format!("/v2/apis/{other_api}/models/{model_id}"),
+        ),
+    ] {
+        let (status, body) = call(
+            &emulator,
+            "PATCH",
+            &uri,
+            Some(json!({ "description": "should not land" })),
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404 from UpdateModel, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {body}"
+        );
+    }
+
+    // None of them wrote anything: the model still has no description.
+    let fetched = read_model(&emulator, "after the refusals", &api_id, &model_id).await;
+    assert_eq!(
+        fetched.get("description"),
+        None,
+        "expected the refused patches to have written nothing, got {fetched}"
+    );
+
+    // An HTTP api has no models at all, so there is nothing there to patch.
+    let case = "an HTTP api, whose protocol has no models";
+    let (status, created) = call(
+        &emulator,
+        "POST",
+        "/v2/apis",
+        Some(json!({ "name": "model-patch-http-api", "protocolType": "HTTP" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from CreateApi, got {status} {created}"
+    );
+    let http_api_id = as_str(&created, "apiId");
+    let (status, body) = call(
+        &emulator,
+        "PATCH",
+        &format!("/v2/apis/{http_api_id}/models/anymodelid"),
+        Some(json!({ "description": "should not land" })),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected 400 from UpdateModel, got {status} {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "BadRequestException",
+        "case {case:?}: expected BadRequestException, got {body}"
     );
 }

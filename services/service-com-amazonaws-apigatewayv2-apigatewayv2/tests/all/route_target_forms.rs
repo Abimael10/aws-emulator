@@ -1067,9 +1067,10 @@ async fn the_route_quick_create_mints_is_api_gateway_managed_whatever_key_it_car
             );
             assert_eq!(
                 created.get("apiGatewayManaged"),
-                Some(&json!(false)),
+                None,
                 "case {case:?} ({target:?}): a route the caller created is not \
-                 API-Gateway-managed, got {created}"
+                 API-Gateway-managed, so it reports no apiGatewayManaged member at all, \
+                 got {created}"
             );
         }
     }

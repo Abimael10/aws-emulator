@@ -22,6 +22,34 @@ use super::WEBSOCKET_PROTOCOL_TYPE;
 /// naming anything else names no variable at all.
 pub const SELECTION_EXPRESSION_VARIABLES: &[&str] = &["request", "context", "stagevariables"];
 
+/// The `IntegrationResponseSelectionExpression` every integration of a WEBSOCKET api
+/// reports: the expression API Gateway matches an integration's own responses against.
+///
+/// "The integration response selection expression for the integration. Supported only for
+/// WebSocket APIs" (`Integration$IntegrationResponseSelectionExpression`). No member of any
+/// request sets it, and the responses it selects among are stored under the
+/// `IntegrationResponseKey`s a caller gives them — keys that match the STATUS CODE the
+/// integration answered — so the expression that extracts the value a response is selected
+/// by is the integration's own response status. It is fixed text: nothing in it comes from
+/// the request.
+pub const INTEGRATION_RESPONSE_SELECTION_EXPRESSION: &str =
+    "${integration.response.statuscode}";
+
+/// The `IntegrationResponseSelectionExpression` an integration of an api of this
+/// `ProtocolType` reports, or `None` for an api whose protocol does not support the member
+/// at all.
+///
+/// The member is "Supported only for WebSocket APIs", and only a WebSocket api has
+/// integration responses to select among at all, so a WebSocket api's integration carries
+/// [`INTEGRATION_RESPONSE_SELECTION_EXPRESSION`] and an HTTP api's carries nothing. Read by
+/// the writers of an integration, so the expression is resolved once where the integration
+/// is stored rather than per read.
+pub fn default_integration_response_selection_expression(
+    protocol_type: &str,
+) -> Option<&'static str> {
+    (protocol_type == WEBSOCKET_PROTOCOL_TYPE).then_some(INTEGRATION_RESPONSE_SELECTION_EXPRESSION)
+}
+
 /// The sentence API Gateway refuses a `RouteSelectionExpression` that is no selector with:
 /// the one a WEBSOCKET api's request left out, and one sent with nothing in it.
 ///

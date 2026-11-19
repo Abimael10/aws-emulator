@@ -25,12 +25,24 @@
 //!   still due and `AVAILABLE` once it is not, and "if the status is UPDATING, the
 //!   domain cannot be modified further until the existing operation is complete"
 //!   (`DomainNameConfiguration$DomainNameStatus`).
+//! * **A custom domain name's ARN names it by its API Gateway management path with an EMPTY
+//!   account-id field** — `arn:aws:apigateway:<region>::/domainnames/<domainName>`, with
+//!   the Region taken from the request's credential scope — and it is built once, when the
+//!   resource is created, so every later reader reports the same ARN whatever Region that
+//!   reader signs for. An ARN carrying an account id never equals the one AWS produces for
+//!   the same domain name, so no IAM resource pattern or cross-service reference a caller
+//!   builds would match it.
+//! * **`CreateDomainName` answers the tags its own request attached**, and a request that
+//!   attached none answers no `tags` member at all — the member's presence is what a client
+//!   tests to tell a tagged resource from an untagged one — **while every READER of the
+//!   resource reports its tag collection**, empty or not.
 //!
 //! The rows vary what each rule generalises over: how many configurations a request
 //! carries (one, several), which members of a configuration it sets, which members
 //! of the patch it names (none, one, several, all), every value of the modelled
-//! `RoutingMode` enum, the published bounds of the domain name's length, and the form of
-//! an absent name.
+//! `RoutingMode` enum, the published bounds of the domain name's length, the form of
+//! an absent name, and — for the last two rules — the Region the request is signed for, the
+//! form of the domain name, and whether the create attached tags.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -54,12 +66,26 @@ use crate::api_lifecycle::{as_str, call_in_region, emulator, error_code};
 /// fails.
 const REGION: &str = "eu-central-1";
 
+/// How long a poll for the endpoint migration to come due may run before the test gives
+/// up, and how long it waits between looks. Both are generous next to
+/// `DOMAIN_NAME_MIGRATION`, the span the service owes the migration: the deadline is the
+/// only bound, and it is far above anything a loaded host needs.
+const MIGRATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+const MIGRATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// An ACM certificate ARN, the only source `DomainNameConfiguration$CertificateArn`
 /// documents ("AWS Certificate Manager is the only supported source"). Built through the
 /// emulator's own ARN helper rather than written out, so the account segment is the
 /// canonical one.
 pub(crate) fn certificate_arn(name: &str) -> String {
     engine::emulator_arn("acm", REGION, &format!("certificate/{name}"))
+}
+
+/// The ARN a custom domain name named `domain`, created in `region`, must report: the API
+/// Gateway management form, whose account-id field is EMPTY. Written out here rather than
+/// built through the emulator's ARN helper, which always writes the account in.
+pub(crate) fn expected_domain_name_arn(region: &str, domain: &str) -> String {
+    format!("arn:aws:apigateway:{region}::/domainnames/{domain}")
 }
 
 /// Send one request to `/v2/domainnames…` and answer `(status, body)`.
@@ -134,6 +160,10 @@ struct CreateCase {
     /// For each configuration the response must carry, in order:
     /// `(endpointType, securityPolicy, ipAddressType, certificateArn)`.
     expect_configurations: Vec<(String, String, String, String)>,
+    /// What the CREATE's own answer must carry under `tags`: the tags the request
+    /// attached, and `null` — no member at all — for a request that attached none. A
+    /// READER of the resource reports its collection either way, which
+    /// [`the_create_answers_the_tags_it_attached_and_every_reader_the_collection`] owns.
     expect_tags: Value,
 }
 
@@ -150,7 +180,7 @@ fn create_cases() -> Vec<CreateCase> {
                 DEFAULT_IP_ADDRESS_TYPE.to_string(),
                 String::new(),
             )],
-            expect_tags: json!({}),
+            expect_tags: json!(null),
         },
         CreateCase {
             label: "one configuration naming only a certificate",
@@ -167,7 +197,7 @@ fn create_cases() -> Vec<CreateCase> {
                 DEFAULT_IP_ADDRESS_TYPE.to_string(),
                 certificate_arn("one-config"),
             )],
-            expect_tags: json!({}),
+            expect_tags: json!(null),
         },
         CreateCase {
             label: "one configuration setting every defaulted enum itself",
@@ -189,7 +219,7 @@ fn create_cases() -> Vec<CreateCase> {
                 "dualstack".to_string(),
                 certificate_arn("explicit"),
             )],
-            expect_tags: json!({}),
+            expect_tags: json!(null),
         },
         CreateCase {
             label: "three configurations, tags, and mutual TLS",
@@ -243,7 +273,7 @@ fn create_cases() -> Vec<CreateCase> {
                 DEFAULT_IP_ADDRESS_TYPE.to_string(),
                 certificate_arn("shortest"),
             )],
-            expect_tags: json!({}),
+            expect_tags: json!(null),
         },
     ]
 }
@@ -268,11 +298,7 @@ async fn a_created_domain_name_is_reported_back_by_get_domain_name() {
         );
         assert_eq!(
             as_str(&body, "domainNameArn"),
-            engine::emulator_arn(
-                "apigateway",
-                REGION,
-                &format!("/domainnames/{}", case.domain)
-            ),
+            expected_domain_name_arn(REGION, case.domain),
             "case {label:?}: expected the ARN of the created resource, got {body}"
         );
         assert_eq!(
@@ -346,14 +372,23 @@ async fn a_created_domain_name_is_reported_back_by_get_domain_name() {
             );
         }
 
-        // The round trip: a read of the same name reports exactly what the create did.
+        // The round trip: a read of the same name reports exactly what the create did,
+        // except under `tags` — the create answers the tags its own request attached while
+        // a read reports the resource's collection, empty or not (see
+        // [`the_create_answers_the_tags_it_attached_and_every_reader_the_collection`]).
         let (status, read) = get_domain_name(&emulator, case.domain).await;
         assert_eq!(
             status, 200,
             "case {label:?}: expected 200 from GetDomainName, got {status} {read}"
         );
+        let mut expected_read = body.clone();
+        expected_read["tags"] = case
+            .expect_tags
+            .as_object()
+            .cloned()
+            .map_or_else(|| json!({}), Value::Object);
         assert_eq!(
-            read, body,
+            read, expected_read,
             "case {label:?}: expected GetDomainName to report the created record, got {read}"
         );
     }
@@ -814,13 +849,26 @@ async fn a_migrating_domain_name_refuses_a_further_update_until_the_migration_is
 
     // The migration is owed by the CLOCK, so once its span has passed the same read
     // reports `AVAILABLE` without anything having been called in between, and the domain
-    // name takes updates again.
-    sleep(DOMAIN_NAME_MIGRATION + std::time::Duration::from_millis(250)).await;
-    let (status, settled) = get_domain_name(&emulator, domain).await;
-    assert_eq!(
-        status, 200,
-        "expected 200 from GetDomainName after the migration came due, got {status} {settled}"
-    );
+    // name takes updates again. Polled for the CONDITION under a deadline far above the
+    // span the service owes it, so nothing here depends on how fast the host runs.
+    let deadline = std::time::Instant::now() + MIGRATION_DEADLINE;
+    let settled = loop {
+        let (status, settled) = get_domain_name(&emulator, domain).await;
+        assert_eq!(
+            status, 200,
+            "expected 200 from GetDomainName while the migration settles, got {status} \
+             {settled}"
+        );
+        if configuration_member(&settled, 0, "domainNameStatus") == DOMAIN_NAME_STATUS_AVAILABLE {
+            break settled;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected the migration ({DOMAIN_NAME_MIGRATION:?}) to come due and report \
+             {DOMAIN_NAME_STATUS_AVAILABLE} within {MIGRATION_DEADLINE:?}, got {settled}"
+        );
+        sleep(MIGRATION_POLL_INTERVAL).await;
+    };
     assert_eq!(
         configuration_member(&settled, 0, "domainNameStatus"),
         DOMAIN_NAME_STATUS_AVAILABLE,
@@ -972,4 +1020,245 @@ async fn a_request_cannot_set_the_service_computed_domain_name_status() {
         status, 404,
         "expected the refused create to have persisted nothing, got {status}"
     );
+}
+
+/// One row of the representation table: the Region the request is signed for, the name, the
+/// configurations and the tags the create attaches.
+struct RepresentationCase {
+    case: &'static str,
+    region: &'static str,
+    domain: &'static str,
+    configurations: Value,
+    /// The `tags` member of the request, or `None` for a request that attaches none.
+    tags: Option<Value>,
+}
+
+/// The rows the ARN rule and the tags rule are asserted over: they differ along the Region
+/// the request is signed for, the form of the domain name, how many endpoint configurations
+/// the resource carries, and whether the create attached tags.
+fn representation_cases() -> Vec<RepresentationCase> {
+    vec![
+        RepresentationCase {
+            case: "a dotted name, one configuration, no tags",
+            region: "us-west-2",
+            domain: "representation.example.com",
+            configurations: json!([{}]),
+            tags: None,
+        },
+        RepresentationCase {
+            case: "a hyphenated name in another Region, three configurations, no tags",
+            region: "ap-southeast-2",
+            domain: "edge-api-two.example.com",
+            configurations: json!([
+                { "endpointType": "REGIONAL" },
+                { "endpointType": "EDGE" },
+                { "endpointType": "REGIONAL", "securityPolicy": "TLS_1_2" }
+            ]),
+            tags: None,
+        },
+        RepresentationCase {
+            case: "the shortest name the target shape allows, with one tag",
+            region: "eu-west-3",
+            domain: "a",
+            configurations: json!([{}]),
+            tags: Some(json!({ "team": "edge" })),
+        },
+        RepresentationCase {
+            case: "a deep name with several tags",
+            region: "sa-east-1",
+            domain: "gateway.internal.service.example.com",
+            configurations: json!([{ "endpointType": "EDGE" }]),
+            tags: Some(json!({ "team": "edge", "env": "test" })),
+        },
+    ]
+}
+
+/// Create the domain name one representation row describes and answer the created document.
+async fn create_for_representation(
+    emulator: &MultiServiceRouter,
+    row: &RepresentationCase,
+) -> Value {
+    let mut request = json!({
+        "domainName": row.domain,
+        "domainNameConfigurations": row.configurations.clone()
+    });
+    if let Some(tags) = &row.tags {
+        request["tags"] = tags.clone();
+    }
+    let (status, body) = call_in_region(
+        emulator,
+        row.region,
+        "POST",
+        "/v2/domainnames",
+        Some(request),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {:?}: expected 201 from CreateDomainName, got {status} {body}",
+        row.case
+    );
+    body
+}
+
+/// The one item of `GetDomainNames` that names `domain`.
+fn listed_domain_name(case: &str, page: &Value, domain: &str) -> Value {
+    page.get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| as_str(item, "domainName") == domain)
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("case {case:?}: GetDomainNames must list {domain}, got {page}"))
+}
+
+/// Every writer and every reader of a custom domain name reports the account-less ARN of
+/// the resource, and the ARN does not move with the Region a later reader signs for.
+#[tokio::test]
+async fn a_custom_domain_name_is_named_by_an_account_less_api_gateway_arn() {
+    let emulator = emulator();
+    // A Region no row is created in, so a read signed for it cannot be the Region the ARN
+    // reports by accident.
+    let elsewhere = "us-east-2";
+
+    for row in representation_cases() {
+        let case = row.case;
+        let created = create_for_representation(&emulator, &row).await;
+        let expected = expected_domain_name_arn(row.region, row.domain);
+        assert_eq!(
+            as_str(&created, "domainNameArn"),
+            expected,
+            "case {case:?}: expected CreateDomainName to report {expected:?}, got {created}"
+        );
+
+        // The single reader, signed for the creating Region and for another one: an ARN
+        // names the Region its resource was created in.
+        for reader_region in [row.region, elsewhere] {
+            let (status, read) = call_in_region(
+                &emulator,
+                reader_region,
+                "GET",
+                &format!("/v2/domainnames/{}", row.domain),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} (read in {reader_region:?}): expected 200 from \
+                 GetDomainName, got {status} {read}"
+            );
+            assert_eq!(
+                as_str(&read, "domainNameArn"),
+                expected,
+                "case {case:?} (read in {reader_region:?}): expected the ARN the create \
+                 answered, got {read}"
+            );
+        }
+
+        // The collection reader, which projects the same records.
+        let (status, listed) =
+            call_in_region(&emulator, row.region, "GET", "/v2/domainnames", None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetDomainNames, got {status} {listed}"
+        );
+        assert_eq!(
+            as_str(&listed_domain_name(case, &listed, row.domain), "domainNameArn"),
+            expected,
+            "case {case:?}: expected GetDomainNames to report the same ARN, got {listed}"
+        );
+
+        // And a patch, signed for yet another Region, leaves the ARN where it is.
+        let (status, patched) = call_in_region(
+            &emulator,
+            elsewhere,
+            "PATCH",
+            &format!("/v2/domainnames/{}", row.domain),
+            Some(json!({ "routingMode": "API_MAPPING_ONLY" })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from UpdateDomainName, got {status} {patched}"
+        );
+        assert_eq!(
+            as_str(&patched, "domainNameArn"),
+            expected,
+            "case {case:?}: expected the patch to leave the ARN alone, got {patched}"
+        );
+    }
+}
+
+/// The create answers the tags it was asked to attach — no member at all for a request that
+/// attached none — while every reader of the resource reports its collection.
+#[tokio::test]
+async fn the_create_answers_the_tags_it_attached_and_every_reader_the_collection() {
+    let emulator = emulator();
+
+    for row in representation_cases() {
+        let case = row.case;
+        let created = create_for_representation(&emulator, &row).await;
+        assert_eq!(
+            created.get("tags"),
+            row.tags.as_ref(),
+            "case {case:?}: expected CreateDomainName to answer the tags it attached \
+             ({:?}), got {created}",
+            row.tags
+        );
+
+        // The collection the resource carries, which is the empty map for a resource
+        // nothing tagged.
+        let collection = row.tags.clone().unwrap_or_else(|| json!({}));
+        let (status, read) = call_in_region(
+            &emulator,
+            row.region,
+            "GET",
+            &format!("/v2/domainnames/{}", row.domain),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetDomainName, got {status} {read}"
+        );
+        assert_eq!(
+            read.get("tags"),
+            Some(&collection),
+            "case {case:?}: expected GetDomainName to report the resource's collection \
+             ({collection}), got {read}"
+        );
+
+        let (status, listed) =
+            call_in_region(&emulator, row.region, "GET", "/v2/domainnames", None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetDomainNames, got {status} {listed}"
+        );
+        assert_eq!(
+            listed_domain_name(case, &listed, row.domain).get("tags"),
+            Some(&collection),
+            "case {case:?}: expected GetDomainNames to report the same collection, got \
+             {listed}"
+        );
+
+        let (status, patched) = call_in_region(
+            &emulator,
+            row.region,
+            "PATCH",
+            &format!("/v2/domainnames/{}", row.domain),
+            Some(json!({ "routingMode": "API_MAPPING_ONLY" })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from UpdateDomainName, got {status} {patched}"
+        );
+        assert_eq!(
+            patched.get("tags"),
+            Some(&collection),
+            "case {case:?}: expected the patch to report the same collection, got {patched}"
+        );
+    }
 }
