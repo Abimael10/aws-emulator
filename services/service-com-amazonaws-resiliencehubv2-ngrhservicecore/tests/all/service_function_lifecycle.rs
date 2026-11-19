@@ -34,6 +34,8 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The modelled routes this suite drives.
 const CREATE_SERVICE: &str = "/v2/create-service";
 const CREATE_SERVICE_FUNCTION: &str = "/v2/create-service-function";
+const CREATE_SERVICE_FUNCTION_RESOURCES: &str = "/v2/create-service-function-resources";
+const CREATE_INPUT_SOURCE: &str = "/v2/create-input-source";
 const DELETE_SERVICE: &str = "/v2/delete-service";
 const LIST_SERVICE_FUNCTIONS: &str = "/v2/list-functions";
 
@@ -124,6 +126,78 @@ async fn list_functions(router: &MultiServiceRouter, query: &str) -> (u16, Value
         None,
     )
     .await
+}
+
+/// Create an input source for `service_arn` from `configuration`.
+async fn create_input_source(
+    router: &MultiServiceRouter,
+    service_arn: &str,
+    configuration: Value,
+) {
+    let (status, body) = call(
+        router,
+        "POST",
+        CREATE_INPUT_SOURCE,
+        Some(json!({"serviceArn": service_arn, "resourceConfiguration": configuration})),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "creating the input source: got {status} {body:?}"
+    );
+}
+
+/// Create one function of `service_arn` and answer its minted id.
+async fn create_function_id(router: &MultiServiceRouter, service_arn: &str, name: &str) -> String {
+    let (status, body) = create_function(
+        router,
+        json!({
+            "serviceArn": service_arn,
+            "name": name,
+            "criticality": CRITICALITY_VALUES[0],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "creating function {name}: got {status} {body:?}");
+    body["serviceFunction"]["serviceFunctionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no serviceFunctionId in {body:?}"))
+        .to_string()
+}
+
+/// Associate `resources` with one function of `service_arn`.
+async fn associate_resources(
+    router: &MultiServiceRouter,
+    service_arn: &str,
+    service_function_id: &str,
+    resources: &[String],
+) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        CREATE_SERVICE_FUNCTION_RESOURCES,
+        Some(json!({
+            "serviceArn": service_arn,
+            "serviceFunctionId": service_function_id,
+            "resources": resources,
+        })),
+    )
+    .await
+}
+
+/// The `ServiceFunction` the service's own listing reports for `service_function_id`: the
+/// read every association below is proven through.
+async fn listed_function(
+    router: &MultiServiceRouter,
+    case: &str,
+    service_arn: &str,
+    service_function_id: &str,
+) -> Value {
+    let (status, body) = list_functions(router, &format!("serviceArn={service_arn}")).await;
+    listed(case, status, &body)
+        .into_iter()
+        .find(|function| function["serviceFunctionId"] == json!(service_function_id))
+        .unwrap_or_else(|| panic!("case {case:?}: no function {service_function_id} in {body:?}"))
 }
 
 async fn delete_service(router: &MultiServiceRouter, service_arn: &str) -> (u16, Value) {
@@ -731,4 +805,224 @@ async fn deleting_a_service_cascades_to_the_functions_it_holds() {
             "case {case:?}: a freshly created service holds no functions, got {functions:?}"
         );
     }
+}
+
+/// A service's resources are DISCOVERED through its input sources, so a service with no input
+/// source has discovered none: `CreateServiceFunctionResources` refuses every identifier with
+/// the modelled `ValidationException` and associates nothing.
+///
+/// The rows differ along the FORM the identifier takes — an ARN, a bare name, a resource url —
+/// and along how many identifiers one call names, since the refusal names the first the
+/// service has not discovered.
+#[tokio::test]
+async fn a_resource_the_service_never_discovered_is_refused_and_associates_nothing() {
+    let router = emulator();
+    let service_arn = create_service(&router, "UndiscoveredResources").await;
+    let function_id = create_function_id(&router, &service_arn, "Checkout").await;
+    let created = listed_function(&router, "before any association", &service_arn, &function_id)
+        .await;
+
+    for (case, resources, refused) in [
+        (
+            "an ARN",
+            vec!["arn:aws:s3:::rhv2-undiscovered-bucket".to_string()],
+            "arn:aws:s3:::rhv2-undiscovered-bucket",
+        ),
+        (
+            "a bare resource name",
+            vec!["rhv2-undiscovered-table".to_string()],
+            "rhv2-undiscovered-table",
+        ),
+        (
+            "a resource url",
+            vec!["https://sqs.us-east-1.amazonaws.com/000000000000/rhv2-queue".to_string()],
+            "https://sqs.us-east-1.amazonaws.com/000000000000/rhv2-queue",
+        ),
+        (
+            "several identifiers, none of them discovered",
+            vec![
+                "rhv2-first-undiscovered".to_string(),
+                "rhv2-second-undiscovered".to_string(),
+            ],
+            "rhv2-first-undiscovered",
+        ),
+    ] {
+        let (status, body) = associate_resources(&router, &service_arn, &function_id, &resources)
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 for a resource the service never discovered, got \
+             {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body:?}"
+        );
+        let expected = format!("Resource not discovered for service: {refused}");
+        assert_eq!(
+            body["message"].as_str(),
+            Some(expected.as_str()),
+            "case {case:?}: expected {expected:?}, got {:?}",
+            body["message"]
+        );
+        assert_eq!(
+            body["reason"].as_str(),
+            Some("INVALID_FIELD_VALUE"),
+            "case {case:?}: the refusal reports the value as invalid, got {body:?}"
+        );
+
+        // Nothing was written: the function still counts no resources, and the record was
+        // not touched at all, so its `updatedAt` is still its `createdAt`.
+        let function = listed_function(&router, case, &service_arn, &function_id).await;
+        assert_eq!(
+            function["resourceCount"].as_i64(),
+            Some(0),
+            "case {case:?}: a refused association stores nothing, got {function:?}"
+        );
+        assert_eq!(
+            function["updatedAt"], created["updatedAt"],
+            "case {case:?}: a refused association must not touch the record, got {function:?}"
+        );
+    }
+}
+
+/// The resources of a service function are a SET of identifiers, and `resourceCount` is that
+/// set's size: an identifier named twice, or named again by a later call, is associated once
+/// and counted once, while a new one is added to what is already held.
+///
+/// The service here discovers through an input source whose resources nothing in this emulator
+/// holds (tag-based discovery), so its resource set is unknown and no identifier is refused
+/// for being outside it — which is what leaves these rows about the set itself.
+#[tokio::test]
+async fn associating_resources_keeps_them_as_a_set_and_counts_them_once() {
+    let router = emulator();
+    let service_arn = create_service(&router, "AssociatedResources").await;
+    create_input_source(
+        &router,
+        &service_arn,
+        json!({"resourceTags": [{"key": "Env", "values": ["prod"]}]}),
+    )
+    .await;
+    let function_id = create_function_id(&router, &service_arn, "Checkout").await;
+    let first = "arn:aws:s3:::rhv2-associated-bucket".to_string();
+    let second = "rhv2-associated-table".to_string();
+
+    for (case, resources, associated, expected_count) in [
+        ("the first association", vec![first.clone()], vec![first.clone()], 1),
+        (
+            "the same identifier again",
+            vec![first.clone()],
+            vec![first.clone()],
+            1,
+        ),
+        (
+            "one identifier named twice in a call",
+            vec![second.clone(), second.clone()],
+            vec![second.clone()],
+            2,
+        ),
+        (
+            "both, one of them already held",
+            vec![first.clone(), second.clone()],
+            vec![first.clone(), second.clone()],
+            2,
+        ),
+    ] {
+        let (status, body) = associate_resources(&router, &service_arn, &function_id, &resources)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} {body:?}"
+        );
+        assert_eq!(
+            body["serviceArn"].as_str(),
+            Some(service_arn.as_str()),
+            "case {case:?}: the answer names the service the request did, got {body:?}"
+        );
+        assert_eq!(
+            body["serviceFunctionId"].as_str(),
+            Some(function_id.as_str()),
+            "case {case:?}: the answer names the function the request did, got {body:?}"
+        );
+        assert_eq!(
+            body["resources"],
+            json!(associated),
+            "case {case:?}: the answer reports the resources it associated, each once, got \
+             {body:?}"
+        );
+
+        let function = listed_function(&router, case, &service_arn, &function_id).await;
+        assert_eq!(
+            function["resourceCount"].as_i64(),
+            Some(expected_count),
+            "case {case:?}: expected resourceCount {expected_count}, got {function:?}"
+        );
+    }
+}
+
+/// The resources are associated WITH a function OF a service, so a request naming either of
+/// them wrongly is the modelled 404 about that resource — and an identifier of ANOTHER
+/// service's function is no identifier of this one's.
+#[tokio::test]
+async fn associating_resources_resolves_the_service_and_the_function_first() {
+    let router = emulator();
+    let service_arn = create_service(&router, "ParentResolution").await;
+    let function_id = create_function_id(&router, &service_arn, "Checkout").await;
+    let other_service = create_service(&router, "OtherParent").await;
+    let other_function = create_function_id(&router, &other_service, "Checkout").await;
+    let missing_service = "arn:aws:resiliencehub:us-east-1:000000000000:service/absent";
+
+    for (case, service, function, expected) in [
+        (
+            "a serviceArn naming no service",
+            missing_service.to_string(),
+            function_id.clone(),
+            "Service not found: service/absent".to_string(),
+        ),
+        (
+            "a serviceFunctionId naming no function",
+            service_arn.clone(),
+            "absent-function".to_string(),
+            "Service function not found: absent-function".to_string(),
+        ),
+        (
+            "a function of another service",
+            service_arn.clone(),
+            other_function.clone(),
+            format!("Service function not found: {other_function}"),
+        ),
+    ] {
+        let (status, body) =
+            associate_resources(&router, &service, &function, &["rhv2-ghost".to_string()]).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(expected.as_str()),
+            "case {case:?}: expected {expected:?}, got {:?}",
+            body["message"]
+        );
+    }
+
+    // The other service's function was named, never written to.
+    let untouched = listed_function(
+        &router,
+        "a function of another service",
+        &other_service,
+        &other_function,
+    )
+    .await;
+    assert_eq!(
+        untouched["resourceCount"].as_i64(),
+        Some(0),
+        "a refused association stores nothing anywhere, got {untouched:?}"
+    );
 }

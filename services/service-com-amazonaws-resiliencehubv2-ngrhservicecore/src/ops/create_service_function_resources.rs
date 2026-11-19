@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateServiceFunctionResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateServiceFunctionResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Associates DISCOVERED resources with a service function and stores them on that
+//! function's record, so `resourceCount` is the number of resources really associated and a
+//! resource the service never discovered is refused. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateServiceFunctionResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The resources of a function are a SET of identifiers, so associating one the function
+//! already holds — or naming one twice in a request — adds nothing and is served, which is
+//! why the modelled `ConflictException` has no path here: nothing this operation can be
+//! asked for is a second resource under an identifier already taken. The modelled
+//! `AccessDeniedException` has none either, for the reason it has none anywhere in this
+//! emulator: no operation of this service evaluates a caller's permissions.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +155,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateServiceFunctionResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceFunctionResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateServiceFunctionResources"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateServiceFunctionResourcesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The function the resources are associated with is a child of the service, so both
+        // are resolved BEFORE anything is read elsewhere or written here: a request naming
+        // either of them wrongly is a 404 rather than an association hanging off nothing.
+        // Resolved in a scope of its own, because the discovery below asks another
+        // component over the in-process callback, which no store guard is held across.
+        let sources = {
+            let store = state.lock();
+            let Some(service) = store.services.get(&input.service_arn) else {
+                return Err(service_not_found(&input.service_arn).into());
+            };
+            if !service
+                .service_functions
+                .contains_key(&input.service_function_id)
+            {
+                return Err(function_not_found(&input.service_function_id).into());
+            }
+            store.discovery_sources(&input.service_arn)
+        };
+
+        // A service's resources are DISCOVERED through its input sources, never supplied by
+        // a caller, so each identifier the request names is resolved against what those
+        // sources discover — asked of the component that owns the resources, so an
+        // association is only ever stored for a resource that really exists (see
+        // `crate::state::discovered_resources`). A source this emulator cannot read leaves
+        // the set unknown, and nothing is refused on the strength of that.
+        let discovery =
+            crate::state::discovered_resources::discover(ctx.callback(), &sources).await;
+        if let Some(undiscovered) = discovery.first_undiscovered(&input.resources) {
+            return Err(undiscovered_resource(undiscovered).into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Both were there when this request started and are resolved again now: nothing is
+        // stored under a service or a function that was deleted while the resources were
+        // being resolved.
+        let Some(service) = store.services.get_mut(&input.service_arn) else {
+            return Err(service_not_found(&input.service_arn).into());
+        };
+        let Some(function) = service
+            .service_functions
+            .get_mut(&input.service_function_id)
+        else {
+            return Err(function_not_found(&input.service_function_id).into());
+        };
+
+        // The resources of a function are a SET of identifiers — `resourceCount` is that
+        // list's length — so a resource named twice, or named again after an earlier call
+        // associated it, is associated once and counted once.
+        let mut associated: Vec<String> = Vec::new();
+        let mut held = function.resources.clone();
+        for identifier in &input.resources {
+            if !associated.iter().any(|seen| seen == identifier) {
+                associated.push(identifier.clone());
+            }
+            if !held.iter().any(|seen| seen == identifier) {
+                held.push(identifier.clone());
+            }
+        }
+
+        // The store is BOUNDED before it is written: every association grows the function's
+        // record by a caller-supplied identifier, and past the modelled `ResourceList`
+        // ceiling the association has no representation on the wire either.
+        if held.len() > crate::state::MAX_RESOURCES_PER_SERVICE_FUNCTION {
+            return Err(too_many_resources(
+                &input.service_function_id,
+                function.resources.len(),
+            )
+            .into());
+        }
+
+        function.resources = held;
+        function.updated_at = now;
+
+        Ok(CreateServiceFunctionResourcesOutput {
+            service_arn: Some(input.service_arn),
+            service_function_id: Some(input.service_function_id),
+            // "The list of resources that were associated": the identifiers this call
+            // associated, each named once, in the order the request named them.
+            resources: Some(associated),
+        })
     }
+}
+
+/// The refusal for a `serviceArn` that names no stored service: a service function, and so
+/// the resources associated with one, exist only within a service.
+fn service_not_found(service_arn: &str) -> CreateServiceFunctionResourcesErrorModeled {
+    CreateServiceFunctionResourcesErrorModeled::ResourceNotFoundException(
+        crate::state::resource_not_found(crate::state::SERVICE_RESOURCE_TYPE, service_arn),
+    )
+}
+
+/// The refusal for a `serviceFunctionId` that names no function of that service.
+fn function_not_found(service_function_id: &str) -> CreateServiceFunctionResourcesErrorModeled {
+    CreateServiceFunctionResourcesErrorModeled::ResourceNotFoundException(
+        crate::state::service_function_not_found(service_function_id),
+    )
+}
+
+/// The refusal for an identifier the service has not discovered.
+///
+/// Fixed text around ONE variable part: the identifier, taken verbatim from the request's
+/// `resources`. `reason` is `INVALID_FIELD_VALUE` — the value the request sent names a
+/// resource this service has no reading of, which is this member's value being invalid
+/// rather than missing or duplicated — and `fieldList` is left out, since nothing in the
+/// model or this service's own wording fixes the per-field sentence an entry carries.
+fn undiscovered_resource(identifier: &str) -> CreateServiceFunctionResourcesErrorModeled {
+    CreateServiceFunctionResourcesErrorModeled::ValidationException(ValidationException {
+        message: format!("Resource not discovered for service: {identifier}"),
+        reason: Some("INVALID_FIELD_VALUE".to_string()),
+        field_list: None,
+    })
+}
+
+/// The refusal for an association that would take a function past the resources one can
+/// hold, naming the ceiling and what the function already holds.
+fn too_many_resources(
+    service_function_id: &str,
+    held: usize,
+) -> CreateServiceFunctionResourcesErrorModeled {
+    CreateServiceFunctionResourcesErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "Service function {service_function_id} holds at most {} resources and already \
+             holds {held}",
+            crate::state::MAX_RESOURCES_PER_SERVICE_FUNCTION
+        ),
+        reason: Some("INVALID_FIELD_VALUE".to_string()),
+        field_list: None,
+    })
 }

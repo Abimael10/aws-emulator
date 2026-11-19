@@ -38,6 +38,10 @@
 //! engine, which is what `CreateService` and `UpdateService` have to know before they
 //! write.
 //!
+//! [`discovered_resources`] reads what a service's input sources DISCOVER — the resources
+//! `CreateServiceFunctionResources` may associate with one of its functions — asking the
+//! component that owns each one rather than taking a caller's word for it.
+//!
 //! [`not_found`] holds the refusal every operation that resolves an ARN answers with when
 //! the ARN names nothing stored, so the whole crate words it once, [`conflicts`] holds the
 //! `ConflictException` wordings a create answers with, and [`tagging`] holds
@@ -46,6 +50,7 @@
 
 mod assertions;
 mod conflicts;
+pub mod discovered_resources;
 mod input_sources;
 mod invoker_role;
 mod not_found;
@@ -59,6 +64,9 @@ pub use assertions::{
     ASSERTION_RESOURCE_TYPE, ASSERTION_SOURCE_USER, MAX_ASSERTIONS_PER_SERVICE,
 };
 pub use conflicts::{name_already_exists_message, two_requests_one_token_message};
+pub use discovered_resources::{
+    DiscoveredResource, Discovery, DiscoverySource, MAX_RESOURCES_PER_SERVICE_FUNCTION,
+};
 pub use input_sources::{
     mint_input_source_id, InputSourceCollection, InputSourceRecord, INPUT_SOURCE_TYPE_CFN_STACK,
     INPUT_SOURCE_TYPE_DESIGN_FILE, INPUT_SOURCE_TYPE_EKS, INPUT_SOURCE_TYPE_TAGS,
