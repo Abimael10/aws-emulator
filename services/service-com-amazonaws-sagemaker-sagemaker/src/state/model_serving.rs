@@ -85,6 +85,17 @@ pub const CSV_MEDIA_TYPE: &str = "text/csv";
 /// The media type an answer is rendered as JSON for, when the request's `Accept` asks for it.
 pub const JSON_MEDIA_TYPE: &str = "application/json";
 
+/// The content type a comma-separated answer is served under: [`CSV_MEDIA_TYPE`] together with
+/// the character set its bytes are written in.
+///
+/// "The MIME type of the inference returned from the model container"
+/// (`InvokeEndpointOutput$ContentType`) — so what an answer declares is the content type the
+/// bytes really carry, parameters and all. The predictions are rendered as UTF-8 text and the
+/// bytes of a TEXTUAL media type are only readable against the encoding they were written in, so
+/// the answer says which that is. A media type whose own definition fixes the encoding takes no
+/// such parameter, which is why [`JSON_MEDIA_TYPE`] is a JSON answer's content type as it stands.
+pub const CSV_ANSWER_CONTENT_TYPE: &str = "text/csv; charset=utf-8";
+
 /// What separates the predictions of a `text/csv` answer: one answer is a SINGLE record of
 /// comma-separated values, one per input record, so a client reads a batched answer by
 /// splitting it on commas.
@@ -527,12 +538,25 @@ pub fn archive_entries_named(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
     read
 }
 
-/// What an endpoint answers one invocation with: the rendered body and the media type it is
-/// rendered in.
+/// What an endpoint answers one invocation with: the rendered body and the content type it is
+/// served under.
 #[derive(Debug, Clone)]
 pub struct ServedInference {
     pub body: Vec<u8>,
     pub content_type: String,
+}
+
+impl ServedInference {
+    /// The MEDIA TYPE of the answer, without the parameters its content type carries beside it:
+    /// what the body was rendered as, for a reader that decides by the form rather than by the
+    /// character set ([`CSV_ANSWER_CONTENT_TYPE`]).
+    #[must_use]
+    pub fn media_type(&self) -> &str {
+        self.content_type
+            .split_once(';')
+            .map_or(self.content_type.as_str(), |(media_type, _)| media_type)
+            .trim()
+    }
 }
 
 /// Apply `model` to the records `body` carries and render the predictions in the media type
@@ -583,7 +607,7 @@ pub fn serve_inference(
         .join(CSV_FIELD_SEPARATOR);
     Ok(ServedInference {
         body: rendered.into_bytes(),
-        content_type: CSV_MEDIA_TYPE.to_string(),
+        content_type: CSV_ANSWER_CONTENT_TYPE.to_string(),
     })
 }
 

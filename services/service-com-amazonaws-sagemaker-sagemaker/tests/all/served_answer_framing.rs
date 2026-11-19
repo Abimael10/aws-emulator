@@ -7,7 +7,10 @@
 //! RULE: an answer carries one prediction per input record, in the order the payload carried
 //! them. Rendered as `text/csv` it is ONE record of comma-separated values with no line
 //! terminator — the framing a client reads by splitting the answer on commas — and rendered
-//! as `application/json` it is the `predictions` list of `score` objects.
+//! as `application/json` it is the `predictions` list of `score` objects. Either way the answer
+//! declares the content type its bytes really carry: a textual rendering names the character
+//! set they are written in, and `application/json`, whose own definition fixes the encoding,
+//! takes no such parameter.
 //!
 //! The rows differ along what the rule generalises over: how many records a payload carries
 //! (one, two, more than the model's own feature count, the widest batch this suite drives),
@@ -20,7 +23,8 @@
 
 use serde_json::Value;
 use service_com_amazonaws_sagemaker_sagemaker::state::{
-    fit, fit_epochs, serve_inference, Record, ServedModel, CSV_MEDIA_TYPE, JSON_MEDIA_TYPE,
+    fit, fit_epochs, serve_inference, Record, ServedModel, CSV_ANSWER_CONTENT_TYPE, CSV_MEDIA_TYPE,
+    JSON_MEDIA_TYPE,
 };
 
 /// How many feature columns the fitted model takes.
@@ -74,7 +78,7 @@ struct Row {
     payload: String,
     records: usize,
     accept: Option<&'static str>,
-    /// The media type the answer must be rendered in.
+    /// The content type the answer must be served under.
     answered_as: &'static str,
 }
 
@@ -85,49 +89,49 @@ fn rows() -> Vec<Row> {
             payload: csv_payload(1),
             records: 1,
             accept: None,
-            answered_as: CSV_MEDIA_TYPE,
+            answered_as: CSV_ANSWER_CONTENT_TYPE,
         },
         Row {
             case: "two comma-separated records, text/csv asked for",
             payload: csv_payload(2),
             records: 2,
             accept: Some(CSV_MEDIA_TYPE),
-            answered_as: CSV_MEDIA_TYPE,
+            answered_as: CSV_ANSWER_CONTENT_TYPE,
         },
         Row {
             case: "more records than the model has features",
             payload: csv_payload(FEATURES + 5),
             records: FEATURES + 5,
             accept: Some(CSV_MEDIA_TYPE),
-            answered_as: CSV_MEDIA_TYPE,
+            answered_as: CSV_ANSWER_CONTENT_TYPE,
         },
         Row {
             case: "a wider batch, no Accept",
             payload: csv_payload(32),
             records: 32,
             accept: None,
-            answered_as: CSV_MEDIA_TYPE,
+            answered_as: CSV_ANSWER_CONTENT_TYPE,
         },
         Row {
             case: "a JSON list of rows, no Accept",
             payload: Value::from(json_rows(3)).to_string(),
             records: 3,
             accept: None,
-            answered_as: CSV_MEDIA_TYPE,
+            answered_as: CSV_ANSWER_CONTENT_TYPE,
         },
         Row {
             case: "a JSON instances list, text/csv asked for",
             payload: serde_json::json!({ "instances": json_rows(4) }).to_string(),
             records: 4,
             accept: Some(CSV_MEDIA_TYPE),
-            answered_as: CSV_MEDIA_TYPE,
+            answered_as: CSV_ANSWER_CONTENT_TYPE,
         },
         Row {
             case: "one bare JSON row, no Accept",
             payload: Value::from(record(7)).to_string(),
             records: 1,
             accept: None,
-            answered_as: CSV_MEDIA_TYPE,
+            answered_as: CSV_ANSWER_CONTENT_TYPE,
         },
         Row {
             case: "two comma-separated records, application/json asked for",
@@ -147,6 +151,8 @@ fn rows() -> Vec<Row> {
 }
 
 /// The predictions an answer carries, read the way a client of that media type reads it.
+/// `media_type` is the answer's own ([`ServedInference::media_type`]), so there is one reading of
+/// what a content type's parameters leave out.
 fn answered(body: &[u8], media_type: &str, case: &str) -> Vec<f64> {
     let text = String::from_utf8(body.to_vec())
         .unwrap_or_else(|error| panic!("case {case:?}: the answer is not text: {error}"));
@@ -185,12 +191,12 @@ fn a_csv_answer_is_one_comma_separated_record_of_predictions() {
             });
         assert_eq!(
             served.content_type, row.answered_as,
-            "case {:?}: the answer's media type, got {:?}",
+            "case {:?}: the answer's content type, got {:?}",
             row.case, served.content_type
         );
         let text = String::from_utf8(served.body.clone())
             .unwrap_or_else(|error| panic!("case {:?}: the answer is not text: {error}", row.case));
-        if row.answered_as == CSV_MEDIA_TYPE {
+        if served.media_type() == CSV_MEDIA_TYPE {
             assert!(
                 !text.contains('\n') && !text.contains('\r'),
                 "case {:?}: a comma-separated answer carries no line terminator, got {text:?}",
@@ -203,7 +209,7 @@ fn a_csv_answer_is_one_comma_separated_record_of_predictions() {
                 row.case
             );
         }
-        let predictions = answered(&served.body, &served.content_type, row.case);
+        let predictions = answered(&served.body, served.media_type(), row.case);
         assert_eq!(
             predictions.len(),
             row.records,
@@ -228,7 +234,7 @@ fn every_prediction_is_the_one_its_own_record_is_answered_with() {
             .unwrap_or_else(|refusal| {
                 panic!("case {:?}: the payload must be served, got {refusal:?}", row.case)
             });
-        let batched = answered(&served.body, &served.content_type, row.case);
+        let batched = answered(&served.body, served.media_type(), row.case);
         // The payload's records are the rows `record(index)` builds, in that order, except
         // the bare-JSON row, which carries exactly one record of its own.
         let expected: Vec<f64> = if row.case == "one bare JSON row, no Accept" {

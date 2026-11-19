@@ -36,6 +36,7 @@
 //! form the capture destination's prefix takes.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_sagemaker_sagemaker::state::CSV_ANSWER_CONTENT_TYPE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::sagemaker_endpoint_serves_a_trained_model::{
@@ -344,6 +345,7 @@ struct PayloadRow {
     /// The first feature of each record the payload carries, which is what the models above
     /// split on.
     first_features: Vec<f64>,
+    /// The content type the answer must be served under.
     answer_media_type: &'static str,
 }
 
@@ -356,14 +358,14 @@ fn payload_rows() -> Vec<PayloadRow> {
             headers: vec![("content-type", "text/csv")],
             payload: "1,2,3\n".to_string(),
             first_features: vec![1.0],
-            answer_media_type: "text/csv",
+            answer_media_type: CSV_ANSWER_CONTENT_TYPE,
         },
         PayloadRow {
             case: "three comma-separated records, text/csv asked for",
             headers: vec![("content-type", "text/csv"), ("accept", "text/csv")],
             payload: "1,2,3\n60,0,0\n4.5,1,1\n".to_string(),
             first_features: vec![1.0, 60.0, 4.5],
-            answer_media_type: "text/csv",
+            answer_media_type: CSV_ANSWER_CONTENT_TYPE,
         },
         PayloadRow {
             case: "a JSON list of records, application/json asked for",
@@ -380,7 +382,7 @@ fn payload_rows() -> Vec<PayloadRow> {
             headers: vec![("content-type", "application/json")],
             payload: json!({ "instances": [[10.0, 20.0, 30.0]] }).to_string(),
             first_features: vec![10.0],
-            answer_media_type: "text/csv",
+            answer_media_type: CSV_ANSWER_CONTENT_TYPE,
         },
     ]
 }
@@ -438,7 +440,7 @@ async fn an_endpoint_serves_what_the_model_its_artifact_holds_computes() {
             assert_eq!(
                 answer.header("content-type"),
                 payload.answer_media_type,
-                "case {case:?}: the answer's media type, got {}",
+                "case {case:?}: the answer's content type, got {}",
                 answer.text()
             );
             assert_eq!(

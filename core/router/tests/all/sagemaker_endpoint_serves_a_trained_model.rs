@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_sagemaker_sagemaker::state::CSV_ANSWER_CONTENT_TYPE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::query_wire::form_encode;
@@ -502,7 +503,7 @@ struct Row {
     payload: String,
     /// How many records the payload carries, which is how many predictions must come back.
     records: usize,
-    /// The media type the answer must be rendered in.
+    /// The content type the answer must be served under.
     answer_media_type: &'static str,
 }
 
@@ -550,14 +551,14 @@ fn rows() -> Vec<Row> {
             headers: vec![("content-type", "text/csv")],
             payload: csv_payload(1, TABLE_FEATURES),
             records: 1,
-            answer_media_type: "text/csv",
+            answer_media_type: CSV_ANSWER_CONTENT_TYPE,
         },
         Row {
             case: "several comma-separated records, text/csv asked for",
             headers: vec![("content-type", "text/csv"), ("accept", "text/csv")],
             payload: csv_payload(4, TABLE_FEATURES),
             records: 4,
-            answer_media_type: "text/csv",
+            answer_media_type: CSV_ANSWER_CONTENT_TYPE,
         },
         Row {
             case: "several comma-separated records, application/json asked for",
@@ -584,20 +585,20 @@ fn rows() -> Vec<Row> {
             headers: vec![("content-type", "application/json")],
             payload: json!({ "instances": json_rows(2, TABLE_FEATURES) }).to_string(),
             records: 2,
-            answer_media_type: "text/csv",
+            answer_media_type: CSV_ANSWER_CONTENT_TYPE,
         },
         Row {
             case: "one JSON record as a bare list of numbers",
             headers: vec![("content-type", "application/json")],
             payload: json!(json_rows(1, TABLE_FEATURES)[0]).to_string(),
             records: 1,
-            answer_media_type: "text/csv",
+            answer_media_type: CSV_ANSWER_CONTENT_TYPE,
         },
     ]
 }
 
 /// The predictions one answer carries, whichever media type it is rendered in.
-fn predictions(answer: &Answer, case: &str) -> Vec<f64> {
+pub(crate) fn predictions(answer: &Answer, case: &str) -> Vec<f64> {
     let media_type = answer.header("content-type");
     if media_type.contains("application/json") {
         return answer
@@ -660,7 +661,7 @@ async fn an_endpoint_serves_the_prediction_its_deployed_model_computes() {
         assert_eq!(
             answer.header("content-type"),
             row.answer_media_type,
-            "case {case:?}: the answer's media type, got {}",
+            "case {case:?}: the answer's content type, got {}",
             answer.text()
         );
         assert_eq!(
@@ -886,8 +887,8 @@ async fn a_csv_answer_is_one_comma_separated_record_in_payload_order() {
         );
         assert_eq!(
             answer.header("content-type"),
-            "text/csv",
-            "case {case:?}: the answer's media type, got {}",
+            CSV_ANSWER_CONTENT_TYPE,
+            "case {case:?}: the answer's content type, got {}",
             answer.text()
         );
         let text = answer.text();

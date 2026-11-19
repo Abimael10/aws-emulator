@@ -375,7 +375,7 @@ async fn serve_transform_records(
             // A `.out` object carries one record per line: the inference answered for an
             // invocation is ONE record of comma-separated predictions, which is the framing a
             // single HTTP answer carries, while an object holds the records of a dataset.
-            if !scripted && served.content_type == CSV_MEDIA_TYPE {
+            if !scripted && served.media_type() == CSV_MEDIA_TYPE {
                 let rendered = String::from_utf8_lossy(&served.body)
                     .split(CSV_FIELD_SEPARATOR)
                     .collect::<Vec<_>>()
