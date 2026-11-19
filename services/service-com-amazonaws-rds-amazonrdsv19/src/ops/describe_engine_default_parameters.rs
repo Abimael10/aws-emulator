@@ -1036,6 +1036,31 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "The server's default character set.",
     ),
     parameter(
+        "completion_type",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        // The engine numbers the three completion behaviours 0, 1 and 2 (`NO_CHAIN`, `CHAIN`
+        // and `RELEASE`), and the published list enumerates the numbers.
+        "0,1,2",
+        "0",
+        true,
+        "",
+        "The transaction completion type.",
+    ),
+    parameter(
+        "concurrent_insert",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        // `NEVER`, `AUTO` and `ALWAYS` as the engine numbers them.
+        "0,1,2",
+        "1",
+        true,
+        "",
+        "If AUTO (the default), MySQL permits INSERT and SELECT statements to run \
+         concurrently for MyISAM tables that have no free blocks in the middle of the data \
+         file.",
+    ),
+    parameter(
         "connect_timeout",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
@@ -1045,6 +1070,60 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "",
         "The time in seconds the server waits for a connect packet before responding with a \
          bad handshake.",
+    ),
+    parameter(
+        "default_password_lifetime",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-65535",
+        "0",
+        true,
+        "5.7.4",
+        "This variable defines the global automatic password expiration policy.",
+    ),
+    parameter(
+        "default_week_format",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        // The eight modes the engine's week function admits.
+        "0-7",
+        "0",
+        true,
+        "",
+        "The default mode value to use for the WEEK() function.",
+    ),
+    parameter(
+        "delayed_insert_timeout",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-31536000",
+        "300",
+        true,
+        "",
+        "How many seconds an INSERT DELAYED handler thread should wait for INSERT statements \
+         before terminating.",
+    ),
+    parameter(
+        "div_precision_increment",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-30",
+        "4",
+        true,
+        "",
+        "The number of digits by which to increase the scale of the result of division \
+         operations performed with the / operator.",
+    ),
+    parameter(
+        "flush_time",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-31536000",
+        "0",
+        true,
+        "",
+        "If this is set to a nonzero value, all tables are closed every flush_time seconds \
+         to free up resources and synchronize unflushed data to disk.",
     ),
     parameter(
         "general_log",
@@ -1057,6 +1136,77 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "Enables the general query log.",
     ),
     parameter(
+        // Introduced in the 8.0 release line, so only a family of that line or a later one
+        // carries it ([`crate::state::family_carries_parameter`]).
+        "group_replication_member_expel_timeout",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        // The engine admits an hour at most, counted in seconds.
+        "0-3600",
+        "5",
+        true,
+        "8.0.13",
+        "The period of time in seconds that a Group Replication group member waits before \
+         expelling from the group a member suspected of having failed.",
+    ),
+    parameter(
+        "host_cache_size",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-65536",
+        // Autosized by the engine from the permitted connection count, exactly as `back_log`
+        // is, so the engine publishes no default of its own and this reports none.
+        "",
+        true,
+        "",
+        "The size of the internal host cache.",
+    ),
+    parameter(
+        // Introduced in the 8.0 release line, which is where the data dictionary's cached
+        // table statistics arrived.
+        "information_schema_stats_expiry",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-31536000",
+        "86400",
+        true,
+        "8.0.0",
+        "The period of time before cached table statistics expire.",
+    ),
+    parameter(
+        "innodb_adaptive_flushing_lwm",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-70",
+        "10",
+        true,
+        "",
+        "Defines the low water mark representing percentage of redo log capacity at which \
+         adaptive flushing is enabled.",
+    ),
+    parameter(
+        "innodb_autoextend_increment",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-1000",
+        "64",
+        true,
+        "",
+        "The increment size (in MB) for extending the size of an auto-extending InnoDB \
+         system tablespace file when it becomes full.",
+    ),
+    parameter(
+        "innodb_buffer_pool_dump_pct",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-100",
+        "25",
+        true,
+        "",
+        "Specifies the percentage of the most recently used pages for each buffer pool to \
+         read out and dump.",
+    ),
+    parameter(
         "innodb_buffer_pool_size",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
@@ -1065,6 +1215,54 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         true,
         "",
         "The size in bytes of the buffer pool InnoDB caches table and index data in.",
+    ),
+    parameter(
+        "innodb_change_buffer_max_size",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        // Half of the buffer pool at most, as a percentage of it.
+        "0-50",
+        "25",
+        true,
+        "",
+        "Maximum size for the InnoDB change buffer, as a percentage of the total size of the \
+         buffer pool.",
+    ),
+    parameter(
+        "innodb_compression_failure_threshold_pct",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-100",
+        "5",
+        true,
+        "",
+        "Sets the cutoff point at which MySQL begins adding padding within compressed pages \
+         to avoid expensive compression failures.",
+    ),
+    parameter(
+        "innodb_compression_level",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        // The ten zlib compression levels.
+        "0-9",
+        "6",
+        true,
+        "",
+        "Specifies the level of zlib compression to use for InnoDB compressed tables and \
+         indexes.",
+    ),
+    parameter(
+        "innodb_compression_pad_pct_max",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-75",
+        "50",
+        true,
+        "",
+        "Specifies the maximum percentage that can be reserved as free space within each \
+         compressed page, allowing room to reorganize the data and modification log within \
+         the page when a compressed table or index is updated and the data might be \
+         recompressed.",
     ),
     parameter(
         "innodb_file_per_table",
@@ -1077,6 +1275,17 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "Stores each InnoDB table and its indexes in a tablespace file of its own.",
     ),
     parameter(
+        "innodb_fill_factor",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "10-100",
+        "100",
+        true,
+        "5.7.5",
+        "Defines the percentage of space on each B-tree page that is filled during a sorted \
+         index build, with the remaining space reserved for future index growth.",
+    ),
+    parameter(
         "innodb_flush_log_at_trx_commit",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
@@ -1086,6 +1295,18 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "",
         "Controls the balance between strict ACID compliance for commit operations and the \
          higher performance of flushing the log less often.",
+    ),
+    parameter(
+        "innodb_flush_neighbors",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        // Off, the same extent, or the whole contiguous block of dirty pages.
+        "0,1,2",
+        "0",
+        true,
+        "",
+        "Specifies whether flushing a page from the InnoDB buffer pool also flushes other \
+         dirty pages in the same extent.",
     ),
     parameter(
         "innodb_lock_wait_timeout",

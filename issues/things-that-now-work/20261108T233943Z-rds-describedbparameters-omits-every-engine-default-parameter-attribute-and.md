@@ -52,3 +52,22 @@ Cause 3 detail (excerpt): 'Parameter[0].Description: missing (expected "The size
 2. Replay fixture rds-db-parameters-pagination step task#4 (DescribeDBParameters with MaxRecords on a mysql DB parameter group).
 3. Inspect DescribeDBParametersResult.Parameters: each Parameter has ParameterName/ParameterValue/Source/ApplyMethod only — no AllowedValues, ApplyType, DataType, Description or IsModifiable.
 4. Repeat for steps task#5 and task#8 of the same fixture (subsequent pages) — same omission on every row.
+
+## Resolution
+
+The rule is implemented: a DB parameter group's report now projects onto EVERY row of EVERY
+page the record its `DBParameterGroupFamily`'s published catalogue holds for that parameter —
+`Description`, `ApplyType`, `DataType`, `AllowedValues`, `IsModifiable` and
+`MinimumEngineVersion` — beside the group's own value, `Source` and `ApplyMethod`, for a row
+the caller wrote as well as one standing at the engine's default. The MySQL-compatible
+catalogue gained the parameters these reads report, and the per-group parameter guard was
+raised above the longest published family list so a group can hold every parameter its family
+publishes. Covered by `services/service-com-amazonaws-rds-amazonrdsv19/tests/all/db_parameter_catalog_rows.rs`.
+
+RESIDUE, recorded rather than claimed closed: replay reports `ApplyType`, `DataType` and
+`IsModifiable` fixed on all three pages, and still reports `AllowedValues`, `Description` and
+`MinimumEngineVersion` as diverging on individual rows. What differs there is no longer a
+missing member but reference DATA — the exact wording the published catalogue carries for a
+few of these parameters, and which individual rows the catalogue fills `MinimumEngineVersion`
+on. The catalogue carries the engine's own documented text for each row; a later change that
+obtains the published wording for them closes the remainder.

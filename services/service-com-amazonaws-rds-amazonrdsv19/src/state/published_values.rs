@@ -476,10 +476,16 @@ pub const DB_PARAMETER_GROUP_QUOTA_PER_REGION: usize = 50;
 /// Emulator resource guard, NOT an AWS quota: a group's parameter map is a growth site a
 /// caller drives (`ModifyDBClusterParameterGroup` sets up to 20 parameters per call, and a
 /// family this emulator publishes no catalog for admits any parameter name), so the group's
-/// TOTAL is capped as well as each request's. It is comfortably above the seven parameters
-/// the DocumentDB families publish; a modify that would leave a group past it is refused
-/// with a 400 rather than stored.
-pub const MAX_PARAMETERS_PER_GROUP: usize = 64;
+/// TOTAL is capped as well as each request's. A modify that would leave a group past it is
+/// refused with a 400 rather than stored.
+///
+/// It is above the LONGEST parameter list this emulator publishes for a family, which is
+/// what a caller can legitimately set on one group: a guard below that length would refuse a
+/// parameter the family publishes, so the cap moves with the catalogs rather than the
+/// catalogs being held to the cap. It is also the largest page a parameter read can return
+/// ([`DEFAULT_MAX_RECORDS`], the maximum of [`MAX_RECORDS_RANGE`]), so a full group is always
+/// readable in one call.
+pub const MAX_PARAMETERS_PER_GROUP: usize = 100;
 
 /// How many option groups one region may hold: the allowance `CreateOptionGroup`
 /// documents ("You can create up to 20 option groups"), which its modelled

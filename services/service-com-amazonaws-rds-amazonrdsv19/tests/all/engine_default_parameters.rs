@@ -58,10 +58,11 @@ pub(crate) const DATA_TYPES: [&str; 4] = ["boolean", "float", "integer", "string
 
 /// The parameters whose value the engine does not PUBLISH, and which therefore report no
 /// `ParameterValue` at all: MySQL's `back_log` is autosized from the permitted connection
-/// count ("Default Value: -1 (autosized)"), and `basedir` is the installation directory the
-/// managed service owns and reports unset. Every other published parameter must report the
-/// value its engine runs with; these are the NAMED exceptions, not a licence to omit one.
-const AUTOSIZED: [&str; 2] = ["back_log", "basedir"];
+/// count ("Default Value: -1 (autosized)"), `host_cache_size` is autosized the same way
+/// ("Default Value: -1 (signifies autosizing)"), and `basedir` is the installation directory
+/// the managed service owns and reports unset. Every other published parameter must report
+/// the value its engine runs with; these are the NAMED exceptions, not a licence to omit one.
+const AUTOSIZED: [&str; 3] = ["back_log", "basedir", "host_cache_size"];
 
 /// The parameters the engine bounds by NOTHING it publishes, and which therefore report no
 /// `AllowedValues` at all: `basedir` is a path the managed service owns, so there is no
