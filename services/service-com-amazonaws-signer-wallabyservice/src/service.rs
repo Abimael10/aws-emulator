@@ -28,8 +28,10 @@
 //!   a rule of its own for — an input member the model binds a LIST to the query
 //!   string, for which the request supplied nothing; a signing-profile name
 //!   outside the character class its shape admits; a payload outside the byte
-//!   window its blob declares — and keeps the framework's wording for every
-//!   other refusal. See the inline note on that method.
+//!   window its blob declares; a count outside the range its numeric shape
+//!   declares; a string the model admits no empty value for — and keeps the
+//!   framework's wording for every other refusal. See the inline note on that
+//!   method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -62,7 +64,7 @@
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints::{
-    LengthTrait, PatternTrait, Violation, ViolationKind,
+    LengthTrait, PatternTrait, RangeTrait, Violation, ViolationKind,
 };
 use aws_smithy_types::body::SdkBody;
 use service_common::query_timestamps::QueryTimestampForms;
@@ -544,6 +546,58 @@ fn stated_subject(path: &str) -> Option<String> {
     Some(first.to_uppercase().chain(characters).collect())
 }
 
+/// How Signer states a count outside the `@range` its numeric shape declares:
+/// what the parameter is, that it takes an integer, and the window the MODEL
+/// declares for it — both bounds, whichever one the value fell outside.
+///
+/// `violated` names the bound the validating walk reported, whose rendering is
+/// checked against the one that member declares: a path resolving to another
+/// member's range states nothing rather than a window the refused value was never
+/// judged by. The value the request carried is not stated, because the window is
+/// the requirement and the measurement is not. `None` when the model declares only
+/// one of the two bounds, or a fractional one — half a range is not a window to
+/// state, and a fractional bound is not one this sentence could state.
+fn integer_range_requirements(
+    path: &str,
+    violated: fn(RangeTrait) -> Option<f64>,
+    reported: &str,
+) -> Option<String> {
+    let bounds = declared_integer_range(path)?;
+    if integral(violated(bounds)?)?.to_string() != reported {
+        return None;
+    }
+    let (min, max) = (integral(bounds.min?)?, integral(bounds.max?)?);
+    let subject = stated_subject(path)?;
+    Some(format!(
+        "{subject} parameter must be an integer between {min} and {max}"
+    ))
+}
+
+/// A `@range` bound as a sentence about an INTEGER states it, or `None` for a
+/// fractional or non-finite bound, which such a sentence cannot state.
+fn integral(bound: f64) -> Option<i64> {
+    if !bound.is_finite() || bound.fract() != 0.0 {
+        return None;
+    }
+    Some(bound.trunc() as i64)
+}
+
+/// The `@length` minimum below which the EMPTY value is the only one that falls: a
+/// member declaring it admits every value of one character or more, so a request
+/// refused for that floor carried nothing at all.
+const SHORTEST_NON_EMPTY: i64 = 1;
+
+/// How Signer states a string the model admits no empty value for: what the member
+/// is, and that it cannot be empty.
+///
+/// The whole sentence beyond the member's own name is fixed. Neither the floor nor
+/// the rejected value is stated: the value WAS empty, so there is nothing to echo,
+/// and the rule is that the member has to carry something.
+fn non_empty_requirement(path: &str) -> Option<String> {
+    let subject = stated_subject(path)?;
+    Some(format!("{subject} cannot be empty."))
+}
+
 /// The `@pattern` a signing-profile name is admitted by, as this model declares
 /// it — or `None` when it declares none.
 ///
@@ -571,20 +625,23 @@ fn profile_name_pattern() -> Option<&'static str> {
     Some(declared.as_any().downcast_ref::<PatternTrait>()?.regex)
 }
 
-/// The `@length` bounds this model declares for the input member whose violation
-/// path is `path`, where that member is a BLOB — the byte window a payload the
-/// service is handed has to fit.
+/// The bound of kind `T` this model declares for the input member whose violation
+/// path is `path`, among the members whose shape `admits` accepts.
 ///
 /// Resolved by member path across every operation input ([`OPERATION_INPUTS`]),
 /// because `override_refusal` is handed the violations and not the operation they
-/// came from (`Refusal::Invalid` carries no schema). A path two inputs declare as
-/// a blob with DIFFERENT bounds is declined rather than guessed at, so no refusal
-/// can state a window the operation being called does not enforce.
-fn declared_blob_length(path: &str) -> Option<LengthTrait> {
-    let mut resolved: Option<LengthTrait> = None;
+/// came from (`Refusal::Invalid` carries no schema). A path two inputs declare
+/// with DIFFERENT bounds is declined rather than guessed at, so no refusal can
+/// state a requirement the operation being called does not enforce.
+fn declared_bound<T: Copy + PartialEq + 'static>(
+    path: &str,
+    admits: fn(::aws_smithy_schema::ShapeType) -> bool,
+    bound: &::aws_smithy_schema::ShapeId,
+) -> Option<T> {
+    let mut resolved: Option<T> = None;
     for (_, input) in OPERATION_INPUTS {
         for member in input.members() {
-            if !matches!(member.shape_type(), ::aws_smithy_schema::ShapeType::Blob) {
+            if !admits(member.shape_type()) {
                 continue;
             }
             if member.member_name().map(member_path).as_deref() != Some(path) {
@@ -592,8 +649,8 @@ fn declared_blob_length(path: &str) -> Option<LengthTrait> {
             }
             let Some(declared) = member
                 .traits()
-                .and_then(|traits| traits.get(&LengthTrait::TRAIT_ID))
-                .and_then(|found| found.as_any().downcast_ref::<LengthTrait>())
+                .and_then(|traits| traits.get(bound))
+                .and_then(|found| found.as_any().downcast_ref::<T>())
             else {
                 continue;
             };
@@ -606,19 +663,52 @@ fn declared_blob_length(path: &str) -> Option<LengthTrait> {
     resolved
 }
 
+/// The `@length` bounds this model declares for the BLOB input member at `path` —
+/// the byte window a payload the service is handed has to fit.
+fn declared_blob_length(path: &str) -> Option<LengthTrait> {
+    declared_bound(
+        path,
+        |shape| matches!(shape, ::aws_smithy_schema::ShapeType::Blob),
+        &LengthTrait::TRAIT_ID,
+    )
+}
+
+/// The `@length` bounds this model declares for the STRING input member at `path`
+/// — the character window a value that member carries has to fit.
+fn declared_string_length(path: &str) -> Option<LengthTrait> {
+    declared_bound(
+        path,
+        |shape| matches!(shape, ::aws_smithy_schema::ShapeType::String),
+        &LengthTrait::TRAIT_ID,
+    )
+}
+
+/// The `@range` this model declares for the INTEGER input member at `path` — the
+/// window a count that member carries has to fall in.
+fn declared_integer_range(path: &str) -> Option<RangeTrait> {
+    declared_bound(
+        path,
+        |shape| matches!(shape, ::aws_smithy_schema::ShapeType::Integer),
+        &RangeTrait::TRAIT_ID,
+    )
+}
+
 /// A member's name as a violation's path spells it — the one spelling the
 /// validating walk writes, so a lookup here cannot drift from what it reported.
 fn member_path(member_name: &str) -> String {
     ::aws_smithy_schema_server::constraints::path::member(member_name)
 }
 
-/// How this service words a refusal of ONE value the model bounds, for the two
-/// bounds AWS Signer publishes a rule of its own for: the character class a
-/// signing-profile name is admitted by, and the byte window a blob has to fit.
+/// How this service words a refusal of ONE value the model bounds, for the bounds
+/// AWS Signer publishes a rule of its own for: the character class a
+/// signing-profile name is admitted by, the byte window a blob has to fit, the
+/// window a count has to fall in, and the floor a string that cannot be empty
+/// declares.
 ///
-/// Both are stated from the MODEL — the expression a name is matched against and
-/// the bounds a blob declares — and neither echoes the request, which is what the
-/// framework's generic clause does instead.
+/// All of them are stated from the MODEL — the expression a name is matched
+/// against, the bounds a blob or a count declares, the member a floor belongs to —
+/// and none echoes the request, which is what the framework's generic clause does
+/// instead.
 ///
 /// `None` for every other refusal, and for a refusal carrying more than one
 /// violation: Signer's sentences each state ONE rule, so a request that broke
@@ -638,11 +728,23 @@ fn service_stated_constraint_refusal(violations: &[Violation]) -> Option<Refused
             PROFILE_NAME_CHARACTER_CLASS.to_string()
         }
         ViolationKind::MinLength(reported) => {
-            let bounds = declared_blob_length(&violation.path)?;
-            if bounds.min != Some(*reported) {
-                return None;
+            // A BLOB below its floor is stated as the byte window it has to fit; a
+            // STRING below a one-character floor carried nothing at all, which is
+            // what that refusal states ([`SHORTEST_NON_EMPTY`]). A string below
+            // any HIGHER floor is a value that was present and too short, for
+            // which this service publishes no sentence.
+            if let Some(bounds) = declared_blob_length(&violation.path) {
+                if bounds.min != Some(*reported) {
+                    return None;
+                }
+                blob_size_requirements(&violation.path, bounds)?
+            } else {
+                let bounds = declared_string_length(&violation.path)?;
+                if bounds.min != Some(*reported) || *reported != SHORTEST_NON_EMPTY {
+                    return None;
+                }
+                non_empty_requirement(&violation.path)?
             }
-            blob_size_requirements(&violation.path, bounds)?
         }
         ViolationKind::MaxLength(reported) => {
             let bounds = declared_blob_length(&violation.path)?;
@@ -650,6 +752,12 @@ fn service_stated_constraint_refusal(violations: &[Violation]) -> Option<Refused
                 return None;
             }
             blob_size_requirements(&violation.path, bounds)?
+        }
+        ViolationKind::MinValue(reported) => {
+            integer_range_requirements(&violation.path, |bounds| bounds.min, reported)?
+        }
+        ViolationKind::MaxValue(reported) => {
+            integer_range_requirements(&violation.path, |bounds| bounds.max, reported)?
         }
         _ => return None,
     };
@@ -844,13 +952,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // states instead that such a member must carry something, naming it (see
         // [`missing_list_member_constraint`]).
         //
-        // Two further classes are reworded, and for the same reason: AWS Signer
+        // Further classes are reworded, and for the same reason: AWS Signer
         // publishes a rule of its own for them, so the generic clause — which
         // quotes the caller's value and the raw model expression and states the
         // requirement as a schema fact — is not how this service's refusal reads.
         // A signing-profile name outside the class its shape admits is answered
-        // with that class, and a payload outside the byte window its blob
-        // declares with that window (see
+        // with that class, a payload outside the byte window its blob declares
+        // with that window, a count outside the range its numeric shape declares
+        // with that range, and a string the model admits no empty value for with
+        // the rule that it must carry something (see
         // [`service_stated_constraint_refusal`]).
         //
         // A single-value member the request supplied nothing for is reworded too,

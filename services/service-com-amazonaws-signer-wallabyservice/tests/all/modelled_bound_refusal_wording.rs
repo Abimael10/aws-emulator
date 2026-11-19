@@ -7,13 +7,17 @@
 //! the model declares, a request refused for exactly that bound is answered with
 //! that rule — composed from what the MODEL declares, and carrying nothing from
 //! the request — rather than with the boundary validator's generic constraint
-//! clause, which quotes the caller's value and the raw expression. Two bounds have
+//! clause, which quotes the caller's value and the raw expression. Four bounds have
 //! such a rule:
 //!
 //! * a signing-profile name outside the character class its shape's `@pattern`
 //!   admits is answered with that class, stated as the rule a name must meet;
 //! * a payload outside the byte window its blob's `@length` declares is answered
-//!   with that window — both bounds stated, the offending size withheld.
+//!   with that window — both bounds stated, the offending size withheld;
+//! * a count outside the window its integer shape's `@range` declares is answered
+//!   with that window, stated as the parameter's own rule;
+//! * a string the model admits no empty value for — a `@length` minimum of one
+//!   character — is answered with the rule that the member must carry something.
 //!
 //! Every other bound keeps the generic clause, and so does a request that broke
 //! more than one rule at once: this service publishes no single sentence for
@@ -25,17 +29,23 @@
 //! (hyphen, dot, space, punctuation, a non-ASCII letter) and where in the value
 //! that character sits — with in-class names admitted. For the payload: which side
 //! of the window the size falls on (below the floor, one byte past the ceiling,
-//! far past it), with each published bound itself admitted.
+//! far past it), with each published bound itself admitted. For the count: which
+//! paginated read carries it (all three), and how far outside the window the value
+//! falls on either side, with each published bound itself admitted. For the empty
+//! string: which operation carries the member (both revokers), and whether what it
+//! names exists, with the shortest admitted value served.
 
 use std::sync::Arc;
 
 use aws_smithy_schema::ShapeType;
-use aws_smithy_schema_server::constraints::LengthTrait;
+use aws_smithy_schema_server::constraints::{LengthTrait, RangeTrait};
 use aws_smithy_types::base64;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_signer_wallabyservice::ops::types::{
-    PUT_SIGNING_PROFILE_INPUT_SCHEMA, SIGN_PAYLOAD_INPUT_SCHEMA,
+    LIST_SIGNING_JOBS_INPUT_SCHEMA, LIST_SIGNING_PLATFORMS_INPUT_SCHEMA,
+    LIST_SIGNING_PROFILES_INPUT_SCHEMA, PUT_SIGNING_PROFILE_INPUT_SCHEMA,
+    REVOKE_SIGNATURE_INPUT_SCHEMA, REVOKE_SIGNING_PROFILE_INPUT_SCHEMA, SIGN_PAYLOAD_INPUT_SCHEMA,
 };
 use service_com_amazonaws_signer_wallabyservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -551,12 +561,26 @@ async fn a_bound_with_no_published_sentence_keeps_the_generic_clause() {
             })),
         ),
         (
-            // A paging bound on a listing: outside its modelled `@range`, and
-            // nothing this service rewords.
-            "a page size below the modelled range",
+            // A string present but shorter than a floor HIGHER than one
+            // character: a value that was supplied and too short, for which this
+            // service publishes no sentence.
+            "an ARN shorter than the floor its member declares",
             "GET",
-            "/signing-jobs?maxResults=0".to_string(),
+            format!(
+                "/revocations?signatureTimestamp=2023-11-14T22%3A13%3A20Z&platformId={PLATFORM_ID}\
+                 &profileVersionArn=arn%3Aaws%3Asigner%3Aus-west-2%3A000000000000%3A%2F\
+                 signing-profiles%2FEcho_Profile%2Fabcde12345&jobArn=arn%3Aaws%3Asigner\
+                 &certificateHashes=abcd"
+            ),
             None,
+        ),
+        (
+            // A revocation reason past its modelled CEILING: the floor has a
+            // sentence of its own, the ceiling does not.
+            "a reason past the modelled length ceiling",
+            "PUT",
+            "/signing-jobs/00000000-0000-0000-0000-000000000001/revoke".to_string(),
+            Some(json!({ "reason": "r".repeat(501) })),
         ),
     ];
 
@@ -584,5 +608,339 @@ async fn a_bound_with_no_published_sentence_keeps_the_generic_clause() {
             "case {case:?}: expected the window sentence not used, got {:?}",
             answer.message()
         );
+        assert_ne!(
+            answer.message(),
+            NON_EMPTY_REASON_RULE,
+            "case {case:?}: expected the empty-value sentence not used, got {:?}",
+            answer.message()
+        );
     }
+}
+
+/// The member of `input` the model names `member_name`, and the `@length` it
+/// declares for it — read off the generated schema, so a window stated below is
+/// the model's own and not a second copy of it.
+fn declared_length(input: &::aws_smithy_schema::Schema, member_name: &str) -> (i64, i64) {
+    let member = input
+        .members()
+        .iter()
+        .find(|member| member.member_name() == Some(member_name))
+        .unwrap_or_else(|| panic!("the input declares a member {member_name:?}"));
+    let declared = member
+        .traits()
+        .and_then(|traits| traits.get(&LengthTrait::TRAIT_ID))
+        .and_then(|found| found.as_any().downcast_ref::<LengthTrait>())
+        .unwrap_or_else(|| panic!("the member {member_name:?} declares @length"));
+    (
+        declared.min.expect("the @length declares a minimum"),
+        declared.max.expect("the @length declares a maximum"),
+    )
+}
+
+/// The `@range` the model declares for `member_name` on `input`, read off the
+/// generated schema for the same reason.
+fn declared_range(input: &::aws_smithy_schema::Schema, member_name: &str) -> (i64, i64) {
+    let member = input
+        .members()
+        .iter()
+        .find(|member| member.member_name() == Some(member_name))
+        .unwrap_or_else(|| panic!("the input declares a member {member_name:?}"));
+    let declared = member
+        .traits()
+        .and_then(|traits| traits.get(&RangeTrait::TRAIT_ID))
+        .and_then(|found| found.as_any().downcast_ref::<RangeTrait>())
+        .unwrap_or_else(|| panic!("the member {member_name:?} declares @range"));
+    (
+        declared.min.expect("the @range declares a minimum") as i64,
+        declared.max.expect("the @range declares a maximum") as i64,
+    )
+}
+
+/// The wire name of the page-size member every paginated read of this service
+/// binds to the query string (`smithy_query(query="operation",
+/// operation="ListSigningJobs")`).
+const PAGE_SIZE_MEMBER: &str = "maxResults";
+
+/// The wire name of the member both revocation writers carry the revocation reason
+/// in (`smithy_query(query="operation", operation="RevokeSignature")`).
+const REASON_MEMBER: &str = "reason";
+
+/// The sentence this service states for a revocation reason the model admits no
+/// empty value for, written out here rather than imported so the exact bytes a
+/// client reads are pinned independently of the service's own formatter.
+const NON_EMPTY_REASON_RULE: &str = "Reason cannot be empty.";
+
+/// The sentence this service states for a page size outside the window its
+/// integer shape declares, with only the BOUNDS taken from the model.
+fn page_size_window_rule(input: &::aws_smithy_schema::Schema) -> String {
+    let (min, max) = declared_range(input, PAGE_SIZE_MEMBER);
+    format!("MaxResults parameter must be an integer between {min} and {max}")
+}
+
+/// Every paginated read of this service, by the route its listing answers on —
+/// each one binds the page size to the query string under the same modelled shape,
+/// so one sentence covers all three.
+fn paginated_reads() -> Vec<(&'static str, &'static ::aws_smithy_schema::Schema)> {
+    vec![
+        ("/signing-jobs", LIST_SIGNING_JOBS_INPUT_SCHEMA),
+        ("/signing-profiles", LIST_SIGNING_PROFILES_INPUT_SCHEMA),
+        ("/signing-platforms", LIST_SIGNING_PLATFORMS_INPUT_SCHEMA),
+    ]
+}
+
+/// A page size outside the modelled window is refused with that WINDOW: both
+/// bounds, read off the model, stated as the parameter's own rule and quoting
+/// neither the size the request carried nor the member path.
+#[tokio::test]
+async fn a_page_size_outside_the_modelled_window_is_refused_with_that_window() {
+    let router = emulator();
+
+    for (route, input) in paginated_reads() {
+        let (floor, ceiling) = declared_range(input, PAGE_SIZE_MEMBER);
+        // The rows differ along which side of the window the size falls on and by
+        // how far: one below the floor, far below it (a negative count), one past
+        // the ceiling, and far past it.
+        for size in [floor - 1, -1, ceiling + 1, ceiling * 4] {
+            let case = format!("{route} at a page size of {size}");
+            let answer = call(&router, "GET", &format!("{route}?maxResults={size}"), None).await;
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: expected HTTP 400, got {} {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                answer.shape(),
+                ERROR_SHAPE_VALIDATION,
+                "case {case:?}: expected a {ERROR_SHAPE_VALIDATION}, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                answer.message(),
+                page_size_window_rule(input),
+                "case {case:?}: expected the modelled window stated, got {:?}",
+                answer.message()
+            );
+            // The window is the requirement; what this request asked for is not
+            // part of it, and neither is the member path the validating walk
+            // would have named.
+            assert!(
+                !answer.message().contains(&size.to_string()),
+                "case {case:?}: expected the refused size withheld, got {:?}",
+                answer.message()
+            );
+            assert!(
+                !answer.message().contains(PAGE_SIZE_MEMBER),
+                "case {case:?}: expected the member path withheld, got {:?}",
+                answer.message()
+            );
+        }
+    }
+}
+
+/// A page size ON either published bound is not refused for its size: the request
+/// gets past the boundary validator and is SERVED by the listing.
+#[tokio::test]
+async fn a_page_size_on_a_published_bound_is_not_refused_for_its_size() {
+    let router = emulator();
+
+    for (route, input) in paginated_reads() {
+        let (floor, ceiling) = declared_range(input, PAGE_SIZE_MEMBER);
+        for size in [floor, ceiling] {
+            let case = format!("{route} at a page size of {size}, on a published bound");
+            let answer = call(&router, "GET", &format!("{route}?maxResults={size}"), None).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected a published bound served, got {} {:?}",
+                answer.status, answer.body
+            );
+        }
+    }
+}
+
+/// A revocation reason the request left EMPTY is refused with the rule that the
+/// member must carry something — on both operations that carry it, and whether or
+/// not what the request names exists, since the bound is judged before anything is
+/// resolved.
+#[tokio::test]
+async fn an_empty_reason_is_refused_with_the_rule_that_it_must_carry_something() {
+    let router = emulator();
+    let (job_id, profile, profile_version) = seeded_signature(&router).await;
+
+    // Every other member of each row is well formed, so the empty reason is the
+    // ONE rule the request breaks.
+    let cases: Vec<(String, &str, String, Option<Value>)> = vec![
+        (
+            "RevokeSignature on a job this endpoint holds".to_string(),
+            "PUT",
+            format!("/signing-jobs/{job_id}/revoke"),
+            Some(json!({ "reason": "" })),
+        ),
+        (
+            "RevokeSignature on a job id nothing was started under".to_string(),
+            "PUT",
+            "/signing-jobs/00000000-0000-0000-0000-000000009999/revoke".to_string(),
+            Some(json!({ "reason": "" })),
+        ),
+        (
+            "RevokeSigningProfile on a profile this endpoint holds".to_string(),
+            "PUT",
+            format!("/signing-profiles/{profile}/revoke"),
+            Some(json!({
+                "profileVersion": profile_version,
+                "reason": "",
+                "effectiveTime": 1_700_000_000,
+            })),
+        ),
+        (
+            "RevokeSigningProfile on a profile nothing was created under".to_string(),
+            "PUT",
+            "/signing-profiles/No_Such_Profile_Here/revoke".to_string(),
+            Some(json!({
+                "profileVersion": "0123456789",
+                "reason": "",
+                "effectiveTime": 1_700_000_000,
+            })),
+        ),
+    ];
+
+    for (case, method, uri, body) in cases {
+        let answer = call(&router, method, &uri, body).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.shape(),
+            ERROR_SHAPE_VALIDATION,
+            "case {case:?}: expected a {ERROR_SHAPE_VALIDATION}, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.message(),
+            NON_EMPTY_REASON_RULE,
+            "case {case:?}: expected the empty-value rule stated, got {:?}",
+            answer.message()
+        );
+    }
+
+    // And the refused calls wrote nothing: the job the first row named is still
+    // unrevoked.
+    let described = call(&router, "GET", &format!("/signing-jobs/{job_id}"), None).await;
+    assert!(
+        described.body["revocationRecord"].is_null(),
+        "expected the refused revoke to write nothing, got {:?}",
+        described.body
+    );
+}
+
+/// A reason ON the modelled floor — the shortest value the `@length` admits — is
+/// not refused: the revoke is SERVED and the reason is what the record carries.
+#[tokio::test]
+async fn a_reason_on_the_modelled_floor_is_served_and_recorded() {
+    let router = emulator();
+    let (job_id, profile, profile_version) = seeded_signature(&router).await;
+    let (floor, _) = declared_length(REVOKE_SIGNATURE_INPUT_SCHEMA, REASON_MEMBER);
+    let shortest = "x".repeat(usize::try_from(floor).expect("the floor is a character count"));
+
+    let revoked = call(
+        &router,
+        "PUT",
+        &format!("/signing-jobs/{job_id}/revoke"),
+        Some(json!({ "reason": shortest })),
+    )
+    .await;
+    assert!(
+        revoked.status < 300,
+        "case \"RevokeSignature at the modelled floor\": expected the revoke served, got {} {:?}",
+        revoked.status,
+        revoked.body
+    );
+    let described = call(&router, "GET", &format!("/signing-jobs/{job_id}"), None).await;
+    assert_eq!(
+        described.body["revocationRecord"]["reason"].as_str(),
+        Some(shortest.as_str()),
+        "case \"RevokeSignature at the modelled floor\": expected the reason recorded, got {:?}",
+        described.body["revocationRecord"]
+    );
+
+    // The same floor on the other writer, whose `reason` is the same modelled
+    // shape: the profile revocation is served and reports that reason.
+    let (profile_floor, _) = declared_length(REVOKE_SIGNING_PROFILE_INPUT_SCHEMA, REASON_MEMBER);
+    assert_eq!(
+        profile_floor, floor,
+        "both revokers carry the reason in one modelled shape, got {profile_floor} and {floor}"
+    );
+    let revoked_profile = call(
+        &router,
+        "PUT",
+        &format!("/signing-profiles/{profile}/revoke"),
+        Some(json!({
+            "profileVersion": profile_version,
+            "reason": shortest,
+            "effectiveTime": 1_700_000_000,
+        })),
+    )
+    .await;
+    assert!(
+        revoked_profile.status < 300,
+        "case \"RevokeSigningProfile at the modelled floor\": expected the revoke served, got {} \
+         {:?}",
+        revoked_profile.status,
+        revoked_profile.body
+    );
+    let read = call(&router, "GET", &format!("/signing-profiles/{profile}"), None).await;
+    assert_eq!(
+        read.body["statusReason"].as_str(),
+        Some(shortest.as_str()),
+        "case \"RevokeSigningProfile at the modelled floor\": expected the reason reported, got \
+         {:?}",
+        read.body
+    );
+}
+
+/// One profile on the payload-signing platform and one signature made under it:
+/// answers the job id, the profile name and the version that signed, so a
+/// revocation row names something this endpoint really holds.
+async fn seeded_signature(router: &MultiServiceRouter) -> (String, String, String) {
+    let profile = "Reason_Floor_Profile";
+    let seeded = call(
+        router,
+        "PUT",
+        &format!("/signing-profiles/{profile}"),
+        Some(json!({ "platformId": PAYLOAD_PLATFORM_ID })),
+    )
+    .await;
+    assert_eq!(
+        seeded.status, 200,
+        "seeding the profile: got {} {:?}",
+        seeded.status, seeded.body
+    );
+    let profile_version = seeded.body["profileVersion"]
+        .as_str()
+        .unwrap_or_else(|| panic!("seeding the profile: expected a version, got {:?}", seeded.body))
+        .to_string();
+
+    let signed = call(
+        router,
+        "POST",
+        "/signing-jobs/with-payload",
+        Some(json!({
+            "profileName": profile,
+            "payload": base64::encode([7_u8].as_slice()),
+            "payloadFormat": PAYLOAD_FORMAT,
+        })),
+    )
+    .await;
+    assert_eq!(
+        signed.status, 200,
+        "seeding the signature: got {} {:?}",
+        signed.status, signed.body
+    );
+    let job_id = signed.body["jobId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("seeding the signature: expected a jobId, got {:?}", signed.body))
+        .to_string();
+
+    (job_id, profile.to_string(), profile_version)
 }
