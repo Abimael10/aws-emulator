@@ -38,7 +38,7 @@ use emulator_server::CredentialStore;
 /// ([`IntegratedUserPools`]).
 pub use ::service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice::state::PresentedTokenUser;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -187,6 +187,11 @@ impl IdentityPool {
         }
         PoolLoginTrust {
             issuers,
+            // The pool's OTHER provider members name providers this trust states no issuer
+            // entry for, and a login keyed by one of them is still a login of a provider the
+            // pool IS configured with: what decides such a login lies elsewhere, so the trust
+            // refuses none of them ([`PoolLoginTrust::refuse_login`]).
+            named_providers: self.provider_names_outside_the_issuer_trust(),
             // WHY the trust holds no entry for an issuer is part of what a refusal says, so
             // the pool's whole provider configuration travels with the trust: a pool that
             // names no identity provider AT ALL is in a different state from one whose
@@ -242,6 +247,28 @@ impl IdentityPool {
     /// names no developer provider has no such entry at all.
     pub fn names_developer_provider(&self, provider_name: &str) -> bool {
         self.developer_provider_name.as_deref() == Some(provider_name)
+    }
+
+    /// The provider names this pool's configuration names that its login trust holds no
+    /// ISSUER entry for ([`Self::login_trust`]): the keys of its `SupportedLoginProviders`,
+    /// its `SamlProviderARNs`, the ARN spelling of its `OpenIdConnectProviderARNs` — whose
+    /// issuer spelling the trust does hold — and its own `DeveloperProviderName`.
+    ///
+    /// A `Logins` entry can be keyed by any of them ([`Self::names_federated_provider`]), and
+    /// each is decided by a rule of its own: the credential a public login provider issues
+    /// and the assertion a SAML provider issues are that provider's to decide, and a
+    /// developer user identifier is the account's own back end's. So these are the names the
+    /// issuer trust refuses nothing under, as against a name the pool's configuration does
+    /// not hold at all.
+    fn provider_names_outside_the_issuer_trust(&self) -> BTreeSet<String> {
+        self.supported_login_providers
+            .iter()
+            .flatten()
+            .map(|(named, _)| named.clone())
+            .chain(self.saml_provider_arns.iter().flatten().cloned())
+            .chain(self.open_id_connect_provider_arns.iter().flatten().cloned())
+            .chain(self.developer_provider_name.clone())
+            .collect()
     }
 
     /// Whether `provider_name` is one of this pool's `SamlProviderARNs`: a SAML identity
@@ -721,6 +748,10 @@ impl TrustedAudiences {
 #[derive(Debug, Default, Clone)]
 pub struct PoolLoginTrust {
     issuers: BTreeMap<String, TrustedAudiences>,
+    /// The provider names the pool's configuration names that state no issuer trust above
+    /// ([`IdentityPool::provider_names_outside_the_issuer_trust`]) — a login keyed by one of
+    /// them is of a provider the pool IS configured with, so the trust refuses none of them.
+    named_providers: BTreeSet<String>,
     /// Whether the pool names no identity provider of any kind
     /// ([`IdentityPool::configures_no_identity_provider`]) — which is what an issuer the
     /// trust holds no entry for is refused on, where it is refused at all.
@@ -751,14 +782,21 @@ impl PoolLoginTrust {
     /// readable audience is not refused here — its audience is decided by the provider that
     /// issued it, which this emulator does not reach.
     ///
-    /// An issuer the pool states NO trust for is refused only where the issuer is one this
-    /// emulator itself hosts (an Amazon Cognito user pool, whose provider name names it):
-    /// any other issuer's token is decided by that issuer, so the pool's configuration
-    /// alone does not refuse it.
+    /// An issuer the pool states NO trust for is refused wherever the entry is an OpenID
+    /// Connect federation at all ([`federates_its_own_issuer`]): whether such a login is
+    /// admitted is the POOL's own configuration to decide and needs nothing from the issuing
+    /// provider, so a federation whose issuer the pool's current configuration does not name
+    /// authorizes nothing. An entry that is no such federation — the opaque credential of a
+    /// public login provider, a SAML assertion, a developer user identifier — is decided by
+    /// the provider that issued it instead, so the trust refuses none of them.
     fn refuse_login(&self, provider_name: &str, token: &str) -> Option<LoginProviderRefusal> {
         let issuer = login_provider_issuer(provider_name);
         let Some(trusted) = self.issuers.get(issuer) else {
-            if !names_cognito_user_pool(issuer) {
+            // A provider the pool's configuration names outside this trust is one the pool IS
+            // configured with, whatever the value presented for it looks like.
+            if self.named_providers.contains(provider_name)
+                || !federates_its_own_issuer(provider_name, token)
+            {
                 return None;
             }
             // The pool holds no trust for this issuer, and WHY decides the wording: a pool
@@ -1097,6 +1135,42 @@ fn names_the_same_issuer(provider_name: &str, claimed: &str) -> bool {
         ::service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice
             ::state::is_pool_issuer(region, user_pool_id, claimed)
     })
+}
+
+/// Whether the `Logins` entry keyed by `provider_name` is an OPENID CONNECT FEDERATION of
+/// that provider — the kind of login whose admission the identity pool's OWN provider
+/// configuration decides, with nothing asked of the issuing provider.
+///
+/// Two readings say so, and each is taken from the request alone:
+///
+/// * the name names an Amazon Cognito user pool ([`names_cognito_user_pool`]), whose login
+///   is always that pool's identity token;
+/// * the value presented IS an identity token of that very provider — a readable claim set
+///   whose `iss`, "the principal that issued the JWT" (RFC 7519 §4.1.1), names the provider
+///   the entry is keyed by ([`names_the_same_issuer`]). WHICH host and path an OpenID Connect
+///   provider publishes its issuer on is that provider's own, so what makes an entry a
+///   federation is the token naming its own provider rather than the shape of that name.
+///
+/// A token THIS service minted is not one of them: it is presented under this service's own
+/// provider name ([`COGNITO_IDENTITY_LOGIN_PROVIDER`]) and claims this service as its issuer,
+/// and what it buys is decided by the issuance this service recorded for it rather than by a
+/// pool's federated-provider configuration.
+///
+/// The claim set is read through [`::service_common::jwt::read_unsecured`], the reading that
+/// leaves the signature judgement out, as every other reading of a presented token's issuer
+/// here is: the signature needs the issuer's published verification key, which this emulator
+/// makes no outbound connection to fetch.
+fn federates_its_own_issuer(provider_name: &str, token: &str) -> bool {
+    if provider_name == COGNITO_IDENTITY_LOGIN_PROVIDER {
+        return false;
+    }
+    if names_cognito_user_pool(login_provider_issuer(provider_name)) {
+        return true;
+    }
+    ::service_common::jwt::read_unsecured(token)
+        .ok()
+        .and_then(|read| read.claim_str(ISSUER_CLAIM).map(ToString::to_string))
+        .is_some_and(|issuer| names_the_same_issuer(provider_name, &issuer))
 }
 
 /// The region and user-pool id a user-pool provider name states, read out of the

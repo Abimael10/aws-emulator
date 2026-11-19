@@ -15,9 +15,12 @@
 //!   audience that trust does not accept. A trust whose accepted audiences this emulator
 //!   cannot know constrains none: another account's provider ARN, and a user pool named by
 //!   `CognitoIdentityProviders`, whose own token validation is not this rule. An issuer the
-//!   pool states no trust for is refused where the issuer is one this emulator itself hosts
-//!   (an Amazon Cognito user pool, which its provider name names); any other issuer's token
-//!   is decided by that issuer, which this emulator does not reach.
+//!   pool states no trust for is refused wherever the entry is an OpenID Connect FEDERATION
+//!   — a presented token whose own `iss` names the provider the entry is keyed by, whatever
+//!   host and path that issuer is published on — because whether such a login is admitted is
+//!   the pool's own configuration to decide; a login that is no such federation (a public
+//!   provider's opaque credential, a SAML assertion, a developer user identifier) is decided
+//!   by the provider that issued it.
 //! * ONE IDENTITY PER FEDERATED USER: `Logins` maps a provider name to a
 //!   "provider_user_identifier", so an admitted login resolves to the identity of the user
 //!   its token NAMES — every token naming one subject, whatever app client it was issued
@@ -923,5 +926,173 @@ async fn every_token_naming_one_subject_resolves_to_one_identity() {
                  {identity_id} and {other_identity}"
             );
         }
+    }
+}
+
+/// The issuer the pools of the removal table below keep through every update, so each row
+/// has a sibling provider that must go on vending while the dropped one is refused.
+const KEPT_ISSUER: &str = "auth.example.org/realms/kept";
+
+/// One row of the removal table: a provider registered with IAM, named by a pool, then
+/// dropped from it by `UpdateIdentityPool`.
+struct RemovalRow {
+    /// What this row is, named in every assertion it drives.
+    case: &'static str,
+    /// The issuer the dropped provider publishes, which is the `Logins` key of its tokens.
+    issuer: String,
+    /// The `aud` its token carries — a single string or a list, both of which RFC 7519
+    /// §4.1.3 allows.
+    audience: Value,
+}
+
+/// `UpdateIdentityPool` restating the pool as it was created, with `provider_arns` as its
+/// whole OpenID Connect provider set — the member the call REPLACES — asserting that the
+/// update and the following read both report exactly that set.
+async fn set_provider_arns(
+    emulator: &Emulator,
+    case: &str,
+    pool_id: &str,
+    pool_name: &str,
+    provider_arns: &[&String],
+) {
+    let asked: Vec<&str> = provider_arns.iter().map(|arn| arn.as_str()).collect();
+    let updated = emulator
+        .ok(
+            "UpdateIdentityPool",
+            &json!({
+                "IdentityPoolId": pool_id,
+                "IdentityPoolName": pool_name,
+                "AllowUnauthenticatedIdentities": true,
+                "OpenIdConnectProviderARNs": provider_arns,
+            }),
+        )
+        .await;
+    let described = emulator
+        .ok("DescribeIdentityPool", &json!({"IdentityPoolId": pool_id}))
+        .await;
+    for (read, reported) in [("the update", &updated), ("a later read", &described)] {
+        let named: Vec<&str> = reported["OpenIdConnectProviderARNs"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: {read} reports the provider set: {reported}")
+            })
+            .iter()
+            .map(|arn| arn.as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            named, asked,
+            "case {case:?}: expected {read} to report {asked:?}, got {reported}"
+        );
+    }
+}
+
+/// RULE, over the SHAPE of the issuer: a provider ARN `UpdateIdentityPool` dropped states no
+/// trust any more, so from the next call on a login of that issuer — a token naming it as its
+/// own `iss` — is refused `NotAuthorizedException` with the sentence AWS words for a provider
+/// the pool does not support, whatever host and path the provider publishes its issuer on.
+///
+/// It is a refusal to VEND and to resolve, nothing else: the identity keeps the login it was
+/// resolved under, a sibling provider the pool still names keeps vending at the same instant,
+/// and restoring the ARN makes the identical call serve again — the pool's CURRENT set is
+/// what the gate reads.
+///
+/// The rows differ along what the rule generalises over: the form of the dropped provider's
+/// issuer (a user pool's, a hosted provider's tenant path, an address with a port as a
+/// provider served on this machine publishes, a bare host) and how its token spells its
+/// audience.
+#[tokio::test]
+async fn a_dropped_provider_arn_stops_vending_whatever_shape_its_issuer_has() {
+    let emulator = Emulator::new();
+    let kept_arn = emulator.oidc_provider(KEPT_ISSUER, &[CLIENT_B]).await;
+    let kept_logins = json!({ KEPT_ISSUER: id_token(KEPT_ISSUER, json!(CLIENT_B)) });
+
+    let rows = [
+        RemovalRow {
+            case: "an Amazon Cognito user pool's issuer",
+            issuer: user_pool_issuer("us-east-1_removed01"),
+            audience: json!(CLIENT_A),
+        },
+        RemovalRow {
+            case: "a hosted provider's tenant path",
+            issuer: "auth.example.com/tenants/7".to_string(),
+            audience: json!(CLIENT_A),
+        },
+        RemovalRow {
+            case: "an address with a port, as a provider served on this machine publishes",
+            issuer: "127.0.0.1:9297/us-east-1_served01".to_string(),
+            audience: json!([CLIENT_A, CLIENT_B]),
+        },
+        RemovalRow {
+            case: "a bare host",
+            issuer: "accounts.example.net".to_string(),
+            audience: json!([CLIENT_A]),
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let RemovalRow {
+            case,
+            issuer,
+            audience,
+        } = row;
+        let dropped_arn = emulator.oidc_provider(issuer, &[CLIENT_A]).await;
+        let pool_name = format!("oidc-removed-{index}");
+        let pool_id = emulator
+            .pool(
+                &pool_name,
+                json!({"OpenIdConnectProviderARNs": [&dropped_arn, &kept_arn]}),
+            )
+            .await;
+        let logins = json!({ issuer.as_str(): id_token(issuer, audience.clone()) });
+
+        // The control: while the pool names the provider, its token resolves an identity and
+        // vends the pool's role — and so does the sibling's.
+        let identity_id = admitted(&emulator, case, &pool_id, &logins).await;
+        let kept_identity = admitted(&emulator, case, &pool_id, &kept_logins).await;
+
+        set_provider_arns(&emulator, case, &pool_id, &pool_name, &[&kept_arn]).await;
+
+        // The identical call, after the removal: refused, with nothing vended.
+        refused(
+            &emulator,
+            case,
+            &pool_id,
+            &identity_id,
+            &logins,
+            UNSUPPORTED_PROVIDER_MESSAGE,
+        )
+        .await;
+
+        // A refusal to vend, not an unlink: the identity still carries the login it was
+        // resolved under, and the sibling provider still vends for its own identity.
+        let linked = described_logins(&emulator, case, &identity_id).await;
+        assert_eq!(
+            linked,
+            vec![issuer.clone()],
+            "case {case:?}: the refused identity keeps its login, got {linked:?}"
+        );
+        let vending_again = admitted(&emulator, case, &pool_id, &kept_logins).await;
+        assert_eq!(
+            vending_again, kept_identity,
+            "case {case:?}: the sibling provider keeps vending for its own identity, got \
+             {vending_again}"
+        );
+
+        // Restoring the ARN restores the admission: the same call is served again, for the
+        // identity it already resolved.
+        set_provider_arns(
+            &emulator,
+            case,
+            &pool_id,
+            &pool_name,
+            &[&dropped_arn, &kept_arn],
+        )
+        .await;
+        let restored = admitted(&emulator, case, &pool_id, &logins).await;
+        assert_eq!(
+            restored, identity_id,
+            "case {case:?}: the restored provider vends for the identity it already resolved, \
+             got {restored}"
+        );
     }
 }
