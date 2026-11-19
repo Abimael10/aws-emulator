@@ -352,6 +352,12 @@ pub enum AggregationFieldRejection {
         /// The index the request aggregates over.
         index_name: String,
     },
+    /// The aggregation reads the values of ONE field and the request named none, so
+    /// there is no field to aggregate at all. Carries the aggregation that needs one.
+    Missing {
+        /// The aggregation the request asked for.
+        aggregation_name: String,
+    },
     /// The field is indexed, and the aggregation asked for some VALUES its type cannot
     /// be summarised by — the arithmetic statistics of a field that holds no numbers.
     UnsupportedValues {
@@ -388,6 +394,9 @@ impl AggregationFieldRejection {
             } => format!(
                 "Aggregation field {aggregation_field} is not indexed in index {index_name}; add \
                  it as a custom field by calling UpdateIndexingConfiguration"
+            ),
+            Self::Missing { aggregation_name } => format!(
+                "Aggregation field is required for the {aggregation_name} aggregation"
             ),
             Self::UnsupportedValues {
                 aggregation_name,

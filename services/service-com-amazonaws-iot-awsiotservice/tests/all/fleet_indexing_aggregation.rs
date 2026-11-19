@@ -30,7 +30,11 @@
 //!   and nothing more where it does not;
 //! * `GetCardinality` counts the DISTINCT values one field holds across the things a
 //!   query selects, so a repeated value counts once and a request naming no field counts
-//!   the selected records themselves.
+//!   the selected records themselves;
+//! * `GetPercentiles` positions the percentile groups it is asked for — the default
+//!   groups where the request names none — in the distribution of ONE numeric field's
+//!   values across the things a query selects, interpolating between the two neighbouring
+//!   values where a group's position falls between them.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -1250,10 +1254,434 @@ async fn statistics_over_an_absent_index_or_an_unindexed_field_are_refused() {
     }
 }
 
-/// A managed field the index carries as a FLAG, so a case can show which field types a
-/// count of distinct VALUES is asked of. `Boolean` is one of the modelled `FieldType`
-/// values (`smithy_query(query="shape",shape="FieldType")`).
+/// A managed field the index carries as a FLAG, so a case can show which field types an
+/// aggregation is computed over: the distinct VALUES of a field are not counted for a
+/// flag, and a position in a distribution is read only off numbers. `Boolean` is one of
+/// the modelled `FieldType` values (`smithy_query(query="shape",shape="FieldType")`).
 const BOOLEAN_MANAGED_FIELD: &str = "connectivity.connected";
+
+impl Emulator {
+    async fn percentiles(&self, body: &Value) -> Reply {
+        self.dispatch("POST", "/indices/percentiles", Some(body))
+            .await
+    }
+}
+
+impl Reply {
+    /// The `(percent, value)` pairs a `GetPercentiles` answer carries, in the order it
+    /// reported them.
+    ///
+    /// A distribution with no values has no groups in it, which the answer carries as no
+    /// pairs at all.
+    fn percentiles(&self) -> Vec<(f64, f64)> {
+        let body = self.json();
+        body["percentiles"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|pair| {
+                let percent = pair["percent"].as_f64().unwrap_or_else(|| {
+                    panic!("each percentile pair carries a percent, got {pair}")
+                });
+                let value = pair["value"]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("each percentile pair carries a value, got {pair}"));
+                (percent, value)
+            })
+            .collect()
+    }
+}
+
+/// The percentile groups a request that names none is answered for: "The default
+/// percentile groupings are: 1,5,25,50,75,95,99"
+/// (`smithy_query(query="doc",shape="GetPercentiles")`).
+const DEFAULT_PERCENT_GROUPS: &[f64] = &[1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0];
+
+/// One `GetPercentiles` case: which things the query selects, which field is positioned,
+/// which groups are asked for, and where each group stands.
+struct PercentileCase {
+    label: &'static str,
+    query: &'static str,
+    field: &'static str,
+    /// The `percents` asked for, or `None` for a request that names none.
+    percents: Option<Vec<f64>>,
+    /// The `(percent, value)` pairs the answer must carry, in order.
+    expected: Vec<(f64, f64)>,
+}
+
+/// RULE: `GetPercentiles` positions the groups it is asked for in the distribution of ONE
+/// numeric field's values across the things the query selects — the group `p` standing `p`
+/// percent of the way through those values in order, interpolated between the two
+/// neighbouring values where the position falls between them — so every figure is computed
+/// over the account's own registry.
+#[tokio::test]
+async fn percentiles_position_the_groups_in_the_field_the_query_selects() {
+    let emulator = Emulator::with_numeric_custom_field("percentiles").await;
+    for thing_type_name in ["sensor", "gateway"] {
+        emulator
+            .create_thing_type("percentiles", thing_type_name)
+            .await;
+    }
+    // Five things carrying a numeric attribute and one carrying none: every figure
+    // asserted below is a property of THESE values (10, 20, 30, 40 on the sensors and 100
+    // on the gateway), so a wrong distribution cannot answer the table.
+    for (thing_name, thing_type_name, temperature) in [
+        ("sensor-1", "sensor", "10"),
+        ("sensor-2", "sensor", "20"),
+        ("sensor-3", "sensor", "30"),
+        ("sensor-4", "sensor", "40"),
+        ("gateway-1", "gateway", "100"),
+    ] {
+        emulator
+            .create_thing(
+                "percentiles",
+                thing_name,
+                Some(thing_type_name),
+                &[(NUMERIC_ATTRIBUTE, temperature)],
+            )
+            .await;
+    }
+    emulator
+        .create_thing("percentiles", "spare-1", None, &[])
+        .await;
+
+    // The rows differ along what the rule generalises over: which groups are asked for
+    // (the defaults, an explicit set, the published bounds of a group, a set given out of
+    // order and twice), how many values the query selects (the whole registry, one type,
+    // one thing, none), and which numeric field is positioned (a custom attribute and a
+    // managed registry field).
+    let cases = vec![
+        PercentileCase {
+            label: "the default groups over the whole registry",
+            query: "thingName:*",
+            field: NUMERIC_ATTRIBUTE_FIELD,
+            percents: None,
+            // 10, 20, 30, 40, 100: the group p stands at p/100 of the way from the first
+            // value to the last, so 1 is a fortieth of the step 10 -> 20 and 95 is four
+            // fifths of the step 40 -> 100.
+            expected: vec![
+                (1.0, 10.4),
+                (5.0, 12.0),
+                (25.0, 20.0),
+                (50.0, 30.0),
+                (75.0, 40.0),
+                (95.0, 88.0),
+                (99.0, 97.6),
+            ],
+        },
+        PercentileCase {
+            label: "the groups the request names",
+            query: "thingName:*",
+            field: NUMERIC_ATTRIBUTE_FIELD,
+            percents: Some(vec![25.0, 50.0, 75.0]),
+            expected: vec![(25.0, 20.0), (50.0, 30.0), (75.0, 40.0)],
+        },
+        PercentileCase {
+            label: "the published bounds of a percentile group",
+            query: "thingName:*",
+            field: NUMERIC_ATTRIBUTE_FIELD,
+            // `Percent` is modelled `range 0..100`
+            // (`smithy_query(query="shape",shape="Percent")`), so the whole of the
+            // distribution is asked for at its bounds: its lowest and its highest value.
+            percents: Some(vec![0.0, 100.0]),
+            expected: vec![(0.0, 10.0), (100.0, 100.0)],
+        },
+        PercentileCase {
+            label: "groups named out of order and twice",
+            query: "thingName:*",
+            field: NUMERIC_ATTRIBUTE_FIELD,
+            percents: Some(vec![50.0, 25.0, 50.0]),
+            expected: vec![(25.0, 20.0), (50.0, 30.0)],
+        },
+        PercentileCase {
+            label: "a query selecting part of the registry",
+            query: "thingTypeName:sensor",
+            field: NUMERIC_ATTRIBUTE_FIELD,
+            percents: Some(vec![0.0, 25.0, 50.0, 75.0, 100.0]),
+            // 10, 20, 30, 40: the median falls BETWEEN two values and is read off the
+            // line between them.
+            expected: vec![
+                (0.0, 10.0),
+                (25.0, 17.5),
+                (50.0, 25.0),
+                (75.0, 32.5),
+                (100.0, 40.0),
+            ],
+        },
+        PercentileCase {
+            label: "a query selecting one thing",
+            query: "thingName:gateway-1",
+            field: NUMERIC_ATTRIBUTE_FIELD,
+            percents: Some(vec![1.0, 50.0, 99.0]),
+            // One value is the whole distribution, so every group stands at it.
+            expected: vec![(1.0, 100.0), (50.0, 100.0), (99.0, 100.0)],
+        },
+        PercentileCase {
+            label: "a managed field the index carries as a number",
+            query: "thingName:*",
+            field: "registry.version",
+            percents: Some(vec![0.0, 50.0, 100.0]),
+            // A create leaves every thing at registry version 1.
+            expected: vec![(0.0, 1.0), (50.0, 1.0), (100.0, 1.0)],
+        },
+        PercentileCase {
+            label: "a query selecting a thing that carries no value for the field",
+            query: "thingName:spare-1",
+            field: NUMERIC_ATTRIBUTE_FIELD,
+            percents: Some(vec![50.0]),
+            expected: Vec::new(),
+        },
+        PercentileCase {
+            label: "a query selecting nothing at all",
+            query: "thingName:absent-*",
+            field: NUMERIC_ATTRIBUTE_FIELD,
+            percents: None,
+            expected: Vec::new(),
+        },
+    ];
+    for case in &cases {
+        let mut request = json!({
+            "queryString": case.query,
+            "aggregationField": case.field,
+        });
+        if let Some(percents) = case.percents.as_ref() {
+            request["percents"] = json!(percents);
+        }
+        let answer = emulator.percentiles(&request).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {}: expected 200, got {} body {}",
+            case.label,
+            answer.status,
+            answer.text()
+        );
+        let reported = answer.percentiles();
+        assert_eq!(
+            reported.len(),
+            case.expected.len(),
+            "case {}: expected {} groups {:?}, got {reported:?}",
+            case.label,
+            case.expected.len(),
+            case.expected
+        );
+        for (expected, actual) in case.expected.iter().zip(reported.iter()) {
+            let (expected_percent, expected_value) = *expected;
+            let (actual_percent, actual_value) = *actual;
+            assert!(
+                (actual_percent - expected_percent).abs() <= TOLERANCE,
+                "case {}: expected group {expected_percent}, got {actual_percent}",
+                case.label
+            );
+            assert!(
+                (actual_value - expected_value).abs()
+                    <= TOLERANCE * expected_value.abs().max(1.0),
+                "case {}: expected group {expected_percent} at {expected_value}, got \
+                 {actual_value}",
+                case.label
+            );
+        }
+    }
+
+    // A request naming no groups is answered for the DEFAULT groups, which is what the
+    // first row asserted the values of: the groups themselves are asserted here against
+    // the published list, so the default cannot drift.
+    let defaulted = emulator
+        .percentiles(&json!({
+            "queryString": "thingName:*",
+            "aggregationField": NUMERIC_ATTRIBUTE_FIELD,
+        }))
+        .await;
+    let groups: Vec<f64> = defaulted
+        .percentiles()
+        .into_iter()
+        .map(|(percent, _value)| percent)
+        .collect();
+    assert_eq!(
+        groups,
+        DEFAULT_PERCENT_GROUPS.to_vec(),
+        "case a request naming no percents: expected the default groups {:?}, got {:?}",
+        DEFAULT_PERCENT_GROUPS,
+        defaulted.text()
+    );
+
+    // One more thing carrying a HIGHER value moves the distribution, which is what makes
+    // the figures computed over the account's own records rather than fixed.
+    emulator
+        .create_thing(
+            "percentiles",
+            "sensor-5",
+            Some("sensor"),
+            &[(NUMERIC_ATTRIBUTE, "200")],
+        )
+        .await;
+    let after = emulator
+        .percentiles(&json!({
+            "queryString": "thingName:*",
+            "aggregationField": NUMERIC_ATTRIBUTE_FIELD,
+            "percents": [50.0, 100.0],
+        }))
+        .await;
+    // 10, 20, 30, 40, 100, 200: the median now falls between 30 and 40.
+    assert_eq!(
+        after.percentiles(),
+        vec![(50.0, 35.0), (100.0, 200.0)],
+        "case a thing carrying a new highest value: expected the groups to move, got {}",
+        after.text()
+    );
+}
+
+/// RULE: the groups are positioned in a distribution the INDEX holds, over a field it
+/// carries as numbers, so the index's own state and the request's field decide the
+/// refusal — and the same request is answered once the index is ACTIVE.
+#[tokio::test]
+async fn percentiles_over_an_absent_index_or_an_unpositionable_field_are_refused() {
+    let request = json!({
+        "queryString": "thingName:*",
+        "aggregationField": "registry.version",
+    });
+
+    // No indexing configured at all: there is no index to position values in.
+    let emulator = Emulator::new();
+    let refused = emulator.percentiles(&request).await;
+    assert_eq!(
+        refused.status,
+        404,
+        "case no indexing configured: expected 404, got {} body {}",
+        refused.status,
+        refused.text()
+    );
+    assert_eq!(
+        refused.error_code(),
+        "ResourceNotFoundException",
+        "case no indexing configured: expected ResourceNotFoundException, got {}",
+        refused.text()
+    );
+
+    // Turned on, the index exists but is still building until the clock makes it active.
+    emulator
+        .enable_thing_index("percentiles while building")
+        .await;
+    emulator.hold_index_build();
+    let building = emulator.percentiles(&request).await;
+    assert_eq!(
+        building.status,
+        400,
+        "case the index still building: expected 400, got {} body {}",
+        building.status,
+        building.text()
+    );
+    assert_eq!(
+        building.error_code(),
+        "IndexNotReadyException",
+        "case the index still building: expected IndexNotReadyException, got {}",
+        building.text()
+    );
+
+    // ACTIVE, the same request is answered — over a registry holding no thing at all,
+    // which is a distribution with no values in it rather than a refusal.
+    emulator.finish_index_build();
+    let answered = emulator.percentiles(&request).await;
+    assert_eq!(
+        answered.status,
+        200,
+        "case the index ACTIVE over an empty registry: expected 200, got {} body {}",
+        answered.status,
+        answered.text()
+    );
+    assert_eq!(
+        answered.percentiles(),
+        Vec::new(),
+        "case the index ACTIVE over an empty registry: expected no groups, got {}",
+        answered.text()
+    );
+
+    // Each remaining row is one rule the request broke: a name that is no fleet index of
+    // this service, a field the index does not carry, a field the index carries as text
+    // rather than as the numbers a position is read off, a request naming no field at all,
+    // a string that is not a query, and a group past the published bound of a percentile.
+    let rows = vec![
+        (
+            "an index name this service does not serve",
+            json!({
+                "indexName": "AWS_Nothing",
+                "queryString": "thingName:*",
+                "aggregationField": "registry.version",
+            }),
+            400,
+            "InvalidRequestException",
+        ),
+        (
+            "a field the index does not carry",
+            json!({
+                "queryString": "thingName:*",
+                "aggregationField": UNDECLARED_ATTRIBUTE_FIELD,
+            }),
+            400,
+            "InvalidRequestException",
+        ),
+        (
+            "a field the index carries as text",
+            json!({
+                "queryString": "thingName:*",
+                "aggregationField": DECLARED_ATTRIBUTE_FIELD,
+            }),
+            400,
+            "InvalidRequestException",
+        ),
+        (
+            "a field the index carries as a flag",
+            json!({
+                "queryString": "thingName:*",
+                "aggregationField": BOOLEAN_MANAGED_FIELD,
+            }),
+            400,
+            "InvalidRequestException",
+        ),
+        (
+            "a request naming no aggregation field",
+            json!({ "queryString": "thingName:*" }),
+            400,
+            "InvalidRequestException",
+        ),
+        (
+            "a query string that is not a query",
+            json!({
+                "queryString": "thingName:(",
+                "aggregationField": "registry.version",
+            }),
+            400,
+            "InvalidQueryException",
+        ),
+        (
+            "a percentile group past the published bound",
+            json!({
+                "queryString": "thingName:*",
+                "aggregationField": "registry.version",
+                "percents": [101.0],
+            }),
+            400,
+            "InvalidRequestException",
+        ),
+    ];
+    for (label, request, status, expected) in &rows {
+        let refused = emulator.percentiles(request).await;
+        assert_eq!(
+            refused.status,
+            *status,
+            "case {label}: expected {status}, got {} body {}",
+            refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            &refused.error_code(),
+            expected,
+            "case {label}: expected {expected}, got {}",
+            refused.text()
+        );
+    }
+}
 
 impl Emulator {
     async fn cardinality(&self, body: &Value) -> Reply {

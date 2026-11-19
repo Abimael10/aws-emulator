@@ -483,6 +483,77 @@ fn summarise(values: &[f64]) -> Option<NumericSummary> {
     })
 }
 
+/// The percentile groups an aggregation that names none reports.
+///
+/// "The default percentile groupings are: 1,5,25,50,75,95,99, although you can specify
+/// your own when you call GetPercentiles"
+/// (`smithy_query(query="doc",shape="GetPercentiles")`), so a request carrying no
+/// `percents` asks for exactly these.
+pub const DEFAULT_PERCENTS: &[f64] = &[1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0];
+
+/// The value each percentile group of `percents` stands at, over the numbers `field`
+/// holds across `documents` — one `(percent, value)` pair per group asked for.
+///
+/// A percentile is a POSITION in the distribution of the selected values: "The
+/// percentile group "1" contains the aggregated field value that occurs in approximately
+/// one percent of the values that match the query", so the group `p` reports the value
+/// `p` percent of the way through those values once they are in order, interpolated
+/// between the two neighbouring values when the position falls between them. The groups
+/// are reported in ascending order and once each, a group being a position rather than a
+/// value of its own, so two reads of one store report the same pairs in the same order.
+///
+/// A document carrying no value for the field contributes nothing to the distribution,
+/// exactly as it is in no bucket of [`terms_buckets`], and a document carrying several
+/// values for one field contributes each of them. Values nothing holds have no positions
+/// at all, so an empty distribution reports NO groups rather than a figure for each.
+///
+/// CPU-BOUND, like [`documents_matching`] whose answer it positions: a caller runs it off
+/// the async worker and with no store lock held. What it costs is the values the scan
+/// already bounded, in order, plus one position per group the request itself carries —
+/// nothing is sized from a figure the request names.
+pub fn field_percentiles(
+    documents: &[IndexedDocument],
+    field: &str,
+    percents: &[f64],
+) -> Vec<(f64, f64)> {
+    let mut values: Vec<f64> = documents
+        .iter()
+        .flat_map(|document| document.get(field).into_iter().flatten())
+        .filter_map(|value| value.parse::<f64>().ok())
+        .filter(|number| number.is_finite())
+        .collect();
+    if values.is_empty() {
+        return Vec::new();
+    }
+    values.sort_by(f64::total_cmp);
+    let mut asked: Vec<f64> = percents
+        .iter()
+        .copied()
+        .filter(|percent| percent.is_finite())
+        .collect();
+    asked.sort_by(f64::total_cmp);
+    asked.dedup();
+    asked
+        .into_iter()
+        .map(|percent| (percent, percentile_of(&values, percent)))
+        .collect()
+}
+
+/// Where the group `percent` stands in `sorted`, a non-empty ascending run of numbers.
+///
+/// The position `percent` percent of the way through the run is `percent / 100` of the
+/// way from its first value to its last; where that falls between two values the figure
+/// is read off the line between them, so a group no value sits exactly at still reports a
+/// figure the distribution supports rather than the nearest value to it.
+fn percentile_of(sorted: &[f64], percent: f64) -> f64 {
+    let last = sorted.len() - 1;
+    let rank = percent.clamp(0.0, 100.0) / 100.0 * last as f64;
+    let below = rank.floor();
+    let low = sorted[below as usize];
+    let high = sorted[rank.ceil() as usize];
+    low + (high - low) * (rank - below)
+}
+
 /// One bounded walk of a query's tokens against ONE document.
 ///
 /// The grammar is the one [`super::fleet_query`] reads: terms joined by `AND` / `OR`,
