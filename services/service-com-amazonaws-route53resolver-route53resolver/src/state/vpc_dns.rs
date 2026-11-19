@@ -58,6 +58,9 @@ use std::time::Instant;
 use ::service_com_amazonaws_route53_awsdnsv20130401::ops::types::shared_types::ResourceRecordSet;
 use ::service_com_amazonaws_route53_awsdnsv20130401::state as route53;
 
+use ::service_common::vpc_dns_firewall::FirewallDecision;
+
+use super::dns_firewall::{qtype_number, FirewallView};
 use super::{ec2, ENDPOINT_STATUS_OPERATIONAL, IP_STATUS_ATTACHED};
 
 /// The link-local address every VPC's own Resolver answers at: "the Route 53 Resolver …
@@ -197,6 +200,9 @@ pub struct VpcDnsView {
     servers: Vec<DnsServer>,
     /// The private hosted zones associated with the VPC, most specific first.
     zones: Vec<ViewZone>,
+    /// The DNS Firewall filtering this VPC's queries, which decides a query BEFORE any zone
+    /// is read for it ([`super::dns_firewall`]).
+    firewall: FirewallView,
 }
 
 /// One address of the VPC that answers DNS.
@@ -283,10 +289,16 @@ impl VpcDnsView {
         self.nameserver.to_string()
     }
 
-    /// The answer itself: the zone the name falls in, and what that zone holds for it.
+    /// The answer itself: what the DNS Firewall decides about the name, and otherwise the zone
+    /// the name falls in and what that zone holds for it.
     fn resolved(&self, name: &str, record_type: &str) -> Answer {
         let asked = route53::canonical_dns_name(name);
         let record_type = record_type.trim().to_ascii_uppercase();
+        // The firewall decides a query before anything resolves the name: a blocked name is
+        // answered the rule's way whether or not any zone of this VPC holds it.
+        if let Some(blocked) = self.blocked(&asked, &record_type) {
+            return blocked;
+        }
         let Some(zone) = self.zone_for(&asked) else {
             return Answer {
                 code: ResponseCode::ServFail,
@@ -373,6 +385,50 @@ impl VpcDnsView {
         }
     }
 
+    /// What the DNS Firewall answers a query for the canonical name `asked` of `record_type`
+    /// with, or `None` for a query it lets through — one no rule of the view matches, and one
+    /// a matched `ALLOW` or `ALERT` rule permits.
+    ///
+    /// A block is the resolver's own answer rather than a zone's, so it is not authoritative:
+    /// `NXDOMAIN` carries no record, `NODATA` is a successful answer with no record, and
+    /// `OVERRIDE` carries the rule's own record under the name that was asked for.
+    fn blocked(&self, asked: &str, record_type: &str) -> Option<Answer> {
+        if self.firewall.is_empty() {
+            return None;
+        }
+        // A spelling this emulator cannot number is still a query the firewall decides: a rule
+        // that names no `Qtype` evaluates every type, so the number is passed as what it is —
+        // unknown — rather than taking the query out of the firewall's reach.
+        let qtype = qtype_number(record_type);
+        match self.firewall.decision(asked, qtype)? {
+            FirewallDecision::Allow => None,
+            FirewallDecision::BlockNxDomain => Some(Answer {
+                code: ResponseCode::NxDomain,
+                authoritative: false,
+                records: Vec::new(),
+            }),
+            FirewallDecision::BlockNoData => Some(Answer {
+                code: ResponseCode::NoError,
+                authoritative: false,
+                records: Vec::new(),
+            }),
+            FirewallDecision::BlockOverride {
+                domain,
+                dns_type,
+                ttl,
+            } => Some(Answer {
+                code: ResponseCode::NoError,
+                authoritative: false,
+                records: vec![AnsweredRecord {
+                    name: asked.to_string(),
+                    ttl: i64::from(ttl),
+                    record_type: dns_type,
+                    value: route53::canonical_dns_name(&domain),
+                }],
+            }),
+        }
+    }
+
     /// The zone of this view a query for `asked` is answered out of: the one whose name is the
     /// LONGEST suffix of the name, and `None` when no zone of the VPC holds it.
     ///
@@ -438,6 +494,7 @@ pub fn view_from_instance<Eng: Send + Sync + 'static>(
         nameserver,
         servers,
         zones: zones_of_vpc(engine, &client.vpc_id),
+        firewall: super::dns_firewall::view_for_vpc(engine, &client.vpc_id),
     })
 }
 
@@ -753,6 +810,9 @@ mod tests {
                 name: "example.internal.".to_string(),
                 records,
             }],
+            // The rows below are about the zones; a view whose VPC no rule group reaches
+            // filters nothing, which is every row here.
+            firewall: FirewallView::default(),
         }
     }
 
@@ -922,6 +982,147 @@ mod tests {
             assert_eq!(
                 &answered, expected,
                 "case {case:?}: expected {expected:?}, got {answered:?}"
+            );
+        }
+    }
+
+    /// RULE: the DNS Firewall of the VPC decides a query BEFORE any zone is read for it, so a
+    /// name a matched `BLOCK` rule covers is answered that rule's `BlockResponse` way whether
+    /// or not a zone of the VPC holds the name, while a name no rule covers — and one a
+    /// matched `ALLOW` rule permits — is answered out of the zones exactly as before.
+    ///
+    /// The rows differ along what the rule generalises over: the `BlockResponse` (`NXDOMAIN`,
+    /// `NODATA`, `OVERRIDE`), whether the blocked name is one the VPC's own zone holds, the
+    /// action of the rule that matched, and the record type asked for — including one this
+    /// emulator cannot number, which a rule naming no query type still decides.
+    #[test]
+    fn a_blocked_name_is_answered_by_the_firewall_rather_than_by_the_zone() {
+        let link_local = Ipv4Addr::from(VPC_RESOLVER_LINK_LOCAL_OCTETS).to_string();
+        // One row: the case, the firewall the VPC is filtered by, the name asked for, the record
+        // type asked of it, and the answer that query must come back with.
+        let rows: &[(&str, FirewallView, &str, &str, Answer)] = &[
+            (
+                "a name of the VPC's own zone, blocked with NXDOMAIN",
+                FirewallView::of_rule(
+                    &["app.example.internal"],
+                    None,
+                    FirewallDecision::BlockNxDomain,
+                ),
+                "app.example.internal",
+                TYPE_A,
+                Answer {
+                    code: ResponseCode::NxDomain,
+                    authoritative: false,
+                    records: Vec::new(),
+                },
+            ),
+            (
+                "a name under no zone of the VPC, blocked with NXDOMAIN",
+                FirewallView::of_rule(&["example.com"], None, FirewallDecision::BlockNxDomain),
+                "example.com",
+                TYPE_A,
+                Answer {
+                    code: ResponseCode::NxDomain,
+                    authoritative: false,
+                    records: Vec::new(),
+                },
+            ),
+            (
+                "a blocked name whose rule answers NODATA",
+                FirewallView::of_rule(
+                    &["app.example.internal"],
+                    None,
+                    FirewallDecision::BlockNoData,
+                ),
+                "app.example.internal",
+                TYPE_A,
+                Answer {
+                    code: ResponseCode::NoError,
+                    authoritative: false,
+                    records: Vec::new(),
+                },
+            ),
+            (
+                "a blocked name whose rule answers its own record",
+                FirewallView::of_rule(
+                    &["app.example.internal"],
+                    None,
+                    FirewallDecision::BlockOverride {
+                        domain: "safe.example.net".to_string(),
+                        dns_type: TYPE_CNAME.to_string(),
+                        ttl: 30,
+                    },
+                ),
+                "app.example.internal",
+                TYPE_A,
+                Answer {
+                    code: ResponseCode::NoError,
+                    authoritative: false,
+                    records: vec![AnsweredRecord {
+                        name: "app.example.internal.".to_string(),
+                        ttl: 30,
+                        record_type: TYPE_CNAME.to_string(),
+                        value: "safe.example.net.".to_string(),
+                    }],
+                },
+            ),
+            (
+                "a name a matched ALLOW rule permits",
+                FirewallView::of_rule(&["app.example.internal"], None, FirewallDecision::Allow),
+                "app.example.internal",
+                TYPE_A,
+                Answer {
+                    code: ResponseCode::NoError,
+                    authoritative: true,
+                    records: vec![AnsweredRecord {
+                        name: "app.example.internal.".to_string(),
+                        ttl: 300,
+                        record_type: TYPE_A.to_string(),
+                        value: "192.0.2.10".to_string(),
+                    }],
+                },
+            ),
+            (
+                "a name the firewall's rule does not cover",
+                FirewallView::of_rule(&["blocked.example.com"], None, FirewallDecision::BlockNxDomain),
+                "app.example.internal",
+                TYPE_A,
+                Answer {
+                    code: ResponseCode::NoError,
+                    authoritative: true,
+                    records: vec![AnsweredRecord {
+                        name: "app.example.internal.".to_string(),
+                        ttl: 300,
+                        record_type: TYPE_A.to_string(),
+                        value: "192.0.2.10".to_string(),
+                    }],
+                },
+            ),
+            (
+                "a blocked name asked of a record type this emulator cannot number, whose rule \
+                 names no query type",
+                FirewallView::of_rule(
+                    &["app.example.internal"],
+                    None,
+                    FirewallDecision::BlockNxDomain,
+                ),
+                "app.example.internal",
+                "HTTPS",
+                Answer {
+                    code: ResponseCode::NxDomain,
+                    authoritative: false,
+                    records: Vec::new(),
+                },
+            ),
+        ];
+        for (case, firewall, name, record_type, expected) in rows {
+            let mut filtered = view();
+            filtered.firewall = firewall.clone();
+            let answered = filtered.answer(&link_local, name, record_type, PROTOCOL_UDP);
+            assert_eq!(
+                answered,
+                Resolution::Answered(expected.clone()),
+                "case {case:?}: expected {expected:?} for {name} ({record_type}), got {answered:?}"
             );
         }
     }

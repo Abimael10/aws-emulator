@@ -45,6 +45,11 @@ use crate::ops::types::{
 // resource family's records, refusals and the store methods that write them,
 // and the root re-exports them all so every handler reaches them from
 // `crate::state`.
+/// What DNS Firewall decides about a query asked inside a VPC: which rule groups reach that
+/// VPC — its own associations, and the Route 53 Profiles associated with it — and what the
+/// first rule matching the name asked for does to the query. `pub` because the components
+/// that answer in-VPC queries take the view and decide their queries against it.
+pub mod dns_firewall;
 mod domain_imports;
 mod firewall_associations;
 mod firewall_rules;
@@ -58,6 +63,7 @@ mod vpc_configs;
 /// associated with the VPC answer. `pub` because the component that reaches into a VPC client
 /// takes the view and answers its queries out of it.
 pub mod vpc_dns;
+pub use dns_firewall::*;
 pub use domain_imports::*;
 pub use firewall_associations::*;
 pub use firewall_rules::*;

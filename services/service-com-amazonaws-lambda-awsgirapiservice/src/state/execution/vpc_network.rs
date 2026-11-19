@@ -14,11 +14,13 @@
 //!   the destination's own subnet when there is one and otherwise the first the function holds.
 //!   An address OUTSIDE the VPC's ranges has no route through the attachment, so it is answered
 //!   the way a host with no route to an address answers one;
-//! * the VPC's own DNS resolver, at the second address of the VPC's IPv4 range — "the Amazon
-//!   DNS server … is located at the base of your VPC network range plus two" (Amazon VPC User
-//!   Guide, "Amazon DNS server") — which answers the queries the function sends it while the
-//!   VPC's `enableDnsSupport` attribute is on: "If … enableDnsSupport is false, the Amazon
-//!   Route 53 Resolver server cannot resolve … DNS hostnames"
+//! * the VPC's own DNS resolver, which answers at the second address of the VPC's IPv4 range —
+//!   "the Amazon DNS server … is located at the base of your VPC network range plus two"
+//!   (Amazon VPC User Guide, "Amazon DNS server") — and at the LINK-LOCAL address every VPC's
+//!   resolver also answers at ([`LINK_LOCAL_RESOLVER`]), reachable from any execution
+//!   environment the VPC holds an interface for. It answers the queries the function sends it
+//!   while the VPC's `enableDnsSupport` attribute is on: "If … enableDnsSupport is false, the
+//!   Amazon Route 53 Resolver server cannot resolve … DNS hostnames"
 //!   (`ModifyVpcAttributeRequest$EnableDnsSupport`).
 //!
 //! What that resolver answers is the VPC's OWN internal zone — the Region's private DNS domain
@@ -31,6 +33,14 @@
 //! read and written by the `simple-dns` crate, so what travels is a real DNS exchange rather
 //! than a shape of this module's own.
 //!
+//! Before the resolver reads anything for a query, the DNS FIREWALL filtering that VPC decides
+//! it: the rule groups that reach the VPC — its own associations, and the Route 53 Profiles
+//! associated with it — are the records of the service that OWNS DNS Firewall, so the decision
+//! is read out of the register that service records itself in
+//! ([`::service_common::vpc_dns_firewall`]) rather than out of a copy of the rules held here. A
+//! name a matched `BLOCK` rule covers is answered that rule's `BlockResponse` way instead of
+//! out of the zone; an engine no such service is mounted on filters nothing.
+//!
 //! The attachment is read out of the EC2 inventory ONCE, when the invocation's seam is built
 //! ([`attachment_of`]), which is the point the execution environment is given its place in the
 //! VPC; nothing here writes to that inventory. A function attached to no VPC has no attachment
@@ -41,7 +51,10 @@ use ::std::net::Ipv4Addr;
 
 use ::ipnet::Ipv4Net;
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
-use ::simple_dns::rdata::{RData, A, PTR};
+use ::service_common::vpc_dns_firewall::{
+    FirewallDecision, VpcQueryFilters, OVERRIDE_DNS_TYPE_CNAME,
+};
+use ::simple_dns::rdata::{RData, A, CNAME, PTR};
 use ::simple_dns::{
     Name, Packet, PacketFlag, QCLASS, Question, ResourceRecord, CLASS, QTYPE, RCODE, TYPE,
 };
@@ -53,6 +66,16 @@ const RESOLVER_OFFSET: u32 = 2;
 
 /// The port that server answers on, which is the port DNS is served at (`domain`, 53).
 pub const RESOLVER_PORT: u16 = 53;
+
+/// The LINK-LOCAL address the Amazon-provided DNS server of every VPC also answers at: the
+/// Amazon-provided DNS server is reached either at "the 169.254.169.253 IP address, or the
+/// reserved IP address at the base of the VPC network range plus two"
+/// (`ModifyVpcAttributeRequest$EnableDnsSupport`'s own account of the two addresses).
+///
+/// A link-local address is not part of the VPC's own ranges, so the route to it is the
+/// attachment's rather than one of a range it holds: an execution environment with an
+/// interface in the VPC reaches it, one attached to no VPC does not.
+pub const LINK_LOCAL_RESOLVER: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 253);
 
 /// How long an answer of that resolver may be held: the TTL every record below carries.
 ///
@@ -75,6 +98,15 @@ const LOOKUP_QUERY_ID: u16 = 1;
 /// The zone a reverse lookup of an IPv4 address is asked in (RFC 1035's `IN-ADDR.ARPA`
 /// domain).
 const REVERSE_ZONE: &str = "in-addr.arpa";
+
+/// How many questions of ONE message this resolver answers.
+///
+/// A client asks one question per message — "the question section … usually contains exactly
+/// one entry" (RFC 1035 §4.1.2) — and a datagram is bounded only by how much it can carry, so
+/// this is the bound on how much work one datagram can ask for: the number of questions it may
+/// multiply the firewall's decisions and the zone's lookups by. A message past it is dropped,
+/// as one that carries no readable DNS message is. Well above the one question a client asks.
+const MAX_QUESTIONS_PER_MESSAGE: usize = 16;
 
 /// The response codes this resolver answers with, as RFC 1035 §4.1.1 numbers them: no error,
 /// a server failure (what a resolver answers for a question it cannot have answered), and a
@@ -111,6 +143,12 @@ pub struct VpcAttachment {
     /// The Region the function runs in, whose private DNS domain is the suffix of every
     /// Amazon-provided hostname the resolver answers for.
     region: String,
+    /// The VPC those interfaces sit in, which is what the DNS Firewall filtering the run's
+    /// queries is keyed by.
+    vpc_id: String,
+    /// Where a query's firewall decision is read from, and `None` for an engine that vends no
+    /// such register — then nothing filters the run's queries.
+    filters: Option<VpcQueryFilters>,
 }
 
 /// The attachment of the function whose interfaces are `interface_ids`, read out of the
@@ -182,11 +220,15 @@ pub fn attachment_of<Eng: Send + Sync + 'static>(
         .vpc_attributes
         .get(vpc_id.as_str())
         .is_some_and(|attributes| attributes.enable_dns_support);
+    // The EC2 inventory is done with: nothing below reads it.
+    drop(store);
     Some(VpcAttachment {
         interfaces,
         ranges,
         dns_support,
         region: region.to_string(),
+        filters: VpcQueryFilters::of(engine),
+        vpc_id,
     })
 }
 
@@ -196,10 +238,11 @@ impl VpcAttachment {
     ///
     /// The route resolves through the interface in the destination's OWN subnet when the
     /// function holds one there, and otherwise through the first interface it holds — which is
-    /// how an address elsewhere in the VPC is reached, through the VPC's own router.
+    /// how an address elsewhere in the VPC is reached, through the VPC's own router, and how
+    /// the link-local address of the VPC's resolver is reached, which belongs to no subnet.
     #[must_use]
     pub fn source_toward(&self, destination: Ipv4Addr) -> Option<Ipv4Addr> {
-        if !self.holds(destination) {
+        if !self.holds(destination) && destination != LINK_LOCAL_RESOLVER {
             return None;
         }
         self.interfaces
@@ -234,21 +277,27 @@ impl VpcAttachment {
         range.contains(&address).then_some(address)
     }
 
-    /// Whether `destination`:`port` is where that server answers.
+    /// Whether `destination`:`port` is where that server answers: either address it is reached
+    /// at, on the DNS port.
     #[must_use]
     pub fn is_resolver(&self, destination: Ipv4Addr, port: u16) -> bool {
-        port == RESOLVER_PORT && self.resolver() == Some(destination)
+        port == RESOLVER_PORT
+            && (destination == LINK_LOCAL_RESOLVER || self.resolver() == Some(destination))
     }
 
     /// The reply the VPC's DNS server answers `query` with, or `None` when it answers nothing
-    /// at all: a VPC whose `enableDnsSupport` is off has no resolver to reply with, and a
-    /// datagram that carries no readable DNS message is one the server drops.
+    /// at all: a VPC whose `enableDnsSupport` is off has no resolver to reply with, a datagram
+    /// that carries no readable DNS message is one the server drops, and so is one asking more
+    /// questions than [`MAX_QUESTIONS_PER_MESSAGE`].
     #[must_use]
     pub fn resolved(&self, query: &[u8]) -> Option<Vec<u8>> {
         if !self.dns_support {
             return None;
         }
         let asked = Packet::parse(query).ok()?;
+        if asked.questions.len() > MAX_QUESTIONS_PER_MESSAGE {
+            return None;
+        }
         let mut reply = Packet::new_reply(asked.id());
         if asked.has_flags(PacketFlag::RECURSION_DESIRED) {
             reply.set_flags(PacketFlag::RECURSION_DESIRED);
@@ -256,9 +305,26 @@ impl VpcAttachment {
         // The server is a resolver: it answers for the zone it holds and recurses for the
         // rest.
         reply.set_flags(PacketFlag::RECURSION_AVAILABLE);
+        // What the firewall decides about this message's questions, read ONCE for the whole
+        // message however many questions it carries.
+        let mut filtered = self.filtered(&asked.questions);
         let mut code = RESPONSE_NO_ERROR;
         for question in &asked.questions {
             reply.questions.push(question.clone());
+            // The firewall decides a query before the resolver reads anything for it, so a
+            // blocked name is answered the rule's way whatever the zone holds.
+            match filtered.next().flatten() {
+                Some(Filtered::NxDomain) => {
+                    code = RESPONSE_NAME_ERROR;
+                    continue;
+                }
+                Some(Filtered::NoData) => continue,
+                Some(Filtered::Record(record)) => {
+                    reply.answers.push(*record);
+                    continue;
+                }
+                None => {}
+            }
             match self.answer_for(&question.qname, question.qtype) {
                 Answer::Found(record) => {
                     // The zone is the VPC's own, so the answer is authoritative.
@@ -287,15 +353,46 @@ impl VpcAttachment {
         Some(bytes)
     }
 
+    /// What the DNS Firewall of this VPC answers each of `questions` with, in the order they
+    /// were asked: `None` for a question it lets through — one no rule matches, and one a
+    /// matched `ALLOW` or `ALERT` rule permits.
+    ///
+    /// The rules are read ONCE for the whole message ([`VpcQueryFilters::decisions`]), so a
+    /// message of several questions costs one reading of them and not one per question.
+    fn filtered(&self, questions: &[Question<'_>]) -> ::std::vec::IntoIter<Option<Filtered>> {
+        let Some(filters) = self.filters.as_ref() else {
+            return Vec::new().into_iter();
+        };
+        let asked: Vec<(String, Option<u16>)> = questions
+            .iter()
+            .map(|question| {
+                (
+                    question.qname.to_string(),
+                    Some(u16::from(question.qtype)),
+                )
+            })
+            .collect();
+        filters
+            .decisions(&self.vpc_id, &asked)
+            .into_iter()
+            .zip(questions)
+            .map(|(decided, question)| {
+                decided.and_then(|decision| filtered_answer(&question.qname, decision))
+            })
+            .collect::<Vec<Option<Filtered>>>()
+            .into_iter()
+    }
+
     /// The IPv4 addresses the VPC's own DNS server answers for `name`, ASKED OF IT the way a
     /// client asks: one `A` question, carried to [`Self::resolved`] as a real DNS message and
     /// read back off the reply that server answered with.
     ///
     /// Empty for a name it holds no address under — a name of its own zone that names no
-    /// address in the VPC, a name of another zone it would have to recurse for, and every name
-    /// at all while the VPC's `enableDnsSupport` is off, which leaves it with no server to
-    /// answer. So a name service that asks this ([`super::guest_resolver`]) is answered by the
-    /// same server, and with the same records, as a handler that sends the query itself.
+    /// address in the VPC, a name of another zone it would have to recurse for, a name the
+    /// VPC's DNS Firewall blocks, and every name at all while the VPC's `enableDnsSupport` is
+    /// off, which leaves it with no server to answer. So a name service that asks this
+    /// ([`super::guest_resolver`]) is answered by the same server, and with the same records, as
+    /// a handler that sends the query itself.
     #[must_use]
     pub fn addresses_of(&self, name: &str) -> Vec<Ipv4Addr> {
         let Ok(asked) = Name::new(name) else {
@@ -394,9 +491,51 @@ impl VpcAttachment {
     }
 }
 
-/// What the resolver holds for one question: a record, a name of its own zone with no record
-/// of the type asked about, a name of that zone it holds nothing under, or a name of another
-/// zone.
+/// What one question came to in the DNS Firewall of the VPC.
+enum Filtered {
+    /// `BLOCK` with `BlockResponse` `NXDOMAIN`: the name is answered as one that does not
+    /// exist, with no record.
+    NxDomain,
+    /// `BLOCK` with `BlockResponse` `NODATA`: a successful answer carrying no record.
+    NoData,
+    /// `BLOCK` with `BlockResponse` `OVERRIDE`: the rule's own record answers the question.
+    Record(Box<ResourceRecord<'static>>),
+}
+
+/// How one question is answered once the firewall has decided it, or `None` for a decision
+/// that lets the query through to the zone.
+fn filtered_answer(asked: &Name<'_>, decision: FirewallDecision) -> Option<Filtered> {
+    match decision {
+        FirewallDecision::Allow => None,
+        FirewallDecision::BlockNxDomain => Some(Filtered::NxDomain),
+        FirewallDecision::BlockNoData => Some(Filtered::NoData),
+        FirewallDecision::BlockOverride {
+            domain,
+            dns_type,
+            ttl,
+        } => {
+            // The override answers with the rule's OWN record: the one type such a rule may
+            // name is a `CNAME`, so a rule naming another carries no record this resolver can
+            // write, and the query is answered as the block with no record it is.
+            if !dns_type.eq_ignore_ascii_case(OVERRIDE_DNS_TYPE_CNAME) {
+                return Some(Filtered::NoData);
+            }
+            let Ok(target) = Name::new(&domain) else {
+                return Some(Filtered::NoData);
+            };
+            Some(Filtered::Record(Box::new(ResourceRecord::new(
+                asked.clone().into_owned(),
+                CLASS::IN,
+                ttl,
+                RData::CNAME(CNAME(target.into_owned())),
+            ))))
+        }
+    }
+}
+
+/// What one question came to in the resolver's own zone: a record, a name of its own zone with
+/// no record of the type asked about, a name of that zone it holds nothing under, or a name of
+/// another zone.
 enum Answer {
     /// The record itself.
     Found(Box<ResourceRecord<'static>>),

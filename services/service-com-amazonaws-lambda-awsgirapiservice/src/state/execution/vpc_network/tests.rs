@@ -5,9 +5,12 @@
 
 use ::std::net::Ipv4Addr;
 
-use super::{attachment_of, VpcAttachment, RESOLVER_PORT};
+use super::{
+    attachment_of, VpcAttachment, LINK_LOCAL_RESOLVER, MAX_QUESTIONS_PER_MESSAGE, RESOLVER_PORT,
+};
 use ::service_com_amazonaws_ec2_amazonec2::ops::types as ec2_types;
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
+use ::service_common::vpc_dns_firewall::FirewallDecision;
 use ::simple_dns::rdata::RData;
 use ::simple_dns::{Name, Packet, Question, QCLASS, QTYPE, RCODE, TYPE};
 
@@ -89,19 +92,32 @@ pub(crate) fn two_subnet_attachment(engine: &::engine::InMemoryEngine) -> VpcAtt
 
 /// RULE: a route toward an address of the VPC resolves through the interface in that
 /// address's own subnet, and through the first interface the function holds for an address
-/// elsewhere in the VPC; an address outside the VPC's ranges has no route at all.
+/// elsewhere in the VPC or for the link-local address of the VPC's resolver, which is in no
+/// subnet; an address outside the VPC's ranges has no route at all.
 ///
 /// The rows differ along where the destination sits: in each of the two subnets an interface
-/// is in, elsewhere in the VPC, at the VPC's own resolver, and outside the VPC.
+/// is in, elsewhere in the VPC, at each address the VPC's own resolver answers at, and outside
+/// the VPC.
 #[test]
 fn a_route_resolves_through_the_interface_of_the_destination_s_own_subnet() {
     let engine = ::engine::InMemoryEngine::new();
     let attachment = two_subnet_attachment(&engine);
-    let rows: [(&str, &str, Option<&str>); 6] = [
+    let link_local = LINK_LOCAL_RESOLVER.to_string();
+    let rows: [(&str, &str, Option<&str>); 8] = [
         ("the first interface's own subnet", "10.7.1.200", Some("10.7.1.37")),
         ("the second interface's own subnet", "10.7.2.200", Some("10.7.2.19")),
         ("elsewhere in the VPC", "10.7.9.9", Some("10.7.1.37")),
         ("the VPC's resolver", "10.7.0.2", Some("10.7.1.37")),
+        (
+            "the link-local address that resolver also answers at",
+            link_local.as_str(),
+            Some("10.7.1.37"),
+        ),
+        (
+            "another link-local address, which nothing of the VPC answers at",
+            "169.254.11.22",
+            None,
+        ),
         ("an address of another VPC's range", "10.8.0.5", None),
         ("a public address", "198.51.100.7", None),
     ];
@@ -117,11 +133,11 @@ fn a_route_resolves_through_the_interface_of_the_destination_s_own_subnet() {
     }
 }
 
-/// RULE: the VPC's DNS server answers at the second address of the VPC's own IPv4 range, on
-/// the DNS port.
+/// RULE: the VPC's DNS server answers at the second address of the VPC's own IPv4 range and at
+/// the link-local address every VPC's resolver answers at, on the DNS port and on no other.
 ///
-/// The rows differ along the range the VPC was created with, which is what the address is
-/// read off.
+/// The rows differ along the range the VPC was created with, which is what the first of those
+/// two addresses is read off.
 #[test]
 fn the_resolver_sits_at_the_second_address_of_the_vpc_range() {
     let rows: [(&str, &str, &str, &str); 4] = [
@@ -141,28 +157,88 @@ fn the_resolver_sits_at_the_second_address_of_the_vpc_range() {
             Some(expected),
             "case {case:?}: expected the resolver of {cidr} at {expected}, got {resolver:?}"
         );
-        assert!(
-            attachment.is_resolver(expected, RESOLVER_PORT),
-            "case {case:?}: expected {expected}:{RESOLVER_PORT} to be the resolver"
-        );
-        assert!(
-            !attachment.is_resolver(expected, RESOLVER_PORT + 1),
-            "case {case:?}: expected no resolver on any other port"
-        );
+        for (where_at, address) in [
+            ("the base of the range plus two", expected),
+            ("the link-local address", LINK_LOCAL_RESOLVER),
+        ] {
+            assert!(
+                attachment.is_resolver(address, RESOLVER_PORT),
+                "case {case:?}: expected {address}:{RESOLVER_PORT} ({where_at}) to be the \
+                 resolver"
+            );
+            assert!(
+                !attachment.is_resolver(address, RESOLVER_PORT + 1),
+                "case {case:?}: expected no resolver at {address} on any other port"
+            );
+        }
     }
 }
 
 /// One question, as a client frames it on the wire.
 fn query(name: &str, kind: TYPE) -> Vec<u8> {
+    questions(&[(name, kind)])
+}
+
+/// A message asking every one of `asked`, as a client frames it on the wire.
+fn questions(asked: &[(&str, TYPE)]) -> Vec<u8> {
     let mut packet = Packet::new_query(QUERY_ID);
     packet.set_flags(::simple_dns::PacketFlag::RECURSION_DESIRED);
-    packet.questions.push(Question::new(
-        Name::new(name).expect("a test name"),
-        QTYPE::TYPE(kind),
-        QCLASS::CLASS(::simple_dns::CLASS::IN),
-        false,
-    ));
+    for (name, kind) in asked {
+        packet.questions.push(Question::new(
+            Name::new(name).expect("a test name"),
+            QTYPE::TYPE(*kind),
+            QCLASS::CLASS(::simple_dns::CLASS::IN),
+            false,
+        ));
+    }
     packet.build_bytes_vec().expect("the query encodes")
+}
+
+/// RULE: this resolver answers every question of a message up to the number it answers
+/// ([`MAX_QUESTIONS_PER_MESSAGE`]), which is what bounds the work one datagram can ask of it; a
+/// message asking more is dropped, as one carrying no readable DNS message is.
+///
+/// The rows differ along how many questions the message carries: one, the bound itself, and one
+/// past it.
+#[test]
+fn a_message_asking_more_questions_than_the_resolver_answers_is_dropped() {
+    let engine = ::engine::InMemoryEngine::new();
+    let attachment = two_subnet_attachment(&engine);
+    let rows: [(&str, usize, Option<usize>); 3] = [
+        ("one question", 1, Some(1)),
+        ("the bound itself", MAX_QUESTIONS_PER_MESSAGE, Some(MAX_QUESTIONS_PER_MESSAGE)),
+        ("one question past the bound", MAX_QUESTIONS_PER_MESSAGE + 1, None),
+    ];
+    for (case, count, answered) in rows {
+        let asked: Vec<(&str, TYPE)> =
+            (0..count).map(|_| ("ip-10-7-1-37.us-west-2.compute.internal", TYPE::A)).collect();
+        let reply = attachment.resolved(&questions(&asked));
+        match answered {
+            Some(expected) => {
+                let reply = reply
+                    .unwrap_or_else(|| panic!("case {case:?}: the resolver must reply"));
+                let reply = Packet::parse(&reply)
+                    .unwrap_or_else(|error| panic!("case {case:?}: the reply must parse: {error}"));
+                assert_eq!(
+                    reply.questions.len(),
+                    expected,
+                    "case {case:?}: expected the reply to carry {expected} questions, got {}",
+                    reply.questions.len()
+                );
+                assert_eq!(
+                    reply.answers.len(),
+                    expected,
+                    "case {case:?}: expected one answer per question, got {}",
+                    reply.answers.len()
+                );
+            }
+            None => assert!(
+                reply.is_none(),
+                "case {case:?}: expected the message to be dropped, got a reply of {} bytes",
+                reply.unwrap_or_default().len()
+            ),
+        }
+    }
 }
 
 /// RULE: the VPC's DNS server answers a query for an Amazon-provided hostname of an address in
@@ -264,6 +340,150 @@ fn the_vpc_resolver_answers_the_names_of_its_own_zone() {
         assert_eq!(
             rendered, expected,
             "case {case:?}: expected the answers {expected:?}, got {rendered:?}"
+        );
+    }
+}
+
+/// A filter blocking ONE name of every VPC the `decision` way, for the rows below: the stand-in
+/// for the service that owns DNS Firewall, which records its own filter in this register when it
+/// is mounted on the engine.
+struct OneBlockedName {
+    /// The name it decides.
+    name: &'static str,
+    /// What it decides about that name.
+    decision: FirewallDecision,
+}
+
+impl ::service_common::vpc_dns_firewall::VpcQueryFilter for OneBlockedName {
+    fn decisions(
+        &self,
+        _vpc_id: &str,
+        asked: &[(String, Option<u16>)],
+    ) -> Vec<Option<FirewallDecision>> {
+        asked
+            .iter()
+            .map(|(name, _qtype)| {
+                (name.trim_end_matches('.') == self.name).then(|| self.decision.clone())
+            })
+            .collect()
+    }
+}
+
+/// One row of the table below: the case, what the registered filter decides about the name, the
+/// name asked for, the response code the reply must carry, and the answers it must hold.
+type FirewallRow = (
+    &'static str,
+    Option<FirewallDecision>,
+    &'static str,
+    RCODE,
+    Vec<String>,
+);
+
+/// RULE: the DNS Firewall filtering the VPC decides a query BEFORE the resolver reads its own
+/// zone for it, so a name a matched `BLOCK` rule covers is answered that rule's `BlockResponse`
+/// way whether or not the VPC's zone holds the name, while a name no rule covers — and one a
+/// matched `ALLOW` rule permits — is answered out of the zone exactly as it was.
+///
+/// The rows differ along what the firewall decided (`NXDOMAIN`, `NODATA`, an `OVERRIDE` record,
+/// `ALLOW`, no decision at all) and along whether the name is one the VPC's own zone holds.
+#[test]
+fn a_query_the_vpcs_firewall_blocks_is_answered_the_way_that_block_states() {
+    let in_vpc = "ip-10-7-1-37.us-west-2.compute.internal";
+    let rows: [FirewallRow; 7] = [
+        (
+            "a name of the VPC's own zone, blocked with NXDOMAIN",
+            Some(FirewallDecision::BlockNxDomain),
+            in_vpc,
+            RCODE::NameError,
+            Vec::new(),
+        ),
+        (
+            "a name of another zone, blocked with NXDOMAIN",
+            Some(FirewallDecision::BlockNxDomain),
+            "blocked.example.com",
+            RCODE::NameError,
+            Vec::new(),
+        ),
+        (
+            "a blocked name whose rule answers NODATA",
+            Some(FirewallDecision::BlockNoData),
+            in_vpc,
+            RCODE::NoError,
+            Vec::new(),
+        ),
+        (
+            "a blocked name whose rule answers its own record",
+            Some(FirewallDecision::BlockOverride {
+                domain: "safe.example.net".to_string(),
+                dns_type: "CNAME".to_string(),
+                ttl: 30,
+            }),
+            "blocked.example.com",
+            RCODE::NoError,
+            vec!["safe.example.net".to_string()],
+        ),
+        (
+            "a blocked name whose rule names a record type an override may not carry",
+            Some(FirewallDecision::BlockOverride {
+                domain: "safe.example.net".to_string(),
+                dns_type: "TXT".to_string(),
+                ttl: 30,
+            }),
+            "blocked.example.com",
+            RCODE::NoError,
+            Vec::new(),
+        ),
+        (
+            "a name a matched ALLOW rule permits",
+            Some(FirewallDecision::Allow),
+            in_vpc,
+            RCODE::NoError,
+            vec!["10.7.1.37".to_string()],
+        ),
+        (
+            "a name the firewall decides nothing about",
+            None,
+            in_vpc,
+            RCODE::NoError,
+            vec!["10.7.1.37".to_string()],
+        ),
+    ];
+    for (case, decided, name, code, answered) in rows {
+        let engine = ::engine::InMemoryEngine::new();
+        if let Some(decision) = decided {
+            ::service_common::vpc_dns_firewall::VpcQueryFilters::of(&engine)
+                .expect("the engine vends the register")
+                .registering(::std::sync::Arc::new(OneBlockedName {
+                    name: name.trim_end_matches('.'),
+                    decision,
+                }));
+        }
+        // The attachment is read AFTER the filter is recorded, as an invocation's seam is.
+        let attachment = two_subnet_attachment(&engine);
+        let asked = query(name, TYPE::A);
+        let reply = attachment
+            .resolved(&asked)
+            .unwrap_or_else(|| panic!("case {case:?}: the resolver must reply"));
+        let reply = Packet::parse(&reply)
+            .unwrap_or_else(|error| panic!("case {case:?}: the reply must parse: {error}"));
+        assert_eq!(
+            reply.rcode(),
+            code,
+            "case {case:?}: expected {code:?} for {name}, got {:?}",
+            reply.rcode()
+        );
+        let rendered: Vec<String> = reply
+            .answers
+            .iter()
+            .map(|record| match &record.rdata {
+                RData::A(address) => ::std::net::Ipv4Addr::from(address.address).to_string(),
+                RData::CNAME(name) => name.0.to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            rendered, answered,
+            "case {case:?}: expected the answers {answered:?} for {name}, got {rendered:?}"
         );
     }
 }

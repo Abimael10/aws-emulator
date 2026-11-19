@@ -10,8 +10,10 @@
 //! resolves through one of those interfaces — the one in the destination's own subnet when
 //! there is one, and otherwise the first the function holds — and the source address the
 //! socket reports is that interface's own private address, the one Amazon EC2 handed it out of
-//! its subnet's range. The VPC's Amazon-provided DNS server, "at the base of your VPC network
-//! range plus two", answers the queries the function sends it: a hostname of an address in the
+//! its subnet's range. The VPC's Amazon-provided DNS server — reached at "the 169.254.169.253 IP
+//! address, or the reserved IP address at the base of the VPC network range plus two" — answers
+//! the queries the function sends it at either of those two addresses: a hostname of an address
+//! in the
 //! VPC resolves to that address, a reverse question about such an address to that hostname, a
 //! name of the VPC's internal zone that names no address in it is `NXDOMAIN`, and a name of
 //! another zone — which the resolver would have to recurse for — is `SERVFAIL`. An address
@@ -24,9 +26,10 @@
 //! services run on one shared engine, exactly as the router mounts them.
 //!
 //! The rows differ along what the rule generalises over: where the destination sits (each
-//! subnet an interface is in, elsewhere in the VPC, the resolver itself, this machine's own
-//! interface, an address outside the VPC), which name is asked of the resolver and of which
-//! record type, and whether the function is attached to a VPC at all.
+//! subnet an interface is in, elsewhere in the VPC, each address the resolver answers at,
+//! another link-local address, this machine's own interface, an address outside the VPC), which
+//! name is asked of the resolver and of which record type, and whether the function is attached
+//! to a VPC at all.
 //!
 //! Each test here RUNS a handler, so it takes the one invocation stream the suites that run
 //! handlers share ([`crate::invoke_request_id::one_invocation_stream_at_a_time`]): this
@@ -75,6 +78,13 @@ const RCODE_NXDOMAIN: u64 = 3;
 
 /// `ENETUNREACH`, the number a host with no route to an address answers with.
 const ENETUNREACH: u64 = 101;
+
+/// The LINK-LOCAL address the Amazon-provided DNS server of every VPC also answers at: the
+/// server is reached either at "the 169.254.169.253 IP address, or the reserved IP address at
+/// the base of the VPC network range plus two" (`ModifyVpcAttributeRequest$EnableDnsSupport`),
+/// and it is the address an execution environment attached to the VPC queries when it names no
+/// server of its own.
+const LINK_LOCAL_RESOLVER: &str = "169.254.169.253";
 
 /// The handler every row runs: it answers one result per probe the event names — the address a
 /// datagram toward an address leaves from, or what the VPC's DNS server replied to a query.
@@ -363,6 +373,16 @@ async fn a_vpc_attached_function_leaves_from_the_address_of_its_own_interface() 
             Some(in_first_subnet.clone()),
         ),
         (
+            "the link-local address that resolver also answers at",
+            LINK_LOCAL_RESOLVER.to_string(),
+            Some(in_first_subnet.clone()),
+        ),
+        (
+            "another link-local address, which nothing of the VPC answers at",
+            "169.254.11.22".to_string(),
+            None,
+        ),
+        (
             "an address elsewhere in the VPC",
             format!("10.{PREFIX}.9.9"),
             Some(in_first_subnet.clone()),
@@ -536,6 +556,109 @@ async fn the_vpc_resolver_answers_the_queries_a_function_inside_it_sends() {
     }
 }
 
+/// RULE: the Amazon-provided DNS server of the VPC answers at BOTH addresses it is reached at —
+/// the base of the VPC's range plus two, and the link-local 169.254.169.253 — so a datagram a
+/// VPC-attached function sends to either is answered with the same reply, and each reply comes
+/// back from the address it was sent to.
+///
+/// The rows differ along the name asked for and the record type, which is what the reply's
+/// response code and records are read off; each row is asked at both addresses.
+#[tokio::test]
+async fn the_vpc_resolver_answers_at_the_link_local_address_as_well() {
+    let _stream = one_invocation_stream_at_a_time().await;
+    let emulator = emulator();
+    let network = network(&emulator.ec2, "link-local resolver", PREFIX, SUBNETS).await;
+    let function = "link-local-resolver-probe";
+    create_probe_function(
+        &emulator,
+        function,
+        Some(json!({
+            "SubnetIds": network.subnet_ids.clone(),
+            "SecurityGroupIds": [network.group_id.clone()],
+        })),
+    )
+    .await;
+    let in_range = format!("10.{PREFIX}.0.2");
+    let in_vpc = format!("10.{PREFIX}.1.50");
+    let hostname = format!("ip-10-{PREFIX}-1-50.{INTERNAL_DOMAIN}");
+
+    // One case per row: the name, its record type, the response code and the answers.
+    let rows: Vec<(&str, String, u16, u64, Vec<String>)> = vec![
+        (
+            "a hostname of an address in the VPC",
+            hostname.clone(),
+            TYPE_A,
+            RCODE_NOERROR,
+            vec![in_vpc.clone()],
+        ),
+        (
+            "a reverse question about that address",
+            format!("50.1.{PREFIX}.10.in-addr.arpa"),
+            TYPE_PTR,
+            RCODE_NOERROR,
+            vec![format!("{hostname}.")],
+        ),
+        (
+            "a name of the internal zone that names no address in the VPC",
+            format!("broker.{INTERNAL_DOMAIN}"),
+            TYPE_A,
+            RCODE_NXDOMAIN,
+            Vec::new(),
+        ),
+    ];
+    for (resolver, where_at) in [
+        (in_range.as_str(), "the base of the VPC's range plus two"),
+        (LINK_LOCAL_RESOLVER, "the link-local address"),
+    ] {
+        let probes: Vec<Value> = rows
+            .iter()
+            .map(|(_case, name, kind, _, _)| query_probe(resolver, name, *kind))
+            .collect();
+        let results = probed(&emulator, function, &probes).await;
+        assert_eq!(
+            results.len(),
+            rows.len(),
+            "expected one result per probe at {where_at}, got {results:?}"
+        );
+        for ((case, name, _kind, code, answers), result) in rows.iter().zip(results) {
+            assert_eq!(
+                result.get("rcode").and_then(Value::as_u64),
+                Some(*code),
+                "case {case:?} at {where_at}: expected response code {code} for {name}, got \
+                 {result}"
+            );
+            let reported: Vec<String> = result
+                .get("answers")
+                .and_then(Value::as_array)
+                .map(|answers| {
+                    answers
+                        .iter()
+                        .map(|answer| answer.as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                &reported, answers,
+                "case {case:?} at {where_at}: expected the answers {answers:?} for {name}, got \
+                 {result}"
+            );
+            // The reply came back from the address the query was sent to, as a datagram's
+            // answer does.
+            let peer = result
+                .get("peer")
+                .and_then(Value::as_array)
+                .and_then(|peer| peer.first())
+                .and_then(Value::as_str);
+            assert_eq!(
+                peer,
+                Some(resolver),
+                "case {case:?} at {where_at}: expected the reply to come from {resolver}, got \
+                 {result}"
+            );
+        }
+    }
+}
+
 /// RULE: a function attached to NO VPC has no route into one: neither an address of a VPC nor
 /// that VPC's resolver is reachable from it, and both are answered the way a host with no
 /// route to an address answers it.
@@ -553,15 +676,20 @@ async fn a_function_attached_to_no_vpc_reaches_no_vpc_address() {
         "a function attached to no VPC must hold no interface"
     );
     let resolver = format!("10.{PREFIX}.0.2");
+    let in_zone = format!("ip-10-{PREFIX}-0-200.{INTERNAL_DOMAIN}");
     let probes = vec![
         source_probe(&format!("10.{PREFIX}.0.200")),
         source_probe(&resolver),
-        query_probe(&resolver, &format!("ip-10-{PREFIX}-0-200.{INTERNAL_DOMAIN}"), TYPE_A),
+        source_probe(LINK_LOCAL_RESOLVER),
+        query_probe(&resolver, &in_zone, TYPE_A),
+        query_probe(LINK_LOCAL_RESOLVER, &in_zone, TYPE_A),
     ];
     let cases = [
         "an address in a subnet of the VPC",
         "the VPC's own resolver",
+        "the link-local address a VPC's resolver answers at",
         "a query to that resolver",
+        "a query to the link-local address",
     ];
     let results = probed(&emulator, function, &probes).await;
     for (case, result) in cases.iter().zip(results) {

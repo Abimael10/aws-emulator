@@ -58,7 +58,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// Build this service from the shared engine. The engine is threaded into the
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
+    ///
+    /// Mounting this service also records it as what decides the engine's in-VPC DNS queries
+    /// ([`crate::state::dns_firewall::register_as_the_vpc_query_filter`]): DNS Firewall's rule
+    /// groups are this service's records, and every component that ANSWERS a query asked inside
+    /// a VPC reads their decision out of that register rather than holding a copy of the rules.
     pub fn new(engine: Arc<Eng>) -> Self {
+        crate::state::dns_firewall::register_as_the_vpc_query_filter(&*engine);
         Self {
             entry: crate::ServiceDefinition::new(engine),
         }

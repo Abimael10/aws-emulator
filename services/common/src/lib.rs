@@ -421,6 +421,10 @@ pub mod static_web_servers;
 /// client of this emulator that was handed one of those addresses, so the connection it opens
 /// is a pipe to that plane's own handler rather than a socket.
 pub mod dialable_data_planes;
+/// What DNS FIREWALL decides about a query asked inside a VPC — recorded by the service that
+/// owns the rule groups, and read by whatever ANSWERS such a query, so the decision is made
+/// over that service's own live records rather than over a copy of them.
+pub mod vpc_dns_firewall;
 /// The ONE rendering of a `restJson1` timestamp whose model declares the `date-time` form,
 /// for every service of that class — which the generated member schemas drop, so without it
 /// such a member goes on the wire as the protocol's default epoch-seconds NUMBER.

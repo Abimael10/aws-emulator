@@ -947,6 +947,21 @@ pub fn firewall_priority_accepted(resource_type: &str, resource_properties: Opti
     }
 }
 
+/// The DNS Firewall `priority` the `ResourceProperties` document `resource_properties`
+/// states, or `None` when it states none — a document that names no `priority`, one that
+/// cannot be read as JSON, and no document at all.
+///
+/// The reader beside [`firewall_priority_accepted`], so the one shape of that document is
+/// read in one place: that function decides which priorities the service ACCEPTS, and this
+/// one reads the priority a stored association carries, for whatever orders the rule groups
+/// a Profile pushes onto a VPC.
+pub fn firewall_priority_of(resource_properties: Option<&str>) -> Option<i64> {
+    ::serde_json::from_str::<::serde_json::Value>(resource_properties?)
+        .ok()?
+        .get(PRIORITY_PROPERTY)?
+        .as_i64()
+}
+
 /// The message for the one failure that is not about the request: this service was
 /// mounted on an engine that holds no store for it.
 pub const NO_STORE: &str =
