@@ -14,7 +14,8 @@ use serde_json::Value;
 
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::ops::types::{Anomaly, LogEvent};
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
-    ComAmazonawsCloudwatchlogsLogs20140328State, ANOMALY_STATE_ACTIVE,
+    ComAmazonawsCloudwatchlogsLogs20140328State, ANOMALY_DETECTOR_ANALYSIS_DELAY_MS,
+    ANOMALY_DETECTOR_STATUS_ANALYZING, ANOMALY_DETECTOR_STATUS_TRAINING, ANOMALY_STATE_ACTIVE,
     EXPORT_TASK_COMPLETION_DELAY_MS, EXPORT_TASK_RUNNING_DELAY_MS,
     LOG_GROUP_METERING_INTERVAL_MS,
 };
@@ -382,6 +383,30 @@ pub fn messages(page: &Value) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+/// The statuses a detector created at `creation_ms` may be reported in by a read that
+/// happened somewhere between `read_from_ms` and `read_to_ms`: a created detector is TRAINING
+/// until the clock makes ANALYZING due, and ANALYZING after that.
+///
+/// A read window that straddles the due instant admits the statuses on both sides of it, so a
+/// case asserts what the clock allows and never races it. The instant the transition is due
+/// is the one the create stored, which is why the window is computed from the detector's
+/// REPORTED creation timestamp.
+pub fn admissible_detector_statuses(
+    creation_ms: i64,
+    read_from_ms: i64,
+    read_to_ms: i64,
+) -> Vec<&'static str> {
+    let analyzing_due = creation_ms + ANOMALY_DETECTOR_ANALYSIS_DELAY_MS;
+    let mut admissible = Vec::new();
+    if read_from_ms < analyzing_due {
+        admissible.push(ANOMALY_DETECTOR_STATUS_TRAINING);
+    }
+    if read_to_ms >= analyzing_due {
+        admissible.push(ANOMALY_DETECTOR_STATUS_ANALYZING);
+    }
+    admissible
 }
 
 /// Record, in the store, that the detector under `arn` has REPORTED the anomaly `anomaly`

@@ -320,10 +320,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::now_ms(),
         );
         detector.detector_name = input.detector_name.clone();
-        detector.evaluation_frequency = input.evaluation_frequency.clone();
         detector.filter_pattern = input.filter_pattern.clone();
         detector.kms_key_id = input.kms_key_id.clone();
-        detector.anomaly_visibility_time = input.anomaly_visibility_time;
+        // `evaluationFrequency` and `anomalyVisibilityTime` are the two configuration members
+        // the service DEFAULTS, and the record already carries those defaults, so a create
+        // that names one replaces it and a create that names none leaves the detector running
+        // with the service's own value — which is what every read of it then reports, rather
+        // than an absent member a caller cannot tell from "unset".
+        if let Some(evaluation_frequency) = input.evaluation_frequency.clone() {
+            detector.evaluation_frequency = Some(evaluation_frequency);
+        }
+        if let Some(anomaly_visibility_time) = input.anomaly_visibility_time {
+            detector.anomaly_visibility_time = Some(anomaly_visibility_time);
+        }
         if let Some(tags) = &input.tags {
             detector.tags = tags
                 .iter()

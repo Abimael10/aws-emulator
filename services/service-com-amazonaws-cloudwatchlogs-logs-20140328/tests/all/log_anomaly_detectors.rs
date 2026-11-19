@@ -6,10 +6,12 @@
 //! The rule under test: `CreateLogAnomalyDetector` persists ONE anomaly detector over the
 //! single log group ARN the request names, mints an ARN that identifies it and hands that
 //! ARN back, and `GetLogAnomalyDetector` reports, under that ARN, exactly the configuration
-//! the create stored — each optional member present only when a call named it — in the
-//! status the CLOCK has made due. A request that names no log group, more than one, an ARN
-//! that is not a log group's, or a log group the account does not hold creates nothing and
-//! is refused; so is a read of an ARN no detector is stored under.
+//! the create stored — a member the service defaults (`evaluationFrequency`,
+//! `anomalyVisibilityTime`) carrying that default when the create named none, every other
+//! optional member present only when a call named it — in the status the CLOCK has made due.
+//! A request that names no log group, more than one, an ARN that is not a log group's, or a
+//! log group the account does not hold creates nothing and is refused; so is a read of an
+//! ARN no detector is stored under.
 //!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so a
@@ -29,11 +31,11 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     anomaly_detector_arn, log_group_arn, AnomalyDetectorRecord,
     ComAmazonawsCloudwatchlogsLogs20140328State, ANOMALY_DETECTOR_ANALYSIS_DELAY_MS,
-    ANOMALY_DETECTOR_STATUS_ANALYZING, ANOMALY_DETECTOR_STATUS_INITIALIZING,
-    ANOMALY_DETECTOR_STATUS_TRAINING, ANOMALY_DETECTOR_TRAINING_DELAY_MS, MAX_ANOMALY_DETECTORS,
+    ANOMALY_DETECTOR_STATUS_ANALYZING, DEFAULT_ANOMALY_VISIBILITY_TIME_DAYS,
+    DEFAULT_EVALUATION_FREQUENCY, MAX_ANOMALY_DETECTORS,
 };
 
-use crate::harness::{now_ms, Logs, REGION};
+use crate::harness::{admissible_detector_statuses, now_ms, Logs, REGION};
 
 /// The operation that creates a detector, and the one that reports it back.
 const CREATE: &str = "CreateLogAnomalyDetector";
@@ -198,30 +200,6 @@ fn stamp(body: &Value, key: &str, case: &str) -> i64 {
         .unwrap_or_else(|| panic!("case {case:?}: a detector carries {key}, got {body}"))
 }
 
-/// The statuses a detector created at `creation_ms` may be reported in by a read that
-/// happened somewhere between `read_from_ms` and `read_to_ms`: INITIALIZING until it is due
-/// to start training, TRAINING until it is due to start analyzing, ANALYZING after that.
-///
-/// A read window that straddles a due instant admits the statuses on both sides of it, so
-/// these cases assert what the clock allows and never a race against it. The instant each
-/// transition is due is the one the create stored, which is why the window is computed from
-/// the REPORTED creation timestamp.
-fn admissible_statuses(creation_ms: i64, read_from_ms: i64, read_to_ms: i64) -> Vec<&'static str> {
-    let training_due = creation_ms + ANOMALY_DETECTOR_TRAINING_DELAY_MS;
-    let analyzing_due = training_due + ANOMALY_DETECTOR_ANALYSIS_DELAY_MS;
-    let mut admissible = Vec::new();
-    if read_from_ms < training_due {
-        admissible.push(ANOMALY_DETECTOR_STATUS_INITIALIZING);
-    }
-    if read_to_ms >= training_due && read_from_ms < analyzing_due {
-        admissible.push(ANOMALY_DETECTOR_STATUS_TRAINING);
-    }
-    if read_to_ms >= analyzing_due {
-        admissible.push(ANOMALY_DETECTOR_STATUS_ANALYZING);
-    }
-    admissible
-}
-
 /// The log group every accepted case watches, created, with the ARN form the modelled
 /// `LogGroupArn` pattern admits (`^[\w#+=/:,.@-]*$` has no `*`, so the `LogGroup$arn` form
 /// ending in `:*` is not one of them).
@@ -274,10 +252,17 @@ async fn a_created_detector_is_reported_back_exactly_as_it_was_configured() {
             Some(&json!([group])),
             "case {case:?}: expected the watched log group {group:?}, got {reported}"
         );
-        // (member, what the create named)
+        // (member, what the create named) — `evaluationFrequency` is the one the service
+        // DEFAULTS, so a create that named none reports the default rather than nothing.
         let echoed: [(&str, Option<&str>); 3] = [
             ("detectorName", row.detector_name),
-            ("evaluationFrequency", row.evaluation_frequency),
+            (
+                "evaluationFrequency",
+                Some(
+                    row.evaluation_frequency
+                        .unwrap_or(DEFAULT_EVALUATION_FREQUENCY),
+                ),
+            ),
             ("filterPattern", row.filter_pattern),
         ];
         for (key, named) in echoed {
@@ -293,11 +278,15 @@ async fn a_created_detector_is_reported_back_exactly_as_it_was_configured() {
             "case {case:?}: expected kmsKeyId {:?}, got {reported}",
             row.kms_key_id
         );
+        // The other member the service defaults: a create that named none reports the
+        // default life cycle the detector runs with.
+        let expected_visibility = row
+            .anomaly_visibility_time
+            .unwrap_or(DEFAULT_ANOMALY_VISIBILITY_TIME_DAYS);
         assert_eq!(
             reported.get("anomalyVisibilityTime").and_then(Value::as_i64),
-            row.anomaly_visibility_time,
-            "case {case:?}: expected anomalyVisibilityTime {:?}, got {reported}",
-            row.anomaly_visibility_time
+            Some(expected_visibility),
+            "case {case:?}: expected anomalyVisibilityTime {expected_visibility:?}, got {reported}"
         );
 
         let creation = stamp(&reported, "creationTimeStamp", case);
@@ -312,7 +301,7 @@ async fn a_created_detector_is_reported_back_exactly_as_it_was_configured() {
              created ({creation}), got {modified}"
         );
 
-        let admissible = admissible_statuses(creation, before, after);
+        let admissible = admissible_detector_statuses(creation, before, after);
         let status = member(&reported, "anomalyDetectorStatus").unwrap_or_else(|| {
             panic!("case {case:?}: a detector carries anomalyDetectorStatus, got {reported}")
         });
@@ -357,9 +346,9 @@ async fn a_created_detector_is_reported_back_exactly_as_it_was_configured() {
     );
 }
 
-/// The status a read reports is the one the CLOCK already made due — a detector
-/// initializes, then trains, then analyzes — and reading a detector the clock owes nothing
-/// reports the same thing every time.
+/// The status a read reports is the one the CLOCK already made due — a detector trains,
+/// then analyzes — and reading a detector the clock owes nothing reports the same thing
+/// every time.
 #[tokio::test]
 async fn the_status_the_clock_owes_is_reported_and_reading_changes_nothing() {
     let logs = Logs::new();
@@ -370,12 +359,12 @@ async fn the_status_the_clock_owes_is_reported_and_reading_changes_nothing() {
     let ages: [(&str, i64); 4] = [
         ("created just now", 0),
         (
-            "created one millisecond before training was due",
-            ANOMALY_DETECTOR_TRAINING_DELAY_MS - 1,
+            "created one millisecond before analysis was due",
+            ANOMALY_DETECTOR_ANALYSIS_DELAY_MS - 1,
         ),
         (
-            "created after training became due",
-            ANOMALY_DETECTOR_TRAINING_DELAY_MS + 1,
+            "created after analysis became due",
+            ANOMALY_DETECTOR_ANALYSIS_DELAY_MS + 1,
         ),
         ("created an hour ago", 60 * 60 * 1_000),
     ];
@@ -398,7 +387,7 @@ async fn the_status_the_clock_owes_is_reported_and_reading_changes_nothing() {
         let before = now_ms();
         let reported = logs.ok(GET, &json!({"anomalyDetectorArn": arn})).await;
         let after = now_ms();
-        let admissible = admissible_statuses(*created, before, after);
+        let admissible = admissible_detector_statuses(*created, before, after);
         let status = member(&reported, "anomalyDetectorStatus").unwrap_or_else(|| {
             panic!("case {case:?}: a detector carries anomalyDetectorStatus, got {reported}")
         });

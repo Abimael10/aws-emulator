@@ -30,12 +30,11 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     anomaly_detector_arn, log_group_arn, AnomalyDetectorRecord,
     ComAmazonawsCloudwatchlogsLogs20140328State, ANOMALY_DETECTOR_ANALYSIS_DELAY_MS,
-    ANOMALY_DETECTOR_STATUS_ANALYZING, ANOMALY_DETECTOR_STATUS_INITIALIZING,
-    ANOMALY_DETECTOR_STATUS_PAUSED, ANOMALY_DETECTOR_STATUS_TRAINING,
-    ANOMALY_DETECTOR_TRAINING_DELAY_MS,
+    ANOMALY_DETECTOR_STATUS_ANALYZING, ANOMALY_DETECTOR_STATUS_PAUSED,
+    ANOMALY_DETECTOR_STATUS_TRAINING,
 };
 
-use crate::harness::{now_ms, Logs, REGION};
+use crate::harness::{admissible_detector_statuses, now_ms, Logs, REGION};
 
 /// The operation under test, the one that creates what it updates, and the one the update
 /// is read back through.
@@ -181,34 +180,12 @@ fn status(body: &Value, case: &str) -> String {
         .to_string()
 }
 
-/// The statuses the clock admits for a RUNNING detector created at `creation_ms` and read
-/// somewhere between `read_from_ms` and `read_to_ms`: initializing until training is due,
-/// training until analysis is due, analyzing after that.
-///
-/// A read window that straddles a due instant admits the statuses on both sides of it, so a
-/// case asserts what the clock allows and never races it.
-fn admissible_statuses(creation_ms: i64, read_from_ms: i64, read_to_ms: i64) -> Vec<&'static str> {
-    let training_due = creation_ms + ANOMALY_DETECTOR_TRAINING_DELAY_MS;
-    let analyzing_due = training_due + ANOMALY_DETECTOR_ANALYSIS_DELAY_MS;
-    let mut admissible = Vec::new();
-    if read_from_ms < training_due {
-        admissible.push(ANOMALY_DETECTOR_STATUS_INITIALIZING);
-    }
-    if read_to_ms >= training_due && read_from_ms < analyzing_due {
-        admissible.push(ANOMALY_DETECTOR_STATUS_TRAINING);
-    }
-    if read_to_ms >= analyzing_due {
-        admissible.push(ANOMALY_DETECTOR_STATUS_ANALYZING);
-    }
-    admissible
-}
-
 /// The lifecycle the clock carries a running detector through, in order, so a case can state
 /// that a restart never puts a detector BACK to an earlier one. Source:
 /// `smithy_query(query="shape",shape="AnomalyDetectorStatus")`, whose other values
-/// (`PAUSED`, `FAILED`, `DELETED`) are not statuses the clock moves a detector into.
-const LIFECYCLE: [&str; 3] = [
-    ANOMALY_DETECTOR_STATUS_INITIALIZING,
+/// (`PAUSED`, `FAILED`, `DELETED`, `INITIALIZING`) are not statuses the clock moves a
+/// detector into.
+const LIFECYCLE: [&str; 2] = [
     ANOMALY_DETECTOR_STATUS_TRAINING,
     ANOMALY_DETECTOR_STATUS_ANALYZING,
 ];
@@ -354,7 +331,7 @@ async fn an_update_writes_the_members_it_names_and_keeps_the_rest() {
             // clock has made due.
             let reported_status = status(&reported, case);
             if update.enabled {
-                let admissible = admissible_statuses(creation, before, read_after);
+                let admissible = admissible_detector_statuses(creation, before, read_after);
                 assert!(
                     admissible.contains(&reported_status.as_str()),
                     "case {case:?} pass {pass}: expected one of {admissible:?}, got \
@@ -385,10 +362,10 @@ async fn enabled_pauses_and_restarts_a_detector_from_any_status() {
     // create uses, since the rule is about the status the detector is in when the pause
     // arrives and not about how it got there.
     let ages: [(&str, i64); 3] = [
-        ("paused while still initializing", 0),
+        ("paused while still training", 0),
         (
-            "paused after training became due",
-            ANOMALY_DETECTOR_TRAINING_DELAY_MS + 1,
+            "paused one millisecond before analysis was due",
+            ANOMALY_DETECTOR_ANALYSIS_DELAY_MS - 1,
         ),
         ("paused an hour after it was created", 60 * 60 * 1_000),
     ];
@@ -481,8 +458,7 @@ async fn enabled_pauses_and_restarts_a_detector_from_any_status() {
         match status_due_ms {
             Some(due) => {
                 // Whatever was outstanding is at most one whole span of the lifecycle.
-                let latest = restart_after
-                    + ANOMALY_DETECTOR_TRAINING_DELAY_MS.max(ANOMALY_DETECTOR_ANALYSIS_DELAY_MS);
+                let latest = restart_after + ANOMALY_DETECTOR_ANALYSIS_DELAY_MS;
                 assert!(
                     due > restart_before && due <= latest,
                     "case {case:?}: a restart re-arms what the clock still owed, so the next \

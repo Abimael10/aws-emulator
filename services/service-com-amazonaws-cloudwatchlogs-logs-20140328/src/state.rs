@@ -1059,7 +1059,7 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
     /// Materialise every anomaly-detector status change the clock has ALREADY made due, as
     /// of `now_ms`.
     ///
-    /// A detector initializes and trains on its own, so the status it is in is owed by the
+    /// A detector trains on its own, so the status it is in is owed by the
     /// clock rather than by a call ([`AnomalyDetectorRecord::status_due_ms`]). A reporting
     /// operation calls this before it reads, so what it reports is what the clock already
     /// decided — never a status moved on because something was polled.

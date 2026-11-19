@@ -21,14 +21,15 @@ pub struct AnomalyDetectorRecord {
     pub log_group_arn_list: Vec<String>,
     /// `AnomalyDetector$evaluationFrequency` — "Specifies how often the anomaly detector
     /// runs and look for anomalies", one value of the model's `EvaluationFrequency` enum.
-    /// `None` when neither the create nor an update named one: AWS documents no default for
-    /// the member, so none is invented here.
+    /// A detector no call named one for carries [`DEFAULT_EVALUATION_FREQUENCY`], the
+    /// frequency the service runs it at, so every read reports the frequency it actually
+    /// runs with.
     pub evaluation_frequency: Option<String>,
     /// `AnomalyDetector$filterPattern` — the pattern that limits "the anomaly detection
     /// model to examine only log events that match", when one was named.
     pub filter_pattern: Option<String>,
     /// `AnomalyDetector$anomalyDetectorStatus`, one of the
-    /// [`ANOMALY_DETECTOR_STATUS_INITIALIZING`] family.
+    /// [`ANOMALY_DETECTOR_STATUS_TRAINING`] family.
     pub status: String,
     /// `AnomalyDetector$kmsKeyId` — "The ARN of the KMS key assigned to this anomaly
     /// detector, if any."
@@ -42,7 +43,8 @@ pub struct AnomalyDetectorRecord {
     /// configuration moves this on.
     pub last_modified_time_ms: i64,
     /// `AnomalyDetector$anomalyVisibilityTime` — "The number of days used as the life cycle
-    /// of anomalies". `None` when no call named one; AWS documents no default.
+    /// of anomalies". A detector no call named one for carries
+    /// [`DEFAULT_ANOMALY_VISIBILITY_TIME_DAYS`], the life cycle the service gives it.
     pub anomaly_visibility_time: Option<i64>,
     /// The tags `CreateLogAnomalyDetector$tags` assigned to this detector. A `BTreeMap` so
     /// the stored order is stable; no `AnomalyDetector` member reports them, so they are
@@ -113,27 +115,31 @@ pub fn suppression_period_ms(period: &crate::ops::types::SuppressionPeriod) -> i
 }
 
 impl AnomalyDetectorRecord {
-    /// A brand-new anomaly detector over the log groups it was asked to watch: still
-    /// initializing, and due to start training [`ANOMALY_DETECTOR_TRAINING_DELAY_MS`] after
-    /// it was created. This is what `CreateLogAnomalyDetector` stores.
+    /// A brand-new anomaly detector over the log groups it was asked to watch: training on
+    /// the log group's events, and due to reach [`ANOMALY_DETECTOR_STATUS_ANALYZING`]
+    /// [`ANOMALY_DETECTOR_ANALYSIS_DELAY_MS`] after it was created. This is what
+    /// `CreateLogAnomalyDetector` stores.
     ///
-    /// The optional members a create may name — `detectorName`, `evaluationFrequency`,
-    /// `filterPattern`, `kmsKeyId`, `anomalyVisibilityTime`, `tags` — are left at their "the
-    /// request named none" value and set on the returned record by the caller that has them.
+    /// The configuration members the service DEFAULTS — `evaluationFrequency` and
+    /// `anomalyVisibilityTime` — are materialised here, so a create that names neither
+    /// stores the values the detector runs with and every read of it reports them; a create
+    /// that names one replaces it. The members the service defaults nothing for —
+    /// `detectorName`, `filterPattern`, `kmsKeyId`, `tags` — are left at their "the request
+    /// named none" value and set on the returned record by the caller that has them.
     pub fn new(arn: &str, log_group_arn_list: Vec<String>, creation_time_ms: i64) -> Self {
         Self {
             arn: arn.to_string(),
             detector_name: None,
             log_group_arn_list,
-            evaluation_frequency: None,
+            evaluation_frequency: Some(DEFAULT_EVALUATION_FREQUENCY.to_string()),
             filter_pattern: None,
-            status: ANOMALY_DETECTOR_STATUS_INITIALIZING.to_string(),
+            status: ANOMALY_DETECTOR_STATUS_TRAINING.to_string(),
             kms_key_id: None,
             creation_time_ms,
             last_modified_time_ms: creation_time_ms,
-            anomaly_visibility_time: None,
+            anomaly_visibility_time: Some(DEFAULT_ANOMALY_VISIBILITY_TIME_DAYS),
             tags: BTreeMap::new(),
-            status_due_ms: Some(creation_time_ms.saturating_add(ANOMALY_DETECTOR_TRAINING_DELAY_MS)),
+            status_due_ms: Some(creation_time_ms.saturating_add(ANOMALY_DETECTOR_ANALYSIS_DELAY_MS)),
             // Nothing has paused a detector the create just stored.
             resume_status: None,
             resume_due_in_ms: None,
@@ -289,16 +295,8 @@ impl AnomalyDetectorRecord {
     /// for the one after is in that one too — each change taken AT the instant it was due,
     /// not at the time something happened to look.
     pub fn materialize_due_transitions(&mut self, now_ms: i64) {
-        while let Some(due) = self.status_due_ms {
-            if due > now_ms {
-                return;
-            }
+        while self.status_due_ms.is_some_and(|due| due <= now_ms) {
             match self.status.as_str() {
-                ANOMALY_DETECTOR_STATUS_INITIALIZING => {
-                    self.status = ANOMALY_DETECTOR_STATUS_TRAINING.to_string();
-                    self.status_due_ms =
-                        Some(due.saturating_add(ANOMALY_DETECTOR_ANALYSIS_DELAY_MS));
-                }
                 ANOMALY_DETECTOR_STATUS_TRAINING => {
                     self.status = ANOMALY_DETECTOR_STATUS_ANALYZING.to_string();
                     self.status_due_ms = None;
@@ -317,7 +315,7 @@ impl AnomalyDetectorRecord {
     /// [`ANOMALY_DETECTOR_STATUS_PAUSED`], which only another call leaves. What the clock
     /// still owed it is kept rather than discarded, so restarting resumes the lifecycle from
     /// where the pause interrupted it — the remaining span is re-armed against the clock at
-    /// the restart — instead of jumping a detector that was still initializing straight to
+    /// the restart — instead of jumping a detector that was still training straight to
     /// analyzing. A detector the clock had already carried to its last status restarts into
     /// that status with nothing further owed.
     ///

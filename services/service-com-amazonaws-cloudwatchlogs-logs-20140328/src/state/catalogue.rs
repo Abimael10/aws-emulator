@@ -771,15 +771,11 @@ pub const DEFAULT_EXPORT_DESTINATION_PREFIX: &str = "exportedlogs";
 /// rather than growing without bound on request.
 pub const MAX_EXPORT_TASKS: usize = 1_000;
 
-/// The status a log anomaly detector is created in, from the model's
-/// `AnomalyDetectorStatus` enum: it has to initialize before it can train on a log group's
-/// events, so a create hands back a detector that is not analyzing anything yet.
-pub const ANOMALY_DETECTOR_STATUS_INITIALIZING: &str = "INITIALIZING";
-
-/// The status a log anomaly detector reaches once it is initialized and is learning the
-/// log group's patterns: `CreateLogAnomalyDetector` documents that the detector "uses the
-/// evaluationFrequency to compare current log events and patterns with trained baselines",
-/// so training precedes analysis.
+/// The status a log anomaly detector is CREATED in, from the model's
+/// `AnomalyDetectorStatus` enum: a detector starts out learning the log group's patterns —
+/// `CreateLogAnomalyDetector` documents that it "uses the evaluationFrequency to compare
+/// current log events and patterns with trained baselines", so training precedes analysis —
+/// and a create therefore hands back a detector that is not analyzing anything yet.
 pub const ANOMALY_DETECTOR_STATUS_TRAINING: &str = "TRAINING";
 
 /// The status a trained log anomaly detector settles in: it is scanning log events for
@@ -794,18 +790,29 @@ pub const ANOMALY_DETECTOR_STATUS_ANALYZING: &str = "ANALYZING";
 pub const ANOMALY_DETECTOR_STATUS_PAUSED: &str = "PAUSED";
 
 /// How long after it is created a log anomaly detector takes to leave
-/// [`ANOMALY_DETECTOR_STATUS_INITIALIZING`] for [`ANOMALY_DETECTOR_STATUS_TRAINING`].
+/// [`ANOMALY_DETECTOR_STATUS_TRAINING`] for [`ANOMALY_DETECTOR_STATUS_ANALYZING`].
 ///
 /// AWS documents no duration for this — the detector trains "using machine learning
 /// algorithms" over however long its log group needs — so this span is THE EMULATOR'S OWN
 /// CHOICE. It is deliberately not zero: a caller that reads the detector straight after
 /// creating it still observes the status the create handed back.
-pub const ANOMALY_DETECTOR_TRAINING_DELAY_MS: i64 = 500;
+pub const ANOMALY_DETECTOR_ANALYSIS_DELAY_MS: i64 = 3_000;
 
-/// How long after it starts training a log anomaly detector takes to reach
-/// [`ANOMALY_DETECTOR_STATUS_ANALYZING`]. The emulator's own choice, for the same reason as
-/// [`ANOMALY_DETECTOR_TRAINING_DELAY_MS`].
-pub const ANOMALY_DETECTOR_ANALYSIS_DELAY_MS: i64 = 500;
+/// The `evaluationFrequency` a log anomaly detector runs with when no call named one — "how
+/// often the anomaly detector is to run and look for anomalies"
+/// (`CreateLogAnomalyDetector$evaluationFrequency`), one value of the model's
+/// `EvaluationFrequency` enum. The member is optional on the create and the service runs the
+/// detector on a schedule regardless, so a detector created without one carries the default
+/// the service fills in rather than no value at all.
+pub const DEFAULT_EVALUATION_FREQUENCY: &str = "FIVE_MIN";
+
+/// The `anomalyVisibilityTime` a log anomaly detector runs with when no call named one, in
+/// days — "The number of days to have visibility on an anomaly"
+/// (`CreateLogAnomalyDetector$anomalyVisibilityTime`). The member is optional on the create
+/// and anomalies are baselined after some span regardless, so a detector created without one
+/// carries the default the service fills in; it is the low end of the member's modelled
+/// `@range(min: 7, max: 90)`.
+pub const DEFAULT_ANOMALY_VISIBILITY_TIME_DAYS: i64 = 7;
 
 /// `INFINITE`, one of the two values the model's `SuppressionType` enum carries: a
 /// suppression that does not run out — "If you specify INFINITE, any value for

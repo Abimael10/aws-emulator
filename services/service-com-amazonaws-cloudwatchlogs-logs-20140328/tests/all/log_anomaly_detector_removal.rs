@@ -20,7 +20,7 @@
 //! The tables here span what the rule generalises over rather than one request: the seeded
 //! detectors differ in which optional members the create named (none, each, all of them),
 //! in `anomalyVisibilityTime` at both published bounds of its `@range(7..90)`, in the log
-//! group they watch, in the status the clock has them in (one still initializing, one that
+//! group they watch, in the status the clock has them in (one still training, one that
 //! has reached ANALYZING), and in how many findings they have reported (none, one, several)
 //! and whether one of those findings is suppressed; the deletes then run in an order that is
 //! neither the creation order nor the ARN order, so the detector removed is a middle, a
@@ -31,7 +31,8 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     anomaly_detector_arn, anomaly_detector_not_found_message, log_group_arn,
     ComAmazonawsCloudwatchlogsLogs20140328State, AnomalyDetectorRecord,
-    ANOMALY_DETECTOR_STATUS_ANALYZING, MAX_ANOMALY_DETECTORS, SUPPRESSION_TYPE_INFINITE,
+    ANOMALY_DETECTOR_STATUS_ANALYZING, DEFAULT_ANOMALY_VISIBILITY_TIME_DAYS,
+    DEFAULT_EVALUATION_FREQUENCY, MAX_ANOMALY_DETECTORS, SUPPRESSION_TYPE_INFINITE,
 };
 
 use crate::harness::{now_ms, report_anomaly, Logs, REGION};
@@ -435,7 +436,15 @@ async fn each_deleted_detector_is_gone_from_every_read() {
             );
             for (key, named) in [
                 ("detectorName", seed.detector_name),
-                ("evaluationFrequency", seed.evaluation_frequency),
+                (
+                    "evaluationFrequency",
+                    // The one member of this set the service defaults, so a seed that named
+                    // none keeps the default the create stored.
+                    Some(
+                        seed.evaluation_frequency
+                            .unwrap_or(DEFAULT_EVALUATION_FREQUENCY),
+                    ),
+                ),
                 ("filterPattern", seed.filter_pattern),
                 ("kmsKeyId", seed.kms_key_id),
             ] {
@@ -447,13 +456,15 @@ async fn each_deleted_detector_is_gone_from_every_read() {
                     seed.case
                 );
             }
+            let expected_visibility = seed
+                .anomaly_visibility_time
+                .unwrap_or(DEFAULT_ANOMALY_VISIBILITY_TIME_DAYS);
             assert_eq!(
                 read.get("anomalyVisibilityTime").and_then(Value::as_i64),
-                seed.anomaly_visibility_time,
-                "case {case:?}: the surviving detector {:?} keeps anomalyVisibilityTime {:?}, \
-                 got {read}",
-                seed.case,
-                seed.anomaly_visibility_time
+                Some(expected_visibility),
+                "case {case:?}: the surviving detector {:?} keeps anomalyVisibilityTime \
+                 {expected_visibility:?}, got {read}",
+                seed.case
             );
         }
 

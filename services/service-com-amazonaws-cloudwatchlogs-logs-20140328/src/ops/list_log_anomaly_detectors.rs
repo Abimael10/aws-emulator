@@ -259,7 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // A detector initializes and trains on its own, so the status each row reports is
+        // A detector trains on its own, so the status each row reports is
         // the one the clock has ALREADY made due — materialised here rather than moved on
         // because something looked.
         store.materialize_due_anomaly_detector_transitions(crate::state::now_ms());
