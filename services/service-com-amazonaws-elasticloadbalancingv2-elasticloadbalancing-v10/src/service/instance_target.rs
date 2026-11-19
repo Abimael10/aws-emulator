@@ -14,6 +14,14 @@
 //! with the TARGET's own status line, media type and bytes — nothing of the answer is the load
 //! balancer's.
 //!
+//! An `ip` registration may also name a workload of a service this one cannot ask — a container
+//! an Amazon ECS task runs, whose own service registers that task's address in this store and
+//! so cannot read this store back. Such a workload's server is recorded by the service that
+//! STARTED it, under the address and port it listens at
+//! ([`::service_common::served_http_addresses`]), and this hand-off reads it there: the answer
+//! is that workload's own, computed by its own service from what it holds, exactly as an
+//! instance's is computed by Amazon EC2.
+//!
 //! The hand-off is made with no lock of this service's store held, exactly as a `lambda`
 //! target's invocation is ([`super::lambda_target`]), and it changes nothing: serving a
 //! request moves no status of the target, consumes no quota and bumps no counter — the
@@ -23,13 +31,15 @@
 //!
 //! A registration this emulator has no server behind on that port is a target the load
 //! balancer cannot establish a connection to, which is
-//! [`super::data_plane::TARGET_UNREACHABLE_STATUS`] — a target that is not an instance of this
-//! account, an instance whose guest is not up, and one running nothing on the port the
-//! registration receives traffic on. No body is invented for it: the load balancer's own error
-//! page is not a document this emulator holds, exactly as the sibling statuses this plane
-//! answers carry none ([`super::data_plane`]).
+//! [`super::data_plane::TARGET_UNREACHABLE_STATUS`] — a target that is neither an instance of
+//! this account nor an address a workload of another service is listening at, an instance whose
+//! guest is not up, and one running nothing on the port the registration receives traffic on. No
+//! body is invented for it: the load balancer's own error page is not a document this emulator
+//! holds, exactly as the sibling statuses this plane answers carry none
+//! ([`super::data_plane`]).
 
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
+use ::service_common::served_http_addresses::{AddressAnswer, ServedAddresses};
 
 use super::data_plane::{DataPlaneRequest, Served, TARGET_UNREACHABLE_STATUS};
 
@@ -103,34 +113,11 @@ fn proxied<Eng: Send + Sync + 'static>(
         );
         return Served::status(TARGET_UNREACHABLE_STATUS);
     };
-    let Some(state) = ec2::service_state(engine) else {
-        // Nothing of this emulator reports what the account's instances run, so there is no
-        // server behind the registration to connect to.
-        return Served::status(TARGET_UNREACHABLE_STATUS);
-    };
     // How long the TARGET took, which the access-log record reports for a connection that was
     // made at all.
     let started = ::std::time::Instant::now();
-    let answered = {
-        let store = state.lock();
-        let instance_id = match forwarded.target_type.as_str() {
-            // "if the target type is instance, specify an instance ID"
-            // (`TargetDescription$Id`).
-            INSTANCE_TARGET_TYPE => Some(forwarded.target_id.clone()),
-            // "if the target type is ip, specify an IP address": the workload at that address
-            // is the one the interface holding it belongs to.
-            IP_TARGET_TYPE => store.instance_id_at_address(&forwarded.target_id),
-            // Every other target type is one this hand-off does not name a server for: a
-            // `lambda` target is invoked ([`super::lambda_target`]) and an `alb` one is passed
-            // on ([`super::data_plane`]), both before this.
-            _ => None,
-        };
-        instance_id.and_then(|instance_id| {
-            // The request's own path, which is what a static server resolves under the
-            // directory it serves.
-            store.serve_instance_guest_http(&instance_id, port, &request.method, &request.path)
-        })
-    };
+    let answered = published_workload(engine, forwarded, port, request)
+        .or_else(|| instance_guest(engine, forwarded, port, request));
     let Some(answered) = answered else {
         ::tracing::warn!(
             target = %forwarded.target_id,
@@ -160,3 +147,63 @@ fn proxied<Eng: Send + Sync + 'static>(
     served.observed.target_elapsed = Some(started.elapsed());
     served
 }
+
+/// What a workload ANOTHER service started a server for answers — the server recorded at the
+/// address the registration names, on the port it receives traffic on
+/// ([`::service_common::served_http_addresses`]).
+///
+/// Only an `ip` registration names such an address: every other target type names a resource by
+/// its own id, which is no address a workload listens at. `None` when nothing is recorded there,
+/// which leaves the instance of this account holding the address to answer instead.
+fn published_workload<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    forwarded: &Forwarded,
+    port: i32,
+    request: &DataPlaneRequest,
+) -> Option<AddressAnswer> {
+    if forwarded.target_type != IP_TARGET_TYPE {
+        return None;
+    }
+    ServedAddresses::of(engine)?.serve(&forwarded.target_id, port, &request.method, &request.path)
+}
+
+/// What the GUEST of the instance the registration names answers, read out of Amazon EC2's own
+/// store under its own guard.
+///
+/// The address of an `ip` registration is resolved to the instance whose interface holds it, and
+/// an `instance` registration names that instance outright. `None` for a registration no
+/// instance of this account stands behind, one whose guest is not up, and one whose guest is
+/// listening on no such port.
+fn instance_guest<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    forwarded: &Forwarded,
+    port: i32,
+    request: &DataPlaneRequest,
+) -> Option<AddressAnswer> {
+    // Nothing of this emulator reports what the account's instances run, so there is no server
+    // behind the registration to connect to.
+    let state = ec2::service_state(engine)?;
+    let store = state.lock();
+    let instance_id = match forwarded.target_type.as_str() {
+        // "if the target type is instance, specify an instance ID"
+        // (`TargetDescription$Id`).
+        INSTANCE_TARGET_TYPE => Some(forwarded.target_id.clone()),
+        // "if the target type is ip, specify an IP address": the workload at that address
+        // is the one the interface holding it belongs to.
+        IP_TARGET_TYPE => store.instance_id_at_address(&forwarded.target_id),
+        // Every other target type is one this hand-off does not name a server for: a
+        // `lambda` target is invoked ([`super::lambda_target`]) and an `alb` one is passed
+        // on ([`super::data_plane`]), both before this.
+        _ => None,
+    }?;
+    // The request's own path, which is what a static server resolves under the directory it
+    // serves.
+    let answered =
+        store.serve_instance_guest_http(&instance_id, port, &request.method, &request.path)?;
+    Some(AddressAnswer {
+        status: answered.status,
+        content_type: answered.content_type,
+        body: answered.body,
+    })
+}
+

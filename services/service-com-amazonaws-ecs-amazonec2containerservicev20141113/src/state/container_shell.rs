@@ -188,20 +188,34 @@ const SIGTERM_NUMBER: i32 = 15;
 /// the bare name, the `SIG`-prefixed name and the number.
 const SIGTERM_NAMES: [&str; 3] = ["TERM", "SIGTERM", "15"];
 
+/// The utility that REPLACES the session with the command it names: "the `exec` utility shall
+/// open, close, and/or copy file descriptors as specified by any redirections as part of the
+/// command. If `exec` is specified with command, it shall replace the shell with command without
+/// creating a new process."
+///
+/// So a command written with it runs, and what the program wrote after it is not run at all: the
+/// session was that command. A container's own command uses it exactly for that — handing the
+/// container's one process to the server its image ships.
+const EXEC_COMMAND: &str = "exec";
+
 /// The commands this container provides, as their names.
 ///
 /// Each one's whole effect is inside the container's own session, which is why it can be
 /// performed in process: `echo` writes to the container's output, `true`, `false` and `:`
 /// answer a status, `exit` ends the session, `export`/`unset` change its variables, `trap`
 /// records what a signal does to it, `sleep` waits, `wait` answers for the jobs it has none
-/// of, and `test` — with its `[ ... ]` spelling — answers a question about the words it was
-/// given or about the container's own filesystem ([`ContainerShell::run_test`]). The
+/// of, `exec` runs the command it names IN PLACE of the session ("the shell shall replace
+/// itself with the command"), which is how a container's command hands itself to the server its
+/// image ships, `hostname` writes the name the runtime gave this container, and `test` — with
+/// its `[ ... ]` spelling — answers a question about the words it
+/// was given or about the container's own filesystem ([`ContainerShell::run_test`]). The
 /// commands that work over that filesystem are [`FILE_COMMANDS`]; a command outside either
-/// catalog and outside the text filters needs a program or a network this container does not
+/// catalog and outside the text filters and the SERVERS the container's image ships
+/// ([`super::container_servers`]) needs a program or a network this container does not
 /// have.
 pub const BUILT_IN_COMMANDS: &[&str] = &[
     "echo", "true", "false", ":", "exit", "export", "unset", "trap", "sleep", "wait", "test",
-    "[", "set",
+    "[", "set", "exec", "hostname",
 ];
 
 /// The commands an assignment written before them persists in the session for: POSIX's
@@ -506,6 +520,15 @@ pub struct ContainerShell {
     /// Whether the pipeline just performed was written with `!`, which is the other form
     /// `set -e` does not end the program for.
     negated_pipeline: bool,
+    /// WHERE a server this container's program starts is reached
+    /// ([`super::container_servers`]) — the address of the interface the task was allocated,
+    /// and the records the server is published in — and `None` for a container whose task this
+    /// emulator holds no address for, whose server nothing could reach.
+    serving: Option<ContainerServing>,
+    /// What keeps the servers this container's program started LISTENING: dropping a handle is
+    /// that server stopping, so a session that ends — or a run this emulator gives up on and
+    /// drops — leaves nothing listening at the task's address.
+    listening: Vec<::service_common::served_http_addresses::ServedAddressHandle>,
     /// Whether the program asked to be ENDED by an expansion of a parameter this session
     /// holds nothing for (`set -u`).
     nounset: bool,
@@ -527,14 +550,17 @@ pub struct ContainerShell {
 
 impl ContainerShell {
     /// A session holding `variables` — the container's environment — writing to `output`,
-    /// answering the signals raised on `signals`, given until `deadline`, and reading and
-    /// writing `filesystem` — the container's own layer and the volumes mounted into it.
+    /// answering the signals raised on `signals`, given until `deadline`, reading and
+    /// writing `filesystem` — the container's own layer and the volumes mounted into it — and
+    /// publishing the servers its program starts through `serving`
+    /// ([`super::container_servers`]).
     pub fn new(
         variables: BTreeMap<String, String>,
         output: Arc<ContainerOutput>,
         signals: Arc<ContainerSignals>,
         deadline: Instant,
         filesystem: ContainerFilesystem,
+        serving: Option<ContainerServing>,
     ) -> Self {
         let held_bytes = variables
             .iter()
@@ -566,6 +592,8 @@ impl ContainerShell {
             errexit: false,
             condition_depth: 0,
             negated_pipeline: false,
+            serving,
+            listening: Vec::new(),
             nounset: false,
             unset_parameter: None,
             pipefail: false,
@@ -1043,6 +1071,50 @@ impl ContainerShell {
             self.abandoned = true;
         }
         false
+    }
+
+    /// Start the server `starting` names and hold the container's program until the container
+    /// is stopped — which is what running a server in the FOREGROUND does.
+    ///
+    /// The server is published at the task's own address on the port it listens on, so whatever
+    /// sends this task traffic reaches it ([`super::container_servers`]), and it stops being
+    /// reachable when this session ends: the handle that keeps it listening is held here.
+    ///
+    /// A container whose task this emulator holds no address for is reached by nothing, so
+    /// there is no server to start: the invocation is one this session does not perform
+    /// ([`Self::declined`]), exactly as it was before this container shipped a server at all.
+    ///
+    /// The command itself answers success, and what the CONTAINER then exits with is decided by
+    /// the signal that ended the wait, not here: a foreground server runs until it is
+    /// signalled, and the handler the program installed for that signal — or the signal itself —
+    /// is what sets the session's status ([`Self::deliver_pending_signal`], whose latch takes
+    /// precedence over any status a command answered). A wait this emulator's own bound on the
+    /// run ended instead leaves the run claiming nothing ([`Self::wait_for`]).
+    fn run_server<'a>(
+        &'a mut self,
+        starting: &'a container_servers::StartingServer,
+    ) -> ShellFuture<'a, i32> {
+        Box::pin(async move {
+            let Some(serving) = self.serving.clone() else {
+                return self.declined();
+            };
+            let document_root = starting.document_root(&self.filesystem);
+            let files = container_servers::files_under(&self.filesystem, &document_root);
+            let handle = serving.start(
+                ::service_com_amazonaws_ec2_amazonec2::state::guest_services::GuestServer {
+                    program: starting.program.clone(),
+                    port: starting.port,
+                    document_root,
+                    lists_directories: starting.lists_directories,
+                },
+                files,
+            );
+            self.listening.push(handle);
+            // Until the container is stopped, or until this emulator's own bound on the run
+            // ends it — which is the wait every other wait of this session is clamped to.
+            self.wait_for(None).await;
+            EXIT_SUCCESS
+        })
     }
 
     /// Run an and-or list: its first pipeline, then each later pipeline only when the
@@ -1549,11 +1621,54 @@ impl ContainerShell {
     /// because this session starts no job to wait for.
     ///
     /// A name outside [`BUILT_IN_COMMANDS`] is one of the commands that work over the
-    /// container's FILESYSTEM ([`FILE_COMMANDS`], [`Self::run_file_command`]) or one of the
+    /// container's FILESYSTEM ([`FILE_COMMANDS`], [`Self::run_file_command`]), one of the
     /// TEXT FILTERS that compute over one input
-    /// ([`::service_common::posix_shell_text_filters`], [`Self::run_text_filter`]); a name
-    /// outside all three needs a program or a network this container does not have.
+    /// ([`::service_common::posix_shell_text_filters`], [`Self::run_text_filter`]), or one of
+    /// the SERVERS the container's image ships ([`super::container_servers`],
+    /// [`Self::run_server`]); a name outside all four needs a program or a network this
+    /// container does not have.
+    ///
+    /// A command the session is REPLACED by is reached through here too: `exec` is peeled off
+    /// the front of the command ([`Self::run_built_in`]'s caller-visible behaviour, stated on
+    /// [`EXEC_COMMAND`]), so what runs is the command after it and the session ENDS with the
+    /// status that command answered — "the shell shall replace itself with the command", so
+    /// there is no session left to run what follows.
     fn run_built_in<'a>(
+        &'a mut self,
+        name: &'a str,
+        arguments: &'a [String],
+        redirections: &'a Redirections,
+    ) -> ShellFuture<'a, i32> {
+        Box::pin(async move {
+            // The leading `exec`s of one command, peeled rather than re-entered: the words come
+            // out of the command's own vector, so following them by recursion would cost one
+            // stack frame per word a caller wrote.
+            let mut name = name;
+            let mut arguments = arguments;
+            let mut replaced = false;
+            while name == EXEC_COMMAND {
+                replaced = true;
+                let Some((replacement, rest)) = arguments.split_first() else {
+                    // An `exec` with no command at all has only the redirections it carried,
+                    // which have been applied already, and the session is not replaced.
+                    return EXIT_SUCCESS;
+                };
+                name = replacement.as_str();
+                arguments = rest;
+            }
+            let status = self.run_named_command(name, arguments, redirections).await;
+            if replaced && self.exit_status.is_none() {
+                // The session WAS that command, so when the command is over the session is
+                // over: its status is the status the container exits with.
+                self.exit_status = Some(status);
+            }
+            status
+        })
+    }
+
+    /// What one command NAME answers, once any `exec` in front of it has been peeled
+    /// ([`Self::run_built_in`]).
+    fn run_named_command<'a>(
         &'a mut self,
         name: &'a str,
         arguments: &'a [String],
@@ -1565,6 +1680,14 @@ impl ContainerShell {
             }
             if ::service_common::posix_shell_text_filters::TEXT_FILTER_COMMANDS.contains(&name) {
                 return self.run_text_filter(name, arguments, redirections).await;
+            }
+            // A server the container's IMAGE ships, invoked the way that image's own command
+            // invokes it: the command starts the server and then holds the container's program
+            // until it is stopped ([`Self::run_server`]).
+            if let Some(starting) =
+                container_servers::server_started_by(name, arguments, self.filesystem.working_in())
+            {
+                return self.run_server(&starting).await;
             }
             // The AWS CLI, which is a program of the container's ENVIRONMENT rather than a
             // utility of this session: what it performs is the shared reading of that program
@@ -1594,6 +1717,34 @@ impl ContainerShell {
                     }
                 }
                 "true" | ":" => EXIT_SUCCESS,
+                // "hostname — show or set the system's host name": with no operand it WRITES
+                // the name, which for a container is the one the runtime gave it
+                // ([`super::container_runtime::HOSTNAME_VARIABLE`]). Only the unqualified name
+                // this container has is answered, so a form that asks for anything else (a
+                // name to SET, the fully qualified name, the addresses it resolves to) is one
+                // this session does not perform.
+                "hostname" => {
+                    if !arguments.is_empty() && arguments != ["-s"] {
+                        return self.declined();
+                    }
+                    let Some(hostname) = self
+                        .variables
+                        .get(super::container_runtime::HOSTNAME_VARIABLE)
+                        .cloned()
+                    else {
+                        // Nothing gave this container a hostname, so it has none to write and
+                        // no name is invented for it.
+                        return self.declined();
+                    };
+                    if self
+                        .write_stdout(&format!("{hostname}\n"), redirections)
+                        .await
+                    {
+                        EXIT_SUCCESS
+                    } else {
+                        EXIT_FAILURE
+                    }
+                }
                 "false" => EXIT_FAILURE,
                 "exit" => {
                     let status = match arguments.first() {

@@ -296,6 +296,14 @@ impl ContainerFilesystem {
         }
     }
 
+    /// `ContainerDefinition$workingDirectory`, "the working directory to run commands inside
+    /// the container in", which is also the directory a server the program starts serves when
+    /// the invocation names none ([`super::container_servers`]).
+    #[must_use]
+    pub fn working_in(&self) -> &str {
+        &self.working_directory
+    }
+
     /// Whether this container has any volume mounted into it at all.
     pub fn has_mounts(&self) -> bool {
         !self.mounts.is_empty()

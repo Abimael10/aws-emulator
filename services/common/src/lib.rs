@@ -405,6 +405,17 @@ pub mod data_plane_addressing;
 /// route an in-process client that was handed that address, which cannot read a service off
 /// an address the way it can off an endpoint host.
 pub mod published_data_planes;
+/// The `address:port` pairs a WORKLOAD this emulator runs is listening for HTTP at — recorded
+/// by the service that started the server and read by whatever has to serve a request addressed
+/// there, for the hand-offs where that service already reads the reader's own store and so
+/// cannot be read back by it.
+pub mod served_http_addresses;
+/// The STATIC WEB SERVERS a caller-supplied program can start — which server an invocation
+/// names, the port and directory its shipped configuration serves, and the directory and port
+/// an interpreter's own HTTP server module was invoked for — for every service that runs such a
+/// program and then has to answer an HTTP request at its machine's address, so two of them
+/// cannot read the same invocation differently.
+pub mod static_web_servers;
 /// The data planes an IN-PROCESS client may open a connection to and the `host:port` each
 /// answers at — recorded by the service that opened the resource's listener, and read by a
 /// client of this emulator that was handed one of those addresses, so the connection it opens

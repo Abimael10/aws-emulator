@@ -34,3 +34,28 @@ The requirement here is the pair of error codes and their fixed message text plu
 
 ## Steps to Reproduce
 In the shared VPC (two subnets): create an ALB security group open on :80 to the harness CIDRs and a task security group open on :80 from the ALB group; create a CloudWatch Logs group; create an execution role trusted by ecs-tasks.amazonaws.com with logs:CreateLogStream/logs:PutLogEvents; create an ECS cluster. RegisterTaskDefinition an awsvpc FARGATE revision (cpu 256, memory 512, container "app" on :80, awslogs to that group). Create an ip-type target group and an internet-facing ALB with a listener forwarding to it. CreateService(launchType FARGATE, desiredCount=1, that task definition, the two subnets and task SG, loadBalancers=[{targetGroupArn, containerName="app", containerPort=80}], healthCheckGracePeriodSeconds=120). Then poll: one RUNNING task with an awsvpc private IP; DescribeTargetHealth for that IP == "healthy"; GET http://<alb-dns>/ == 200 with the revision marker. Observe none of the three converge. (Then, once they do: RegisterTaskDefinition FARGATE+bridge must answer 400 ClientException "Fargate only supports network mode ‘awsvpc’.", and UpdateService onto an EC2/bridge revision must answer 400 InvalidParameterException "Task definition does not support launch_type FARGATE." while the service keeps serving the old revision.)
+
+## Resolution
+The convergence this report waited on is served now, and the key it carries no longer fails.
+
+A request a `forward` action sends to a healthy `ip` target is answered with the status, media
+type and bytes the server the workload behind that registration started answers for it, out of
+that workload's own storage on the port the registration receives traffic on. For an `awsvpc`
+Amazon ECS task that workload is its CONTAINER: the server is the one the container's own
+`entryPoint`/`command` started — a web server image's documented command is that server in the
+foreground — and the document is the file the request's path names under the directory that
+server serves, which is a directory of the container's own filesystem.
+
+Two gaps stood in the way. The load balancer resolved an `ip` registration only to an Amazon EC2
+instance, and an `awsvpc` task's address belongs to an interface no instance holds, so every
+forward to such a target fell through to the status it gives a target it cannot connect to; and
+nothing of Amazon ECS ever started a server for a container, so a command that runs one in the
+foreground was a command that session did not perform. The container data plane now starts the
+server its command names (`state::container_servers`), records it at the task's own address for
+whatever sends that task traffic (`service_common::served_http_addresses`), and holds the
+container's program until the container is stopped, which is what a foreground server does; the
+load balancer reads that record for an `ip` target before it looks for an instance.
+
+The two refusals the negative contract measures were already served with AWS's own fixed
+wording and are unchanged; they are now pinned end to end, together with the "a rejected update
+changed nothing" invariant, by `core/router/tests/all/ecs_alb_serves_its_awsvpc_tasks_container.rs`.

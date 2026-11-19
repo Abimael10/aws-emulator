@@ -830,7 +830,11 @@ async fn run_health_probe(
     // by the `timeout` its own member documents.
     let signals = Arc::new(ContainerSignals::new());
     let deadline = Instant::now() + probe.timeout;
-    let mut shell = ContainerShell::new(probe.environment, output, signals, deadline, filesystem);
+    // A probe starts no server of the container's: `HealthCheck$command` is the command the
+    // container is PROBED with, and what listens in the container is what its own program
+    // started ([`super::container_servers`]), so this session publishes nothing.
+    let mut shell =
+        ContainerShell::new(probe.environment, output, signals, deadline, filesystem, None);
     let program = probe.program;
     let outcome = ::tokio::time::timeout(probe.timeout, async move { shell.run(&program).await })
         .await

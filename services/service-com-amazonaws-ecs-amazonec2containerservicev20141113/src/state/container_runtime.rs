@@ -196,6 +196,12 @@ pub struct ContainerLaunch {
     /// `ContainerDefinition$workingDirectory`, which the program's relative paths are
     /// resolved against.
     working_directory: Option<String>,
+    /// The private address of the elastic network interface the TASK was allocated, which is
+    /// where a server this container's program starts is reached
+    /// ([`super::container_servers`]) — `None` for a task that holds no interface of its own,
+    /// whose containers are reached at their container instance's address instead, which this
+    /// store does not hold.
+    address: Option<String>,
     /// The signals it answers.
     signals: Arc<ContainerSignals>,
     /// What the AWS calls this container's program makes PRESENT: the session of the task
@@ -335,7 +341,25 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     .and_then(|over| over.command.as_deref())
                     .or(stored.command.as_deref());
                 let program = ContainerProgram::resolve(stored.entry_point.as_deref(), command);
-                let mut environment = environment_of(stored.environment.as_deref());
+                // The address the task's own interface holds, which is both where a server
+                // this container starts is reached and what the container's HOSTNAME is read
+                // from ([`container_hostname`]).
+                let address = task
+                    .attachments
+                    .iter()
+                    .find_map(AttachmentRecord::private_ipv4_address)
+                    .map(str::to_string);
+                // The container's own hostname, which the container runtime puts in its
+                // environment under [`HOSTNAME_VARIABLE`] — before the definition's own
+                // `environment`, so a revision that sets that name itself is what its process
+                // sees.
+                let mut environment: BTreeMap<String, String> = BTreeMap::new();
+                if let Some(hostname) =
+                    container_hostname(stored, address.as_deref(), &launch_region)
+                {
+                    environment.insert(HOSTNAME_VARIABLE.to_string(), hostname);
+                }
+                environment.extend(environment_of(stored.environment.as_deref()));
                 // `ContainerOverride$environment`: "The environment variables to send to
                 // the container ... This parameter maps to Env in the docker container
                 // create command" — an override of a name the revision also sets is the
@@ -381,6 +405,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     // the storage each names is resolved where the run is started.
                     mounts: mount_requests(&definition, stored, task),
                     working_directory: stored.working_directory.clone(),
+                    // Where a server this container's program starts is reached: the address
+                    // of the interface the task holds, read off the task itself.
+                    address,
                     signals,
                     credential: credential.clone(),
                     region: launch_region.clone(),
@@ -507,6 +534,41 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     }
 }
 
+/// The variable the container runtime puts a container's own HOSTNAME in, which is what a
+/// program of it reads its hostname from and what the `hostname` utility answers
+/// (`crate::state::container_shell`).
+pub const HOSTNAME_VARIABLE: &str = "HOSTNAME";
+
+/// The hostname ONE container carries.
+///
+/// `ContainerDefinition$hostname` is "the hostname to use for your container", so a definition
+/// that names one is what the container is called — except that the same member states "this
+/// parameter is not supported for ... tasks that use the `awsvpc` network mode", and such a
+/// task is reached at its OWN elastic network interface: the hostname is then the private DNS
+/// hostname Amazon EC2 gives that interface's address
+/// (`::service_com_amazonaws_ec2_amazonec2::state::private_dns_name`, the one reading of that
+/// name in this workspace), as the unqualified name a host answers with.
+///
+/// `None` for a container that is neither — one of a task this store holds no address for and
+/// whose definition names no hostname — which carries no hostname rather than an invented one.
+fn container_hostname(
+    stored: &ContainerDefinition,
+    address: Option<&str>,
+    region: &str,
+) -> Option<String> {
+    if let Some(address) = address {
+        let qualified =
+            ::service_com_amazonaws_ec2_amazonec2::state::private_dns_name(address, region);
+        return qualified.split('.').next().map(str::to_string);
+    }
+    stored
+        .hostname
+        .as_deref()
+        .map(str::trim)
+        .filter(|hostname| !hostname.is_empty())
+        .map(str::to_string)
+}
+
 /// The environment a `KeyValuePair` list describes, as the variables a session holds.
 ///
 /// `KeyValuePair$name` is "the name of the key-value pair" and `value` "the value of the
@@ -540,10 +602,22 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
         return;
     };
     let launches = state.lock().settle_container_runs(region);
+    // The records a server a container's program starts is published in, taken once for the
+    // whole pass: they live in the SAME shared engine as this store
+    // ([`::service_common::served_http_addresses`]), and an engine that vends none leaves a
+    // container's server reachable by nothing.
+    let addresses = ::service_common::served_http_addresses::ServedAddresses::of(&**engine);
     for launch in launches {
         let container_arn = launch.container_arn.clone();
         let run_state = ::engine::ServiceState::clone(&state);
         let callback = callback.clone();
+        // WHERE a server this container starts is reached, for a task that holds an interface
+        // of its own on an engine that vends the records.
+        let serving = launch
+            .address
+            .clone()
+            .zip(addresses.clone())
+            .map(|(address, addresses)| ContainerServing::new(address, addresses));
         // The volumes the container's `mountPoints` mount, resolved with NO guard of this
         // store held: the files of an `efsVolumeConfiguration` volume are the Amazon EFS
         // service's own, so resolving one reads that service's store
@@ -552,8 +626,9 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
             launch.working_directory.as_deref(),
             mounted_volumes(&**engine, &state, &launch.mounts),
         );
-        let handle = runtime
-            .spawn(async move { run_container(run_state, callback, launch, filesystem).await });
+        let handle = runtime.spawn(async move {
+            run_container(run_state, callback, launch, filesystem, serving).await
+        });
         // The handle is kept with the run, so a run whose task is gone is aborted rather
         // than merely forgotten.
         state.lock().attach_container_run(&container_arn, handle);
@@ -577,6 +652,7 @@ async fn run_container(
     callback: ::smithy_server_runtime::EmbeddedEmulator,
     launch: ContainerLaunch,
     filesystem: ContainerFilesystem,
+    serving: Option<ContainerServing>,
 ) {
     // The values the agent fetches for the container, before anything of it runs: a secret
     // it could not retrieve starts NO program, so the container reports no exit code —
@@ -607,6 +683,7 @@ async fn run_container(
         Arc::clone(&launch.signals),
         deadline,
         filesystem,
+        serving,
     )
     // The AWS CLI this container's program reaches the account's services through, signing
     // as the task role ([`super::container_aws_cli`]).

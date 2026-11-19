@@ -338,6 +338,11 @@ pub use deployment_events::*;
 mod container_shell;
 pub use container_shell::*;
 
+/// The SERVER a container's program starts, and what it answers for a request made to the
+/// task's own address on the port that server listens on.
+mod container_servers;
+pub use container_servers::*;
+
 /// The `awslogs` log driver: where the output of a container that runs is delivered.
 mod container_logs;
 pub use container_logs::*;

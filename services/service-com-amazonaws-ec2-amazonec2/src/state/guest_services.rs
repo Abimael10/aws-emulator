@@ -41,6 +41,16 @@ use ::std::collections::{BTreeMap, BTreeSet};
 use ::std::sync::{Arc, Mutex, PoisonError};
 
 use ::service_common::posix_shell_session::{EnvironmentPrograms, ProgramFiles, ProgramOutcome};
+// The ONE reading this workspace has of which web server an invocation names, what its shipped
+// configuration serves, and what an interpreter's own HTTP server module was invoked for —
+// shared with every other service that runs a caller-supplied program and then has to answer an
+// HTTP request at its machine's address.
+use ::service_common::static_web_servers::{
+    served_module as module_invocation, HTTP_SERVER_MODULE, UNIT_SUFFIX,
+};
+pub use ::service_common::static_web_servers::{
+    package_named, WebServerPackage, INDEX_DOCUMENT, WEB_SERVER_PACKAGES,
+};
 
 use super::guest_console::GuestMachine;
 use super::{ComAmazonawsEc2Amazonec2State, InstanceRecord, InstanceStateName};
@@ -50,48 +60,6 @@ use super::{ComAmazonawsEc2Amazonec2State, InstanceRecord, InstanceStateName};
 /// The emulator's own bound: a boot program is caller-supplied text, so what it can make this
 /// process hold is bounded here. Far above the one or two ports a workload serves.
 pub const MAX_GUEST_SERVERS: usize = 8;
-
-/// One web server a guest can have installed, as the distribution's own package ships it.
-#[derive(Debug, Clone, Copy)]
-pub struct WebServerPackage {
-    /// The name a package manager installs it under, which is also the name its init-system
-    /// unit carries.
-    pub name: &'static str,
-    /// The port its shipped configuration listens on.
-    pub port: i32,
-    /// The directory its shipped configuration serves.
-    pub document_root: &'static str,
-}
-
-/// The web servers a guest of this emulator can install and run.
-///
-/// The Apache HTTP Server package of the Amazon Linux family is `httpd`, serving
-/// `/var/www/html` on port 80 — the configuration the EC2 user guide's own web-server
-/// tutorial relies on, which installs that package, starts its unit and then writes the page
-/// it serves into that directory; `apache2` is the same server under the name the Debian
-/// family's package carries; and the `nginx` package serves `/usr/share/nginx/html` on the
-/// same port. A package name carrying a version suffix (`httpd24`, `nginx1`) names the same
-/// server ([`package_named`]).
-pub const WEB_SERVER_PACKAGES: &[WebServerPackage] = &[
-    WebServerPackage {
-        name: "httpd",
-        port: 80,
-        document_root: "/var/www/html",
-    },
-    WebServerPackage {
-        name: "apache2",
-        port: 80,
-        document_root: "/var/www/html",
-    },
-    WebServerPackage {
-        name: "nginx",
-        port: 80,
-        document_root: "/usr/share/nginx/html",
-    },
-];
-
-/// The document a static server answers a DIRECTORY with, where the directory holds one.
-pub const INDEX_DOCUMENT: &str = "index.html";
 
 /// The package managers a guest of this emulator has installed: the two of the Amazon Linux
 /// family, the two of the Debian family, and the Amazon Linux 2 topic installer.
@@ -110,21 +78,10 @@ const APACHE_CONTROL: &str = "apachectl";
 /// The unit [`APACHE_CONTROL`] controls.
 const APACHE_UNIT: &str = "httpd";
 
-/// The interpreters that serve a directory with the module below.
-const INTERPRETERS: &[&str] = &["python3", "python"];
-
-/// The module a Python interpreter serves a directory over HTTP with, named after `-m`.
-const HTTP_SERVER_MODULE: &str = "http.server";
-
-/// The port that module serves on when the invocation names none, and the directory it serves
-/// when no `--directory` names one: its own documented default port, and the working
-/// directory of the session the command was written in — which, for a session with no `cd`
-/// to change it, is the root of the machine's tree.
-const DEFAULT_MODULE_PORT: i32 = 8000;
+/// The directory the interpreter's own HTTP server module serves when no `--directory` names
+/// one: the working directory of the session the command was written in — which, for a session
+/// with no `cd` to change it, is the root of the machine's tree.
 const SESSION_WORKING_DIRECTORY: &str = "/";
-
-/// The suffix an init-system unit name carries, which an invocation may leave off.
-const UNIT_SUFFIX: &str = ".service";
 
 /// The status a program of this guest exits with when it did what it was asked.
 const SUCCESS: i32 = 0;
@@ -245,20 +202,6 @@ impl GuestRuntime {
             .values()
             .any(|server| server.program == program)
     }
-}
-
-/// The web server `name` names, where this guest has one of that name — a package name
-/// carrying a VERSION suffix (`httpd24`, `nginx1`) names the same server, which is how the
-/// Amazon Linux topic and collection packages are written.
-#[must_use]
-pub fn package_named(name: &str) -> Option<&'static WebServerPackage> {
-    let name = name.trim().trim_end_matches(UNIT_SUFFIX);
-    WEB_SERVER_PACKAGES.iter().find(|package| {
-        name == package.name
-            || name
-                .strip_prefix(package.name)
-                .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
-    })
 }
 
 /// The services of one guest, as the programs of that guest change them while a session runs.
@@ -445,36 +388,19 @@ impl GuestServices {
         })
     }
 
-    /// Serve a directory with the interpreter's own HTTP server module: `-m http.server`,
-    /// with the port it was given (else [`DEFAULT_MODULE_PORT`]) and the directory
-    /// `--directory` names (else the session's working directory).
+    /// Serve a directory with the interpreter's own HTTP server module, read through the ONE
+    /// reading of that invocation this workspace has
+    /// ([`::service_common::static_web_servers::served_module`]): the port it was given and the
+    /// directory `--directory` names, else this session's working directory.
     ///
     /// `None` for every other invocation of the interpreter: this guest performs the module
     /// below and nothing else of it.
     fn serve_module(&self, arguments: &[String]) -> Option<ProgramOutcome> {
-        let mut words = arguments.iter();
-        if words.next().map(String::as_str) != Some("-m") {
-            return None;
-        }
-        if words.next().map(String::as_str) != Some(HTTP_SERVER_MODULE) {
-            return None;
-        }
-        let mut port = DEFAULT_MODULE_PORT;
-        let mut root = SESSION_WORKING_DIRECTORY.to_string();
-        while let Some(word) = words.next() {
-            match word.as_str() {
-                "--directory" | "-d" => root = words.next()?.clone(),
-                "--bind" | "-b" => {
-                    // The interface it binds is not a fact this emulator holds: a guest has
-                    // one address, and the module is serving on it either way.
-                    let _ = words.next()?;
-                }
-                operand => port = operand.parse().ok()?,
-            }
-        }
+        let served = module_invocation(arguments, SESSION_WORKING_DIRECTORY)?;
         // The module LISTS a directory that holds no index document, which is what
         // `SimpleHTTPRequestHandler` answers such a request with.
-        self.held().listen(HTTP_SERVER_MODULE, port, &root, true);
+        self.held()
+            .listen(HTTP_SERVER_MODULE, served.port, &served.document_root, true);
         Some(ProgramOutcome {
             status: SUCCESS,
             output: Vec::new(),
@@ -569,7 +495,7 @@ impl GuestEnvironment {
             let (verb, _, now) = invocation(arguments);
             return self.services.control(verb?, APACHE_UNIT, now);
         }
-        if INTERPRETERS.contains(&name) {
+        if ::service_common::static_web_servers::INTERPRETERS.contains(&name) {
             return self.services.serve_module(arguments);
         }
         if let Some(package) = package_named(name) {
