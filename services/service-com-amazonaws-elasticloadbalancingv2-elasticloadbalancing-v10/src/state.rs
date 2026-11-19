@@ -3545,7 +3545,8 @@ pub struct RuleRecord {
     pub conditions: Vec<RuleCondition>,
     pub actions: Vec<Action>,
     /// The transforms applied to a request this rule matches. A rule carrying none is
-    /// reported with the member PRESENT and empty, never with the member left out.
+    /// reported with the member PRESENT and empty by every operation that reports the
+    /// rule's configuration — the create, the modification and the read.
     pub transforms: Vec<RuleTransform>,
     /// The tags this rule was created with, which `DescribeTags` reports: a listener
     /// rule is a taggable Elastic Load Balancing resource.
@@ -3565,9 +3566,9 @@ impl RuleRecord {
             actions: Some(reported_actions(&self.actions)),
             // Only the rule a listener mints with itself is the default one.
             is_default: Some(false),
-            // `Rule$Transforms` is a list member every reported rule carries: a rule with
-            // no transform answers the empty list, which is a different answer from an
-            // absent member.
+            // `Rule$Transforms` is a list member every rule this read reports carries: a
+            // rule with no transform answers the empty list, which is a different answer
+            // from an absent member.
             transforms: Some(self.transforms.clone()),
         }
     }

@@ -293,13 +293,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(rule_not_found());
             };
             record.priority = *priority;
-            moved.push(record.to_shape());
+            moved.push(reprioritised_rule(record));
         }
 
         Ok(SetRulePrioritiesOutput {
             rules: Some(moved),
         })
     }
+}
+
+/// One moved rule as THIS response reports it.
+///
+/// Every member is the one the rule's own read answers ([`crate::state::RuleRecord::to_shape`])
+/// except `Rule$Transforms`: this response carries that member only for a rule that actually
+/// holds a transform, where the operations that report a rule's whole configuration — the
+/// create, the modification and the read — carry it present and empty for a rule holding
+/// none. A re-prioritisation answers what it CHANGED about each rule it names, and a rule's
+/// transforms are not it, so an empty transform list is left out of the member rather than
+/// serialized as an empty one: an absent member and an empty list are different answers to a
+/// client that reads this wire form, and only the paths that report the configuration itself
+/// say "this rule has no transform" out loud.
+fn reprioritised_rule(record: &crate::state::RuleRecord) -> Rule {
+    let mut reported = record.to_shape();
+    reported.transforms = reported.transforms.filter(|transforms| !transforms.is_empty());
+    reported
 }
 
 /// One rule this call moves: the listener whose priority namespace the move lands in, the
