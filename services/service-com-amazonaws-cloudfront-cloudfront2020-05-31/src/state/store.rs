@@ -1580,11 +1580,13 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
                     // The same request again: the record the first create left behind, at
                     // its current version. Nothing is minted and nothing is stored — so a
                     // tag set this repeat carries changes nothing either, the distribution
-                    // keeping the tags it was created with.
+                    // keeping the tags it was created with, and the logging configuration it
+                    // keeps is the one it was created with too.
                     return Ok(CreatedDistribution {
                         id: existing.id.clone(),
                         etag: existing.etag.clone(),
                         distribution: existing.to_distribution(&self.key_groups),
+                        replayed: true,
                     });
                 }
                 return Err(CreateRefusal::DistributionAlreadyExists(
@@ -1645,6 +1647,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             id: id.clone(),
             etag,
             distribution: stored.to_distribution(&self.key_groups),
+            replayed: false,
         };
         self.caller_references.insert(caller_reference, id.clone());
         // The listener now has a distribution to serve, and its handle is held for as long

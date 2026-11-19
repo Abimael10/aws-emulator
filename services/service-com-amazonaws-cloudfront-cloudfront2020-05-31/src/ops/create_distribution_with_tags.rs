@@ -487,7 +487,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(create_refusal)?
         };
 
-        Box::pin(access_logs.grant_log_delivery(ctx)).await;
+        // The grant `CreateDistribution` owes once a distribution is stored, and for the
+        // reason it states: a caller-reference repeat stored nothing, so nothing is owed for
+        // the configuration it submitted.
+        if !created.replayed {
+            Box::pin(access_logs.grant_log_delivery(ctx)).await;
+        }
 
         Ok(CreateDistributionWithTagsOutput {
             distribution: Some(created.distribution),

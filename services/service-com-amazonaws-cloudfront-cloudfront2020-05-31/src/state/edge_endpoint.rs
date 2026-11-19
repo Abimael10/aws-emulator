@@ -577,6 +577,13 @@ async fn serve_connection(
     if let Err(error) = ::hyper::server::conn::http1::Builder::new()
         .timer(::hyper_util::rt::TokioTimer::new())
         .header_read_timeout(request_deadline())
+        // The names of the response headers are written in the CANONICAL HTTP form —
+        // `Location`, `Content-Type`, `X-Cache`, `X-Amz-Cf-Id` — which is the form a viewer
+        // reads off the wire from CloudFront itself. A name is case-insensitive (RFC 9110),
+        // so this changes no header's meaning; what it changes is the bytes a client that
+        // reads the names AS SENT sees, and an answer whose `Location` arrived spelled
+        // `location` is one such a client finds no redirect target in.
+        .title_case_headers(true)
         .serve_connection(io, service)
         .await
     {

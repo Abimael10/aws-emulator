@@ -519,8 +519,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The distribution is stored, so the side effect of enabling standard logging is
-        // owed: the log-delivery account holds `FULL_CONTROL` on the target bucket.
-        Box::pin(access_logs.grant_log_delivery(ctx)).await;
+        // owed: the log-delivery account holds `FULL_CONTROL` on the target bucket. A
+        // caller-reference REPEAT stored nothing — it was answered with the distribution that
+        // reference already names, which runs under the logging configuration it was created
+        // with — so nothing is owed for the configuration that repeat submitted.
+        if !created.replayed {
+            Box::pin(access_logs.grant_log_delivery(ctx)).await;
+        }
 
         Ok(CreateDistributionOutput {
             distribution: Some(created.distribution),

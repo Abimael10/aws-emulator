@@ -1183,15 +1183,23 @@ pub fn same_batch(left: &InvalidationBatch, right: &InvalidationBatch) -> bool {
     same_paths(&left.paths, &right.paths)
 }
 
-/// Whether two distribution configurations ask for the same thing, which is what decides
-/// whether a repeated `CallerReference` is the same create again or a second
+/// Whether two distribution configurations ask for the same DISTRIBUTION, which is what
+/// decides whether a repeated `CallerReference` is the same create again or a second
 /// distribution under a reference that is already taken.
 ///
-/// Compared over the WHOLE configuration rather than a chosen few members: the question is
+/// Compared over the whole configuration rather than a chosen few members: the question is
 /// about "the content of the config", so every member a caller can submit takes part, down
 /// to the members a request left out. Comparing the DESERIALIZED configurations also makes
 /// the comparison insensitive to the request document's whitespace and member order, which
 /// is what "identical … (ignoring white space)" asks for.
+///
+/// EXCEPT the access-logging configuration ([`without_access_logging`]): where the two
+/// configurations describe the same distribution and differ only in `Logging`, the repeat is
+/// the same create again — the recorded service answers it with the distribution the
+/// reference already names, carrying the logging configuration that distribution was created
+/// with, and mints nothing. Access logging is a delivery setting of a distribution that
+/// already exists, turned on and retargeted through `UpdateDistribution`, so it is not part
+/// of what a create asks a caller reference to name.
 ///
 /// The comparison goes through the shapes' derived `Debug` rendering, which spells out
 /// every member in declaration order with its value, because the alternative — deriving
@@ -1204,7 +1212,17 @@ pub fn same_batch(left: &InvalidationBatch, right: &InvalidationBatch) -> bool {
 /// rendering that hid or truncated a member would make two configurations differing in it
 /// compare equal, and that test fails the moment it does.
 pub fn same_config(left: &DistributionConfig, right: &DistributionConfig) -> bool {
+    let (left, right) = (without_access_logging(left), without_access_logging(right));
     format!("{left:?}") == format!("{right:?}")
+}
+
+/// `config` with its access-logging configuration set aside, which is the configuration
+/// [`same_config`] compares: the distribution the create asks for, without the delivery
+/// setting that is not part of naming it.
+fn without_access_logging(config: &DistributionConfig) -> DistributionConfig {
+    let mut config = config.clone();
+    config.logging = None;
+    config
 }
 
 /// Whether two continuous deployment policy configurations ask for the same thing, which

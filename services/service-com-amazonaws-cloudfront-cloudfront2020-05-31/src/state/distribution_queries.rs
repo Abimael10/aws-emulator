@@ -66,6 +66,15 @@ pub struct CreatedDistribution {
     pub etag: String,
     /// The `Distribution` the response carries.
     pub distribution: Distribution,
+    /// Whether this is the record a create under the SAME caller reference already left
+    /// behind, answered to a repeat of that create rather than minted here
+    /// ([`crate::state::same_config`] decides which a repeat is).
+    ///
+    /// A repeat creates nothing, so the side effects a create owes — the log-delivery grant
+    /// on the bucket its standard logging names — are not owed again: the distribution runs
+    /// under the logging configuration it was CREATED with, whatever the repeat submitted,
+    /// so a grant made for the repeat's own bucket would be a change nothing asked for.
+    pub replayed: bool,
 }
 
 /// Whether a configuration describes a MULTI-TENANT distribution.
