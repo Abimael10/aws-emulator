@@ -23,9 +23,10 @@
 
 /// The `status` an authorizer must carry before it can be deleted.
 ///
-/// One of the two values `AuthorizerStatus` admits — the other is
-/// [`super::DEFAULT_AUTHORIZER_STATUS`], the status a create that asks for none yields —
-/// and the one that means the authorizer authorizes nothing.
+/// One of the two values `AuthorizerStatus` admits — the other is `ACTIVE`, the status
+/// `UpdateAuthorizer` puts an authorizer into service with — and the one that means the
+/// authorizer authorizes nothing, which is also the status a create that names none
+/// yields ([`super::DEFAULT_AUTHORIZER_STATUS`]).
 pub const INACTIVE_AUTHORIZER_STATUS: &str = "INACTIVE";
 
 /// How this service refuses the delete of an authorizer the account still has in
@@ -61,5 +62,19 @@ impl super::RegisteredAuthorizer {
     /// `INACTIVE` and later updated back is not.
     pub fn is_deactivated(&self) -> bool {
         self.status == INACTIVE_AUTHORIZER_STATUS
+    }
+
+    /// This record as the `AuthorizerSummary` a LISTING of authorizers reports it as:
+    /// "The authorizer name" and "The authorizer ARN", the two members that shape
+    /// declares (`smithy_query(query="shape",shape="AuthorizerSummary")`).
+    ///
+    /// Projected from the stored record, like [`super::RegisteredAuthorizer::description`]
+    /// is, so what a listing reports and what the single-authorizer reader reports cannot
+    /// drift.
+    pub fn summary(&self) -> crate::ops::types::AuthorizerSummary {
+        crate::ops::types::AuthorizerSummary {
+            authorizer_name: Some(self.authorizer_name.clone()),
+            authorizer_arn: Some(self.authorizer_arn.clone()),
+        }
     }
 }

@@ -409,9 +409,16 @@ async fn the_delete_precondition_is_read_from_the_record_and_not_from_the_create
 
     let walks = vec![
         Walk {
-            case: "created in service and never updated",
+            case: "created without a status, so out of service, and never updated",
             name: "walk_untouched",
             create_status: None,
+            updates: vec![],
+            deletable: true,
+        },
+        Walk {
+            case: "created in service and never updated",
+            name: "walk_in_service",
+            create_status: Some("ACTIVE"),
             updates: vec![],
             deletable: false,
         },
@@ -517,12 +524,16 @@ async fn the_delete_precondition_is_read_from_the_record_and_not_from_the_create
 async fn a_name_the_account_holds_no_authorizer_under_is_the_only_not_found() {
     let emulator = Emulator::new();
 
-    // One authorizer exists and is in service, so the refusals below are about the NAME
-    // rather than about an empty store.
+    // One authorizer exists and is in service — the create states that status, which is
+    // not the one a create that states none resolves to ([`DEFAULT_AUTHORIZER_STATUS`]) —
+    // so the refusals below are about the NAME rather than about an empty store.
     let created = emulator
         .create(
             "held_authorizer",
-            &json!({ "authorizerFunctionArn": function_arn("held") }),
+            &json!({
+                "authorizerFunctionArn": function_arn("held"),
+                "status": "ACTIVE",
+            }),
         )
         .await;
     assert_eq!(
@@ -567,7 +578,7 @@ async fn a_name_the_account_holds_no_authorizer_under_is_the_only_not_found() {
     let read = emulator.describe("held_authorizer").await;
     assert_eq!(
         read.member_str("status"),
-        Some(DEFAULT_AUTHORIZER_STATUS),
+        Some("ACTIVE"),
         "the held authorizer must be unchanged, got {read:?}"
     );
     let refused = emulator.delete("held_authorizer").await;

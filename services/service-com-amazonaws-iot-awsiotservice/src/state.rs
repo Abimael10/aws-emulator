@@ -2246,12 +2246,14 @@ pub fn token_signing_public_keys_limit_message(requested: usize) -> String {
 /// The `status` an authorizer created without one carries.
 ///
 /// `AuthorizerStatus` is `ACTIVE | INACTIVE`
-/// (`smithy_query(query="shape",shape="AuthorizerStatus")`) and AWS IoT's custom
-/// authentication documentation describes INACTIVE as the status you move an
-/// authorizer to in order to stop it being used — so a create that does not ask for
-/// INACTIVE yields an authorizer that is in use, which is `ACTIVE`. The record keeps
-/// it, and every later read reports it.
-pub const DEFAULT_AUTHORIZER_STATUS: &str = "ACTIVE";
+/// (`smithy_query(query="shape",shape="AuthorizerStatus")`) and the model attaches no
+/// `@default`, so the value a create that names none resolves to is the service's: AWS
+/// reports such an authorizer as NOT in service, which is
+/// [`INACTIVE_AUTHORIZER_STATUS`] — the same way this service's other security
+/// resources arrive (a certificate is registered inactive unless the request asks for
+/// it to be active), and `UpdateAuthorizer`'s `status` is what puts the authorizer into
+/// service afterwards. The record keeps it, and every later read reports it.
+pub const DEFAULT_AUTHORIZER_STATUS: &str = INACTIVE_AUTHORIZER_STATUS;
 
 /// One custom authorizer in the authorizer store, as this service persists it.
 ///
@@ -3278,6 +3280,13 @@ pub use policy_attachments::{
     PolicyAttachmentLimit, PolicyAttachments, PolicyTarget, PolicyTargetRefusal,
     ResolvedPolicyTarget, MAX_ATTACHED_TARGETS, MAX_LIST_PAGE_SIZE, MAX_POLICIES_PER_TARGET,
 };
+
+// WHERE a NAMED resource sits in a listing ordered by its name, in the direction that
+// listing's `ascendingOrder` asks for — the one total order per direction the shared
+// pager above walks — lives in `state/name_listing.rs`, beside that pager. Its names are
+// re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod name_listing;
+pub use name_listing::{name_listing_row, name_listing_row_name, name_listing_rows};
 
 // HOW an authorization question is DECIDED out of that relation — which policies are in
 // effect for a principal, and what their statements say about one action on one resource —

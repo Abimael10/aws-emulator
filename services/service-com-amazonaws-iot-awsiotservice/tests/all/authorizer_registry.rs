@@ -48,6 +48,14 @@ use smithy_server_runtime::MultiServiceRouter;
 #[path = "authorizer_registry/resource_tagging.rs"]
 mod resource_tagging;
 
+/// `ListAuthorizers`: the page of summaries the account's authorizers are reported as. It
+/// is driven through the same harness, so what a listing says and what this suite's create
+/// and single-authorizer reader say are compared against one emulator — which is why it is
+/// a child of this suite rather than a second suite beside it. The `#[path]` is what keeps
+/// it one, for the reason the sibling above records.
+#[path = "authorizer_registry/listing.rs"]
+mod listing;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.
